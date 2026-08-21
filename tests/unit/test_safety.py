@@ -123,6 +123,15 @@ def make_observation(api: SimpleNamespace, **overrides: Any) -> Any:
     return api.Observation(**values)
 
 
+def make_raw_observation(api: SimpleNamespace, **overrides: Any) -> SimpleNamespace:
+    """Bypass domain validation only to probe SafetyKernel's defensive boundary."""
+
+    valid = make_observation(api)
+    values = {name: getattr(valid, name) for name in type(valid).model_fields}
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 @dataclass(frozen=True)
 class ProposedSetpointRecord:
     """Allocator output used to isolate SafetyKernel from FleetAllocator."""
@@ -132,6 +141,7 @@ class ProposedSetpointRecord:
     watts: int
     intent_id: str
     intent_expires_at_mono: float
+    reactive_vars: int = 0
 
 
 def make_proposed_setpoints(
@@ -141,6 +151,7 @@ def make_proposed_setpoints(
     watts: int = 1_000,
     watts_by_unit: dict[str, int] | None = None,
     intent_expires_at_mono: float = 109.0,
+    reactive_vars: int = 0,
 ) -> tuple[ProposedSetpointRecord, ...]:
     selected_direction = direction or api.Direction.DISCHARGE
     allocation = watts_by_unit if watts_by_unit is not None else {"mid": watts}
@@ -151,6 +162,7 @@ def make_proposed_setpoints(
             watts=unit_watts,
             intent_id="intent-001",
             intent_expires_at_mono=intent_expires_at_mono,
+            reactive_vars=reactive_vars,
         )
         for unit_id, unit_watts in sorted(allocation.items())
     )
@@ -252,7 +264,7 @@ def test_zero_is_permitted_even_without_usable_telemetry(
         {}
         if observations == {}
         else {
-            "mid": make_observation(
+            "mid": make_raw_observation(
                 api,
                 system_soc_pct=math.nan,
                 active_faults=frozenset({"BMS_CRITICAL"}),
@@ -334,11 +346,44 @@ def test_overall_telemetry_age_boundary_is_inclusive_then_stale(api: SimpleNames
         ("temperatures_c", (25.0, math.inf)),
     ],
 )
-def test_nonfinite_safety_data_is_never_clamped_or_coerced(
+def test_domain_rejects_nonfinite_safety_data_before_control(
     api: SimpleNamespace, field: str, value: Any
 ) -> None:
-    observation = make_observation(api, **{field: value})
-    decision = evaluate(api, current_observations={"mid": observation})
+    with pytest.raises(ValueError, match="finite"):
+        make_observation(api, **{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("system_soc_pct", math.nan),
+        ("bms_soc_pct", math.inf),
+        ("soh_pct", -math.inf),
+        ("battery_watts", math.nan),
+        ("pack_voltage_v", math.inf),
+        ("pack_current_a", math.nan),
+        ("dynamic_charge_limit_w", math.inf),
+        ("dynamic_discharge_limit_w", math.nan),
+        ("cell_voltages_v", (3.3, 3.3, math.nan, 3.3)),
+        ("temperatures_c", (25.0, math.inf)),
+    ],
+)
+def test_safety_kernel_defensively_rejects_raw_nonfinite_data(
+    api: SimpleNamespace, field: str, value: Any
+) -> None:
+    observation = make_raw_observation(api, **{field: value})
+    previous = make_observation(
+        api,
+        captured_at_mono=99.0,
+        sequence=6,
+        cell_captured_at_mono=99.0,
+        cell_sequence=3,
+    )
+    decision = evaluate(
+        api,
+        current_observations={"mid": observation},
+        previous_observations={"mid": previous},
+    )
     assert_rejected(decision, api)
 
 
@@ -454,7 +499,11 @@ def test_system_and_bms_soc_disagreement_boundary(
 def test_cell_safety_failures_fail_closed(
     api: SimpleNamespace, cells: tuple[float, ...] | None
 ) -> None:
-    observation = make_observation(api, cell_voltages_v=cells)
+    observation = (
+        make_raw_observation(api, cell_voltages_v=None)
+        if cells is None
+        else make_observation(api, cell_voltages_v=cells)
+    )
     decision = evaluate(api, current_observations={"mid": observation})
     assert_rejected(decision, api)
 
@@ -494,6 +543,45 @@ def test_cell_age_boundary_is_inclusive_then_stale(api: SimpleNamespace) -> None
     assert_rejected(denied, api)
 
 
+def test_unchanged_cell_sequence_is_permitted_while_cell_data_is_fresh(
+    api: SimpleNamespace,
+) -> None:
+    """Cell blocks poll slower than the control rate; an unchanged cell sequence
+    between consecutive observations must not fail closed on its own."""
+    current = make_observation(api)
+    previous = make_observation(
+        api,
+        captured_at_mono=99.0,
+        sequence=6,
+        cell_captured_at_mono=current.cell_captured_at_mono,
+        cell_sequence=current.cell_sequence,
+    )
+    decision = evaluate(
+        api,
+        current_observations={"mid": current},
+        previous_observations={"mid": previous},
+    )
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+
+
+def test_regressed_cell_sequence_fails_closed(api: SimpleNamespace) -> None:
+    current = make_observation(api)
+    previous = make_observation(
+        api,
+        captured_at_mono=99.0,
+        sequence=6,
+        cell_captured_at_mono=99.0,
+        cell_sequence=current.cell_sequence + 1,
+    )
+    decision = evaluate(
+        api,
+        current_observations={"mid": current},
+        previous_observations={"mid": previous},
+    )
+    assert_rejected(decision, api)
+    assert "cell_sequence_invalid" in reasons(decision)
+
+
 @pytest.mark.parametrize(
     "temperatures",
     [
@@ -507,7 +595,11 @@ def test_temperature_failures_have_exact_reasons(
     api: SimpleNamespace,
     temperatures: tuple[float, ...] | None,
 ) -> None:
-    observation = make_observation(api, temperatures_c=temperatures)
+    observation = (
+        make_raw_observation(api, temperatures_c=None)
+        if temperatures is None
+        else make_observation(api, temperatures_c=temperatures)
+    )
     decision = evaluate(api, current_observations={"mid": observation})
     assert_rejected(decision, api)
 
@@ -648,6 +740,207 @@ def test_fleet_limit_clamps_total_without_multiplication(api: SimpleNamespace) -
     assert_reason_contract(decision)
     assert sum(point.watts for point in setpoints.values()) == 4_500
     assert all(0 <= point.watts <= 3_000 for point in setpoints.values())
+
+
+def test_fleet_limit_remainder_keeps_the_exact_total(api: SimpleNamespace) -> None:
+    proposed = make_proposed_setpoints(
+        api,
+        watts_by_unit={"lhs": 2_000, "mid": 2_000, "rhs": 2_000},
+    )
+    current = {unit: make_observation(api, unit_id=unit) for unit in UNIT_IDS}
+    policy = make_policy(api, fleet_discharge_limit_w=4_501)
+
+    decision = evaluate(
+        api,
+        proposed_setpoints=proposed,
+        current_observations=current,
+        policy=policy,
+    )
+    setpoints = setpoints_by_unit(decision)
+
+    assert decision.status is api.DecisionStatus.CLAMPED
+    assert_reason_contract(decision)
+    assert sum(point.watts for point in setpoints.values()) == 4_501
+    assert all(0 <= point.watts <= 2_000 for point in setpoints.values())
+
+
+def test_fleet_limit_remainder_never_exceeds_requested_per_unit(api: SimpleNamespace) -> None:
+    proposed = make_proposed_setpoints(api, watts_by_unit={"lhs": 10, "mid": 10, "rhs": 10})
+    current = {unit: make_observation(api, unit_id=unit) for unit in UNIT_IDS}
+    policy = make_policy(api, fleet_discharge_limit_w=29)
+
+    decision = evaluate(
+        api, proposed_setpoints=proposed, current_observations=current, policy=policy
+    )
+    setpoints = setpoints_by_unit(decision)
+
+    assert decision.status is api.DecisionStatus.CLAMPED
+    assert sum(point.watts for point in setpoints.values()) == 29
+    assert all(0 <= point.watts <= 10 for point in setpoints.values())
+
+
+def test_ramp_limit_accounts_for_signed_battery_power(api: SimpleNamespace) -> None:
+    ramp = {unit: 200 for unit in UNIT_IDS}
+    policy = make_policy(api, ramp_limit_w_per_s_by_unit=ramp)
+    discharging = make_observation(api, battery_watts=500.0)
+
+    discharge = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, watts=1_000),
+        current_observations={"mid": discharging},
+        policy=policy,
+    )
+    assert discharge.status is api.DecisionStatus.CLAMPED
+    assert setpoints_by_unit(discharge)["mid"].watts == 700
+
+    charge = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(
+            api, direction=api.Direction.CHARGE, watts=1_000
+        ),
+        current_observations={"mid": discharging},
+        policy=policy,
+    )
+    assert_rejected(charge, api)
+    assert "zero_dynamic_capability" in reasons(charge)
+
+
+def test_one_watt_is_the_inclusive_dynamic_capability_floor(api: SimpleNamespace) -> None:
+    observation = make_observation(api, dynamic_discharge_limit_w=1)
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, watts=1_000),
+        current_observations={"mid": observation},
+    )
+    assert decision.status is api.DecisionStatus.CLAMPED
+    assert setpoints_by_unit(decision)["mid"].watts == 1
+
+
+def test_fleet_charge_limit_governs_charge_direction(api: SimpleNamespace) -> None:
+    proposed = make_proposed_setpoints(
+        api,
+        direction=api.Direction.CHARGE,
+        watts_by_unit={"lhs": 2_000, "mid": 2_000, "rhs": 2_000},
+    )
+    current = {unit: make_observation(api, unit_id=unit) for unit in UNIT_IDS}
+    policy = make_policy(api, fleet_charge_limit_w=3_000)
+
+    decision = evaluate(
+        api, proposed_setpoints=proposed, current_observations=current, policy=policy
+    )
+
+    assert decision.status is api.DecisionStatus.CLAMPED
+    assert sum(point.watts for point in decision.setpoints) == 3_000
+
+
+def test_reactive_power_derates_apparent_capability(api: SimpleNamespace) -> None:
+    policy = make_policy(api, reactive_limit_var=5_000)
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, watts=2_000, reactive_vars=4_800),
+        policy=policy,
+    )
+    assert decision.status is api.DecisionStatus.CLAMPED
+    assert setpoints_by_unit(decision)["mid"].watts == 1_400
+
+
+def test_control_decision_is_immutable(api: SimpleNamespace) -> None:
+    decision = evaluate(api)
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        decision.status = api.DecisionStatus.REVOKED
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        decision.reason_codes = ()
+
+
+def test_expired_intent_boundary_is_rejected_at_evaluation(api: SimpleNamespace) -> None:
+    expired = evaluate(
+        api, proposed_setpoints=make_proposed_setpoints(api, intent_expires_at_mono=NOW)
+    )
+    assert_rejected(expired, api)
+    assert "intent_expired" in reasons(expired)
+    expired_one_watt = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, watts=1, intent_expires_at_mono=NOW),
+    )
+    assert_rejected(expired_one_watt, api)
+    assert "intent_expired" in reasons(expired_one_watt)
+    live = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, intent_expires_at_mono=NOW + 0.001),
+    )
+    assert live.status is api.DecisionStatus.AUTHORIZED
+
+
+def test_noninteger_cell_sequence_is_rejected_defensively(api: SimpleNamespace) -> None:
+    observation = make_raw_observation(api, cell_sequence="4")
+    previous = make_observation(
+        api, captured_at_mono=99.0, sequence=6, cell_captured_at_mono=99.0, cell_sequence=3
+    )
+    decision = evaluate(
+        api,
+        current_observations={"mid": observation},
+        previous_observations={"mid": previous},
+    )
+    assert_rejected(decision, api)
+    assert "cell_sequence_invalid" in reasons(decision)
+
+
+def test_mixed_directions_are_rejected_before_evaluation(api: SimpleNamespace) -> None:
+    mixed = (
+        make_proposed_setpoints(api, direction=api.Direction.CHARGE, watts=500)[0],
+        make_proposed_setpoints(api, direction=api.Direction.DISCHARGE, watts=500)[0],
+    )
+    decision = evaluate(api, proposed_setpoints=mixed)
+    assert_rejected(decision, api)
+    assert "mixed_directions" in reasons(decision)
+
+
+def test_noninteger_power_is_rejected_defensively(api: SimpleNamespace) -> None:
+    invalid = ProposedSetpointRecord(
+        unit_id="mid",
+        direction=api.Direction.DISCHARGE,
+        watts="5",  # type: ignore[arg-type]
+        intent_id="intent-001",
+        intent_expires_at_mono=109.0,
+    )
+    decision = evaluate(api, proposed_setpoints=(invalid,))
+    assert_rejected(decision, api)
+    assert "invalid_power" in reasons(decision)
+
+
+def test_capture_times_equal_to_now_are_not_from_the_future(api: SimpleNamespace) -> None:
+    observation = make_observation(api, captured_at_mono=NOW, cell_captured_at_mono=NOW)
+    decision = evaluate(api, current_observations={"mid": observation})
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+
+
+def test_core_reason_codes_are_stable_machine_vocabulary(api: SimpleNamespace) -> None:
+    empty = evaluate(api, proposed_setpoints=())
+    assert empty.status is api.DecisionStatus.REVOKED
+    assert reasons(empty) == ("no_setpoints",)
+
+    stop = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, direction=api.Direction.IDLE, watts=0),
+    )
+    assert stop.status is api.DecisionStatus.AUTHORIZED
+    assert reasons(stop) == ("stop_authorized",)
+
+    missing = evaluate(api, current_observations={})
+    assert_rejected(missing, api)
+    assert "observation_missing" in reasons(missing)
+
+    duplicated = make_proposed_setpoints(api)
+    duplicate = evaluate(api, proposed_setpoints=duplicated + duplicated)
+    assert_rejected(duplicate, api)
+    assert "duplicate_unit_setpoint" in reasons(duplicate)
+
+    clamped = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, watts=100_000),
+    )
+    assert clamped.status is api.DecisionStatus.CLAMPED
+    assert reasons(clamped) == ("power_clamped",)
 
 
 def test_authorization_expiry_is_minimum_of_kernel_ttl_and_intent_expiry(

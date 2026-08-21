@@ -183,7 +183,7 @@ def test_config_rejects_duplicate_unit_identity_fields(
 
     error = _assert_invalid(payload, location_contains="units")
 
-    assert "duplicate" in str(error.value).lower()
+    assert "duplicate" in str(error).lower()
 
 
 def test_config_rejects_duplicate_gateway_endpoints() -> None:
@@ -193,7 +193,7 @@ def test_config_rejects_duplicate_gateway_endpoints() -> None:
 
     error = _assert_invalid(payload, location_contains="units")
 
-    assert "duplicate" in str(error.value).lower()
+    assert "duplicate" in str(error).lower()
 
 
 @pytest.mark.parametrize("unit_count", [0, 1, 2, 4])
@@ -265,7 +265,7 @@ def test_write_enabled_mode_rejects_disabled_authentication() -> None:
 
     error = _assert_invalid(payload, location_contains="authentication")
 
-    assert "write" in str(error.value).lower()
+    assert "write" in str(error).lower()
 
 
 def test_observe_only_mode_does_not_require_control_credentials() -> None:
@@ -317,7 +317,7 @@ def test_complete_worst_case_cycle_must_fit_device_expiry_window() -> None:
 
     error = _assert_invalid(payload, location_contains="timing")
 
-    message = str(error.value).lower()
+    message = str(error).lower()
     assert "budget" in message
     assert "expiry" in message or "renewal" in message
 
@@ -330,7 +330,7 @@ def test_control_period_must_be_shorter_than_authorization_lifetime() -> None:
 
     error = _assert_invalid(payload, location_contains="policy")
 
-    assert "authorization" in str(error.value).lower()
+    assert "authorization" in str(error).lower()
 
 
 def test_independent_heartbeat_setting_is_rejected() -> None:
@@ -350,7 +350,7 @@ def test_authorization_lifetime_must_be_inside_device_expiry_window() -> None:
 
     error = _assert_invalid(payload, location_contains="policy")
 
-    assert "expiry" in str(error.value).lower() or "authorization" in str(error.value).lower()
+    assert "expiry" in str(error).lower() or "authorization" in str(error).lower()
 
 
 def test_device_expiry_is_explicit_evidence_backed_and_not_a_two_second_default() -> None:

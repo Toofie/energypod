@@ -55,7 +55,8 @@ def _intent(
         direction=getattr(models.Direction, direction),
         watts=watts,
         duration_s=5.0,
-        created_at_mono=100.0,
+        accepted_at_mono=100.0,
+        acceptance_revision=7,
         actor_identity="optimizer:test",
     )
 
@@ -147,6 +148,17 @@ def test_zero_headroom_is_valid() -> None:
     allocation = _allocation()
     capability = _headroom(allocation, "mid", 0, 0)
     assert capability.charge_watts == capability.discharge_watts == 0
+
+
+def test_headroom_validation_messages_are_stable() -> None:
+    allocation = _allocation()
+    pattern = r"Value error, unit id must be non-empty and normalized \[type=value_error"
+    with pytest.raises(ValueError, match=pattern):
+        allocation.UnitHeadroom(unit_id=" mid ", charge_watts=1, discharge_watts=1)
+    with pytest.raises(
+        ValueError, match=r"Value error, headroom must be non-negative \[type=value_error"
+    ):
+        allocation.UnitHeadroom(unit_id="mid", charge_watts=-1, discharge_watts=1)
 
 
 def test_exact_sum_does_not_depend_on_an_undocumented_remainder_policy() -> None:
@@ -316,6 +328,128 @@ def test_result_is_deeply_immutable() -> None:
         result.allocations["a"] = 0
     with pytest.raises((AttributeError, TypeError, ValueError)):
         result.requested_watts = 1
+
+
+def test_headroom_defaults_to_eligible_and_participates_in_allocation(
+    allocation_api: SimpleNamespace,
+) -> None:
+    allocation = allocation_api.allocation
+    capability = allocation.UnitHeadroom(unit_id="mid", charge_watts=10, discharge_watts=20)
+    assert capability.eligible is True
+    result = allocation.allocate_fleet_power(
+        _intent(allocation_api.models, watts=15, selected=frozenset({"mid"})),
+        (capability,),
+    )
+    assert result.allocations["mid"] == 15
+
+
+def test_allocation_model_is_strict_and_rejects_negative_entries_or_totals(
+    allocation_api: SimpleNamespace,
+) -> None:
+    allocation = allocation_api.allocation
+    models = allocation_api.models
+    with pytest.raises((TypeError, ValueError)):
+        allocation.FleetAllocation(
+            direction=models.Direction.DISCHARGE,
+            allocations={"a": "5"},
+            requested_watts=5,
+            allocated_watts=5,
+            unallocated_watts=0,
+        )
+    with pytest.raises(
+        ValueError, match=r"Value error, allocations must be non-negative \[type=value_error"
+    ):
+        allocation.FleetAllocation(
+            direction=models.Direction.DISCHARGE,
+            allocations={"a": -1},
+            requested_watts=-1,
+            allocated_watts=-1,
+            unallocated_watts=0,
+        )
+    with pytest.raises(
+        ValueError, match=r"Value error, allocation totals must be non-negative \[type=value_error"
+    ):
+        allocation.FleetAllocation(
+            direction=models.Direction.DISCHARGE,
+            allocations={"a": 0},
+            requested_watts=-1,
+            allocated_watts=0,
+            unallocated_watts=-1,
+        )
+
+
+def test_allocation_model_rejects_incoherent_or_nonnormalized_construction(
+    allocation_api: SimpleNamespace,
+) -> None:
+    allocation = allocation_api.allocation
+    models = allocation_api.models
+    pattern = r"Value error, allocation unit identifiers must be normalized \[type=value_error"
+    with pytest.raises(ValueError, match=pattern):
+        allocation.FleetAllocation(
+            direction=models.Direction.DISCHARGE,
+            allocations={"": 5},
+            requested_watts=5,
+            allocated_watts=5,
+            unallocated_watts=0,
+        )
+    pattern = r"Value error, allocation entries must sum to the allocated total \[type=value_error"
+    with pytest.raises(ValueError, match=pattern):
+        allocation.FleetAllocation(
+            direction=models.Direction.DISCHARGE,
+            allocations={"a": 4},
+            requested_watts=5,
+            allocated_watts=5,
+            unallocated_watts=0,
+        )
+    pattern = (
+        r"Value error, allocated and unallocated totals must equal the request"
+        r" \[type=value_error"
+    )
+    with pytest.raises(ValueError, match=pattern):
+        allocation.FleetAllocation(
+            direction=models.Direction.DISCHARGE,
+            allocations={"a": 5},
+            requested_watts=6,
+            allocated_watts=5,
+            unallocated_watts=0,
+        )
+    pattern = r"Value error, idle allocation must contain only zero power \[type=value_error"
+    with pytest.raises(ValueError, match=pattern):
+        allocation.FleetAllocation(
+            direction=models.Direction.IDLE,
+            allocations={"a": 1},
+            requested_watts=1,
+            allocated_watts=1,
+            unallocated_watts=0,
+        )
+    pattern = r"Value error, active allocation requires a positive request \[type=value_error"
+    with pytest.raises(ValueError, match=pattern):
+        allocation.FleetAllocation(
+            direction=models.Direction.DISCHARGE,
+            allocations={"a": 0},
+            requested_watts=0,
+            allocated_watts=0,
+            unallocated_watts=0,
+        )
+
+
+def test_allocate_arguments_are_exact_types_not_merely_iterable(
+    allocation_api: SimpleNamespace,
+) -> None:
+    allocation = allocation_api.allocation
+    models = allocation_api.models
+    capability = _headroom(allocation, "a", 100, 100)
+    selected_one = _intent(models, watts=10, selected=frozenset({"a"}))
+    with pytest.raises(TypeError, match=r"^intent must be a PowerIntent$"):
+        allocation.allocate_fleet_power(object(), (capability,))
+    with pytest.raises(TypeError, match=r"^headrooms must be a tuple of UnitHeadroom values$"):
+        allocation.allocate_fleet_power(selected_one, [capability])
+    with pytest.raises(ValueError, match=r"^duplicate headroom for a$"):
+        allocation.allocate_fleet_power(selected_one, (capability, capability))
+    with pytest.raises(ValueError, match=r"^missing headroom for selected units: \['zz'\]$"):
+        allocation.allocate_fleet_power(
+            _intent(models, watts=10, selected=frozenset({"a", "zz"})), (capability,)
+        )
 
 
 @st.composite

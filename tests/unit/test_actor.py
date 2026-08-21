@@ -621,6 +621,52 @@ async def test_write_failure_revokes_attempts_zero_and_inhibits(contract: Any) -
     await actor.shutdown()
 
 
+async def test_inhibit_recovery_requires_qualifying_samples_and_never_bad_ones(
+    contract: Any,
+) -> None:
+    transport = SpyTransport()
+    transport.write_failures.append(OSError("gateway reset"))
+    actor, _, _, _, _ = make_actor(
+        contract,
+        transport=transport,
+        authorizations=FakeAuthorizationRepository(AuthorizationRecord()),
+    )
+    await ready_actor(actor)
+    await actor.heartbeat_once()
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+
+    # The worst-quality telemetry must never be what clears a safety inhibit.
+    await actor.accept_observation(replace(ObservationRecord(), quality="bad"))
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+
+    # Stable qualifying samples recover to DISARMED, never directly to ACTIVE.
+    await actor.accept_observation(replace(ObservationRecord(), sequence=2))
+    assert actor.lifecycle is contract.UnitLifecycle.DISARMED
+
+    # Nonzero power still requires an explicit arm after recovery.
+    await actor.arm()
+    assert actor.lifecycle is contract.UnitLifecycle.ARMED_IDLE
+    await actor.shutdown()
+
+
+async def test_shutdown_attempts_bounded_zero_when_owner_is_dead(contract: Any) -> None:
+    class FailingConnectTransport(SpyTransport):
+        async def connect(self) -> None:
+            raise OSError("gateway unreachable")
+
+    transport = FailingConnectTransport()
+    actor, _, _, _, _ = make_actor(contract, transport=transport)
+    with pytest.raises(OSError, match="gateway unreachable"):
+        await actor.start()
+    assert actor.lifecycle is contract.UnitLifecycle.DISCONNECTED
+
+    # Even with no mailbox task alive, shutdown owes one bounded zero attempt
+    # before closing the transport.
+    await actor.shutdown()
+    assert transport.writes == [EncodedWrite(0x0200, (1, 0, 0))]
+    assert transport.closed
+
+
 async def test_shutdown_fences_cancels_nonzero_attempt_then_zeroes_and_closes(
     contract: Any,
 ) -> None:

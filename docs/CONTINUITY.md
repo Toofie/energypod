@@ -162,28 +162,71 @@ Git commits currently known:
 
 - `3381c1f test: define safety kernel and arbiter contracts`
 - `f989dd7 test: define actor and control kernel safety contracts`
+- `1552202 test: accept reviewed architecture and contract baseline`
 
 Most documentation and several test files are intentionally not committed yet;
 inspect `git status` before changing anything. Never discard uncommitted work.
 
 ## Current work and agent state at this update
 
-The reviewed contract/test baseline is accepted. Production implementation has
-not started. Review status is:
+The first production implementation round is complete, independently reviewed,
+and repaired. All five disjoint streams delivered working code (domain and
+fleet allocation; configuration, schedules, and SQLite/memory repositories;
+arbiter, safety kernel, authorization capability, control kernel, generation
+coordinator, and audit factory; protocol codec, register maps, fault decoding,
+and Waveshare transport; sole-owner actor), and the guarded REST/WebSocket/MCP
+boundary with idempotency was delivered with its contract tests. Status:
 
-- Protocol test authoring completed for codec, register layout, faults, and the
-  Waveshare transport. Coverage includes field-specific endian/signed encoding,
-  all known blocks, layout detection, 59/60-cell uncertainty and overlap,
-  evidence-gated actuation, and PyModbus 3.15 RTU/device-ID calls. These tests
-  passed independent adversarial review. Review removed maintenance/debug writes
-  from production catalogs, added cancellation/one-attempt and real malformed-
-  frame cases, and classified handcrafted frames as E1 reference vectors rather
-  than deployed captures. Exact Waveshare framing remains a commissioning item.
-- Domain/allocation adversarial review completed.
-- Safety/arbiter repair after contract resolution completed; focused collection,
-  lint, and formatting passed.
-- Actor/control kernel: adversarial review completed; 31 focused tests (17
-  actor, 14 kernel), formatting/lint/diff checks passed.
+- Full suite: 729 tests pass. Ruff lint and format checks pass. Mypy strict
+  passes on all 32 source files. No test contacts hardware.
+- Independent adversarial implementation review completed as a 36-agent
+  workflow: eight reviewers (five disjoint streams plus cross-cutting
+  docs-vs-code coherence and test-gaming detection), each P0/P1 finding then
+  attacked by two independent skeptic lenses. Result: 0 P0, 11 confirmed P1,
+  3 properly refuted, 18 P2 notes.
+- All 11 confirmed P1 findings were repaired at the cause without weakening
+  assertions; every repair carries a new regression test:
+  1. control_kernel: audit-event creation crashed with KeyError when a
+     selected unit had no observation. The audited observation basis is now
+     every observation the kernel held for the cycle.
+  2. control_kernel: the canonical audit-event factory is required at
+     construction; authority can never be granted on a degraded audit trail.
+  3. control_kernel: a cycle fenced between minting and publication now
+     appends a durable zero-authorized audit record after revocation, so
+     fencing never produces an audit gap.
+  4. safety: cell-sequence monotonicity is non-decreasing. An unchanged cell
+     sequence between control cycles is permitted (cells poll slower than the
+     control rate); a regressed sequence still fails closed.
+  5. protocol evidence: the vendor byte-cast of the enable mask was verified
+     first-hand (MiniESapp.cs:1289,1299; SysControl.cs:729,1150) and recorded
+     in PROTOCOL_EVIDENCE.md section 4. Implementation already matched the
+     vendor and is unchanged; the legacy 8-BECU cap is evidence-backed.
+  6. actor: INHIBITED was a dead-end clearable only by bad telemetry. Bad
+     observations now preserve the inhibit; recovery requires the configured
+     count of stable qualifying observations and returns to DISARMED, never
+     directly to ACTIVE. Latched-class acknowledgement is not modeled yet.
+  7. actor: shutdown makes its bounded zero attempt even when the mailbox
+     owner task is already dead.
+  8. rest: latched emergency stops are no longer evicted by the idempotency
+     capacity bound; exact-id acknowledgement remains possible.
+  9. rest: a failure after WebSocket accept sends the structured error
+     envelope and a clean 1011 close.
+  10. rest and mcp: audit reads require both observe and audit:read.
+  11. rest/tests: the production testserver origin bypass was removed; the
+      configured-origin path is now genuinely tested for accept and reject.
+- Mutation testing (mutmut 2.4.5; mutmut 3.x fails on Windows because it
+  imports the Unix-only resource module): allocation reached 6 survivors, all
+  proved equivalent (pydantic tolerates missing @classmethod on validators,
+  arbitrary_types_allowed is unused, one idle branch is unreachable behind
+  prior invariants). Protocol codec survivors are enum-value strings, error
+  message text, the slots flag, and an equivalent scale shortcut; no core
+  encode/sign/word-order mutant survived. Safety kernel: 60 survivors remain,
+  dominated by reason-code string vocabulary and isclose-guarded boundary
+  equivalents; every decision/clamp/fleet-distribution/ramp/reactive/expiry/
+  capability-floor logic mutant is killed. A reason-code pinning pass is the
+  natural follow-up.
+- 18 P2 findings from the review are deferred without safety impact; see the
+  update log entry for the list.
 
 Do not assume an agent is still running based on this list. Inspect current
 agent/task status where available and inspect file diffs. Agent output is input
@@ -225,23 +268,26 @@ edit the same production module concurrently.
    by missing module versus malformed/contradictory contract.
 3. **Completed:** Perform a primary coherence review across all tests and authoritative docs;
    resolve every remaining P0/P1 finding before implementation.
-4. **In progress:** Commit the accepted documentation/test baseline.
-5. **Next:** Dispatch disjoint implementation rounds:
-   - domain value objects, observation models, codecs, and fleet allocation;
-   - configuration, schedules, and SQLite repositories;
-   - arbiter, safety policy, authorization capability, and control kernel;
-   - protocol codec, register maps, fault decoding, and transport adapter;
-   - per-unit actor and lifecycle supervision.
-6. Integrate, run focused/full suites, and repair causes rather than weakening
-   assertions.
-7. Run independent implementation reviews and mutation/property testing.
-8. Specify tests first, then implement REST/API authentication, WebSocket event
-   delivery, audit views, and read-only-default MCP.
-9. Build the deterministic simulator and golden protocol/integration scenarios.
+4. **Completed:** Commit the accepted documentation/test baseline.
+5. **Completed:** Disjoint implementation rounds delivered for domain/allocation,
+   configuration/schedules/repositories, arbiter/safety/authorization/kernel,
+   protocol codec/register maps/faults/transport, and the sole-owner actor, plus
+   the guarded REST/WebSocket/MCP boundary.
+6. **Completed:** Integration: full suite green; every failure repaired at the cause.
+7. **Completed:** Independent adversarial implementation review (36 agents, two-lens
+   verification) and mutation testing; all 11 confirmed P1 findings repaired with
+   regression tests; contracts updated to match.
+8. **Completed:** REST/API authentication, WebSocket event delivery, audit views, and
+   read-only-default MCP implemented against their contract tests and hardened by the
+   review (scope composition, idempotency, origin policy, error envelope).
+9. **Next:** Build the deterministic simulator and golden protocol/integration
+   scenarios. Also run the reason-code pinning pass identified by mutation testing,
+   and decide the latched-inhibit acknowledgement model for the actor.
 10. Specify UI behavior/accessibility tests, then build the polished React UI
     and visually inspect all states and responsive layouts.
-11. Add bootstrap/configuration UX, Docker image/Compose, health checks,
-    migrations, backup/restore, operator documentation, and end-to-end tests.
+11. Add bootstrap/configuration UX (including `energypod.main`, which pyproject
+    already declares but which does not exist yet), Docker image/Compose, health
+    checks, migrations, backup/restore, operator documentation, and end-to-end tests.
 12. Because Docker is currently unavailable, perform static Docker validation
     and explicitly defer an actual image build to an environment with Docker.
 
@@ -252,13 +298,24 @@ Known environment state:
 - Windows/PowerShell workspace.
 - Python 3.12.10 was installed at
   `C:\Users\vagrant\AppData\Local\Programs\Python\Python312\python.exe` and a
-  `.venv` was created, but one isolated reviewer later reported that base path
-  missing. Verify before use; recreate the virtual environment if broken.
-- Dependencies were installed and resolved with Starlette 1.6.0.
+  `.venv` was created. On 2026-08-21 the `.venv` was re-verified working
+  (`.\.venv\Scripts\python.exe --version` -> 3.12.10); the earlier "missing
+  base path" report did not reproduce. Still verify before use.
+- Dependencies were installed and resolved with Starlette 1.6.0. Package index
+  network access is available (pip installs succeed).
 - PyModbus 3.15 uses `device_id=`, not legacy `slave=`, on requests.
 - Node 24.19.0 exists; npm is broken due a missing user-level npm CLI. Corepack
   works and should invoke pinned pnpm.
 - Docker is not installed in this environment.
+- The repository is owned by a different Windows account (Codex sandbox). Git
+  requires `git config --global --add safe.directory
+  C:/Users/vagrant/Downloads/EnergyPod/pod-manager` before any git command.
+- Mutation testing: mutmut 3.x fails on Windows (it imports the Unix-only
+  `resource` module). Use mutmut 2.4.5 via
+  `python -m mutmut run --paths-to-mutate=<module> --runner='<runner>'` with
+  backslash paths in the runner, and set `PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8`
+  so console emoji do not crash the cp1252 codec. Results land in
+  `.mutmut-cache` (git-ignored).
 
 Safe fresh-context checks from the project root:
 
@@ -305,3 +362,32 @@ direction, freshness, and watchdog timing per physical unit.
 - 2026-08-21: Accepted the reviewed red-phase baseline: 567 tests collect;
   execution fails cleanly on absent production modules; Ruff lint and format
   checks pass. Implementation may now begin in disjoint modules.
+- 2026-08-21: Committed the baseline as `1552202` and dispatched five disjoint
+  implementation streams: domain/allocation; config/schedule/persistence;
+  arbiter/safety/kernel; protocol/transport; and sole-owner actor.
+- 2026-08-21: First implementation milestone. All five streams plus the
+  REST/WebSocket/MCP boundary delivered; 729 tests pass; Ruff lint/format and
+  mypy strict pass. Ran the independent adversarial implementation review as a
+  36-agent workflow (8 reviewers + two-lens verification of each P0/P1): 0 P0,
+  11 confirmed P1 (all repaired with regression tests, contracts updated), 3
+  refuted, 18 P2 deferred. Ran mutation testing on allocation, protocol codec,
+  and the safety kernel; equivalent survivors are classified in this ledger.
+  Deferred P2 inventory (no safety impact; address opportunistically):
+  ControlPolicy accepts zero `max_soc_jump_pct`/`max_soc_disagreement_pct`;
+  `allocate_fleet_power` signature drift vs API_CONTRACTS.md wording;
+  in-memory authorization repository discards revoke reason;
+  SQLite `_json_value` non-determinism for set/frozenset; policy-timing
+  cross-validation skipped when timing validation fails first; SQLite
+  `open` creates parent directories without path validation; O(n^2) schedule
+  overlap detection; untyped Any in in-memory repositories;
+  `_revoke_after_failure` can mask the original exception; no audit event when
+  no intent is selected; FaultTracker prefix type guard; Waveshare `close`
+  failure handling; shutdown transport leak if the owner dies mid-check; stale
+  read-preemption start time; redundant `_used_cycles.clear()` in `fence()`;
+  duplicated idempotency-key parsing in rest mutation lambdas; missing
+  ttl_s<=0 negative cases in REST/MCP tests; one tautological prompt-injection
+  assertion. Open risks and follow-ups: reason-code vocabulary pinning pass
+  (mutation survivors); latched-inhibit acknowledgement model for the actor;
+  cell-capture-time ordering relative to previous capture is unspecified;
+  `energypod.main` entry point absent though declared in pyproject; simulator
+  and golden scenarios are the next major milestone.

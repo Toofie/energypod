@@ -1,22 +1,24 @@
-"""S0 orchestration contracts for one deterministic control-kernel cycle."""
+"""Executable S0 contract for one control-kernel authorization cycle."""
 
 from __future__ import annotations
 
 import asyncio
 import importlib
+import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-UNITS = frozenset({"mid", "rhs", "lhs"})
+UNITS = frozenset({"lhs", "mid", "rhs"})
 
 
-class FakeClock:
-    def __init__(self, now: float = 100.0) -> None:
-        self.now = now
+class Clock:
+    def __init__(self) -> None:
+        self.now = 100.0
 
     def monotonic(self) -> float:
         return self.now
@@ -24,650 +26,458 @@ class FakeClock:
     def wall_now(self) -> datetime:
         return datetime(2026, 8, 21, tzinfo=UTC)
 
-    async def sleep(self, seconds: float) -> None:
-        self.now += seconds
-
     def advance(self, seconds: float) -> None:
         self.now += seconds
 
 
 @dataclass(frozen=True)
-class IntentRecord:
+class Intent:
     id: str
     source: Any
     unit_ids: frozenset[str]
     direction: Any
     watts: int
-    created_at_mono: float = 99.0
+    accepted_at_mono: float = 99.0
+    acceptance_revision: int = 17
     expires_at_mono: float = 110.0
-    revision: int = 1
+    actor_identity: str = "operator-1"
 
 
 @dataclass(frozen=True)
-class ObservationRecord:
+class Observation:
     unit_id: str
-    connection_epoch: int = 1
+    connection_epoch: int = 4
     sequence: int = 10
     captured_at_mono: float = 99.9
-    quality: str = "good"
 
 
 @dataclass(frozen=True)
-class AuthorizationRecord:
+class Proposal:
     unit_id: str
-    generation: int
-    cycle_id: int
-    intent_id: str
     direction: Any
     watts: int
-    connection_epoch: int = 1
-    observation_sequence: int = 10
-    issued_at_mono: float = 100.0
-    expires_at_mono: float = 101.0
+    intent_id: str
+    intent_expires_at_mono: float
 
 
 @dataclass(frozen=True)
-class DecisionRecord:
-    status: Any
+class Setpoint:
+    unit_id: str
+    direction: Any
+    watts: int
     intent_id: str
-    cycle_id: int
-    authorizations: tuple[AuthorizationRecord, ...]
-    reasons: tuple[str, ...] = ()
+    authorization_expires_at_mono: float = 101.0
+    reactive_vars: int = 0
 
 
-class FakeIntentRepository:
-    def __init__(self, intents: tuple[IntentRecord, ...], history: list[str]) -> None:
-        self.intents = intents
-        self.history = history
+@dataclass(frozen=True)
+class Decision:
+    status: Any
+    setpoints: tuple[Setpoint, ...]
+    reason_codes: tuple[str, ...] = ("safety_checks_passed",)
 
-    async def active(self, now_mono: float) -> tuple[IntentRecord, ...]:
-        assert now_mono == 100.0
+
+class Intents:
+    def __init__(self, intent: Intent, history: list[str]) -> None:
+        self.intent, self.history = intent, history
+
+    async def active(self, now: float) -> tuple[Intent, ...]:
+        assert now == 100.0
         self.history.append("intents")
-        return self.intents
+        return (self.intent,)
 
 
-class FakeObservationRepository:
-    def __init__(self, values: dict[str, ObservationRecord], history: list[str]) -> None:
-        self.values = values
-        self.history = history
+class Observations:
+    def __init__(self, current: dict[str, Any], previous: dict[str, Any], history: list[str]):
+        self.current, self.previous, self.history = current, previous, history
 
-    async def all_latest(self) -> dict[str, ObservationRecord]:
-        self.history.append("observations")
-        return dict(self.values)
+    async def all_latest(self) -> dict[str, Any]:
+        self.history.append("current")
+        return dict(self.current)
+
+    async def all_previous(self) -> dict[str, Any]:
+        self.history.append("previous")
+        return dict(self.previous)
 
 
-class FakeAuthorizationRepository:
-    def __init__(
-        self,
-        history: list[str],
-        publish_error: BaseException | None = None,
-        publish_gate: asyncio.Event | None = None,
-    ) -> None:
-        self.history = history
-        self.publish_error = publish_error
-        self.publish_gate = publish_gate
-        self.publish_entered = asyncio.Event()
-        self.published: list[tuple[AuthorizationRecord, ...]] = []
+class Authorizations:
+    def __init__(self, history: list[str], error: BaseException | None = None, gate=None):
+        self.history, self.error, self.gate = history, error, gate
+        self.entered = asyncio.Event()
+        self.published: list[Any] = []
         self.revocations: list[tuple[Any, str]] = []
 
-    async def publish(self, batch: tuple[AuthorizationRecord, ...]) -> None:
+    async def publish(self, batch: Any) -> None:
         self.history.append("publish")
-        self.publish_entered.set()
-        if self.publish_gate is not None:
-            await self.publish_gate.wait()
-        if self.publish_error is not None:
-            raise self.publish_error
-        self.published.append(tuple(batch))
+        self.entered.set()
+        if self.gate:
+            await self.gate.wait()
+        if self.error:
+            raise self.error
+        self.published.append(batch)
 
-    async def revoke(
-        self,
-        unit_ids: Any = None,
-        *,
-        reason: str,
-        **_context: Any,
-    ) -> None:
+    async def revoke(self, unit_ids=None, *, reason: str, **_: Any) -> None:
         self.history.append("revoke")
         self.revocations.append((unit_ids, reason))
 
 
-class FakeAuditRepository:
-    def __init__(
-        self,
-        history: list[str],
-        *,
-        error: BaseException | None = None,
-        after_append: Callable[[], None] | None = None,
-        append_gate: asyncio.Event | None = None,
-    ) -> None:
-        self.history = history
-        self.error = error
-        self.after_append = after_append
-        self.append_gate = append_gate
-        self.append_entered = asyncio.Event()
+class Audit:
+    def __init__(self, history: list[str], error=None, after=None, gate=None):
+        self.history, self.error, self.after, self.gate = history, error, after, gate
+        self.entered = asyncio.Event()
         self.events: list[Any] = []
 
     async def append(self, event: Any) -> None:
         self.history.append("audit")
-        self.append_entered.set()
-        if self.append_gate is not None:
-            await self.append_gate.wait()
-        if self.error is not None:
+        self.entered.set()
+        if self.gate:
+            await self.gate.wait()
+        if self.error:
             raise self.error
         self.events.append(event)
-        if self.after_append is not None:
-            self.after_append()
+        if self.after:
+            self.after()
 
 
-class FakeArbiter:
-    def __init__(self, winner: IntentRecord, history: list[str]) -> None:
-        self.winner = winner
-        self.history = history
-        self.calls: list[tuple[tuple[IntentRecord, ...], float]] = []
+class Arbiter:
+    def __init__(self, intent: Intent, history: list[str]):
+        self.intent, self.history = intent, history
 
-    def select(self, intents: tuple[IntentRecord, ...], now_mono: float) -> IntentRecord:
+    def select(self, intents: tuple[Intent, ...], now: float) -> Intent:
+        assert intents == (self.intent,) and now == 100.0
         self.history.append("select")
-        self.calls.append((intents, now_mono))
-        return self.winner
+        return self.intent
 
 
-class FakeSafetyKernel:
-    def __init__(
-        self,
-        outcome: DecisionRecord | BaseException,
-        history: list[str],
-    ) -> None:
-        self.outcome = outcome
-        self.history = history
-        self.calls: list[tuple[Any, Any, Any, float]] = []
+class Allocator:
+    def __init__(self, output: tuple[Proposal, ...], history: list[str]):
+        self.output, self.history, self.calls = output, history, []
 
-    def evaluate(
-        self,
-        intent: IntentRecord,
-        observations: dict[str, ObservationRecord],
-        policy: Any,
-        now_mono: float,
-    ) -> DecisionRecord:
+    def allocate(self, intent: Any, observations: Any, policy: Any) -> Any:
+        self.history.append("allocate")
+        self.calls.append((intent, observations, policy))
+        return self.output
+
+
+class Safety:
+    def __init__(self, output: Decision | BaseException, history: list[str]):
+        self.output, self.history, self.calls = output, history, []
+
+    def evaluate(self, proposals, current, previous, policy, now) -> Decision:
         self.history.append("safety")
-        self.calls.append((intent, observations, policy, now_mono))
-        if isinstance(self.outcome, BaseException):
-            raise self.outcome
-        return self.outcome
+        self.calls.append((proposals, current, previous, policy, now))
+        if isinstance(self.output, BaseException):
+            raise self.output
+        return self.output
 
 
 @pytest.fixture
-def contract() -> Any:
-    try:
-        kernel_module = importlib.import_module("energypod.application.control_kernel")
-        domain_module = importlib.import_module("energypod.domain")
-        return type(
-            "Contract",
-            (),
-            {
-                "ControlKernel": kernel_module.ControlKernel,
-                "DecisionStatus": domain_module.DecisionStatus,
-                "Direction": domain_module.Direction,
-                "IntentSource": domain_module.IntentSource,
-            },
-        )
-    except (ImportError, AttributeError) as error:
-        pytest.fail(f"Control-kernel contract is not implemented: {error}", pytrace=False)
-
-
-def make_intent(
-    contract: Any,
-    *,
-    emergency: bool = False,
-    units: frozenset[str] = UNITS,
-) -> IntentRecord:
-    return IntentRecord(
-        id="emergency-1" if emergency else "manual-1",
-        source=(
-            contract.IntentSource.EMERGENCY_STOP if emergency else contract.IntentSource.MANUAL
-        ),
-        unit_ids=units,
-        direction=contract.Direction.IDLE if emergency else contract.Direction.DISCHARGE,
-        watts=0 if emergency else 900,
+def api() -> SimpleNamespace:
+    kernel = importlib.import_module("energypod.application.control_kernel")
+    generation = importlib.import_module("energypod.application.generation")
+    audit = importlib.import_module("energypod.application.audit")
+    domain = importlib.import_module("energypod.domain")
+    auth = importlib.import_module("energypod.domain.authorization")
+    return SimpleNamespace(
+        ControlKernel=kernel.ControlKernel,
+        AuthorityGenerationCoordinator=generation.AuthorityGenerationCoordinator,
+        AuditEventFactory=audit.AuditEventFactory,
+        AuthorizationBatch=auth.AuthorizationBatch,
+        AuthorizedSetpoint=auth.AuthorizedSetpoint,
+        DecisionStatus=domain.DecisionStatus,
+        Direction=domain.Direction,
+        IntentSource=domain.IntentSource,
     )
 
 
-def make_authorizations(intent_id: str = "manual-1") -> tuple[AuthorizationRecord, ...]:
+def deterministic_audit_factory(api: Any, clock: Any) -> Any:
+    """Canonical factory with every nondeterministic input pinned by the test."""
+    counter = itertools.count(1)
+    return api.AuditEventFactory(
+        process_instance_id="kernel-contract-test",
+        process_origin_mono=0.0,
+        wall_now=clock.wall_now,
+        event_id_factory=lambda: f"kernel-event-{next(counter):04d}",
+    )
+
+
+def intent(api: Any, *, emergency=False, units=UNITS) -> Intent:
+    return Intent(
+        "stop-1" if emergency else "intent-1",
+        api.IntentSource.EMERGENCY_STOP if emergency else api.IntentSource.MANUAL,
+        units,
+        api.Direction.IDLE if emergency else api.Direction.DISCHARGE,
+        0 if emergency else 900,
+    )
+
+
+def observation_pairs(units=UNITS):
+    return (
+        {unit: Observation(unit) for unit in units},
+        {unit: Observation(unit, sequence=9, captured_at_mono=99.0) for unit in units},
+    )
+
+
+def proposals_for(value: Intent):
+    watts = 0 if value.watts == 0 else value.watts // len(value.unit_ids)
     return tuple(
-        AuthorizationRecord(
-            unit_id=unit_id,
-            generation=1,
-            cycle_id=1,
-            intent_id=intent_id,
-            direction="discharge",
-            watts=300,
-        )
-        for unit_id in sorted(UNITS)
+        Proposal(unit, value.direction, watts, value.id, value.expires_at_mono)
+        for unit in sorted(value.unit_ids)
+    )
+
+
+def decision_for(api: Any, value: Intent, units=None, status=None):
+    selected = value.unit_ids if units is None else units
+    watts = 0 if value.watts == 0 else value.watts // len(selected)
+    return Decision(
+        status
+        or (
+            api.DecisionStatus.REVOKED
+            if value.source is api.IntentSource.EMERGENCY_STOP
+            else api.DecisionStatus.AUTHORIZED
+        ),
+        tuple(Setpoint(unit, value.direction, watts, value.id) for unit in sorted(selected)),
+        ("emergency_stop",) if value.watts == 0 else ("safety_checks_passed",),
     )
 
 
 def make_kernel(
-    contract: Any,
+    api: Any,
+    value: Intent,
+    output: Decision | BaseException,
     *,
-    intent: IntentRecord,
-    observations: dict[str, ObservationRecord],
-    decision: DecisionRecord | BaseException,
-    clock: FakeClock | None = None,
-    audit_error: BaseException | None = None,
-    after_audit: Callable[[], None] | None = None,
-    publish_error: BaseException | None = None,
-    audit_gate: asyncio.Event | None = None,
-    publish_gate: asyncio.Event | None = None,
-) -> tuple[Any, list[str], FakeAuthorizationRepository, FakeAuditRepository, FakeSafetyKernel]:
+    current=None,
+    previous=None,
+    clock=None,
+    audit_error=None,
+    after_audit=None,
+    audit_gate=None,
+    publish_error=None,
+    publish_gate=None,
+):
     history: list[str] = []
-    test_clock = clock or FakeClock()
-    authorizations = FakeAuthorizationRepository(history, publish_error, publish_gate)
-    audit = FakeAuditRepository(
-        history,
-        error=audit_error,
-        after_append=after_audit,
-        append_gate=audit_gate,
-    )
-    safety = FakeSafetyKernel(decision, history)
-    kernel = contract.ControlKernel(
-        clock=test_clock,
+    clock = clock or Clock()
+    default_current, default_previous = observation_pairs(value.unit_ids)
+    current = default_current if current is None else current
+    previous = default_previous if previous is None else previous
+    allocator = Allocator(proposals_for(value), history)
+    safety = Safety(output, history)
+    authorizations = Authorizations(history, publish_error, publish_gate)
+    audit = Audit(history, audit_error, after_audit, audit_gate)
+    kernel = api.ControlKernel(
+        clock=clock,
         unit_ids=UNITS,
-        intents=FakeIntentRepository((intent,), history),
-        observations=FakeObservationRepository(observations, history),
+        intents=Intents(value, history),
+        observations=Observations(current, previous, history),
         authorizations=authorizations,
         audit=audit,
-        arbiter=FakeArbiter(intent, history),
+        arbiter=Arbiter(value, history),
+        allocator=allocator,
         safety=safety,
-        policy=object(),
+        policy=SimpleNamespace(version="policy-5", max_telemetry_age_s=2.0),
+        generation_coordinator=api.AuthorityGenerationCoordinator(),
+        configuration_version=12,
+        audit_event_factory=deterministic_audit_factory(api, clock),
     )
-    return kernel, history, authorizations, audit, safety
+    return kernel, history, authorizations, audit, allocator, safety
 
 
-def complete_observations() -> dict[str, ObservationRecord]:
-    return {unit_id: ObservationRecord(unit_id) for unit_id in UNITS}
-
-
-async def settle_until(predicate: Callable[[], bool], turns: int = 50) -> bool:
-    for _ in range(turns):
+async def settle(predicate: Callable[[], bool]) -> bool:
+    for _ in range(50):
         if predicate():
             return True
         await asyncio.sleep(0)
     return predicate()
 
 
-async def test_tick_selects_evaluates_audits_then_publishes(contract: Any) -> None:
-    intent = make_intent(contract)
-    batch = make_authorizations()
-    decision = DecisionRecord(
-        status=contract.DecisionStatus.AUTHORIZED,
-        intent_id=intent.id,
-        cycle_id=1,
-        authorizations=batch,
-    )
-    kernel, history, authorizations, audit, safety = make_kernel(
-        contract,
-        intent=intent,
-        observations=complete_observations(),
-        decision=decision,
-    )
-
-    result = await kernel.tick()
-
-    assert result is decision
-    assert history == ["intents", "observations", "select", "safety", "audit", "publish"]
-    assert safety.calls[0][0] is intent
-    assert audit.events == [decision]
-    assert authorizations.published == [batch]
+def assert_batch(api: Any, batch: Any, value: Intent) -> None:
+    assert isinstance(batch, api.AuthorizationBatch)
+    assert batch.generation == 0 and batch.cycle_id
+    assert {cap.unit_id for cap in batch.authorizations} == value.unit_ids
+    assert len({cap.decision_id for cap in batch.authorizations}) == 1
+    for cap in batch.authorizations:
+        assert isinstance(cap, api.AuthorizedSetpoint)
+        assert (cap.cycle_id, cap.generation) == (batch.cycle_id, batch.generation)
+        assert (cap.intent_id, cap.intent_revision) == (value.id, value.acceptance_revision)
+        assert cap.direction is value.direction
+        assert (cap.connection_epoch, cap.observation_sequence) == (4, 10)
+        assert (cap.issued_at_mono, cap.not_before_mono, cap.expires_at_mono) == (
+            100.0,
+            100.0,
+            101.0,
+        )
+        assert cap.maximum_observation_age_s == 2.0
+        assert (cap.policy_version, cap.configuration_version) == ("policy-5", 12)
 
 
-async def test_audit_failure_revokes_all_and_never_publishes(contract: Any) -> None:
-    intent = make_intent(contract)
-    decision = DecisionRecord(
-        contract.DecisionStatus.AUTHORIZED,
-        intent.id,
-        1,
-        make_authorizations(),
-    )
-    kernel, history, authorizations, _, _ = make_kernel(
-        contract,
-        intent=intent,
-        observations=complete_observations(),
-        decision=decision,
-        audit_error=OSError("audit volume full"),
-    )
-
-    with pytest.raises(OSError, match="audit volume full"):
-        await kernel.tick()
-
-    assert authorizations.published == []
-    assert authorizations.revocations
-    assert history[-2:] == ["audit", "revoke"]
-
-
-async def test_cancellation_while_audit_is_pending_revokes_without_publishing(
-    contract: Any,
-) -> None:
-    audit_gate = asyncio.Event()
-    intent = make_intent(contract)
-    decision = DecisionRecord(
-        contract.DecisionStatus.AUTHORIZED,
-        intent.id,
-        1,
-        make_authorizations(),
-    )
-    kernel, history, authorizations, audit, _ = make_kernel(
-        contract,
-        intent=intent,
-        observations=complete_observations(),
-        decision=decision,
-        audit_gate=audit_gate,
-    )
-
-    tick = asyncio.create_task(kernel.tick())
-    entered_audit = await settle_until(audit.append_entered.is_set)
-    if not entered_audit:
-        tick.cancel()
-        await asyncio.gather(tick, return_exceptions=True)
-    assert entered_audit, "control cycle never reached durable audit acceptance"
-    tick.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await tick
-
-    assert authorizations.published == []
-    assert authorizations.revocations
-    assert history[-2:] == ["audit", "revoke"]
-
-
-async def test_failed_control_evaluation_revokes_all_authority(contract: Any) -> None:
-    intent = make_intent(contract)
-    kernel, history, authorizations, audit, _ = make_kernel(
-        contract,
-        intent=intent,
-        observations=complete_observations(),
-        decision=RuntimeError("control task died"),
-    )
-
-    with pytest.raises(RuntimeError, match="control task died"):
-        await kernel.tick()
-
-    assert audit.events == []
-    assert authorizations.published == []
-    assert authorizations.revocations
-    assert history[-1] == "revoke"
-
-
-async def test_dead_cycle_after_audit_cannot_publish_expired_authority(contract: Any) -> None:
-    clock = FakeClock()
-    intent = make_intent(contract)
-    decision = DecisionRecord(
-        contract.DecisionStatus.AUTHORIZED,
-        intent.id,
-        1,
-        make_authorizations(),
-    )
-    kernel, _, authorizations, audit, _ = make_kernel(
-        contract,
-        intent=intent,
-        observations=complete_observations(),
-        decision=decision,
-        clock=clock,
-        after_audit=lambda: clock.advance(1.01),
-    )
-
-    await kernel.tick()
-
-    assert audit.events == [decision]
-    assert authorizations.published == []
-    assert any(
-        reason == "control_cycle_deadline_expired" for _, reason in authorizations.revocations
-    )
+async def test_allocates_evaluates_mints_audits_then_atomically_publishes(api: Any):
+    value = intent(api)
+    outcome = decision_for(api, value)
+    kernel, history, auth, audit, allocator, safety = make_kernel(api, value, outcome)
+    assert await kernel.tick() is outcome
+    assert history == [
+        "intents",
+        "current",
+        "previous",
+        "select",
+        "allocate",
+        "safety",
+        "audit",
+        "publish",
+    ]
+    assert safety.calls[0][0] == allocator.output
+    assert len(auth.published) == 1 and audit.events
+    assert_batch(api, auth.published[0], value)
 
 
 @pytest.mark.parametrize("elapsed", [1.0, 1.001])
-async def test_authority_is_not_published_at_or_after_its_deadline(
-    contract: Any,
-    elapsed: float,
-) -> None:
-    clock = FakeClock()
-    intent = make_intent(contract)
-    decision = DecisionRecord(
-        contract.DecisionStatus.AUTHORIZED,
-        intent.id,
-        1,
-        make_authorizations(),
-    )
-    kernel, _, authorizations, audit, _ = make_kernel(
-        contract,
-        intent=intent,
-        observations=complete_observations(),
-        decision=decision,
+async def test_deadline_is_rechecked_after_durable_audit(api: Any, elapsed: float):
+    value, clock = intent(api), Clock()
+    kernel, _, auth, audit, _, _ = make_kernel(
+        api,
+        value,
+        decision_for(api, value),
         clock=clock,
         after_audit=lambda: clock.advance(elapsed),
     )
-
     await kernel.tick()
-
-    assert audit.events == [decision]
-    assert authorizations.published == []
-    assert any(
-        reason == "control_cycle_deadline_expired" for _, reason in authorizations.revocations
-    )
+    assert audit.events and not auth.published
+    assert any(reason == "control_cycle_deadline_expired" for _, reason in auth.revocations)
 
 
-async def test_partial_data_for_requested_fleet_fails_closed(contract: Any) -> None:
-    intent = make_intent(contract)
-    unsafe_partial_batch = tuple(
-        authorization for authorization in make_authorizations() if authorization.unit_id != "lhs"
+async def test_exact_current_epoch_and_sequence_are_minted(api: Any):
+    value = intent(api)
+    current, previous = observation_pairs()
+    current["mid"] = Observation("mid", connection_epoch=41, sequence=73)
+    kernel, _, auth, _, _, _ = make_kernel(
+        api, value, decision_for(api, value), current=current, previous=previous
     )
-    decision = DecisionRecord(
-        contract.DecisionStatus.AUTHORIZED,
-        intent.id,
-        1,
-        unsafe_partial_batch,
-    )
-    partial = complete_observations()
-    partial.pop("lhs")
-    kernel, _, authorizations, audit, _ = make_kernel(
-        contract,
-        intent=intent,
-        observations=partial,
-        decision=decision,
-    )
-
     await kernel.tick()
-
-    assert authorizations.published == []
-    assert authorizations.revocations
-    assert audit.events
+    cap = next(item for item in auth.published[0].authorizations if item.unit_id == "mid")
+    assert (cap.connection_epoch, cap.observation_sequence) == (41, 73)
 
 
-async def test_partial_fleet_is_allowed_only_when_intent_explicitly_selects_subset(
-    contract: Any,
-) -> None:
-    selected = frozenset({"mid", "rhs"})
-    intent = make_intent(contract, units=selected)
-    batch = tuple(AuthorizationRecord(unit, 1, 1, intent.id, 450) for unit in sorted(selected))
-    decision = DecisionRecord(
-        contract.DecisionStatus.AUTHORIZED,
-        intent.id,
-        1,
-        batch,
+@pytest.mark.parametrize("missing", ["current", "previous"])
+async def test_partial_selected_fleet_fails_closed(api: Any, missing: str):
+    value = intent(api)
+    current, previous = observation_pairs()
+    (current if missing == "current" else previous).pop("lhs")
+    output = decision_for(api, value, units=frozenset({"mid", "rhs"}))
+    kernel, _, auth, audit, _, _ = make_kernel(
+        api, value, output, current=current, previous=previous
     )
-    observations = {unit: ObservationRecord(unit) for unit in selected}
-    kernel, _, authorizations, _, _ = make_kernel(
-        contract,
-        intent=intent,
-        observations=observations,
-        decision=decision,
-    )
-
     await kernel.tick()
+    assert audit.events and not auth.published and auth.revocations
 
-    assert authorizations.published == [batch]
 
-
-async def test_emergency_stop_revokes_before_any_publication(contract: Any) -> None:
-    emergency = make_intent(contract, emergency=True)
-    stale_nonzero = make_authorizations(intent_id=emergency.id)
-    decision = DecisionRecord(
-        contract.DecisionStatus.REVOKED,
-        emergency.id,
-        2,
-        stale_nonzero,
-        ("emergency_stop",),
-    )
-    kernel, history, authorizations, audit, _ = make_kernel(
-        contract,
-        intent=emergency,
-        observations=complete_observations(),
-        decision=decision,
-    )
-
+async def test_explicit_selected_subset_is_complete(api: Any):
+    value = intent(api, units=frozenset({"mid", "rhs"}))
+    kernel, _, auth, _, _, _ = make_kernel(api, value, decision_for(api, value))
     await kernel.tick()
-
-    assert authorizations.published == []
-    assert authorizations.revocations
-    assert audit.events == [decision]
-    assert history.index("revoke") < history.index("audit")
+    assert_batch(api, auth.published[0], value)
 
 
-async def test_emergency_stop_revokes_before_waiting_for_durable_audit(
-    contract: Any,
-) -> None:
-    audit_gate = asyncio.Event()
-    emergency = make_intent(contract, emergency=True)
-    decision = DecisionRecord(
-        contract.DecisionStatus.REVOKED,
-        emergency.id,
-        2,
-        (),
-        ("emergency_stop",),
+@pytest.mark.parametrize("shape", ["missing", "duplicate", "extra"])
+async def test_missing_duplicate_or_extra_setpoint_rejects_whole_batch(api: Any, shape: str):
+    value = intent(api)
+    points = list(decision_for(api, value).setpoints)
+    if shape == "missing":
+        points = points[:-1]
+    elif shape == "duplicate":
+        points.append(points[0])
+    else:
+        points.append(Setpoint("intruder", value.direction, 1, value.id))
+    kernel, _, auth, audit, _, _ = make_kernel(
+        api, value, Decision(api.DecisionStatus.AUTHORIZED, tuple(points))
     )
-    kernel, _, authorizations, audit, _ = make_kernel(
-        contract,
-        intent=emergency,
-        observations=complete_observations(),
-        decision=decision,
-        audit_gate=audit_gate,
-    )
-
-    tick = asyncio.create_task(kernel.tick())
-    entered_audit = await settle_until(audit.append_entered.is_set)
-    if not entered_audit:
-        tick.cancel()
-        await asyncio.gather(tick, return_exceptions=True)
-    assert entered_audit, "emergency-stop decision never reached the audit boundary"
-
-    assert authorizations.revocations, "audit backpressure delayed emergency revocation"
-    assert authorizations.published == []
-
-    tick.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await tick
-
-
-async def test_emergency_stop_cannot_be_turned_into_nonzero_authority_by_safety_output(
-    contract: Any,
-) -> None:
-    emergency = make_intent(contract, emergency=True)
-    malicious_nonzero = make_authorizations(intent_id=emergency.id)
-    decision = DecisionRecord(
-        contract.DecisionStatus.AUTHORIZED,
-        emergency.id,
-        2,
-        malicious_nonzero,
-    )
-    kernel, _, authorizations, audit, _ = make_kernel(
-        contract,
-        intent=emergency,
-        observations=complete_observations(),
-        decision=decision,
-    )
-
     await kernel.tick()
-
-    assert authorizations.published == []
-    assert authorizations.revocations
-    assert audit.events == [decision]
+    assert audit.events and not auth.published and auth.revocations
 
 
-async def test_emergency_stop_revocation_survives_audit_failure(contract: Any) -> None:
-    emergency = make_intent(contract, emergency=True)
-    decision = DecisionRecord(
-        contract.DecisionStatus.REVOKED,
-        emergency.id,
-        2,
-        (),
-        ("emergency_stop",),
+async def test_all_safety_reasons_are_audited_without_authority(api: Any):
+    value = intent(api)
+    output = Decision(
+        api.DecisionStatus.REJECTED,
+        tuple(Setpoint(unit, api.Direction.IDLE, 0, value.id) for unit in sorted(UNITS)),
+        ("blocking_fault", "soc_jump", "telemetry_stale"),
     )
-    kernel, history, authorizations, _, _ = make_kernel(
-        contract,
-        intent=emergency,
-        observations=complete_observations(),
-        decision=decision,
-        audit_error=OSError("audit unavailable"),
-    )
+    kernel, _, auth, audit, _, _ = make_kernel(api, value, output)
+    assert await kernel.tick() is output
+    assert audit.events and not auth.published and auth.revocations
 
-    with pytest.raises(OSError, match="audit unavailable"):
+
+async def test_audit_failure_revokes_and_propagates(api: Any):
+    value = intent(api)
+    kernel, history, auth, _, _, _ = make_kernel(
+        api, value, decision_for(api, value), audit_error=OSError("audit full")
+    )
+    with pytest.raises(OSError, match="audit full"):
         await kernel.tick()
-
-    assert authorizations.published == []
-    assert authorizations.revocations
-    assert history.index("revoke") < history.index("audit")
+    assert not auth.published and history[-2:] == ["audit", "revoke"]
 
 
-async def test_publish_failure_revokes_and_propagates(contract: Any) -> None:
-    intent = make_intent(contract)
-    decision = DecisionRecord(
-        contract.DecisionStatus.AUTHORIZED,
-        intent.id,
-        1,
-        make_authorizations(),
+async def test_cancellation_during_audit_revokes(api: Any):
+    gate, value = asyncio.Event(), intent(api)
+    kernel, _, auth, audit, _, _ = make_kernel(
+        api, value, decision_for(api, value), audit_gate=gate
     )
-    kernel, history, authorizations, audit, _ = make_kernel(
-        contract,
-        intent=intent,
-        observations=complete_observations(),
-        decision=decision,
-        publish_error=OSError("authorization store unavailable"),
-    )
-
-    with pytest.raises(OSError, match="authorization store unavailable"):
-        await kernel.tick()
-
-    assert audit.events == [decision]
-    assert authorizations.published == []
-    assert history[-2:] == ["publish", "revoke"]
-
-
-async def test_cancellation_during_publication_revokes_the_candidate_batch(
-    contract: Any,
-) -> None:
-    publish_gate = asyncio.Event()
-    intent = make_intent(contract)
-    decision = DecisionRecord(
-        contract.DecisionStatus.AUTHORIZED,
-        intent.id,
-        1,
-        make_authorizations(),
-    )
-    kernel, history, authorizations, audit, _ = make_kernel(
-        contract,
-        intent=intent,
-        observations=complete_observations(),
-        decision=decision,
-        publish_gate=publish_gate,
-    )
-
-    tick = asyncio.create_task(kernel.tick())
-    entered_publish = await settle_until(authorizations.publish_entered.is_set)
-    if not entered_publish:
-        tick.cancel()
-        await asyncio.gather(tick, return_exceptions=True)
-    assert entered_publish, "control cycle never reached authorization publication"
-    tick.cancel()
+    task = asyncio.create_task(kernel.tick())
+    assert await settle(audit.entered.is_set)
+    task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await tick
+        await task
+    assert not auth.published and auth.revocations
 
-    assert audit.events == [decision]
-    assert authorizations.published == []
-    assert authorizations.revocations
-    assert history[-2:] == ["publish", "revoke"]
+
+@pytest.mark.parametrize("mode", ["cancel", "fail"])
+async def test_publication_cancellation_or_failure_revokes(api: Any, mode: str):
+    value, gate = intent(api), asyncio.Event()
+    kwargs = (
+        {"publish_gate": gate} if mode == "cancel" else {"publish_error": OSError("store down")}
+    )
+    kernel, _, auth, audit, _, _ = make_kernel(api, value, decision_for(api, value), **kwargs)
+    task = asyncio.create_task(kernel.tick())
+    if mode == "cancel":
+        assert await settle(auth.entered.is_set)
+        task.cancel()
+        expected = asyncio.CancelledError
+    else:
+        expected = OSError
+    with pytest.raises(expected):
+        await task
+    assert audit.events and not auth.published and auth.revocations
+
+
+async def test_emergency_revokes_before_blocking_audit(api: Any):
+    gate, value = asyncio.Event(), intent(api, emergency=True)
+    kernel, history, auth, audit, _, _ = make_kernel(
+        api, value, decision_for(api, value), audit_gate=gate
+    )
+    task = asyncio.create_task(kernel.tick())
+    assert await settle(audit.entered.is_set)
+    assert auth.revocations
+    assert history.index("revoke") < history.index("audit")
+    assert not auth.published
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_emergency_cannot_be_promoted_by_malicious_safety(api: Any):
+    value = intent(api, emergency=True)
+    malicious = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        tuple(Setpoint(unit, api.Direction.DISCHARGE, 300, value.id) for unit in sorted(UNITS)),
+    )
+    kernel, history, auth, audit, _, _ = make_kernel(api, value, malicious)
+    await kernel.tick()
+    assert history.index("revoke") < history.index("audit")
+    assert audit.events and not auth.published
+
+
+async def test_evaluation_failure_revokes_and_propagates(api: Any):
+    value = intent(api)
+    kernel, _, auth, audit, _, _ = make_kernel(api, value, RuntimeError("control died"))
+    with pytest.raises(RuntimeError, match="control died"):
+        await kernel.tick()
+    assert not audit.events and not auth.published and auth.revocations

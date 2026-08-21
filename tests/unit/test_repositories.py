@@ -72,9 +72,9 @@ def _observation(unit_id: str, sequence: int, *, epoch: int = 1) -> Any:
     _require_contract()
     return Observation(
         unit_id=unit_id,
-        observed_identity=f"BEP-{unit_id.upper()}",
-        wall_time=datetime(2026, 8, 21, 1, sequence % 60, tzinfo=UTC),
-        captured_at_monotonic=100.0 + sequence,
+        device_identity=f"BEP-{unit_id.upper()}",
+        wall_timestamp=datetime(2026, 8, 21, 1, sequence % 60, tzinfo=UTC),
+        captured_at_mono=100.0 + sequence,
         connection_epoch=epoch,
         sequence=sequence,
         lifecycle=UnitLifecycle.DISARMED,
@@ -82,18 +82,26 @@ def _observation(unit_id: str, sequence: int, *, epoch: int = 1) -> Any:
         system_soc_pct=50.0,
         bms_soc_pct=50.0,
         soh_pct=98.0,
-        battery_w=0,
+        battery_watts=0.0,
         pack_voltage_v=205.0,
         pack_current_a=0.0,
-        dynamic_charge_limit_w=2500,
-        dynamic_discharge_limit_w=2500,
+        dynamic_charge_limit_w=2500.0,
+        dynamic_discharge_limit_w=2500.0,
+        expected_cell_count=3,
         cell_voltages_v=(3.40, 3.41, 3.39),
+        expected_temperature_count=2,
         temperatures_c=(24.0, 25.0),
         active_faults=frozenset(),
         active_warnings=frozenset(),
         quality={
             "system_soc_pct": DataQuality.GOOD,
             "bms_soc_pct": DataQuality.GOOD,
+            "soh_pct": DataQuality.GOOD,
+            "battery_watts": DataQuality.GOOD,
+            "pack_voltage_v": DataQuality.GOOD,
+            "pack_current_a": DataQuality.GOOD,
+            "dynamic_charge_limit_w": DataQuality.GOOD,
+            "dynamic_discharge_limit_w": DataQuality.GOOD,
             "cell_voltages_v": DataQuality.GOOD,
             "temperatures_c": DataQuality.GOOD,
         },
@@ -104,6 +112,7 @@ def _authorization(
     unit_id: str,
     generation: int,
     *,
+    cycle_id: str | None = None,
     issued: float = 10.0,
     not_before: float = 10.0,
     expires: float = 11.0,
@@ -113,19 +122,32 @@ def _authorization(
         unit_id=unit_id,
         connection_epoch=1,
         generation=generation,
-        cycle_id=f"cycle-{generation}",
+        cycle_id=cycle_id or f"cycle-{generation}",
         intent_id=f"intent-{generation}",
         intent_revision=1,
-        active_w=-500,
-        reactive_var=0,
-        issued_at_monotonic=issued,
-        not_before_monotonic=not_before,
-        expires_at_monotonic=expires,
+        direction=Direction.DISCHARGE,
+        watts=500,
+        reactive_vars=0,
+        issued_at_mono=issued,
+        not_before_mono=not_before,
+        expires_at_mono=expires,
         observation_sequence=12,
         maximum_observation_age_s=0.5,
-        policy_version=3,
+        policy_version="3",
         configuration_version=7,
         decision_id=f"decision-{generation}",
+    )
+
+
+def _batch(*authorizations: Any) -> Any:
+    _require_contract()
+    if not authorizations:
+        raise ValueError("test batch requires at least one authorization")
+    first = authorizations[0]
+    return AuthorizationBatch(
+        cycle_id=first.cycle_id,
+        generation=first.generation,
+        authorizations=tuple(authorizations),
     )
 
 
@@ -233,12 +255,12 @@ def test_authorization_is_not_visible_before_not_before_and_expires_at_deadline(
     """T-UNIT-REPO-004 / INV-AUTH-001 / S0."""
     _require_contract()
     repository = InMemoryAuthorizationRepository()
-    repository.publish(AuthorizationBatch(authorizations=(_authorization("mid", 1),)))
+    repository.publish(_batch(_authorization("mid", 1)))
 
     assert repository.current("mid", now_monotonic=9.999) is None
     assert repository.current("mid", now_monotonic=10.0) is not None
 
-    repository.publish(AuthorizationBatch(authorizations=(_authorization("rhs", 1),)))
+    repository.publish(_batch(_authorization("rhs", 1)))
     assert repository.current("rhs", now_monotonic=11.0) is None
 
 
@@ -247,7 +269,7 @@ def test_authorization_is_single_use() -> None:
     _require_contract()
     repository = InMemoryAuthorizationRepository()
     expected = _authorization("mid", 1)
-    repository.publish(AuthorizationBatch(authorizations=(expected,)))
+    repository.publish(_batch(expected))
 
     assert repository.current("mid", now_monotonic=10.5) == expected
     assert repository.current("mid", now_monotonic=10.5) is None
@@ -257,41 +279,76 @@ def test_new_generation_replaces_old_and_old_generation_cannot_be_republished() 
     """T-UNIT-REPO-006 / INV-AUTH-003 / S0."""
     _require_contract()
     repository = InMemoryAuthorizationRepository()
-    repository.publish(AuthorizationBatch(authorizations=(_authorization("mid", 4),)))
+    repository.publish(_batch(_authorization("mid", 4)))
     newest = _authorization("mid", 5)
-    repository.publish(AuthorizationBatch(authorizations=(newest,)))
+    repository.publish(_batch(newest))
 
     assert repository.current("mid", now_monotonic=10.5) == newest
     assert StaleGenerationError is not None
     with pytest.raises(StaleGenerationError):
-        repository.publish(AuthorizationBatch(authorizations=(_authorization("mid", 4),)))
+        repository.publish(_batch(_authorization("mid", 4)))
 
 
-def test_consumed_authorization_cannot_be_republished_in_the_same_generation() -> None:
-    """T-UNIT-REPO-006A / INV-AUTH-002 / S0: consumption is irreversible."""
+def test_consumed_cycle_cannot_be_republished_in_the_same_generation() -> None:
+    """T-UNIT-REPO-006A / INV-AUTH-002 / S0: cycle consumption is irreversible."""
     repository = InMemoryAuthorizationRepository()
     authorization = _authorization("mid", 4)
-    repository.publish(AuthorizationBatch(authorizations=(authorization,)))
+    repository.publish(_batch(authorization))
     assert repository.current("mid", now_monotonic=10.5) == authorization
 
     assert StaleGenerationError is not None
     with pytest.raises(StaleGenerationError):
-        repository.publish(AuthorizationBatch(authorizations=(authorization,)))
+        repository.publish(_batch(authorization))
+
+
+def test_successive_fresh_cycles_are_permitted_in_one_healthy_generation() -> None:
+    """A fencing epoch remains stable while each renewal cycle is single-use."""
+    repository = InMemoryAuthorizationRepository()
+    first = _authorization("mid", 4, cycle_id="cycle-4-a")
+    second = _authorization("mid", 4, cycle_id="cycle-4-b")
+
+    repository.publish(_batch(first))
+    assert repository.current("mid", now_monotonic=10.5) == first
+    repository.publish(_batch(second))
+    assert repository.current("mid", now_monotonic=10.5) == second
+
+
+def test_newer_cycle_replaces_unconsumed_cycle_in_same_generation() -> None:
+    """A later healthy renewal atomically supersedes an unused older cycle."""
+    repository = InMemoryAuthorizationRepository()
+    older = _authorization("mid", 4, cycle_id="cycle-4-a")
+    newer = _authorization("mid", 4, cycle_id="cycle-4-b")
+
+    repository.publish(_batch(older))
+    repository.publish(_batch(newer))
+
+    assert repository.current("mid", now_monotonic=10.5) == newer
+    assert repository.current("mid", now_monotonic=10.5) is None
+    with pytest.raises(StaleGenerationError):
+        repository.publish(_batch(older))
+
+
+def test_consumed_cycle_replay_is_rejected_after_later_cycle_in_same_generation() -> None:
+    repository = InMemoryAuthorizationRepository()
+    consumed = _authorization("mid", 4, cycle_id="cycle-4-a")
+    later = _authorization("mid", 4, cycle_id="cycle-4-b")
+    repository.publish(_batch(consumed))
+    assert repository.current("mid", now_monotonic=10.5) == consumed
+    repository.publish(_batch(later))
+
+    with pytest.raises(StaleGenerationError):
+        repository.publish(_batch(consumed))
 
 
 def test_generation_order_dominates_later_issue_times() -> None:
     """T-UNIT-REPO-006B / INV-AUTH-003 / S0: wall or issue time cannot defeat fencing."""
     repository = InMemoryAuthorizationRepository()
-    repository.publish(AuthorizationBatch(authorizations=(_authorization("mid", 8, issued=10.0),)))
+    repository.publish(_batch(_authorization("mid", 8, issued=10.0)))
 
     assert StaleGenerationError is not None
     with pytest.raises(StaleGenerationError):
         repository.publish(
-            AuthorizationBatch(
-                authorizations=(
-                    _authorization("mid", 7, issued=1000.0, not_before=10.0, expires=1001.0),
-                )
-            )
+            _batch(_authorization("mid", 7, issued=1000.0, not_before=1000.0, expires=1001.0))
         )
 
 
@@ -299,15 +356,15 @@ def test_revocation_fences_same_and_older_generations() -> None:
     """T-UNIT-REPO-007 / INV-AUTH-004 / S0."""
     _require_contract()
     repository = InMemoryAuthorizationRepository()
-    repository.publish(AuthorizationBatch(authorizations=(_authorization("mid", 7),)))
+    repository.publish(_batch(_authorization("mid", 7)))
     repository.revoke(unit_id="mid", generation=8)
 
     assert repository.current("mid", now_monotonic=10.5) is None
     assert StaleGenerationError is not None
     with pytest.raises(StaleGenerationError):
-        repository.publish(AuthorizationBatch(authorizations=(_authorization("mid", 8),)))
+        repository.publish(_batch(_authorization("mid", 8)))
     generation_9 = _authorization("mid", 9)
-    repository.publish(AuthorizationBatch(authorizations=(generation_9,)))
+    repository.publish(_batch(generation_9))
     assert repository.current("mid", now_monotonic=10.5) == generation_9
 
 
@@ -316,7 +373,7 @@ def test_authorization_batch_publication_is_atomic_when_one_generation_is_stale(
     _require_contract()
     repository = InMemoryAuthorizationRepository()
     repository.revoke(unit_id="mid", generation=3)
-    mixed = AuthorizationBatch(authorizations=(_authorization("mid", 3), _authorization("rhs", 1)))
+    mixed = _batch(_authorization("mid", 3), _authorization("rhs", 3))
 
     assert StaleGenerationError is not None
     with pytest.raises(StaleGenerationError):

@@ -1,0 +1,524 @@
+"""Per-unit, sole-owner actor for safety-critical EnergyPod I/O.
+
+The actor deliberately depends on structural (duck-typed) ports.  Adapters and
+repositories may therefore evolve independently, while all socket operations
+remain owned by one mailbox task.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import itertools
+from dataclasses import dataclass
+from typing import Any, Final
+
+from energypod.domain import UnitLifecycle
+
+from .generation import AuthorityGenerationCoordinator
+
+_HEARTBEAT_PRIORITY: Final = 0
+_CONTROL_PRIORITY: Final = 10
+_POLL_PRIORITY: Final = 20
+
+
+@dataclass(slots=True)
+class _Message:
+    operation: str
+    argument: Any
+    reply: asyncio.Future[Any]
+
+
+class EnergyPodActor:
+    """Serialize one unit's lifecycle and protocol operations through a mailbox."""
+
+    def __init__(
+        self,
+        *,
+        unit_id: str,
+        transport: Any,
+        clock: Any,
+        observations: Any,
+        authorizations: Any,
+        audit: Any,
+        command_encoder: Any,
+        generation_coordinator: AuthorityGenerationCoordinator | None = None,
+        expected_identity: str,
+        expected_profile: str,
+        expected_cell_count: int,
+        stable_observations_required: int,
+        essential_read_address: int,
+        essential_read_count: int,
+        heartbeat_interval_s: float,
+        heartbeat_safety_margin_s: float,
+    ) -> None:
+        if stable_observations_required < 1:
+            raise ValueError("stable_observations_required must be positive")
+        if heartbeat_interval_s <= 0:
+            raise ValueError("heartbeat_interval_s must be positive")
+        if not 0 <= heartbeat_safety_margin_s < heartbeat_interval_s:
+            raise ValueError("heartbeat safety margin must be within the interval")
+
+        self.unit_id = unit_id
+        self._transport = transport
+        self._clock = clock
+        self._observations = observations
+        self._authorizations = authorizations
+        self._audit = audit
+        self._command_encoder = command_encoder
+        self._generation_coordinator = generation_coordinator or AuthorityGenerationCoordinator()
+        self._expected_identity = expected_identity
+        self._expected_profile = expected_profile
+        self._expected_cell_count = expected_cell_count
+        self._stable_required = stable_observations_required
+        self._essential_address = essential_read_address
+        self._essential_count = essential_read_count
+        self._heartbeat_interval = heartbeat_interval_s
+        self._heartbeat_margin = heartbeat_safety_margin_s
+
+        self.lifecycle = UnitLifecycle.BOOT
+        self.generation = 0
+        self._connection_epoch: int | None = None
+        self._latest_observation: Any | None = None
+        self._stable_observations = 0
+        self._used_cycles: set[tuple[int, int]] = set()
+
+        self._mailbox: asyncio.PriorityQueue[tuple[int, int, _Message]] = asyncio.PriorityQueue()
+        self._sequence = itertools.count()
+        self._owner: asyncio.Task[None] | None = None
+        self._active_operation: str | None = None
+        self._active_started_mono: float | None = None
+        self._active_reply: asyncio.Future[Any] | None = None
+        self._started = False
+        self._stopping = False
+        self._closed = False
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._start_lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        """Start disconnected authority in observe-only mode."""
+        async with self._start_lock:
+            if self._stopping:
+                raise RuntimeError("actor is stopping")
+            if self._started:
+                return
+            self._started = True
+            self._owner = asyncio.create_task(self._run(), name=f"energypod-actor:{self.unit_id}")
+            try:
+                await self._submit("connect", None, _CONTROL_PRIORITY)
+            except BaseException:
+                self.lifecycle = UnitLifecycle.DISCONNECTED
+                self._stopping = True
+                await self._advance_generation("actor-start-failed")
+                self._cancel_owner()
+                if self._owner is not None:
+                    await asyncio.gather(self._owner, return_exceptions=True)
+                raise
+            self.lifecycle = UnitLifecycle.OBSERVE_ONLY
+
+    async def accept_observation(self, observation: Any) -> None:
+        await self._submit("observation", observation, _CONTROL_PRIORITY)
+
+    async def arm(self) -> None:
+        await self._submit("arm", None, _CONTROL_PRIORITY)
+
+    async def poll_once(self) -> Any:
+        if self._stopping or not self._started:
+            return None
+        return await self._submit("poll", None, _POLL_PRIORITY)
+
+    async def heartbeat_once(self) -> None:
+        if self._stopping or not self._started:
+            return
+
+        # A queued heartbeat may not sit behind a telemetry read beyond the
+        # commissioned renewal budget.  Cancellation affects the mailbox task,
+        # which catches it at the current await boundary before starting a write.
+        preempt = asyncio.create_task(self._preempt_overdue_read())
+        try:
+            await self._submit("heartbeat", None, _HEARTBEAT_PRIORITY)
+        finally:
+            preempt.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await preempt
+
+    async def fence(self, reason: str) -> int:
+        """Publish revocation before waiting for cancellation or durable work."""
+        if self._stopping:
+            return self.generation
+        await self._advance_generation(reason)
+        self._used_cycles.clear()
+        self._stable_observations = 0
+        if self.lifecycle is UnitLifecycle.ACTIVE:
+            self.lifecycle = UnitLifecycle.ARMED_IDLE
+        self._cancel_active_authority_work()
+        # Publish cancellation to an in-flight heartbeat before this method
+        # returns, without waiting for cancellation-resistant port work to end.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        await self._revoke(reason)
+        return self.generation
+
+    async def shutdown(self) -> None:
+        """Fence once, make one bounded zero attempt, and close once."""
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(
+                self._shutdown_once(), name=f"energypod-stop:{self.unit_id}"
+            )
+        await asyncio.shield(self._shutdown_task)
+
+    async def _shutdown_once(self) -> None:
+        self._stopping = True
+        await self._advance_generation("shutdown")
+        self._used_cycles.clear()
+        self.lifecycle = UnitLifecycle.STOPPING
+        self._cancel_active_authority_work()
+
+        if self._owner is None or self._owner.done():
+            # The owner cannot serialize a stop, but the shutdown contract still
+            # requires one bounded zero-command attempt before closing.  No
+            # mailbox task is alive, so a direct bounded write is safe.
+            await self._attempt_zero_owned()
+            await self._close_directly()
+            return
+
+        # Start external revocation before stopping, but never let repository
+        # latency postpone the bounded zero and close sequence.
+        revoke_task = asyncio.create_task(
+            self._revoke("shutdown"), name=f"energypod-revoke:{self.unit_id}"
+        )
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await self._submit("stop", None, -100, allow_stopping=True)
+        if self._owner is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._owner
+        try:
+            async with asyncio.timeout(self._heartbeat_margin or 0.1):
+                await revoke_task
+        except (Exception, asyncio.CancelledError):
+            revoke_task.cancel()
+            await asyncio.gather(revoke_task, return_exceptions=True)
+
+    async def _close_directly(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        with contextlib.suppress(Exception):
+            await self._transport.close()
+
+    async def _submit(
+        self,
+        operation: str,
+        argument: Any,
+        priority: int,
+        *,
+        allow_stopping: bool = False,
+    ) -> Any:
+        if self._owner is None or self._owner.done():
+            if operation == "stop":
+                return None
+            raise RuntimeError("actor is not running")
+        if self._stopping and not allow_stopping:
+            return None
+
+        reply: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        message = _Message(operation, argument, reply)
+        await self._mailbox.put((priority, next(self._sequence), message))
+        try:
+            return await reply
+        except asyncio.CancelledError:
+            # Cancellation of a caller must cross the mailbox boundary.  This
+            # prevents an abandoned nonzero write from completing silently.
+            if self._active_reply is reply and self._owner is not None:
+                self._owner.cancel()
+            raise
+
+    async def _run(self) -> None:
+        terminal_error: BaseException | None = None
+        try:
+            while True:
+                _, _, message = await self._mailbox.get()
+                if message.reply.cancelled():
+                    continue
+                self._active_operation = message.operation
+                self._active_reply = message.reply
+                self._active_started_mono = self._clock.monotonic()
+                try:
+                    result = await self._dispatch(message.operation, message.argument)
+                except asyncio.CancelledError:
+                    if not message.reply.done():
+                        message.reply.cancel()
+                    # Cancellation is an operation-level fence, not actor death.
+                    continue
+                except Exception as error:
+                    if not message.reply.done():
+                        message.reply.set_exception(error)
+                except BaseException:
+                    if not message.reply.done():
+                        message.reply.cancel()
+                    raise
+                else:
+                    if not message.reply.done():
+                        message.reply.set_result(result)
+                finally:
+                    self._active_operation = None
+                    self._active_started_mono = None
+                    self._active_reply = None
+                if message.operation == "stop":
+                    return
+        except BaseException as error:
+            terminal_error = error
+            raise
+        finally:
+            if self._active_reply is not None and not self._active_reply.done():
+                self._active_reply.cancel()
+            self._active_operation = None
+            self._active_started_mono = None
+            self._active_reply = None
+            self._fail_queued_replies(terminal_error)
+
+    async def _dispatch(self, operation: str, argument: Any) -> Any:
+        if operation == "connect":
+            return await self._transport.connect()
+        if operation == "observation":
+            return await self._accept_observation_owned(argument)
+        if operation == "arm":
+            return self._arm_owned()
+        if operation == "poll":
+            return await self._transport.read_holding(
+                self._essential_address, self._essential_count
+            )
+        if operation == "heartbeat":
+            return await self._heartbeat_owned()
+        if operation == "stop":
+            return await self._stop_owned()
+        raise RuntimeError(f"unknown actor operation: {operation}")
+
+    async def _accept_observation_owned(self, observation: Any) -> None:
+        await self._observations.append(observation)
+        self._latest_observation = observation
+        if self._qualifies(observation):
+            observation_epoch = observation.connection_epoch
+            if self._connection_epoch not in {None, observation_epoch}:
+                # Stable samples never span reconnects.  Publish the fence before
+                # the revocation adapter can block or fail.
+                await self._advance_generation("connection-epoch-changed")
+                self._used_cycles.clear()
+                self._stable_observations = 0
+                self.lifecycle = UnitLifecycle.OBSERVE_ONLY
+                await self._revoke("connection_epoch_changed")
+            self._stable_observations += 1
+            self._connection_epoch = observation_epoch
+            if (
+                self.lifecycle in {UnitLifecycle.OBSERVE_ONLY, UnitLifecycle.INHIBITED}
+                and self._stable_observations >= self._stable_required
+            ):
+                # Non-latching recovery returns to DISARMED, never directly to
+                # ACTIVE: nonzero power still requires an explicit arm.
+                self.lifecycle = UnitLifecycle.DISARMED
+        else:
+            self._stable_observations = 0
+            if self.lifecycle not in {
+                UnitLifecycle.BOOT,
+                UnitLifecycle.STOPPING,
+                UnitLifecycle.INHIBITED,
+            }:
+                self.lifecycle = UnitLifecycle.OBSERVE_ONLY
+
+    def _qualifies(self, observation: Any) -> bool:
+        quality = getattr(observation, "quality", None)
+        quality_value = getattr(quality, "value", quality)
+        cells = getattr(observation, "cells", None)
+        cell_count_ok = cells is None or len(cells) == self._expected_cell_count
+        return bool(
+            getattr(observation, "complete", False)
+            and quality_value == "good"
+            and getattr(observation, "unit_id", None) == self.unit_id
+            and getattr(observation, "device_identity", None) == self._expected_identity
+            and getattr(observation, "protocol_profile", None) == self._expected_profile
+            and cell_count_ok
+        )
+
+    def _arm_owned(self) -> None:
+        if self._stopping:
+            return
+        if (
+            self.lifecycle is not UnitLifecycle.DISARMED
+            or self._stable_observations < self._stable_required
+        ):
+            raise RuntimeError("unit is not qualified for arming")
+        self.lifecycle = UnitLifecycle.ARMED_IDLE
+
+    async def _heartbeat_owned(self) -> None:
+        if self._stopping or self.lifecycle not in {
+            UnitLifecycle.ARMED_IDLE,
+            UnitLifecycle.ACTIVE,
+        }:
+            return
+
+        lookup_generation = (await self._generation_coordinator.snapshot()).epoch
+        self.generation = lookup_generation
+        lookup_now = self._clock.monotonic()
+        try:
+            authorization = await self._authorizations.current(self.unit_id, lookup_now)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._inhibit_owned("authorization_lookup_failed")
+            return
+        if authorization is None:
+            await self._reject_authorization(None, "authorization_missing")
+            return
+
+        try:
+            reason = await self._authorization_rejection(authorization, lookup_generation)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._inhibit_owned("observation_lookup_failed")
+            return
+        if reason is not None:
+            await self._reject_authorization(authorization, reason)
+            return
+
+        cycle = (authorization.generation, authorization.cycle_id)
+        if cycle in self._used_cycles:
+            await self._reject_authorization(authorization, "authorization_already_used")
+            return
+
+        # Consumption deliberately precedes encoding and the transport await.
+        self._used_cycles.add(cycle)
+        try:
+            encoded = self._command_encoder.encode(authorization)
+        except Exception:
+            await self._inhibit_owned("command_encoding_failed")
+            return
+        try:
+            await self._transport.write_registers(encoded.address, encoded.values)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._advance_generation("write-failed")
+            self._used_cycles.clear()
+            self._stable_observations = 0
+            self.lifecycle = UnitLifecycle.INHIBITED
+            await self._attempt_zero_owned()
+            await self._revoke("write_failed")
+            return
+
+        # A cancellation-resistant adapter may acknowledge after replacement.
+        # Never let that stale result restore ACTIVE authority.
+        if (
+            not self._stopping
+            and lookup_generation == (await self._generation_coordinator.snapshot()).epoch
+            and authorization.generation == lookup_generation
+        ):
+            self.lifecycle = UnitLifecycle.ACTIVE
+
+    async def _authorization_rejection(
+        self, authorization: Any, lookup_generation: int
+    ) -> str | None:
+        now = self._clock.monotonic()
+        if getattr(authorization, "unit_id", None) != self.unit_id:
+            return "unit_mismatch"
+        current_generation = (await self._generation_coordinator.snapshot()).epoch
+        self.generation = current_generation
+        if authorization.generation != lookup_generation or lookup_generation != current_generation:
+            return "generation_mismatch"
+        if authorization.not_before_mono > now:
+            return "authorization_not_yet_valid"
+        if authorization.expires_at_mono <= now:
+            return "authorization_expired"
+
+        # Refresh evidence after the authorization lookup.  This is the final
+        # awaited safety read before capability consumption and transport I/O.
+        observation = await self._observations.latest(self.unit_id)
+        current_generation = (await self._generation_coordinator.snapshot()).epoch
+        self.generation = current_generation
+        if lookup_generation != current_generation:
+            return "generation_mismatch"
+        now = self._clock.monotonic()
+        if authorization.expires_at_mono <= now:
+            return "authorization_expired"
+        if authorization.not_before_mono > now:
+            return "authorization_not_yet_valid"
+        if observation is None or not self._qualifies(observation):
+            return "observation_invalid"
+        if observation.connection_epoch != authorization.connection_epoch:
+            return "connection_epoch_mismatch"
+        if self._connection_epoch != authorization.connection_epoch:
+            return "connection_epoch_mismatch"
+        if observation.sequence != authorization.observation_sequence:
+            return "observation_sequence_mismatch"
+        self._latest_observation = observation
+        return None
+
+    async def _reject_authorization(self, authorization: Any, reason: str) -> None:
+        if self.lifecycle is UnitLifecycle.ACTIVE:
+            self.lifecycle = UnitLifecycle.ARMED_IDLE
+        await self._revoke(reason, authorization)
+
+    async def _inhibit_owned(self, reason: str) -> None:
+        """Fail closed locally before invoking any potentially blocking port."""
+        await self._advance_generation(reason)
+        self._used_cycles.clear()
+        self._stable_observations = 0
+        self.lifecycle = UnitLifecycle.INHIBITED
+        await self._attempt_zero_owned()
+        await self._revoke(reason)
+
+    async def _advance_generation(self, reason: str) -> int:
+        snapshot = await self._generation_coordinator.advance(reason=reason)
+        self.generation = snapshot.epoch
+        self._used_cycles.clear()
+        return snapshot.epoch
+
+    async def _revoke(self, reason: str, authorization: Any = None) -> None:
+        with contextlib.suppress(Exception):
+            await self._authorizations.revoke(
+                (self.unit_id,), reason=reason, authorization=authorization
+            )
+
+    async def _attempt_zero_owned(self) -> None:
+        zero = self._command_encoder.zero()
+        try:
+            async with asyncio.timeout(self._heartbeat_margin or 0.1):
+                await self._transport.write_registers(zero.address, zero.values)
+        except (Exception, asyncio.CancelledError):
+            return
+
+    async def _stop_owned(self) -> None:
+        await self._attempt_zero_owned()
+        if not self._closed:
+            self._closed = True
+            with contextlib.suppress(Exception):
+                await self._transport.close()
+
+    async def _preempt_overdue_read(self) -> None:
+        threshold = self._heartbeat_interval - self._heartbeat_margin
+        started = self._active_started_mono
+        elapsed = 0.0 if started is None else max(0.0, self._clock.monotonic() - started)
+        await self._clock.sleep(max(0.0, threshold - elapsed))
+        if self._active_operation == "poll" and self._owner is not None:
+            self._owner.cancel()
+
+    def _cancel_active_authority_work(self) -> None:
+        if self._active_operation == "heartbeat" and self._owner is not None:
+            self._owner.cancel()
+
+    def _cancel_owner(self) -> None:
+        if self._owner is not None and not self._owner.done():
+            self._owner.cancel()
+
+    def _fail_queued_replies(self, error: BaseException | None) -> None:
+        while True:
+            try:
+                _, _, message = self._mailbox.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if message.reply.done():
+                continue
+            if error is None or isinstance(error, asyncio.CancelledError):
+                message.reply.cancel()
+            else:
+                message.reply.set_exception(RuntimeError("actor mailbox terminated unexpectedly"))

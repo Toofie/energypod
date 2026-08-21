@@ -91,7 +91,8 @@ Any implementation must select framing explicitly. A default `ModbusTcpClient` u
 | IoT/new layout discriminator | **Confirmed by vendor code** | If returned register offset 0 is greater than 10, `protocolFlag = 1`. Enable mask is offset 4 and BIC count is offset 5. |
 | Legacy layout discriminator | **Confirmed by vendor code** | Otherwise `protocolFlag = 0`. Enable mask is offset 2 and BIC count is offset 6. |
 | Negative BIC count handling | **Confirmed by vendor code** | The value is cast to signed 16-bit; if negative, the local copy is set to zero. No upper-bound validation is performed during detection. |
-| BECU count | **Confirmed by vendor code** | It is the population count of the enable mask, forced to at least 1 (`GlobalFun.NumberOf1`, `SysControl.cs:90-99`). |
+| Enable mask width | **Confirmed by vendor code** | The enable-mask register is cast to `byte` before being stored (`BmsInfo.battstringEnableStatus`, declared `byte`; `(byte)array[4]` for IoT and `(byte)array[2]` for legacy, `MiniESapp.cs:1289,1299`, `SysControl.cs:729,1150`). Only the low 8 bits are used, so at most 8 BECU enable bits exist; bits 8-15 of the raw register are discarded by the vendor. |
+| BECU count | **Confirmed by vendor code** | It is the population count of the byte-truncated enable mask, forced to at least 1 (`GlobalFun.NumberOf1`, `SysControl.cs:90-99`). Because the mask is truncated to 8 bits, the legacy BECU count cannot exceed 8. |
 | Deployed units use the IoT layout. | **Assumed** | The prior sensor map addresses match the IoT decoder, but no raw layout-probe response or telemetry capture is present in the supplied artifacts. Control must remain observe-only until each unit's layout and identity are read and pinned. |
 
 ## 5. Exhaustive vendor call-site register inventory

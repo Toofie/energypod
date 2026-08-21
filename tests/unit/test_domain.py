@@ -35,7 +35,8 @@ def _intent_kwargs(models: ModuleType, **overrides: Any) -> dict[str, Any]:
         "direction": models.Direction.CHARGE,
         "watts": 4_000,
         "duration_s": 5.0,
-        "created_at_mono": 100.0,
+        "accepted_at_mono": 100.0,
+        "acceptance_revision": 42,
         "actor_identity": "operator:owner",
     }
     values.update(overrides)
@@ -162,6 +163,8 @@ def test_power_intent_is_frozen_and_derives_expiry() -> None:
     models = _models()
     intent = models.PowerIntent(**_intent_kwargs(models))
     assert intent.id == "intent-001"
+    assert intent.accepted_at_mono == 100.0
+    assert intent.acceptance_revision == 42
     assert intent.expires_at_mono == pytest.approx(105.0)
     assert (intent.direction, intent.watts) == (models.Direction.CHARGE, 4_000)
     _assert_frozen(intent, "watts", 1)
@@ -169,7 +172,7 @@ def test_power_intent_is_frozen_and_derives_expiry() -> None:
 
 def test_monotonic_timestamp_may_be_negative_but_must_be_finite() -> None:
     models = _models()
-    intent = models.PowerIntent(**_intent_kwargs(models, created_at_mono=-10.0, duration_s=2.5))
+    intent = models.PowerIntent(**_intent_kwargs(models, accepted_at_mono=-10.0, duration_s=2.5))
     assert intent.expires_at_mono == pytest.approx(-7.5)
 
 
@@ -197,9 +200,12 @@ def test_domain_power_is_not_bounded_by_a_signed_wire_register() -> None:
         ("duration_s", math.nan),
         ("duration_s", math.inf),
         ("duration_s", True),
-        ("created_at_mono", math.nan),
-        ("created_at_mono", math.inf),
-        ("created_at_mono", True),
+        ("accepted_at_mono", math.nan),
+        ("accepted_at_mono", math.inf),
+        ("accepted_at_mono", True),
+        ("acceptance_revision", -1),
+        ("acceptance_revision", 1.0),
+        ("acceptance_revision", True),
     ],
 )
 def test_power_intent_rejects_malformed_or_coerced_values(field: str, value: object) -> None:
@@ -212,6 +218,15 @@ def test_power_intent_rejects_signed_protocol_field() -> None:
     models = _models()
     with pytest.raises((TypeError, ValueError)):
         models.PowerIntent(**_intent_kwargs(models, signed_watts=-1_000))
+
+
+def test_power_intent_rejects_legacy_ordering_alias() -> None:
+    """The clean-slate domain has one canonical server-ordering vocabulary."""
+    models = _models()
+    values = _intent_kwargs(models)
+    values["created_at_mono"] = values.pop("accepted_at_mono")
+    with pytest.raises((TypeError, ValueError)):
+        models.PowerIntent(**values)
 
 
 @pytest.mark.parametrize("direction", ["CHARGE", "DISCHARGE"])

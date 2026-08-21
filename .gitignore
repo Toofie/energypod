@@ -10,3 +10,5 @@ data/
 web/node_modules/
 web/dist/
 .env
+.mutmut-cache/
+html/
