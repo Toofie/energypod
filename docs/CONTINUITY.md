@@ -163,6 +163,7 @@ Git commits currently known:
 - `3381c1f test: define safety kernel and arbiter contracts`
 - `f989dd7 test: define actor and control kernel safety contracts`
 - `1552202 test: accept reviewed architecture and contract baseline`
+- `89f483a feat: implement reviewed production round with adversarial hardening`
 
 Most documentation and several test files are intentionally not committed yet;
 inspect `git status` before changing anything. Never discard uncommitted work.
