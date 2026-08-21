@@ -9,12 +9,12 @@ from __future__ import annotations
 import asyncio
 import importlib
 from collections import deque
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable
+from typing import Any
 
 import pytest
-
 
 UNIT_ID = "mid"
 IDENTITY = "BEP0005KXX11B10500055"
@@ -39,7 +39,8 @@ class AuthorizationRecord:
     generation: int = 0
     cycle_id: int = 1
     intent_id: str = "manual-1"
-    active_watts: int = 500
+    direction: str = "discharge"
+    watts: int = 500
     reactive_vars: int = 0
     issued_at_mono: float = 100.0
     not_before_mono: float = 100.0
@@ -93,18 +94,29 @@ class FakeClock:
 
 
 class Gate:
-    def __init__(self) -> None:
+    """A deterministic await boundary that can model cancellation-resistant I/O."""
+
+    def __init__(self, *, ignore_cancellation: bool = False) -> None:
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
+        self.cancelled = asyncio.Event()
+        self.ignore_cancellation = ignore_cancellation
 
     async def wait(self) -> None:
         self.entered.set()
-        await self.release.wait()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            if not self.ignore_cancellation:
+                raise
+            await self.release.wait()
 
 
 class SpyTransport:
     def __init__(self) -> None:
         self.history: list[tuple[str, Any]] = []
+        self.operation_tasks: list[tuple[str, asyncio.Task[Any] | None]] = []
         self.write_attempts: list[EncodedWrite] = []
         self.writes: list[EncodedWrite] = []
         self.active_operations = 0
@@ -156,6 +168,7 @@ class SpyTransport:
         self.active_operations += 1
         self.maximum_concurrency = max(self.maximum_concurrency, self.active_operations)
         self.history.append((f"{name}:start", detail))
+        self.operation_tasks.append((name, asyncio.current_task()))
         try:
             if body is None:
                 return None
@@ -183,13 +196,20 @@ class FakeObservationRepository:
 
 
 class FakeAuthorizationRepository:
-    def __init__(self, *responses: AuthorizationRecord | None) -> None:
+    def __init__(
+        self,
+        *responses: AuthorizationRecord | None,
+        current_gate: Gate | None = None,
+    ) -> None:
         self.responses: deque[AuthorizationRecord | None] = deque(responses)
         self.current_calls: list[tuple[str, float]] = []
         self.revocations: list[tuple[Any, str]] = []
+        self.current_gate = current_gate
 
     async def current(self, unit_id: str, now_mono: float) -> AuthorizationRecord | None:
         self.current_calls.append((unit_id, now_mono))
+        if self.current_gate is not None:
+            await self.current_gate.wait()
         return self.responses.popleft() if self.responses else None
 
     async def revoke(
@@ -212,7 +232,12 @@ class FakeAuditRepository:
 
 class FakeCommandEncoder:
     def encode(self, authorization: AuthorizationRecord) -> EncodedWrite:
-        return EncodedWrite(0x0200, (1, authorization.active_watts, authorization.reactive_vars))
+        sign = (
+            -1
+            if getattr(authorization.direction, "value", authorization.direction) == "charge"
+            else 1
+        )
+        return EncodedWrite(0x0200, (1, sign * authorization.watts, authorization.reactive_vars))
 
     def zero(self) -> EncodedWrite:
         return EncodedWrite(0x0200, (1, 0, 0))
@@ -273,12 +298,12 @@ async def ready_actor(actor: Any, observation: ObservationRecord | None = None) 
     await actor.arm()
 
 
-async def settle_until(predicate: Callable[[], bool], turns: int = 50) -> None:
+async def settle_until(predicate: Callable[[], bool], turns: int = 50) -> bool:
     for _ in range(turns):
         if predicate():
-            return
+            return True
         await asyncio.sleep(0)
-    pytest.fail("deterministic condition was not reached")
+    return predicate()
 
 
 async def test_boot_is_observe_only_and_requires_qualification_then_explicit_arm(
@@ -313,12 +338,16 @@ async def test_transport_operations_are_serialized_by_the_actor(contract: Any) -
 
     assert transport.maximum_concurrency == 1
     assert transport.writes == [EncodedWrite(0x0200, (1, 500, 0))]
+    protocol_tasks = {
+        task for operation, task in transport.operation_tasks if operation in {"read", "write"}
+    }
+    assert len(protocol_tasks) == 1, "one actor mailbox task must be the sole socket owner"
     await actor.shutdown()
 
 
 async def test_every_heartbeat_fetches_and_consumes_fresh_authorization(contract: Any) -> None:
-    first = AuthorizationRecord(cycle_id=10, active_watts=400)
-    second = AuthorizationRecord(cycle_id=11, active_watts=600)
+    first = AuthorizationRecord(cycle_id=10, watts=400)
+    second = AuthorizationRecord(cycle_id=11, watts=600)
     repository = FakeAuthorizationRepository(first, second)
     actor, _, transport, _, _ = make_actor(contract, authorizations=repository)
     await ready_actor(actor)
@@ -338,7 +367,7 @@ async def test_single_cycle_authorization_cannot_be_reused(contract: Any) -> Non
     authorization = AuthorizationRecord(cycle_id=7)
     actor, _, transport, _, authorizations = make_actor(
         contract,
-        authorizations=FakeAuthorizationRepository(authorization, authorization),
+        authorizations=FakeAuthorizationRepository(authorization, replace(authorization)),
     )
     await ready_actor(actor)
 
@@ -347,6 +376,92 @@ async def test_single_cycle_authorization_cannot_be_reused(contract: Any) -> Non
 
     assert transport.writes == [EncodedWrite(0x0200, (1, 500, 0))]
     assert any(reason == "authorization_already_used" for _, reason in authorizations.revocations)
+    await actor.shutdown()
+
+
+async def test_authorization_is_consumed_before_entering_the_transport_await(
+    contract: Any,
+) -> None:
+    gate = Gate()
+    transport = SpyTransport()
+    transport.write_gates.append(gate)
+    authorization = AuthorizationRecord(cycle_id=7)
+    actor, _, _, _, authorizations = make_actor(
+        contract,
+        transport=transport,
+        authorizations=FakeAuthorizationRepository(authorization, replace(authorization)),
+    )
+    await ready_actor(actor)
+
+    first_attempt = asyncio.create_task(actor.heartbeat_once())
+    entered_write = await settle_until(gate.entered.is_set)
+    first_attempt.cancel()
+    await asyncio.gather(first_attempt, return_exceptions=True)
+    assert entered_write, "heartbeat never reached the controlled write boundary"
+    await actor.heartbeat_once()
+
+    nonzero_attempts = [attempt for attempt in transport.write_attempts if attempt.values[1] != 0]
+    assert nonzero_attempts == [EncodedWrite(0x0200, (1, 500, 0))]
+    assert any(reason == "authorization_already_used" for _, reason in authorizations.revocations)
+    await actor.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("now_mono", "expected_reason"),
+    [
+        (99.999, "authorization_not_yet_valid"),
+        (101.0, "authorization_expired"),
+        (101.001, "authorization_expired"),
+    ],
+)
+async def test_authorization_time_window_is_closed_at_both_unsafe_boundaries(
+    contract: Any,
+    now_mono: float,
+    expected_reason: str,
+) -> None:
+    clock = FakeClock(now_mono)
+    authorization = AuthorizationRecord(not_before_mono=100.0, expires_at_mono=101.0)
+    actor, _, transport, _, authorizations = make_actor(
+        contract,
+        clock=clock,
+        authorizations=FakeAuthorizationRepository(authorization),
+    )
+    await ready_actor(actor)
+
+    await actor.heartbeat_once()
+
+    assert transport.write_attempts == []
+    assert any(reason == expected_reason for _, reason in authorizations.revocations)
+    await actor.shutdown()
+
+
+async def test_authorization_expiring_during_lookup_is_rechecked_before_write(
+    contract: Any,
+) -> None:
+    lookup_gate = Gate()
+    clock = FakeClock()
+    authorization = AuthorizationRecord(expires_at_mono=100.5)
+    repository = FakeAuthorizationRepository(authorization, current_gate=lookup_gate)
+    actor, _, transport, _, authorizations = make_actor(
+        contract,
+        clock=clock,
+        authorizations=repository,
+    )
+    await ready_actor(actor)
+
+    heartbeat = asyncio.create_task(actor.heartbeat_once())
+    entered_lookup = await settle_until(lookup_gate.entered.is_set)
+    if not entered_lookup:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+    assert entered_lookup, "heartbeat never requested current authorization"
+    clock.advance(0.5)
+    lookup_gate.release.set()
+    await heartbeat
+
+    assert repository.current_calls == [(UNIT_ID, 100.0)]
+    assert transport.write_attempts == []
+    assert any(reason == "authorization_expired" for _, reason in authorizations.revocations)
     await actor.shutdown()
 
 
@@ -365,7 +480,9 @@ async def test_observation_sequence_mismatch_rejects_authorization(
     await actor.heartbeat_once()
 
     assert transport.writes == []
-    assert any(reason == "observation_sequence_mismatch" for _, reason in authorizations.revocations)
+    assert any(
+        reason == "observation_sequence_mismatch" for _, reason in authorizations.revocations
+    )
     await actor.shutdown()
 
 
@@ -373,9 +490,9 @@ async def test_generation_fence_rejects_old_authorization_and_accepts_current_on
     contract: Any,
 ) -> None:
     old = AuthorizationRecord(generation=0, cycle_id=1)
-    current = AuthorizationRecord(generation=1, cycle_id=2, active_watts=700)
+    current = AuthorizationRecord(generation=1, cycle_id=2, watts=700)
     repository = FakeAuthorizationRepository(old, current)
-    actor, _, transport, _, _ = make_actor(contract, authorizations=repository)
+    actor, _, transport, _, authorizations = make_actor(contract, authorizations=repository)
     await ready_actor(actor)
 
     assert await actor.fence("replacement") == 1
@@ -383,6 +500,7 @@ async def test_generation_fence_rejects_old_authorization_and_accepts_current_on
     await actor.heartbeat_once()
 
     assert transport.writes == [EncodedWrite(0x0200, (1, 700, 0))]
+    assert any(reason == "generation_mismatch" for _, reason in authorizations.revocations)
     await actor.shutdown()
 
 
@@ -400,14 +518,83 @@ async def test_replacement_cancels_inflight_old_generation_before_it_can_write(
     await ready_actor(actor)
 
     heartbeat = asyncio.create_task(actor.heartbeat_once())
-    await gate.entered.wait()
+    entered_write = await settle_until(gate.entered.is_set)
+    if not entered_write:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+    assert entered_write, "heartbeat never reached the controlled write boundary"
     replacement = asyncio.create_task(actor.fence("replacement"))
-    await settle_until(lambda: heartbeat.done())
+    heartbeat_cancelled = await settle_until(heartbeat.done)
     gate.release.set()
-    await replacement
+    await asyncio.gather(heartbeat, replacement, return_exceptions=True)
 
+    assert heartbeat_cancelled, "replacement did not cancel old-generation work"
     assert EncodedWrite(0x0200, (1, 500, 0)) not in transport.writes
     assert actor.generation == 1
+    await actor.shutdown()
+
+
+async def test_fence_is_published_before_cancelling_an_authorization_lookup(
+    contract: Any,
+) -> None:
+    lookup_gate = Gate(ignore_cancellation=True)
+    repository = FakeAuthorizationRepository(
+        AuthorizationRecord(generation=0),
+        current_gate=lookup_gate,
+    )
+    actor, _, transport, _, _ = make_actor(contract, authorizations=repository)
+    await ready_actor(actor)
+
+    heartbeat = asyncio.create_task(actor.heartbeat_once())
+    entered_lookup = await settle_until(lookup_gate.entered.is_set)
+    if not entered_lookup:
+        heartbeat.cancel()
+        lookup_gate.release.set()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+    assert entered_lookup, "heartbeat never requested current authorization"
+    replacement = asyncio.create_task(actor.fence("replacement"))
+    generation_published = await settle_until(lambda: actor.generation == 1)
+
+    assert not lookup_gate.release.is_set()
+    assert transport.write_attempts == []
+
+    lookup_gate.release.set()
+    await asyncio.gather(heartbeat, replacement, return_exceptions=True)
+
+    assert generation_published, "fence was not visible before cancellation completed"
+    assert actor.generation == 1
+    assert transport.write_attempts == []
+    await actor.shutdown()
+
+
+async def test_late_old_generation_acknowledgement_cannot_restore_active_state(
+    contract: Any,
+) -> None:
+    write_gate = Gate(ignore_cancellation=True)
+    transport = SpyTransport()
+    transport.write_gates.append(write_gate)
+    actor, _, _, _, _ = make_actor(
+        contract,
+        transport=transport,
+        authorizations=FakeAuthorizationRepository(AuthorizationRecord(generation=0)),
+    )
+    await ready_actor(actor)
+
+    heartbeat = asyncio.create_task(actor.heartbeat_once())
+    entered_write = await settle_until(write_gate.entered.is_set)
+    if not entered_write:
+        heartbeat.cancel()
+        write_gate.release.set()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+    assert entered_write, "heartbeat never reached the controlled write boundary"
+    replacement = asyncio.create_task(actor.fence("replacement"))
+    generation_published = await settle_until(lambda: actor.generation == 1)
+    write_gate.release.set()
+    await asyncio.gather(heartbeat, replacement, return_exceptions=True)
+
+    assert generation_published, "replacement did not publish its fence before cancellation"
+    assert actor.generation == 1
+    assert actor.lifecycle is not contract.UnitLifecycle.ACTIVE
     await actor.shutdown()
 
 
@@ -448,12 +635,17 @@ async def test_shutdown_fences_cancels_nonzero_attempt_then_zeroes_and_closes(
     await ready_actor(actor)
 
     heartbeat = asyncio.create_task(actor.heartbeat_once())
-    await gate.entered.wait()
+    entered_write = await settle_until(gate.entered.is_set)
+    if not entered_write:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+    assert entered_write, "heartbeat never reached the controlled write boundary"
     shutdown = asyncio.create_task(actor.shutdown())
-    await settle_until(lambda: heartbeat.done())
+    heartbeat_cancelled = await settle_until(heartbeat.done)
     gate.release.set()
-    await shutdown
+    await asyncio.gather(heartbeat, shutdown, return_exceptions=True)
 
+    assert heartbeat_cancelled, "shutdown did not cancel nonzero work before zeroing"
     assert EncodedWrite(0x0200, (1, 500, 0)) not in transport.writes
     assert EncodedWrite(0x0200, (1, 0, 0)) in transport.writes
     assert actor.lifecycle is contract.UnitLifecycle.STOPPING
@@ -472,15 +664,24 @@ async def test_heartbeat_preempts_an_overdue_telemetry_read(contract: Any) -> No
     await ready_actor(actor)
 
     poll = asyncio.create_task(actor.poll_once())
-    await read_gate.entered.wait()
+    entered_read = await settle_until(read_gate.entered.is_set)
+    if not entered_read:
+        poll.cancel()
+        await asyncio.gather(poll, return_exceptions=True)
+    assert entered_read, "poll never reached the controlled read boundary"
     heartbeat = asyncio.create_task(actor.heartbeat_once())
     clock.advance(0.81)
-    await settle_until(lambda: heartbeat.done())
+    heartbeat_finished = await settle_until(heartbeat.done)
 
+    read_gate.release.set()
+    await asyncio.gather(poll, heartbeat, return_exceptions=True)
+
+    assert heartbeat_finished, "overdue telemetry blocked the heartbeat deadline"
     assert any(name == "read:cancelled" for name, _ in transport.history)
     assert transport.writes == [EncodedWrite(0x0200, (1, 500, 0))]
-    read_gate.release.set()
-    await asyncio.gather(poll, return_exceptions=True)
+    history_names = [name for name, _ in transport.history]
+    assert history_names.index("read:end") < history_names.index("write:start")
+    assert transport.maximum_concurrency == 1
     await actor.shutdown()
 
 
@@ -496,3 +697,35 @@ async def test_no_nonzero_write_is_possible_after_stop(contract: Any) -> None:
 
     assert tuple(transport.writes) == writes_at_stop
     assert transport.writes[-1] == EncodedWrite(0x0200, (1, 0, 0))
+
+
+async def test_concurrent_shutdown_is_idempotent_and_stop_dominates_queued_renewal(
+    contract: Any,
+) -> None:
+    lookup_gate = Gate(ignore_cancellation=True)
+    repository = FakeAuthorizationRepository(
+        AuthorizationRecord(),
+        AuthorizationRecord(),
+        current_gate=lookup_gate,
+    )
+    actor, _, transport, _, _ = make_actor(contract, authorizations=repository)
+    await ready_actor(actor)
+
+    heartbeat = asyncio.create_task(actor.heartbeat_once())
+    entered_lookup = await settle_until(lookup_gate.entered.is_set)
+    if not entered_lookup:
+        heartbeat.cancel()
+        lookup_gate.release.set()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+    assert entered_lookup, "heartbeat never requested current authorization"
+    first_shutdown = asyncio.create_task(actor.shutdown())
+    second_shutdown = asyncio.create_task(actor.shutdown())
+    stop_published = await settle_until(lambda: actor.generation > 0)
+    lookup_gate.release.set()
+    await asyncio.gather(heartbeat, first_shutdown, second_shutdown, return_exceptions=True)
+
+    assert stop_published, "shutdown did not publish its generation fence"
+    assert [write for write in transport.writes if write.values[1] != 0] == []
+    assert transport.writes.count(EncodedWrite(0x0200, (1, 0, 0))) == 1
+    assert [name for name, _ in transport.history].count("close:start") == 1
+    assert actor.lifecycle is contract.UnitLifecycle.STOPPING

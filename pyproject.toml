@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "energypod-controller"
+version = "0.1.0"
+description = "Safety-first fleet controller for BYD EnergyPod systems"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.141.1",
+  "fastmcp==3.4.7",
+  "httpx==0.28.1",
+  "prometheus-client==0.22.1",
+  "pydantic==2.11.7",
+  "pydantic-settings==2.10.1",
+  "pymodbus==3.15.0",
+  "PyYAML==6.0.2",
+  "uvicorn[standard]==0.35.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "hypothesis==6.138.2",
+  "mypy==1.17.1",
+  "pytest==8.4.1",
+  "pytest-asyncio==1.1.0",
+  "pytest-cov==6.2.1",
+  "ruff==0.12.9",
+]
+
+[project.scripts]
+energypod = "energypod.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/energypod"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["energypod"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+fail_under = 90
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ASYNC", "S", "RUF"]
+ignore = ["S101"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["energypod"]

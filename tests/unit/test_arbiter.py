@@ -9,8 +9,26 @@ from typing import Any
 
 import pytest
 
-
 NOW = 100.0
+STOP_ACKNOWLEDGE_SCOPE = "stop-acknowledge"
+
+
+class FakeIntentRepository:
+    def __init__(self, *intents: Any) -> None:
+        self._intents = {intent.id: intent for intent in intents}
+        self.removed_ids: list[str] = []
+
+    def active(self) -> tuple[Any, ...]:
+        return tuple(self._intents.values())
+
+    def add(self, intent: Any) -> None:
+        self._intents[intent.id] = intent
+
+    def remove(self, intent_id: str) -> None:
+        if intent_id not in self._intents:
+            raise KeyError(intent_id)
+        self.removed_ids.append(intent_id)
+        del self._intents[intent_id]
 
 
 @pytest.fixture(scope="module")
@@ -33,7 +51,8 @@ def make_intent(
     *,
     intent_id: str,
     source: Any,
-    created_at_mono: float = 90.0,
+    accepted_at_mono: float = 90.0,
+    acceptance_revision: int = 1,
     duration_s: float = 20.0,
     direction: Any | None = None,
     watts: int = 1_000,
@@ -51,7 +70,8 @@ def make_intent(
         direction=selected_direction,
         watts=watts,
         duration_s=duration_s,
-        created_at_mono=created_at_mono,
+        accepted_at_mono=accepted_at_mono,
+        acceptance_revision=acceptance_revision,
         actor_identity=actor_identity,
     )
 
@@ -66,7 +86,7 @@ def test_intent_is_expired_at_and_after_its_deadline(api: SimpleNamespace, now: 
         api,
         intent_id="expires",
         source=api.IntentSource.MANUAL,
-        created_at_mono=100.0,
+        accepted_at_mono=100.0,
         duration_s=10.0,
     )
     assert api.IntentArbiter().select([intent], now) is None
@@ -77,7 +97,7 @@ def test_intent_is_live_immediately_before_its_deadline(api: SimpleNamespace) ->
         api,
         intent_id="live",
         source=api.IntentSource.MANUAL,
-        created_at_mono=100.0,
+        accepted_at_mono=100.0,
         duration_s=10.0,
     )
     assert api.IntentArbiter().select([intent], 109.999).id == "live"
@@ -88,7 +108,7 @@ def test_future_dated_intent_is_not_yet_eligible(api: SimpleNamespace) -> None:
         api,
         intent_id="future",
         source=api.IntentSource.MANUAL,
-        created_at_mono=100.001,
+        accepted_at_mono=100.001,
     )
     assert api.IntentArbiter().select([future], NOW) is None
 
@@ -117,39 +137,48 @@ def test_priority_order_is_emergency_manual_agent_optimizer_schedule(
         ("OPTIMIZER", "SCHEDULE"),
     ],
 )
-def test_each_adjacent_priority_dominates_regardless_of_creation_time(
+def test_each_adjacent_priority_dominates_regardless_of_acceptance_revision(
     api: SimpleNamespace, winner_source: str, loser_source: str
 ) -> None:
     higher = make_intent(
         api,
         intent_id="higher",
         source=getattr(api.IntentSource, winner_source),
-        created_at_mono=80.0,
+        accepted_at_mono=80.0,
+        acceptance_revision=1,
         duration_s=30.0,
     )
     newer_lower = make_intent(
         api,
         intent_id="newer-lower",
         source=getattr(api.IntentSource, loser_source),
-        created_at_mono=99.0,
+        accepted_at_mono=99.0,
+        acceptance_revision=999,
     )
     assert api.IntentArbiter().select([newer_lower, higher], NOW).id == "higher"
 
 
-def test_newest_creation_time_wins_within_equal_priority(api: SimpleNamespace) -> None:
-    older = make_intent(
+def test_highest_server_acceptance_revision_wins_within_equal_priority(
+    api: SimpleNamespace,
+) -> None:
+    later_but_lower_revision = make_intent(
         api,
-        intent_id="older",
+        intent_id="later-lower-revision",
         source=api.IntentSource.MANUAL,
-        created_at_mono=90.0,
+        accepted_at_mono=99.0,
+        acceptance_revision=41,
     )
-    newer = make_intent(
+    earlier_but_higher_revision = make_intent(
         api,
-        intent_id="newer",
+        intent_id="earlier-higher-revision",
         source=api.IntentSource.MANUAL,
-        created_at_mono=99.0,
+        accepted_at_mono=90.0,
+        acceptance_revision=42,
     )
-    assert api.IntentArbiter().select([newer, older], NOW).id == "newer"
+    winner = api.IntentArbiter().select(
+        [later_but_lower_revision, earlier_but_higher_revision], NOW
+    )
+    assert winner.id == "earlier-higher-revision"
 
 
 def test_lexicographically_smallest_id_is_stable_final_tie_break(
@@ -159,13 +188,15 @@ def test_lexicographically_smallest_id_is_stable_final_tie_break(
         api,
         intent_id="intent-a",
         source=api.IntentSource.AGENT,
-        created_at_mono=99.0,
+        accepted_at_mono=99.0,
+        acceptance_revision=7,
     )
     zulu = make_intent(
         api,
         intent_id="intent-z",
         source=api.IntentSource.AGENT,
-        created_at_mono=99.0,
+        accepted_at_mono=98.0,
+        acceptance_revision=7,
     )
     assert api.IntentArbiter().select([zulu, alpha], NOW).id == "intent-a"
 
@@ -191,14 +222,14 @@ def test_expiry_reveals_next_priority_without_mutating_input(api: SimpleNamespac
         api,
         intent_id="manual",
         source=api.IntentSource.MANUAL,
-        created_at_mono=90.0,
+        accepted_at_mono=90.0,
         duration_s=5.0,
     )
     schedule = make_intent(
         api,
         intent_id="schedule",
         source=api.IntentSource.SCHEDULE,
-        created_at_mono=90.0,
+        accepted_at_mono=90.0,
         duration_s=20.0,
     )
     intents = [manual, schedule]
@@ -255,7 +286,7 @@ def test_emergency_stop_latches_after_first_selection_and_ignores_ttl(
         api,
         intent_id="stop-1",
         source=api.IntentSource.EMERGENCY_STOP,
-        created_at_mono=99.0,
+        accepted_at_mono=99.0,
         duration_s=1.5,
         actor_identity="safety-owner",
     )
@@ -263,7 +294,7 @@ def test_emergency_stop_latches_after_first_selection_and_ignores_ttl(
         api,
         intent_id="manual",
         source=api.IntentSource.MANUAL,
-        created_at_mono=109.0,
+        accepted_at_mono=109.0,
     )
 
     assert arbiter.select([stop], NOW).id == "stop-1"
@@ -275,73 +306,91 @@ def test_expired_unseen_emergency_stop_does_not_latch(api: SimpleNamespace) -> N
         api,
         intent_id="already-expired",
         source=api.IntentSource.EMERGENCY_STOP,
-        created_at_mono=90.0,
+        accepted_at_mono=90.0,
         duration_s=5.0,
     )
     assert api.IntentArbiter().select([stop], NOW) is None
 
 
-def test_only_latch_owner_can_clear_emergency_stop(api: SimpleNamespace) -> None:
-    arbiter = api.IntentArbiter()
+def test_emergency_stop_acknowledgement_requires_operator_scope(
+    api: SimpleNamespace,
+) -> None:
     stop = make_intent(
         api,
-        intent_id="stop-owned",
+        intent_id="stop-protected",
         source=api.IntentSource.EMERGENCY_STOP,
         actor_identity="owner-a",
     )
-    arbiter.select([stop], NOW)
+    repository = FakeIntentRepository(stop)
+    arbiter = api.IntentArbiter(intent_repository=repository)
+    arbiter.select(repository.active(), NOW)
 
-    with pytest.raises(PermissionError, match="owner"):
-        arbiter.clear_emergency_stop(
-            intent_id="stop-owned", actor_identity="owner-b"
+    with pytest.raises(PermissionError):
+        arbiter.acknowledge_emergency_stop(
+            intent_id="stop-protected",
+            actor_identity="operator-without-scope",
+            operator_scopes=frozenset(),
         )
 
-    assert arbiter.select([], NOW + 1).id == "stop-owned"
+    assert repository.removed_ids == []
+    assert arbiter.select(repository.active(), NOW + 1).id == "stop-protected"
 
 
-def test_clear_requires_the_current_latched_intent_id(api: SimpleNamespace) -> None:
-    arbiter = api.IntentArbiter()
+def test_acknowledgement_requires_the_exact_latched_stop_id(api: SimpleNamespace) -> None:
     stop = make_intent(
         api,
         intent_id="stop-current",
         source=api.IntentSource.EMERGENCY_STOP,
         actor_identity="owner-a",
     )
-    arbiter.select([stop], NOW)
+    repository = FakeIntentRepository(stop)
+    arbiter = api.IntentArbiter(intent_repository=repository)
+    arbiter.select(repository.active(), NOW)
 
-    with pytest.raises(KeyError, match="stop-current"):
-        arbiter.clear_emergency_stop(
-            intent_id="different-stop", actor_identity="owner-a"
+    with pytest.raises(KeyError):
+        arbiter.acknowledge_emergency_stop(
+            intent_id="different-stop",
+            actor_identity="authorized-operator",
+            operator_scopes=frozenset({STOP_ACKNOWLEDGE_SCOPE}),
         )
 
+    assert repository.removed_ids == []
+    assert arbiter.select(repository.active(), NOW + 1).id == "stop-current"
 
-def test_owner_clear_releases_latch_and_allows_normal_arbitration(
+
+def test_authorized_operator_acknowledgement_removes_intent_and_releases_latch(
     api: SimpleNamespace,
 ) -> None:
-    arbiter = api.IntentArbiter()
     stop = make_intent(
         api,
-        intent_id="stop-clearable",
+        intent_id="stop-acknowledged",
         source=api.IntentSource.EMERGENCY_STOP,
         actor_identity="owner-a",
     )
     manual = make_intent(
         api,
-        intent_id="manual-after-clear",
+        intent_id="manual-after-acknowledgement",
         source=api.IntentSource.MANUAL,
-        created_at_mono=99.0,
+        accepted_at_mono=99.0,
     )
-    arbiter.select([stop], NOW)
+    repository = FakeIntentRepository(stop, manual)
+    arbiter = api.IntentArbiter(intent_repository=repository)
+    arbiter.select(repository.active(), NOW)
 
-    arbiter.clear_emergency_stop(
-        intent_id="stop-clearable", actor_identity="owner-a"
+    arbiter.acknowledge_emergency_stop(
+        intent_id="stop-acknowledged",
+        actor_identity="different-authorized-operator",
+        operator_scopes=frozenset({STOP_ACKNOWLEDGE_SCOPE}),
     )
 
-    assert arbiter.select([manual], NOW + 1).id == "manual-after-clear"
+    assert repository.removed_ids == ["stop-acknowledged"]
+    assert [intent.id for intent in repository.active()] == ["manual-after-acknowledgement"]
+    assert arbiter.select(repository.active(), NOW + 1).id == "manual-after-acknowledgement"
 
 
-def test_new_stop_relatches_after_a_previous_stop_was_cleared(api: SimpleNamespace) -> None:
-    arbiter = api.IntentArbiter()
+def test_new_stop_relatches_after_a_previous_stop_was_acknowledged(
+    api: SimpleNamespace,
+) -> None:
     first = make_intent(
         api,
         intent_id="first-stop",
@@ -353,12 +402,19 @@ def test_new_stop_relatches_after_a_previous_stop_was_cleared(api: SimpleNamespa
         intent_id="second-stop",
         source=api.IntentSource.EMERGENCY_STOP,
         actor_identity="owner-b",
-        created_at_mono=101.0,
+        accepted_at_mono=101.0,
     )
-    arbiter.select([first], NOW)
-    arbiter.clear_emergency_stop(intent_id="first-stop", actor_identity="owner-a")
+    repository = FakeIntentRepository(first)
+    arbiter = api.IntentArbiter(intent_repository=repository)
+    arbiter.select(repository.active(), NOW)
+    arbiter.acknowledge_emergency_stop(
+        intent_id="first-stop",
+        actor_identity="authorized-operator",
+        operator_scopes=frozenset({STOP_ACKNOWLEDGE_SCOPE}),
+    )
+    repository.add(second)
 
-    assert arbiter.select([second], 101.0).id == "second-stop"
+    assert arbiter.select(repository.active(), 101.0).id == "second-stop"
     assert arbiter.select([], 200.0).id == "second-stop"
 
 
@@ -384,7 +440,8 @@ def test_emergency_stop_domain_contract_rejects_nonzero_or_nonidle_payload(
             direction=api.Direction.DISCHARGE,
             watts=1,
             duration_s=10.0,
-            created_at_mono=NOW,
+            accepted_at_mono=NOW,
+            acceptance_revision=1,
             actor_identity="owner-a",
         )
 
