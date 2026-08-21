@@ -40,6 +40,8 @@ reactive limit (zero by default), blocking fault codes, and debug-mode enable (f
 - `UnitIO.read_holding(address, count)`, `write_registers(address, values)`, `close()`.
 - `ObservationRepository.latest(unit_id)`, `all_latest()`, `append(observation)`, `history(...)`.
 - `AuthorizationRepository.publish(batch)`, `current(unit_id, now_mono)`, `revoke(...)`.
+- `IntentRepository.add(intent)`, `active(now_mono)` (expiry-filtered; emergency-stop
+  intents stay active until acknowledged), `remove(stop_id)` for acknowledged stops.
 - `AuditRepository.append(event)`, `recent(limit)`.
 - `ScheduleRepository.get()`, `replace(version, entries)`.
 - Provider families: `TariffProvider`, `WeatherProvider`, `PvForecastProvider`,
@@ -144,3 +146,109 @@ priority are rejected. Evaluation returns a short-lived schedule intent, never a
 - Latched emergency stops are safety-critical state, not a bounded replay cache: they remain
   acknowledgeable through the exact-id acknowledgement endpoint regardless of how many stops
   accumulate, and the idempotency capacity bound never evicts a latched stop.
+
+## Application service facade
+
+`energypod.application.service.EnergyServiceFacade` is the only implementation of the
+`EnergyService` protocol behind REST and MCP. It composes the intent, observation,
+authorization, audit, and schedule repositories, the kernel control surface, the fleet
+coordinator, the event bus, and per-unit actor handles.
+
+- `snapshot(principal)` returns one immutable fleet view: `site_id`, `snapshot_sequence`
+  (from the event bus), `captured_at` wall time, and per-unit `lifecycle`, `telemetry_age_s`,
+  `quality`, `requested_power` (from the newest active intent for that unit), `authorized_power`
+  (from the current authorization, if any), and `measured_watts` (from the latest observation).
+  It performs no I/O beyond repository reads and never triggers control.
+- `health(principal)` separates `liveness` (process-up), `service_readiness` (repositories and
+  coordinator responsive), and `control_readiness` (every unit qualified and at least one
+  armed, with blocking reasons listed per unit). Readiness never fabricates optimism: an
+  unknown unit state is a reason, not an assumption.
+- `recent_audit(principal, limit)` is a bounded, newest-first read over the durable audit
+  repository with a stable cursor; it never mutates.
+- `submit_intent(...)` validates and accepts one intent with a server-assigned monotonic
+  `acceptance_revision`, stores it through the intent repository, and returns the acceptance
+  view (`intent_id`, `acceptance_revision`, `accepted_at_monotonic`, `status: accepted`,
+  requested/authorized/measured projections). It never writes hardware and never publishes
+  authorization; only the kernel tick does that.
+- `arm(principal, unit_ids)` arms exactly the requested qualified, disarmed units through
+  their owning actors and reports per-unit outcomes; partial failure is visible, never
+  silent. Arming is refused for unknown units, unqualified units, or units inhibited with a
+  latched cause that has not been acknowledged. Disarm is the same path inverted and always
+  succeeds for known units.
+- `emergency_stop(principal, unit_ids, reason)` creates one latched stop intent through the
+  intent repository, immediately advances the fleet generation (fencing all outstanding
+  authority before returning), requests the bounded zero through the affected actors, and
+  records a stop id that `acknowledge_emergency_stop(principal, stop_id)` accepts exactly;
+  acknowledgement removes the latched stop so it cannot relatch.
+- Every facade mutation is audited and published to the event bus. The facade rejects
+  cross-site principals and never trusts caller-supplied identity, revisions, or sequences.
+
+## Event bus
+
+`energypod.application.events.EventBus` is the only `EventSource`.
+
+- Every published event receives one strictly monotonic sequence; there are no gaps for
+  successfully published events. `snapshot_sequence()` is the sequence of the latest snapshot
+  state.
+- `subscribe(after_sequence)` yields events with `sequence > after_sequence` in order. When
+  `after_sequence` is older than the retained window, subscription starts at the next event
+  after the window with an explicit discontinuity marker so clients resynchronize from a
+  snapshot instead of replaying stale history.
+- Retention is a bounded most-recent window. Publishers are never blocked by slow consumers:
+  the bounded per-subscriber queue drops to a resync marker.
+- Event bodies are JSON-serializable, credential-free, and carry `type`, `sequence`,
+  `occurred_at`, and a minimal payload. Observation, decision/audit, lifecycle, arming, and
+  stop events are the initial vocabulary.
+
+## Runtime composition and entry point
+
+- `energypod.runtime.composition.build_runtime(config)` constructs the whole graph
+  (repositories, coordinator, audit factory, kernel, actors, event bus, facade, API app, MCP
+  server) and is the only composition point. Construction validates wiring eagerly; a
+  misconfiguration raises before any task starts.
+- Boot is observe-only: no arming, authorization, or active command is restored from
+  persistence; the process starts disarmed regardless of prior state.
+- `energypod.main` exposes `check-config` (validate and print the effective configuration,
+  zero side effects), `run` (serve the composed API), and `simulate` (compose with simulator
+  transports and in-memory persistence regardless of configured database). Importing
+  `energypod.main` has no side effects; `main(argv)` returns an exit code and is callable
+  from tests without process teardown tricks.
+- Supervision runs as structured asyncio tasks in one process: the kernel tick loop at the
+  heartbeat cadence, per-unit actor loops, and event publication. Supervisor or task failure
+  fences every generation and runs actor shutdown with the bounded-zero contract before the
+  process exits.
+
+## Deterministic simulator
+
+- `energypod.simulator.pod.SimulatedEnergyPod` models one unit as a register bank over the
+  evidence-backed IoT layout: identity/profile registers, layout probe (`0x5000` seven
+  registers, register 0 > 10), telemetry blocks, cell blocks with their own slower capture
+  cadence, and BMS/BECU status words. Reads return exactly what the evidence matrix decodes.
+- The device model latches applied `0x0200` PQ writes, expires to idle under watchdog
+  timeout, derives deterministic telemetry from the applied setpoint on a seeded schedule,
+  and advances monotonic telemetry/cell sequences per poll. All timing is injected
+  monotonic time; the device model never reads a clock and never uses randomness without an
+  injected seed. Identical scenario scripts produce identical register values, sequences,
+  audit events, and event-bus sequences.
+- `energypod.simulator.transport.SimulatorTransport` implements the actor transport port
+  against the register bank and enforces the production write gate: only `0x0200` PQ writes
+  are accepted; any other write raises. It never opens a socket: on-wire framing stays a
+  commissioning capture item and must not be simulated as if known.
+- Scenario hooks inject faults, warnings, disconnects, and malformed registers for testing.
+  The simulator is a distinct deployment target composed through `build_runtime` with
+  simulator transports and in-memory persistence.
+
+## Inhibit acknowledgement
+
+- Entering `INHIBITED` records a cause class: `TRANSIENT`, `QUALIFIED`, or `LATCHED`
+  (critical blocking faults, identity mismatch, repeated timing failure, or external-writer
+  evidence per policy).
+- `TRANSIENT`/`QUALIFIED` recover through stable qualifying samples to `DISARMED` (existing
+  behavior). `LATCHED` additionally requires one explicit acknowledgement:
+  `POST /api/v1/units/{unit_id}/inhibit/acknowledge`, requiring the `arm` scope and an
+  interactive principal, idempotent, audited, and published as an event.
+- Acknowledgement only clears the latch; the unit still needs stable qualifying samples to
+  reach `DISARMED`, then an explicit arm. It never bypasses the safety kernel, and a still
+  present blocking fault re-latches on the next observation.
+- The actor exposes the inhibit cause class and its latched flag through the facade
+  snapshot; the REST surface is exactly this one new endpoint and nothing else.
