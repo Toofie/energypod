@@ -174,6 +174,24 @@ class InMemoryAuthorizationRepository:
                 return None
             return authorization
 
+    def revoked_through(self, unit_ids: Iterable[str]) -> int:
+        """The highest generation permanently fenced for these units.
+
+        Returns ``-1`` when no member has ever been fenced.  This is the
+        reconciliation input for the authority-generation coordinator: a
+        mint at or below this value will be fenced by ``publish``, so the
+        epoch the kernel consults must stand strictly beyond it (2026-08-23
+        publish-fence generation desync).
+        """
+        targets = set(unit_ids)
+        if any(
+            not isinstance(target, str) or not target or target != target.strip()
+            for target in targets
+        ):
+            raise ValueError("unit_ids must contain normalized identifiers")
+        with self._lock:
+            return max((self._revoked_through.get(target, -1) for target in targets), default=-1)
+
     def revoke(
         self,
         *,

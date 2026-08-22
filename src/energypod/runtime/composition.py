@@ -580,6 +580,9 @@ class _AsyncAuthorizationRepository:
     async def peek(self, unit_id: str) -> Any | None:
         return self._store.peek(unit_id)
 
+    async def revoked_through(self, unit_ids: Iterable[str]) -> int:
+        return self._store.revoked_through(unit_ids)
+
     async def revoke(
         self,
         unit_ids: Iterable[str] | None = None,
