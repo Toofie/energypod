@@ -257,7 +257,10 @@ class ControllerConfig(_FrozenModel):
     timing: TimingConfig
     policy: PolicyConfig | None = None
     authentication: AuthenticationConfig | None = None
-    storage: StorageConfig
+    # API_CONTRACTS "Runtime composition and entry point" grants fully
+    # in-memory persistence when no database path is configured, so storage
+    # is optional; when present it must identify a durable database file.
+    storage: StorageConfig | None = None
 
     @field_validator("units")
     @classmethod

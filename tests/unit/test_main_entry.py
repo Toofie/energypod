@@ -228,14 +228,14 @@ def call_main(
 ) -> Invocation:
     """Call main in-process; a SystemExit escape is recorded, never honored."""
     effective = runner if runner is not None else ServerRunner()
-    capsys.read_outerr()
+    capsys.readouterr()
     try:
         exit_code = module.main(argv, server_runner=effective)
     except SystemExit as exc:
-        captured = capsys.read_outerr()
+        captured = capsys.readouterr()
         code = exc.code if isinstance(exc.code, int) else None
         return Invocation(list(argv), code, True, effective, captured.out, captured.err)
-    captured = capsys.read_outerr()
+    captured = capsys.readouterr()
     code = exit_code if isinstance(exit_code, int) else None
     return Invocation(list(argv), code, False, effective, captured.out, captured.err)
 

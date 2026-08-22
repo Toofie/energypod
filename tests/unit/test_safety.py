@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -251,6 +252,7 @@ def test_healthy_request_preserves_direction_and_magnitude_without_reversing_it(
 
     assert decision.status is api.DecisionStatus.AUTHORIZED
     assert_reason_contract(decision)
+    assert reasons(decision) == ("safety_checks_passed",)
     setpoint = setpoints_by_unit(decision)["mid"]
     assert setpoint.direction is getattr(api.Direction, direction)
     assert setpoint.watts == 1_000
@@ -295,6 +297,7 @@ def test_missing_previous_observation_fails_closed_for_nonzero_power(
 ) -> None:
     decision = evaluate(api, previous_observations={})
     assert_rejected(decision, api)
+    assert "previous_observation_missing" in reasons(decision)
 
 
 @pytest.mark.parametrize(
@@ -317,6 +320,7 @@ def test_every_required_field_and_non_good_quality_class_fails_closed(
     decision = evaluate(api, current_observations={"mid": observation})
 
     assert_rejected(decision, api)
+    assert f"quality_{field}" in reasons(decision)
 
 
 def test_overall_telemetry_age_boundary_is_inclusive_then_stale(api: SimpleNamespace) -> None:
@@ -329,6 +333,7 @@ def test_overall_telemetry_age_boundary_is_inclusive_then_stale(api: SimpleNames
 
     assert allowed.status is api.DecisionStatus.AUTHORIZED
     assert_rejected(denied, api)
+    assert "telemetry_stale" in reasons(denied)
 
 
 @pytest.mark.parametrize(
@@ -385,6 +390,7 @@ def test_safety_kernel_defensively_rejects_raw_nonfinite_data(
         previous_observations={"mid": previous},
     )
     assert_rejected(decision, api)
+    assert "nonfinite_safety_data" in reasons(decision)
 
 
 @pytest.mark.parametrize(
@@ -541,6 +547,7 @@ def test_cell_age_boundary_is_inclusive_then_stale(api: SimpleNamespace) -> None
 
     assert allowed.status is api.DecisionStatus.AUTHORIZED
     assert_rejected(denied, api)
+    assert "cell_data_stale" in reasons(denied)
 
 
 def test_unchanged_cell_sequence_is_permitted_while_cell_data_is_fresh(
@@ -941,6 +948,339 @@ def test_core_reason_codes_are_stable_machine_vocabulary(api: SimpleNamespace) -
     )
     assert clamped.status is api.DecisionStatus.CLAMPED
     assert reasons(clamped) == ("power_clamped",)
+
+
+# Mutation testing showed reason-code strings survive whenever tests only
+# assert rejection. Each row below pins the exact machine code the kernel
+# emits for one triggering condition, because operators and audit consumers
+# match on these names.
+REASON_CODE_CASES: tuple[pytest.Param, ...] = (
+    pytest.param(
+        "invalid_direction",
+        lambda api: evaluate(
+            api, proposed_setpoints=make_proposed_setpoints(api, direction="reverse")
+        ),
+        id="invalid_direction",
+    ),
+    pytest.param(
+        "direction_power_mismatch",
+        lambda api: evaluate(
+            api,
+            proposed_setpoints=make_proposed_setpoints(
+                api, direction=api.Direction.IDLE, watts=500
+            ),
+        ),
+        id="direction_power_mismatch",
+    ),
+    pytest.param(
+        "unit_policy_missing",
+        lambda api: evaluate(
+            api,
+            proposed_setpoints=make_proposed_setpoints(api, watts_by_unit={"ghost": 1_000}),
+            current_observations={},
+            previous_observations={},
+        ),
+        id="unit_policy_missing",
+    ),
+    pytest.param(
+        "previous_observation_missing",
+        lambda api: evaluate(api, previous_observations={}),
+        id="previous_observation_missing",
+    ),
+    pytest.param(
+        "lifecycle_not_controllable",
+        lambda api: evaluate(
+            api,
+            current_observations={
+                "mid": make_observation(api, lifecycle=api.UnitLifecycle.OBSERVE_ONLY)
+            },
+        ),
+        id="lifecycle_not_controllable",
+    ),
+    pytest.param(
+        "telemetry_from_future",
+        lambda api: evaluate(
+            api,
+            current_observations={
+                "mid": make_observation(api, captured_at_mono=105.0, cell_captured_at_mono=100.0)
+            },
+        ),
+        id="telemetry_from_future",
+    ),
+    pytest.param(
+        "cell_data_missing",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_raw_observation(api, cell_captured_at_mono=math.nan)},
+            previous_observations={
+                "mid": make_observation(
+                    api,
+                    captured_at_mono=99.0,
+                    sequence=6,
+                    cell_captured_at_mono=99.0,
+                    cell_sequence=3,
+                )
+            },
+        ),
+        id="cell_data_missing",
+    ),
+    pytest.param(
+        "cell_data_from_future",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_observation(api, cell_captured_at_mono=NOW + 0.5)},
+        ),
+        id="cell_data_from_future",
+    ),
+    pytest.param(
+        "observation_time_invalid",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_observation(api)},
+            previous_observations={
+                "mid": make_raw_observation(
+                    api,
+                    captured_at_mono=math.nan,
+                    sequence=6,
+                    cell_captured_at_mono=99.0,
+                    cell_sequence=3,
+                )
+            },
+        ),
+        id="observation_time_invalid",
+    ),
+    pytest.param(
+        "observation_order_invalid",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_observation(api)},
+            previous_observations={
+                "mid": make_observation(
+                    api,
+                    captured_at_mono=100.0,
+                    sequence=6,
+                    cell_captured_at_mono=99.0,
+                    cell_sequence=3,
+                )
+            },
+        ),
+        id="observation_order_invalid",
+    ),
+    pytest.param(
+        "observation_sequence_invalid",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_observation(api)},
+            previous_observations={
+                "mid": make_observation(
+                    api,
+                    captured_at_mono=99.0,
+                    sequence=7,
+                    cell_captured_at_mono=99.0,
+                    cell_sequence=3,
+                )
+            },
+        ),
+        id="observation_sequence_invalid",
+    ),
+    pytest.param(
+        "observation_epoch_changed",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_observation(api)},
+            previous_observations={
+                "mid": make_observation(
+                    api,
+                    captured_at_mono=99.0,
+                    sequence=6,
+                    cell_captured_at_mono=99.0,
+                    cell_sequence=3,
+                    connection_epoch=5,
+                )
+            },
+        ),
+        id="observation_epoch_changed",
+    ),
+    pytest.param(
+        "soc_disagreement",
+        lambda api: evaluate(
+            api,
+            current_observations={
+                "mid": make_observation(api, system_soc_pct=56.0, bms_soc_pct=50.0)
+            },
+        ),
+        id="soc_disagreement",
+    ),
+    pytest.param(
+        "soc_below_discharge_floor",
+        lambda api: evaluate(
+            api,
+            current_observations={
+                "mid": make_observation(api, system_soc_pct=9.5, bms_soc_pct=9.5)
+            },
+        ),
+        id="soc_below_discharge_floor",
+    ),
+    pytest.param(
+        "soc_above_charge_ceiling",
+        lambda api: evaluate(
+            api,
+            proposed_setpoints=make_proposed_setpoints(api, direction=api.Direction.CHARGE),
+            current_observations={
+                "mid": make_observation(api, system_soc_pct=95.0, bms_soc_pct=95.0)
+            },
+        ),
+        id="soc_above_charge_ceiling",
+    ),
+    pytest.param(
+        "soc_jump",
+        lambda api: evaluate(
+            api,
+            current_observations={
+                "mid": make_observation(api, system_soc_pct=61.0, bms_soc_pct=61.0)
+            },
+            previous_observations={
+                "mid": make_observation(
+                    api,
+                    captured_at_mono=99.0,
+                    sequence=6,
+                    cell_captured_at_mono=99.0,
+                    cell_sequence=3,
+                    system_soc_pct=50.0,
+                    bms_soc_pct=50.0,
+                )
+            },
+        ),
+        id="soc_jump",
+    ),
+    pytest.param(
+        "cell_count_invalid",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_observation(api, cell_voltages_v=(3.30, 3.31, 3.29))},
+        ),
+        id="cell_count_invalid",
+    ),
+    pytest.param(
+        "cell_voltage_low",
+        lambda api: evaluate(
+            api,
+            current_observations={
+                "mid": make_observation(api, cell_voltages_v=(2.999, 3.30, 3.30, 3.30))
+            },
+        ),
+        id="cell_voltage_low",
+    ),
+    pytest.param(
+        "cell_voltage_high",
+        lambda api: evaluate(
+            api,
+            current_observations={
+                "mid": make_observation(api, cell_voltages_v=(3.601, 3.30, 3.30, 3.30))
+            },
+        ),
+        id="cell_voltage_high",
+    ),
+    pytest.param(
+        "cell_imbalance",
+        lambda api: evaluate(
+            api,
+            current_observations={
+                "mid": make_observation(api, cell_voltages_v=(3.300, 3.351, 3.325, 3.330))
+            },
+        ),
+        id="cell_imbalance",
+    ),
+    pytest.param(
+        "temperatures_missing",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_raw_observation(api, temperatures_c=None)},
+        ),
+        id="temperatures_missing",
+    ),
+    pytest.param(
+        "temperature_low",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_observation(api, temperatures_c=(-0.001, 5.0))},
+        ),
+        id="temperature_low",
+    ),
+    pytest.param(
+        "temperature_high",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_observation(api, temperatures_c=(25.0, 45.001))},
+        ),
+        id="temperature_high",
+    ),
+    pytest.param(
+        "temperature_spread",
+        lambda api: evaluate(
+            api,
+            current_observations={"mid": make_observation(api, temperatures_c=(20.0, 30.001))},
+        ),
+        id="temperature_spread",
+    ),
+    pytest.param(
+        "blocking_fault",
+        lambda api: evaluate(
+            api,
+            current_observations={
+                "mid": make_observation(api, active_faults=frozenset({"BMS_CRITICAL"}))
+            },
+        ),
+        id="blocking_fault",
+    ),
+    pytest.param(
+        "blocking_warning",
+        lambda api: evaluate(
+            api,
+            current_observations={
+                "mid": make_observation(api, active_warnings=frozenset({"PCS_Warning0_1"}))
+            },
+        ),
+        id="blocking_warning",
+    ),
+)
+
+
+@pytest.mark.parametrize(("expected_code", "evaluate_case"), REASON_CODE_CASES)
+def test_each_triggering_condition_emits_its_pinned_reason_code(
+    api: SimpleNamespace, expected_code: str, evaluate_case: Callable[[SimpleNamespace], Any]
+) -> None:
+    decision = evaluate_case(api)
+    assert_rejected(decision, api)
+    assert expected_code in reasons(decision)
+
+
+def test_nonfinite_evaluation_time_fails_closed_under_its_own_name(
+    api: SimpleNamespace,
+) -> None:
+    """A non-finite clock fails closed even though the code cannot surface yet.
+
+    The zero setpoints minted on rejection expire at ``now``, so the domain's
+    finite-expiry validation raises before a decision carrying
+    ``invalid_evaluation_time`` could be returned: an invalid clock is still
+    fail-closed, just by exception. The vocabulary is therefore pinned on the
+    proposal gate itself so the machine code cannot drift silently while that
+    construction order holds.
+    """
+
+    try:
+        decision = evaluate(api, now_mono=math.nan)
+    except (TypeError, ValueError):
+        decision = None
+
+    if decision is None:
+        gate = api.SafetyKernel._proposal_reasons(  # white-box pin; see docstring
+            make_proposed_setpoints(api), make_policy(api), math.nan
+        )
+        assert "invalid_evaluation_time" in gate
+    else:
+        assert_rejected(decision, api)
+        assert "invalid_evaluation_time" in reasons(decision)
 
 
 def test_authorization_expiry_is_minimum_of_kernel_ttl_and_intent_expiry(

@@ -885,7 +885,7 @@ async def test_supervisor_failure_fences_generations_and_runs_actor_shutdown(
             message="a failed supervisor component must stop the application lifespan",
         )
         await session.pump_until(
-            _actors_stopped(runtime),
+            lambda: _actors_stopped(runtime),
             message="a failed supervisor component must run actor shutdown",
         )
         # Fencing every generation also revokes outstanding authority.

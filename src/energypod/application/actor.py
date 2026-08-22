@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import itertools
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Final
 
 from energypod.domain import UnitLifecycle
@@ -20,6 +21,17 @@ from .generation import AuthorityGenerationCoordinator
 _HEARTBEAT_PRIORITY: Final = 0
 _CONTROL_PRIORITY: Final = 10
 _POLL_PRIORITY: Final = 20
+# An externally requested bounded zero outranks every scheduled operation
+# except terminal shutdown; the facade enqueues it for emergency stops.
+_ZERO_PRIORITY: Final = -1
+
+
+class InhibitCause(StrEnum):
+    """Cause class recorded when the unit enters INHIBITED (API_CONTRACTS)."""
+
+    TRANSIENT = "transient"
+    QUALIFIED = "qualified"
+    LATCHED = "latched"
 
 
 @dataclass(slots=True)
@@ -51,6 +63,7 @@ class EnergyPodActor:
         essential_read_count: int,
         heartbeat_interval_s: float,
         heartbeat_safety_margin_s: float,
+        blocking_fault_codes: frozenset[str] | None = None,
     ) -> None:
         if stable_observations_required < 1:
             raise ValueError("stable_observations_required must be positive")
@@ -58,6 +71,10 @@ class EnergyPodActor:
             raise ValueError("heartbeat_interval_s must be positive")
         if not 0 <= heartbeat_safety_margin_s < heartbeat_interval_s:
             raise ValueError("heartbeat safety margin must be within the interval")
+        if blocking_fault_codes is not None and any(
+            not code or code != code.strip() for code in blocking_fault_codes
+        ):
+            raise ValueError("blocking_fault_codes must be non-empty and normalized")
 
         self.unit_id = unit_id
         self._transport = transport
@@ -75,9 +92,16 @@ class EnergyPodActor:
         self._essential_count = essential_read_count
         self._heartbeat_interval = heartbeat_interval_s
         self._heartbeat_margin = heartbeat_safety_margin_s
+        self._blocking_fault_codes = frozenset(blocking_fault_codes or ())
 
         self.lifecycle = UnitLifecycle.BOOT
         self.generation = 0
+        # Inhibit cause class and latch, exposed for facade snapshots.  A
+        # latched cause never auto-recovers and needs one explicit privileged
+        # acknowledgement before stable samples may return the unit to
+        # DISARMED (API_CONTRACTS "Inhibit acknowledgement").
+        self.inhibit_cause: InhibitCause | None = None
+        self.inhibit_latched = False
         self._connection_epoch: int | None = None
         self._latest_observation: Any | None = None
         self._stable_observations = 0
@@ -141,6 +165,26 @@ class EnergyPodActor:
             preempt.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await preempt
+
+    async def request_bounded_zero(self, reason: str) -> None:
+        """Enqueue exactly one bounded zero write through the mailbox.
+
+        The service facade uses this for emergency stop after it has fenced
+        the fleet generation itself; the actor only owns the serialized
+        bounded write.  A stopping actor is dropped here because shutdown
+        owes its own bounded zero before closing the transport.
+        """
+        await self._submit("zero", reason, _ZERO_PRIORITY)
+
+    async def acknowledge_inhibit(self) -> None:
+        """Clear one latched inhibit cause.
+
+        Idempotent and deliberately weak: acknowledgement only clears the
+        latch.  The unit still needs the configured count of stable
+        qualifying observations to reach DISARMED and then an explicit arm;
+        it never bypasses the safety path.
+        """
+        await self._submit("acknowledge_inhibit", None, _CONTROL_PRIORITY)
 
     async def fence(self, reason: str) -> int:
         """Publish revocation before waiting for cancellation or durable work."""
@@ -290,6 +334,10 @@ class EnergyPodActor:
             )
         if operation == "heartbeat":
             return await self._heartbeat_owned()
+        if operation == "zero":
+            return await self._attempt_zero_owned()
+        if operation == "acknowledge_inhibit":
+            return self._acknowledge_inhibit_owned()
         if operation == "stop":
             return await self._stop_owned()
         raise RuntimeError(f"unknown actor operation: {operation}")
@@ -297,6 +345,9 @@ class EnergyPodActor:
     async def _accept_observation_owned(self, observation: Any) -> None:
         await self._observations.append(observation)
         self._latest_observation = observation
+        if self._latching_fault_present(observation):
+            await self._accept_blocking_fault_owned()
+            return
         if self._qualifies(observation):
             observation_epoch = observation.connection_epoch
             if self._connection_epoch not in {None, observation_epoch}:
@@ -309,13 +360,18 @@ class EnergyPodActor:
                 await self._revoke("connection_epoch_changed")
             self._stable_observations += 1
             self._connection_epoch = observation_epoch
+            # Non-latching recovery returns to DISARMED, never directly to
+            # ACTIVE: nonzero power still requires an explicit arm.  A latched
+            # cause additionally holds INHIBITED until the explicit
+            # acknowledgement clears the latch; stable samples alone never
+            # clear it, and good telemetry alone never clears an inhibit.
             if (
                 self.lifecycle in {UnitLifecycle.OBSERVE_ONLY, UnitLifecycle.INHIBITED}
                 and self._stable_observations >= self._stable_required
+                and not self.inhibit_latched
             ):
-                # Non-latching recovery returns to DISARMED, never directly to
-                # ACTIVE: nonzero power still requires an explicit arm.
                 self.lifecycle = UnitLifecycle.DISARMED
+                self.inhibit_cause = None
         else:
             self._stable_observations = 0
             if self.lifecycle not in {
@@ -324,6 +380,23 @@ class EnergyPodActor:
                 UnitLifecycle.INHIBITED,
             }:
                 self.lifecycle = UnitLifecycle.OBSERVE_ONLY
+
+    def _latching_fault_present(self, observation: Any) -> bool:
+        # Blocking-fault classification is the policy's: composition wires the
+        # configured blocking fault codes, so an empty set disables the hook.
+        if not self._blocking_fault_codes:
+            return False
+        faults = getattr(observation, "active_faults", None) or ()
+        return bool(set(faults) & self._blocking_fault_codes)
+
+    async def _accept_blocking_fault_owned(self) -> None:
+        """Latch on a policy blocking fault; it never clears by itself."""
+        if self.lifecycle is UnitLifecycle.INHIBITED and self.inhibit_latched:
+            # The fault is still present: preserve the latch and reset the
+            # stable-sample count so recovery cannot proceed underneath it.
+            self._stable_observations = 0
+            return
+        await self._inhibit_owned("blocking_fault_active", InhibitCause.LATCHED)
 
     def _qualifies(self, observation: Any) -> bool:
         quality = getattr(observation, "quality", None)
@@ -344,10 +417,16 @@ class EnergyPodActor:
             return
         if (
             self.lifecycle is not UnitLifecycle.DISARMED
+            or self.inhibit_latched
             or self._stable_observations < self._stable_required
         ):
             raise RuntimeError("unit is not qualified for arming")
         self.lifecycle = UnitLifecycle.ARMED_IDLE
+
+    def _acknowledge_inhibit_owned(self) -> None:
+        # Acknowledgement clears only the latch; lifecycle and the stable-sample
+        # recovery path are untouched, so it can never arm the unit directly.
+        self.inhibit_latched = False
 
     async def _heartbeat_owned(self) -> None:
         if self._stopping or self.lifecycle not in {
@@ -391,7 +470,9 @@ class EnergyPodActor:
         try:
             encoded = self._command_encoder.encode(authorization)
         except Exception:
-            await self._inhibit_owned("command_encoding_failed")
+            # The authorized command could not be encoded: a control-data
+            # mismatch, not a transport blip.
+            await self._inhibit_owned("command_encoding_failed", InhibitCause.QUALIFIED)
             return
         try:
             await self._transport.write_registers(encoded.address, encoded.values)
@@ -402,6 +483,9 @@ class EnergyPodActor:
             self._used_cycles.clear()
             self._stable_observations = 0
             self.lifecycle = UnitLifecycle.INHIBITED
+            # A transport failure is one failed renewal attempt: transient, so
+            # the existing stable-sample recovery path is unchanged.
+            self._record_inhibit_cause(InhibitCause.TRANSIENT)
             await self._attempt_zero_owned()
             await self._revoke("write_failed")
             return
@@ -458,14 +542,24 @@ class EnergyPodActor:
             self.lifecycle = UnitLifecycle.ARMED_IDLE
         await self._revoke(reason, authorization)
 
-    async def _inhibit_owned(self, reason: str) -> None:
+    async def _inhibit_owned(
+        self, reason: str, cause: InhibitCause = InhibitCause.TRANSIENT
+    ) -> None:
         """Fail closed locally before invoking any potentially blocking port."""
         await self._advance_generation(reason)
         self._used_cycles.clear()
         self._stable_observations = 0
         self.lifecycle = UnitLifecycle.INHIBITED
+        self._record_inhibit_cause(cause)
         await self._attempt_zero_owned()
         await self._revoke(reason)
+
+    def _record_inhibit_cause(self, cause: InhibitCause) -> None:
+        # Entering INHIBITED always records a cause class.  Only LATCHED sets
+        # the latch; TRANSIENT/QUALIFIED keep the existing stable-sample
+        # recovery behavior (ADR-0003 D5).
+        self.inhibit_cause = cause
+        self.inhibit_latched = cause is InhibitCause.LATCHED
 
     async def _advance_generation(self, reason: str) -> int:
         snapshot = await self._generation_coordinator.advance(reason=reason)

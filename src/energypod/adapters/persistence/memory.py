@@ -1,4 +1,4 @@
-"""Bounded process-local repositories for observations and capabilities."""
+"""Bounded process-local repositories for observations, capabilities, and intents."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from threading import RLock
 from typing import Any
 
+from energypod.domain import IntentSource
 from energypod.domain.authorization import AuthorizationBatch, StaleGenerationError
 
 
@@ -56,6 +57,7 @@ class InMemoryAuthorizationRepository:
         *,
         max_cycles_per_unit_generation: int = 4096,
         max_tracked_units: int = 1024,
+        clock: Any | None = None,
     ) -> None:
         if type(max_cycles_per_unit_generation) is not int or max_cycles_per_unit_generation <= 0:
             raise ValueError("max_cycles_per_unit_generation must be positive")
@@ -70,6 +72,9 @@ class InMemoryAuthorizationRepository:
         self._seen_cycles: dict[str, tuple[int, set[str]]] = {}
         self._max_cycles_per_unit_generation = max_cycles_per_unit_generation
         self._max_tracked_units = max_tracked_units
+        # Injected monotonic clock for the non-consuming projection read.  All
+        # timing stays injected; this repository never reads ambient time.
+        self._clock = clock
         self._lock = RLock()
 
     def publish(self, batch: AuthorizationBatch) -> None:
@@ -146,6 +151,29 @@ class InMemoryAuthorizationRepository:
                 return None
             return authorization
 
+    def peek(self, unit_id: str) -> Any | None:
+        """Non-consuming projection read for snapshot views; control uses current().
+
+        Returns the currently valid capability -- not-before satisfied and
+        unexpired -- or None.  Without an injected clock a capability's
+        validity window cannot be established, so the projection fails closed
+        rather than showing a possibly expired capability as live authority.
+        """
+        if not isinstance(unit_id, str) or not unit_id or unit_id != unit_id.strip():
+            raise ValueError("unit_id must be non-empty and normalized")
+        if self._clock is None:
+            return None
+        with self._lock:
+            authorization = self._current.get(unit_id)
+            if authorization is None:
+                return None
+            now = self._clock.monotonic()
+            if now < authorization.not_before_mono:
+                return None
+            if authorization.expires_at_mono <= now:
+                return None
+            return authorization
+
     def revoke(
         self,
         *,
@@ -200,3 +228,77 @@ class InMemoryAuthorizationRepository:
                 seen = self._seen_cycles.get(target)
                 if seen is not None and seen[0] <= fence:
                     self._seen_cycles.pop(target, None)
+
+
+class InMemoryIntentRepository:
+    """Process-local intent store with latched emergency stops.
+
+    ``active`` filters by the monotonic acceptance window, except that an
+    emergency-stop intent stays active until it is explicitly removed by the
+    scoped exact-id acknowledgement; it never expires by TTL.
+    """
+
+    def __init__(self, *, max_stored_intents: int | None = None) -> None:
+        if max_stored_intents is not None and (
+            type(max_stored_intents) is not int or max_stored_intents <= 0
+        ):
+            raise ValueError("max_stored_intents must be positive when provided")
+        self._intents: dict[str, Any] = {}
+        self._max_stored_intents = max_stored_intents
+        self._lock = RLock()
+
+    def add(self, intent: Any) -> None:
+        intent_id = getattr(intent, "id", None)
+        if not isinstance(intent_id, str) or not intent_id or intent_id != intent_id.strip():
+            raise ValueError("intent id must be non-empty and normalized")
+        with self._lock:
+            if intent_id in self._intents:
+                raise ValueError("intent id is already stored")
+            if (
+                self._max_stored_intents is not None
+                and len(self._intents) >= self._max_stored_intents
+            ):
+                # Never evict: a capacity failure is loud, a silently dropped
+                # latched stop would be a safety regression.
+                raise RuntimeError("intent store capacity exhausted")
+            self._intents[intent_id] = intent
+
+    def active(self, now_mono: float) -> tuple[Any, ...]:
+        if (
+            isinstance(now_mono, bool)
+            or not isinstance(now_mono, int | float)
+            or not math.isfinite(now_mono)
+        ):
+            raise ValueError("now_mono must be finite")
+        with self._lock:
+            return tuple(
+                intent for intent in self._intents.values() if self._is_active(intent, now_mono)
+            )
+
+    def remove(self, intent_id: str) -> None:
+        if not isinstance(intent_id, str) or not intent_id or intent_id != intent_id.strip():
+            raise ValueError("intent id must be non-empty and normalized")
+        with self._lock:
+            if intent_id not in self._intents:
+                raise LookupError(intent_id)
+            del self._intents[intent_id]
+
+    def _is_active(self, intent: Any, now_mono: float) -> bool:
+        accepted_at = getattr(intent, "accepted_at_mono", None)
+        if isinstance(accepted_at, bool) or not isinstance(accepted_at, int | float):
+            # An intent without a sound acceptance time can never authorize.
+            return False
+        if accepted_at > now_mono:
+            return False
+        if self._is_emergency_stop(intent):
+            return True
+        duration = getattr(intent, "duration_s", None)
+        if isinstance(duration, bool) or not isinstance(duration, int | float):
+            return False
+        return now_mono < accepted_at + duration
+
+    @staticmethod
+    def _is_emergency_stop(intent: Any) -> bool:
+        # Duck-typed so structural fakes may carry either the enum or its value.
+        source = getattr(intent, "source", None)
+        return getattr(source, "value", source) == IntentSource.EMERGENCY_STOP.value

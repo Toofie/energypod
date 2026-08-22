@@ -915,7 +915,9 @@ async def test_submit_intent_returns_the_acceptance_view_and_never_grants_author
     assert rig.authorizations.published == [], "only the kernel tick may publish authorization"
     assert rig.authorizations.current_calls == []
     assert rig.authorizations.peek_calls == []
-    assert rig.history == []
+    # Acceptance is a facade mutation: audited and published per API_CONTRACTS,
+    # while every authorization port stays untouched (never grants authority).
+    assert_audited_and_published(rig, OPERATOR.subject)
 
 
 async def test_submit_intent_is_audited_and_published(api: Any) -> None:

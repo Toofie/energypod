@@ -1,0 +1,940 @@
+"""Application service facade: the sole application surface behind REST and MCP.
+
+The facade composes the intent, observation, authorization, and audit
+repositories, the fleet-wide generation fence, the event bus, and per-unit
+actor handles into the operations the guarded adapters call.  It owns no
+transport and imports no protocol adapter: every hardware effect travels
+through an actor handle's bounded-zero request, and authorization is only
+ever published by the control kernel, never by this module.
+
+The safety order inside ``emergency_stop`` is fixed and may not be reordered:
+fence the fleet generation first, then revoke outstanding fleet
+authorizations, then request the bounded zero through the affected actors, and
+only then audit and publish.  A degraded dependency anywhere in that sequence
+may turn the response into an error, but it never removes a step.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import re
+import uuid
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any, Final, Protocol
+
+from energypod.domain import Direction, IntentSource, PowerIntent, UnitLifecycle
+from energypod.domain.audit import AuditEvent
+
+_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+# API_CONTRACTS: a latched stop carries a fixed duration of at least 24 hours
+# and is removed only by acknowledgement, never by TTL expiry.
+_LATCHED_STOP_DURATION_S: Final[float] = 86_400.0
+
+# The control-side telemetry freshness limit is policy-owned
+# (ControlPolicy.max_telemetry_age_s) and enforced by the safety kernel.  The
+# facade has no policy, so its snapshot view applies only this conservative
+# display bound: telemetry older than this is never labelled "good".
+_SNAPSHOT_GOOD_TELEMETRY_MAX_AGE_S: Final[float] = 30.0
+
+_ARMED_LIFECYCLES: Final[frozenset[str]] = frozenset({"armed_idle", "active"})
+_FACADE_POLICY_VERSION: Final[str] = "facade"
+_MAX_REASON_LENGTH: Final[int] = 500
+
+
+class Principal(Protocol):
+    """Authenticated caller identity, as validated by the guarded boundary."""
+
+    @property
+    def subject(self) -> str: ...
+
+    @property
+    def scopes(self) -> frozenset[str]: ...
+
+    @property
+    def interactive(self) -> bool: ...
+
+    @property
+    def site_id(self) -> str: ...
+
+
+class Clock(Protocol):
+    """Injected deterministic time source; the facade never sleeps."""
+
+    def monotonic(self) -> float: ...
+
+    def wall_now(self) -> datetime: ...
+
+
+class IntentRepository(Protocol):
+    async def add(self, intent: Any) -> None: ...
+
+    async def active(self, now_mono: float) -> tuple[Any, ...]: ...
+
+    async def remove(self, intent_id: str) -> None: ...
+
+
+class ObservationRepository(Protocol):
+    async def all_latest(self) -> dict[str, Any]: ...
+
+
+class AuthorizationRepository(Protocol):
+    async def peek(self, unit_id: str) -> Any | None: ...
+
+    async def revoke(self, **kwargs: Any) -> None: ...
+
+
+class AuditRepository(Protocol):
+    async def append(self, event: Any) -> None: ...
+
+    async def recent(self, limit: int, after_sequence: int | None = None) -> tuple[Any, ...]: ...
+
+
+class EventPublisher(Protocol):
+    async def publish(self, body: Mapping[str, Any]) -> int: ...
+
+    def snapshot_sequence(self) -> int: ...
+
+
+class GenerationCoordinator(Protocol):
+    async def snapshot(self) -> Any: ...
+
+    async def advance(self, *, reason: str) -> Any: ...
+
+
+class ActorHandle(Protocol):
+    """Per-unit control handle owned by the actor (or its composition wrapper).
+
+    ``qualified`` and ``inhibit_latched`` are read defensively through
+    ``getattr`` because a handle that cannot report them is itself a reason to
+    refuse: an unknown state is never treated as permission.
+    """
+
+    @property
+    def unit_id(self) -> str: ...
+
+    @property
+    def lifecycle(self) -> Any: ...
+
+    async def arm(self) -> None: ...
+
+    async def disarm(self) -> None: ...
+
+    async def acknowledge_inhibit(self) -> None: ...
+
+    async def request_bounded_zero(self, reason: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class _LatchedStop:
+    stop_id: str
+    unit_ids: frozenset[str]
+    created_at_mono: float
+    fenced_generation: int | None
+
+
+def _enum_value(raw: Any) -> str:
+    value = getattr(raw, "value", raw)
+    return value if isinstance(value, str) else str(raw)
+
+
+def _fingerprint(facts: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        dict(facts), ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validated_units(unit_ids: Any) -> list[str]:
+    if isinstance(unit_ids, str | bytes) or not isinstance(unit_ids, Sequence):
+        raise TypeError("unit_ids must be a sequence of unit identifiers")
+    units = list(unit_ids)
+    if not units:
+        raise ValueError("at least one unit must be selected")
+    for unit_id in units:
+        if not isinstance(unit_id, str) or _ID_PATTERN.fullmatch(unit_id) is None:
+            raise ValueError("unit identifiers must be canonical")
+    if len(set(units)) != len(units):
+        raise ValueError("unit identifiers must be unique")
+    return units
+
+
+def _dispatch_direction(direction: Any) -> Direction:
+    if isinstance(direction, Direction):
+        resolved = direction
+    elif isinstance(direction, str):
+        try:
+            resolved = Direction(direction)
+        except ValueError as error:
+            raise ValueError("unknown dispatch direction") from error
+    else:
+        raise TypeError("direction must be charge or discharge")
+    if resolved is Direction.IDLE:
+        raise ValueError("dispatch accepts charge or discharge only")
+    return resolved
+
+
+def _positive_watts(watts: Any) -> int:
+    if isinstance(watts, bool) or type(watts) is not int:
+        raise TypeError("watts must be an integer")
+    if watts <= 0:
+        raise ValueError("watts must be positive")
+    return int(watts)
+
+
+def _positive_duration(ttl_s: Any) -> float:
+    if isinstance(ttl_s, bool) or not isinstance(ttl_s, int | float):
+        raise TypeError("ttl_s must be a number")
+    if not math.isfinite(float(ttl_s)) or ttl_s <= 0:
+        raise ValueError("ttl_s must be finite and positive")
+    return float(ttl_s)
+
+
+def _reason_text(reason: Any, *, required: bool) -> str | None:
+    if reason is None:
+        if required:
+            raise ValueError("a reason is required")
+        return None
+    if not isinstance(reason, str):
+        raise TypeError("reason must be a string")
+    if (
+        not reason
+        or reason != reason.strip()
+        or len(reason) > _MAX_REASON_LENGTH
+        or any(character in reason for character in "\r\n")
+    ):
+        raise ValueError("reason must be canonical and at most 500 characters")
+    return reason
+
+
+def _correlation_key(value: Any, name: str) -> str:
+    if not isinstance(value, str) or _ID_PATTERN.fullmatch(value) is None:
+        raise ValueError(f"{name} must be a canonical identifier")
+    return value
+
+
+def _requested_power(unit_id: str, intents: Sequence[Any]) -> dict[str, Any]:
+    selected = [
+        intent for intent in intents if unit_id in getattr(intent, "selected_unit_ids", frozenset())
+    ]
+    if not selected:
+        return {"direction": "idle", "watts": 0}
+    newest = max(selected, key=lambda intent: (intent.acceptance_revision, intent.id))
+    return {"direction": _enum_value(newest.direction), "watts": int(newest.watts)}
+
+
+def _authorized_projection(capability: Any) -> dict[str, Any] | None:
+    if capability is None:
+        return None
+    return {"direction": _enum_value(capability.direction), "watts": int(capability.watts)}
+
+
+class EnergyServiceFacade:
+    """Fleet-level application service behind the guarded REST and MCP adapters."""
+
+    def __init__(
+        self,
+        *,
+        site_id: str,
+        clock: Clock,
+        intents: IntentRepository,
+        observations: ObservationRepository,
+        authorizations: AuthorizationRepository,
+        audit: AuditRepository,
+        events: EventPublisher,
+        coordinator: GenerationCoordinator,
+        actors: Mapping[str, ActorHandle],
+    ) -> None:
+        if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
+            raise ValueError("site_id must be a canonical identifier")
+        handles = dict(actors)
+        if any(
+            not isinstance(unit_id, str) or _ID_PATTERN.fullmatch(unit_id) is None
+            for unit_id in handles
+        ):
+            raise ValueError("actor handles must be keyed by canonical unit identifiers")
+        self._site_id = site_id
+        self._clock = clock
+        self._intents = intents
+        self._observations = observations
+        self._authorizations = authorizations
+        self._audit = audit
+        self._events = events
+        self._coordinator = coordinator
+        self._actors = handles
+        self._revision = 0
+        self._latched_stops: dict[str, _LatchedStop] = {}
+        self._acknowledged_stops: set[str] = set()
+        self._process_instance_id = f"facade-{uuid.uuid4().hex}"
+        self._process_origin_mono = float(clock.monotonic())
+
+    # --- read views ---------------------------------------------------------
+
+    async def snapshot(self, *, principal: Principal) -> dict[str, Any]:
+        """Assemble one immutable fleet view from repository reads only."""
+        self._admit(principal, "observe")
+        now_mono = float(self._clock.monotonic())
+        sequence = self._events.snapshot_sequence()
+        latest = await self._observations.all_latest()
+        active = await self._intents.active(now_mono)
+        units: list[dict[str, Any]] = []
+        for unit_id, handle in self._actors.items():
+            telemetry = latest.get(unit_id) if isinstance(latest, Mapping) else None
+            units.append(await self._unit_view(unit_id, handle, telemetry, active, now_mono))
+        return {
+            "site_id": self._site_id,
+            "snapshot_sequence": sequence,
+            "captured_at": self._clock.wall_now().isoformat(),
+            "units": units,
+        }
+
+    async def health(self, *, principal: Principal) -> dict[str, Any]:
+        """Separate process liveness, dependency readiness, and control readiness."""
+        self._admit(principal, "observe")
+        now_mono = float(self._clock.monotonic())
+        service_reasons: list[str] = []
+        await self._probe(
+            service_reasons, "intent_repository_unavailable", lambda: self._intents.active(now_mono)
+        )
+        await self._probe(
+            service_reasons,
+            "observation_repository_unavailable",
+            lambda: self._observations.all_latest(),
+        )
+        probe_unit = next(iter(self._actors), "")
+        if probe_unit:
+            await self._probe(
+                service_reasons,
+                "authorization_repository_unavailable",
+                lambda: self._authorizations.peek(probe_unit),
+            )
+        await self._probe(
+            service_reasons, "audit_repository_unavailable", lambda: self._audit.recent(limit=1)
+        )
+        await self._probe(
+            service_reasons,
+            "authority_coordinator_unavailable",
+            lambda: self._coordinator.snapshot(),
+        )
+        control_reasons = self._control_readiness_reasons()
+        return {
+            "liveness": {"ok": True},
+            "service_readiness": {"ready": not service_reasons, "reasons": service_reasons},
+            "control_readiness": {"ready": not control_reasons, "reasons": control_reasons},
+        }
+
+    async def recent_audit(
+        self, *, principal: Principal, limit: int, cursor: int | None = None
+    ) -> dict[str, Any]:
+        """Bounded, newest-first audit read with a stable pagination cursor."""
+        self._admit(principal, "observe")
+        if isinstance(limit, bool) or type(limit) is not int or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        if cursor is not None and (
+            isinstance(cursor, bool) or type(cursor) is not int or cursor < 0
+        ):
+            raise ValueError("cursor must be a non-negative integer")
+        events = list(await self._audit.recent(limit=limit, after_sequence=cursor))
+        # The cursor names the oldest delivered event so pagination resumes
+        # with strictly older facts; a short terminal page leaves no cursor.
+        next_cursor = None
+        if len(events) == limit:
+            oldest = getattr(events[-1], "sequence", None)
+            if type(oldest) is int:
+                next_cursor = oldest
+        return {"events": events, "next_cursor": next_cursor}
+
+    # --- mutations ----------------------------------------------------------
+
+    async def submit_intent(
+        self,
+        *,
+        unit_ids: Any,
+        direction: Any,
+        watts: Any,
+        ttl_s: Any,
+        reason: Any = None,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """Accept one intent with a server-assigned revision; grant nothing."""
+        self._admit(principal, "dispatch")
+        units = _validated_units(unit_ids)
+        unknown = [unit_id for unit_id in units if unit_id not in self._actors]
+        if unknown:
+            raise ValueError(f"unknown units requested: {unknown}")
+        resolved_direction = _dispatch_direction(direction)
+        resolved_watts = _positive_watts(watts)
+        duration_s = _positive_duration(ttl_s)
+        _reason_text(reason, required=False)
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+
+        now_mono = float(self._clock.monotonic())
+        revision = self._next_revision()
+        intent_id = f"intent-{revision}-{now_mono:.6f}"
+        intent = PowerIntent(
+            id=intent_id,
+            source=IntentSource.MANUAL,
+            selected_unit_ids=frozenset(units),
+            direction=resolved_direction,
+            watts=resolved_watts,
+            duration_s=duration_s,
+            accepted_at_mono=now_mono,
+            acceptance_revision=revision,
+            actor_identity=principal.subject,
+        )
+        await self._intents.add(intent)
+        await self._append_audit(
+            self._mutation_audit(
+                event_type="intent_accepted",
+                subject=principal.subject,
+                result="accepted",
+                request_id=request,
+                source=IntentSource.MANUAL,
+                intent_id=intent_id,
+                reason_codes=("accepted",),
+                # Acceptance alone moves no unit; authority comes only from a
+                # kernel tick, so the fleet stays in its non-active state.
+                lifecycle=UnitLifecycle.DISARMED,
+                payload={
+                    "direction": resolved_direction.value,
+                    "unit_ids": sorted(units),
+                    "watts": resolved_watts,
+                },
+            )
+        )
+        await self._publish(
+            "intent.accepted",
+            {
+                "principal": principal.subject,
+                "intent_id": intent_id,
+                "direction": resolved_direction.value,
+                "watts": resolved_watts,
+                "unit_ids": sorted(units),
+            },
+        )
+        return {
+            "intent_id": intent_id,
+            "acceptance_revision": revision,
+            "accepted_at_monotonic": now_mono,
+            "status": "accepted",
+            "requested": {
+                "direction": resolved_direction.value,
+                "watts": resolved_watts,
+            },
+            "authorized": None,
+            "measured": None,
+            "expires_in_s": duration_s,
+        }
+
+    async def arm(
+        self,
+        *,
+        unit_ids: Any,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """Arm exactly the requested qualified, disarmed units; report each outcome."""
+        self._admit(principal, "arm", interactive=True)
+        units = _validated_units(unit_ids)
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        outcomes: list[dict[str, str]] = []
+        for unit_id in units:
+            outcome = await self._arm_one(unit_id)
+            outcomes.append(outcome)
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="unit_armed",
+                    subject=principal.subject,
+                    result=outcome["status"],
+                    request_id=request,
+                    reason_codes=(outcome["reason"],),
+                    unit_id=unit_id,
+                    lifecycle=self._handle_lifecycle(unit_id),
+                    payload=dict(outcome),
+                )
+            )
+        await self._publish("unit.armed", {"principal": principal.subject, "units": outcomes})
+        return {"units": outcomes}
+
+    async def disarm(
+        self,
+        *,
+        unit_ids: Any,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """Disarm the requested known units; partial refusal stays visible."""
+        self._admit(principal, "arm")
+        units = _validated_units(unit_ids)
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        outcomes: list[dict[str, str]] = []
+        for unit_id in units:
+            outcome = await self._disarm_one(unit_id)
+            outcomes.append(outcome)
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="unit_disarmed",
+                    subject=principal.subject,
+                    result=outcome["status"],
+                    request_id=request,
+                    reason_codes=(outcome["reason"],),
+                    unit_id=unit_id,
+                    lifecycle=self._handle_lifecycle(unit_id),
+                    payload=dict(outcome),
+                )
+            )
+        await self._publish("unit.disarmed", {"principal": principal.subject, "units": outcomes})
+        return {"units": outcomes}
+
+    async def emergency_stop(
+        self,
+        *,
+        unit_ids: Any,
+        reason: Any,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """Latch one fleet stop: fence, revoke, bounded zero, then audit and publish."""
+        self._admit(principal, "stop")
+        units = _validated_units(unit_ids)
+        stop_reason = _reason_text(reason, required=True)
+        if stop_reason is None:  # pragma: no cover - guarded by required=True
+            raise ValueError("a reason is required")
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+
+        now_mono = float(self._clock.monotonic())
+        revision = self._next_revision()
+        stop_id = f"stop-{revision}-{now_mono:.6f}"
+        selected = frozenset(units)
+        intent = PowerIntent(
+            id=stop_id,
+            source=IntentSource.EMERGENCY_STOP,
+            selected_unit_ids=selected,
+            direction=Direction.IDLE,
+            watts=0,
+            duration_s=_LATCHED_STOP_DURATION_S,
+            accepted_at_mono=now_mono,
+            acceptance_revision=revision,
+            actor_identity=principal.subject,
+        )
+        unknown = [unit_id for unit_id in units if unit_id not in self._actors]
+        degraded: list[str] = []
+
+        # 1. Fence first: no potentially blocking work may precede the fence.
+        fenced_generation: int | None = None
+        try:
+            snapshot = await self._coordinator.advance(reason=f"emergency_stop:{stop_id}")
+            epoch = getattr(snapshot, "epoch", None)
+            if type(epoch) is int:
+                fenced_generation = epoch
+        except Exception:
+            # The fence itself may already have landed; a lost acknowledgement
+            # must never abandon the remaining stop work.
+            degraded.append("fence_unconfirmed")
+        # 2. Revoke every outstanding authorization: the fenced generation is
+        # dead fleet-wide, so no capability may survive the stop.
+        try:
+            await self._authorizations.revoke(reason=f"emergency_stop:{stop_id}")
+        except Exception:
+            degraded.append("revocation_unconfirmed")
+        # 3. Record the latch so exact-id acknowledgement can find it, then
+        # store the latched intent best-effort.
+        self._latched_stops[stop_id] = _LatchedStop(
+            stop_id=stop_id,
+            unit_ids=selected,
+            created_at_mono=now_mono,
+            fenced_generation=fenced_generation,
+        )
+        store_error: Exception | None = None
+        try:
+            await self._intents.add(intent)
+        except Exception as error:
+            store_error = error
+            degraded.append("intent_store_unavailable")
+        # 4. Bounded zero through every affected actor handle.
+        for unit_id in units:
+            handle = self._actors.get(unit_id)
+            if handle is None:
+                degraded.append(f"unknown_unit:{unit_id}")
+                continue
+            try:
+                await handle.request_bounded_zero(stop_reason)
+            except Exception:
+                degraded.append(f"bounded_zero_failed:{unit_id}")
+        # 5/6. Audit and publish only after the safety work has landed.
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="emergency_stop",
+                    subject=principal.subject,
+                    result="latched",
+                    request_id=request,
+                    source=IntentSource.EMERGENCY_STOP,
+                    intent_id=stop_id,
+                    reason_codes=tuple(degraded) if degraded else ("latched",),
+                    # A latched stop inhibits the fleet, matching the control
+                    # aggregate the kernel assigns to stop intents.
+                    lifecycle=UnitLifecycle.INHIBITED,
+                    generation=fenced_generation,
+                    payload={
+                        "degraded": list(degraded),
+                        "reason": stop_reason,
+                        "stop_id": stop_id,
+                        "unit_ids": sorted(selected),
+                    },
+                )
+            )
+        except Exception:
+            degraded.append("audit_unavailable")
+        try:
+            await self._publish(
+                "emergency_stop.latched",
+                {
+                    "principal": principal.subject,
+                    "stop_id": stop_id,
+                    "unit_ids": sorted(selected),
+                    "reason": stop_reason,
+                    "generation": fenced_generation,
+                    "degraded": list(degraded),
+                },
+            )
+        except Exception:
+            degraded.append("publish_unavailable")
+
+        # The safety sequence is complete; only now may caller-facing errors
+        # surface, and never by undoing any step above.
+        if store_error is not None:
+            raise store_error
+        if unknown:
+            raise ValueError(f"unknown units requested for emergency stop: {unknown}")
+        return {
+            "stop_id": stop_id,
+            "status": "latched",
+            "unit_ids": sorted(selected),
+            "fenced_generation": fenced_generation,
+            "degraded": degraded,
+        }
+
+    async def acknowledge_emergency_stop(
+        self,
+        *,
+        stop_id: Any,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """Remove exactly one latched stop so it cannot relatch."""
+        self._admit(principal, "stop:acknowledge")
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        if not isinstance(stop_id, str):
+            raise LookupError("stop_id must be a string")
+        record = self._latched_stops.get(stop_id)
+        if record is None or stop_id in self._acknowledged_stops:
+            raise LookupError(f"no latched emergency stop with id {stop_id!r}")
+        if not self._is_fleet_wide(record.unit_ids):
+            # A stop that fenced only part of the fleet leaves the remaining
+            # units untouched, so its latch must still be confirmed live in
+            # the intent repository before the acknowledgement consumes it.
+            # A fleet-wide stop fenced every unit in one generation and is
+            # authoritative in this facade's own registry.
+            active = await self._intents.active(float(self._clock.monotonic()))
+            live = any(
+                getattr(intent, "id", None) == stop_id
+                and _enum_value(getattr(intent, "source", None)) == "emergency_stop"
+                for intent in active
+            )
+            if not live:
+                raise LookupError(f"no latched emergency stop with id {stop_id!r}")
+        await self._intents.remove(stop_id)
+        self._latched_stops.pop(stop_id, None)
+        self._acknowledged_stops.add(stop_id)
+        await self._append_audit(
+            self._mutation_audit(
+                event_type="stop_acknowledged",
+                subject=principal.subject,
+                result="acknowledged",
+                request_id=request,
+                source=IntentSource.EMERGENCY_STOP,
+                intent_id=stop_id,
+                reason_codes=("acknowledged",),
+                # The latch is gone; units re-qualify through stable samples
+                # back to DISARMED, never directly to ACTIVE.
+                lifecycle=UnitLifecycle.DISARMED,
+                payload={"stop_id": stop_id, "unit_ids": sorted(record.unit_ids)},
+            )
+        )
+        await self._publish(
+            "emergency_stop.acknowledged",
+            {"principal": principal.subject, "stop_id": stop_id},
+        )
+        return {"stop_id": stop_id, "status": "acknowledged"}
+
+    async def acknowledge_inhibit(
+        self,
+        *,
+        unit_id: Any,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """Clear exactly one unit's latched inhibit; never arm and never bypass recovery."""
+        self._admit(principal, "arm", interactive=True)
+        canonical_unit = _correlation_key(unit_id, "unit_id")
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        handle = self._actors.get(canonical_unit)
+        if handle is None:
+            raise LookupError(f"no unit with id {canonical_unit!r}")
+        latched = bool(getattr(handle, "inhibit_latched", False))
+        latch_cleared = False
+        if latched:
+            await handle.acknowledge_inhibit()
+            latch_cleared = True
+        # A non-latched inhibit needs no acknowledgement: it recovers through
+        # stable qualifying samples, and a repeated call stays a no-op success.
+        await self._append_audit(
+            self._mutation_audit(
+                event_type="inhibit_acknowledged",
+                subject=principal.subject,
+                result="acknowledged",
+                request_id=request,
+                reason_codes=("latch_cleared",) if latch_cleared else ("not_latched",),
+                unit_id=canonical_unit,
+                # Acknowledgement only clears the latch; the unit still needs
+                # stable samples to reach DISARMED, so report the unit as-is.
+                lifecycle=self._handle_lifecycle(canonical_unit),
+                payload={"latch_cleared": latch_cleared, "unit_id": canonical_unit},
+            )
+        )
+        await self._publish(
+            "inhibit.acknowledged",
+            {
+                "principal": principal.subject,
+                "unit_id": canonical_unit,
+                "latch_cleared": latch_cleared,
+            },
+        )
+        return {
+            "unit_id": canonical_unit,
+            "status": "acknowledged",
+            "latch_cleared": latch_cleared,
+        }
+
+    # --- internal helpers ---------------------------------------------------
+
+    def _admit(self, principal: Principal, scope: str, *, interactive: bool = False) -> None:
+        """Reject malformed and cross-site principals before any port is touched."""
+        subject = getattr(principal, "subject", None)
+        site_id = getattr(principal, "site_id", None)
+        scopes = getattr(principal, "scopes", None)
+        is_interactive = getattr(principal, "interactive", None)
+        if not isinstance(subject, str) or _ID_PATTERN.fullmatch(subject) is None:
+            raise ValueError("principal subject must be a canonical identifier")
+        if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
+            raise ValueError("principal site must be a canonical identifier")
+        if type(scopes) is not frozenset or any(
+            not isinstance(item, str) or _ID_PATTERN.fullmatch(item) is None for item in scopes
+        ):
+            raise TypeError("principal scopes must be a frozenset of canonical identifiers")
+        if type(is_interactive) is not bool:
+            raise TypeError("principal interactivity must be boolean")
+        if site_id != self._site_id:
+            raise PermissionError("principal belongs to another site")
+        if scope not in scopes:
+            raise PermissionError(f"principal lacks the required scope {scope!r}")
+        if interactive and not is_interactive:
+            raise PermissionError("an interactive operator principal is required")
+
+    def _next_revision(self) -> int:
+        revision = self._revision
+        self._revision += 1
+        return revision
+
+    async def _unit_view(
+        self,
+        unit_id: str,
+        handle: ActorHandle,
+        telemetry: Any,
+        active_intents: Sequence[Any],
+        now_mono: float,
+    ) -> dict[str, Any]:
+        age_s: float | None = None
+        measured_watts: float | None = None
+        if telemetry is not None:
+            captured = getattr(telemetry, "captured_at_mono", None)
+            if isinstance(captured, int | float) and not isinstance(captured, bool):
+                age_s = max(0.0, float(now_mono - float(captured)))
+            watts = getattr(telemetry, "battery_watts", None)
+            if isinstance(watts, int | float) and not isinstance(watts, bool):
+                measured_watts = float(watts)
+        # peek() is the granted non-consuming projection read; current() is
+        # reserved for control and a snapshot must never burn a capability.
+        capability = await self._authorizations.peek(unit_id)
+        return {
+            "unit_id": unit_id,
+            "lifecycle": _enum_value(getattr(handle, "lifecycle", None)),
+            "telemetry_age_s": age_s,
+            "quality": self._quality_projection(telemetry, age_s),
+            "requested_power": _requested_power(unit_id, active_intents),
+            "authorized_power": _authorized_projection(capability),
+            "measured_watts": measured_watts,
+        }
+
+    def _quality_projection(self, telemetry: Any, age_s: float | None) -> str:
+        if telemetry is None:
+            return "missing"
+        quality = getattr(telemetry, "quality", None)
+        if not isinstance(quality, Mapping):
+            return "degraded"
+        values = [_enum_value(item) for item in quality.values()]
+        if "bad" in values:
+            return "bad"
+        fresh = age_s is not None and age_s <= _SNAPSHOT_GOOD_TELEMETRY_MAX_AGE_S
+        if fresh and values and all(value == "good" for value in values):
+            return "good"
+        return "degraded"
+
+    async def _probe(
+        self, reasons: list[str], code: str, action: Callable[[], Awaitable[Any]]
+    ) -> None:
+        try:
+            await action()
+        except Exception:
+            # Cancellation is a BaseException and is never swallowed here.
+            reasons.append(code)
+
+    def _control_readiness_reasons(self) -> list[str]:
+        reasons: list[str] = []
+        any_armed = False
+        for unit_id, handle in self._actors.items():
+            lifecycle = _enum_value(getattr(handle, "lifecycle", None))
+            # Unknown qualification is a reason, never an assumption.
+            qualified = getattr(handle, "qualified", None)
+            if bool(getattr(handle, "inhibit_latched", False)):
+                reasons.append(f"{unit_id}:inhibit_latched")
+            if lifecycle == "inhibited":
+                reasons.append(f"{unit_id}:inhibited")
+            if qualified is False:
+                reasons.append(f"{unit_id}:not_qualified")
+            elif qualified is None:
+                reasons.append(f"{unit_id}:qualification_unknown")
+            if lifecycle in _ARMED_LIFECYCLES:
+                any_armed = True
+        if not any_armed:
+            reasons.append("no_unit_armed")
+        return reasons
+
+    async def _arm_one(self, unit_id: str) -> dict[str, str]:
+        handle = self._actors.get(unit_id)
+        if handle is None:
+            return {"unit_id": unit_id, "status": "refused", "reason": "unknown_unit"}
+        if bool(getattr(handle, "inhibit_latched", False)):
+            return {"unit_id": unit_id, "status": "refused", "reason": "inhibit_latched"}
+        qualified = getattr(handle, "qualified", None)
+        if qualified is False:
+            return {"unit_id": unit_id, "status": "refused", "reason": "not_qualified"}
+        if qualified is None:
+            # The owning handle would accept this unit; only the facade's own
+            # unknown-state gate refuses it.
+            return {"unit_id": unit_id, "status": "refused", "reason": "qualification_unknown"}
+        try:
+            await handle.arm()
+        except Exception:
+            # An actor-side refusal can only be discovered by attempting it.
+            return {"unit_id": unit_id, "status": "refused", "reason": "actor_failure"}
+        return {"unit_id": unit_id, "status": "armed", "reason": "armed"}
+
+    async def _disarm_one(self, unit_id: str) -> dict[str, str]:
+        handle = self._actors.get(unit_id)
+        if handle is None:
+            return {"unit_id": unit_id, "status": "refused", "reason": "unknown_unit"}
+        try:
+            await handle.disarm()
+        except Exception:
+            return {"unit_id": unit_id, "status": "refused", "reason": "actor_failure"}
+        return {"unit_id": unit_id, "status": "disarmed", "reason": "disarmed"}
+
+    def _handle_lifecycle(self, unit_id: str) -> UnitLifecycle:
+        handle = self._actors.get(unit_id)
+        if handle is None:
+            # An unknown unit has no place in this site's control; reporting
+            # it as disconnected never claims controllability it cannot have.
+            return UnitLifecycle.DISCONNECTED
+        return UnitLifecycle(_enum_value(getattr(handle, "lifecycle", None)))
+
+    def _is_fleet_wide(self, unit_ids: frozenset[str]) -> bool:
+        return set(self._actors).issubset(unit_ids)
+
+    def _mutation_audit(
+        self,
+        *,
+        event_type: str,
+        subject: str,
+        result: str,
+        request_id: str,
+        lifecycle: UnitLifecycle,
+        reason_codes: tuple[str, ...],
+        unit_id: str | None = None,
+        source: IntentSource | None = None,
+        intent_id: str | None = None,
+        generation: int | None = None,
+        payload: Mapping[str, Any] | None = None,
+    ) -> AuditEvent:
+        now_mono = float(self._clock.monotonic())
+        wall = self._clock.wall_now()
+        if not isinstance(wall, datetime) or wall.tzinfo is None or wall.utcoffset() is None:
+            raise ValueError("clock wall time must be timezone-aware")
+        facts = {
+            "event_type": event_type,
+            "principal": subject,
+            "result": result,
+            **dict(payload or {}),
+        }
+        return AuditEvent(
+            event_id=f"facade-{uuid.uuid4().hex}",
+            occurred_at=wall.astimezone(UTC),
+            monotonic_offset_s=now_mono - self._process_origin_mono,
+            process_instance_id=self._process_instance_id,
+            event_type=event_type,
+            unit_id=unit_id,
+            generation=generation,
+            principal=subject,
+            source=source,
+            correlation_id=f"facade:{event_type}:{request_id}",
+            intent_id=intent_id,
+            # Facade events carry no policy decision; the kernel alone speaks
+            # for a policy version when it grants authority.
+            policy_version=_FACADE_POLICY_VERSION,
+            configuration_version=0,
+            observation_sequences={},
+            reason_codes=reason_codes,
+            requested_active_w=0,
+            authorized_active_w=0,
+            request_fingerprint=_fingerprint(facts),
+            response_fingerprint=_fingerprint({"result": result}),
+            result=result,
+            lifecycle=lifecycle,
+        )
+
+    async def _append_audit(self, event: AuditEvent) -> None:
+        await self._audit.append(event)
+
+    async def _publish(self, event_type: str, payload: Mapping[str, Any]) -> int:
+        return await self._events.publish({"type": event_type, "payload": dict(payload)})
+
+
+__all__ = ["EnergyServiceFacade"]
