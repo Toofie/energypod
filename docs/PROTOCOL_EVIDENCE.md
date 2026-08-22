@@ -95,6 +95,7 @@ Any implementation must select framing explicitly. A default `ModbusTcpClient` u
 | BECU count | **Confirmed by vendor code** | It is the population count of the byte-truncated enable mask, forced to at least 1 (`GlobalFun.NumberOf1`, `SysControl.cs:90-99`). Because the mask is truncated to 8 bits, the legacy BECU count cannot exceed 8. |
 | Deployed units use the IoT layout. | **Verified by live capture (2026-08-22)** | All three layout probes return register 0 = 536 (> 10 selects IoT). Per-unit commissioned topology: MID (192.168.1.11) 6 BIC, RHS (192.168.1.12) 5 BIC — differing topology across the fleet, validating the per-unit commissioning requirement — LHS (192.168.1.13) 6 BIC; enable mask 1 on all. Pinned device identities (RTU ID at 0x8106, low-word-first uint32): MID `0x2C225097`, RHS `0x2C225076`, LHS `0x2C225095`. Control remains observe-only until scaling, direction, freshness, and watchdog timing are validated per unit. |
 
+## 4a. Live commissioning evidence (2026-08-22, authorized observe-only)
 ## 4b. Power-direction sign conventions (2026-08-22, three-source reconciliation)
 
 Reconciled across the decompiled vendor app, the operator's three prior
@@ -146,8 +147,6 @@ three prior implementations but not yet proven against live firmware — the
 low-power command-direction confirmation (command small negative P, observe
 charging: SOC rising, battery power negative, charge-energy counter
 incrementing) still requires the separate actuation authorization.
-
-## 4a. Live commissioning evidence (2026-08-22, authorized observe-only)
 
 Authorized by the operator as a direct hookup; every operation below was a
 read-only FC03 holding-register read through the production
