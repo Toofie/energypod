@@ -589,6 +589,34 @@ direction, freshness, and watchdog timing per physical unit.
   exists, the honest stop paths remain: TTL expiry (≤300 s), emergency
   stop (immediate, fleet-wide, latched + acknowledge), or disarm.
 
+- 2026-08-23 (events): REQUEST-OBSERVABILITY ROOT CAUSE PINNED (tracer,
+  field-level matrix). The WS event stream carries almost nothing the UI
+  needs: observation.published = {unit_id, connection_epoch, sequence} ONLY
+  (no readings); authority GRANT is store-only (composition.py ~574);
+  intent EXPIRY is total silence (no intent.expired type exists — the
+  kernel's no-winner revoke publishes only when `held` is non-empty, and
+  held is always empty at expiry because capabilities are consumed/expired
+  by then); audit.appended is trimmed to identity+result+reasons (no
+  watts); intent.accepted IS published but was ignored by the views. REST
+  /snapshot is always fresh; views read it once per connection plus a few
+  event-triggered refetches. Hence: only ages/sequences moved on screen
+  while requested/allowed/actual froze everywhere, and expired request
+  cards linger forever. BACKEND FIX (queued behind the excess-charging
+  implementation — same files): (1) publish `intent.expired` (fix the
+  empty-held expiry path: publish from the kernel no-winner tick or the
+  facade's intent TTL sweep); (2) publish an authority-grant event
+  (symmetry with authorization.revoked); (3) decide: enrich
+  observation.published with the reading vs republish snapshot frames on
+  material change — the UI architecture assumes "snapshot once + events
+  carry state", so events must carry the power figures. WEB FIX (console
+  agent, in flight): consume intent.accepted now; refetchSnapshot must
+  force a wire read (plane.refresh) and the plane must republish refreshed
+  snapshots to subscribers; interim 2-3 s snapshot cadence-poll while
+  live. Served bundle verified current — hard refresh is NOT the fix.
+  Dispatch itself confirmed healthy through all of this: the operator's
+  2000 W intent drove authorized 2000 W / measured 2197-2239 W before
+  their own 22:58:50 disarm.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
