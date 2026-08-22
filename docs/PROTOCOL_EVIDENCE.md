@@ -61,7 +61,7 @@ Principal source anchors:
 | Vendor serial transport is Modbus RTU. | **Confirmed by vendor code** | `ModbusSerialMaster.CreateRtu(serialPort)` is used. Bundled/default settings are 19200 baud, 8 data bits, no parity, 1 stop bit, station/slave address 4, 5000 ms read/write timeout, and zero transport retries (V-CONN, O-CONFIG). |
 | The vendor application's Ethernet mode is a reverse connection. | **Confirmed by vendor code** | The PC configures local `192.168.1.10`, listens on TCP port `507`, waits up to 30 seconds, and accepts a connection from the device assigned `192.168.1.100` (V-CONN; `DeviceInfo.cs:9-15`). The PC is the TCP listener; the device initiates the TCP connection. |
 | Vendor Ethernet uses the NModbus IP master, not the serial RTU framer. | **Confirmed by vendor code** | The accepted `TcpClient` is passed to `ModbusIpMaster.CreateIp(...)` (V-CONN). This is distinct from the Waveshare path below and implies Modbus IP/MBAP framing in NModbus. |
-| The deployed Waveshare path is client-initiated RTU framing carried over a TCP stream. | **Corroborated operationally** | Prior integrations instantiate `ModbusTcpClient(..., framer=ModbusRtuFramer)` and connect outward to each gateway (P-TRANSPORT). This is commonly called RTU-over-TCP, not Modbus TCP/MBAP. No byte capture was supplied, so exact on-wire framing remains to be captured before implementation acceptance. |
+| The deployed Waveshare path is client-initiated RTU framing carried over a TCP stream. | **Verified by live capture (2026-08-22)** | The production `WaveshareTransport` (PyModbus 3.15, `FramerType.RTU`, `device_id=4`, TCP 4196) connected outward to each gateway and read the full 13-block IoT plan cleanly on first attempt, three units, zero malformed responses. Raw vectors: `docs/evidence/live-capture-2026-08-22.json`. |
 | The three gateway endpoints are MID `.11`, RHS `.12`, LHS `.13`, TCP port `4196`. | **Corroborated operationally** | Repeated in `modbus/manager.py:833-835`, `modbus/byd/config.py:19-48`, and the next-generation config. The physical identity behind each IP has not been cryptographically or register-identity verified. |
 | Slave/unit ID is 4. | **Confirmed by vendor code** | Default and bundled serial configuration use 4; every NModbus read/write receives `DeviceInfo.devAddress`; prior Waveshare code also sends slave 4. |
 | TCP unit ID is ignored by the device. | **Unknown** | The vendor code passes the unit ID on every TCP operation. Whether the firmware or gateway ignores it is not established. |
@@ -93,7 +93,25 @@ Any implementation must select framing explicitly. A default `ModbusTcpClient` u
 | Negative BIC count handling | **Confirmed by vendor code** | The value is cast to signed 16-bit; if negative, the local copy is set to zero. No upper-bound validation is performed during detection. |
 | Enable mask width | **Confirmed by vendor code** | The enable-mask register is cast to `byte` before being stored (`BmsInfo.battstringEnableStatus`, declared `byte`; `(byte)array[4]` for IoT and `(byte)array[2]` for legacy, `MiniESapp.cs:1289,1299`, `SysControl.cs:729,1150`). Only the low 8 bits are used, so at most 8 BECU enable bits exist; bits 8-15 of the raw register are discarded by the vendor. |
 | BECU count | **Confirmed by vendor code** | It is the population count of the byte-truncated enable mask, forced to at least 1 (`GlobalFun.NumberOf1`, `SysControl.cs:90-99`). Because the mask is truncated to 8 bits, the legacy BECU count cannot exceed 8. |
-| Deployed units use the IoT layout. | **Assumed** | The prior sensor map addresses match the IoT decoder, but no raw layout-probe response or telemetry capture is present in the supplied artifacts. Control must remain observe-only until each unit's layout and identity are read and pinned. |
+| Deployed units use the IoT layout. | **Verified by live capture (2026-08-22)** | All three layout probes return register 0 = 536 (> 10 selects IoT). Per-unit commissioned topology: MID (192.168.1.11) 6 BIC, RHS (192.168.1.12) 5 BIC — differing topology across the fleet, validating the per-unit commissioning requirement — LHS (192.168.1.13) 6 BIC; enable mask 1 on all. Pinned device identities (RTU ID at 0x8106, low-word-first uint32): MID `0x2C225097`, RHS `0x2C225076`, LHS `0x2C225095`. Control remains observe-only until scaling, direction, freshness, and watchdog timing are validated per unit. |
+
+## 4a. Live commissioning evidence (2026-08-22, authorized observe-only)
+
+Authorized by the operator as a direct hookup; every operation below was a
+read-only FC03 holding-register read through the production
+`WaveshareTransport`; no write of any kind was issued.
+
+- First live read: MID layout probe (0x5000, 7 registers) — succeeded first
+  attempt, validating the previously unverified RTU-over-TCP framing end to
+  end through our own adapter.
+- Full 13-block IoT read plan captured once per unit (including the 0x8106
+  identity pair): `docs/evidence/live-capture-2026-08-22.json` — the first
+  E1 reference vectors taken from deployed hardware rather than handcrafted.
+- Fleet topology: MID 6 BIC / RHS 5 BIC / LHS 6 BIC (enable mask 1 each).
+- Still unknown and required before any actuation: telemetry scaling and
+  field placement validation against the evidence matrix, power-direction
+  sign on the real installation, watchdog expiry timing, and the
+  string-identity binding strategy (the wire carries only the CRC32 RTU ID).
 
 ## 5. Exhaustive vendor call-site register inventory
 
