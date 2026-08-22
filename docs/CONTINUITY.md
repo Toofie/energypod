@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-21 (Australia/Brisbane)
+Last updated: 2026-08-23 (Australia/Brisbane)
 
 ## Purpose
 
@@ -366,6 +366,39 @@ direction, freshness, and watchdog timing per physical unit.
 - 2026-08-21: Committed the baseline as `1552202` and dispatched five disjoint
   implementation streams: domain/allocation; config/schedule/persistence;
   arbiter/safety/kernel; protocol/transport; and sole-owner actor.
+- 2026-08-23: PARTIAL ELIGIBILITY FIXED END TO END (6abd869). Every console
+  fleet dispatch (charge AND discharge, all three pods) was rejected every
+  1.5 s cycle with "Allowed: None yet" — the fleet never halted but never
+  acted, which reads as a stall in the console. Root cause was NOT load or
+  time-of-day: any fleet-wide intent is PARTIALLY eligible in practice (MID
+  sits at the 10% discharge floor; earlier, two pods sat above the 95%
+  charge ceiling), and the allocator correctly proposed zero watts for
+  those units — but four layers coupled "active direction" to "positive
+  watts" and each rejected the WHOLE batch: the domain UnitSetpoint
+  validator (could not even REPRESENT a non-participating setpoint), the
+  safety kernel (direction_power_mismatch, then zero_dynamic_capability,
+  then per-unit deny reasons like soc_below_discharge_floor vetoing
+  everyone), and the control kernel matcher (fixed first, cc2b58e) and
+  mint gate (_eligible required positive watts for EVERY selected unit).
+  Resolution: a zero-watt setpoint with an active direction is explicit
+  NON-participation — no authority is ever minted for it, so representing
+  and accepting it is safe. Domain now forbids only IDLE-with-nonzero;
+  safety skips per-unit deny reasons for zero-watt proposals (their
+  telemetry cannot endanger actuation; the kernel's evidence-coherence
+  gate still requires observations for every selected unit before minting
+  anything); the kernel mints authority per participating unit, and an
+  intent participating nowhere still mints nothing (fail-closed).
+  Single-unit verification (2026-08-22 evening) never tripped this because
+  single-unit intents are either fully eligible or honestly refused — only
+  fleet-wide dispatches with a mixed fleet do. Also fixed en route
+  (f788701): a pymodbus client closed by resync never reconnects with
+  reconnect_delay=0 — the transport now rebuilds its client from the
+  factory, ending the multi-hour LHS telemetry-stale incident.
+  Verification sweep dispatched (agent-driven, per unit: discharge
+  500 W x 300 s then charge 500 W x 60 s); results to be appended.
+  Process note from the operator: long test harness runs must never block
+  the live development loop — full suites go to background/subagents.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
