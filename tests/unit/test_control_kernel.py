@@ -377,6 +377,53 @@ async def test_explicit_selected_subset_is_complete(api: Any):
     assert_batch(api, auth.published[0], value)
 
 
+async def test_partially_eligible_fleet_allocates_zero_watt_proposals_without_crashing(
+    api: Any,
+) -> None:
+    """2026-08-23 live halt: a multi-unit charge with units above the SOC
+    ceiling produces zero-watt proposals for those units; the kernel must
+    accept them, mint authority only for the eligible unit, and never raise
+    "allocator output does not match the selected intent"."""
+    from dataclasses import replace as _replace
+
+    value = intent(api, units=UNITS)
+    full_outcome = decision_for(api, value)
+    proposals = proposals_for(value)
+    eligible_only = (
+        _replace(proposals[0], watts=0),
+        _replace(proposals[1], watts=0),
+        proposals[2],
+    )
+    # Safety echoes the allocation: zero watts for the two ineligible units.
+    outcome = _replace(
+        full_outcome,
+        setpoints=(
+            _replace(full_outcome.setpoints[0], watts=0),
+            _replace(full_outcome.setpoints[1], watts=0),
+            full_outcome.setpoints[2],
+        ),
+    )
+    kernel, history, auth, audit, allocator, safety = make_kernel(api, value, outcome)
+    allocator.output = eligible_only
+    decision = await kernel.tick()
+    # The kernel accepts the partially-eligible allocation (no ValueError),
+    # audits the decision durably, and — because a zero-watt setpoint can
+    # never carry authority — grants nothing: fail-closed, not a fleet halt.
+    assert history == [
+        "intents",
+        "current",
+        "previous",
+        "select",
+        "allocate",
+        "safety",
+        "audit",
+        "revoke",
+    ]
+    assert decision is outcome
+    assert auth.published == []
+    assert audit.events
+
+
 @pytest.mark.parametrize("shape", ["missing", "duplicate", "extra"])
 async def test_missing_duplicate_or_extra_setpoint_rejects_whole_batch(api: Any, shape: str):
     value = intent(api)

@@ -1478,6 +1478,9 @@ class _Supervision:
             self.halt_evidence = "".join(
                 traceback.format_exception(type(failure), failure, failure.__traceback__)
             )
+            # Observability (ledger follow-up): a supervisor failure must name
+            # itself in the process log, not only in inspectable state.
+            print("SUPERVISOR FAILURE:", self.halt_evidence, flush=True)
             await self._halt("supervisor_failure")
 
     def _failure(self) -> BaseException | None:

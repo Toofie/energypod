@@ -454,6 +454,7 @@ class ControlKernel:
             return False
         seen: set[str] = set()
         total_watts = 0
+        zero_watts = 0
         for item in items:
             unit_id = getattr(item, "unit_id", None)
             watts = getattr(item, "watts", None)
@@ -465,11 +466,25 @@ class ControlKernel:
                 or getattr(item, "direction", None) is not intent.direction
                 or type(watts) is not int
                 or watts < 0
-                or (intent.direction is Direction.IDLE) != (watts == 0)
             ):
                 return False
+            # A zero-watt entry is legitimate for two reasons the domain
+            # allocator contract pins: an IDLE intent carries all zeros, and
+            # a partially eligible fleet carries zero watts for selected units
+            # with no usable headroom (2026-08-23 live halt: a 3-unit charge
+            # with two units above the SOC ceiling crashed the kernel here).
+            # Zero watts is inherently safe — `_eligible` refuses to mint any
+            # authority for a zero-watt setpoint — so only the coupling that
+            # active directions must be all-positive is dropped, not the
+            # unit-set, identity, direction, or total checks.
+            if watts == 0:
+                zero_watts += 1
             seen.add(unit_id)
             total_watts += watts
+        if intent.direction is Direction.IDLE and total_watts != 0:
+            return False
+        if intent.direction is not Direction.IDLE and zero_watts == len(items):
+            return False
         return seen == selected and total_watts <= intent.watts
 
     @staticmethod
