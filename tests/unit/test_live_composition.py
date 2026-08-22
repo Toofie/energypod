@@ -1128,13 +1128,11 @@ async def test_run_mode_supervision_failure_fences_and_shuts_down_the_fleet(
     session = _LifespanSession(runtime.app)
     try:
         session.send("lifespan.startup")
-        await session.pump_until(
-            lambda: session.seen("lifespan.startup.failed")
-            or session.seen("lifespan.shutdown.complete")
-            or session.seen("lifespan.shutdown.failed"),
-            message="a failed run-mode supervisor component must fail the lifespan startup",
-        )
-        assert session.seen("lifespan.startup.failed"), f"startup: {session.events!r}"
+        # The fleet cycle stages the first kernel tick after startup, so a
+        # component failure surfaces as a halt (fence, revoke, actor shutdown)
+        # rather than a startup refusal. In production the serving bridge
+        # stops the server on that halt; in this raw lifespan session the
+        # halt is observed directly, then shutdown is driven explicitly.
         await session.pump_until(
             lambda: _actors_stopped(runtime),
             message="a failed run-mode supervisor component must run actor shutdown",
@@ -1148,6 +1146,13 @@ async def test_run_mode_supervision_failure_fences_and_shuts_down_the_fleet(
             lambda: not asyncio.all_tasks() - baseline - {session.app_task},
             message="a failed run-mode supervisor component must not leave tasks running",
         )
+        session.send("lifespan.shutdown")
+        await session.pump_until(
+            lambda: session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed"),
+            message="the halted fleet must still shut the lifespan down cleanly",
+        )
+        assert not session.seen("lifespan.shutdown.failed")
     finally:
         await session.close()
 

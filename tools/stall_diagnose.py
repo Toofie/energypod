@@ -26,19 +26,17 @@ TTL_S = 180
 async def main() -> None:
     import pathlib
 
-    from energypod.runtime.credentials import FileCredentialStore
-
     import yaml
+
+    from energypod.runtime.credentials import FileCredentialStore
 
     payload = yaml.safe_load(
         pathlib.Path("config/config.live-write-example.yaml").read_text(encoding="utf-8")
     )
     config = ControllerConfig.model_validate(payload)
     store = FileCredentialStore(pathlib.Path("var/live-credentials.json"))
-    runtime = composition.build_runtime(
-        config, credential_store=store
-    )
-    supervision = composition._LAST_SUPERVISION  # noqa: SLF001 - diagnostic
+    runtime = composition.build_runtime(config, credential_store=store)
+    supervision = composition._LAST_SUPERVISION
     assert supervision is not None
     principal = type(
         "P",
@@ -63,7 +61,7 @@ async def main() -> None:
             await asyncio.sleep(1.0)
             try:
                 observation = await runtime.observations.latest(UNIT)
-            except Exception as error:  # noqa: BLE001 - diagnostic
+            except Exception as error:
                 log(f"observation read failed: {error!r}")
                 continue
             if observation is None:
@@ -81,7 +79,7 @@ async def main() -> None:
             stale_for = time.monotonic() - last_fresh
             if stale_for >= STALL_AFTER_S:
                 log(f"STALL DETECTED (telemetry age {age:.1f}s, stale {stale_for:.1f}s)")
-                log(f"supervision stopped={supervision._stopped} tasks={len(supervision._tasks)}")  # noqa: SLF001
+                log(f"supervision stopped={supervision._stopped} tasks={len(supervision._tasks)}")
                 for report_name, report in getattr(supervision, "_start_reports", {}).items():
                     log(f"  start[{report_name}] done={report.done()}")
                 for task in asyncio.all_tasks():
@@ -103,8 +101,8 @@ async def main() -> None:
                         log(f"    {line}")
                 for name, actor in runtime.actors.items():
                     log(
-                        f"  actor {name}: lifecycle={actor.lifecycle} stopping={actor._stopping}"  # noqa: SLF001
-                        f" owner={actor._owner and actor._owner.done()}"  # noqa: SLF001
+                        f"  actor {name}: lifecycle={actor.lifecycle} stopping={actor._stopping}"
+                        f" owner={actor._owner and actor._owner.done()}"
                     )
                 return
 

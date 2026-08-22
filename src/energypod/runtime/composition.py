@@ -1344,13 +1344,9 @@ class _Supervision:
         loop = asyncio.get_running_loop()
         self._start_reports = {actor.unit_id: loop.create_future() for actor in self._actors}
         self._tasks = [
-            asyncio.create_task(self._run_kernel(), name="energypod-supervision:kernel"),
-            *(
-                asyncio.create_task(
-                    self._run_actor(actor, self._start_reports[actor.unit_id]),
-                    name=f"energypod-supervision:actor:{actor.unit_id}",
-                )
-                for actor in self._actors
+            asyncio.create_task(
+                self._run_fleet(self._start_reports),
+                name="energypod-supervision:fleet-cycle",
             ),
         ]
         try:
@@ -1404,55 +1400,70 @@ class _Supervision:
                 return False
         return True
 
-    async def _run_kernel(self) -> None:
-        # Tick immediately at startup, then hold the commissioned heartbeat
-        # cadence; any tick failure ends this task and fences the fleet.
-        while True:
-            await self._kernel.tick()
-            await self._clock.sleep(self._interval_s)
+    async def _run_fleet(self, start_reports: dict[str, asyncio.Future[None]]) -> None:
+        """One fleet cycle: start, then heartbeat -> poll -> tick forever.
 
-    async def _run_actor(self, actor: EnergyPodActor, started: asyncio.Future[None]) -> None:
-        # A start failure is a component failure and propagates.  Poll and
-        # heartbeat failures are survived: the actor's own state machine
-        # fences/inhibits on write failures, and unreadable telemetry fails
-        # closed through authorization expiry and kernel staleness checks.
-        try:
-            await actor.start()
-        except BaseException as error:
-            if not started.done():
-                started.set_exception(error)
-            raise
-        started.set_result(None)
-        poll: asyncio.Task[None] | None = None
-        try:
-            while True:
-                await self._clock.sleep(self._interval_s)
-                # Heartbeat first: it consumes authority minted against the
-                # previous observation before a fresh poll invalidates it.
-                # The heartbeat is awaited while the previous cycle's telemetry
-                # read may still be in dispatch, so the actor's own
-                # overdue-read preemption can abandon that read instead of
-                # delaying the renewal past its safety margin.
+        The ordering is the load-bearing part (2026-08-22 live commissioning):
+        with independent kernel/actor/poll timers, a fresh poll lands between
+        the kernel's mint and the actor's heartbeat with near certainty, so the
+        sequence-bound single-use authorization is stale by consumption time
+        and no write ever happens. In one cycle: heartbeats run first and
+        consume the authority minted by the PREVIOUS cycle's tick against the
+        observation that has not changed since; polls then advance the
+        observations concurrently (independent gateways, bounded by the read
+        timeout); the kernel tick mints against those fresh observations,
+        which the next cycle's heartbeats consume before any poll can
+        invalidate them. Renewal spacing is therefore bounded by the cycle:
+        sleep(interval) + at most one read timeout + the kernel timeout, all
+        inside the commissioned device-command expiry.
+
+        Start failures are component failures and propagate (the watcher
+        halts the fleet). Heartbeat and poll failures are survived per cycle:
+        the actor's own state machine fences/inhibits on write failures, and
+        unreadable telemetry fails closed through authorization expiry and
+        kernel staleness checks. A kernel tick failure ends the task and
+        fences the fleet.
+        """
+        for actor in self._actors:
+            try:
+                await actor.start()
+            except BaseException as error:
+                report = start_reports.get(actor.unit_id)
+                if report is not None and not report.done():
+                    report.set_exception(error)
+                raise
+            report = start_reports.get(actor.unit_id)
+            if report is not None and not report.done():
+                report.set_result(None)
+        while True:
+            await self._clock.sleep(self._interval_s)
+            for actor in self._actors:
                 try:
                     with contextlib.suppress(Exception):
                         await actor.heartbeat_once()
                 except asyncio.CancelledError:
                     # A facade fence (emergency stop) cancels in-flight
                     # authority work; that borrowed cancellation must not end
-                    # this unit's supervision loop. Genuine shutdown of this
-                    # task carries a real cancellation request, which wins.
+                    # the fleet cycle. Genuine shutdown of this task carries a
+                    # real cancellation request, which wins.
                     task = asyncio.current_task()
                     if task is None or task.cancelling():
                         raise
-                if poll is not None:
-                    await asyncio.gather(poll, return_exceptions=True)
-                poll = asyncio.create_task(
-                    _poll_once(actor), name=f"energypod-supervision:poll:{actor.unit_id}"
-                )
-        finally:
-            if poll is not None:
-                poll.cancel()
-                await asyncio.gather(poll, return_exceptions=True)
+            # API_CONTRACTS "Unit actor": an overdue read is abandoned
+            # rather than delaying a heartbeat past its safety margin. In the
+            # fleet cycle the bound is structural — a poll that overruns the
+            # interval is cancelled (its observation is only appended at the
+            # end of the poll, so abandoned reads never become evidence) and
+            # the cycle proceeds to the tick, keeping renewal cadence.
+            await asyncio.gather(
+                *(self._bounded_poll(actor) for actor in self._actors),
+                return_exceptions=True,
+            )
+            await self._kernel.tick()
+
+    async def _bounded_poll(self, actor: EnergyPodActor) -> None:
+        with contextlib.suppress(Exception, asyncio.TimeoutError):
+            await asyncio.wait_for(_poll_once(actor), timeout=self._interval_s)
 
     async def _watch_for_failure(self) -> None:
         if not self._tasks:
