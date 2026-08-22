@@ -1033,3 +1033,107 @@ def test_recorded_supervision_halt_decides_the_exit_code(
     else:
         assert invocation.exit_code == 0, invocation.report()
     assert audit.issues == []
+
+
+# ---------------------------------------------------------------------------
+# db lifecycle subcommands (API_CONTRACTS "Operations surface"): pure
+# database maintenance. They may never compose a runtime, hand an app to a
+# runner, start a server, or touch hardware, and they fail closed with a
+# structured error whenever the durable store is absent or unusable.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["db"],
+        ["db", "frobnicate"],
+        ["db", "migrate"],
+        ["db", "migrate", "--config"],
+        ["db", "migrate", "left.yaml", "right.yaml"],
+        ["db", "migrate", "--config", "a.yaml", "b.yaml"],
+        ["db", "migrate", "--out", "x.sqlite3", "unused.yaml"],
+        ["db", "migrate", "--in", "x.sqlite3", "unused.yaml"],
+        ["db", "backup"],
+        ["db", "backup", "unused.yaml"],
+        ["db", "backup", "--out"],
+        ["db", "backup", "--out", "a.sqlite3", "--out", "b.sqlite3", "unused.yaml"],
+        ["db", "backup", "--in", "x.sqlite3", "unused.yaml"],
+        ["db", "restore"],
+        ["db", "restore", "unused.yaml"],
+        ["db", "restore", "--in"],
+        ["db", "restore", "--in", "a.sqlite3", "--in", "b.sqlite3", "unused.yaml"],
+        ["db", "restore", "--out", "x.sqlite3", "unused.yaml"],
+        ["db", "backup", "--wat", "unused.yaml"],
+    ],
+)
+def test_db_subcommand_usage_errors_fail_closed_without_side_effects(
+    main_module: ModuleType, capsys: pytest.CaptureFixture[str], argv: list[str]
+) -> None:
+    """A malformed db command line is a usage error before anything loads."""
+    with SideEffectAudit() as audit:
+        invocation = call_main(main_module, argv, capsys)
+    assert not invocation.system_exit_raised, invocation.report()
+    assert invocation.exit_code == 2, invocation.report()
+    assert "usage" in invocation.combined_output.lower(), invocation.report()
+    assert invocation.runner.calls == []
+    assert audit.issues == []
+
+
+def test_db_commands_never_compose_a_runtime_or_reach_the_injected_runner(
+    main_module: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even an operational failure must stay a plain database command."""
+    _forbid_real_serving(monkeypatch)
+    spy = _wrap_build_runtime(monkeypatch)
+    database = tmp_path / "absent.sqlite3"
+    path = tmp_path / "controller.yaml"
+    _write_valid_config(path, database)
+    with SideEffectAudit(allow_config_reads=True) as audit:
+        invocation = call_main(main_module, ["db", "migrate", str(path)], capsys)
+    assert not invocation.system_exit_raised, invocation.report()
+    assert invocation.exit_code == 1, invocation.report()
+    assert "database error" in invocation.stderr, invocation.report()
+    assert invocation.runner.calls == [], "db commands must never reach serving"
+    if spy is not None:
+        assert spy.calls == [], "db commands must never compose a runtime"
+    assert not database.exists()
+    assert audit.issues == []
+
+
+def test_db_commands_fail_closed_when_no_durable_database_is_configured(
+    main_module: ModuleType, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A storage-less configuration cannot service database maintenance."""
+    database = tmp_path / "unused.sqlite3"
+    path = tmp_path / "controller.yaml"
+    _write_yaml(path, _valid_payload(database) | {"storage": None})
+    with SideEffectAudit(allow_config_reads=True) as audit:
+        invocation = call_main(main_module, ["db", "migrate", str(path)], capsys)
+    assert not invocation.system_exit_raised, invocation.report()
+    assert invocation.exit_code == 1, invocation.report()
+    assert "database error" in invocation.stderr, invocation.report()
+    assert "storage" in invocation.stderr, invocation.report()
+    assert invocation.runner.calls == []
+    assert not database.exists()
+    assert {child.name for child in tmp_path.iterdir()} == {"controller.yaml"}
+    assert audit.issues == []
+
+
+def test_db_commands_report_invalid_configurations_fail_closed(
+    main_module: ModuleType, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    template, valid = _discovered_argv(main_module, tmp_path, capsys)
+    database = tmp_path / "must-not-exist.sqlite3"
+    path = tmp_path / "invalid.yaml"
+    _write_yaml(path, _invalid_payload(database, "unit_count_mismatch"))
+    with SideEffectAudit(allow_config_reads=True) as audit:
+        invocation = call_main(main_module, ["db", "migrate", str(path)], capsys)
+    assert_failed_cleanly(invocation)
+    assert "configuration error" in invocation.stderr, invocation.report()
+    assert invocation.runner.calls == []
+    assert not database.exists()
+    assert audit.issues == []

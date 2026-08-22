@@ -807,7 +807,12 @@ def test_public_route_and_openapi_surfaces_exclude_maintenance_and_debug(
 
     lowered = " ".join(paths).lower()
     assert all(word not in lowered for word in forbidden)
-    assert all(path == "/openapi.json" or path.startswith(API) for path in paths)
+    # /healthz is the one contracted non-API public surface: unauthenticated
+    # liveness for container orchestration (API_CONTRACTS "Operations
+    # surface").  Everything else stays behind the versioned, guarded prefix.
+    non_api = {path for path in paths if not path.startswith(API)}
+    assert non_api <= {"/openapi.json", "/healthz"}
+    assert "/healthz" in paths
 
 
 def test_events_session_requires_bearer_and_observe_scope(
@@ -900,3 +905,97 @@ def test_event_ticket_grants_nothing_but_the_event_stream(
     _assert_error(session, 401, "authentication_required")
     assert service.calls == []
     assert authenticator.presented_tokens == ["operator-token", ticket, ticket, ticket]
+
+
+# --- Operations surface (Milestone C): GET /healthz -------------------------
+#
+# API_CONTRACTS: "/healthz is the only unauthenticated endpoint: liveness only
+# (process up), never readiness, never data.  It exists for container
+# orchestration; /api/v1/health remains the authenticated three-fact health
+# view."
+
+
+def test_healthz_answers_unauthenticated_liveness_only(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        response = client.get("/healthz")
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body) == {"ok"}, "liveness exposes exactly the ok fact, never readiness or data"
+    assert body["ok"] is True
+    # Nothing was consulted on the way to the answer: no credential was
+    # validated and no service read happened.
+    assert authenticator.presented_tokens == []
+    assert service.calls == []
+
+
+@pytest.mark.parametrize(
+    "authorization",
+    ["Bearer unknown-token", "Bearer ", "Basic dXNlcjpwYXNz", "not-a-scheme"],
+)
+def test_healthz_ignores_offered_credentials_instead_of_validating_them(
+    authorization: str,
+    service: RecordingEnergyService,
+    authenticator: FakeAuthenticator,
+) -> None:
+    """A liveness probe never consults the credential store: an orchestrator
+    that forwards (or mangles) an Authorization header still learns process-up
+    without granting itself anything."""
+    with _client(service, authenticator) as client:
+        response = client.get("/healthz", headers={"Authorization": authorization})
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert authenticator.presented_tokens == []
+    assert service.calls == []
+
+
+def test_healthz_is_a_get_only_deterministic_probe(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        first = client.get("/healthz")
+        second = client.get("/healthz")
+        post = client.post("/healthz")
+        api_health = client.get(f"{API}/health")
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json() == {"ok": True}
+    assert post.status_code == 405
+    # The authenticated three-fact health view stays a separate guarded route.
+    _assert_error(api_health, 401, "authentication_required")
+    assert service.calls == []
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "payload"),
+    [
+        ("GET", "/snapshot", None),
+        ("GET", "/health", None),
+        ("GET", "/audit", None),
+        (
+            "POST",
+            "/intents",
+            {"unit_ids": ["pod-a"], "direction": "charge", "watts": 500, "ttl_s": 10},
+        ),
+        ("POST", "/arm", {"unit_ids": ["pod-a"], "confirmation": "ARM"}),
+        ("POST", "/disarm", {"unit_ids": ["pod-a"]}),
+        ("POST", "/emergency-stop", {"unit_ids": ["pod-a"], "reason": "probe"}),
+        ("POST", "/emergency-stop/stop-1/acknowledge", {"confirmation": "ACKNOWLEDGE"}),
+        ("POST", "/units/pod-a/inhibit/acknowledge", {"confirmation": "ACKNOWLEDGE"}),
+        ("POST", "/events/session", None),
+    ],
+)
+def test_every_route_except_healthz_still_requires_bearer_authentication(
+    method: str,
+    path: str,
+    payload: dict[str, Any] | None,
+    service: RecordingEnergyService,
+    authenticator: FakeAuthenticator,
+) -> None:
+    """Adding the one unauthenticated liveness endpoint weakens nothing else:
+    every operational route refuses an unauthenticated request exactly as
+    before, and none of them reach the service."""
+    with _client(service, authenticator) as client:
+        response = client.request(method, API + path, json=payload)
+    _assert_error(response, 401, "authentication_required")
+    assert service.calls == []

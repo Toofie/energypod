@@ -1,0 +1,79 @@
+# EnergyPod controller composition (docs/API_CONTRACTS.md "Operations
+# surface"): one controller service plus a simulator profile for local
+# operation.
+#
+#   docker compose up -d controller                 # observe-only controller
+#   docker compose --profile simulate up -d simulate # local simulator
+#   docker compose logs simulate | grep -i token    # the printed dev token
+#
+# Contract notes:
+#   - Exactly one controller process runs (ADR-0002: uvicorn must run one
+#     worker; never scale this service while control is enabled).
+#   - The container filesystem is read-only; configuration is mounted
+#     read-only at /etc/energypod, and the durable SQLite store lives on the
+#     named data volume /var/lib/energypod (the image declares that VOLUME).
+#   - No secret is provided by this file. `run` mode without a credential
+#     store stays fail-closed (all bearer auth refused).
+#   - HEALTHCHECK is inherited from the image (GET /healthz, liveness only).
+#
+# Static validation performed here (Docker is NOT installed in the authoring
+# environment; docs/CONTINUITY.md ledger step 12 defers the image build):
+#   1. This file parses as YAML (safe_load) and every services.*.build/
+#     volumes source path was verified to exist in the repository
+#     (./Dockerfile, ./config/controller.yaml, ./config/controller.simulate.yaml).
+#   2. Both mounted configurations were round-tripped through the strict
+#     ControllerConfig model (`energypod check-config` spelling).
+#   3. The simulate service command matches the CLI contract
+#     (`energypod simulate PATH`), and both services' config mount point
+#     matches the image CMD argument /etc/energypod/controller.yaml.
+#
+# Known limitation (tracked in docs/DEFERRED_FINDINGS.md #16): until an
+# explicit listener contract exists, `energypod run`/`simulate` bind their
+# loopback interface inside the container. The published port below is
+# therefore reachable only once the serving host is configurable; until then
+# probe the API from inside the container (`docker compose exec controller
+# python -c "..."` against http://127.0.0.1:8080/healthz) or front the
+# controller once the listener contract lands.
+
+name: energypod
+
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: energypod-controller:0.1.0
+    init: true
+    restart: unless-stopped
+    # The safety path is one process on one loop; a read-only root keeps the
+    # durable store on its volume and nothing else writable.
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./config/controller.yaml:/etc/energypod/controller.yaml:ro
+      - energypod-data:/var/lib/energypod
+    ports:
+      - "8080:8080"
+
+  simulate:
+    profiles: ["simulate"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: energypod-controller:0.1.0
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    # Simulator deployment: deterministic in-process pods, in-memory
+    # persistence, one development principal whose bearer token is printed
+    # once to stdout at startup (fetch it from `docker compose logs simulate`).
+    command: ["energypod", "simulate", "/etc/energypod/controller.yaml"]
+    volumes:
+      - ./config/controller.simulate.yaml:/etc/energypod/controller.yaml:ro
+    ports:
+      - "8081:8080"
+
+volumes:
+  energypod-data:

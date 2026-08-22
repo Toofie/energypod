@@ -1,0 +1,55 @@
+# EnergyPod controller build context (paired with ./Dockerfile).
+#
+# Keeps the image build hermetic and secret-free (docs/API_CONTRACTS.md
+# "Operations surface": no secrets baked in): local virtualenvs, caches,
+# test state, databases, mutation caches, and environment files never enter
+# a build layer. Everything the Dockerfile COPYs (pyproject.toml, README.md,
+# src/, web/ manifest + sources) stays reachable — verified by the static
+# packaging check described in the Dockerfile header.
+
+# Version control and CI metadata
+.git
+.gitignore
+.gitattributes
+
+# Local Python state
+.venv
+__pycache__
+*.pyc
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.hypothesis
+.coverage
+htmlcov
+.mutmut-cache
+
+# Local node state (the web stage installs from the lockfile itself)
+web/node_modules
+web/dist
+web/tsconfig.tsbuildinfo
+
+# Local runtime state and durable stores
+data
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Secrets and environment files — never part of an image
+.env
+.env.*
+
+# Test and review artifacts
+tests
+.review-findings
+.claude
+claude.txt
+
+# Container artifacts
+Dockerfile
+compose.yaml
+.dockerignore
+
+# OS noise
+Thumbs.db
+.DS_Store

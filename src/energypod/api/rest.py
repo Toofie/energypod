@@ -445,6 +445,17 @@ def create_api_app(
                 "The key is bound to another request",
             ) from exc
 
+    @app.get("/healthz")
+    async def healthz() -> dict[str, bool]:
+        """Liveness only (API_CONTRACTS "Operations surface").
+
+        The one unauthenticated endpoint: the process answers, nothing more —
+        no readiness, no data, no credential consultation — so container
+        orchestration can probe process-up while every operational view stays
+        behind bearer authentication at ``/api/v1/health``.
+        """
+        return {"ok": True}
+
     @app.get(f"{API_PREFIX}/snapshot")
     async def get_snapshot(identity: Principal = observe_dependency) -> Any:
         return await service.snapshot(principal=identity)

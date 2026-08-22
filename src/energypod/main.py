@@ -30,6 +30,22 @@ RUN_COMMAND: Final = "run"
 SIMULATE_COMMAND: Final = "simulate"
 _COMMANDS: Final = (CHECK_CONFIG_COMMAND, RUN_COMMAND, SIMULATE_COMMAND)
 
+# Database lifecycle maintenance (API_CONTRACTS "Operations surface"): these
+# subcommands operate on the configured durable store only. They never
+# compose a runtime, hand an application to a runner, start a server, or
+# touch hardware.
+DB_COMMAND: Final = "db"
+DB_MIGRATE_SUBCOMMAND: Final = "migrate"
+DB_BACKUP_SUBCOMMAND: Final = "backup"
+DB_RESTORE_SUBCOMMAND: Final = "restore"
+_DB_SUBCOMMANDS: Final = (
+    DB_MIGRATE_SUBCOMMAND,
+    DB_BACKUP_SUBCOMMAND,
+    DB_RESTORE_SUBCOMMAND,
+)
+DB_OUTPUT_OPTION: Final = "--out"
+DB_INPUT_OPTION: Final = "--in"
+
 # Serving defaults. The strict configuration model does not describe the HTTP
 # listener yet, and a fleet control plane must not become reachable on every
 # interface by accident, so the default bind stays on loopback until serving
@@ -63,14 +79,21 @@ _BENIGN_HALT_TOKENS: Final = (
 )
 
 _USAGE: Final = """usage: energypod [--config PATH | PATH] COMMAND
+       energypod db SUBCOMMAND [options] [--config PATH | PATH]
 
 commands:
   check-config  validate the configuration and print the effective values
   run           compose the runtime and serve the guarded API
   simulate      compose with simulator transports and in-memory persistence
 
+db subcommands (never start a server, never touch hardware):
+  db migrate                  apply pending database schema migrations
+  db backup --out FILE        write a consistent snapshot to a new file
+  db restore --in FILE        validate a backup and swap it in atomically
+
 The configuration path is given either as `--config PATH` or as a single
-positional `PATH`; exactly one spelling is accepted."""
+positional `PATH`; exactly one spelling is accepted. The db subcommands use
+the durable store configured under `storage.database_path`."""
 
 
 class ServerRunner(Protocol):
@@ -83,6 +106,9 @@ class ServerRunner(Protocol):
 class _Invocation:
     command: str
     config_path: Path
+    db_subcommand: str | None = None
+    db_output_path: Path | None = None
+    db_input_path: Path | None = None
 
 
 class _UsageError(Exception):
@@ -98,6 +124,8 @@ def _parse_arguments(argv: Sequence[str]) -> _Invocation:
     if not argv:
         raise _UsageError("no command given")
     command, *operands = argv
+    if command == DB_COMMAND:
+        return _parse_db_arguments(operands)
     if command not in _COMMANDS:
         raise _UsageError(f"unknown command: {command!r}")
     flagged: Path | None = None
@@ -125,6 +153,72 @@ def _parse_arguments(argv: Sequence[str]) -> _Invocation:
     if config_path is None:
         raise _UsageError(f"{command} requires a configuration file path")
     return _Invocation(command=command, config_path=config_path)
+
+
+def _parse_db_arguments(operands: Sequence[str]) -> _Invocation:
+    """Parse `db SUBCOMMAND [options] [--config PATH | PATH]` fail-closed."""
+    if not operands:
+        raise _UsageError("db requires a subcommand: migrate, backup, or restore")
+    subcommand, *rest = operands
+    if subcommand not in _DB_SUBCOMMANDS:
+        raise _UsageError(f"unknown db subcommand: {subcommand!r}")
+    flagged: Path | None = None
+    positional: Path | None = None
+    output: Path | None = None
+    source: Path | None = None
+    index = 0
+    while index < len(rest):
+        operand = rest[index]
+        if operand == "--config":
+            if flagged is not None:
+                raise _UsageError("--config may be given at most once")
+            if index + 1 == len(rest):
+                raise _UsageError("--config requires a configuration path")
+            flagged = Path(rest[index + 1])
+            index += 2
+            continue
+        if operand == DB_OUTPUT_OPTION:
+            if subcommand != DB_BACKUP_SUBCOMMAND:
+                raise _UsageError(f"db {subcommand} does not accept {DB_OUTPUT_OPTION}")
+            if output is not None:
+                raise _UsageError(f"{DB_OUTPUT_OPTION} may be given at most once")
+            if index + 1 == len(rest):
+                raise _UsageError(f"{DB_OUTPUT_OPTION} requires a backup file path")
+            output = Path(rest[index + 1])
+            index += 2
+            continue
+        if operand == DB_INPUT_OPTION:
+            if subcommand != DB_RESTORE_SUBCOMMAND:
+                raise _UsageError(f"db {subcommand} does not accept {DB_INPUT_OPTION}")
+            if source is not None:
+                raise _UsageError(f"{DB_INPUT_OPTION} may be given at most once")
+            if index + 1 == len(rest):
+                raise _UsageError(f"{DB_INPUT_OPTION} requires a backup file path")
+            source = Path(rest[index + 1])
+            index += 2
+            continue
+        if operand.startswith("-"):
+            raise _UsageError(f"unknown option: {operand!r}")
+        if positional is not None:
+            raise _UsageError("give exactly one configuration path")
+        positional = Path(operand)
+        index += 1
+    if flagged is not None and positional is not None:
+        raise _UsageError("use either --config PATH or a positional PATH, not both")
+    config_path = flagged if flagged is not None else positional
+    if config_path is None:
+        raise _UsageError(f"db {subcommand} requires a configuration file path")
+    if subcommand == DB_BACKUP_SUBCOMMAND and output is None:
+        raise _UsageError(f"db {DB_BACKUP_SUBCOMMAND} requires {DB_OUTPUT_OPTION} FILE")
+    if subcommand == DB_RESTORE_SUBCOMMAND and source is None:
+        raise _UsageError(f"db {DB_RESTORE_SUBCOMMAND} requires {DB_INPUT_OPTION} FILE")
+    return _Invocation(
+        command=DB_COMMAND,
+        config_path=config_path,
+        db_subcommand=subcommand,
+        db_output_path=output,
+        db_input_path=source,
+    )
 
 
 def _load_configuration(path: Path) -> ControllerConfig:
@@ -166,6 +260,65 @@ def _check_config_command(path: Path) -> int:
     # whole effect of the command.
     print("effective configuration:")
     print(config.model_dump_json(indent=2))
+    return _EXIT_OK
+
+
+def _db_command(invocation: _Invocation) -> int:
+    """Maintain the configured durable store; never compose or serve anything.
+
+    Imported lazily — like the composition module — so importing
+    ``energypod.main`` still performs no I/O and loads no maintenance stack.
+    The database commands resolve the store from the strict configuration and
+    fail closed with a structured error whenever it is absent or unusable.
+    """
+    from energypod.db.backup import backup_database, restore_database
+    from energypod.db.schema import DatabaseLifecycleError, migrate_file
+
+    try:
+        config = _load_configuration(invocation.config_path)
+    except _ConfigurationFileError as error:
+        print(f"configuration error: {error}", file=sys.stderr)
+        return _EXIT_FAILURE
+    storage = config.storage
+    if storage is None:
+        print(
+            "database error: the configuration declares no durable database "
+            "(storage.database_path is absent); db commands need a "
+            "configured SQLite store",
+            file=sys.stderr,
+        )
+        return _EXIT_FAILURE
+    subcommand = invocation.db_subcommand
+    if subcommand is None:  # pragma: no cover - the parser requires a subcommand
+        print("error: db requires a subcommand", file=sys.stderr)
+        print(_USAGE, file=sys.stderr)
+        return _EXIT_USAGE
+    try:
+        if subcommand == DB_MIGRATE_SUBCOMMAND:
+            result = migrate_file(storage.database_path, busy_timeout_ms=storage.busy_timeout_ms)
+            if result.applied:
+                print(f"database schema migrated to version {result.version}")
+            else:
+                print(f"database schema already at version {result.version}")
+        elif subcommand == DB_BACKUP_SUBCOMMAND:
+            target = invocation.db_output_path
+            if target is None:  # pragma: no cover - the parser requires --out
+                print("error: db backup requires --out FILE", file=sys.stderr)
+                return _EXIT_USAGE
+            backup_database(storage.database_path, target, busy_timeout_ms=storage.busy_timeout_ms)
+            print(f"backup written: {target}")
+        else:
+            source = invocation.db_input_path
+            if source is None:  # pragma: no cover - the parser requires --in
+                print("error: db restore requires --in FILE", file=sys.stderr)
+                return _EXIT_USAGE
+            version = restore_database(
+                source, storage.database_path, busy_timeout_ms=storage.busy_timeout_ms
+            )
+            print(f"database restored from {source} (schema version {version})")
+    except DatabaseLifecycleError as error:
+        print(f"database error: {error}", file=sys.stderr)
+        return _EXIT_FAILURE
     return _EXIT_OK
 
 
@@ -493,6 +646,8 @@ def main(
         return _EXIT_USAGE
     if invocation.command == CHECK_CONFIG_COMMAND:
         return _check_config_command(invocation.config_path)
+    if invocation.command == DB_COMMAND:
+        return _db_command(invocation)
     return _serve_command(
         invocation.config_path,
         simulate=invocation.command == SIMULATE_COMMAND,

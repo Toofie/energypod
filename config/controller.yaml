@@ -1,0 +1,69 @@
+# EnergyPod controller — shipped observe-only configuration (compose mounts
+# this read-only at /etc/energypod/controller.yaml).
+#
+# Safety posture of this file (docs/CONTINUITY.md):
+#   - mode observe_only: the kernel gets the most conservative legal policy;
+#     arming and dispatch exist at the API but non-zero power is bounded to a
+#     nominal watt until a commissioned policy is installed.
+#   - No credential store is configured, so every bearer token is refused
+#     (fail-closed authenticator) until operators commission one.
+#   - Endpoints, identities, and cell counts are PLACEHOLDERS pointing at the
+#     documented Waveshare gateways; per-unit topology, scaling, direction,
+#     and watchdog timing are commissioning items that require separate
+#     observe-only authorization. Never point this at hardware before then.
+#   - The database path must stay on the /var/lib/energypod data volume so
+#     `energypod db backup`/`restore` see one durable store.
+schema_version: 1
+revision: 1
+mode: observe_only
+
+site:
+  site_id: home
+  timezone: Australia/Brisbane
+  expected_unit_count: 3
+
+units:
+  - unit_id: mid
+    display_name: Middle Pod
+    endpoint: { host: 192.168.1.11, port: 4196 }
+    transport_profile: waveshare_rtu_over_tcp
+    protocol_profile: iot
+    device_id: 4
+    expected_identity: BEP-MID
+    expected_cell_count: 59
+  - unit_id: lhs
+    display_name: Left Pod
+    endpoint: { host: 192.168.1.12, port: 4196 }
+    transport_profile: waveshare_rtu_over_tcp
+    protocol_profile: iot
+    device_id: 4
+    expected_identity: BEP-LHS
+    expected_cell_count: 59
+  - unit_id: rhs
+    display_name: Right Pod
+    endpoint: { host: 192.168.1.13, port: 4196 }
+    transport_profile: waveshare_rtu_over_tcp
+    protocol_profile: iot
+    device_id: 4
+    expected_identity: BEP-RHS
+    expected_cell_count: 59
+
+# Cross-validated control budget (docs/API_CONTRACTS.md timing invariants):
+# the complete operation budget (1.00 s) and the renewal cadence budget
+# (1.00 s) both fit inside the 2.35 s device command expiry, and the write
+# timeout fits strictly inside the control period.
+timing:
+  device_command_expiry_s: 2.35
+  device_command_expiry_evidence: commissioning://watchdog-trial-2026-08/rev-1
+  control_period_s: 0.40
+  essential_read_timeout_s: 0.10
+  kernel_timeout_s: 0.05
+  audit_timeout_s: 0.05
+  write_timeout_s: 0.10
+  acknowledgement_timeout_s: 0.10
+  maximum_jitter_s: 0.10
+  renewal_margin_s: 0.50
+
+storage:
+  database_path: /var/lib/energypod/controller.sqlite3
+  busy_timeout_ms: 250

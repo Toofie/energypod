@@ -1,0 +1,104 @@
+# EnergyPod controller — simulator configuration (compose "simulate" profile
+# mounts this read-only at /etc/energypod/controller.yaml and runs
+# `energypod simulate`).
+#
+# Simulate mode (docs/API_CONTRACTS.md "Operations surface"):
+#   - Transports are the deterministic in-process simulator regardless of the
+#     endpoints below; nothing ever opens a socket or reaches hardware.
+#   - Persistence is entirely in-memory regardless of the storage block; the
+#     durable path is kept only so the file round-trips the strict model.
+#   - `energypod simulate` mints one development principal (full scopes,
+#     interactive) and prints its bearer token once to stdout at startup —
+#     simulator deployments only, never `run` mode, never hardware.
+#
+# Shape notes:
+#   - The site stays `observe_only`: the hardware intent of the deployment is
+#     observation, and simulate mode replaces the transports anyway.
+#   - NO credential store is configured. That absence is exactly the grant
+#     for the development principal: a configuration that names a credential
+#     reference stays fail-closed even in simulate mode (every bearer
+#     refused), so do not add an `authentication` block here.
+#   - The `policy` block is the training/commissioning baseline (the same
+#     numbers the golden and end-to-end suites use): without it the
+#     observe-only default bounds authority to a nominal watt and tight cell
+#     imbalance that the simulated fleet cannot meet, which would make local
+#     operation undrivable. Keep it in sync with tests/golden expectations.
+schema_version: 1
+revision: 1
+mode: observe_only
+
+site:
+  site_id: home
+  timezone: Australia/Brisbane
+  expected_unit_count: 3
+
+units:
+  - unit_id: sim-mid
+    display_name: Simulated Middle Pod
+    endpoint: { host: 192.168.1.11, port: 4196 }
+    transport_profile: waveshare_rtu_over_tcp
+    protocol_profile: iot
+    device_id: 4
+    expected_identity: SIM-POD-MID-0001
+    expected_cell_count: 60
+  - unit_id: sim-lhs
+    display_name: Simulated Left Pod
+    endpoint: { host: 192.168.1.12, port: 4196 }
+    transport_profile: waveshare_rtu_over_tcp
+    protocol_profile: iot
+    device_id: 4
+    expected_identity: SIM-POD-LHS-0002
+    expected_cell_count: 60
+  - unit_id: sim-rhs
+    display_name: Simulated Right Pod
+    endpoint: { host: 192.168.1.13, port: 4196 }
+    transport_profile: waveshare_rtu_over_tcp
+    protocol_profile: iot
+    device_id: 4
+    expected_identity: SIM-POD-RHS-0003
+    expected_cell_count: 60
+
+timing:
+  device_command_expiry_s: 2.35
+  device_command_expiry_evidence: commissioning://watchdog-trial-2026-08/rev-1
+  control_period_s: 0.40
+  essential_read_timeout_s: 0.10
+  kernel_timeout_s: 0.05
+  audit_timeout_s: 0.05
+  write_timeout_s: 0.10
+  acknowledgement_timeout_s: 0.10
+  maximum_jitter_s: 0.10
+  renewal_margin_s: 0.50
+
+policy:
+  version: 3
+  threshold_provenance: commissioning-record-2026-08
+  max_fleet_charge_w: 6000
+  max_fleet_discharge_w: 6000
+  max_unit_charge_w: 2500
+  max_unit_discharge_w: 2500
+  minimum_soc_pct: 5.0
+  maximum_soc_pct: 95.0
+  minimum_cell_v: 2.80
+  maximum_cell_v: 3.65
+  maximum_cell_imbalance_v: 0.50
+  minimum_temperature_c: -20.0
+  maximum_temperature_c: 60.0
+  maximum_soc_difference_pct: 5.0
+  maximum_soc_jump_pct: 5.0
+  maximum_telemetry_age_s: 2.0
+  maximum_cell_data_age_s: 10.0
+  authorization_lifetime_s: 1.2
+  ramp_limit_w_per_s: 750
+  stable_samples_to_rearm: 2
+  reactive_power_limit_var: 0
+  blocking_fault_codes:
+    - PCS_EE_CALIBRATION_OUT_OF_RANGE
+    - DCDC_EE_CALIBRATION_OUT_OF_RANGE
+  debug_modes_enabled: false
+
+# Simulate mode ignores this path and stays in-memory; kept for strict-model
+# round-tripping and for `energypod check-config` clarity.
+storage:
+  database_path: /var/lib/energypod/controller.sqlite3
+  busy_timeout_ms: 250

@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, NoReturn
 
+from energypod.db.schema import apply_pending_migrations
 from energypod.domain.audit import AuditEvent, DuplicateAuditEventError
 from energypod.domain.intents import Direction, IntentSource
 from energypod.domain.observations import UnitLifecycle
@@ -105,6 +106,11 @@ class SQLiteDatabase:
                     raise RuntimeError("SQLite refused foreign-key enforcement")
                 if connection.execute("PRAGMA busy_timeout").fetchone()[0] != self.busy_timeout_ms:
                     raise RuntimeError("SQLite refused configured busy timeout")
+                # schema_version from day one: every open runs the same
+                # migration path ``energypod db migrate`` uses, so a fresh
+                # database and a pre-schema database both converge on the
+                # stamped version before any store reads or writes.
+                apply_pending_migrations(connection)
             except BaseException as exc:
                 connection.close()
                 if isinstance(exc, sqlite3.OperationalError) and _is_busy(exc):

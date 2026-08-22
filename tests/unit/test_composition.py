@@ -23,6 +23,7 @@ import inspect
 import itertools
 import json
 import math
+import re
 import socket
 import time
 from collections.abc import Callable, Mapping
@@ -102,10 +103,18 @@ def _build_runtime(config: ControllerConfig, **overrides: Any) -> Any:
     return factory(config, **overrides)
 
 
-def _compose_with(config: ControllerConfig, *, simulate: bool, clock: Any | None = None) -> Any:
+def _compose_with(
+    config: ControllerConfig,
+    *,
+    simulate: bool,
+    clock: Any | None = None,
+    announce: Callable[[str], None] | None = None,
+) -> Any:
     overrides: dict[str, Any] = {"simulate": simulate}
     if clock is not None:
         overrides["clock"] = clock
+    if announce is not None:
+        overrides["dev_credential_announce"] = announce
     return _build_runtime(config, **overrides)
 
 
@@ -224,9 +233,10 @@ def compose(
     simulate: bool = False,
     unit_count: int = 2,
     clock: Any | None = None,
+    announce: Callable[[str], None] | None = None,
 ) -> Any:
     config = _validate(_config_payload(database, unit_count=unit_count))
-    return _compose_with(config, simulate=simulate, clock=clock)
+    return _compose_with(config, simulate=simulate, clock=clock, announce=announce)
 
 
 def compose_write_enabled(
@@ -234,9 +244,10 @@ def compose_write_enabled(
     *,
     simulate: bool = False,
     clock: Any | None = None,
+    announce: Callable[[str], None] | None = None,
 ) -> Any:
     config = _validate(_write_enabled_payload(database))
-    return _compose_with(config, simulate=simulate, clock=clock)
+    return _compose_with(config, simulate=simulate, clock=clock, announce=announce)
 
 
 def _prior_active_audit_event(unit_id: str) -> AuditEvent:
@@ -345,8 +356,23 @@ def _forbid_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "socketpair", refused)
 
 
-async def _asgi_request(app: FastAPI, method: str, path: str) -> tuple[int, dict[str, Any]]:
+async def _asgi_request(
+    app: FastAPI,
+    method: str,
+    path: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    json_body: Mapping[str, Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
     """Drive one request through the composed ASGI app with no test server."""
+    raw_headers = [
+        (name.lower().encode("latin-1"), value.encode("latin-1"))
+        for name, value in (headers or {}).items()
+    ]
+    body = b"" if json_body is None else json.dumps(dict(json_body)).encode("utf-8")
+    if json_body is not None:
+        raw_headers.append((b"content-type", b"application/json"))
+        raw_headers.append((b"content-length", str(len(body)).encode("latin-1")))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -357,14 +383,14 @@ async def _asgi_request(app: FastAPI, method: str, path: str) -> tuple[int, dict
         "raw_path": path.encode(),
         "query_string": b"",
         "root_path": "",
-        "headers": [],
+        "headers": raw_headers,
         "client": ("testclient", 50000),
         "server": ("testserver", 80),
     }
     messages: list[dict[str, Any]] = []
 
     async def receive() -> dict[str, Any]:
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": body, "more_body": False}
 
     async def send(message: dict[str, Any]) -> None:
         messages.append(message)
@@ -1301,3 +1327,202 @@ async def test_build_runtime_fails_closed_and_leaves_no_database_behind(
     assert not database.exists()
     assert not (tmp_path / "leftover.sqlite3-wal").exists()
     assert not (tmp_path / "leftover.sqlite3-shm").exists()
+
+
+# --- Operations surface (Milestone C): the simulator development principal --
+#
+# API_CONTRACTS: "`energypod simulate` mints one deterministic development
+# principal (full scopes, interactive, token printed once to stdout at
+# startup) when no credential store is configured — simulator deployments
+# only, never `run` mode, never against hardware.  `run` mode without a
+# credential store stays fail-closed (all bearer auth refused)."
+
+
+async def test_simulate_mode_prints_one_dev_credential_to_stdout_at_startup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """No credential store configured + simulate mode: one dev credential is
+    minted and its token printed exactly once to stdout at startup, and that
+    printed token is a working bearer credential for the composed API."""
+    capsys.readouterr()
+    runtime = compose(tmp_path / "sim-fleet.sqlite3", simulate=True)
+    captured = capsys.readouterr()
+    lines = [line for line in captured.out.splitlines() if line.strip()]
+    assert len(lines) == 1, "the development credential must be printed exactly once"
+    match = re.search(r"[A-Za-z0-9_-]{32,}", lines[0])
+    assert match is not None, "the startup line must carry the token"
+    token = match.group(0)
+    assert token == token.strip()
+
+    status, body = await _asgi_request(
+        runtime.app, "GET", "/api/v1/snapshot", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert status == 200, body
+    assert body["site_id"] == SITE_ID
+
+    # Anything else — including a tampered copy of the genuine token — is
+    # refused with the ordinary structured 401 envelope.
+    for candidate in ("", "dev", f"{token}x", token.upper(), "x" * 64):
+        status, body = await _asgi_request(
+            runtime.app,
+            "GET",
+            "/api/v1/snapshot",
+            headers={"Authorization": f"Bearer {candidate}"},
+        )
+        assert status == 401, candidate
+        assert body["code"] == "authentication_required"
+
+
+async def test_simulate_dev_principal_holds_full_scopes_and_is_interactive(
+    tmp_path: Path,
+) -> None:
+    """The minted principal is the full-scope interactive operator the guarded
+    surface can express, and its identity is deterministic across builds."""
+    announced: list[str] = []
+    runtime = compose(tmp_path / "dev-fleet.sqlite3", simulate=True, announce=announced.append)
+    assert len(announced) == 1
+    bearer = {"Authorization": f"Bearer {announced[0]}"}
+
+    # observe, and audit:read on top of it.
+    status, snapshot = await _asgi_request(runtime.app, "GET", "/api/v1/snapshot", headers=bearer)
+    assert status == 200, snapshot
+    status, _audit = await _asgi_request(runtime.app, "GET", "/api/v1/audit", headers=bearer)
+    assert status == 200
+
+    # dispatch: a real accepted intent carrying the principal's identity.
+    status, accepted = await _asgi_request(
+        runtime.app,
+        "POST",
+        "/api/v1/intents",
+        headers={**bearer, "Idempotency-Key": "dev-dispatch-probe"},
+        json_body={"unit_ids": ["mid"], "direction": "charge", "watts": 500, "ttl_s": 30},
+    )
+    assert status == 202, accepted
+    active = await _settle(runtime.intents.active(runtime.clock.monotonic()))
+    subjects = {intent.actor_identity for intent in active}
+    assert len(subjects) == 1
+
+    # stop and stop:acknowledge: the full latch/acknowledge round trip.
+    status, stopped = await _asgi_request(
+        runtime.app,
+        "POST",
+        "/api/v1/emergency-stop",
+        headers={**bearer, "Idempotency-Key": "dev-stop-probe"},
+        json_body={"unit_ids": ["mid"], "reason": "dev-principal scope probe"},
+    )
+    assert status == 202, stopped
+    status, acknowledged = await _asgi_request(
+        runtime.app,
+        "POST",
+        f"/api/v1/emergency-stop/{stopped['stop_id']}/acknowledge",
+        headers={**bearer, "Idempotency-Key": "dev-stop-ack-probe"},
+        json_body={"confirmation": "ACKNOWLEDGE"},
+    )
+    assert status == 200, acknowledged
+
+    # arm scope plus an interactive principal: the ghost-unit inhibit
+    # acknowledgement passes both gates and fails on the unit lookup instead
+    # (404 unit_not_found, not a 403).
+    status, body = await _asgi_request(
+        runtime.app,
+        "POST",
+        "/api/v1/units/pod-ghost/inhibit/acknowledge",
+        headers={**bearer, "Idempotency-Key": "dev-interactive-probe"},
+        json_body={"confirmation": "ACKNOWLEDGE"},
+    )
+    assert status == 404, body
+    assert body["code"] == "unit_not_found"
+
+    # The identity is the deterministic part: a second simulated build mints a
+    # different per-process token but the very same principal subject.
+    second_announced: list[str] = []
+    second = compose(
+        tmp_path / "dev-fleet-2.sqlite3", simulate=True, announce=second_announced.append
+    )
+    assert len(second_announced) == 1
+    assert second_announced[0] != announced[0], "tokens are per-process credentials"
+    status, _ = await _asgi_request(
+        second.app,
+        "POST",
+        "/api/v1/intents",
+        headers={
+            "Authorization": f"Bearer {second_announced[0]}",
+            "Idempotency-Key": "dev-dispatch-probe",
+        },
+        json_body={"unit_ids": ["mid"], "direction": "charge", "watts": 500, "ttl_s": 30},
+    )
+    assert status == 202
+    second_active = await _settle(second.intents.active(second.clock.monotonic()))
+    assert {intent.actor_identity for intent in second_active} == subjects
+
+
+async def test_run_mode_without_a_credential_store_refuses_every_bearer(
+    tmp_path: Path,
+) -> None:
+    """`run` mode stays fail-closed with no credential store: every bearer is
+    refused — including a token genuinely minted by a simulator deployment —
+    while /healthz keeps answering unauthenticated liveness."""
+    announced: list[str] = []
+    simulator = compose(tmp_path / "sim-grant.sqlite3", simulate=True, announce=announced.append)
+    assert len(announced) == 1
+    minted = announced[0]
+    status, _ = await _asgi_request(
+        simulator.app, "GET", "/api/v1/snapshot", headers={"Authorization": f"Bearer {minted}"}
+    )
+    assert status == 200, "the minted token must be a real simulator credential"
+
+    refused: list[str] = []
+    runtime = compose(tmp_path / "run-fleet.sqlite3", announce=refused.append)
+    assert refused == [], "run mode must never mint or announce a dev credential"
+    for candidate in (minted, f"dev-{'x' * 40}", "Bearer", "anything"):
+        status, body = await _asgi_request(
+            runtime.app,
+            "GET",
+            "/api/v1/snapshot",
+            headers={"Authorization": f"Bearer {candidate}"},
+        )
+        assert status == 401, candidate
+        assert body["code"] == "authentication_required"
+
+    status, body = await _asgi_request(
+        runtime.app,
+        "POST",
+        "/api/v1/intents",
+        headers={"Authorization": f"Bearer {minted}", "Idempotency-Key": "run-mode-refusal"},
+        json_body={"unit_ids": ["mid"], "direction": "charge", "watts": 500, "ttl_s": 30},
+    )
+    assert status == 401
+    assert body["code"] == "authentication_required"
+
+    # The authenticated three-fact health view stays guarded; /healthz stays
+    # the one unauthenticated endpoint and answers liveness only.
+    status, _body = await _asgi_request(runtime.app, "GET", "/api/v1/health")
+    assert status == 401
+    status, body = await _asgi_request(runtime.app, "GET", "/healthz")
+    assert status == 200
+    assert body == {"ok": True}
+
+
+async def test_a_configured_credential_reference_stays_fail_closed_even_in_simulate(
+    tmp_path: Path,
+) -> None:
+    """A configured credential reference names a store that does not exist in
+    this milestone; the simulator grant never fabricates a principal from it,
+    so even simulate mode with authentication configured refuses every bearer."""
+    announced: list[str] = []
+    runtime = compose_write_enabled(
+        tmp_path / "cred-fleet.sqlite3", simulate=True, announce=announced.append
+    )
+    assert announced == []
+    for candidate in (f"dev-{'y' * 40}", "operator-token", "x" * 60):
+        status, body = await _asgi_request(
+            runtime.app,
+            "GET",
+            "/api/v1/snapshot",
+            headers={"Authorization": f"Bearer {candidate}"},
+        )
+        assert status == 401, candidate
+        assert body["code"] == "authentication_required"
+    status, body = await _asgi_request(runtime.app, "GET", "/healthz")
+    assert status == 200
+    assert body == {"ok": True}

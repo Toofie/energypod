@@ -34,6 +34,7 @@ import contextlib
 import hashlib
 import itertools
 import json
+import secrets
 import sqlite3
 import time
 import uuid
@@ -124,6 +125,16 @@ _CELL_TEMPERATURE_BASE = 0x523C
 
 _RUNTIME_PRINCIPAL = "energypod:runtime"
 _COMPOSITION_POLICY_VERSION = "composition"
+
+# API_CONTRACTS "Operations surface": `energypod simulate` mints one
+# deterministic development principal — full scopes, interactive — when no
+# credential store is configured.  "Full scopes" is exactly the vocabulary the
+# guarded boundary can check (nothing invented, nothing missing); only the
+# token is per-process.
+_DEV_PRINCIPAL_SUBJECT = "dev:simulator"
+_DEV_PRINCIPAL_SCOPES = frozenset(
+    {"observe", "audit:read", "dispatch", "arm", "stop", "stop:acknowledge"}
+)
 
 
 class Clock(Protocol):
@@ -921,10 +932,78 @@ class _UnresolvedCredentialAuthenticator:
     The configuration carries a secret *reference*, never a secret, and no
     credential store exists in this milestone.  Every bearer token is refused
     so no principal is ever fabricated; the REST boundary answers with its
-    structured 401 envelope.
+    structured 401 envelope.  This stays the composed authenticator for every
+    run-mode deployment and for any configuration that names a credential
+    store; only the simulator grant below ever replaces it.
     """
 
     async def authenticate(self, bearer_token: str) -> None:
+        return None
+
+
+@dataclass(slots=True)
+class _DevelopmentPrincipal:
+    """The one deterministic simulator-only principal (API_CONTRACTS).
+
+    Identity, scopes, and interactivity are fixed constants of the simulator
+    deployment; only ``site_id`` follows the configuration so the facade's
+    cross-site refusal still applies.  The REST boundary's ``Principal``
+    protocol declares settable attributes, and mypy models frozen-dataclass
+    fields as read-only, so immutability is enforced by ownership instead:
+    the authenticator mints this once and nothing else ever holds it.
+    """
+
+    subject: str
+    scopes: frozenset[str]
+    interactive: bool
+    site_id: str
+
+
+def _announce_dev_credential_to_stdout(token: str) -> None:
+    """The default startup sink: print the token once (API_CONTRACTS)."""
+    print(f"energypod simulate: development principal bearer token: {token}")
+
+
+class _DevelopmentPrincipalAuthenticator:
+    """Simulator-only bearer authentication for the development principal.
+
+    ``build_runtime`` composes this exactly when simulate mode is on and no
+    credential store is configured: it mints one per-process token for the
+    deterministic interactive development principal with full scopes and
+    announces that token exactly once — through an injectable sink so tests
+    can capture it, stdout by default.  Run mode, and any configuration that
+    names a credential store (enabled or not), keeps the fail-closed
+    authenticator instead: a secret reference names a store that does not
+    exist in this milestone, and no principal is ever fabricated from one.
+    """
+
+    def __init__(self, *, site_id: str, announce: Callable[[str], None]) -> None:
+        if not callable(announce):
+            raise ValueError("announce must be callable")
+        self._principal = _DevelopmentPrincipal(
+            subject=_DEV_PRINCIPAL_SUBJECT,
+            scopes=_DEV_PRINCIPAL_SCOPES,
+            interactive=True,
+            site_id=site_id,
+        )
+        self._token = f"dev-{secrets.token_urlsafe(32)}"
+        self._announce = announce
+        self._announced = False
+
+    def announce_once(self) -> None:
+        """Announce the token exactly once; re-entry stays silent."""
+        if self._announced:
+            return
+        self._announced = True
+        self._announce(self._token)
+
+    async def authenticate(self, bearer_token: str) -> _DevelopmentPrincipal | None:
+        # compare_digest requires ASCII; any non-ASCII offer is simply no
+        # credential rather than an error the boundary would have to absorb.
+        if not bearer_token.isascii():
+            return None
+        if secrets.compare_digest(bearer_token, self._token):
+            return self._principal
         return None
 
 
@@ -1396,22 +1475,34 @@ def _validate_actor_timing_wiring(config: ControllerConfig) -> None:
 
 
 def build_runtime(
-    config: ControllerConfig, *, simulate: bool = False, clock: Clock | None = None
+    config: ControllerConfig,
+    *,
+    simulate: bool = False,
+    clock: Clock | None = None,
+    dev_credential_announce: Callable[[str], None] | None = None,
 ) -> ComposedRuntime:
     """Construct the whole controller graph; the only composition point.
 
     Construction is eager and side-effect free apart from opening the durable
-    SQLite store when one is configured: no task starts, no socket opens, no
-    transport connects, and nothing is restored from persistence.  Wiring is
-    validated before that store opens, and a composition that cannot complete
-    closes it again, so a rejected configuration leaves nothing on disk.
+    SQLite store when one is configured — and, in simulate mode with no
+    credential store configured, printing the minted development credential's
+    token once (API_CONTRACTS "Operations surface"; ``dev_credential_announce``
+    replaces the stdout sink so tests can capture it).  No task starts, no
+    socket opens, no transport connects, and nothing is restored from
+    persistence.  Wiring is validated before that store opens, and a
+    composition that cannot complete closes it again, so a rejected
+    configuration leaves nothing on disk.
     """
     _validate_actor_timing_wiring(config)
     resolved_clock = clock if clock is not None else _SystemClock()
     storage = config.storage
     if storage is None or simulate:
         return _build_runtime(
-            config, simulate=simulate, resolved_clock=resolved_clock, database=None
+            config,
+            simulate=simulate,
+            resolved_clock=resolved_clock,
+            database=None,
+            dev_credential_announce=dev_credential_announce,
         )
     database = SQLiteDatabase(
         storage.database_path,
@@ -1425,7 +1516,11 @@ def build_runtime(
         raise
     try:
         return _build_runtime(
-            config, simulate=simulate, resolved_clock=resolved_clock, database=database
+            config,
+            simulate=simulate,
+            resolved_clock=resolved_clock,
+            database=database,
+            dev_credential_announce=dev_credential_announce,
         )
     except BaseException:
         # A composition that cannot complete must not leave an open durable
@@ -1441,6 +1536,7 @@ def _build_runtime(
     simulate: bool,
     resolved_clock: Clock,
     database: SQLiteDatabase | None,
+    dev_credential_announce: Callable[[str], None] | None = None,
 ) -> ComposedRuntime:
     unit_ids = frozenset(unit.unit_id for unit in config.units)
     process_instance_id = f"energypod-{uuid.uuid4().hex}"
@@ -1596,9 +1692,31 @@ def _build_runtime(
     # named-argument implementation behind them, so this cast only narrows the
     # structural boundary both sides already tested independently.
     adapter_service = cast("Any", facade)
+
+    # API_CONTRACTS "Operations surface": simulate mode with no configured
+    # credential store mints exactly one deterministic development principal
+    # (full scopes, interactive) and announces its per-process token once —
+    # composition is the controller's startup.  Run mode, and any
+    # configuration that names a credential store (enabled or not), stays
+    # fail-closed: every bearer is refused until a real credential store is
+    # composed, so no principal is fabricated outside the simulator grant.
+    authenticator: _DevelopmentPrincipalAuthenticator | _UnresolvedCredentialAuthenticator
+    if simulate and config.authentication is None:
+        dev_authenticator = _DevelopmentPrincipalAuthenticator(
+            site_id=config.site.site_id,
+            announce=(
+                _announce_dev_credential_to_stdout
+                if dev_credential_announce is None
+                else dev_credential_announce
+            ),
+        )
+        dev_authenticator.announce_once()
+        authenticator = dev_authenticator
+    else:
+        authenticator = _UnresolvedCredentialAuthenticator()
     app = create_api_app(
         service=adapter_service,
-        authenticator=_UnresolvedCredentialAuthenticator(),
+        authenticator=authenticator,
         event_source=bus,
     )
     supervision = _Supervision(
