@@ -366,6 +366,25 @@ direction, freshness, and watchdog timing per physical unit.
 - 2026-08-21: Committed the baseline as `1552202` and dispatched five disjoint
   implementation streams: domain/allocation; config/schedule/persistence;
   arbiter/safety/kernel; protocol/transport; and sole-owner actor.
+- 2026-08-22: MILESTONE A COMPLETE — the application runs. Implementation
+  (7 agents, commits 8a57706/e2ca540), adversarial implementation review
+  (32 agents, two-lens verification: 24 confirmed findings incl. 3 P0,
+  1 refuted, 30 P2 notes), and full repair (5 agents + primary seams,
+  commit 858caf9). Every repair carries a regression test and was
+  mutation-verified by defect re-introduction. 998 tests pass; ruff and
+  mypy strict clean. The product now composes and serves end to end:
+  build_runtime (observe-only boot, lifespan supervision, lazy production
+  transport), EnergyServiceFacade, EventBus, deterministic simulator,
+  energypod main CLI (check-config/run/simulate), inhibit acknowledgement
+  (actor classes + facade + REST endpoint), reason-code vocabulary pinned
+  (safety mutation survivors 60 -> 23, all non-vocabulary). Key accepted
+  limitations recorded: run-mode telemetry decode unwired until identity
+  evidence is commissioned (observe-only); repeated-timing-failure and
+  external-writer latched causes deferred; latched-cause golden scenario
+  and store-side cursor for the shipped SQLite audit class are follow-ups.
+  EXACT NEXT STEP: Milestone B — pin the web toolchain via corepack pnpm,
+  author UI behavior/accessibility tests first, then build the React
+  operator console; then Milestone C packaging/ops/e2e.
 - 2026-08-22: Milestone A contracts and red-phase test baseline accepted.
   ADR-0003 fixed the composition/facade/event-bus/simulator/inhibit design;
   API_CONTRACTS.md gained the service-facade, event-bus, composition,
