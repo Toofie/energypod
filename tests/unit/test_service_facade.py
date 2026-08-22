@@ -463,6 +463,7 @@ class FakeActorHandle:
         disarmed_lifecycle: Any = None,
         qualified: bool | None = True,
         inhibit_latched: bool = False,
+        inhibit_cause: str | None = None,
         arm_error: BaseException | None = None,
         zero_error: BaseException | None = None,
     ) -> None:
@@ -472,6 +473,7 @@ class FakeActorHandle:
         self.armed_lifecycle = armed_lifecycle
         self.qualified = qualified
         self.inhibit_latched = inhibit_latched
+        self.inhibit_cause = inhibit_cause if inhibit_latched else None
         self.arm_error = arm_error
         self.zero_error = zero_error
         self.history = history
@@ -646,6 +648,7 @@ def make_rig(
             history=history,
             qualified=spec.get("qualified", True),
             inhibit_latched=spec.get("inhibit_latched", False),
+            inhibit_cause=spec.get("inhibit_cause"),
             arm_error=spec.get("arm_error"),
             zero_error=spec.get("zero_error"),
         )
@@ -847,6 +850,84 @@ async def test_snapshot_assembles_site_sequence_and_per_unit_projections(api: An
     assert pod_b["requested_power"] == {"direction": "idle", "watts": 0}
     assert pod_b["authorized_power"] is None
     assert pod_b["measured_watts"] is None
+
+
+async def test_snapshot_exposes_latched_stops_and_unit_inhibit_state(api: Any) -> None:
+    """2026-08-23 operator-facing defect: the emergency-stop latch was
+    event-driven only, so a console opened after a latch showed nothing.
+
+    The snapshot must tell the truth: a non-acknowledged latched stop appears
+    in ``active_stops`` with the exact console-rendered shape (null unit_ids
+    means fleet-wide), acknowledgement empties the list, and each unit view
+    carries its actor's inhibit latch state and cause.
+    """
+    rig = make_rig(
+        api,
+        units={"pod-a": {}, "pod-b": {"inhibit_latched": True, "inhibit_cause": "latched"}},
+    )
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    assert snapshot["active_stops"] == []
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["inhibit_latched"] is False
+    assert units["pod-a"]["inhibit_cause"] is None
+    assert units["pod-b"]["inhibit_latched"] is True
+    assert units["pod-b"]["inhibit_cause"] == "latched"
+
+    # A fleet-wide stop latches; the snapshot lists it with the exact shape.
+    stop = await _stop(
+        rig.facade,
+        unit_ids=["pod-a", "pod-b"],
+        reason="console latch visibility",
+        idempotency_key="stop-latch-visible-1",
+        request_id="stop-latch-visible-1-r",
+    )
+    assert stop["status"] == "latched", stop
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    (entry,) = snapshot["active_stops"]
+    assert entry == {
+        "stop_id": stop["stop_id"],
+        "latched_at": rig.clock.wall_now().isoformat(),
+        "principal": OPERATOR.subject,
+        "reason_codes": ["latched"],
+        "unit_ids": None,
+    }
+
+    # Acknowledgement empties the list (the bus already publishes
+    # emergency_stop.acknowledged for the transition itself).
+    acknowledged = await rig.facade.acknowledge_emergency_stop(
+        stop_id=stop["stop_id"],
+        principal=OPERATOR,
+        idempotency_key="ack-latch-visible-1",
+        request_id="ack-latch-visible-1-r",
+    )
+    assert acknowledged["status"] == "acknowledged", acknowledged
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    assert snapshot["active_stops"] == []
+
+
+async def test_snapshot_lists_partial_fleet_stops_with_their_unit_ids(api: Any) -> None:
+    """A stop that fenced only part of the fleet names exactly those units."""
+    rig = make_rig(api, units={"pod-a": {}, "pod-b": {}})
+    stop = await _stop(
+        rig.facade,
+        unit_ids=["pod-a"],
+        reason="partial fleet latch",
+        idempotency_key="stop-latch-partial-1",
+        request_id="stop-latch-partial-1-r",
+    )
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    (entry,) = snapshot["active_stops"]
+    assert entry["stop_id"] == stop["stop_id"]
+    assert entry["unit_ids"] == ["pod-a"]
+
+    acknowledged = await rig.facade.acknowledge_emergency_stop(
+        stop_id=stop["stop_id"],
+        principal=OPERATOR,
+        idempotency_key="ack-latch-partial-1",
+        request_id="ack-latch-partial-1-r",
+    )
+    assert acknowledged["status"] == "acknowledged", acknowledged
+    assert (await rig.facade.snapshot(principal=OPERATOR))["active_stops"] == []
 
 
 async def test_snapshot_quality_projection_never_masks_bad_telemetry(api: Any) -> None:
