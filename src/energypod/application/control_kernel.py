@@ -152,6 +152,15 @@ class ControlKernel:
                 # Revocation must never wait behind durable audit I/O.
                 await self._revoke("emergency_stop")
 
+            # 2026-08-23 publish-fence generation desync: every kernel
+            # revocation fences the repository through the last published
+            # generation, and minting at an epoch at or below that fence is
+            # rejected by the publish CAS forever.  Reconcile the epoch the
+            # kernel consults past the repository's permanent fence BEFORE
+            # minting, so a fresh intent publishes on its first cycle.
+            selected = self._selected_units(winner)
+            if selected <= self._unit_ids:
+                await self._reconcile_generation(selected, "authority_generation_reconciled")
             generation_before_mint = (await self._generation_coordinator.snapshot()).epoch
             # Stable per-authority sequencing makes canonical fingerprints
             # reproducible while preserving uniqueness within the sole runtime
@@ -524,6 +533,40 @@ class ControlKernel:
 
     async def _revoke(self, reason: str) -> None:
         await self._authorizations.revoke(self._unit_ids, reason=reason)
+        # The revocation just fenced the repository through the last
+        # published generation; the epoch consulted for the next mint must
+        # reconcile strictly beyond it, or that mint is permanently fenced
+        # (the 2026-08-23 authorized-but-never-dispatched live incident).
+        await self._reconcile_generation(self._unit_ids, reason)
+
+    async def _reconcile_generation(self, unit_ids: frozenset[str], reason: str) -> None:
+        """Advance the epoch this kernel consults past the repository's fence.
+
+        Generation fencing is the core invariant and stays fully intact: the
+        defect was minting AT a fenced epoch, never the fence's existence.
+        The repository owns the authoritative permanent fence, so its
+        revoked-through watermark — not the coordinator's own counter —
+        decides what is dead: any revocation path, in this kernel or in
+        another component, is reflected here by advancing the coordinator
+        strictly beyond that watermark.  Everything at or below the fence
+        stays permanently unpublishable; the next tick mints at a live epoch.
+
+        A legitimate fence that lands mid-cycle, between this reconciliation
+        and publication, is still caught by the repository's publish CAS:
+        that cycle audits its zero-authorized fenced record and the NEXT
+        cycle reconciles and succeeds.  Ports without these operations
+        (isolated deterministic compositions pinned to a fixed generation,
+        structural fakes) keep their exact current behavior; a malformed
+        fence read is skipped so it can never jeopardize the revocation
+        itself — the fence at publish remains the fail-closed backstop.
+        """
+        reader = getattr(self._authorizations, "revoked_through", None)
+        reconciler = getattr(self._generation_coordinator, "advance_past", None)
+        if reader is None or reconciler is None:
+            return
+        fence = await reader(unit_ids)
+        if type(fence) is int and not isinstance(fence, bool) and fence >= 0:
+            await reconciler(fence, reason=reason)
 
     async def _revoke_after_failure(self, reason: str) -> None:
         task = asyncio.create_task(self._revoke(reason))
