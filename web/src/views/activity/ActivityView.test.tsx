@@ -1,29 +1,49 @@
 // Activity view contract suite (docs/UI_CONTRACTS.md, "Activity" and
 // "State and error contract").
 //
+// WIRE TRUTH: every audit fixture is built by web/src/test/wire.ts from the
+// service's own read model (service.py `recent_audit` over the sequenced
+// AuditEvent projection). On the wire:
+//   - the kind key is `event_type` — control_decision, intent_accepted,
+//     unit_armed, unit_disarmed, emergency_stop, stop_acknowledged,
+//     inhibit_acknowledged, authorization_revoked — there is no `type` field
+//     and no observation entry (observations are published on the event bus,
+//     never audited);
+//   - `principal` is the caller's subject string, shown verbatim as "who";
+//   - the outcome is `result` (authorized/clamped/rejected/... plus the
+//     facade's accepted/armed/disarmed/latched/acknowledged/revoked);
+//   - the watt figures are the signed `requested_active_w` and
+//     `authorized_active_w` (charge is negative on the wire);
+//   - `reason_codes` are the service's own codes (power_clamped,
+//     telemetry_stale, latched, latch_cleared, ...);
+//   - only the per-unit mutations (unit_armed, unit_disarmed,
+//     inhibit_acknowledged) carry a `unit_id`; fleet-wide decisions and stops
+//     carry none and are never claimed for a unit.
+//
 // Pinned surface strings an implementation must render (calm household tone,
 // plain language first, raw codes on demand):
-//   - heading "Activity"; entries as list items, newest first
+//   - heading "Activity"; entries as list items, newest first by `sequence`
 //   - pagination button "Load more"; it passes the previous page's
 //     next_cursor as the afterSequence argument of client.getAudit and
 //     disappears when next_cursor is null
-//   - per control entry: principal display_name verbatim (who), the decided /
+//   - per control entry: the principal subject verbatim (who), the decided /
 //     happened / why lines below, and a "Show technical detail" disclosure
 //     revealing the raw reason codes; a native <details> is legal - before
 //     the disclosure the raw code must be not VISIBLE, not absent from the
 //     DOM
-//   - decision language: CLAMPED -> "Reduced to 1500 W of the 3000 W
-//     requested"; result -> "Delivering 1480 W"; reason SITE_EXPORT_LIMIT ->
-//     "Site export limit"; a missing result -> "Result not recorded yet"
-//     (never a fabricated measurement)
+//   - decision language: result "clamped" with the wire's watt figures ->
+//     "Reduced to 1500 W of the 3000 W requested"; reason power_clamped ->
+//     "Power clamped"; a missing result -> "Result not recorded yet" (never
+//     a fabricated measurement)
 //   - kind chips "Observations", "Decisions", "Arming", "Stops",
-//     "Acknowledgements" with the audit-type mapping observation ->
-//     Observations, decision -> Decisions, arm AND disarm -> Arming, stop ->
-//     Stops, *_acknowledgement -> Acknowledgements; unit chips "All units",
-//     "MID", "RHS", "LHS" where "All units" resets the unit filter; every
-//     chip is a toggle button exposing aria-pressed across its whole
-//     lifecycle (false before activation, true while active, false again
-//     after de-toggle) and keyboard operable
+//     "Acknowledgements" with the wire mapping control_decision ->
+//     Decisions, unit_armed AND unit_disarmed -> Arming, emergency_stop ->
+//     Stops, *_acknowledged -> Acknowledgements; the Observations chip is
+//     contracted and selects an empty set today (the audit trail holds no
+//     observation entries), which pins the filtered-empty state; unit chips
+//     "All units", "MID", "RHS", "LHS" where "All units" resets the unit
+//     filter; every chip is a toggle button exposing aria-pressed across its
+//     whole lifecycle and keyboard operable
 //   - states: loading role "status" named "Loading activity" renders skeleton
 //     placeholder entries INSIDE the status region (never a spinner-only
 //     region) that carry no data; empty "Nothing here yet" + what appears
@@ -36,16 +56,15 @@
 //     instead of hiding it
 //
 // The audit REST envelope is { events, next_cursor } and error envelopes are
-// { code, message, details, request_id } (docs/API_CONTRACTS.md). Audit
-// fixtures use the service's lowercase wire enum values (decision_status
-// "authorized" / "clamped"; docs/UI_CONTRACTS.md "Wire casing"), and
-// rejections are thrown as the client's ApiClientError carrying the envelope
-// verbatim plus the HTTP status (docs: src/api/client.ts "TypedError pin").
+// { code, message, details, request_id } (docs/API_CONTRACTS.md). Rejections
+// are thrown as the client's ApiClientError carrying the envelope verbatim
+// plus the HTTP status (docs: src/api/client.ts "TypedError pin").
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
-import type { ApiClient, AuditPage } from "../../api/client";
+import type { ApiClient } from "../../api/client";
+import { auditEvent, auditPage, type WireAuditEvent } from "../../test/wire";
 import { ActivityView } from "./ActivityView";
 
 // Only createApiClient is replaced; the rest of the client module (notably
@@ -62,84 +81,87 @@ const PAGE_SIZE = 50;
 const minutesAgo = (m: number) =>
   new Date(Date.now() - m * 60_000).toISOString();
 
-const principalSam = { kind: "human", display_name: "Sam (home operator)" };
+/** A canonical principal subject (rest.py `_ID_PATTERN` grammar). */
+const PRINCIPAL = "operator.sam";
 
-// Wire fixtures: lowercase StrEnum values exactly as /api/v1/audit
-// serializes them. Newest first, exactly as the API returns a page.
-const authorizedDecisionMID = {
-  type: "decision",
+// Wire fixtures, newest first exactly as the API returns a page. The facade
+// audits fleet-wide decisions and stops without a unit id; only the per-unit
+// mutations carry one.
+const clampedDecision = auditEvent({
   sequence: 60,
-  occurred_at: minutesAgo(2),
-  unit_id: "MID",
-  principal: principalSam,
-  decision_status: "authorized",
-  requested_watts: 1000,
-  authorized_watts: 1000,
-  measured_watts: 990,
-  reason_codes: ["WITHIN_LIMITS"],
-};
-
-const observationRHS = {
-  type: "observation",
-  sequence: 59,
-  occurred_at: minutesAgo(30),
-  unit_id: "RHS",
-};
-
-const armLHS = {
-  type: "arm",
-  sequence: 58,
-  occurred_at: minutesAgo(90),
-  unit_id: "LHS",
-  principal: principalSam,
-  decision_status: "authorized",
-  reason_codes: ["OPERATOR_REQUEST"],
-};
-
-const disarmLHS = {
-  type: "disarm",
-  sequence: 57,
-  occurred_at: minutesAgo(95),
-  unit_id: "LHS",
-  principal: principalSam,
-  decision_status: "authorized",
-  reason_codes: ["OPERATOR_REQUEST"],
-};
-
-const clampedDecisionMID = {
-  type: "decision",
-  sequence: 60,
+  event_type: "control_decision",
+  unit_id: null,
   occurred_at: minutesAgo(5),
-  unit_id: "MID",
-  principal: principalSam,
-  decision_status: "clamped",
-  requested_watts: 3000,
-  authorized_watts: 1500,
-  measured_watts: 1480,
-  reason_codes: ["SITE_EXPORT_LIMIT"],
-};
+  principal: PRINCIPAL,
+  result: "clamped",
+  reason_codes: ["power_clamped"],
+  requested_active_w: 3000,
+  authorized_active_w: 1500,
+});
 
-const stopRHS = {
-  type: "stop",
+const authorizedDecision = auditEvent({
+  sequence: 60,
+  event_type: "control_decision",
+  unit_id: null,
+  occurred_at: minutesAgo(2),
+  principal: PRINCIPAL,
+  result: "authorized",
+  reason_codes: ["safety_checks_passed"],
+  requested_active_w: 1000,
+  authorized_active_w: 1000,
+});
+
+const emergencyStop = auditEvent({
   sequence: 61,
+  event_type: "emergency_stop",
+  unit_id: null,
   occurred_at: minutesAgo(1),
-  unit_id: "RHS",
-  principal: principalSam,
-  decision_status: "authorized",
-  stop_id: "stop-17",
-  reason_codes: ["OPERATOR_REQUEST"],
-};
+  principal: PRINCIPAL,
+  intent_id: "stop-17",
+  result: "latched",
+  reason_codes: ["latched"],
+});
 
-const stopAcknowledgementRHS = {
-  type: "stop_acknowledgement",
+const stopAcknowledgement = auditEvent({
   sequence: 62,
+  event_type: "stop_acknowledged",
+  unit_id: null,
   occurred_at: minutesAgo(0.5),
-  unit_id: "RHS",
-  principal: principalSam,
-  decision_status: "authorized",
-  stop_id: "stop-17",
-  reason_codes: [],
-};
+  principal: PRINCIPAL,
+  intent_id: "stop-17",
+  result: "acknowledged",
+  reason_codes: ["acknowledged"],
+});
+
+const inhibitAcknowledgementMID = auditEvent({
+  sequence: 57,
+  event_type: "inhibit_acknowledged",
+  unit_id: "MID",
+  occurred_at: minutesAgo(30),
+  principal: PRINCIPAL,
+  result: "acknowledged",
+  reason_codes: ["latch_cleared"],
+});
+
+const armLHS = auditEvent({
+  sequence: 58,
+  event_type: "unit_armed",
+  unit_id: "LHS",
+  occurred_at: minutesAgo(90),
+  principal: PRINCIPAL,
+  result: "armed",
+  reason_codes: ["armed"],
+});
+
+const disarmLHS = auditEvent({
+  sequence: 59,
+  event_type: "unit_disarmed",
+  unit_id: "LHS",
+  occurred_at: minutesAgo(95),
+  principal: PRINCIPAL,
+  result: "disarmed",
+  reason_codes: ["disarmed"],
+});
 
 let client: ApiClient;
 
@@ -163,10 +185,20 @@ const renderView = (connection?: "connected" | "disconnected") =>
     render(<ActivityView client={client} connection={connection} />)
   );
 
+/** The units named by the visible entries, in order; an entry with no unit
+ * (a fleet-wide decision or stop) contributes null. */
 const unitOrder = () =>
   screen
     .getAllByRole("listitem")
-    .map((item) => (item.textContent ?? "").match(/MID|RHS|LHS/)?.[0]);
+    .map((item) => (item.textContent ?? "").match(/MID|RHS|LHS/)?.[0] ?? null);
+
+/** Drop one field from a wire entry: the view must name it missing, never
+ * invent a value for it. */
+function withoutField(entry: WireAuditEvent, field: string): WireAuditEvent {
+  const mutable = entry as unknown as Record<string, unknown>;
+  delete mutable[field];
+  return mutable as unknown as WireAuditEvent;
+}
 
 beforeEach(() => {
   client = makeClient();
@@ -176,11 +208,9 @@ beforeEach(() => {
 
 describe("Activity view", () => {
   it("renders a healthy newest-first timeline with who requested each entry", async () => {
-    const page: AuditPage = {
-      events: [authorizedDecisionMID, observationRHS, armLHS],
-      next_cursor: 58,
-    };
-    client.getAudit = vi.fn().mockResolvedValue(page);
+    client.getAudit = vi
+      .fn()
+      .mockResolvedValue(auditPage([authorizedDecision, disarmLHS, armLHS], 58));
 
     renderView();
 
@@ -190,11 +220,12 @@ describe("Activity view", () => {
 
     const items = screen.getAllByRole("listitem");
     expect(items).toHaveLength(3);
-    expect(unitOrder()).toEqual(["MID", "RHS", "LHS"]);
+    expect(unitOrder()).toEqual([null, "LHS", "LHS"]);
 
-    // Who requested it is shown on the newest entry.
+    // Who requested it is shown on the newest entry: the audit record's own
+    // principal subject, verbatim.
     expect(
-      within(items[0] as HTMLElement).getByText("Sam (home operator)"),
+      within(items[0] as HTMLElement).getByText("operator.sam"),
     ).toBeVisible();
 
     // More history is available.
@@ -206,7 +237,7 @@ describe("Activity view", () => {
   it("shows what was decided, what happened, and why, with raw codes on demand", async () => {
     client.getAudit = vi
       .fn()
-      .mockResolvedValue({ events: [clampedDecisionMID], next_cursor: null });
+      .mockResolvedValue(auditPage([clampedDecision], null));
 
     renderView();
 
@@ -214,18 +245,19 @@ describe("Activity view", () => {
     expect(items).toHaveLength(1);
     const entry = within(items[0] as HTMLElement);
 
-    // Who / what was decided / what happened / why, in plain language first.
-    expect(entry.getByText("Sam (home operator)")).toBeVisible();
+    // Who / what was decided / what happened / why, in plain language first,
+    // mapped from the wire's result and the signed active-watt figures.
+    expect(entry.getByText("operator.sam")).toBeVisible();
     expect(
       entry.getByText("Reduced to 1500 W of the 3000 W requested"),
     ).toBeVisible();
-    expect(entry.getByText("Delivering 1480 W")).toBeVisible();
-    expect(entry.getByText("Site export limit")).toBeVisible();
+    expect(entry.getByText("Power reduced by the safety system")).toBeVisible();
+    expect(entry.getByText("Power clamped")).toBeVisible();
 
     // Raw codes are not visible until asked for. A closed native <details>
     // satisfies this: text queries match hidden text, so the pin is
     // visibility, never DOM presence.
-    const hiddenCode = entry.queryByText("SITE_EXPORT_LIMIT");
+    const hiddenCode = entry.queryByText("power_clamped");
     if (hiddenCode) {
       expect(hiddenCode).not.toBeVisible();
     }
@@ -233,22 +265,14 @@ describe("Activity view", () => {
     const user = userEvent.setup();
     await user.click(entry.getByRole("button", { name: "Show technical detail" }));
 
-    expect(entry.getByText("SITE_EXPORT_LIMIT")).toBeVisible();
+    expect(entry.getByText("power_clamped")).toBeVisible();
   });
 
   it("paginates with the audit cursor and stops when the cursor is null", async () => {
-    const page1: AuditPage = {
-      events: [authorizedDecisionMID, observationRHS],
-      next_cursor: 59,
-    };
-    const page2: AuditPage = {
-      events: [armLHS],
-      next_cursor: null,
-    };
     const getAudit = vi
       .fn()
-      .mockResolvedValueOnce(page1)
-      .mockResolvedValueOnce(page2);
+      .mockResolvedValueOnce(auditPage([authorizedDecision, disarmLHS], 59))
+      .mockResolvedValueOnce(auditPage([armLHS], null));
     client.getAudit = getAudit;
 
     renderView();
@@ -266,7 +290,7 @@ describe("Activity view", () => {
       expect(screen.getAllByRole("listitem")).toHaveLength(3);
     });
     // Older entries are appended below, newest-first order preserved.
-    expect(unitOrder()).toEqual(["MID", "RHS", "LHS"]);
+    expect(unitOrder()).toEqual([null, "LHS", "LHS"]);
 
     // A null cursor means the end of the timeline: no further load offered.
     expect(
@@ -275,23 +299,25 @@ describe("Activity view", () => {
     expect(getAudit).toHaveBeenCalledTimes(2);
   });
 
-  it("maps every audit kind to its chip and resets the unit filter with All units", async () => {
-    client.getAudit = vi.fn().mockResolvedValue({
-      events: [
-        stopAcknowledgementRHS,
-        stopRHS,
-        clampedDecisionMID,
-        observationRHS,
-        armLHS,
-        disarmLHS,
-      ],
-      next_cursor: null,
-    });
+  it("maps every audit kind to its chip, keeps unit-less entries out of unit filters, and resets with All units", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage(
+        [
+          stopAcknowledgement,
+          emergencyStop,
+          clampedDecision,
+          disarmLHS,
+          armLHS,
+          inhibitAcknowledgementMID,
+        ],
+        null,
+      ),
+    );
 
     renderView();
 
     expect(await screen.findAllByRole("listitem")).toHaveLength(6);
-    expect(unitOrder()).toEqual(["RHS", "RHS", "MID", "RHS", "LHS", "LHS"]);
+    expect(unitOrder()).toEqual([null, null, null, "LHS", "LHS", "MID"]);
 
     // Every contracted chip exists as a button and, with no filter active,
     // every toggle starts honestly unpressed.
@@ -314,46 +340,55 @@ describe("Activity view", () => {
     const user = userEvent.setup();
 
     // Each kind chip, keyboard-activated on its own, keeps exactly that
-    // kind's entries: arm AND disarm both map to Arming, while a stop
-    // acknowledgement is an Acknowledgement, not a Stop.
+    // kind's entries: arm AND disarm both map to Arming, a stop
+    // acknowledgement is an Acknowledgement (never a Stop), and the
+    // Observations chip selects the empty set today because the audit trail
+    // holds no observation entries.
     const expectedByKind = [
-      ["Observations", ["RHS"]],
-      ["Decisions", ["MID"]],
-      ["Arming", ["LHS", "LHS"]],
-      ["Stops", ["RHS"]],
-      ["Acknowledgements", ["RHS"]],
+      ["Observations", 0],
+      ["Decisions", 1],
+      ["Arming", 2],
+      ["Stops", 1],
+      ["Acknowledgements", 2],
     ] as const;
-    for (const [name, expectedUnits] of expectedByKind) {
+    for (const [name, expected] of expectedByKind) {
       const chip = screen.getByRole("button", { name });
       chip.focus();
       await user.keyboard("{Enter}");
       expect(chip).toHaveAttribute("aria-pressed", "true");
-      expect(unitOrder()).toEqual(expectedUnits);
+      if (expected === 0) {
+        expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+        expect(screen.getByText("No activity matches these filters")).toBeVisible();
+      } else {
+        expect(screen.getAllByRole("listitem")).toHaveLength(expected);
+      }
       chip.focus();
       await user.keyboard("{Enter}");
       expect(chip).toHaveAttribute("aria-pressed", "false");
       expect(screen.getAllByRole("listitem")).toHaveLength(6);
     }
 
-    // Unit chips narrow the timeline to that unit's entries.
+    // Unit chips narrow the timeline to that unit's own entries; a fleet-wide
+    // decision or stop is never claimed for a unit it does not name.
     const lhsChip = screen.getByRole("button", { name: "LHS" });
     lhsChip.focus();
     await user.keyboard("{Enter}");
     expect(lhsChip).toHaveAttribute("aria-pressed", "true");
     expect(unitOrder()).toEqual(["LHS", "LHS"]);
-    lhsChip.focus();
+
+    const midChip = screen.getByRole("button", { name: "MID" });
+    midChip.focus();
     await user.keyboard("{Enter}");
-    expect(lhsChip).toHaveAttribute("aria-pressed", "false");
-    expect(screen.getAllByRole("listitem")).toHaveLength(6);
+    expect(unitOrder()).toEqual(["MID"]);
 
     const rhsChip = screen.getByRole("button", { name: "RHS" });
     rhsChip.focus();
     await user.keyboard("{Enter}");
-    expect(rhsChip).toHaveAttribute("aria-pressed", "true");
-    expect(unitOrder()).toEqual(["RHS", "RHS", "RHS"]);
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+    expect(screen.getByText("No activity matches these filters")).toBeVisible();
 
     // "All units" resets the unit filter: every entry returns and the unit
-    // toggle goes back to unpressed.
+    // toggles go back to unpressed.
     const allUnitsChip = screen.getByRole("button", { name: "All units" });
     allUnitsChip.focus();
     await user.keyboard("{Enter}");
@@ -362,10 +397,9 @@ describe("Activity view", () => {
   });
 
   it("filters by kind and unit using the keyboard only", async () => {
-    client.getAudit = vi.fn().mockResolvedValue({
-      events: [stopRHS, clampedDecisionMID, { ...armLHS, unit_id: "MID" }],
-      next_cursor: null,
-    });
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage([emergencyStop, clampedDecision, { ...armLHS, unit_id: "MID" }], null),
+    );
 
     renderView();
 
@@ -382,9 +416,10 @@ describe("Activity view", () => {
     expect(stopsChip).toHaveAttribute("aria-pressed", "true");
     const onlyStop = screen.getAllByRole("listitem");
     expect(onlyStop).toHaveLength(1);
-    expect((onlyStop[0] as HTMLElement).textContent).toContain("RHS");
+    expect((onlyStop[0] as HTMLElement).textContent).toContain("Emergency stop");
 
-    // Narrow further by unit, still keyboard only.
+    // Narrow further by unit, still keyboard only: the stop is fleet-wide on
+    // the wire (no unit id), so it cannot be claimed for MID.
     const midChip = screen.getByRole("button", { name: "MID" });
     midChip.focus();
     await user.keyboard("{Enter}");
@@ -402,8 +437,52 @@ describe("Activity view", () => {
     expect(screen.getAllByRole("listitem")).toHaveLength(1);
   });
 
+  it("renders the wire's own vocabulary in words: an unknown event type never crashes and a missing result is named", async () => {
+    // A type the service has not taught the console yet, plus an entry whose
+    // result never arrived: both render defensively, neither fabricates.
+    const unknown = auditEvent({
+      sequence: 71,
+      event_type: "maintenance_window",
+      unit_id: "RHS",
+      occurred_at: minutesAgo(3),
+      principal: PRINCIPAL,
+    });
+    const missingResult = withoutField(
+      auditEvent({
+        sequence: 70,
+        event_type: "control_decision",
+        unit_id: null,
+        occurred_at: minutesAgo(10),
+        principal: PRINCIPAL,
+        requested_active_w: 1200,
+        authorized_active_w: 800,
+        reason_codes: ["safety_checks_passed"],
+      }),
+      "result",
+    );
+    client.getAudit = vi
+      .fn()
+      .mockResolvedValue(auditPage([unknown, missingResult], null));
+
+    renderView();
+
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(2);
+
+    // The newest entry is the unknown-but-named type, in plain words.
+    expect(
+      within(items[0] as HTMLElement).getByText("Maintenance window"),
+    ).toBeVisible();
+
+    // The decision without a result says so and never invents a measurement.
+    const decision = within(items[1] as HTMLElement);
+    expect(decision.getByText("Result not recorded yet")).toBeVisible();
+    expect(decision.queryByText(/delivering/i)).toBeNull();
+    expect(screen.queryByText(/^0 W$/)).toBeNull();
+  });
+
   it("shows an empty state that explains what will appear here and the first step", async () => {
-    client.getAudit = vi.fn().mockResolvedValue({ events: [], next_cursor: null });
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
 
     renderView();
 
@@ -455,10 +534,7 @@ describe("Activity view", () => {
           request_id: "req-9z8y",
         }),
       )
-      .mockResolvedValueOnce({
-        events: [authorizedDecisionMID],
-        next_cursor: null,
-      });
+      .mockResolvedValueOnce(auditPage([authorizedDecision], null));
     client.getAudit = getAudit;
 
     renderView();
@@ -477,13 +553,12 @@ describe("Activity view", () => {
   });
 
   it("keeps the loaded timeline visible under a disconnected notice with a manual retry", async () => {
-    client.getAudit = vi.fn().mockResolvedValue({
-      events: [
-        { ...authorizedDecisionMID, occurred_at: minutesAgo(125) },
-        observationRHS,
-      ],
-      next_cursor: null,
-    });
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage(
+        [{ ...authorizedDecision, occurred_at: minutesAgo(125) }, disarmLHS],
+        null,
+      ),
+    );
 
     renderView("disconnected");
 
@@ -496,7 +571,9 @@ describe("Activity view", () => {
     // age: the retained newest entry is stale and says so next to its values.
     const items = screen.getAllByRole("listitem");
     expect(items).toHaveLength(2);
-    expect(screen.getByText("Sam (home operator)")).toBeVisible();
+    expect(
+      within(items[0] as HTMLElement).getByText("operator.sam"),
+    ).toBeVisible();
     expect(
       within(items[0] as HTMLElement).getByText("2 hours ago"),
     ).toBeVisible();
@@ -508,10 +585,9 @@ describe("Activity view", () => {
   });
 
   it("shows the age next to a stale entry instead of hiding it", async () => {
-    client.getAudit = vi.fn().mockResolvedValue({
-      events: [{ ...authorizedDecisionMID, occurred_at: minutesAgo(125) }],
-      next_cursor: null,
-    });
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage([{ ...authorizedDecision, occurred_at: minutesAgo(125) }], null),
+    );
 
     renderView();
 
@@ -521,44 +597,13 @@ describe("Activity view", () => {
     // The age belongs to the stale entry itself, not to a page-level banner.
     const stale = within(items[0] as HTMLElement);
     expect(stale.getByText("2 hours ago")).toBeVisible();
-    expect((items[0] as HTMLElement).textContent).toContain("MID");
-  });
-
-  it("names a missing result explicitly and never fabricates a measurement", async () => {
-    const missingResult = {
-      type: "decision",
-      sequence: 44,
-      occurred_at: minutesAgo(10),
-      unit_id: "LHS",
-      principal: principalSam,
-      decision_status: "authorized",
-      requested_watts: 1200,
-      authorized_watts: 800,
-      reason_codes: ["WITHIN_LIMITS"],
-    };
-    client.getAudit = vi.fn().mockResolvedValue({
-      events: [missingResult],
-      next_cursor: null,
-    });
-
-    renderView();
-
-    const items = await screen.findAllByRole("listitem");
-    expect(items).toHaveLength(1);
-    const entry = within(items[0] as HTMLElement);
-
-    expect(entry.getByText("Result not recorded yet")).toBeVisible();
-    expect(entry.queryByText(/delivering/i)).toBeNull();
-    expect(screen.queryByText(/^0 W$/)).toBeNull();
+    expect(stale.getByText("Power decision")).toBeVisible();
   });
 
   it("surfaces a refused Load more verbatim with the envelope code, message, and request id", async () => {
     const getAudit = vi
       .fn()
-      .mockResolvedValueOnce({
-        events: [authorizedDecisionMID],
-        next_cursor: 60,
-      })
+      .mockResolvedValueOnce(auditPage([authorizedDecision], 60))
       .mockRejectedValueOnce(
         new ApiClientError({
           status: 403,

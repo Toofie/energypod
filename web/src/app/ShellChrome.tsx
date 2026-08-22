@@ -6,7 +6,7 @@
 import type { ReactElement } from "react";
 import type { UnitModel } from "./fleet";
 import { fleetBanner, UNIT_LABELS } from "./fleet";
-import type { ConsoleData } from "./useConsoleData";
+import type { ConsoleData, RefusalEnvelope } from "./useConsoleData";
 
 const BADGE_ICONS: Record<string, string> = {
   Inhibited: "■",
@@ -114,14 +114,37 @@ export function ConnectionFacts({ data }: { data: ConsoleData }): ReactElement {
 /**
  * The designed disconnected state: a notice apart from the four-fact
  * indicator, while the last known data stays on screen (dimmed) with its age.
+ * The stream's own error envelope — when there is one — is surfaced here
+ * verbatim instead of being swallowed by the retry loop, and once the
+ * automatic reconnect budget is spent the operator is left a manual retry
+ * rather than a silent, endless hammering of a failing endpoint.
  */
-export function DisconnectedNotice(): ReactElement {
+export function DisconnectedNotice({
+  error,
+  exhausted,
+  onRetry,
+}: {
+  error: RefusalEnvelope | null;
+  exhausted: boolean;
+  onRetry: () => void;
+}): ReactElement {
   return (
     <section aria-label="Live updates" className="disconnected-notice">
       <p>
-        Live updates: connection lost. The last known picture is still shown —
-        readings may be old. Reconnecting automatically…
+        {exhausted
+          ? "Live updates: connection lost, and automatic reconnection has paused after repeated failures. The last known picture is still shown — readings may be old."
+          : "Live updates: connection lost. The last known picture is still shown — readings may be old. Reconnecting automatically…"}
       </p>
+      {error !== null && (
+        <p className="stream-error-envelope">
+          <span>{error.code}</span> — <span>{error.message}</span>
+        </p>
+      )}
+      {exhausted && (
+        <button type="button" className="stream-retry" onClick={onRetry}>
+          Try reconnecting
+        </button>
+      )}
     </section>
   );
 }

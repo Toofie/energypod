@@ -130,6 +130,54 @@ def test_auditor_read_is_bounded_and_reaches_the_service(
     assert service.calls[-1][1]["limit"] == 25
 
 
+def test_audit_endpoint_serves_real_canonical_events(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """Regression: kernel-minted AuditEvents (frozen mapping fields) must
+    serialize through the REST boundary, not 500 on the frozen mapping."""
+    from datetime import UTC, datetime
+
+    from energypod.domain import IntentSource, UnitLifecycle
+    from energypod.domain.audit import AuditEvent
+
+    event = AuditEvent(
+        event_id="event-0001",
+        occurred_at=datetime(2026, 8, 22, tzinfo=UTC),
+        monotonic_offset_s=12.5,
+        process_instance_id="process-1",
+        event_type="control_decision",
+        generation=3,
+        cycle_id="cycle-1",
+        principal="person:operator",
+        source=IntentSource.MANUAL,
+        correlation_id="intent:i-1:revision:2",
+        intent_id="i-1",
+        policy_version="policy-1",
+        configuration_version=1,
+        observation_sequences={"MID": 41, "RHS": 12},
+        reason_codes=("safety_checks_passed",),
+        requested_active_w=1500,
+        authorized_active_w=1200,
+        request_fingerprint="ab" * 32,
+        response_fingerprint="cd" * 32,
+        result="authorized",
+        lifecycle=UnitLifecycle.ACTIVE,
+    )
+
+    async def real_audit(**_kwargs: Any) -> dict[str, Any]:
+        return {"events": [event], "next_cursor": None}
+
+    service.recent_audit = real_audit  # type: ignore[method-assign]
+    with _client(service, authenticator) as client:
+        response = client.get(f"{API}/audit", headers=_auth("auditor-token"))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    served = body["events"][0]
+    assert served["observation_sequences"] == {"MID": 41, "RHS": 12}
+    assert served["event_type"] == "control_decision"
+    assert served["result"] == "authorized"
+
+
 def test_audit_read_scope_alone_is_insufficient_without_observe(
     service: RecordingEnergyService, authenticator: FakeAuthenticator
 ) -> None:

@@ -17,11 +17,35 @@
  * values; labels shown to humans are capitalized. The client module's TS types
  * spell directions in uppercase, so this view narrows frames defensively to
  * the real wire shape rather than trusting those annotations.
+ *
+ * Prop seam (web/src/app/views.ts `ShellViewProps`): the shell owns the
+ * session, mints the client from the operator's token, and hands every mounted
+ * view the session's shared client (coalesced reads, one fanned-out stream).
+ * This view never builds its own client — a second client would open a second
+ * events socket (one ticket per connection) and race the shell for frames.
+ *
+ * Live-frame truth (src/energypod/application/service.py `_publish`):
+ * `unit.armed` / `unit.disarmed` carry `{units: [{unit_id, status, reason}]}`
+ * where `status` is "armed"/"disarmed" on success and "refused" with the
+ * refusal reason otherwise — a refused row is never a lifecycle change, so it
+ * is rendered as a refusal and the unit's lifecycle is left untouched.
+ * `emergency_stop.latched` carries `{stop_id, unit_ids, reason, generation,
+ * degraded}` and fences the fleet to inhibited; `inhibit.acknowledged` clears
+ * exactly one latch and changes no lifecycle (the unit re-qualifies through
+ * stable samples). Both latch frames also trigger a snapshot refetch: the
+ * event updates the picture immediately, and the refreshed snapshot — adopted
+ * only when its sequence advances — is the world that wins.
  */
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { ApiClientError, createApiClient } from "../../api/client";
-import type { Health } from "../../api/client";
+import { ApiClientError } from "../../api/client";
+import type { ApiClient, Health } from "../../api/client";
+import "./now.css";
+
+/** The one prop the shell hands every mounted view (views.ts ShellViewProps). */
+export interface NowViewProps {
+  client: ApiClient;
+}
 
 // ---------------------------------------------------------------------------
 // wire shapes (runtime truth: lowercase enums) and narrowing
@@ -108,6 +132,41 @@ function toApiClientError(error: unknown): ApiClientError {
 }
 
 // ---------------------------------------------------------------------------
+// monotonic time: ages and countdowns tick from captured markers, never freeze
+// ---------------------------------------------------------------------------
+
+/** A monotonic reading: ages must never run backwards when the wall clock jumps. */
+function monotonicNowMs(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+const TICK_MS = 1000;
+
+/**
+ * A ticking "now" so displayed ages advance after render. The interval runs
+ * only while something on screen is derived from elapsed time and is always
+ * cleared on unmount; without it a 300 s countdown would sit frozen at the
+ * value captured when the frame arrived.
+ */
+function useTickingNow(enabled: boolean): number {
+  const [nowMs, setNowMs] = useState(monotonicNowMs);
+  useEffect(() => {
+    if (!enabled) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      setNowMs(monotonicNowMs());
+    }, TICK_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [enabled]);
+  return nowMs;
+}
+
+// ---------------------------------------------------------------------------
 // display helpers — lowercase wire values in, human-capitalized labels out
 // ---------------------------------------------------------------------------
 
@@ -160,6 +219,42 @@ function asMutationRows(value: unknown): MutationRow[] {
   return rows;
 }
 
+/**
+ * The per-unit rows a `unit.armed` / `unit.disarmed` frame carries in
+ * `payload.units` (same shape the arm/disarm endpoints return).
+ */
+function mutationRowsFromPayload(payload: Record<string, unknown> | null): MutationRow[] {
+  if (payload === null || !Array.isArray(payload.units)) return [];
+  const rows: MutationRow[] = [];
+  for (const entry of payload.units) {
+    if (!isRecord(entry)) continue;
+    if (typeof entry.unit_id !== "string" || typeof entry.status !== "string") continue;
+    rows.push({
+      unitId: entry.unit_id,
+      status: entry.status,
+      reason: typeof entry.reason === "string" ? entry.reason : null,
+    });
+  }
+  return rows;
+}
+
+/** `payload.unit_ids` as the strings it is (service publishes sorted ids). */
+function unitIdsFromPayload(payload: Record<string, unknown> | null): string[] {
+  if (payload === null || !Array.isArray(payload.unit_ids)) return [];
+  return payload.unit_ids.filter((entry): entry is string => typeof entry === "string");
+}
+
+/** A refusal that arrived over the stream: rendered as a refusal, never a lifecycle change. */
+type LiveRefusal = { action: "arm" | "disarm"; rows: MutationRow[] };
+
+/** An emergency stop another operator (or the system) latched, seen on the stream. */
+type LatchedStop = {
+  stopId: string | null;
+  reason: string | null;
+  degraded: string[];
+  unitIds: string[];
+};
+
 type DispatchOutcome = { status: string; intentId: string | null; expiresInSeconds: number | null };
 
 function asDispatchOutcome(value: unknown): DispatchOutcome | null {
@@ -170,6 +265,9 @@ function asDispatchOutcome(value: unknown): DispatchOutcome | null {
     expiresInSeconds: typeof value.expires_in_s === "number" ? value.expires_in_s : null,
   };
 }
+
+/** A remaining-time countdown is a marker, not a value: it must run down. */
+type ExpiryMarker = { remainingS: number; atMs: number };
 
 type StopOutcome = {
   stopId: string | null;
@@ -364,16 +462,25 @@ type DispatchApiError = { error: ApiClientError; field: "watts" | "minutes" | nu
 const MAX_DURATION_MINUTES = 5;
 const RECONNECT_DELAY_MS = 3000;
 
-export function NowView({ token }: { token: string }) {
-  const client = useMemo(() => createApiClient(token), [token]);
-
+export function NowView({ client }: NowViewProps) {
   // --- data state -----------------------------------------------------------
   const [snapshot, setSnapshot] = useState<WireSnapshot | null>(null);
   const [loadFailed, setLoadFailed] = useState<ApiClientError | null>(null);
   const [snapshotNonce, setSnapshotNonce] = useState(0);
+  const [healthNonce, setHealthNonce] = useState(0);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [health, setHealth] = useState<Health | null>(null);
-  const [expirySeconds, setExpirySeconds] = useState<number | null>(null);
+  const [expiry, setExpiry] = useState<ExpiryMarker | null>(null);
+  const [liveRefusal, setLiveRefusal] = useState<LiveRefusal | null>(null);
+  const [latchedStop, setLatchedStop] = useState<LatchedStop | null>(null);
+  const [revokedNotice, setRevokedNotice] = useState<string | null>(null);
+  const [inhibitNotice, setInhibitNotice] = useState<string | null>(null);
+
+  // The sequence of the picture currently on screen and the monotonic marker
+  // it was captured at: the snapshot guard and the ticking ages both hang off
+  // these.
+  const pictureSequenceRef = useRef<number | null>(null);
+  const capturedAtRef = useRef<number>(monotonicNowMs());
 
   // --- control state ----------------------------------------------------------
   const [dialog, setDialog] = useState<DialogState | null>(null);
@@ -393,6 +500,27 @@ export function NowView({ token }: { token: string }) {
   const [stopAckOutcome, setStopAckOutcome] = useState<string | null>(null);
   const [inhibitOutcome, setInhibitOutcome] = useState<InhibitOutcome | null>(null);
 
+  // --- snapshot adoption (guarded: only an advancing sequence may replace) ----
+
+  /**
+   * The single adoption path. A snapshot whose sequence does not advance the
+   * picture on screen is never adopted: the shell's shared stream republishes
+   * its latest snapshot frame to every newly mounted view, and a REST read can
+   * resolve after a newer stream frame — neither may rewind a newer world.
+   */
+  const adoptSnapshot = useCallback((wire: WireSnapshot, sequence: number | null): boolean => {
+    const incoming = sequence ?? wire.snapshot_sequence;
+    const current = pictureSequenceRef.current;
+    if (current !== null && incoming <= current) {
+      return false;
+    }
+    pictureSequenceRef.current = incoming;
+    capturedAtRef.current = monotonicNowMs();
+    setSnapshot(wire);
+    setLoadFailed(null);
+    return true;
+  }, []);
+
   // --- REST snapshot (initial load + manual retry) ----------------------------
 
   useEffect(() => {
@@ -403,8 +531,7 @@ export function NowView({ token }: { token: string }) {
         if (cancelled) return;
         const wire = asSnapshot(value);
         if (wire !== null) {
-          setSnapshot(wire);
-          setLoadFailed(null);
+          adoptSnapshot(wire, null);
         } else {
           setLoadFailed(
             new ApiClientError({
@@ -423,9 +550,9 @@ export function NowView({ token }: { token: string }) {
     return () => {
       cancelled = true;
     };
-  }, [client, snapshotNonce]);
+  }, [client, snapshotNonce, adoptSnapshot]);
 
-  // --- health (control readiness reasons feed the arm checklist) --------------
+  // --- health (control readiness reasons are the live latch signal) -----------
 
   useEffect(() => {
     let cancelled = false;
@@ -440,7 +567,23 @@ export function NowView({ token }: { token: string }) {
     return () => {
       cancelled = true;
     };
-  }, [client]);
+  }, [client, healthNonce]);
+
+  /**
+   * A guarded fresh read. Without it, Allowed and Actual freeze at connect
+   * time for the whole session while the indicator says "live": the snapshot
+   * is re-read after every successful mutation and whenever the arm gate (the
+   * one dialog whose answer is a safety question) is opened.
+   */
+  const refreshSnapshot = useCallback((): void => {
+    setSnapshotNonce((nonce) => nonce + 1);
+  }, []);
+
+  /** The arm gate must read the current latch state, not the mount-time one. */
+  const refreshReadiness = useCallback((): void => {
+    setSnapshotNonce((nonce) => nonce + 1);
+    setHealthNonce((nonce) => nonce + 1);
+  }, []);
 
   // --- event stream: snapshot frame first, then events; resync refetches -------
 
@@ -450,17 +593,49 @@ export function NowView({ token }: { token: string }) {
     let resyncing = false;
     let lastSequence: number | undefined;
 
-    const adoptSnapshot = (value: unknown): void => {
-      const wire = asSnapshot(value);
-      if (wire !== null) {
-        setSnapshot(wire);
-        setLoadFailed(null);
+    const refetchSnapshot = (): void => {
+      client
+        .getSnapshot()
+        .then((value: unknown) => {
+          if (cancelled) return;
+          const wire = asSnapshot(value);
+          if (wire !== null) adoptSnapshot(wire, null);
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) setLoadFailed(toApiClientError(error));
+        });
+    };
+
+    /** Success rows move the lifecycle; refused rows are refusals, never moves. */
+    const applyLifecycleRows = (armed: boolean, rows: MutationRow[]): void => {
+      const successStatus = armed ? "armed" : "disarmed";
+      const succeeded = rows.filter((row) => row.status === successStatus);
+      const refused = rows.filter((row) => row.status !== successStatus);
+      const changed = new Set(succeeded.map((row) => row.unitId));
+      if (changed.size > 0) {
+        const lifecycle = armed ? "armed_idle" : "disarmed";
+        setSnapshot((previous) =>
+          previous === null
+            ? previous
+            : {
+                ...previous,
+                units: previous.units.map((unit) =>
+                  changed.has(unit.unit_id) ? { ...unit, lifecycle } : unit,
+                ),
+              },
+        );
+      }
+      if (refused.length > 0) {
+        // The frame's own outcome is the refusal with its reason: the unit is
+        // NOT armed/disarmed, so its lifecycle on screen must not change.
+        setLiveRefusal({ action: armed ? "arm" : "disarm", rows: refused });
       }
     };
 
     const applyEvent = (frame: Record<string, unknown>): void => {
+      const type = typeof frame.type === "string" ? frame.type : "";
       const payload = isRecord(frame.payload) ? frame.payload : null;
-      if (frame.type === "intent.accepted" && payload !== null) {
+      if (type === "intent.accepted" && payload !== null) {
         const direction = typeof payload.direction === "string" ? payload.direction : null;
         const watts = typeof payload.watts === "number" ? payload.watts : null;
         const unitIds = Array.isArray(payload.unit_ids)
@@ -479,40 +654,84 @@ export function NowView({ token }: { token: string }) {
                   ),
                 },
           );
-          if (typeof payload.expires_in_s === "number") setExpirySeconds(payload.expires_in_s);
+          // The published payload carries no expiry; the accepted response's
+          // expires_in_s is the countdown source. Kept defensive for a future
+          // wire addition.
+          if (typeof payload.expires_in_s === "number") {
+            setExpiry({ remainingS: payload.expires_in_s, atMs: monotonicNowMs() });
+          }
         }
-      } else if (frame.type === "unit.armed" || frame.type === "unit.disarmed") {
-        const lifecycle = frame.type === "unit.armed" ? "armed_idle" : "disarmed";
-        const changed = new Set(
-          payload !== null && Array.isArray(payload.units)
-            ? payload.units
-                .filter((entry): entry is Record<string, unknown> => isRecord(entry))
-                .map((entry) => (typeof entry.unit_id === "string" ? entry.unit_id : ""))
-                .filter((unitId) => unitId !== "")
-            : [],
-        );
-        if (changed.size > 0) {
+      } else if (type === "unit.armed" || type === "unit.disarmed") {
+        applyLifecycleRows(type === "unit.armed", mutationRowsFromPayload(payload));
+      } else if (type === "emergency_stop.latched") {
+        // The fleet is fenced: no unit may present as armed or dispatchable,
+        // the revoked request is gone, and a fresh snapshot is on its way.
+        const unitIds = unitIdsFromPayload(payload);
+        const fenced = new Set(unitIds);
+        if (fenced.size > 0) {
           setSnapshot((previous) =>
             previous === null
               ? previous
               : {
                   ...previous,
                   units: previous.units.map((unit) =>
-                    changed.has(unit.unit_id) ? { ...unit, lifecycle } : unit,
+                    fenced.has(unit.unit_id)
+                      ? {
+                          ...unit,
+                          lifecycle: "inhibited",
+                          requested_power: { direction: "idle", watts: 0 },
+                          authorized_power: null,
+                        }
+                      : unit,
                   ),
                 },
           );
         }
-      }
-    };
-
-    const refetchSnapshot = (): void => {
-      client
-        .getSnapshot()
-        .then(adoptSnapshot)
-        .catch((error: unknown) => {
-          if (!cancelled) setLoadFailed(toApiClientError(error));
+        setExpiry(null);
+        setLatchedStop({
+          stopId: payload !== null && typeof payload.stop_id === "string" ? payload.stop_id : null,
+          reason: payload !== null && typeof payload.reason === "string" ? payload.reason : null,
+          degraded:
+            payload !== null && Array.isArray(payload.degraded)
+              ? payload.degraded.filter((entry): entry is string => typeof entry === "string")
+              : [],
+          unitIds,
         });
+        refetchSnapshot();
+      } else if (type === "authorization.revoked") {
+        // The runtime publishes this for every unit that still held authority
+        // when a revocation ran (composition.py `_AsyncAuthorizationRepository`),
+        // and revocation is routine — intent expiry, disarm, generation fences —
+        // not only a latched inhibit. So the frame says "authority changed",
+        // never "this unit latched": the view re-reads the snapshot and says
+        // exactly that, without inventing a lifecycle the frame does not carry.
+        const unitIds = unitIdsFromPayload(payload);
+        const reason =
+          payload !== null && typeof payload.reason === "string" && payload.reason !== ""
+            ? payload.reason
+            : "authorization revoked";
+        if (unitIds.length > 0) {
+          setRevokedNotice(
+            `Authorization was held on ${unitIds.join(", ")} (${reason}) — re-reading the current pod state.`,
+          );
+        }
+        refetchSnapshot();
+      } else if (type === "emergency_stop.acknowledged") {
+        // Another operator (or the system) cleared the latch: the notice goes
+        // and the refreshed snapshot decides where the fleet stands now.
+        setLatchedStop(null);
+        refetchSnapshot();
+      } else if (type === "inhibit.acknowledged") {
+        // Clearing the latch changes no lifecycle: the unit re-qualifies through
+        // stable samples, so only the refreshed snapshot may move it.
+        const unitId = payload !== null && typeof payload.unit_id === "string" ? payload.unit_id : null;
+        if (unitId !== null) {
+          setInhibitNotice(
+            `Inhibit acknowledged on ${unitId} — the latch is clear; the pod re-qualifies through stable samples before it can be armed again.`,
+          );
+        }
+        refetchSnapshot();
+      }
     };
 
     const connect = (): void => {
@@ -526,15 +745,33 @@ export function NowView({ token }: { token: string }) {
               lastSequence = frame.sequence;
             }
             if (frame.type === "snapshot") {
-              adoptSnapshot(frame.data);
+              const wire = asSnapshot(frame.data);
+              if (wire !== null) adoptSnapshot(wire, wire.snapshot_sequence);
               setConnection("live");
             } else if (frame.type === "resync_required") {
               // The pinned client ends iteration right after this marker; the
               // view resynchronizes from a fresh snapshot and reconnects with
               // the last seen sequence as the cursor.
               resyncing = true;
+            } else if (
+              typeof frame.sequence === "number" &&
+              pictureSequenceRef.current !== null &&
+              frame.sequence <= pictureSequenceRef.current
+            ) {
+              // Already part of the picture on screen (a republished frame from
+              // the shared stream, or a replay behind the adopted sequence):
+              // applying it again could rewind a newer world. With no picture
+              // yet, every frame is new to this view.
             } else {
-              applyEvent(frame);
+              applyEvent(frame as Record<string, unknown>);
+              if (typeof frame.sequence === "number") {
+                // The applied event is now part of the picture: a snapshot (or
+                // replay) older than it may never replace what is on screen.
+                pictureSequenceRef.current = Math.max(
+                  pictureSequenceRef.current ?? frame.sequence,
+                  frame.sequence,
+                );
+              }
               setConnection("live");
             }
           }
@@ -566,6 +803,16 @@ export function NowView({ token }: { token: string }) {
   }, [client]);
 
   // --- derived fleet state -----------------------------------------------------
+
+  // Ages are captured values plus elapsed monotonic time: `telemetry_age_s` is
+  // the age at capture, so it must keep growing after render or a 300 s
+  // countdown (and every "x s ago") would sit frozen forever.
+  const needsTick =
+    (snapshot?.units.some((unit) => unit.telemetry_age_s !== null) ?? false) || expiry !== null;
+  const nowMs = useTickingNow(needsTick);
+  const elapsedSeconds = Math.max(0, (nowMs - capturedAtRef.current) / 1000);
+  const displayedAge = (unit: WireUnit): number | null =>
+    unit.telemetry_age_s === null ? null : Math.floor(unit.telemetry_age_s + elapsedSeconds);
 
   const units = snapshot?.units ?? [];
   const armableUnits = units.filter((unit) => unit.lifecycle === "disarmed");
@@ -608,14 +855,21 @@ export function NowView({ token }: { token: string }) {
     measuredUnits.length > 0
       ? measuredUnits
           .map((unit) => {
-            const age =
-              unit.telemetry_age_s !== null ? ` (${formatSeconds(unit.telemetry_age_s)} ago)` : "";
+            const ageSeconds = displayedAge(unit);
+            const age = ageSeconds !== null ? ` (${formatSeconds(ageSeconds)} ago)` : "";
             return `${formatWatts(unit.measured_watts)}${age}`;
           })
           .join("; ")
       : "No measurement available";
+  const remainingSeconds =
+    expiry === null
+      ? null
+      : Math.max(
+          0,
+          Math.ceil(expiry.remainingS - Math.max(0, (nowMs - expiry.atMs) / 1000)),
+        );
   const remainingText =
-    expirySeconds !== null ? `${formatSeconds(expirySeconds)} left` : "Not available";
+    remainingSeconds !== null ? `${formatSeconds(remainingSeconds)} left` : "Not available";
 
   const controlReasons = health?.control_readiness.reasons ?? [];
 
@@ -637,6 +891,9 @@ export function NowView({ token }: { token: string }) {
     setFieldErrors(null);
     setDispatchApiError(null);
     dispatchKeyRef.current = null;
+    // The unit list this dialog offers is a live question: re-read the world
+    // before asking the operator to confirm against it.
+    refreshSnapshot();
     setDialog({ kind: "dispatch", direction });
   };
 
@@ -649,6 +906,9 @@ export function NowView({ token }: { token: string }) {
       .then((result: Record<string, unknown>) => {
         setMutationRows(asMutationRows(result));
         closeDialog();
+        // The outcome rows speak for the request; the snapshot re-read speaks
+        // for the world (authorized/measured/lifecycle) the request produced.
+        refreshSnapshot();
       })
       .catch((error: unknown) => {
         setArmError(toApiClientError(error));
@@ -662,6 +922,7 @@ export function NowView({ token }: { token: string }) {
       .then((result: Record<string, unknown>) => {
         setMutationRows(asMutationRows(result));
         closeDialog();
+        refreshSnapshot();
       })
       .catch((error: unknown) => {
         setArmError(toApiClientError(error));
@@ -718,9 +979,16 @@ export function NowView({ token }: { token: string }) {
         const outcome = asDispatchOutcome(result);
         if (outcome !== null) {
           setDispatchOutcome(outcome);
-          if (outcome.expiresInSeconds !== null) setExpirySeconds(outcome.expiresInSeconds);
+          // The countdown is captured as a marker (remaining + monotonic now),
+          // not as a frozen string: it must run down from here.
+          if (outcome.expiresInSeconds !== null) {
+            setExpiry({ remainingS: outcome.expiresInSeconds, atMs: monotonicNowMs() });
+          }
         }
         closeDialog();
+        // Allowed and Actual are the two facts the API alone can answer after a
+        // dispatch; without this read they stay frozen at connect time.
+        refreshSnapshot();
       })
       .catch((error: unknown) => {
         const apiError = toApiClientError(error);
@@ -741,6 +1009,7 @@ export function NowView({ token }: { token: string }) {
           setStopAckError(null);
         }
         closeDialog();
+        refreshSnapshot();
       })
       .catch((error: unknown) => {
         setStopDialogError(toApiClientError(error));
@@ -754,6 +1023,7 @@ export function NowView({ token }: { token: string }) {
       .then((result: Record<string, unknown>) => {
         setStopAckOutcome(asAcknowledgedStatus(result) ?? "acknowledged");
         setStopAckError(null);
+        refreshSnapshot();
       })
       .catch((error: unknown) => {
         setStopAckError(toApiClientError(error));
@@ -767,6 +1037,9 @@ export function NowView({ token }: { token: string }) {
         const outcome = asInhibitOutcome(result);
         if (outcome !== null) setInhibitOutcome(outcome);
         closeDialog();
+        // The latch is clear; the pod's lifecycle is the refreshed snapshot's
+        // to say (it re-qualifies through stable samples, never instantly).
+        refreshSnapshot();
       })
       .catch((error: unknown) => {
         setArmError(toApiClientError(error));
@@ -863,6 +1136,34 @@ export function NowView({ token }: { token: string }) {
             </p>
           ) : null}
 
+          {latchedStop !== null ? (
+            <div role="alert" className="latched-stop-note">
+              <p>
+                Emergency stop {latchedStop.stopId ?? "unknown"} latched on{" "}
+                {latchedStop.unitIds.length > 0 ? latchedStop.unitIds.join(", ") : "the fleet"}
+                {latchedStop.reason !== null && latchedStop.reason !== ""
+                  ? ` — ${latchedStop.reason}`
+                  : ""}
+                . The fleet is inhibited until the stop is acknowledged.
+              </p>
+              {latchedStop.degraded.length > 0 ? (
+                <p>Degraded: {latchedStop.degraded.join(", ")}</p>
+              ) : null}
+            </div>
+          ) : null}
+
+          {revokedNotice !== null ? (
+            <p role="status" className="inhibit-note">
+              {revokedNotice}
+            </p>
+          ) : null}
+
+          {inhibitNotice !== null ? (
+            <p role="status" className="inhibit-note">
+              {inhibitNotice}
+            </p>
+          ) : null}
+
           {units
             .filter((unit) => unit.quality !== "good")
             .map((unit) => (
@@ -885,7 +1186,17 @@ export function NowView({ token }: { token: string }) {
 
           <div className="now-controls">
             {armableUnits.length > 0 ? (
-              <button type="button" onClick={() => setDialog({ kind: "arm" })}>
+              <button
+                type="button"
+                onClick={() => {
+                  // The arm gate is a safety question answered by current state:
+                  // refresh the snapshot and the readiness reasons before the
+                  // checklist renders, so a latch that appeared mid-session is
+                  // visible instead of green-lit from mount-time data.
+                  refreshReadiness();
+                  setDialog({ kind: "arm" });
+                }}
+              >
                 Arm
               </button>
             ) : null}
@@ -934,6 +1245,28 @@ export function NowView({ token }: { token: string }) {
               <li key={row.unitId}>
                 {row.unitId}: <strong>{row.status}</strong>
                 {row.reason !== null && row.reason !== row.status ? (
+                  <>
+                    {" "}
+                    — <code>{row.reason}</code>
+                  </>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
+
+      {liveRefusal !== null ? (
+        <section aria-label="Live control refusal" className="outcome outcome--refusal">
+          <p>
+            The {liveRefusal.action} request was refused for{" "}
+            {liveRefusal.rows.map((row) => row.unitId).join(", ")}:
+          </p>
+          <ul>
+            {liveRefusal.rows.map((row) => (
+              <li key={row.unitId}>
+                {row.unitId}: <strong>refused</strong>
+                {row.reason !== null ? (
                   <>
                     {" "}
                     — <code>{row.reason}</code>
@@ -1012,18 +1345,32 @@ export function NowView({ token }: { token: string }) {
         <Dialog title="Arm the pod" onDecline={closeDialog}>
           <h4>Readiness</h4>
           <ul>
-            {armableUnits.map((unit) => (
-              <li key={unit.unit_id}>
-                {unit.unit_id}:{" "}
-                {unit.quality === "good"
+            {armableUnits.map((unit) => {
+              // The latch and qualification lines come from the live control
+              // readiness reasons ("<unit>:inhibit_latched",
+              // "<unit>:not_qualified" — service.py `_control_readiness_reasons`),
+              // not from a lifecycle predicate this list can never see: every
+              // unit here is disarmed by construction, so "lifecycle ===
+              // inhibited" would be a test no row could ever fail.
+              const reasons = new Set(controlReasons);
+              const latched =
+                reasons.has(`${unit.unit_id}:inhibit_latched`) ||
+                reasons.has(`${unit.unit_id}:inhibited`);
+              const notQualified =
+                reasons.has(`${unit.unit_id}:not_qualified`) ||
+                reasons.has(`${unit.unit_id}:qualification_unknown`);
+              const qualifiedText = notQualified
+                ? `not qualified (${reasons.has(`${unit.unit_id}:not_qualified`) ? "not_qualified" : "qualification_unknown"})`
+                : unit.quality === "good"
                   ? "qualified"
-                  : `not qualified (quality ${unit.quality})`}
-                ,{" "}
-                {unit.lifecycle === "inhibited"
-                  ? "inhibit latched"
-                  : "latch clear"}
-              </li>
-            ))}
+                  : `not qualified (quality ${unit.quality})`;
+              return (
+                <li key={unit.unit_id}>
+                  {unit.unit_id}: {qualifiedText},{" "}
+                  {latched ? "inhibit latched" : "latch clear"}
+                </li>
+              );
+            })}
           </ul>
           <p className="arm-policy">
             Arming follows the site safety policy: each unit stays fenced to the site limit until

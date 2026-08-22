@@ -1,0 +1,386 @@
+/*
+ * "Now" (control) view styling. Same calm system as the sibling views: state is
+ * carried by text first, color second; dialogs get a real backdrop so they read
+ * as a separate layer over the console (UI_CONTRACTS.md, "Now (control)");
+ * motion only behind prefers-reduced-motion; every control keeps a visible
+ * focus ring.
+ */
+
+.now-view {
+  display: grid;
+  gap: 1rem;
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+/* --- the four facts -------------------------------------------------------- */
+
+.facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 0.6rem;
+}
+
+.facts [role="group"] {
+  padding: 0.5rem 0.65rem;
+  border: 1px solid #eceae3;
+  border-radius: 0.6rem;
+  background: #fbfaf6;
+}
+
+.fact-label {
+  margin: 0;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #78716c;
+}
+
+.fact-value {
+  margin: 0.15rem 0 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #33302a;
+  overflow-wrap: anywhere;
+}
+
+/* A lost stream dims the last known values; it never removes them. */
+.facts-dimmed .fact-value {
+  opacity: 0.75;
+}
+
+/* --- notices ---------------------------------------------------------------- */
+
+.disconnect-note,
+.latched-stop-note {
+  margin: 0;
+  padding: 0.5rem 0.9rem;
+  border-radius: 0.6rem;
+  font-size: 0.95rem;
+}
+
+.disconnect-note {
+  border: 1px solid #fc8181;
+  background: #fff5f5;
+  color: #9b2c2c;
+}
+
+/* A latched emergency stop is the loudest fact this view can show. */
+.latched-stop-note {
+  border: 2px solid #e53e3e;
+  background: #fff5f5;
+  color: #742a2a;
+  font-weight: 600;
+}
+
+.inhibit-note {
+  margin: 0;
+  padding: 0.5rem 0.9rem;
+  border-radius: 0.6rem;
+  border: 1px solid #d6d3d1;
+  background: #faf9f5;
+  color: #57534e;
+  font-size: 0.95rem;
+}
+
+.quality-note {
+  margin: 0;
+  font-size: 0.88rem;
+  color: #975a16;
+}
+
+.empty-note {
+  margin: 0;
+  color: #57534e;
+}
+
+.loading {
+  margin: 0;
+  color: #4a5568;
+}
+
+/* --- controls ---------------------------------------------------------------- */
+
+.now-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.now-controls button,
+.stop-ack button,
+.refetch-error button,
+.load-error button {
+  font: inherit;
+  padding: 0.35rem 1rem;
+  border: 1px solid #b8b2a7;
+  border-radius: 0.6rem;
+  background: #fffefb;
+  color: #3f3a30;
+  cursor: pointer;
+}
+
+.now-controls button:focus-visible,
+.stop-ack button:focus-visible,
+.refetch-error button:focus-visible,
+.load-error button:focus-visible,
+.dialog-actions button:focus-visible {
+  outline: 3px solid #2c5282;
+  outline-offset: 2px;
+}
+
+.now-controls button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Emergency stop is deliberately the heaviest control on the page. */
+.now-controls button:last-child {
+  border-color: #e53e3e;
+  color: #9b2c2c;
+  font-weight: 600;
+}
+
+/* --- outcomes ---------------------------------------------------------------- */
+
+.outcome {
+  padding: 0.6rem 0.9rem;
+  border: 1px solid #eceae3;
+  border-radius: 0.6rem;
+  background: #fbfaf6;
+  font-size: 0.95rem;
+}
+
+.outcome ul {
+  margin: 0.35rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.outcome p {
+  margin: 0.2rem 0;
+}
+
+/* A refusal is a refusal: it never reads as a completed action. */
+.outcome--refusal {
+  border-color: #f6e05e;
+  background: #fffbeb;
+}
+
+.outcome code,
+.api-error code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.85em;
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.3rem;
+  background: #f0efea;
+  overflow-wrap: anywhere;
+}
+
+/* --- errors ------------------------------------------------------------------ */
+
+.load-error,
+.refetch-error {
+  padding: 0.6rem 0.9rem;
+  border: 1px solid #fc8181;
+  border-radius: 0.6rem;
+  background: #fff5f5;
+}
+
+.api-error p {
+  margin: 0.25rem 0;
+  color: #742a2a;
+}
+
+.api-error code {
+  background: #fdf0ef;
+  color: #9b2c2c;
+}
+
+/* --- dialogs: a real layer, not inline markup -------------------------------- */
+
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 3rem 1rem 2rem;
+  background: rgb(35 30 20 / 55%);
+  z-index: 40;
+}
+
+.dialog {
+  width: min(30rem, 100%);
+  max-height: min(34rem, calc(100vh - 5rem));
+  overflow: auto;
+  padding: 1rem 1.25rem 1.25rem;
+  border: 1px solid #d8d4cc;
+  border-radius: 0.9rem;
+  background: #fffdf9;
+  box-shadow: 0 12px 32px rgb(40 32 18 / 25%);
+}
+
+.dialog h3 {
+  margin: 0 0 0.75rem;
+  font-size: 1.1rem;
+  color: #3f3a30;
+}
+
+.dialog h4 {
+  margin: 0.9rem 0 0.4rem;
+  font-size: 0.9rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #78716c;
+}
+
+.dialog ul {
+  margin: 0 0 0.5rem;
+  padding-left: 1.1rem;
+}
+
+.dialog p {
+  margin: 0.35rem 0;
+}
+
+.arm-policy {
+  font-size: 0.9rem;
+  color: #57534e;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin-top: 1rem;
+}
+
+.dialog-actions button {
+  font: inherit;
+  padding: 0.35rem 1.1rem;
+  border: 1px solid #b8b2a7;
+  border-radius: 0.6rem;
+  background: #fffefb;
+  color: #3f3a30;
+  cursor: pointer;
+}
+
+/* The destructive confirmations are unmistakable. */
+.dialog-actions button:last-child {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.dialog:focus-visible {
+  outline: 3px solid #2c5282;
+  outline-offset: 2px;
+}
+
+/* --- dispatch form ----------------------------------------------------------- */
+
+.dispatch-fields {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.dispatch-fields label {
+  font-size: 0.85rem;
+  color: #57534e;
+  margin-top: 0.4rem;
+}
+
+.dispatch-fields input[type="text"] {
+  font: inherit;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid #b8b2a7;
+  border-radius: 0.5rem;
+  background: #fff;
+  color: #33302a;
+}
+
+.dispatch-fields input[type="text"]:focus-visible {
+  outline: 3px solid #2c5282;
+  outline-offset: 1px;
+}
+
+.dispatch-fields fieldset {
+  margin: 0.7rem 0 0;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid #eceae3;
+  border-radius: 0.6rem;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.dispatch-fields legend {
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #78716c;
+  padding: 0 0.3rem;
+}
+
+.field-hint {
+  font-size: 0.85rem;
+  color: #78716c;
+}
+
+.field-error {
+  font-size: 0.9rem;
+  color: #9b2c2c;
+}
+
+.dispatch-preview {
+  margin-top: 0.8rem;
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid #90cdf4;
+  background: #f7fbff;
+  border-radius: 0 0.5rem 0.5rem 0;
+  font-size: 0.95rem;
+  color: #2c5282;
+}
+
+/* --- stop acknowledgement ----------------------------------------------------- */
+
+.stop-ack {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.6rem;
+}
+
+.stop-ack label {
+  font-size: 0.85rem;
+  color: #57534e;
+}
+
+.stop-ack input {
+  font: inherit;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid #b8b2a7;
+  border-radius: 0.5rem;
+}
+
+.stop-ack input:focus-visible {
+  outline: 3px solid #2c5282;
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .dialog-backdrop {
+    animation: now-dialog-fade-in 120ms ease-out;
+  }
+
+  @keyframes now-dialog-fade-in {
+    from {
+      opacity: 0;
+    }
+
+    to {
+      opacity: 1;
+    }
+  }
+}

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from enum import StrEnum
+from typing import NoReturn
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
@@ -12,25 +13,49 @@ from .intents import Direction, IntentSource, PowerIntent
 from .observations import DataQuality, Observation, UnitLifecycle
 
 
-class _FrozenStringMapping[ValueT](Mapping[str, ValueT]):
-    """Deterministic immutable mapping used inside frozen value objects."""
+class _FrozenStringMapping[ValueT](dict[str, ValueT]):
+    """Deterministic immutable mapping used inside frozen value objects.
 
-    __slots__ = ("_items", "_values")
+    A ``dict`` subclass so pydantic and FastAPI serialize it natively (a bare
+    ``Mapping`` ABC cannot be encoded and 500s the audit boundary); every
+    mutator is disabled, preserving immutability, and construction sorts so
+    iteration, equality, and hashing stay deterministic.
+    """
+
+    __slots__ = ("_items",)
 
     def __init__(self, values: Mapping[str, ValueT]) -> None:
         self._items = tuple(sorted(values.items()))
-        self._values = dict(self._items)
+        super().__init__(self._items)
 
-    def __getitem__(self, key: str) -> ValueT:
-        return self._values[key]
+    @staticmethod
+    def _immutable() -> NoReturn:
+        raise TypeError("frozen mapping")
 
-    def __iter__(self) -> Iterator[str]:
-        return iter(self._values)
+    def __setitem__(self, key: str, value: ValueT) -> None:
+        self._immutable()
 
-    def __len__(self) -> int:
-        return len(self._values)
+    def __delitem__(self, key: str) -> None:
+        self._immutable()
 
-    def __hash__(self) -> int:
+    def clear(self) -> None:
+        self._immutable()
+
+    def pop(self, key: str, *default: ValueT) -> ValueT:  # type: ignore[override]
+        self._immutable()
+
+    def popitem(self) -> tuple[str, ValueT]:
+        self._immutable()
+
+    def setdefault(self, key: str, default: ValueT | None = None) -> ValueT:
+        self._immutable()
+
+    def update(  # type: ignore[override]
+        self, *args: Mapping[str, ValueT], **kwargs: ValueT
+    ) -> None:
+        self._immutable()
+
+    def __hash__(self) -> int:  # type: ignore[override]
         return hash(self._items)
 
 

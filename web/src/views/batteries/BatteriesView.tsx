@@ -4,10 +4,35 @@
  * One card per named unit, bound to unit ids — never to list position. Power
  * on a card is what was actually measured (sign carried by the direction
  * word, never a raw negative number); a clamped action is never presented as
- * the request. Missing telemetry is named per field with its age and never
- * zero-filled. A latched inhibit announces assertively and acknowledges only
- * through a confirmed dialog whose result clears from a snapshot refetch —
- * the server is the authority, never optimistic local state.
+ * the request. Fields the wire does not carry are named as missing with their
+ * age and never zero-filled. A latched inhibit announces assertively and
+ * acknowledges only through a confirmed dialog whose result clears from a
+ * snapshot refetch — the server is the authority, never optimistic local
+ * state.
+ *
+ * Wire truth this view is built on (src/energypod/application/service.py,
+ * runtime/composition.py, api/rest.py — mirrored in web/src/test/wire.ts):
+ *
+ * - The snapshot unit carries exactly `unit_id, lifecycle, telemetry_age_s,
+ *   quality, requested_power, authorized_power, measured_watts`. There is no
+ *   charge, temperature, cell, or warning field anywhere on the snapshot, so
+ *   those card fields render "No data" (named, with age) until the service
+ *   exposes them — never an invented value.
+ * - `quality` is the facade's own projection vocabulary
+ *   `good | degraded | bad | missing`; "degraded" already encodes telemetry
+ *   past the service's 30 s good bound, so staleness marking keys on it.
+ * - The only observation event is `observation.published` with the minimal
+ *   payload `{unit_id, connection_epoch, sequence}`: it proves the unit is
+ *   publishing and names its telemetry sequence, and carries no readings.
+ *   Per-unit observation state below is derived from exactly that.
+ * - The audit trail (`GET /api/v1/audit`) is the per-unit event history: the
+ *   kind key is `event_type`, reasons are `reason_codes`, and the outcome is
+ *   `result` (web/src/test/wire.ts `WireAuditEvent`).
+ * - `inhibit` on a unit is the API_CONTRACTS "Inhibit acknowledgement"
+ *   facade exposure. It is read defensively: while the snapshot does not
+ *   carry it, latch display and the acknowledge control derive from
+ *   `lifecycle === "inhibited"` and the latch detail renders not-available —
+ *   the server alone says whether a latch cleared.
  */
 import "./BatteriesView.css";
 
@@ -27,8 +52,17 @@ import type {
   StreamEvent,
 } from "../../api/client";
 
+export type BatteriesConnection = "connected" | "disconnected";
+
 export interface BatteriesViewProps {
   client: ApiClient;
+  /**
+   * The shell's connection fact for the shared data plane, when the shell
+   * provides one. Defaults to "connected" so the view stands alone; the view
+   * also detects the loss of its own stream subscription. Either signal is
+   * enough to show the disconnected state — the last snapshot stays rendered.
+   */
+  connection?: BatteriesConnection;
 }
 
 // ---------------------------------------------------------------------------
@@ -40,6 +74,7 @@ interface WirePower {
   watts: number;
 }
 
+/** The documented latch exposure; absent while the snapshot does not send it. */
 interface LatchState {
   cause_class: string;
   latched: boolean;
@@ -64,19 +99,22 @@ interface FleetState {
   units: ViewUnit[];
 }
 
-interface CellVoltages {
-  min_v: number | null;
-  max_v: number | null;
-  spread_mv: number | null;
+/** What one `observation.published` frame proves about a unit. */
+interface ObservationTrack {
+  occurredAt: string;
+  busSequence: number;
+  telemetrySequence: number | null;
+  connectionEpoch: number | null;
 }
 
-interface ObservationView {
-  socPercent: number | null;
-  temperatureMinC: number | null;
-  temperatureMaxC: number | null;
-  cells: CellVoltages | null;
-  cellDataAgeS: number | null;
-  warningCodes: string[];
+/** One audit entry projected for the Events tab (never fabricated). */
+interface AuditEntryView {
+  sequence: number;
+  eventType: string | null;
+  occurredAt: string | null;
+  result: string | null;
+  reasonCodes: string[];
+  unitId: string | null;
 }
 
 interface ErrorView {
@@ -102,27 +140,52 @@ const RECONNECT_DELAY_MS = 300;
 
 const AUDIT_LIMIT = 50;
 
+/** The service's own snapshot good-telemetry bound (service.py
+ * `_SNAPSHOT_GOOD_TELEMETRY_MAX_AGE_S`): telemetry older than this is never
+ * labelled good, so the card marks it stale rather than re-deriving its own
+ * freshness clock. */
+const GOOD_TELEMETRY_MAX_AGE_S = 30;
+
 // ---------------------------------------------------------------------------
 // Plain-language mappings (words first, raw codes only on demand)
 // ---------------------------------------------------------------------------
 
 const LIFECYCLE_WORDS: Record<string, string> = {
+  boot: "Starting up",
   disarmed: "Standby",
   armed: "Armed",
   armed_idle: "Armed and idle",
   observe_only: "Observe only",
   active: "Active",
   inhibited: "Inhibited",
+  stopping: "Stopping",
   disconnected: "Disconnected",
 };
 
-const CODE_WORDS: Record<string, string> = {
-  EE_CALIBRATION_WARNING: "Calibration warning",
-  CRITICAL_BLOCKING_FAULT: "Critical blocking fault",
-  TEMP_OUT_OF_RANGE: "Battery temperature out of range",
-  BMS_COMM_LOSS: "Battery management system communications lost",
-  CELL_IMBALANCE: "Cell voltages are uneven",
-  OVERCURRENT: "Current above the safe limit",
+/** Audit `event_type` values the service writes (see wire.ts AUDIT_EVENT_TYPES). */
+const AUDIT_TYPE_WORDS: Record<string, string> = {
+  control_decision: "Power decision",
+  intent_accepted: "Dispatch request accepted",
+  unit_armed: "Arm request",
+  unit_disarmed: "Disarm request",
+  emergency_stop: "Emergency stop",
+  stop_acknowledged: "Stop acknowledgement",
+  inhibit_acknowledged: "Inhibit acknowledgement",
+  authorization_revoked: "Authorization revoked",
+};
+
+/** Audit `result` values (DecisionStatus plus the facade mutation results). */
+const RESULT_WORDS: Record<string, string> = {
+  authorized: "Allowed",
+  clamped: "Reduced",
+  rejected: "Refused",
+  revoked: "Revoked",
+  accepted: "Accepted",
+  armed: "Armed",
+  disarmed: "Disarmed",
+  refused: "Refused",
+  latched: "Latched",
+  acknowledged: "Acknowledged",
 };
 
 function availabilityWord(lifecycle: string): string {
@@ -134,17 +197,19 @@ function humanizeCode(code: string): string {
 }
 
 function plainCode(code: string): string {
-  return CODE_WORDS[code] ?? humanizeCode(code);
+  const words = humanizeCode(code);
+  if (words === "") {
+    return code;
+  }
+  return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
-function eventWord(type: string): string {
-  if (type === "warning") {
-    return "Warning";
-  }
-  if (type === "fault") {
-    return "Fault";
-  }
-  return type.replace(/_/g, " ");
+function plainAuditType(eventType: string): string {
+  return AUDIT_TYPE_WORDS[eventType] ?? plainCode(eventType);
+}
+
+function plainResult(result: string): string {
+  return RESULT_WORDS[result] ?? plainCode(result);
 }
 
 // ---------------------------------------------------------------------------
@@ -182,8 +247,7 @@ function cardPowerText(unit: ViewUnit): string {
     return `Discharging ${formatWatts(measured)} W`;
   }
   const fallback = unit.authorized_power?.direction ?? unit.requested_power.direction;
-  const word = directionWord(fallback);
-  return `${word} 0 W`;
+  return `${directionWord(fallback)} 0 W`;
 }
 
 function ageText(seconds: number | null): string {
@@ -202,6 +266,26 @@ function missingText(ageSeconds: number | null): string {
 
 function clockLabel(iso: string): string {
   return `${iso.slice(11, 16)} UTC`;
+}
+
+function observationText(track: ObservationTrack | undefined): string {
+  if (track === undefined) {
+    return "No observation received in this session";
+  }
+  // A frame without its wall stamp names the gap rather than guessing a time.
+  const when = track.occurredAt === "" ? "time not available" : clockLabel(track.occurredAt);
+  const sequence =
+    track.telemetrySequence === null ? "" : ` (telemetry sequence ${track.telemetrySequence})`;
+  return `${when}${sequence}`;
+}
+
+/** The service's own quality projection already encodes staleness: anything
+ * but "good" is data past its freshness bound or otherwise unusable. */
+function isStaleData(unit: ViewUnit): boolean {
+  if (unit.quality !== "good") {
+    return true;
+  }
+  return unit.telemetry_age_s === null || unit.telemetry_age_s > GOOD_TELEMETRY_MAX_AGE_S;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,39 +355,37 @@ function parseSnapshot(raw: unknown): FleetState | null {
   };
 }
 
-function parseObservation(frame: StreamEvent): { unitId: string; data: ObservationView } | null {
+/** The only observation event the service publishes: `observation.published`
+ * with `{unit_id, connection_epoch, sequence}` under `payload`. It carries no
+ * readings, so nothing here can fabricate one. */
+function parseObservationPublished(
+  frame: StreamEvent,
+): { unitId: string; track: ObservationTrack } | null {
   const payload = frame.payload;
-  if (!isRecord(payload)) {
+  if (!isRecord(payload) || typeof payload.unit_id !== "string") {
     return null;
   }
-  const unitId = payload.unit_id;
-  const raw = payload.data;
-  if (typeof unitId !== "string" || !isRecord(raw)) {
-    return null;
-  }
-  const cellsRaw = raw.cells;
-  const cells = isRecord(cellsRaw)
-    ? {
-        min_v: parseNumber(cellsRaw.min_v),
-        max_v: parseNumber(cellsRaw.max_v),
-        spread_mv: parseNumber(cellsRaw.spread_mv),
-      }
-    : null;
-  const warningsRaw = Array.isArray(raw.warnings) ? raw.warnings : [];
-  const warningCodes = warningsRaw
-    .filter(isRecord)
-    .map((warning) => (typeof warning.code === "string" ? warning.code : ""))
-    .filter((code) => code !== "");
   return {
-    unitId,
-    data: {
-      socPercent: parseNumber(raw.soc_percent),
-      temperatureMinC: parseNumber(raw.temperature_min_c),
-      temperatureMaxC: parseNumber(raw.temperature_max_c),
-      cells,
-      cellDataAgeS: parseNumber(raw.cell_data_age_s),
-      warningCodes,
+    unitId: payload.unit_id,
+    track: {
+      occurredAt: typeof frame.occurred_at === "string" ? frame.occurred_at : "",
+      busSequence: parseNumber(frame.sequence) ?? 0,
+      telemetrySequence: parseNumber(payload.sequence),
+      connectionEpoch: parseNumber(payload.connection_epoch),
     },
+  };
+}
+
+function parseAuditEntry(event: AuditEvent): AuditEntryView {
+  return {
+    sequence: typeof event.sequence === "number" ? event.sequence : 0,
+    eventType: typeof event.event_type === "string" ? event.event_type : null,
+    occurredAt: typeof event.occurred_at === "string" ? event.occurred_at : null,
+    result: typeof event.result === "string" ? event.result : null,
+    reasonCodes: Array.isArray(event.reason_codes)
+      ? event.reason_codes.filter((code): code is string => typeof code === "string" && code !== "")
+      : [],
+    unitId: typeof event.unit_id === "string" ? event.unit_id : null,
   };
 }
 
@@ -324,9 +406,20 @@ function toErrorView(error: unknown): ErrorView {
 
 interface FleetCardProps {
   unit: ViewUnit;
-  observation: ObservationView | undefined;
+  observation: ObservationTrack | undefined;
   onOpenDetail: (unitId: string) => void;
   onAcknowledge: (unitId: string, opener: HTMLElement) => void;
+}
+
+/** The acknowledge control is offered exactly when a latch is established:
+ * either the documented inhibit exposure says `latched`, or the unit is
+ * inhibited and the snapshot does not expose the latch detail (the server
+ * alone reports whether acknowledging cleared anything). */
+function acknowledgeOffered(unit: ViewUnit): boolean {
+  if (unit.inhibit !== null) {
+    return unit.inhibit.latched;
+  }
+  return unit.lifecycle === "inhibited";
 }
 
 function FleetCard({
@@ -336,23 +429,16 @@ function FleetCard({
   onAcknowledge,
 }: FleetCardProps): JSX.Element {
   const telemetryAge = unit.telemetry_age_s;
-  const dimmed = unit.quality === "stale" || unit.quality === "missing";
-  const charge =
-    observation !== undefined && observation.socPercent !== null
-      ? `${Math.round(observation.socPercent)}%`
-      : missingText(telemetryAge);
-  const temperature =
-    observation !== undefined &&
-    observation.temperatureMinC !== null &&
-    observation.temperatureMaxC !== null
-      ? `${observation.temperatureMinC.toFixed(1)} to ${observation.temperatureMaxC.toFixed(1)} °C`
-      : missingText(telemetryAge);
-  const cellSpread =
-    observation !== undefined && observation.cells !== null && observation.cells.spread_mv !== null
-      ? `${Math.round(observation.cells.spread_mv)} mV spread`
-      : missingText(observation?.cellDataAgeS ?? telemetryAge);
+  const dimmed = isStaleData(unit);
+  const charge = missingText(telemetryAge);
+  const temperature = missingText(telemetryAge);
+  const cellSpread = missingText(telemetryAge);
   return (
-    <div role="group" aria-label={unit.unit_id} className={dimmed ? "battery-card dimmed" : "battery-card"}>
+    <div
+      role="group"
+      aria-label={unit.unit_id}
+      className={dimmed ? "battery-card dimmed" : "battery-card"}
+    >
       <div className="card-title">
         <button type="button" onClick={() => onOpenDetail(unit.unit_id)}>
           {unit.unit_id}
@@ -375,19 +461,29 @@ function FleetCard({
       </p>
       <p>
         <b>Data age:</b> {ageText(telemetryAge)}
+        {dimmed ? " (stale)" : ""}
       </p>
-      {observation !== undefined && observation.warningCodes.length > 0 && (
-        <p className="warnings">
-          <b>Warnings:</b> {observation.warningCodes.map(plainCode).join(", ")}
-        </p>
-      )}
-      {unit.inhibit?.latched === true && (
+      <p>
+        <b>Last observation:</b> {observationText(observation)}
+      </p>
+      <p className="warnings">
+        <b>Warnings:</b> No data
+      </p>
+      {unit.inhibit !== null ? (
         <p className="latch">
-          <b>Inhibit latched:</b>{" "}
-          {unit.inhibit.reason_code === null ? plainCode("") : plainCode(unit.inhibit.reason_code)}
+          <b>Inhibit:</b>{" "}
+          {unit.inhibit.latched
+            ? `Latched (${plainCode(unit.inhibit.reason_code ?? unit.inhibit.cause_class)})`
+            : "not latched"}
         </p>
+      ) : (
+        unit.lifecycle === "inhibited" && (
+          <p className="latch">
+            <b>Inhibit:</b> latched state not available from this snapshot
+          </p>
+        )
       )}
-      {unit.inhibit?.latched === true && (
+      {acknowledgeOffered(unit) && (
         <button
           type="button"
           className="acknowledge"
@@ -406,7 +502,7 @@ function FleetCard({
 
 interface UnitDetailProps {
   unit: ViewUnit;
-  observation: ObservationView | undefined;
+  observation: ObservationTrack | undefined;
   siteId: string;
   capturedAt: string;
   tab: TabKey;
@@ -422,7 +518,7 @@ function SummaryPanel({
   observation,
 }: {
   unit: ViewUnit;
-  observation: ObservationView | undefined;
+  observation: ObservationTrack | undefined;
 }): JSX.Element {
   const requested = unit.requested_power;
   const allowed = unit.authorized_power;
@@ -452,55 +548,39 @@ function SummaryPanel({
       </p>
       <p>
         <b>Communications:</b> last telemetry {ageText(unit.telemetry_age_s)}, quality{" "}
-        {unit.quality}
+        {unit.quality}; last observation {observationText(observation)}
       </p>
       <p>
-        <b>Recent trend:</b>{" "}
-        {observation === undefined ? "no readings yet" : "no trend history available yet"}
+        <b>Recent trend:</b> no trend history is available from the API yet
       </p>
     </div>
   );
 }
 
 function CellsPanel({
-  observation,
-  telemetryAge,
+  unit,
 }: {
-  observation: ObservationView | undefined;
-  telemetryAge: number | null;
+  unit: ViewUnit;
 }): JSX.Element {
-  const cells = observation?.cells ?? null;
-  const cellAge = observation?.cellDataAgeS ?? telemetryAge;
-  const min = cells !== null && cells.min_v !== null ? `${cells.min_v.toFixed(3)} V` : missingText(cellAge);
-  const max = cells !== null && cells.max_v !== null ? `${cells.max_v.toFixed(3)} V` : missingText(cellAge);
-  const spread =
-    cells !== null && cells.spread_mv !== null
-      ? `${Math.round(cells.spread_mv)} mV`
-      : missingText(cellAge);
-  const temps =
-    observation !== undefined &&
-    observation.temperatureMinC !== null &&
-    observation.temperatureMaxC !== null
-      ? `${observation.temperatureMinC.toFixed(1)} °C to ${observation.temperatureMaxC.toFixed(1)} °C`
-      : missingText(telemetryAge);
+  const age = unit.telemetry_age_s;
   return (
     <div>
       <p>
-        <b>Minimum cell voltage:</b> {min}
+        <b>Minimum cell voltage:</b> {missingText(age)}
       </p>
       <p>
-        <b>Maximum cell voltage:</b> {max}
+        <b>Maximum cell voltage:</b> {missingText(age)}
       </p>
       <p>
-        <b>Voltage spread:</b> {spread}
+        <b>Voltage spread:</b> {missingText(age)}
       </p>
       <p>
-        <b>Temperature range:</b> {temps}
+        <b>Temperature range:</b> {missingText(age)}
       </p>
       <p>
-        <b>Data completeness:</b>{" "}
-        {cells === null ? "cell data missing" : "cell data present"},{" "}
-        {ageText(cellAge)}
+        <b>Data completeness:</b> the snapshot and the observation event carry no cell or
+        temperature readings, so every value above is named as missing rather than estimated
+        ({ageText(age)}).
       </p>
     </div>
   );
@@ -536,33 +616,43 @@ function EventsPanel({
       </p>
     );
   }
-  const events = auditPage.events.filter(
-    (event) =>
-      event.unit_id === unitId && (event.type === "warning" || event.type === "fault"),
-  );
-  if (events.length === 0) {
-    return <p>No warnings or faults recorded for this unit yet.</p>;
+  const entries = auditPage.events
+    .map(parseAuditEntry)
+    .filter((entry) => entry.unitId === unitId);
+  if (entries.length === 0) {
+    return <p>No audit events recorded for this unit yet.</p>;
   }
   return (
     <ul className="event-list">
-      {events.map((event: AuditEvent) => {
-        const code = typeof event.code === "string" ? event.code : event.type;
-        const when =
-          typeof event.occurred_at === "string" ? clockLabel(event.occurred_at) : "";
+      {entries.map((entry: AuditEntryView) => {
+        const typeText = entry.eventType === null ? "Unknown event" : plainAuditType(entry.eventType);
+        const resultText = entry.result === null ? "result not recorded" : plainResult(entry.result);
+        const when = entry.occurredAt !== null ? ` (${clockLabel(entry.occurredAt)})` : "";
+        const raw = [
+          entry.eventType === null ? "event_type unavailable" : `event_type: ${entry.eventType}`,
+          ...entry.reasonCodes.map((code) => code),
+        ].join(", ");
         return (
-          <li key={event.sequence}>
+          <li key={entry.sequence}>
             <p>
-              {eventWord(event.type)}: {plainCode(code)} {when !== "" ? `(${when})` : ""}
+              {typeText}: {resultText}
+              {entry.reasonCodes.length > 0
+                ? ` — ${entry.reasonCodes.map(plainCode).join(", ")}`
+                : ""}
+              {when}
             </p>
             <button
               type="button"
               onClick={() =>
-                setRevealed((previous) => ({ ...previous, [event.sequence]: !previous[event.sequence] }))
+                setRevealed((previous) => ({
+                  ...previous,
+                  [entry.sequence]: !previous[entry.sequence],
+                }))
               }
             >
               Technical details
             </button>
-            {revealed[event.sequence] === true && <p className="raw-code">{code}</p>}
+            {revealed[entry.sequence] === true && <p className="raw-code">{raw}</p>}
           </li>
         );
       })}
@@ -577,29 +667,32 @@ function DetailsPanel({
   capturedAt,
 }: {
   unit: ViewUnit;
-  observation: ObservationView | undefined;
+  observation: ObservationTrack | undefined;
   siteId: string;
   capturedAt: string;
 }): JSX.Element {
-  const cells = observation?.cells ?? null;
+  const observationEpoch =
+    observation?.connectionEpoch === null || observation === undefined
+      ? "not available"
+      : String(observation.connectionEpoch);
   return (
     <div>
       <p>
         <b>Data quality:</b> {unit.quality}
+        {isStaleData(unit) ? " (stale)" : ""}
       </p>
       <p>
         <b>Telemetry age:</b> {ageText(unit.telemetry_age_s)}
       </p>
       <p>
-        <b>Cell data:</b> {cells === null ? "missing" : "present"},{" "}
-        {ageText(observation?.cellDataAgeS ?? unit.telemetry_age_s)}
+        <b>Observation detail:</b> last observation {observationText(observation)}; connection
+        epoch {observationEpoch}; measurement detail (charge, cells, temperatures) not carried
+        by the snapshot or the observation event
       </p>
       <p>
         <b>Measurement completeness:</b>{" "}
-        {unit.measured_watts === null
-          ? "measured power missing"
-          : "measured power present"}
-        {observation === undefined ? ", observation missing" : ", observation present"}
+        {unit.measured_watts === null ? "measured power missing" : "measured power present"};
+        charge, cell, and temperature detail missing
       </p>
       <p>
         <b>Unit ID:</b> {unit.unit_id}
@@ -617,7 +710,7 @@ function DetailsPanel({
       <p>
         <b>Inhibit:</b>{" "}
         {unit.inhibit === null
-          ? "none"
+          ? "not exposed by this snapshot"
           : `${unit.inhibit.cause_class}${unit.inhibit.latched ? ", latched" : ""}${
               unit.inhibit.reason_code !== null ? `, reason ${unit.inhibit.reason_code}` : ""
             }`}
@@ -699,9 +792,7 @@ function UnitDetail({
         aria-labelledby={`tab-${unit.unit_id}-${tab}`}
       >
         {tab === "summary" && <SummaryPanel unit={unit} observation={observation} />}
-        {tab === "cells" && (
-          <CellsPanel observation={observation} telemetryAge={unit.telemetry_age_s} />
-        )}
+        {tab === "cells" && <CellsPanel unit={unit} />}
         {tab === "events" && (
           <EventsPanel
             unitId={unit.unit_id}
@@ -842,7 +933,10 @@ function AcknowledgeDialog({
 // View
 // ---------------------------------------------------------------------------
 
-export function BatteriesView({ client }: BatteriesViewProps): JSX.Element {
+export function BatteriesView({
+  client,
+  connection = "connected",
+}: BatteriesViewProps): JSX.Element {
   const [phase, setPhase] = useState<Phase>("loading");
   const [snapshotError, setSnapshotError] = useState<ErrorView | null>(null);
   const [fleet, setFleet] = useState<FleetState | null>(null);
@@ -853,8 +947,8 @@ export function BatteriesView({ client }: BatteriesViewProps): JSX.Element {
    * value it is about to correct.
    */
   const [fleetReady, setFleetReady] = useState(false);
-  const [observations, setObservations] = useState<Record<string, ObservationView>>({});
-  const [disconnected, setDisconnected] = useState(false);
+  const [observations, setObservations] = useState<Record<string, ObservationTrack>>({});
+  const [streamLost, setStreamLost] = useState(false);
   const [streamOn, setStreamOn] = useState(false);
   const [detail, setDetail] = useState<{ unitId: string; tab: TabKey } | null>(null);
   const [ackUnitId, setAckUnitId] = useState<string | null>(null);
@@ -944,7 +1038,8 @@ export function BatteriesView({ client }: BatteriesViewProps): JSX.Element {
   }, [fetchAudit]);
 
   // Live events: resync when the service says so, retry with the last
-  // delivered sequence as the cursor when the connection drops.
+  // delivered sequence as the cursor when the connection drops. Only frames
+  // the service actually publishes are interpreted.
   useEffect(() => {
     if (!streamOn) {
       return;
@@ -958,7 +1053,7 @@ export function BatteriesView({ client }: BatteriesViewProps): JSX.Element {
             if (cancelled) {
               return;
             }
-            setDisconnected(false);
+            setStreamLost(false);
             if (frame.type === "resync_required") {
               const recovery = frame.snapshot_sequence;
               if (typeof recovery === "number") {
@@ -972,13 +1067,10 @@ export function BatteriesView({ client }: BatteriesViewProps): JSX.Element {
             }
             if (frame.type === "snapshot") {
               applySnapshot(frame.data);
-            } else if (frame.type === "observation") {
-              const parsed = parseObservation(frame);
+            } else if (frame.type === "observation.published") {
+              const parsed = parseObservationPublished(frame);
               if (parsed !== null) {
-                setObservations((previous) => ({
-                  ...previous,
-                  [parsed.unitId]: parsed.data,
-                }));
+                setObservations((previous) => ({ ...previous, [parsed.unitId]: parsed.track }));
               }
             }
           }
@@ -991,7 +1083,7 @@ export function BatteriesView({ client }: BatteriesViewProps): JSX.Element {
         if (resync) {
           await loadSnapshotRef.current();
         } else {
-          setDisconnected(true);
+          setStreamLost(true);
         }
         await new Promise<void>((resolve) => {
           setTimeout(resolve, RECONNECT_DELAY_MS);
@@ -1097,7 +1189,8 @@ export function BatteriesView({ client }: BatteriesViewProps): JSX.Element {
   }
 
   const units = fleet?.units ?? [];
-  const latchedUnits = units.filter((unit) => unit.inhibit?.latched === true);
+  const latchedUnits = units.filter(acknowledgeOffered);
+  const disconnected = connection === "disconnected" || streamLost;
   const detailUnit =
     detail === null ? undefined : units.find((unit) => unit.unit_id === detail.unitId);
   const ackUnit =
@@ -1155,7 +1248,9 @@ export function BatteriesView({ client }: BatteriesViewProps): JSX.Element {
             siteId={fleet?.siteId ?? ""}
             capturedAt={fleet?.capturedAt ?? ""}
             tab={detail.tab}
-            onTabChange={(tab) => setDetail((previous) => (previous === null ? previous : { ...previous, tab }))}
+            onTabChange={(tab) =>
+              setDetail((previous) => (previous === null ? previous : { ...previous, tab }))
+            }
             onBack={() => setDetail(null)}
             auditPage={auditPage}
             auditError={auditError}
@@ -1168,7 +1263,7 @@ export function BatteriesView({ client }: BatteriesViewProps): JSX.Element {
           reasonText={
             ackUnit.inhibit?.reason_code !== null && ackUnit.inhibit?.reason_code !== undefined
               ? plainCode(ackUnit.inhibit.reason_code)
-              : "see event history"
+              : "latch reason not available from this snapshot"
           }
           error={ackError}
           pending={ackPending}

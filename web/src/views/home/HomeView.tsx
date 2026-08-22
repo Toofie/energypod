@@ -25,7 +25,18 @@
  *   stays visible.
  * - The event stream reconnects with the last seen sequence as cursor, and a
  *   `resync_required` frame triggers exactly one snapshot refetch plus a
- *   reconnect from the frame's recovery cursor.
+ *   reconnect from the frame's recovery cursor. A snapshot whose sequence does
+ *   not advance the picture on screen is never adopted (the shell's shared
+ *   stream republishes its latest snapshot frame to every newly mounted view).
+ * - Live frames follow the service's published vocabulary exactly
+ *   (service.py `_publish`): `unit.armed` / `unit.disarmed` rows carry
+ *   `{unit_id, status, reason}`, and a refused row is rendered as a refusal —
+ *   never as a lifecycle change; `emergency_stop.latched` inhibits the fleet;
+ *   `inhibit.acknowledged` clears one latch and changes no lifecycle (the pod
+ *   re-qualifies through stable samples), with a snapshot refetch following
+ *   both latch frames.
+ * - Displayed ages are the captured `telemetry_age_s` plus elapsed monotonic
+ *   time: an age that never grows is a frozen reading, not a current one.
  */
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
@@ -43,6 +54,31 @@ type Phase = "loading" | "ready" | "error";
 const FRESHNESS_BOUND_S = 60;
 const RECONNECT_BASE_DELAY_MS = 400;
 const RECONNECT_MAX_DELAY_MS = 5000;
+const AGE_TICK_MS = 1000;
+
+/** A monotonic reading: displayed ages must never run backwards. */
+function monotonicNowMs(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+/** A ticking "now", mounted only while an on-screen value depends on elapsed time. */
+function useTickingNow(enabled: boolean): number {
+  const [nowMs, setNowMs] = useState(monotonicNowMs);
+  useEffect(() => {
+    if (!enabled) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      setNowMs(monotonicNowMs());
+    }, AGE_TICK_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [enabled]);
+  return nowMs;
+}
 
 // --- honest view-model over the wire ---------------------------------------
 
@@ -203,19 +239,19 @@ function directionWord(direction: PowerFigureView["direction"]): string {
   return "Idle";
 }
 
-function isStale(unit: UnitView): boolean {
-  return unit.telemetry_age_s !== null && unit.telemetry_age_s > FRESHNESS_BOUND_S;
+/** Stale is an age, not a wire value: the age ticks, so staleness can arrive with time alone. */
+function isStale(ageSeconds: number | null): boolean {
+  return ageSeconds !== null && ageSeconds > FRESHNESS_BOUND_S;
 }
 
-function dataAgeText(unit: UnitView): string {
-  if (unit.telemetry_age_s === null) {
+function dataAgeText(ageSeconds: number | null): string {
+  if (ageSeconds === null) {
     return "Data age: not available (telemetry missing)";
   }
-  const age = unit.telemetry_age_s;
-  if (age > FRESHNESS_BOUND_S) {
-    return `Data age: ${age} s old — this reading is stale`;
+  if (ageSeconds > FRESHNESS_BOUND_S) {
+    return `Data age: ${ageSeconds} s old — this reading is stale`;
   }
-  return `Data age: ${age} s`;
+  return `Data age: ${ageSeconds} s`;
 }
 
 function allowedText(unit: UnitView): string {
@@ -327,9 +363,14 @@ export function HomeView({ client }: HomeViewProps) {
   const [health, setHealth] = useState<Health | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [announcement, setAnnouncement] = useState("");
+  const [urgentNotice, setUrgentNotice] = useState("");
   const [expandedFactors, setExpandedFactors] = useState<Record<string, boolean>>({});
   const [reloadNonce, setReloadNonce] = useState(0);
   const lastSequenceRef = useRef<number | undefined>(undefined);
+  // The sequence of the picture on screen (adoption guard) and the monotonic
+  // marker the displayed ages tick from.
+  const adoptedSequenceRef = useRef<number | null>(null);
+  const capturedAtRef = useRef<number>(monotonicNowMs());
 
   // Heading ids are created up front so hook order is stable across the
   // loading / error / ready branches below.
@@ -346,21 +387,45 @@ export function HomeView({ client }: HomeViewProps) {
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempt = 0;
 
-    const applySnapshot = (value: unknown): void => {
+    /**
+     * The single adoption path, guarded by sequence: a snapshot that does not
+     * advance the picture on screen (the shell republishes its latest snapshot
+     * frame to every newly mounted view; a REST read can resolve after a newer
+     * stream frame) never replaces a newer world.
+     */
+    const applySnapshot = (value: unknown, sequence: number | null): boolean => {
       const parsed = readSnapshot(value);
       if (parsed === null) {
-        return;
+        return false;
       }
+      const incoming = sequence ?? parsed.snapshot_sequence;
+      const current = adoptedSequenceRef.current;
+      if (current !== null && incoming <= current) {
+        return false;
+      }
+      adoptedSequenceRef.current = incoming;
+      capturedAtRef.current = monotonicNowMs();
       setSnapshot(parsed);
-      lastSequenceRef.current = parsed.snapshot_sequence;
+      lastSequenceRef.current = incoming;
+      return true;
     };
 
-    /** Status changes arriving over the socket reach non-visual operators. */
-    const applyEventFrame = (frame: StreamEvent): void => {
-      if (frame.type !== "unit.armed" && frame.type !== "unit.disarmed") {
-        return;
-      }
-      const armed = frame.type === "unit.armed";
+    /** A fresher read after a latch frame: adopted only if it advances. */
+    const refetchSnapshot = (): void => {
+      client
+        .getSnapshot()
+        .then((value) => {
+          if (!cancelled) {
+            applySnapshot(value, null);
+          }
+        })
+        .catch(() => {
+          // The last known picture stays; the reconnect path retries anyway.
+        });
+    };
+
+    /** The per-unit rows a unit.armed / unit.disarmed frame carries. */
+    const outcomeRows = (frame: StreamEvent): { unitId: string; status: string; reason: string }[] => {
       const payload: unknown = frame.payload;
       const listed =
         payload !== null &&
@@ -368,20 +433,26 @@ export function HomeView({ client }: HomeViewProps) {
         Array.isArray((payload as Record<string, unknown>).units)
           ? ((payload as Record<string, unknown>).units as unknown[])
           : [];
-      const unitIds: string[] = [];
+      const rows: { unitId: string; status: string; reason: string }[] = [];
       for (const entry of listed) {
         if (
           entry !== null &&
           typeof entry === "object" &&
-          typeof (entry as Record<string, unknown>).unit_id === "string"
+          typeof (entry as Record<string, unknown>).unit_id === "string" &&
+          typeof (entry as Record<string, unknown>).status === "string"
         ) {
-          unitIds.push((entry as Record<string, unknown>).unit_id as string);
+          const record = entry as Record<string, unknown>;
+          rows.push({
+            unitId: record.unit_id as string,
+            status: record.status as string,
+            reason: typeof record.reason === "string" ? record.reason : "",
+          });
         }
       }
-      if (unitIds.length === 0) {
-        return;
-      }
-      const lifecycle = armed ? "armed_idle" : "disarmed";
+      return rows;
+    };
+
+    const patchLifecycles = (unitIds: string[], lifecycle: string): void => {
       setSnapshot((previous) => {
         if (previous === null) {
           return previous;
@@ -393,9 +464,98 @@ export function HomeView({ client }: HomeViewProps) {
           ),
         };
       });
-      setAnnouncement(
-        unitIds.map((unitId) => `${unitId} is now ${armed ? "armed" : "disarmed"}.`).join(" "),
-      );
+    };
+
+    /** Status changes arriving over the socket reach non-visual operators. */
+    const applyEventFrame = (frame: StreamEvent): void => {
+      if (frame.type === "unit.armed" || frame.type === "unit.disarmed") {
+        const armed = frame.type === "unit.armed";
+        const successStatus = armed ? "armed" : "disarmed";
+        const rows = outcomeRows(frame);
+        const succeeded = rows.filter((row) => row.status === successStatus);
+        const refused = rows.filter((row) => row.status !== successStatus);
+        if (succeeded.length > 0) {
+          patchLifecycles(
+            succeeded.map((row) => row.unitId),
+            armed ? "armed_idle" : "disarmed",
+          );
+          setAnnouncement(
+            succeeded
+              .map((row) => `${row.unitId} is now ${armed ? "armed" : "disarmed"}.`)
+              .join(" "),
+          );
+        }
+        if (refused.length > 0) {
+          // A refused row is a refusal, never a lifecycle change: the pods stay
+          // exactly as they are and the reason reaches the operator.
+          setAnnouncement(
+            refused
+              .map(
+                (row) =>
+                  `${row.unitId} ${armed ? "arm" : "disarm"} was refused${
+                    row.reason === "" ? "" : ` — ${row.reason}`
+                  }.`,
+              )
+              .join(" "),
+          );
+        }
+        return;
+      }
+      if (frame.type === "emergency_stop.latched") {
+        // The latched fleet is inhibited: nothing may present as armed or
+        // active until the stop is acknowledged and the pods re-qualify.
+        const payload: unknown = frame.payload;
+        const unitIds =
+          payload !== null &&
+          typeof payload === "object" &&
+          Array.isArray((payload as Record<string, unknown>).unit_ids)
+            ? ((payload as Record<string, unknown>).unit_ids as unknown[]).filter(
+                (entry): entry is string => typeof entry === "string",
+              )
+            : [];
+        const named = unitIds.length > 0 ? unitIds.join(", ") : "the fleet";
+        if (unitIds.length > 0) {
+          patchLifecycles(unitIds, "inhibited");
+        }
+        setUrgentNotice(
+          `Emergency stop latched on ${named} — the pods are inhibited until the stop is acknowledged.`,
+        );
+        refetchSnapshot();
+        return;
+      }
+      if (frame.type === "emergency_stop.acknowledged") {
+        // The latch is gone: stop announcing it and let the refreshed snapshot
+        // say where the fleet stands (the pods re-qualify, they do not resume).
+        setUrgentNotice("");
+        setAnnouncement("The emergency stop was acknowledged.");
+        refetchSnapshot();
+        return;
+      }
+      if (frame.type === "authorization.revoked") {
+        // The runtime publishes this for every unit that still held authority,
+        // and revocation is routine (intent expiry, disarm, generation fences)
+        // — not only a latched inhibit. The frame says authority changed, so
+        // the picture is re-read; no lifecycle is invented from it.
+        refetchSnapshot();
+        return;
+      }
+      if (frame.type === "inhibit.acknowledged") {
+        // Clearing the latch changes no lifecycle: the pod re-qualifies through
+        // stable samples, so only a refreshed snapshot may move it.
+        const payload: unknown = frame.payload;
+        const unitId =
+          payload !== null &&
+          typeof payload === "object" &&
+          typeof (payload as Record<string, unknown>).unit_id === "string"
+            ? ((payload as Record<string, unknown>).unit_id as string)
+            : null;
+        if (unitId !== null) {
+          setAnnouncement(
+            `${unitId} inhibit acknowledged — the latch is clear; the pod re-qualifies through stable samples.`,
+          );
+        }
+        refetchSnapshot();
+      }
     };
 
     const onStreamLost = (): void => {
@@ -436,7 +596,7 @@ export function HomeView({ client }: HomeViewProps) {
               if (cancelled) {
                 return;
               }
-              applySnapshot(fresh);
+              applySnapshot(fresh, null);
               void connect(recovery);
             } catch {
               onStreamLost();
@@ -444,13 +604,10 @@ export function HomeView({ client }: HomeViewProps) {
             return;
           }
           if (frame.type === "snapshot") {
-            const data: unknown = frame.data;
-            const parsed = readSnapshot(data);
-            if (parsed !== null) {
-              setSnapshot(parsed);
-              lastSequenceRef.current =
-                typeof frame.sequence === "number" ? frame.sequence : parsed.snapshot_sequence;
+            if (typeof frame.sequence === "number") {
+              lastSequenceRef.current = frame.sequence;
             }
+            applySnapshot(frame.data, typeof frame.sequence === "number" ? frame.sequence : null);
             setConnection("live");
             continue;
           }
@@ -458,7 +615,22 @@ export function HomeView({ client }: HomeViewProps) {
           if (typeof frame.sequence === "number") {
             lastSequenceRef.current = frame.sequence;
           }
+          if (
+            typeof frame.sequence === "number" &&
+            adoptedSequenceRef.current !== null &&
+            frame.sequence <= adoptedSequenceRef.current
+          ) {
+            // Already part of the picture on screen (a republished frame from
+            // the shared stream): applying it again could rewind a newer world.
+            continue;
+          }
           applyEventFrame(frame);
+          if (typeof frame.sequence === "number") {
+            adoptedSequenceRef.current = Math.max(
+              adoptedSequenceRef.current ?? frame.sequence,
+              frame.sequence,
+            );
+          }
         }
         // The iterator ended without an error: the stream went away.
         onStreamLost();
@@ -490,8 +662,7 @@ export function HomeView({ client }: HomeViewProps) {
         setPhase("error");
         return;
       }
-      setSnapshot(parsed);
-      lastSequenceRef.current = parsed.snapshot_sequence;
+      applySnapshot(snapshotResult.value, null);
       setHealth(healthResult.status === "fulfilled" ? healthResult.value : null);
       setPhase("ready");
       void connect(parsed.snapshot_sequence);
@@ -519,15 +690,23 @@ export function HomeView({ client }: HomeViewProps) {
     setExpandedFactors((previous) => ({ ...previous, [key]: !(previous[key] ?? false) }));
   }, []);
 
+  // Data ages are captured values plus elapsed monotonic time: without the
+  // tick, every "Data age: N s" line would freeze at the value the snapshot
+  // arrived with and read as current forever.
+  const needsAgeTick = snapshot?.units.some((unit) => unit.telemetry_age_s !== null) ?? false;
+  const nowMs = useTickingNow(needsAgeTick);
+  const ageTickS = Math.max(0, (nowMs - capturedAtRef.current) / 1000);
+
   const liveRegion = (
     <p role="status" aria-live="polite" className="home-live-region">
       {announcement}
     </p>
   );
 
-  // A lost connection while a pod is actively powering the home is the one
-  // home-side fact announced assertively; the region always exists so screen
-  // readers (and the role query) see a stable target.
+  // A lost connection while a pod is actively powering the home, and a latched
+  // emergency stop, are the two home-side facts announced assertively; the
+  // region always exists so screen readers (and the role query) see a stable
+  // target.
   const urgent =
     snapshot !== null &&
     connection === "disconnected" &&
@@ -536,7 +715,7 @@ export function HomeView({ client }: HomeViewProps) {
     <p role="alert" aria-live="assertive" className="home-alert-region">
       {urgent
         ? "Connection lost while a pod is actively powering the home — the last known readings are shown with their age and the live feed reconnects automatically."
-        : ""}
+        : urgentNotice}
     </p>
   );
 
@@ -622,7 +801,7 @@ export function HomeView({ client }: HomeViewProps) {
         ) : (
           <ul className="home-units">
             {units.map((unit) => (
-              <UnitPowerEntry key={unit.unit_id} unit={unit} />
+              <UnitPowerEntry key={unit.unit_id} unit={unit} ageTickS={ageTickS} />
             ))}
           </ul>
         )}
@@ -706,12 +885,14 @@ export function HomeView({ client }: HomeViewProps) {
  * own named figure, so the allowed amount can never be presented under the
  * requested label.
  */
-function UnitPowerEntry({ unit }: { unit: UnitView }) {
+function UnitPowerEntry({ unit, ageTickS }: { unit: UnitView; ageTickS: number }) {
   const limited = isLimited(unit);
   const badge = unitBadgeLabel(unit);
   const requested = unit.requested_power;
   const authorized = unit.authorized_power;
-  const stale = isStale(unit);
+  const ageSeconds =
+    unit.telemetry_age_s === null ? null : Math.floor(unit.telemetry_age_s + ageTickS);
+  const stale = isStale(ageSeconds);
   return (
     <li className="home-unit" aria-label={`${unit.unit_id} power`}>
       <div className="home-unit-head">
@@ -742,7 +923,7 @@ function UnitPowerEntry({ unit }: { unit: UnitView }) {
           the request.
         </p>
       ) : null}
-      <p className={stale ? "home-age home-age--stale" : "home-age"}>{dataAgeText(unit)}</p>
+      <p className={stale ? "home-age home-age--stale" : "home-age"}>{dataAgeText(ageSeconds)}</p>
     </li>
   );
 }

@@ -2,14 +2,24 @@
  * The shell's live data plane: REST snapshot + health, the single event-stream
  * connection, the resync protocol, and loss-driven reconnection.
  *
- * Wire behavior (UI_CONTRACTS.md "Data sources"):
+ * Wire behavior (UI_CONTRACTS.md "Data sources", rest.py, service.py):
  * - `openEvents(afterSequence?)` yields the authoritative `snapshot` frame
  *   first, then ordered events. A `resync_required` frame ends iteration; the
  *   shell then refetches the snapshot and reconnects with the recovery cursor
  *   (the marker's `snapshot_sequence` when present, else the last seen one).
+ * - The snapshot frame arrives exactly once per connection, and the bus
+ *   vocabulary carries no lifecycle event for active/inhibited/stopping, so a
+ *   healthy session never sees a fresh picture unless the shell asks for one.
+ *   The shell therefore refetches the snapshot — coalesced, so a burst of
+ *   frames costs one read — on every frame that changes authority:
+ *   emergency_stop.latched, authorization.revoked, inhibit.acknowledged,
+ *   emergency_stop.acknowledged, unit.armed, unit.disarmed.
  * - A lost stream marks the event-stream fact down, keeps the last known data,
  *   announces assertively when control was active, and retries automatically
- *   carrying the last seen sequence as the cursor — never a replay from zero.
+ *   carrying the last seen sequence as the cursor — never a replay from zero —
+ *   on a bounded, widening schedule: an unreachable service is reported, not
+ *   hammered, and the stream's own error envelopes surface instead of being
+ *   swallowed.
  * - A 401 anywhere is the single "session over" signal: it bubbles to the
  *   shell through `onUnauthorized` with the exact error envelope.
  *
@@ -17,9 +27,9 @@
  */
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { ApiClientError, isUnauthorizedError } from "../api/client";
-import type { ApiClientError as ApiClientErrorType, Health } from "../api/client";
+import type { ApiClientError as ApiClientErrorType, Health, StreamEvent } from "../api/client";
 import { isRecord, normalizeSnapshot, type FleetSnapshot, type Lifecycle } from "./fleet";
-import type { SharedDataPlane } from "./SharedDataPlane";
+import type { RealStream, SharedDataPlane } from "./SharedDataPlane";
 
 export type StreamStatus = "connecting" | "live" | "down";
 
@@ -35,6 +45,10 @@ export interface ConsoleData {
   apiReachable: boolean | null;
   snapshotError: RefusalEnvelope | null;
   streamStatus: StreamStatus;
+  /** The last envelope the event stream itself failed with, if any. */
+  streamError: RefusalEnvelope | null;
+  /** True once the automatic reconnect budget is spent; a manual retry remains. */
+  streamExhausted: boolean;
   polite: string[];
   assertive: string[];
 }
@@ -45,6 +59,8 @@ interface State {
   apiReachable: boolean | null;
   snapshotError: RefusalEnvelope | null;
   streamStatus: StreamStatus;
+  streamError: RefusalEnvelope | null;
+  streamExhausted: boolean;
   polite: string[];
   assertive: string[];
 }
@@ -52,11 +68,16 @@ interface State {
 type Action =
   | { type: "reset" }
   | { type: "snapshot"; snapshot: FleetSnapshot }
+  | { type: "snapshot-rest"; snapshot: FleetSnapshot }
   | { type: "snapshot-failed"; refusal: RefusalEnvelope }
   | { type: "health"; health: Health }
   | { type: "health-failed" }
   | { type: "units-patched"; lifecycles: Record<string, Lifecycle> }
+  | { type: "units-inhibited"; ids: string[] }
+  | { type: "units-demoted"; ids: string[] }
   | { type: "stream"; status: StreamStatus }
+  | { type: "stream-error"; refusal: RefusalEnvelope }
+  | { type: "stream-exhausted" }
   | { type: "polite"; text: string }
   | { type: "assertive"; text: string };
 
@@ -66,16 +87,46 @@ const INITIAL: State = {
   apiReachable: null,
   snapshotError: null,
   streamStatus: "connecting",
+  streamError: null,
+  streamExhausted: false,
   polite: [],
   assertive: [],
 };
 
+function patchUnits(
+  state: State,
+  lifecycles: Record<string, Lifecycle>,
+): FleetSnapshot | null {
+  if (state.snapshot === null) {
+    return null;
+  }
+  return {
+    ...state.snapshot,
+    units: state.snapshot.units.map((unit) =>
+      Object.prototype.hasOwnProperty.call(lifecycles, unit.unitId)
+        ? { ...unit, lifecycle: lifecycles[unit.unitId]! }
+        : unit,
+    ),
+  };
+}
+
 function reducer(state: State, action: Action): State {
   switch (action.type) {
     case "reset":
-      return { ...INITIAL, polite: [], assertive: [] };
+      return { ...INITIAL };
     case "snapshot":
+      // A snapshot frame is the service's authoritative picture for this
+      // connection, so it always wins — including after a service restart
+      // that renumbers the sequence space from zero.
       return { ...state, snapshot: action.snapshot, snapshotError: null };
+    case "snapshot-rest": {
+      // A REST read is a refresh of the same timeline: never let an older
+      // response overwrite newer frames already applied.
+      if (state.snapshot !== null && action.snapshot.sequence < state.snapshot.sequence) {
+        return state;
+      }
+      return { ...state, snapshot: action.snapshot, snapshotError: null };
+    }
     case "snapshot-failed":
       return { ...state, snapshotError: action.refusal };
     case "health":
@@ -83,23 +134,45 @@ function reducer(state: State, action: Action): State {
     case "health-failed":
       return { ...state, apiReachable: false };
     case "units-patched": {
-      if (state.snapshot === null) {
-        return state;
+      const snapshot = patchUnits(state, action.lifecycles);
+      return snapshot === null ? state : { ...state, snapshot };
+    }
+    case "units-inhibited": {
+      // A latched stop or inhibit is the most conservative state there is; it
+      // is applied unconditionally so a stopped fleet is never still presented
+      // as armed or active while the refetch is in flight.
+      const lifecycles: Record<string, Lifecycle> = {};
+      for (const id of action.ids) {
+        lifecycles[id] = "inhibited";
       }
-      return {
-        ...state,
-        snapshot: {
-          ...state.snapshot,
-          units: state.snapshot.units.map((unit) =>
-            Object.prototype.hasOwnProperty.call(action.lifecycles, unit.unitId)
-              ? { ...unit, lifecycle: action.lifecycles[unit.unitId]! }
-              : unit,
-          ),
-        },
-      };
+      const snapshot = patchUnits(state, lifecycles);
+      return snapshot === null ? state : { ...state, snapshot };
+    }
+    case "units-demoted": {
+      // A routine revocation ends active authority (the actor demotes ACTIVE
+      // to ARMED_IDLE before revoking); it must never leave "active" on screen.
+      const demote: Record<string, Lifecycle> = {};
+      for (const unit of state.snapshot?.units ?? []) {
+        if (unit.lifecycle === "active" && action.ids.includes(unit.unitId)) {
+          demote[unit.unitId] = "armed_idle";
+        }
+      }
+      const snapshot = patchUnits(state, demote);
+      return snapshot === null ? state : { ...state, snapshot };
     }
     case "stream":
-      return { ...state, streamStatus: action.status };
+      return action.status === "live"
+        ? {
+            ...state,
+            streamStatus: action.status,
+            streamError: null,
+            streamExhausted: false,
+          }
+        : { ...state, streamStatus: action.status };
+    case "stream-error":
+      return { ...state, streamError: action.refusal };
+    case "stream-exhausted":
+      return { ...state, streamStatus: "down", streamExhausted: true };
     case "polite":
       return { ...state, polite: [...state.polite, action.text].slice(-5) };
     case "assertive":
@@ -114,20 +187,33 @@ function asRefusal(error: unknown): RefusalEnvelope {
   return { code: "unexpected_error", message: "Something unexpected went wrong." };
 }
 
-function payloadOf(frame: Record<string, unknown>): Record<string, unknown> {
+function payloadOf(frame: StreamEvent): Record<string, unknown> {
   return isRecord(frame.payload) ? frame.payload : {};
 }
 
-function listedUnitIds(payload: Record<string, unknown>): string[] {
-  // unit.armed / unit.disarmed carry `{units: [{unit_id, status, ...}]}`.
+interface UnitOutcome {
+  unitId: string;
+  applied: boolean;
+  reason: string;
+}
+
+function outcomeUnits(payload: Record<string, unknown>): UnitOutcome[] {
+  // unit.armed / unit.disarmed carry `{units: [{unit_id, status, reason}]}` —
+  // the facade publishes refused rows too, and a refused unit must never be
+  // patched into the state the operator asked for.
   const units = Array.isArray(payload.units) ? payload.units : [];
-  const ids: string[] = [];
+  const outcomes: UnitOutcome[] = [];
   for (const entry of units) {
-    if (isRecord(entry) && typeof entry.unit_id === "string") {
-      ids.push(entry.unit_id);
+    if (!isRecord(entry) || typeof entry.unit_id !== "string") {
+      continue;
     }
+    outcomes.push({
+      unitId: entry.unit_id,
+      applied: entry.status === "armed" || entry.status === "disarmed",
+      reason: typeof entry.reason === "string" ? entry.reason : "",
+    });
   }
-  return ids;
+  return outcomes;
 }
 
 function directUnitIds(payload: Record<string, unknown>): string[] {
@@ -144,111 +230,222 @@ function nameUnits(ids: string[]): string {
   return ids.length === 0 ? "the fleet" : ids.join(", ");
 }
 
-function applyEventFrame(frame: Record<string, unknown>, dispatch: (action: Action) => void): void {
+/**
+ * Revocation reasons that mean a latched inhibit. Only the actor's latched
+ * paths publish these (actor.py `_inhibit_owned(..., InhibitCause.LATCHED)`);
+ * every other reason riding an `authorization.revoked` frame — intent expiry,
+ * disarm, a generation fence, shutdown — is a routine end of authority and
+ * must never be announced as a latch.
+ */
+const LATCHED_INHIBIT_REASONS: readonly string[] = ["blocking_fault_active", "identity_mismatch"];
+
+/**
+ * Apply one wire frame to the shell's own state.
+ *
+ * Returns true when the frame changes authority, meaning the snapshot must be
+ * refetched: the bus has no lifecycle event for active/inhibited/stopping, so
+ * without a refetch the banner, the stop control, and the connection facts
+ * would freeze on the connect-time picture for the whole session.
+ */
+function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void): boolean {
   switch (frame.type) {
     case "snapshot": {
       dispatch({ type: "snapshot", snapshot: normalizeSnapshot(frame.data) });
       dispatch({ type: "stream", status: "live" });
       dispatch({ type: "polite", text: "Fleet picture loaded." });
-      return;
+      return false;
     }
-    case "unit.armed": {
-      const ids = listedUnitIds(payloadOf(frame));
-      if (ids.length === 0) {
-        return;
-      }
-      const lifecycles: Record<string, Lifecycle> = {};
-      for (const id of ids) {
-        lifecycles[id] = "armed_idle";
-      }
-      dispatch({ type: "units-patched", lifecycles });
-      dispatch({
-        type: "polite",
-        text: `${nameUnits(ids)} ${ids.length > 1 ? "are" : "is"} now armed.`,
-      });
-      return;
-    }
+    case "unit.armed":
     case "unit.disarmed": {
-      const ids = listedUnitIds(payloadOf(frame));
-      if (ids.length === 0) {
-        return;
+      const armed = frame.type === "unit.armed";
+      const outcomes = outcomeUnits(payloadOf(frame));
+      if (outcomes.length === 0) {
+        return false;
       }
       const lifecycles: Record<string, Lifecycle> = {};
-      for (const id of ids) {
-        lifecycles[id] = "disarmed";
+      const applied: string[] = [];
+      const refused: string[] = [];
+      for (const outcome of outcomes) {
+        if (outcome.applied) {
+          applied.push(outcome.unitId);
+          lifecycles[outcome.unitId] = armed ? "armed_idle" : "disarmed";
+        } else {
+          refused.push(outcome.unitId);
+        }
       }
-      dispatch({ type: "units-patched", lifecycles });
-      dispatch({
-        type: "polite",
-        text: `${nameUnits(ids)} ${ids.length > 1 ? "are" : "is"} now disarmed.`,
-      });
-      return;
+      if (applied.length > 0) {
+        dispatch({ type: "units-patched", lifecycles });
+        dispatch({
+          type: "polite",
+          text: `${nameUnits(applied)} ${applied.length > 1 ? "are" : "is"} now ${
+            armed ? "armed" : "disarmed"
+          }.`,
+        });
+      }
+      if (refused.length > 0) {
+        const reason = outcomes.find((outcome) => !outcome.applied)?.reason ?? "";
+        dispatch({
+          type: "polite",
+          text: `${nameUnits(refused)} ${refused.length > 1 ? "were" : "was"} not ${
+            armed ? "armed" : "disarmed"
+          }${reason === "" ? "" : ` — ${reason}`}.`,
+        });
+      }
+      return true;
     }
     case "emergency_stop.latched": {
       const payload = payloadOf(frame);
+      const ids = directUnitIds(payload);
       const reason = reasonOf(payload);
+      dispatch({ type: "units-inhibited", ids });
       dispatch({
         type: "assertive",
-        text: `Emergency stop latched on ${nameUnits(directUnitIds(payload))}${
+        text: `Emergency stop latched on ${nameUnits(ids)}${
           reason === "" ? "" : ` — ${reason}`
         }.`,
       });
-      return;
+      return true;
     }
     case "authorization.revoked": {
-      // The latched-inhibit path surfaces on the bus as a revoked authorization
-      // whose reason is the latched cause (see the suite's reconciliation pin).
       const payload = payloadOf(frame);
+      const ids = directUnitIds(payload);
       const reason = reasonOf(payload);
+      if (LATCHED_INHIBIT_REASONS.includes(reason)) {
+        // The latched-inhibit path surfaces on the bus as a revoked
+        // authorization whose reason is the latched cause.
+        dispatch({ type: "units-inhibited", ids });
+        dispatch({
+          type: "assertive",
+          text: `Inhibit latched on ${nameUnits(ids)} — authorization held${
+            reason === "" ? "" : ` (${reason})`
+          }.`,
+        });
+        return true;
+      }
+      // Routine revocation (intent expiry, disarm, generation fence): the end
+      // of authority is worth a polite line, never an emergency announcement.
+      dispatch({ type: "units-demoted", ids });
       dispatch({
-        type: "assertive",
-        text: `Inhibit latched on ${nameUnits(directUnitIds(payload))} — authorization held${
-          reason === "" ? "" : ` (${reason})`
+        type: "polite",
+        text: `Authorization ended on ${nameUnits(ids)}${
+          reason === "" ? "" : ` — ${reason}`
         }.`,
       });
-      return;
+      return true;
+    }
+    case "inhibit.acknowledged": {
+      const payload = payloadOf(frame);
+      const unitId = typeof payload.unit_id === "string" ? payload.unit_id : "";
+      dispatch({
+        type: "polite",
+        text: `Inhibit latch acknowledged on ${
+          unitId === "" ? "the fleet" : unitId
+        }; recovery follows stable samples.`,
+      });
+      return true;
+    }
+    case "emergency_stop.acknowledged": {
+      const payload = payloadOf(frame);
+      const stopId = typeof payload.stop_id === "string" ? payload.stop_id : "";
+      dispatch({
+        type: "polite",
+        text: `Emergency stop acknowledged${stopId === "" ? "" : ` (${stopId})`}.`,
+      });
+      return true;
     }
     default:
       // observation.published, audit.appended, intent.accepted, ... are not
       // shell-level facts; subscribers that care read them through the feed.
-      return;
+      return false;
   }
 }
 
 const HEALTH_POLL_MS = 15000;
-const RETRY_DELAYS_MS: readonly number[] = [300, 800, 1600, 3200];
 /** A discontinuity does not tear the current world off the screen mid-glance:
  * the pre-discontinuity picture renders, then the refetch runs. */
 const RESYNC_REFETCH_DELAY_MS = 60;
+/** Authority frames arrive in bursts (a stop also revokes and audits), so the
+ * refetch is debounced: one read serves the whole burst. */
+const AUTHORITY_REFETCH_DELAY_MS = 120;
+
+/**
+ * The reconnect budget: a bounded run of widening waits. An unreachable or
+ * failing stream is retried this many times and no more — a permanent tight
+ * reconnect loop would hammer the service and buy nothing.
+ */
+export const STREAM_RETRY_DELAYS_MS: readonly number[] = [500, 1000, 2000, 4000, 8000];
+
+/** The wait before the next reconnect attempt, or null once the budget is spent. */
+export function nextStreamRetryDelayMs(attemptsMade: number): number | null {
+  return attemptsMade < STREAM_RETRY_DELAYS_MS.length
+    ? (STREAM_RETRY_DELAYS_MS[attemptsMade] ?? null)
+    : null;
+}
+
+/** Injection points the behavior suite uses to keep time testable. */
+export interface ConsoleDataOptions {
+  /** Reconnect waits, in attempt order; the last entry is the final attempt. */
+  retryDelaysMs?: readonly number[];
+}
 
 export function useConsoleData(
   plane: SharedDataPlane | null,
   onUnauthorized: (error: ApiClientErrorType) => void,
-): ConsoleData & { retrySnapshot: () => void } {
+  options: ConsoleDataOptions = {},
+): ConsoleData & { retrySnapshot: () => void; retryStream: () => void } {
+  const retryDelays = options.retryDelaysMs ?? STREAM_RETRY_DELAYS_MS;
   const [state, dispatch] = useReducer(reducer, INITIAL);
-  const [epoch, setEpoch] = useState(0);
+  const [streamEpoch, setStreamEpoch] = useState(0);
   const onUnauthorizedRef = useRef(onUnauthorized);
   onUnauthorizedRef.current = onUnauthorized;
   const stateRef = useRef(state);
   stateRef.current = state;
+  /**
+   * The last sequence this session consumed. It outlives a single connection
+   * so a manual restart still reconnects from the live edge rather than
+   * dropping back to a cursor-less connection; a new session resets it.
+   */
+  const lastSequenceRef = useRef<number | null>(null);
 
-  const retrySnapshot = useCallback(() => {
-    setEpoch((value) => value + 1);
+  const dropSession = useCallback((error: unknown): void => {
+    if (error instanceof ApiClientError) {
+      onUnauthorizedRef.current(error);
+    }
   }, []);
 
+  /** A manual REST-only recovery: refresh the picture, never rebuild the stream. */
+  const retrySnapshot = useCallback((): void => {
+    if (plane === null) {
+      return;
+    }
+    plane.refresh().then(
+      (raw) => {
+        dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
+      },
+      (error: unknown) => {
+        if (isUnauthorizedError(error)) {
+          dropSession(error);
+          return;
+        }
+        dispatch({ type: "snapshot-failed", refusal: asRefusal(error) });
+      },
+    );
+  }, [plane, dropSession]);
+
+  /** A manual stream restart once the automatic budget is spent. */
+  const retryStream = useCallback((): void => {
+    setStreamEpoch((value) => value + 1);
+  }, []);
+
+  // --- snapshot + health: shared reads through the plane ---------------------
   useEffect(() => {
+    // A new session (or a return to the entry screen) starts a new timeline.
+    lastSequenceRef.current = null;
     if (plane === null) {
       dispatch({ type: "reset" });
       return;
     }
     let cancelled = false;
-    let retryTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const dropSession = (error: unknown): void => {
-      if (error instanceof ApiClientError) {
-        onUnauthorizedRef.current(error);
-      }
-    };
 
     const pollHealth = (): void => {
       plane.health().then(
@@ -274,7 +471,7 @@ export function useConsoleData(
     plane.snapshot().then(
       (raw) => {
         if (!cancelled) {
-          dispatch({ type: "snapshot", snapshot: normalizeSnapshot(raw) });
+          dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
         }
       },
       (error: unknown) => {
@@ -288,61 +485,124 @@ export function useConsoleData(
       },
     );
 
+    return () => {
+      cancelled = true;
+      clearInterval(healthTimer);
+    };
+  }, [plane, dropSession]);
+
+  // --- the one real event-stream connection ---------------------------------
+  useEffect(() => {
+    if (plane === null) {
+      return;
+    }
+    let cancelled = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let refetchTimer: ReturnType<typeof setTimeout> | null = null;
+    let refetchInFlight = false;
+    let refetchQueued = false;
+    let active: RealStream | null = null;
+
     const wait = (ms: number): Promise<void> =>
       new Promise((resolve) => {
         retryTimer = setTimeout(resolve, ms);
       });
 
+    const runAuthorityRefresh = (): void => {
+      if (refetchInFlight) {
+        refetchQueued = true;
+        return;
+      }
+      refetchInFlight = true;
+      plane
+        .refresh()
+        .then(
+          (raw) => {
+            if (!cancelled) {
+              dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
+            }
+          },
+          (error: unknown) => {
+            if (isUnauthorizedError(error)) {
+              dropSession(error);
+              return;
+            }
+            // The refetch failed; the last known picture stays and the next
+            // authority frame schedules another attempt.
+          },
+        )
+        .finally(() => {
+          refetchInFlight = false;
+          if (refetchQueued && !cancelled) {
+            refetchQueued = false;
+            refetchTimer = setTimeout(runAuthorityRefresh, AUTHORITY_REFETCH_DELAY_MS);
+          }
+        });
+    };
+
+    const scheduleAuthorityRefresh = (): void => {
+      if (refetchTimer !== null) {
+        return; // one read is already scheduled: the burst coalesces into it
+      }
+      refetchTimer = setTimeout(() => {
+        refetchTimer = null;
+        runAuthorityRefresh();
+      }, AUTHORITY_REFETCH_DELAY_MS);
+    };
+
     const announceLoss = (): void => {
       dispatch({ type: "stream", status: "down" });
       plane.streamLost();
-      const activeUnits = (stateRef.current.snapshot?.units ?? []).filter(
-        (unit) => unit.lifecycle === "active",
+      // "Active" is a snapshot claim that can lag the wire, so a unit with a
+      // live non-idle request counts as under control too: losing the stream
+      // while power is flowing is exactly the assertive case.
+      const controlling = (stateRef.current.snapshot?.units ?? []).filter(
+        (unit) =>
+          unit.lifecycle === "active" ||
+          (unit.requested.direction !== "idle" && unit.requested.watts > 0),
       );
-      if (activeUnits.length > 0) {
-        const names = activeUnits.map((unit) => unit.unitId).join(", ");
+      if (controlling.length > 0) {
+        const names = controlling.map((unit) => unit.unitId).join(", ");
         dispatch({
           type: "assertive",
           text: `Live updates lost while ${names} ${
-            activeUnits.length > 1 ? "were" : "was"
-          } active — control is unavailable until the connection returns.`,
+            controlling.length > 1 ? "were" : "was"
+          } under active control — control is unavailable until the connection returns.`,
         });
       }
     };
 
     void (async () => {
-      let cursor: number | undefined = undefined;
-      let lastSequence: number | null = null;
+      let cursor: number | undefined = lastSequenceRef.current ?? undefined;
+      let lastSequence: number | null = lastSequenceRef.current;
       let attempt = 0;
       while (!cancelled) {
         dispatch({ type: "stream", status: "connecting" });
         let resync: { cursor: number | null } | null = null;
+        let received = false;
+        active = plane.openRealStream(cursor);
         try {
-          for await (const frame of plane.openRealStream(cursor)) {
+          for await (const frame of active.frames) {
             if (cancelled) {
               return;
             }
-            if (!isRecord(frame)) {
-              continue;
-            }
-            if (typeof frame.sequence === "number") {
-              lastSequence = Math.max(lastSequence ?? frame.sequence, frame.sequence);
-            }
+            received = true;
             if (frame.type === "resync_required") {
               resync = {
                 cursor: typeof frame.snapshot_sequence === "number" ? frame.snapshot_sequence : null,
               };
               break;
             }
+            lastSequence = Math.max(lastSequence ?? frame.sequence, frame.sequence);
+            lastSequenceRef.current = lastSequence;
             if (frame.type === "snapshot") {
-              plane.publishSnapshot(
-                typeof frame.sequence === "number" ? frame.sequence : 0,
-                frame.data,
-              );
+              plane.publishSnapshot(frame.sequence, frame.data);
             } else {
               plane.publishEvent(frame);
             }
-            applyEventFrame(frame, dispatch);
+            if (applyEventFrame(frame, dispatch)) {
+              scheduleAuthorityRefresh();
+            }
           }
         } catch (error) {
           if (cancelled) {
@@ -352,6 +612,9 @@ export function useConsoleData(
             dropSession(error);
             return;
           }
+          // The stream's own failure envelope surfaces — an operator staring
+          // at "reconnecting" deserves to know what actually went wrong.
+          dispatch({ type: "stream-error", refusal: asRefusal(error) });
         }
         if (cancelled) {
           return;
@@ -370,7 +633,7 @@ export function useConsoleData(
             if (cancelled) {
               return;
             }
-            dispatch({ type: "snapshot", snapshot: normalizeSnapshot(fresh) });
+            dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(fresh) });
             dispatch({ type: "polite", text: "Resynchronized — the fleet picture is current." });
           } catch (error) {
             if (cancelled) {
@@ -387,7 +650,18 @@ export function useConsoleData(
           continue;
         }
         announceLoss();
-        const delay = RETRY_DELAYS_MS[Math.min(attempt, RETRY_DELAYS_MS.length - 1)] ?? 3200;
+        // A connection that actually delivered frames was healthy: the next
+        // loss starts a fresh budget rather than inheriting old attempts.
+        if (received) {
+          attempt = 0;
+        }
+        const delay = attempt < retryDelays.length ? (retryDelays[attempt] ?? null) : null;
+        if (delay === null) {
+          // The budget is spent: stop asking, say so, and leave the retry to
+          // the operator rather than hammering a failing endpoint forever.
+          dispatch({ type: "stream-exhausted" });
+          return;
+        }
         attempt += 1;
         await wait(delay);
         cursor = lastSequence ?? undefined;
@@ -395,13 +669,19 @@ export function useConsoleData(
     })();
 
     return () => {
+      // Effect-driven teardown: sign-out, unmount, or a manual restart closes
+      // the authenticated connection now, not whenever a frame next arrives.
       cancelled = true;
       if (retryTimer !== null) {
         clearTimeout(retryTimer);
       }
-      clearInterval(healthTimer);
+      if (refetchTimer !== null) {
+        clearTimeout(refetchTimer);
+      }
+      active?.close();
+      plane.streamLost();
     };
-  }, [plane, epoch]);
+  }, [plane, streamEpoch, dropSession]);
 
-  return { ...state, retrySnapshot };
+  return { ...state, retrySnapshot, retryStream };
 }

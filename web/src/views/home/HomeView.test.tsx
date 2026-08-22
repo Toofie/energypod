@@ -68,9 +68,9 @@
  * with no partial data; a unit status change arriving over the socket is
  * announced through a live region.
  */
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
 import type { ApiClient } from "../../api/client";
 import { HomeView } from "./HomeView";
@@ -822,5 +822,189 @@ describe("HomeView", () => {
     // No partial data renders alongside a refusal.
     expect(screen.queryByText(/pod-mid/i)).toBeNull();
     expect(screen.getByRole("button", { name: /retry|try again/i })).toBeVisible();
+  });
+});
+
+// --- composed-app regressions ---------------------------------------------------
+//
+// The isolated pins above held while the composed console still froze every
+// data age at its captured value, armed a pod whose arm was refused, and left
+// a latched fleet looking armed. These pin the composed behavior directly.
+
+describe("HomeView — live outcomes and ages in the composed app", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("renders a refused arm arriving on the socket as a refusal and never arms the pod", async () => {
+    const snapshot = fleet(allUnits("disarmed"));
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    const openEvents = vi.fn(channel.openEvents);
+    installClient({ snapshot, openEvents });
+    renderHome();
+    await dataLanded();
+
+    channel.push({
+      type: "unit.armed",
+      sequence: 43,
+      occurred_at: "2026-08-22T10:00:05Z",
+      payload: {
+        principal: "operator-7",
+        units: [{ unit_id: "pod-mid", status: "refused", reason: "inhibit_latched" }],
+      },
+    });
+
+    // The refusal is announced with its reason, through a live region.
+    await waitFor(() => {
+      const live = [...screen.getAllByRole("status"), ...screen.getAllByRole("alert")];
+      expect(
+        live.some(
+          (region) =>
+            /pod-mid/i.test(region.textContent ?? "") &&
+            /refused/i.test(region.textContent ?? "") &&
+            /inhibit_latched/.test(region.textContent ?? ""),
+        ),
+      ).toBe(true);
+    });
+
+    // A refused row is never a lifecycle change: the pod and the fleet stay
+    // disarmed, exactly as before the refused request.
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    expectVisibleText(entry, "Disarmed");
+    expectVisibleText(screen.getByRole("region", { name: SAFE_REGION }), "Disarmed");
+  });
+
+  it("shows the fleet as inhibited, never armed, when an emergency stop latches over the socket, and refetches", async () => {
+    const snapshot = fleet(allUnits("armed_idle"));
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    let snapshotCalls = 0;
+    const openEvents = vi.fn(channel.openEvents);
+    installClient({
+      snapshot,
+      getSnapshot: () => {
+        snapshotCalls += 1;
+        // The refetch answers the pre-latch world again (a cached shared read):
+        // only a sequence that advances may replace the latched picture.
+        return Promise.resolve(snapshot);
+      },
+      openEvents,
+    });
+    renderHome();
+    await dataLanded();
+    expectVisibleText(screen.getByRole("region", { name: SAFE_REGION }), "Armed");
+
+    channel.push({
+      type: "emergency_stop.latched",
+      sequence: 43,
+      occurred_at: "2026-08-22T10:00:08Z",
+      payload: {
+        principal: "operator-7",
+        stop_id: "stop-5-800.500000",
+        unit_ids: ["pod-mid", "pod-rhs", "pod-lhs"],
+        reason: "operator requested from the console",
+        generation: 3,
+        degraded: [],
+      },
+    });
+
+    // A latched stop announces assertively, naming the pods it holds.
+    await waitFor(() => {
+      const alerts = screen.getAllByRole("alert");
+      expect(
+        alerts.some(
+          (alert) =>
+            /emergency stop latched/i.test(alert.textContent ?? "") &&
+            /pod-mid/i.test(alert.textContent ?? ""),
+        ),
+      ).toBe(true);
+    });
+
+    // The latched fleet no longer presents as armed or dispatchable.
+    await waitFor(() => {
+      expectVisibleText(screen.getByRole("region", { name: SAFE_REGION }), "Inhibited");
+    });
+    const inhibited = await findUnitEntry(POWER_REGION, "pod-mid");
+    expectVisibleText(inhibited, "Inhibited");
+
+    // Both halves of the contract: the event drove the picture immediately,
+    // and a snapshot refetch followed it.
+    await waitFor(() => {
+      expect(snapshotCalls).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  it("ignores a snapshot whose sequence does not advance the picture on screen", async () => {
+    const newer = fleet(
+      [
+        unit({
+          unit_id: "pod-mid",
+          lifecycle: "active",
+          requested_power: { direction: "discharge", watts: 1500 },
+          authorized_power: { direction: "discharge", watts: 1500 },
+          measured_watts: 1490,
+        }),
+        unit({ unit_id: "pod-rhs", lifecycle: "armed_idle" }),
+        unit({ unit_id: "pod-lhs", lifecycle: "armed_idle" }),
+      ],
+      45,
+    );
+    const older = fleet(allUnits("disarmed"), 42);
+    const channel = liveChannel([{ type: "snapshot", sequence: 45, data: newer }]);
+    installClient({ snapshot: older, openEvents: channel.openEvents });
+    renderHome();
+
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    expectVisibleText(entry, "Active");
+
+    // A republished stale frame (the shared plane hands every newly mounted
+    // view its latest snapshot frame) must not rewind the newer picture...
+    channel.push({ type: "snapshot", sequence: 42, data: older });
+    // ...and this event, newer than both, proves the stream kept flowing: it
+    // applies to the newer world (pod-mid disarmed) while pod-rhs keeps the
+    // newer world's Armed badge — adopting the stale snapshot would have
+    // shown pod-rhs as Disarmed.
+    channel.push({
+      type: "unit.disarmed",
+      sequence: 46,
+      occurred_at: "2026-08-22T10:00:11Z",
+      payload: {
+        principal: "operator-7",
+        units: [{ unit_id: "pod-mid", status: "disarmed", reason: "disarmed" }],
+      },
+    });
+
+    await waitFor(() => {
+      expectVisibleText(entry, "Disarmed");
+    });
+    const rhs = await findUnitEntry(POWER_REGION, "pod-rhs");
+    expectVisibleText(rhs, "Armed");
+  });
+
+  it("advances the data age from a captured marker instead of freezing it at the captured value", async () => {
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+    });
+    const snapshot = fleet([
+      unit({ unit_id: "pod-mid", telemetry_age_s: 20 }),
+      unit({ unit_id: "pod-rhs" }),
+      unit({ unit_id: "pod-lhs" }),
+    ]);
+    installClient({ snapshot });
+    renderHome();
+
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    expectVisibleText(entry, /20 s/);
+
+    act(() => {
+      vi.advanceTimersByTime(5000);
+    });
+    await waitFor(() => {
+      const aged = screen
+        .getAllByText(/Data age:/)
+        .map((node) => node.textContent ?? "")
+        .join(" ");
+      expect(aged).toMatch(/2[45] s/);
+    });
   });
 });

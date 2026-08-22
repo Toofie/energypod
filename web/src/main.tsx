@@ -1,31 +1,28 @@
 /**
  * Console entry point: the token gate lives in the AppShell; this root wires
  * the real views into the shell's injection point and mounts the tree.
+ *
+ * Every view is assigned directly against the shell's view-prop contract
+ * (app/views.ts `ShellView`): each one receives the session's shared client,
+ * and the compiler checks that here — an `unknown`-cast at this seam is what
+ * let a view drift to a prop the shell never passes, killing the view in the
+ * composed app while every isolated suite stayed green.
  */
 import { createRoot } from "react-dom/client";
 import { AppShell } from "./app/AppShell";
-import type { ShellView, ViewId } from "./app/views";
+import type { ShellView, ViewId, ViewRegistry } from "./app/views";
 import { ActivityView } from "./views/activity/ActivityView";
 import { BatteriesView } from "./views/batteries/BatteriesView";
 import { HomeView } from "./views/home/HomeView";
 import { NowView } from "./views/now/NowView";
 import "./styles.css";
 
-/**
- * Sibling views are adapted here to the shell's uniform view prop (each
- * receives the session's shared client); this is the only place the shell's
- * tree reaches outside its own directory.
- */
-function adapt(component: unknown): ShellView {
-  return component as ShellView;
-}
-
-const views: Partial<Record<ViewId, ShellView>> = {
-  home: adapt(HomeView),
-  batteries: adapt(BatteriesView),
-  now: adapt(NowView),
-  activity: adapt(ActivityView),
-};
+const views: ViewRegistry = {
+  home: HomeView,
+  batteries: BatteriesView,
+  now: NowView,
+  activity: ActivityView,
+} satisfies Partial<Record<ViewId, ShellView>>;
 
 const container = document.getElementById("root");
 if (container === null) {

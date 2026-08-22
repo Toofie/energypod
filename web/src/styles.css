@@ -221,7 +221,10 @@ button:disabled {
   margin-top: 0.75rem;
 }
 
-.dialog-actions button:last-child {
+/* Scoped to the shell's own stop dialog: a console-wide "last button is the
+ * dangerous one" rule would repaint every view's dialog, including the
+ * safety-positive acknowledge dialogs that must not read as destructive. */
+.stop-dialog .dialog-actions button:last-child {
   background: var(--no);
   border-color: var(--no);
   color: #fff;
@@ -288,6 +291,17 @@ button:disabled {
 
 .disconnected-notice p {
   margin: 0;
+}
+
+/* The stream's own error envelope, surfaced verbatim next to the notice. */
+.disconnected-notice .stream-error-envelope {
+  margin-top: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+.disconnected-notice .stream-retry {
+  margin-top: 0.6rem;
 }
 
 main h1 {

@@ -9,12 +9,19 @@
 import type { ComponentType } from "react";
 import type { ApiClient } from "../api/client";
 
-/** The one prop every view mounted by the shell receives. */
+/**
+ * The one prop every view mounted by the shell receives: the session's shared
+ * client (coalesced reads through the SharedDataPlane, fanned-out event
+ * stream). A view never builds its own client and never opens its own socket.
+ */
 export interface ShellViewProps {
   client: ApiClient;
 }
 
 export type ShellView = ComponentType<ShellViewProps>;
+
+/** The injection map the shell is handed (main.tsx assigns real views into it). */
+export type ViewRegistry = Partial<Record<ViewId, ShellView>>;
 
 export type ViewId = "home" | "batteries" | "now" | "activity";
 

@@ -4,21 +4,31 @@
  * acknowledgement, unit detail tabs, missing telemetry honesty, and keyboard
  * operation.
  *
- * The API client module is mocked at its exact surface with `createApiClient`
- * replaced and every other canonical export preserved (the view may narrow
- * rejections with `error instanceof ApiClientError`, so every rejection below
- * is a real `ApiClientError` carrying the envelope verbatim plus a status).
- * Fixtures mirror the wire exactly (src/energypod/application/service.py,
- * src/energypod/api/rest.py, src/energypod/application/events.py):
+ * WIRE TRUTH (web/src/test/wire.ts — derived from src/energypod, never
+ * invented here):
  *
- * - enums are lowercase StrEnum values ("disarmed", "observe_only", "active",
- *   "inhibited", "charge", "discharge", "idle", "good", "stale", "missing",
- *   "suspect");
- * - the first WS frame is the snapshot envelope {type, sequence, data};
- * - every event frame carries {type, sequence, occurred_at} with the
- *   event-specific fields nested under "payload" (the facade publishes
- *   {"type", "payload"} and the bus adds only sequence/occurred_at, which
- *   rest.py then sends unchanged).
+ * - The API client module is mocked at its exact surface with
+ *   `createApiClient` replaced and every other canonical export preserved;
+ *   rejections are real `ApiClientError` values carrying the envelope
+ *   verbatim plus a status.
+ * - The snapshot unit carries exactly `unit_id, lifecycle, telemetry_age_s,
+ *   quality, requested_power, authorized_power, measured_watts` (service.py
+ *   `_unit_view`). There is no charge, temperature, cell, or warning field on
+ *   any wire the service sends, so the contracted card fields for those facts
+ *   are pinned as named-missing ("No data", with age) and never as values —
+ *   the "never fabricate or zero-fill" pin, applied to the real wire.
+ * - `quality` is the facade projection vocabulary good/degraded/bad/missing;
+ *   "degraded" already means past the service's 30 s good bound.
+ * - The only observation event is `observation.published` with the minimal
+ *   payload `{unit_id, connection_epoch, sequence}`; the cards' per-unit
+ *   observation state is pinned from exactly that frame.
+ * - Per-unit event history comes from the audit read model (`event_type`,
+ *   `result`, `reason_codes`, integer `sequence`); raw codes are the service's
+ *   own reason codes.
+ * - The latch fixture widens the snapshot unit with the API_CONTRACTS
+ *   "Inhibit acknowledgement" facade exposure (`inhibit`), which the view
+ *   reads defensively: a separate test pins the behaviour when the snapshot
+ *   does not expose it at all.
  */
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -33,6 +43,17 @@ import {
   type ErrorEnvelope,
   type StreamEvent,
 } from "../../api/client";
+import {
+  auditEvent,
+  auditPage,
+  observationPublished,
+  snapshot,
+  snapshotFrame,
+  unitSnapshot,
+  withInhibit,
+  type WireSnapshot,
+  type WireUnitSnapshot,
+} from "../../test/wire";
 import { BatteriesView } from "./BatteriesView";
 
 vi.mock("../../api/client", async (importOriginal) => ({
@@ -42,95 +63,23 @@ vi.mock("../../api/client", async (importOriginal) => ({
 
 const CAPTURED_AT = "2026-08-22T10:00:00Z";
 
-/** The health envelope exactly as the service serializes it (three facts). */
-const HEALTH = {
-  liveness: { ok: true },
-  service_readiness: { ready: true, reasons: [] },
-  control_readiness: { ready: false, reasons: ["no_unit_armed"] },
-};
-
-/**
- * The facade snapshot also exposes each unit's inhibit cause class and
- * latched flag (docs/API_CONTRACTS.md, "Inhibit acknowledgement"); the shared
- * client type keeps the wire-minimal unit, so this suite widens it locally.
- */
-interface LatchState {
-  cause_class: "transient" | "qualified" | "latched";
-  latched: boolean;
-  reason_code: string | null;
-}
-
-type WirePower = { direction: "charge" | "discharge" | "idle"; watts: number };
-
-/** The unit view exactly as the facade serializes it (lowercase StrEnums). */
-interface WireUnit {
-  unit_id: string;
-  lifecycle: string;
-  telemetry_age_s: number | null;
-  quality: string;
-  requested_power: WirePower;
-  authorized_power: WirePower | null;
-  measured_watts: number | null;
-  inhibit?: LatchState | null;
-}
-
-interface WireSnapshot {
-  site_id: string;
-  snapshot_sequence: number;
-  captured_at: string;
-  units: WireUnit[];
-}
-
-/** Per-unit telemetry detail carried by observation events on the socket. */
-interface CellVoltages {
-  min_v: number;
-  max_v: number;
-  spread_mv: number;
-}
-
-interface ObservationData {
-  soc_percent: number;
-  temperature_min_c: number;
-  temperature_max_c: number;
-  cells: CellVoltages | null;
-  cell_data_age_s: number;
-  warnings: { code: string }[];
-}
-
-/** An observation frame: event-specific fields nested under "payload". */
-interface ObservationEvent extends StreamEvent {
-  type: "observation";
-  occurred_at: string;
-  payload: {
-    unit_id: string;
-    data: ObservationData;
-  };
-}
-
 interface MockedClient {
   getSnapshot: Mock<() => Promise<WireSnapshot>>;
-  getHealth: Mock<() => Promise<typeof HEALTH>>;
   getAudit: Mock<(limit: number, afterSequence?: number) => Promise<AuditPage>>;
-  postInhibitAcknowledgement: Mock<
-    (unitId: string) => Promise<Record<string, unknown>>
-  >;
+  postInhibitAcknowledgement: Mock<(unitId: string) => Promise<Record<string, unknown>>>;
   openEvents: Mock<(afterSequence?: number) => AsyncIterable<StreamEvent>>;
 }
 
 function makeClient(): MockedClient {
   const client: MockedClient = {
     getSnapshot: vi.fn<() => Promise<WireSnapshot>>(),
-    getHealth: vi.fn<() => Promise<typeof HEALTH>>(),
-    getAudit: vi.fn<
-      (limit: number, afterSequence?: number) => Promise<AuditPage>
-    >(),
+    getAudit: vi.fn<(limit: number, afterSequence?: number) => Promise<AuditPage>>(),
     postInhibitAcknowledgement: vi.fn<
       (unitId: string) => Promise<Record<string, unknown>>
     >(),
     openEvents: vi.fn<(afterSequence?: number) => AsyncIterable<StreamEvent>>(),
   };
-  client.getHealth.mockResolvedValue(HEALTH);
-  client.getAudit.mockResolvedValue({ events: [], next_cursor: null });
+  client.getAudit.mockResolvedValue(auditPage([]));
   return client;
 }
 
@@ -156,99 +105,10 @@ function openStream(
   };
 }
 
-function unit(spec: Partial<WireUnit> & Pick<WireUnit, "unit_id">): WireUnit {
-  return {
-    unit_id: spec.unit_id,
-    lifecycle: spec.lifecycle ?? "disarmed",
-    telemetry_age_s: spec.telemetry_age_s ?? 3,
-    quality: spec.quality ?? "good",
-    requested_power: spec.requested_power ?? { direction: "idle", watts: 0 },
-    authorized_power: spec.authorized_power ?? null,
-    measured_watts: spec.measured_watts ?? 0,
-    inhibit: spec.inhibit ?? null,
-  };
-}
-
-type ObservationSpec = Partial<ObservationData>;
-
-function observation(
-  sequence: number,
-  unitId: string,
-  spec: ObservationSpec = {},
-): ObservationEvent {
-  return {
-    type: "observation",
-    sequence,
-    occurred_at: CAPTURED_AT,
-    payload: {
-      unit_id: unitId,
-      data: {
-        soc_percent: spec.soc_percent ?? 62,
-        temperature_min_c: spec.temperature_min_c ?? 24.1,
-        temperature_max_c: spec.temperature_max_c ?? 27.8,
-        cells:
-          spec.cells === undefined
-            ? { min_v: 3.31, max_v: 3.352, spread_mv: 42 }
-            : spec.cells,
-        cell_data_age_s: spec.cell_data_age_s ?? 6,
-        warnings: spec.warnings ?? [],
-      },
-    },
-  };
-}
-
-const FLEET_SPEC: Record<string, ObservationSpec> = {
-  MID: { warnings: [{ code: "EE_CALIBRATION_WARNING" }] },
-  RHS: {
-    soc_percent: 78,
-    temperature_min_c: 23.0,
-    temperature_max_c: 25.5,
-    cells: { min_v: 3.32, max_v: 3.338, spread_mv: 18 },
-  },
-  LHS: {
-    soc_percent: 44,
-    temperature_min_c: 25.2,
-    temperature_max_c: 28.0,
-    cells: { min_v: 3.3, max_v: 3.341, spread_mv: 41 },
-  },
-};
-
-function fleetEvents(
-  snapshot: WireSnapshot,
-  spec: Record<string, ObservationSpec> = FLEET_SPEC,
-): StreamEvent[] {
-  const events: StreamEvent[] = [
-    {
-      type: "snapshot",
-      sequence: snapshot.snapshot_sequence,
-      data: snapshot,
-    },
-  ];
-  let sequence = snapshot.snapshot_sequence;
-  for (const snapshotUnit of snapshot.units) {
-    sequence += 1;
-    events.push(
-      observation(
-        sequence,
-        snapshotUnit.unit_id,
-        spec[snapshotUnit.unit_id] ?? {},
-      ),
-    );
-  }
-  return events;
-}
-
-const HEALTHY_SNAPSHOT: WireSnapshot = {
-  site_id: "home-1",
-  snapshot_sequence: 4100,
-  captured_at: CAPTURED_AT,
-  units: [
-    unit({
-      unit_id: "LHS",
-      lifecycle: "observe_only",
-      telemetry_age_s: 4,
-    }),
-    unit({
+const HEALTHY_SNAPSHOT: WireSnapshot = snapshot(
+  [
+    unitSnapshot({ unit_id: "LHS", lifecycle: "observe_only", telemetry_age_s: 4 }),
+    unitSnapshot({
       unit_id: "MID",
       lifecycle: "active",
       telemetry_age_s: 2,
@@ -256,22 +116,31 @@ const HEALTHY_SNAPSHOT: WireSnapshot = {
       authorized_power: { direction: "discharge", watts: 2400 },
       measured_watts: -2400,
     }),
-    unit({
-      unit_id: "RHS",
-      lifecycle: "disarmed",
-      telemetry_age_s: 5,
-    }),
+    unitSnapshot({ unit_id: "RHS", lifecycle: "disarmed", telemetry_age_s: 5 }),
   ],
-};
+  { snapshot_sequence: 4100, captured_at: CAPTURED_AT },
+);
+
+/**
+ * The opening burst the service actually sends: the authoritative snapshot
+ * frame, then one `observation.published` event per unit in snapshot order
+ * (the composition publishes one event per appended observation).
+ */
+function fleetEvents(state: WireSnapshot): StreamEvent[] {
+  const events: StreamEvent[] = [snapshotFrame(state)];
+  let sequence = state.snapshot_sequence;
+  for (const unit of state.units) {
+    sequence += 1;
+    events.push(observationPublished(sequence, unit.unit_id, { occurredAt: CAPTURED_AT }));
+  }
+  return events;
+}
 
 const HEALTHY_EVENTS: StreamEvent[] = fleetEvents(HEALTHY_SNAPSHOT);
 
-function healthyClient(
-  snapshot: WireSnapshot,
-  events: readonly StreamEvent[],
-): MockedClient {
+function healthyClient(state: WireSnapshot, events: readonly StreamEvent[]): MockedClient {
   const client = makeClient();
-  client.getSnapshot.mockResolvedValue(snapshot);
+  client.getSnapshot.mockResolvedValue(state);
   client.openEvents.mockReturnValue(openStream(events));
   return client;
 }
@@ -280,43 +149,41 @@ function snapshotWithOrder(order: string[]): WireSnapshot {
   const byId = new Map(HEALTHY_SNAPSHOT.units.map((u) => [u.unit_id, u]));
   return {
     ...HEALTHY_SNAPSHOT,
-    units: order
-      .map((id) => byId.get(id))
-      .filter((u): u is WireUnit => Boolean(u)),
+    units: order.map((id) => byId.get(id)).filter((u): u is WireUnitSnapshot => Boolean(u)),
   };
 }
 
+/** MID inhibited with the documented latch exposure attached. */
 function latchedSnapshot(): WireSnapshot {
   return {
     ...HEALTHY_SNAPSHOT,
     units: [
       ...HEALTHY_SNAPSHOT.units.filter((u) => u.unit_id !== "MID"),
-      unit({
-        unit_id: "MID",
-        lifecycle: "inhibited",
-        telemetry_age_s: 2,
-        measured_watts: 0,
-        inhibit: {
-          cause_class: "latched",
-          latched: true,
-          reason_code: "CRITICAL_BLOCKING_FAULT",
-        },
-      }),
+      withInhibit(
+        unitSnapshot({
+          unit_id: "MID",
+          lifecycle: "inhibited",
+          telemetry_age_s: 2,
+          measured_watts: 0,
+        }),
+        { cause_class: "latched", latched: true, reason_code: "identity_mismatch" },
+      ),
     ],
   };
 }
 
 function latchedEvents(latched: WireSnapshot): StreamEvent[] {
-  return fleetEvents(latched, {
-    ...FLEET_SPEC,
-    MID: { warnings: [{ code: "CRITICAL_BLOCKING_FAULT" }] },
-  });
+  return fleetEvents(latched);
 }
 
-function renderView(client: MockedClient) {
+function renderView(client: MockedClient, connection?: "connected" | "disconnected") {
   vi.mocked(createApiClient).mockReturnValue(client as unknown as ApiClient);
   const api = createApiClient("operator-token");
-  return render(<BatteriesView client={api} />);
+  return connection === undefined ? (
+    render(<BatteriesView client={api} />)
+  ) : (
+    render(<BatteriesView client={api} connection={connection} />)
+  );
 }
 
 /**
@@ -353,9 +220,7 @@ async function tabUntilFocused(
 }
 
 function focusedElement(): HTMLElement | null {
-  return document.activeElement instanceof HTMLElement
-    ? document.activeElement
-    : null;
+  return document.activeElement instanceof HTMLElement ? document.activeElement : null;
 }
 
 beforeEach(() => {
@@ -363,7 +228,7 @@ beforeEach(() => {
 });
 
 describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
-  it("renders one card per named unit with charge, power, availability, temperatures, cell spread, data age and warnings", async () => {
+  it("renders one card per named unit with power, availability, data age, per-unit observation state, and the wire's missing fields named as missing", async () => {
     const client = healthyClient(HEALTHY_SNAPSHOT, HEALTHY_EVENTS);
     renderView(client);
 
@@ -371,8 +236,7 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     const rhs = await screen.findByRole("group", { name: "RHS" });
     const lhs = await screen.findByRole("group", { name: "LHS" });
 
-    // charge level and data age
-    expect(mid).toHaveTextContent(/62\s*%/);
+    // data age from the snapshot's own telemetry_age_s
     expect(mid).toHaveTextContent(/2\s*(s|seconds)\s*old/);
     // current direction and power come from measured_watts: the sign is
     // carried by the direction word, never rendered as a raw negative number.
@@ -382,13 +246,21 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     // availability in plain language
     expect(rhs).toHaveTextContent(/standby|ready|available/i);
     expect(lhs).toHaveTextContent(/observe/i);
-    // temperature range
-    expect(mid).toHaveTextContent(/24\.1/);
-    expect(mid).toHaveTextContent(/27\.8/);
-    // cell spread
-    expect(mid).toHaveTextContent(/42\s*mV/);
+    // charge, temperature, and cell detail are on no wire the service sends:
+    // each field is named with "no data" and its age, never an invented value
+    expect(tightestText(mid, /charge/i, /no data/i)).not.toMatch(/%|\d+\s*W/);
+    expect(tightestText(mid, /temperature/i, /no data/i)).not.toMatch(/°|\d+\s*C/i);
+    expect(tightestText(mid, /cell/i, /no data/i)).not.toMatch(/mV|\d+\s*V/i);
+    expect(mid).not.toHaveTextContent(/%/);
+    expect(mid).not.toHaveTextContent(/mV/);
+    expect(mid).not.toHaveTextContent(/°/);
     // warnings labelled in words, never colour alone
     expect(mid).toHaveTextContent(/warning/i);
+    // the observation event the service actually publishes drives per-unit
+    // telemetry state: MID's own observation, at MID's own telemetry sequence
+    expect(mid).toHaveTextContent(/last observation:\s*10:00 UTC/i);
+    expect(mid).toHaveTextContent(/telemetry sequence 41020/);
+    expect(lhs).toHaveTextContent(/telemetry sequence 41010/);
     // live events are followed from the snapshot cursor
     expect(client.openEvents).toHaveBeenCalledWith(4100);
   });
@@ -399,17 +271,23 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     );
     const mid = await screen.findByRole("group", { name: "MID" });
     expect(mid).toHaveTextContent(/2,?400\s*W/);
-    expect(screen.getByRole("group", { name: "RHS" })).toHaveTextContent(/78\s*%/);
+    expect(mid).toHaveTextContent(/2\s*(s|seconds)\s*old/);
+    expect(screen.getByRole("group", { name: "RHS" })).toHaveTextContent(
+      /5\s*(s|seconds)\s*old/,
+    );
     firstView.unmount();
 
     const reordered = snapshotWithOrder(["RHS", "LHS", "MID"]);
     renderView(healthyClient(reordered, fleetEvents(reordered)));
     const midAgain = await screen.findByRole("group", { name: "MID" });
-    expect(midAgain).toHaveTextContent(/62\s*%/);
     expect(midAgain).toHaveTextContent(/2,?400\s*W/);
-    const rhsAgain = screen.getByRole("group", { name: "RHS" });
-    expect(rhsAgain).toHaveTextContent(/78\s*%/);
-    expect(rhsAgain).not.toHaveTextContent(/44\s*%/);
+    expect(midAgain).toHaveTextContent(/2\s*(s|seconds)\s*old/);
+    const lhsAgain = screen.getByRole("group", { name: "LHS" });
+    expect(lhsAgain).toHaveTextContent(/4\s*(s|seconds)\s*old/);
+    // RHS never takes LHS's facts with it
+    expect(screen.getByRole("group", { name: "RHS" })).not.toHaveTextContent(
+      /4\s*(s|seconds)\s*old/,
+    );
   });
 
   it("shows the power actually delivered, never the request, when the safety system clamps the action", async () => {
@@ -458,21 +336,8 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
   });
 
   it("explains what will appear when no batteries are connected", async () => {
-    const empty: WireSnapshot = {
-      site_id: "home-1",
-      snapshot_sequence: 42,
-      captured_at: CAPTURED_AT,
-      units: [],
-    };
-    renderView(
-      healthyClient(empty, [
-        {
-          type: "snapshot",
-          sequence: 42,
-          data: empty,
-        },
-      ]),
-    );
+    const empty = snapshot([], { snapshot_sequence: 42, captured_at: CAPTURED_AT });
+    renderView(healthyClient(empty, [snapshotFrame(empty)]));
 
     expect(await screen.findByText(/no batteries/i)).toBeInTheDocument();
     expect(screen.getByText(/appear here/i)).toBeInTheDocument();
@@ -507,29 +372,31 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows the age of stale data next to the value instead of hiding it", async () => {
+  it("marks data past the service's freshness bound stale, with the age next to the value instead of hiding it", async () => {
+    // The facade's own projection: telemetry past its 30 s good bound is
+    // "degraded", never "good" — the fixture uses the wire vocabulary.
     const stale: WireSnapshot = {
       ...HEALTHY_SNAPSHOT,
       units: HEALTHY_SNAPSHOT.units.map((u) =>
-        u.unit_id === "MID"
-          ? { ...u, telemetry_age_s: 95, quality: "stale" }
-          : u,
+        u.unit_id === "MID" ? { ...u, telemetry_age_s: 95, quality: "degraded" } : u,
       ),
     };
     renderView(healthyClient(stale, fleetEvents(stale)));
 
     const mid = await screen.findByRole("group", { name: "MID" });
-    expect(mid).toHaveTextContent(/62\s*%/);
+    // the value is kept and carries its age plus the stale mark
+    expect(mid).toHaveTextContent(/discharging/i);
+    expect(mid).toHaveTextContent(/2,?400\s*W/);
     expect(mid).toHaveTextContent(/95\s*(s|seconds)\s*old/);
+    expect(mid).toHaveTextContent(/stale/i);
+    expect(mid).toHaveTextContent(/charge level:\s*no data/i);
+    expect(mid).not.toHaveTextContent(/%/);
   });
 
   it("names missing telemetry and its age without inventing values", async () => {
-    const partial: WireSnapshot = {
-      site_id: "home-1",
-      snapshot_sequence: 4200,
-      captured_at: CAPTURED_AT,
-      units: [
-        unit({
+    const partial = snapshot(
+      [
+        unitSnapshot({
           unit_id: "MID",
           lifecycle: "active",
           telemetry_age_s: 2,
@@ -537,7 +404,7 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
           authorized_power: { direction: "discharge", watts: 2400 },
           measured_watts: -2400,
         }),
-        unit({
+        unitSnapshot({
           unit_id: "LHS",
           lifecycle: "disconnected",
           telemetry_age_s: 620,
@@ -545,28 +412,19 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
           authorized_power: null,
           measured_watts: null,
         }),
-        unit({
+        unitSnapshot({
           unit_id: "RHS",
           lifecycle: "disarmed",
           telemetry_age_s: 5,
-          quality: "suspect",
+          quality: "bad",
         }),
       ],
-    };
+      { snapshot_sequence: 4200, captured_at: CAPTURED_AT },
+    );
     const events: StreamEvent[] = [
-      {
-        type: "snapshot",
-        sequence: 4200,
-        data: partial,
-      },
-      observation(4201, "MID"),
-      observation(4202, "RHS", {
-        soc_percent: 78,
-        temperature_min_c: 23.0,
-        temperature_max_c: 25.5,
-        cells: null,
-        cell_data_age_s: 402,
-      }),
+      snapshotFrame(partial),
+      observationPublished(4201, "MID", { occurredAt: CAPTURED_AT }),
+      observationPublished(4202, "RHS", { occurredAt: CAPTURED_AT }),
     ];
     renderView(healthyClient(partial, events));
 
@@ -581,21 +439,40 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     }
     expect(lhs).toHaveTextContent(/620\s*(s|seconds)\s*old/);
     expect(lhs).not.toHaveTextContent(/%/);
+    expect(lhs).not.toHaveTextContent(/mV/);
     // measured_watts is null: no fabricated power figure on the card at all
     expect(lhs).not.toHaveTextContent(/\d+\s*W/);
+    expect(lhs).toHaveTextContent(/no observation received/i);
 
-    // a unit with partial telemetry names only what is missing, with the
-    // cell block's own age
+    // a unit whose data the service judged unusable is marked, not hidden
     const rhs = screen.getByRole("group", { name: "RHS" });
-    const rhsCellRow = tightestText(rhs, /cell/i, /no data/i);
-    expect(rhsCellRow).not.toMatch(/mV|\d+\s*W/);
-    expect(rhs).toHaveTextContent(/402\s*(s|seconds)\s*old/);
-    expect(rhs).not.toHaveTextContent(/mV/);
+    expect(rhs).toHaveTextContent(/stale/i);
 
-    // the healthy unit still shows real measurements
+    // the healthy unit still shows the real measurement
     const mid = screen.getByRole("group", { name: "MID" });
-    expect(mid).toHaveTextContent(/62\s*%/);
-    expect(mid).toHaveTextContent(/42\s*mV/);
+    expect(mid).toHaveTextContent(/2,?400\s*W/);
+    expect(mid).toHaveTextContent(/telemetry sequence 42010/);
+  });
+
+  it("names a unknown age as unknown instead of guessing one", async () => {
+    const noAge = snapshot(
+      [
+        ...HEALTHY_SNAPSHOT.units.filter((u) => u.unit_id !== "RHS"),
+        unitSnapshot({
+          unit_id: "RHS",
+          lifecycle: "disconnected",
+          telemetry_age_s: null,
+          quality: "missing",
+          measured_watts: null,
+        }),
+      ],
+      { snapshot_sequence: 4300, captured_at: CAPTURED_AT },
+    );
+    renderView(healthyClient(noAge, fleetEvents(noAge)));
+
+    const rhs = await screen.findByRole("group", { name: "RHS" });
+    expect(rhs).toHaveTextContent(/age unknown/);
+    expect(tightestText(rhs, /charge/i)).not.toMatch(/last update/);
   });
 
   it("keeps the last snapshot visible with a disconnected notice when the event stream drops", async () => {
@@ -603,18 +480,22 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
     // every attempt delivers the snapshot frame plus the LHS and MID
     // observations (through sequence 4102) and then drops, so the notice
-    // persists and MID's charge value honestly comes from its observation.
+    // persists and the cards' observation state is honestly per-unit.
     client.openEvents.mockImplementation(() =>
       openStream(HEALTHY_EVENTS.slice(0, 3), "fail"),
     );
     renderView(client);
 
     const mid = await screen.findByRole("group", { name: "MID" });
-    expect(mid).toHaveTextContent(/62\s*%/);
+    expect(mid).toHaveTextContent(/last observation:\s*10:00 UTC/i);
+    expect(mid).toHaveTextContent(/telemetry sequence 41020/);
 
     expect(await screen.findByText(/disconnected/i)).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "MID" })).toBeInTheDocument();
-    expect(screen.getByRole("group", { name: "RHS" })).toBeInTheDocument();
+    // RHS's observation (sequence 4103) never arrived: named, not invented
+    expect(screen.getByRole("group", { name: "RHS" })).toHaveTextContent(
+      /no observation received/i,
+    );
 
     // the socket retries automatically, carrying the last delivered sequence
     // (4102, the MID observation) as the cursor — not the snapshot's 4100
@@ -622,6 +503,18 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
       expect(client.openEvents.mock.calls.length).toBeGreaterThanOrEqual(2),
     );
     expect(client.openEvents).toHaveBeenLastCalledWith(4102);
+  });
+
+  it("shows the disconnected notice from the shell's connection fact while the last snapshot stays rendered", async () => {
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
+    client.openEvents.mockReturnValue(openStream(HEALTHY_EVENTS));
+    renderView(client, "disconnected");
+
+    expect(await screen.findByText(/disconnected/i)).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "MID" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "MID" })).toHaveTextContent(/2,?400\s*W/);
+    expect(screen.getByRole("group", { name: "RHS" })).toBeInTheDocument();
   });
 
   it("opens a unit and reads the detail tabs using only the keyboard", async () => {
@@ -657,15 +550,16 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     await user.keyboard("{Enter}");
 
     const cells = await screen.findByRole("tabpanel");
-    // min/max/spread readable as text, never colour alone
-    expect(cells).toHaveTextContent(/3\.31/);
-    expect(cells).toHaveTextContent(/3\.35/);
-    expect(cells).toHaveTextContent(/42\s*mV/);
-    expect(cells).toHaveTextContent(/24\.1/);
-    expect(cells).toHaveTextContent(/27\.8/);
-    // data completeness: the cell block's own age is part of the tab
-    expect(cells).toHaveTextContent(/complet|data age/i);
-    expect(cells).toHaveTextContent(/\b6\s*(s|sec)/i);
+    // min/max/spread are named fields with their missing-ness stated as text,
+    // never colour alone — and never an invented reading
+    expect(cells).toHaveTextContent(/minimum cell voltage:\s*no data/i);
+    expect(cells).toHaveTextContent(/maximum cell voltage:\s*no data/i);
+    expect(cells).toHaveTextContent(/voltage spread:\s*no data/i);
+    expect(cells).toHaveTextContent(/temperature range:\s*no data/i);
+    expect(cells).not.toHaveTextContent(/mV/);
+    // data completeness states what the wire carries
+    expect(cells).toHaveTextContent(/complet/i);
+    expect(cells).toHaveTextContent(/no cell or temperature readings/i);
 
     // Details is reachable by keyboard and carries the data-quality map
     await user.keyboard("{ArrowRight}");
@@ -680,29 +574,26 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
 
   it("shows unit events in plain language and reveals the raw code on demand", async () => {
     const user = userEvent.setup();
-    const audit: AuditPage = {
-      events: [
-        {
-          type: "warning",
-          sequence: 4080,
-          occurred_at: "2026-08-22T09:58:00Z",
-          unit_id: "MID",
-          code: "TEMP_OUT_OF_RANGE",
-          payload: null,
-        },
-        {
-          type: "fault",
-          sequence: 4021,
-          occurred_at: "2026-08-22T09:31:00Z",
-          unit_id: "MID",
-          code: "BMS_COMM_LOSS",
-          payload: null,
-        },
-      ],
-      next_cursor: null,
-    };
+    const page = auditPage([
+      auditEvent({
+        sequence: 4080,
+        event_type: "control_decision",
+        unit_id: "MID",
+        result: "rejected",
+        reason_codes: ["temperature_high", "telemetry_stale"],
+        occurred_at: "2026-08-22T09:58:00Z",
+      }),
+      auditEvent({
+        sequence: 4021,
+        event_type: "inhibit_acknowledged",
+        unit_id: "MID",
+        result: "acknowledged",
+        reason_codes: ["latch_cleared"],
+        occurred_at: "2026-08-22T09:31:00Z",
+      }),
+    ]);
     const client = healthyClient(HEALTHY_SNAPSHOT, HEALTHY_EVENTS);
-    client.getAudit.mockResolvedValue(audit);
+    client.getAudit.mockResolvedValue(page);
     renderView(client);
 
     await user.click(await screen.findByRole("button", { name: "MID" }));
@@ -710,22 +601,19 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
 
     const panel = await screen.findByRole("tabpanel");
     expect(within(panel).getByText(/temperature/i)).toBeInTheDocument();
-    expect(
-      within(panel).getByText(/communications|connection/i),
-    ).toBeInTheDocument();
+    expect(within(panel).getByText(/acknowledg/i)).toBeInTheDocument();
     // raw codes are not shown until asked for
-    expect(screen.queryByText("TEMP_OUT_OF_RANGE")).not.toBeInTheDocument();
-    expect(screen.queryByText("BMS_COMM_LOSS")).not.toBeInTheDocument();
+    expect(screen.queryByText(/temperature_high/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/latch_cleared/)).not.toBeInTheDocument();
 
     const items = within(panel).getAllByRole("listitem");
     expect(items.length).toBeGreaterThanOrEqual(2);
-    const warningItem = items.find((item) =>
-      /temperature/i.test(item.textContent ?? ""),
-    );
-    expect(warningItem).toBeDefined();
-    const warning = warningItem as HTMLElement;
-    await user.click(within(warning).getByRole("button", { name: /technical/i }));
-    expect(within(warning).getByText("TEMP_OUT_OF_RANGE")).toBeInTheDocument();
+    const rejectedItem = items.find((item) => /refused/i.test(item.textContent ?? ""));
+    expect(rejectedItem).toBeDefined();
+    const rejected = rejectedItem as HTMLElement;
+    await user.click(within(rejected).getByRole("button", { name: /technical/i }));
+    expect(within(rejected).getByText(/temperature_high/)).toBeInTheDocument();
+    expect(within(rejected).getByText(/event_type: control_decision/)).toBeInTheDocument();
   });
 
   it("shows latch state, announces it assertively, and offers acknowledge only for latched units", async () => {
@@ -750,21 +638,57 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("offers acknowledgement from the inhibited lifecycle while the snapshot does not expose the latch detail, and never invents a latch reason", async () => {
+    // Today's snapshot carries no `inhibit` field at all: the control must
+    // still be reachable for an inhibited unit, the latch detail must render
+    // not-available, and the server alone reports whether anything cleared.
+    const inhibited = {
+      ...HEALTHY_SNAPSHOT,
+      units: [
+        ...HEALTHY_SNAPSHOT.units.filter((u) => u.unit_id !== "MID"),
+        unitSnapshot({
+          unit_id: "MID",
+          lifecycle: "inhibited",
+          telemetry_age_s: 2,
+          measured_watts: 0,
+        }),
+      ],
+    } satisfies WireSnapshot;
+    const client = healthyClient(inhibited, fleetEvents(inhibited));
+    renderView(client);
+
+    const mid = await screen.findByRole("group", { name: "MID" });
+    expect(mid).toHaveTextContent(/latched state not available/i);
+    expect(
+      within(mid).getByRole("button", { name: /acknowledge/i }),
+    ).toBeInTheDocument();
+
+    // no fabricated cause: the dialog names the missing reason, not a code
+    const user = userEvent.setup();
+    await user.click(within(mid).getByRole("button", { name: /acknowledge/i }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent(/not available/i);
+    expect(dialog).not.toHaveTextContent(/identity_mismatch/);
+    expect(dialog).not.toHaveTextContent(/blocking_fault/);
+  });
+
   it("confirms acknowledgement, explains re-arming is separate, and clears the latch from a refetch", async () => {
     const user = userEvent.setup();
     const latched = latchedSnapshot();
     const cleared: WireSnapshot = {
       ...latched,
-      units: latched.units.map((u): WireUnit =>
-        u.unit_id === "MID"
-          ? { ...u, lifecycle: "disarmed", inhibit: null }
-          : u,
+      units: latched.units.map((u): WireUnitSnapshot =>
+        u.unit_id === "MID" ? { ...u, lifecycle: "disarmed", inhibit: null } : u,
       ),
     };
     const client = makeClient();
     client.getSnapshot.mockResolvedValueOnce(latched).mockResolvedValue(cleared);
     client.openEvents.mockReturnValue(openStream(latchedEvents(latched)));
-    client.postInhibitAcknowledgement.mockResolvedValue({ acknowledged: true });
+    client.postInhibitAcknowledgement.mockResolvedValue({
+      unit_id: "MID",
+      status: "acknowledged",
+      latch_cleared: true,
+    });
     renderView(client);
 
     const mid = await screen.findByRole("group", { name: "MID" });
@@ -774,6 +698,8 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     expect(dialog).toHaveTextContent(/acknowledg/i);
     expect(dialog).toHaveTextContent(/separate/i);
     expect(dialog).toHaveTextContent(/arm/);
+    // the reason is the real latched cause in plain words
+    expect(dialog).toHaveTextContent(/identity mismatch/i);
 
     await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
     expect(client.postInhibitAcknowledgement).toHaveBeenCalledWith("MID");

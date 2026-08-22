@@ -64,6 +64,16 @@
  *     storage lengths 0, clean URL, token never echoed in the DOM.
  * (7) matchMedia is stubbed (jsdom lacks it); the reduced-motion test asserts
  *     the implementation actually queries prefers-reduced-motion.
+ * (8) The shell refetches the snapshot whenever a frame changes authority
+ *     (emergency_stop.latched, authorization.revoked, inhibit.acknowledged,
+ *     emergency_stop.acknowledged, unit.armed, unit.disarmed) because the
+ *     server sends its snapshot frame exactly once per connection and the bus
+ *     has no lifecycle event for active/inhibited/stopping. Fixtures model
+ *     that: `snapshots` lists the worlds successive reads return, so a
+ *     post-event read never silently resurrects the pre-event one. Arm/disarm
+ *     outcomes patch state only for rows the service accepted (`status`), and
+ *     only latched causes (`blocking_fault_active`, `identity_mismatch`) are
+ *     announced assertively as inhibit — routine revocations stay polite.
  *
  * TokenEntry, NavBanner, ConnectionIndicator, and EventStreamProvider are
  * internal to AppShell: this suite never imports them, so no stubs are created
@@ -237,6 +247,45 @@ function unreachableStream(): AsyncGenerator<StreamFrame, void, unknown> {
   })();
 }
 
+/**
+ * A channel that also records its own teardown and consumption, so a test can
+ * prove the shell closes the connection itself — at sign-out — instead of
+ * waiting for the next server frame to notice it should stop.
+ * `returnRequested` counts return() calls the consumer made on the iterator
+ * (observable immediately); `returns` counts the returns that actually settled.
+ */
+function instrumentedChannel(initial: StreamFrame[]): {
+  open(): AsyncIterable<StreamFrame>;
+  push(frame: StreamFrame): void;
+  fail(error: unknown): void;
+  state: { returnRequested: number; returns: number; frames: number };
+} {
+  const base = streamChannel(initial);
+  const state = { returnRequested: 0, returns: 0, frames: 0 };
+  const open = (): AsyncIterable<StreamFrame> => {
+    const inner = base.open()[Symbol.asyncIterator]();
+    const iterator = {
+      next: async (): Promise<IteratorResult<StreamFrame, void>> => {
+        const result = await inner.next();
+        if (!result.done) {
+          state.frames += 1;
+        }
+        return result;
+      },
+      return: async (): Promise<IteratorResult<StreamFrame, void>> => {
+        state.returnRequested += 1;
+        try {
+          return (await inner.return(undefined)) as IteratorResult<StreamFrame, void>;
+        } finally {
+          state.returns += 1;
+        }
+      },
+    };
+    return { [Symbol.asyncIterator]: () => iterator } as unknown as AsyncIterable<StreamFrame>;
+  };
+  return { open, push: base.push, fail: base.fail, state };
+}
+
 /** A network-level failure, exactly as the pinned client reports it. */
 function networkError(message: string): ApiClientError {
   return new ApiClientError({
@@ -261,6 +310,13 @@ function unauthorizedError(): ApiClientError {
 
 interface ShellSetup {
   snapshot?: FleetView;
+  /**
+   * The worlds successive snapshot reads return, in order (the last repeats).
+   * The shell refetches the snapshot whenever a frame changes authority — the
+   * service sends its snapshot frame once per connection — so a fixture whose
+   * later reads still return the pre-event world would be lying about the wire.
+   */
+  snapshots?: FleetView[];
   getSnapshot?: () => Promise<FleetView>;
   getHealth?: () => Promise<HealthView>;
   openEvents?: (afterSequence?: number) => AsyncIterable<StreamFrame>;
@@ -270,11 +326,21 @@ interface ShellSetup {
   ) => Promise<Record<string, unknown>>;
 }
 
-function installClient(setup: ShellSetup = {}): void {
-  const snapshot = setup.snapshot ?? fleet(allUnits("armed_idle"));
+function installClient(setup: ShellSetup = {}): { getSnapshot: ReturnType<typeof vi.fn> } {
+  const snapshot = setup.snapshot ?? setup.snapshots?.[0] ?? fleet(allUnits("armed_idle"));
   const channel = streamChannel([snapshotFrame(snapshot)]);
+  let served = 0;
+  const readSnapshot = (): Promise<FleetView> => {
+    if (setup.snapshots === undefined) {
+      return Promise.resolve(snapshot);
+    }
+    const worlds = setup.snapshots;
+    const offered = worlds[Math.min(served, worlds.length - 1)]!;
+    served += 1;
+    return Promise.resolve(offered);
+  };
   const client = {
-    getSnapshot: vi.fn(setup.getSnapshot ?? (() => Promise.resolve(snapshot))),
+    getSnapshot: vi.fn(setup.getSnapshot ?? readSnapshot),
     getHealth: vi.fn(setup.getHealth ?? (() => Promise.resolve(HEALTHY))),
     getAudit: vi.fn(() => Promise.resolve({ events: [], next_cursor: null })),
     postIntent: vi.fn(() => Promise.reject(new Error("not used by AppShell"))),
@@ -296,6 +362,7 @@ function installClient(setup: ShellSetup = {}): void {
     ),
   };
   createClientMock.mockReturnValue(client as unknown as ApiClient);
+  return { getSnapshot: client.getSnapshot };
 }
 
 let matchMediaStub: ReturnType<typeof vi.fn> | null = null;
@@ -795,6 +862,77 @@ describe("AppShell — connection facts", () => {
     );
   });
 
+  it("surfaces the stream's own error envelope instead of swallowing it behind the retry loop", async () => {
+    const snapshot = fleet(allUnits("disarmed"));
+    const channel = streamChannel([snapshotFrame(snapshot)]);
+    const streamFailure = new ApiClientError({
+      status: 1011,
+      code: "event_stream_error",
+      message: "The event stream failed",
+      details: null,
+      request_id: "req-shell-9",
+    });
+    let connections = 0;
+    const openEvents = vi.fn(() => {
+      connections += 1;
+      // The first connection is healthy; every retry fails with the same
+      // envelope the service sends in an `error` frame before closing.
+      if (connections === 1) {
+        return channel.open();
+      }
+      return (async function* failing(): AsyncGenerator<StreamFrame, void, unknown> {
+        throw streamFailure;
+      })();
+    });
+    installClient({ snapshot, openEvents });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    channel.fail(streamFailure);
+
+    // The envelope's code and message surface together, inside the one notice
+    // the operator reads about live updates — never scattered, never silent.
+    const notice = await screen.findByRole("region", { name: /live updates/i });
+    expect(within(notice).getByText(/event_stream_error/)).toBeVisible();
+    expect(within(notice).getByText(/The event stream failed/)).toBeVisible();
+  });
+
+  it("closes the authenticated event stream at sign-out instead of waiting for the next frame", async () => {
+    const snapshot = fleet(allUnits("armed_idle"));
+    const channel = instrumentedChannel([snapshotFrame(snapshot)]);
+    const openEvents = vi.fn(() => channel.open());
+    installClient({ snapshot, openEvents });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+    const consumed = channel.state.frames;
+    expect(consumed).toBeGreaterThan(0);
+    const connectionsAtSignOut = openEvents.mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: /sign out|lock\b/i }));
+    const openEventsAfterSignOut = openEvents.mock.calls.length - connectionsAtSignOut;
+
+    // The connection is returned now — the bus being quiet must not keep an
+    // authenticated socket open past sign-out.
+    await waitFor(() => {
+      expect(channel.state.returnRequested).toBeGreaterThan(0);
+    });
+    // A frame pushed afterwards may settle the one read already in flight,
+    // but nothing further is ever consumed from the retired connection.
+    channel.push({ type: "audit.appended", sequence: 98, payload: { event_type: "x" } });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+    const settled = channel.state.frames;
+    channel.push({ type: "audit.appended", sequence: 99, payload: { event_type: "y" } });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 30);
+    });
+    expect(channel.state.frames).toBe(settled);
+    expect(openEventsAfterSignOut).toBe(0);
+  });
+
   it("reports control not ready when the API says control is blocked, without optimism", async () => {
     const blocked: HealthView = {
       liveness: { ok: true },
@@ -856,9 +994,12 @@ describe("AppShell — connection facts", () => {
 
 describe("AppShell — announcements", () => {
   it("announces a fleet status change politely through the live region", async () => {
-    const snapshot = fleet(allUnits("disarmed"));
-    const channel = streamChannel([snapshotFrame(snapshot)]);
-    installClient({ snapshot, openEvents: () => channel.open() });
+    const before = fleet(allUnits("disarmed"));
+    // The service's picture once MID is armed: the shell refetches the
+    // snapshot on an authority change, so the next read carries the new world.
+    const after = fleet(allUnits("armed_idle"), 43);
+    const channel = streamChannel([snapshotFrame(before)]);
+    installClient({ snapshots: [before, after], openEvents: () => channel.open() });
     const user = userEvent.setup();
     render(<AppShell />);
     await unlockAndLand(user);
@@ -883,6 +1024,122 @@ describe("AppShell — announcements", () => {
     const announcements = screen.getByRole("status", { name: ANNOUNCEMENTS_NAME });
     expect(announcements.textContent ?? "").toMatch(/MID/);
     expect(announcements.textContent ?? "").toMatch(/\barmed\b/);
+  });
+
+  it("refetches the snapshot when a stop latches mid-session: the banner follows the fleet, not the connect-time picture", async () => {
+    const before = fleet(allUnits("armed_idle"));
+    // Wire truth after an emergency stop: the units are fenced into INHIBITED
+    // and the snapshot sequence has moved on. Without the refetch the banner
+    // would keep showing "Armed" for the rest of the session, because the
+    // server sends its snapshot frame exactly once per connection.
+    const after = fleet(allUnits("inhibited"), 46);
+    const channel = streamChannel([snapshotFrame(before)]);
+    const { getSnapshot } = installClient({
+      snapshots: [before, after],
+      openEvents: () => channel.open(),
+    });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+    expectVisibleText(banner(), "Armed");
+
+    channel.push({
+      type: "emergency_stop.latched",
+      sequence: 44,
+      occurred_at: "2026-08-22T10:00:15Z",
+      payload: {
+        principal: "operator-7",
+        stop_id: "stop-11",
+        unit_ids: ["MID", "RHS", "LHS"],
+        reason: "operator requested",
+      },
+    });
+
+    // The assertive announcement still fires...
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent ?? "").toMatch(/stop/i);
+    // ...and the picture itself moves: one refetch, then the real state.
+    await waitFor(() => {
+      expect(getSnapshot.mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+    await waitFor(() => {
+      expectVisibleText(banner(), "Inhibited");
+    });
+  });
+
+  it("never presents a unit the API refused to arm as armed", async () => {
+    const before = fleet([
+      unit({ unit_id: "MID", lifecycle: "disarmed" }),
+      unit({ unit_id: "RHS", lifecycle: "disarmed" }),
+    ]);
+    // The facade publishes refused rows in unit.armed; the world the next
+    // snapshot read returns still has RHS disarmed.
+    const after = fleet(
+      [
+        unit({ unit_id: "MID", lifecycle: "armed_idle" }),
+        unit({ unit_id: "RHS", lifecycle: "disarmed" }),
+      ],
+      43,
+    );
+    const channel = streamChannel([snapshotFrame(before)]);
+    installClient({ snapshots: [before, after], openEvents: () => channel.open() });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    channel.push({
+      type: "unit.armed",
+      sequence: 42,
+      occurred_at: "2026-08-22T10:00:05Z",
+      payload: {
+        principal: "operator-7",
+        units: [
+          { unit_id: "MID", status: "armed", reason: "armed" },
+          { unit_id: "RHS", status: "refused", reason: "not_qualified" },
+        ],
+      },
+    });
+
+    // MID's arming lands, RHS's refusal does not become an arming claim...
+    await waitFor(() => {
+      expect(banner().textContent ?? "").toMatch(/MID\s+—\s+Armed/);
+    });
+    expect(banner().textContent ?? "").toMatch(/RHS\s+—\s+Disarmed/);
+    expect(banner().textContent ?? "").not.toMatch(/RHS\s+—\s+Armed/);
+    // ...and the refusal itself is announced, politely and by reason.
+    const announcements = screen.getByRole("status", { name: ANNOUNCEMENTS_NAME });
+    await waitFor(() => {
+      expect(announcements.textContent ?? "").toMatch(/RHS/);
+    });
+    expect(announcements.textContent ?? "").toMatch(/not armed/);
+    expect(announcements.textContent ?? "").toMatch(/not_qualified/);
+  });
+
+  it("keeps routine authorization endings polite: only latched causes announce as inhibit", async () => {
+    const before = fleet(allUnits("active"));
+    const channel = streamChannel([snapshotFrame(before)]);
+    installClient({ snapshots: [before], openEvents: () => channel.open() });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    // Intent expiry revokes authority on the same event type a latched inhibit
+    // uses; the reason is the only discriminator the wire offers.
+    channel.push({
+      type: "authorization.revoked",
+      sequence: 42,
+      occurred_at: "2026-08-22T10:00:10Z",
+      payload: { reason: "no_active_intent", unit_ids: ["MID"] },
+    });
+
+    const announcements = screen.getByRole("status", { name: ANNOUNCEMENTS_NAME });
+    await waitFor(() => {
+      expect(announcements.textContent ?? "").toMatch(/no_active_intent/);
+    });
+    // A routine revocation is never an emergency: nothing is announced as a
+    // latch, so the assertive region keeps its meaning for real ones.
+    expect(announcements.textContent ?? "").not.toMatch(/inhibit|latch|held/i);
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
   });
 
   it("announces a latched inhibit assertively", async () => {
@@ -1093,9 +1350,10 @@ describe("AppShell — navigation", () => {
 
   it("honors reduced motion: status changes still land in the live region, keyboard flows unaffected", async () => {
     installMatchMedia(true);
-    const snapshot = fleet(allUnits("disarmed"));
-    const channel = streamChannel([snapshotFrame(snapshot)]);
-    installClient({ snapshot, openEvents: () => channel.open() });
+    const before = fleet(allUnits("disarmed"));
+    const after = fleet(allUnits("armed_idle"), 43);
+    const channel = streamChannel([snapshotFrame(before)]);
+    installClient({ snapshots: [before, after], openEvents: () => channel.open() });
     const user = userEvent.setup();
     render(<AppShell />);
 

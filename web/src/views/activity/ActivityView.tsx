@@ -6,14 +6,17 @@
 // pagination, plain language first with raw reason codes on demand, and
 // honest empty/loading/disconnected/stale/partial/error states.
 //
-// Shape notes (client.ts + docs/API_CONTRACTS.md):
-// - Pages are { events, next_cursor }; next_cursor null ends the timeline.
-// - Audit events carry lowercase wire enums (decision_status "authorized" /
-//   "clamped"); the console never capitalizes wire values in logic, only in
-//   human labels.
-// - Failures reject as ApiClientError carrying the error envelope verbatim
-//   (code, message, details, request_id) plus the HTTP status. Every rendered
-//   error envelope keeps all four verbatim so the operator can quote them.
+// WIRE TRUTH (service.py `recent_audit` over the audit read model — mirrored
+// in web/src/test/wire.ts `WireAuditEvent`): every entry carries the
+// `AuditEvent` fields plus the store's integer `sequence`. The kind key is
+// `event_type` (there is no `type` field), `principal` is the caller's
+// subject string (never an object with a display name), the outcome is
+// `result`, the watt figures are the signed `requested_active_w` /
+// `authorized_active_w`, and the reasons are `reason_codes`. The event types
+// the service writes today are control_decision, intent_accepted, unit_armed,
+// unit_disarmed, emergency_stop, stop_acknowledged, inhibit_acknowledged and
+// authorization_revoked; anything else is rendered defensively, never
+// crashed on, and never invented.
 
 import { Fragment } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -25,6 +28,11 @@ export type ActivityConnection = "connected" | "disconnected";
 
 export interface ActivityViewProps {
   client: ApiClient;
+  /**
+   * The shell's connection fact for the shared data plane, when the shell
+   * provides one. Defaults to "connected" so the view stands alone: the
+   * notice is additive and never replaces the REST data the view owns.
+   */
   connection?: ActivityConnection | undefined;
 }
 
@@ -56,30 +64,49 @@ const KIND_CHIPS: readonly { readonly id: KindKey; readonly label: string }[] =
     { id: "acknowledgements", label: "Acknowledgements" },
   ];
 
-/** The five contracted kinds. Arm and disarm are one kind (Arming); every
- * *_acknowledgement is an Acknowledgement, never a Stop. */
-function kindOf(type: string): KindKey | "other" {
-  if (type.endsWith("_acknowledgement")) {
+/** The `event_type` values the audit trail holds (wire.ts AUDIT_EVENT_TYPES). */
+const AUDIT_TYPE_DECISIONS: readonly string[] = ["control_decision", "intent_accepted"];
+const AUDIT_TYPE_ARMING: readonly string[] = ["unit_armed", "unit_disarmed"];
+const AUDIT_TYPE_STOPS: readonly string[] = ["emergency_stop", "authorization_revoked"];
+const AUDIT_TYPE_ACKNOWLEDGEMENTS: readonly string[] = [
+  "stop_acknowledged",
+  "inhibit_acknowledged",
+];
+
+/**
+ * The five contracted kinds. The audit trail holds no observation entries
+ * today (observations are published on the event bus, never audited), so the
+ * Observations chip selects an empty set until the service audits them; arm
+ * and disarm are one kind (Arming) and every acknowledgement is an
+ * Acknowledgement, never a Stop.
+ */
+function kindOf(eventType: string): KindKey | "other" {
+  if (eventType.startsWith("observation")) {
+    return "observations";
+  }
+  if (AUDIT_TYPE_DECISIONS.includes(eventType)) {
+    return "decisions";
+  }
+  if (AUDIT_TYPE_ARMING.includes(eventType)) {
+    return "arming";
+  }
+  if (AUDIT_TYPE_STOPS.includes(eventType)) {
+    return "stops";
+  }
+  if (AUDIT_TYPE_ACKNOWLEDGEMENTS.includes(eventType)) {
     return "acknowledgements";
   }
-  switch (type) {
-    case "observation":
-      return "observations";
-    case "decision":
-      return "decisions";
-    case "arm":
-    case "disarm":
-      return "arming";
-    case "stop":
-      return "stops";
-    default:
-      return "other";
-  }
+  return "other";
 }
+
+// ---------------------------------------------------------------------------
+// Defensive field access: the wire shape is read at one boundary, a missing
+// field is named as missing, and nothing is ever invented.
+// ---------------------------------------------------------------------------
 
 function stringField(event: AuditEvent, key: string): string | undefined {
   const value = event[key];
-  return typeof value === "string" ? value : undefined;
+  return typeof value === "string" && value !== "" ? value : undefined;
 }
 
 function numberField(event: AuditEvent, key: string): number | undefined {
@@ -87,7 +114,17 @@ function numberField(event: AuditEvent, key: string): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-/** A raw wire code as calm words: SITE_EXPORT_LIMIT -> "Site export limit". */
+/** The kind key on the audit wire is `event_type`; a legacy `type` field is
+ * tolerated defensively, and an entry without either still renders. */
+function eventTypeOf(event: AuditEvent): string {
+  return stringField(event, "event_type") ?? stringField(event, "type") ?? "";
+}
+
+function sequenceOf(event: AuditEvent, fallback: number): number {
+  return numberField(event, "sequence") ?? fallback;
+}
+
+/** A raw wire code as calm words: telemetry_stale -> "Telemetry stale". */
 function humanize(code: string): string {
   const words = code.toLowerCase().split(/[_\s]+/).filter((word) => word !== "");
   if (words.length === 0) {
@@ -133,7 +170,9 @@ function isStale(occurredAt: string | undefined, now: number): boolean {
 
 /** The timeline is newest-first: highest sequence on top, stably. */
 function newestFirst(events: AuditEvent[]): AuditEvent[] {
-  return [...events].sort((a, b) => b.sequence - a.sequence);
+  return [...events].sort(
+    (a, b) => sequenceOf(b, 0) - sequenceOf(a, 0),
+  );
 }
 
 /** Older pages append below without duplicating an already-loaded sequence. */
@@ -141,18 +180,9 @@ function mergeBySequence(
   existing: AuditEvent[],
   incoming: AuditEvent[],
 ): AuditEvent[] {
-  const seen = new Set(existing.map((event) => event.sequence));
-  const fresh = incoming.filter((event) => !seen.has(event.sequence));
+  const seen = new Set(existing.map((event) => sequenceOf(event, 0)));
+  const fresh = incoming.filter((event) => !seen.has(sequenceOf(event, 0)));
   return newestFirst([...existing, ...fresh]);
-}
-
-function principalName(event: AuditEvent): string | null {
-  const principal = event.principal;
-  if (principal === null || typeof principal !== "object" || Array.isArray(principal)) {
-    return null;
-  }
-  const displayName = (principal as Record<string, unknown>)["display_name"];
-  return typeof displayName === "string" && displayName !== "" ? displayName : null;
 }
 
 function reasonCodesOf(event: AuditEvent): string[] {
@@ -165,79 +195,110 @@ function reasonCodesOf(event: AuditEvent): string[] {
   );
 }
 
-function headlineFor(type: string): string {
-  switch (type) {
-    case "decision":
-      return "Power request";
+/** `principal` is the caller's subject string; it is shown verbatim. */
+function principalName(event: AuditEvent): string | null {
+  const principal = stringField(event, "principal");
+  return principal ?? null;
+}
+
+function headlineFor(eventType: string): string {
+  switch (eventType) {
+    case "control_decision":
+      return "Power decision";
+    case "intent_accepted":
+      return "Dispatch request accepted";
     case "observation":
       return "Observation";
-    case "arm":
+    case "unit_armed":
       return "Arm request";
-    case "disarm":
+    case "unit_disarmed":
       return "Disarm request";
-    case "stop":
+    case "emergency_stop":
       return "Emergency stop";
+    case "stop_acknowledged":
+      return "Stop acknowledgement";
+    case "inhibit_acknowledged":
+      return "Inhibit acknowledgement";
+    case "authorization_revoked":
+      return "Authorization revoked";
     default:
-      return kindOf(type) === "acknowledgements"
-        ? "Acknowledgement"
-        : humanize(type);
+      return eventType === "" ? "Unknown event" : humanize(eventType);
   }
 }
 
-/** Was the control action allowed through (or reduced), not refused? */
-function statusAllows(event: AuditEvent): boolean {
-  const status = stringField(event, "decision_status");
-  return status === undefined || status === "authorized" || status === "clamped";
-}
-
-/** What was decided, mapped from decision status and the watt figures. */
+/** What was decided, from the decision status (`result`) and the signed watt
+ * figures the audit record carries. Charge figures are negative on the wire;
+ * the household sees magnitudes with the direction named in words. */
 function decidedLine(event: AuditEvent): string | null {
-  const status = stringField(event, "decision_status");
-  if (status === undefined) {
+  const eventType = eventTypeOf(event);
+  const result = stringField(event, "result");
+  if (result === undefined) {
     return null;
   }
-  if (event.type === "decision") {
-    const requested = numberField(event, "requested_watts");
-    const authorized = numberField(event, "authorized_watts");
+  if (eventType === "control_decision" && (result === "clamped" || result === "authorized")) {
+    const requested = numberField(event, "requested_active_w");
+    const authorized = numberField(event, "authorized_active_w");
     if (requested !== undefined && authorized !== undefined) {
-      return status === "clamped"
-        ? `Reduced to ${authorized} W of the ${requested} W requested`
-        : `Allowed ${authorized} W of the ${requested} W requested`;
+      return result === "clamped"
+        ? `Reduced to ${Math.abs(authorized)} W of the ${Math.abs(requested)} W requested`
+        : `Allowed ${Math.abs(authorized)} W of the ${Math.abs(requested)} W requested`;
     }
   }
-  if (status === "authorized" || status === "clamped") {
-    return "Allowed as requested";
+  switch (result) {
+    case "authorized":
+    case "clamped":
+      return "Allowed as requested";
+    case "rejected":
+    case "refused":
+      return "Not allowed";
+    case "accepted":
+      return "Request accepted";
+    case "armed":
+      return "Arm allowed";
+    case "disarmed":
+      return "Disarm allowed";
+    case "latched":
+      return "Stop accepted";
+    case "acknowledged":
+      return "Acknowledgement accepted";
+    default:
+      return humanize(result);
   }
-  return humanize(status);
 }
 
-/** What happened. A missing result is named as missing, never invented. */
+/** What happened. The audit record's own `result`, in words — a missing
+ * result is named as missing, never a fabricated measurement. */
 function happenedLine(event: AuditEvent): string | null {
-  const type = event.type;
-  if (type === "decision") {
-    const measured = numberField(event, "measured_watts");
-    return measured !== undefined ? `Delivering ${measured} W` : "Result not recorded yet";
-  }
-  if (stringField(event, "decision_status") === undefined) {
-    return null;
-  }
-  if (!statusAllows(event)) {
+  const eventType = eventTypeOf(event);
+  const result = stringField(event, "result");
+  if (result === undefined) {
     return "Result not recorded yet";
   }
-  if (type === "arm") {
-    return "Armed";
+  switch (result) {
+    case "authorized":
+      return eventType === "control_decision" ? "Power allowed" : "Allowed";
+    case "clamped":
+      return "Power reduced by the safety system";
+    case "rejected":
+    case "refused":
+      return "Refused — nothing was authorized";
+    case "accepted":
+      return "Accepted";
+    case "armed":
+      return "Armed";
+    case "disarmed":
+      return "Disarmed";
+    case "latched": {
+      const stopId = stringField(event, "intent_id");
+      return stopId === undefined ? "Stop latched" : `Stop latched (${stopId})`;
+    }
+    case "acknowledged":
+      return kindOf(eventType) === "acknowledgements" ? "Acknowledged" : humanize(result);
+    case "revoked":
+      return "Authorization revoked";
+    default:
+      return humanize(result);
   }
-  if (type === "disarm") {
-    return "Disarmed";
-  }
-  if (type === "stop") {
-    const stopId = stringField(event, "stop_id");
-    return stopId === undefined ? "Stop latched" : `Stop latched (${stopId})`;
-  }
-  if (kindOf(type) === "acknowledgements") {
-    return "Acknowledged";
-  }
-  return "Result not recorded yet";
 }
 
 function whyLine(codes: string[]): string | null {
@@ -406,7 +467,7 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
     () =>
       events.filter(
         (event) =>
-          (kindFilter === null || kindOf(event.type) === kindFilter) &&
+          (kindFilter === null || kindOf(eventTypeOf(event)) === kindFilter) &&
           (unitFilter === null || stringField(event, "unit_id") === unitFilter),
       ),
     [events, kindFilter, unitFilter],
@@ -497,7 +558,11 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
               }
             >
               {visibleEvents.map((event) => (
-                <ActivityEntry key={event.sequence} event={event} now={now} />
+                <ActivityEntry
+                  key={sequenceOf(event, 0)}
+                  event={event}
+                  now={now}
+                />
               ))}
             </ol>
           )}
@@ -657,6 +722,7 @@ function ActivityError({
  * and why — plain language first, raw codes behind a disclosure. */
 function ActivityEntry({ event, now }: { event: AuditEvent; now: number }) {
   const [detailOpen, setDetailOpen] = useState(false);
+  const eventType = eventTypeOf(event);
   const unitId = stringField(event, "unit_id");
   const occurredAt = stringField(event, "occurred_at");
   const age = ageText(occurredAt, now);
@@ -666,7 +732,7 @@ function ActivityEntry({ event, now }: { event: AuditEvent; now: number }) {
   const happened = happenedLine(event);
   const codes = reasonCodesOf(event);
   const why = whyLine(codes);
-  const detailId = `activity-detail-${event.sequence}`;
+  const detailId = `activity-detail-${sequenceOf(event, 0)}`;
 
   return (
     <li
@@ -675,7 +741,7 @@ function ActivityEntry({ event, now }: { event: AuditEvent; now: number }) {
       }
     >
       <p className="activity-entry__head">
-        <span className="activity-entry__kind">{headlineFor(event.type)}</span>
+        <span className="activity-entry__kind">{headlineFor(eventType)}</span>
         {unitId !== undefined && (
           <span className="activity-entry__unit">{unitId}</span>
         )}

@@ -96,6 +96,10 @@ export function AppShell({ views = {} }: AppShellProps): ReactElement {
 
   const client = session.client;
   const disconnected = data.streamStatus === "down";
+  // The disconnected notice also covers a reconnect attempt that is failing
+  // with an envelope the operator deserves to see — the stream's own error
+  // frames surface here instead of being swallowed by the retry loop.
+  const showStreamNotice = disconnected || data.streamError !== null;
   const currentView = VIEWS.find((entry) => entry.id === view) ?? VIEWS[0]!;
   const CurrentComponent = views[currentView.id];
 
@@ -165,7 +169,13 @@ export function AppShell({ views = {} }: AppShellProps): ReactElement {
         </p>
       ))}
 
-      {disconnected && <DisconnectedNotice />}
+      {showStreamNotice && (
+        <DisconnectedNotice
+          error={data.streamError}
+          exhausted={data.streamExhausted}
+          onRetry={data.retryStream}
+        />
+      )}
 
       <main aria-labelledby="current-view-heading" className={disconnected ? "dimmed" : ""}>
         <h1 id="current-view-heading" tabIndex={-1} ref={headingRef}>
