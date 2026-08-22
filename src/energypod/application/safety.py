@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -88,6 +89,19 @@ class SafetyKernel:
                 continue
             unit_reasons = self._deny_reasons(proposal, observation, previous, policy, now_mono)
             reasons.update(unit_reasons)
+            if getattr(proposal, "export_bounded", False):
+                # API_CONTRACTS "Excess-solar accelerated charging
+                # (advisory)": defense in depth behind the allocator's export
+                # bound.  A NON-ZERO export-bounded proposal re-derives the
+                # fleet grid evidence here, over the observations the kernel
+                # already holds, so a proposal that outran its evidence is
+                # refused even if some other path minted it.  Zero-watt
+                # proposals never reach this line (they are explicit
+                # non-participation above), keeping the all-zero/partial
+                # -eligibility doctrine of 6abd869/d2163a5 intact.
+                reasons.update(
+                    self._export_evidence_reasons(current_observations, policy, now_mono)
+                )
             if observation is not None and not unit_reasons:
                 limits[proposal.unit_id] = self._unit_limit(proposal, observation, policy)
                 expiries[proposal.unit_id] = min(
@@ -311,6 +325,46 @@ class SafetyKernel:
             reasons.add("blocking_fault")
         if observation.active_warnings & policy.blocking_warning_codes:
             reasons.add("blocking_warning")
+        return reasons
+
+    def _export_evidence_reasons(
+        self, current_observations: dict[str, Any], policy: Any, now_mono: float
+    ) -> set[str]:
+        """Fleet-wide grid-evidence denial for an export-bounded proposal.
+
+        The export bound is computed from EVERY fleet unit's per-pod CT power
+        (net across phases), so its evidence check is fleet-wide too: one
+        unreadable phase is never treated as zero export.  Missing, bad and
+        stale mirror the kernel's existing spelling — a unit with no
+        observation, a ``None``/non-finite ``grid_power_w``, or a quality map
+        without the key is ``export_evidence_missing``; a present-but-not-GOOD
+        quality is ``export_evidence_bad``; evidence older than the armed
+        ``export_telemetry_max_age_s`` is ``export_evidence_stale``.  An
+        unarmed policy triple carries no bound to violate and yields nothing
+        (the allocator never flags a proposal against one).
+        """
+        if policy.export_telemetry_max_age_s is None:
+            return set()
+        reasons: set[str] = set()
+        for unit_id in policy.expected_cell_count_by_unit:
+            observation = current_observations.get(unit_id)
+            if observation is None:
+                reasons.add("export_evidence_missing")
+                continue
+            grid = getattr(observation, "grid_power_w", None)
+            quality = getattr(observation, "quality", None)
+            flag = quality.get("grid_power_w") if isinstance(quality, Mapping) else None
+            if grid is None or not self._finite(grid) or flag is None:
+                reasons.add("export_evidence_missing")
+                continue
+            if flag is not DataQuality.GOOD:
+                reasons.add("export_evidence_bad")
+                continue
+            captured = getattr(observation, "captured_at_mono", None)
+            if self._finite(captured) and now_mono - float(cast(int | float, captured)) > (
+                policy.export_telemetry_max_age_s
+            ):
+                reasons.add("export_evidence_stale")
         return reasons
 
     @staticmethod
