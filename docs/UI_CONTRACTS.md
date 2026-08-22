@@ -21,12 +21,23 @@ tariff/provider views.
 
 ## Data sources
 
-- REST `/api/v1`: `snapshot`, `health`, `audit`, `intents` (dispatch),
-  `arm`, `emergency-stop` (+ acknowledgement), `units/{id}/inhibit/acknowledge`.
+- REST `/api/v1`: `snapshot`, `health`, `audit` (with `after_sequence` cursor),
+  `intents` (dispatch), `arm`, `disarm`, `emergency-stop` (+ acknowledgement),
+  `units/{id}/inhibit/acknowledge`, `events/session` (browser WS ticket).
+- Every mutation carries an `Idempotency-Key` header: the client generates one
+  per call unless the caller supplies a key to reuse for retries of the same
+  operator action.
 - WebSocket `/api/v1/events`: authoritative snapshot envelope first, then
   ordered events; `resync_required` (any reason) triggers a snapshot refetch
   and reconnect; connection loss shows the disconnected state and retries with
-  the last sequence as the cursor when reconnecting.
+  the last sequence as the cursor when reconnecting. Browsers authenticate the
+  handshake with a single-use ticket via `Sec-WebSocket-Protocol:
+  energypod-events, <ticket>` obtained from `events/session` (API_CONTRACTS);
+  the token never appears in a URL.
+- Wire casing: the service serializes enums as lowercase StrEnum values
+  (`"disarmed"`, `"armed_idle"`, `"active"`, `"inhibited"`, `"charge"`,
+  `"discharge"`, `"idle"`, `"good"` ...). All fixtures and comparisons use the
+  lowercase wire values.
 - The console is a client of the guarded API only. It never imports anything
   from the controller, never derives safety decisions, and never talks to a
   gateway.

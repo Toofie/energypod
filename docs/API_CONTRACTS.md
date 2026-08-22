@@ -142,6 +142,19 @@ priority are rejected. Evaluation returns a short-lived schedule intent, never a
   hold that scope). It submits ordinary bounded, expiring intents and cannot arm, acknowledge stops
   or inhibits, change policy, or use debug/maintenance modes. Its audit view requires both
   `observe` and `audit:read`, matching the REST boundary.
+- `GET /api/v1/audit` accepts `after_sequence` (integer >= 0, default absent) passed through
+  to the facade as the oldest-delivered cursor; pagination continues until `next_cursor` is
+  null. `POST /api/v1/disarm` mirrors arm with the `arm` scope but does not require an
+  interactive principal (disarming is safety-positive); body `{unit_ids}`, per-unit outcomes.
+- Browser event-stream handshake: browsers cannot set an Authorization header on a WebSocket.
+  `POST /api/v1/events/session` (Bearer, `observe` scope) returns `{ticket, expires_in_s}` —
+  a single-use opaque ticket with a short TTL (<= 30 s) bound to that principal and to the
+  events stream only. The WebSocket handshake must offer
+  `Sec-WebSocket-Protocol: energypod-events, <ticket>`; the server validates and consumes the
+  ticket at handshake, accepts the `energypod-events` subprotocol, and proceeds with that
+  principal's `observe` scope. A consumed, expired, or absent ticket refuses the handshake.
+  Query-string credentials remain prohibited in all cases; non-browser clients may keep using
+  the Authorization header.
 - Both adapters depend on one `EnergyService` application facade and never import Modbus classes.
 - Errors are `{code, message, details, request_id}`; decisions expose requested, authorized and
   measured power separately.
