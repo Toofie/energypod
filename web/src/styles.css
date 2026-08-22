@@ -15,6 +15,8 @@
   --focus: #2b5bd7;
   --yes: #1d7a3e;
   --no: #a33327;
+  --warn: #8a5a00;
+  --warn-surface: #fdf6e9;
   --armed: #8a6d1a;
   --active: #1d5fa0;
   --inhibited: #7a2d5e;
@@ -186,6 +188,70 @@ button:disabled {
 
 .connection .fact.no strong {
   color: var(--no);
+}
+
+/* --- the one-glance live-data badge -------------------------------------- */
+
+.connection-badge {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.connection-badge-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--ink-soft);
+  flex: none;
+}
+
+.connection-badge--live {
+  color: var(--yes);
+}
+
+.connection-badge--live .connection-badge-dot {
+  background: var(--yes);
+}
+
+.connection-badge--stale {
+  color: var(--warn);
+}
+
+.connection-badge--stale .connection-badge-dot {
+  background: var(--warn);
+}
+
+.connection-badge--reconnecting {
+  color: var(--ink-soft);
+}
+
+.connection-badge--reconnecting .connection-badge-dot {
+  background: var(--ink-soft);
+}
+
+.connection-badge--offline {
+  color: var(--no);
+}
+
+.connection-badge--offline .connection-badge-dot {
+  background: var(--no);
+}
+
+/* The calm, non-blocking trace of a connection that had to resume (a
+ * controller restart): informational, never an alarm. */
+.restart-notice {
+  margin: 0.75rem 0;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--active);
+  border-radius: 0 10px 10px 0;
+  background: var(--card);
+  padding: 0.5rem 0.9rem;
+  font-size: 0.9rem;
+  color: var(--ink);
 }
 
 .header-actions {

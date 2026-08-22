@@ -68,7 +68,7 @@
  * with no partial data; a unit status change arriving over the socket is
  * announced through a live region.
  */
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
@@ -1193,4 +1193,35 @@ describe("HomeView — live observations and staleness", () => {
     );
     expectVisibleText(entry, "Active");
   });
+
+  it("recomputes the displayed age the moment a throttled tab becomes visible", async () => {
+    // Only the clocks are faked; the 1 s age interval stays real, standing in
+    // for a browser-throttled background tab whose ticks barely run.
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["Date", "performance"],
+    });
+    const snapshot = fleet([unit({ unit_id: "pod-mid", telemetry_age_s: 20 })]);
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    installClient({ snapshot, openEvents: vi.fn(channel.openEvents) });
+    renderHome();
+
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    expectVisibleText(entry, /20 s/);
+
+    // Half a minute passes with the tab hidden: the throttled interval has
+    // not fired, so the number on screen is still the stale "20 s".
+    act(() => {
+      vi.advanceTimersByTime(30_000);
+    });
+    expectVisibleText(entry, /20 s/);
+
+    // Coming back to the tab recomputes the age from the clock BEFORE the
+    // operator can read the frozen number — no interval tick required.
+    act(() => {
+      fireEvent(document, new Event("visibilitychange"));
+    });
+    expectVisibleText(entry, /Data age: 5[0-2] s/);
+  });
 });
+

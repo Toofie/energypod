@@ -23,6 +23,16 @@
  * - A 401 anywhere is the single "session over" signal: it bubbles to the
  *   shell through `onUnauthorized` with the exact error envelope.
  *
+ * Self-diagnosis (the 2026-08 background-tab and restart incidents): the shell
+ * tracks when the last frame of any kind arrived, so a connection that claims
+ * live but has gone quiet is reported STALE (see STALE_AFTER_MS) instead of
+ * masquerading as current; a backgrounded tab whose timers the browser
+ * throttled re-checks the stream the moment it becomes visible or focused
+ * again (re-subscribing with the last sequence as the resume cursor when the
+ * data is quiet or the connection is down); and a reconnection that had to
+ * resume surfaces as a calm controller-restart notice, because the operator
+ * could not otherwise tell a deploy restart from a stall.
+ *
  * All reads go through the SharedDataPlane so mounted views share them.
  */
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
@@ -32,6 +42,28 @@ import { isRecord, normalizeSnapshot, type FleetSnapshot, type Lifecycle } from 
 import type { RealStream, SharedDataPlane } from "./SharedDataPlane";
 
 export type StreamStatus = "connecting" | "live" | "down";
+
+/**
+ * The one-glance connection health the shell badge shows. LIVE: connected and
+ * frames flowing. STALE: the connection claims live but no frame has arrived
+ * for the staleness bound (the frozen-tab signature). RECONNECTING: the
+ * connection dropped and is retrying with backoff. OFFLINE: the service
+ * itself cannot be reached.
+ */
+export type ConnectionHealth = "live" | "stale" | "reconnecting" | "offline";
+
+/**
+ * No event frame for this long while the connection claims live means the
+ * data on screen may no longer be current. The healthy cadence is one
+ * observation per ~1.5-2 s per pod, so 10 s is ~5 missed cycles — far past a
+ * slow frame, well before an operator would misread a climbing age as a
+ * healthy sawtooth.
+ */
+export const STALE_AFTER_MS = 10_000;
+
+/** The calm notice a resume-reconnect surfaces (a controller restart). */
+export const CONTROLLER_RESTART_NOTICE =
+  "Connection restored after controller restart — the fleet picture is current again.";
 
 export interface RefusalEnvelope {
   code: string;
@@ -49,6 +81,15 @@ export interface ConsoleData {
   streamError: RefusalEnvelope | null;
   /** True once the automatic reconnect budget is spent; a manual retry remains. */
   streamExhausted: boolean;
+  /** The one-glance connection health (see ConnectionHealth). */
+  connection: ConnectionHealth;
+  /** Seconds since the last event frame landed; null before the first one. */
+  secondsSinceUpdate: number | null;
+  /**
+   * A calm, non-blocking notice that the connection had to resume — the
+   * operator-visible trace of a controller restart. Cleared by the next loss.
+   */
+  restartNotice: string | null;
   polite: string[];
   assertive: string[];
 }
@@ -61,6 +102,8 @@ interface State {
   streamStatus: StreamStatus;
   streamError: RefusalEnvelope | null;
   streamExhausted: boolean;
+  lastEventAtMs: number | null;
+  restartNotice: string | null;
   polite: string[];
   assertive: string[];
 }
@@ -78,6 +121,9 @@ type Action =
   | { type: "stream"; status: StreamStatus }
   | { type: "stream-error"; refusal: RefusalEnvelope }
   | { type: "stream-exhausted" }
+  | { type: "frame-received"; at: number }
+  | { type: "restart-notice" }
+  | { type: "clear-restart-notice" }
   | { type: "polite"; text: string }
   | { type: "assertive"; text: string };
 
@@ -89,9 +135,40 @@ const INITIAL: State = {
   streamStatus: "connecting",
   streamError: null,
   streamExhausted: false,
+  lastEventAtMs: null,
+  restartNotice: null,
   polite: [],
   assertive: [],
 };
+
+/**
+ * Derive the one-glance health from the stream facts. Priority: a stream that
+ * is not live is reconnecting, or offline when the service itself cannot be
+ * reached — the health poll failing is direct evidence, and a network-level
+ * stream failure counts only while the health poll has not just answered OK
+ * (a dropped socket with a healthy REST probe is a lost connection, not an
+ * unreachable service); a live stream is stale once its last frame is older
+ * than the bound; otherwise live.
+ */
+export function connectionHealth(
+  state: Pick<
+    State,
+    "streamStatus" | "apiReachable" | "streamError" | "lastEventAtMs"
+  >,
+  nowMs: number,
+  staleAfterMs: number = STALE_AFTER_MS,
+): ConnectionHealth {
+  if (state.streamStatus !== "live") {
+    const networkLevelFailure = state.streamError?.code === "network_error";
+    const unreachable =
+      state.apiReachable === false || (networkLevelFailure && state.apiReachable !== true);
+    return unreachable ? "offline" : "reconnecting";
+  }
+  if (state.lastEventAtMs !== null && nowMs - state.lastEventAtMs > staleAfterMs) {
+    return "stale";
+  }
+  return "live";
+}
 
 function patchUnits(
   state: State,
@@ -173,6 +250,14 @@ function reducer(state: State, action: Action): State {
       return { ...state, streamError: action.refusal };
     case "stream-exhausted":
       return { ...state, streamStatus: "down", streamExhausted: true };
+    case "frame-received":
+      // Every frame of any kind is liveness evidence: the staleness clock
+      // restarts here, not at the last snapshot.
+      return { ...state, lastEventAtMs: action.at };
+    case "restart-notice":
+      return { ...state, restartNotice: CONTROLLER_RESTART_NOTICE };
+    case "clear-restart-notice":
+      return state.restartNotice === null ? state : { ...state, restartNotice: null };
     case "polite":
       return { ...state, polite: [...state.polite, action.text].slice(-5) };
     case "assertive":
@@ -361,6 +446,12 @@ function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void)
 }
 
 const HEALTH_POLL_MS = 15000;
+/** How often the staleness clock re-renders: the badge's "last update N s ago"
+ * must move once a second while it is showing, and never at all while live. */
+const HEALTH_TICK_MS = 1000;
+/** Two foreground signals firing back-to-back (switching to the tab fires
+ * both visibilitychange and focus) count as one re-check. */
+const RESYNC_DEBOUNCE_MS = 1000;
 /** A discontinuity does not tear the current world off the screen mid-glance:
  * the pre-discontinuity picture renders, then the refetch runs. */
 const RESYNC_REFETCH_DELAY_MS = 60;
@@ -386,6 +477,8 @@ export function nextStreamRetryDelayMs(attemptsMade: number): number | null {
 export interface ConsoleDataOptions {
   /** Reconnect waits, in attempt order; the last entry is the final attempt. */
   retryDelaysMs?: readonly number[];
+  /** How long without a frame a "live" connection may go before it is stale. */
+  staleAfterMs?: number;
 }
 
 export function useConsoleData(
@@ -394,8 +487,10 @@ export function useConsoleData(
   options: ConsoleDataOptions = {},
 ): ConsoleData & { retrySnapshot: () => void; retryStream: () => void } {
   const retryDelays = options.retryDelaysMs ?? STREAM_RETRY_DELAYS_MS;
+  const staleAfterMs = options.staleAfterMs ?? STALE_AFTER_MS;
   const [state, dispatch] = useReducer(reducer, INITIAL);
   const [streamEpoch, setStreamEpoch] = useState(0);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const onUnauthorizedRef = useRef(onUnauthorized);
   onUnauthorizedRef.current = onUnauthorized;
   const stateRef = useRef(state);
@@ -436,6 +531,64 @@ export function useConsoleData(
   const retryStream = useCallback((): void => {
     setStreamEpoch((value) => value + 1);
   }, []);
+
+  // --- the self-diagnosis clock ------------------------------------------------
+  //
+  // The staleness derivation needs a once-per-second render while it is
+  // showing ("last update N s ago"); while the connection is live and frames
+  // flow, the derived health does not change and no extra render is needed —
+  // the interval's state write only has to exist, and every frame already
+  // re-renders through the reducer.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setNowMs(Date.now());
+    }, HEALTH_TICK_MS);
+    return () => {
+      clearInterval(timer);
+    };
+  }, []);
+
+  /**
+   * Background-tab recovery: a browser throttles a hidden tab's timers to
+   * ~once a minute, so a dropped stream can sit unnoticed and the last painted
+   * age can freeze on screen for as long as the tab stays hidden. The moment
+   * the tab becomes visible or focused again the stream is re-checked NOW: a
+   * re-render re-derives every age from the current clock, and when the data
+   * is quiet or the connection is down the stream is re-subscribed
+   * immediately (the last seen sequence as the resume cursor) instead of
+   * waiting out the remaining backoff.
+   */
+  useEffect(() => {
+    let lastResyncAt = 0;
+    const recheck = (): void => {
+      // Always force a fresh render first: the operator's first glance must
+      // carry the true age, never the number the throttled tab last painted.
+      setNowMs(Date.now());
+      const current = stateRef.current;
+      const quiet =
+        current.lastEventAtMs === null || Date.now() - current.lastEventAtMs > staleAfterMs;
+      if (current.streamStatus === "live" && !quiet) {
+        return;
+      }
+      const now = Date.now();
+      if (now - lastResyncAt < RESYNC_DEBOUNCE_MS) {
+        return;
+      }
+      lastResyncAt = now;
+      setStreamEpoch((value) => value + 1);
+    };
+    const onVisibility = (): void => {
+      if (document.visibilityState === "visible") {
+        recheck();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", recheck);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", recheck);
+    };
+  }, [staleAfterMs]);
 
   // --- snapshot + health: shared reads through the plane ---------------------
   useEffect(() => {
@@ -552,6 +705,9 @@ export function useConsoleData(
 
     const announceLoss = (): void => {
       dispatch({ type: "stream", status: "down" });
+      // A new loss supersedes any earlier restore notice: the restart message
+      // must never linger beside a connection that is down again.
+      dispatch({ type: "clear-restart-notice" });
       plane.streamLost();
       // "Active" is a snapshot claim that can lag the wire, so a unit with a
       // live non-idle request counts as under control too: losing the stream
@@ -580,6 +736,12 @@ export function useConsoleData(
         dispatch({ type: "stream", status: "connecting" });
         let resync: { cursor: number | null } | null = null;
         let received = false;
+        // A connection opened with a cursor is a resume after this session had
+        // already consumed frames — the operator-visible trace of the stream
+        // having been away (a controller restart swaps the process and the
+        // socket with it). Its first delivered frame surfaces the calm notice.
+        const resumed = cursor !== undefined;
+        let noticedRestore = false;
         active = plane.openRealStream(cursor);
         try {
           for await (const frame of active.frames) {
@@ -587,6 +749,13 @@ export function useConsoleData(
               return;
             }
             received = true;
+            if (!noticedRestore) {
+              noticedRestore = true;
+              if (resumed) {
+                dispatch({ type: "restart-notice" });
+              }
+            }
+            dispatch({ type: "frame-received", at: Date.now() });
             if (frame.type === "resync_required") {
               resync = {
                 cursor: typeof frame.snapshot_sequence === "number" ? frame.snapshot_sequence : null,
@@ -683,5 +852,10 @@ export function useConsoleData(
     };
   }, [plane, streamEpoch, dropSession]);
 
-  return { ...state, retrySnapshot, retryStream };
+  const connection = connectionHealth(state, nowMs, staleAfterMs);
+  const secondsSinceUpdate =
+    state.lastEventAtMs === null
+      ? null
+      : Math.max(0, Math.round((nowMs - state.lastEventAtMs) / 1000));
+  return { ...state, connection, secondsSinceUpdate, retrySnapshot, retryStream };
 }

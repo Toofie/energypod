@@ -1,16 +1,23 @@
 /**
  * The operator-console app shell (UI_CONTRACTS.md "Authentication model" and
  * "Global shell behavior"): the token gate, the always-visible fleet banner,
- * the four-fact connection indicator, ARIA live regions, honest navigation,
- * the emergency-stop control, and view switching by state — no router
- * library, the shell drives views itself.
+ * the one-glance live-data badge, the four-fact connection indicator, ARIA
+ * live regions, the controller-restart notice, honest navigation, the
+ * emergency-stop control, and view switching by state — no router library,
+ * the shell drives views itself.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import { createApiClient } from "../api/client";
 import type { ApiClient, ApiClientError } from "../api/client";
 import { SharedDataPlane, sharedClient } from "./SharedDataPlane";
-import { ConnectionFacts, DisconnectedNotice, FleetBanner } from "./ShellChrome";
+import {
+  ConnectionFacts,
+  ConnectionStatusBadge,
+  DisconnectedNotice,
+  FleetBanner,
+  RestartNotice,
+} from "./ShellChrome";
 import { StopControl } from "./StopControl";
 import { TokenEntry } from "./TokenEntry";
 import { useConsoleData } from "./useConsoleData";
@@ -116,6 +123,10 @@ export function AppShell({ views = {} }: AppShellProps): ReactElement {
       <header className="shell-header">
         <p className="brand">EnergyPod</p>
         <FleetBanner units={data.snapshot?.units ?? []} />
+        <ConnectionStatusBadge
+          health={data.connection}
+          secondsSinceUpdate={data.secondsSinceUpdate}
+        />
         <ConnectionFacts data={data} />
         <div className="header-actions">
           <StopControl
@@ -176,6 +187,8 @@ export function AppShell({ views = {} }: AppShellProps): ReactElement {
           onRetry={data.retryStream}
         />
       )}
+
+      {data.restartNotice !== null && <RestartNotice text={data.restartNotice} />}
 
       <main aria-labelledby="current-view-heading" className={disconnected ? "dimmed" : ""}>
         <h1 id="current-view-heading" tabIndex={-1} ref={headingRef}>

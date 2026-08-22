@@ -1390,3 +1390,117 @@ describe("AppShell — navigation", () => {
     expect(announcements.textContent ?? "").toMatch(/\barmed\b/);
   });
 });
+
+// --- the live-data badge (self-diagnosis surface) -----------------------------
+
+describe("AppShell — live-data badge", () => {
+  /** The always-visible one-glance badge on the shell header. */
+  function badge(): HTMLElement {
+    return screen.getByLabelText("Live data");
+  }
+
+  it("shows Live once the connection delivers, on every view", async () => {
+    installClient();
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    expect(badge().textContent).toBe("Live");
+
+    // The badge stays put when the operator moves to another view: it is
+    // chrome, not part of any single view.
+    await user.click(screen.getByRole("link", { name: "Batteries" }));
+    expect(badge().textContent).toBe("Live");
+  });
+
+  it("moves Live → Reconnecting → Live through a drop and an automatic recovery", async () => {
+    const snapshot = fleet(allUnits("armed_idle"));
+    const channel = streamChannel([snapshotFrame(snapshot)]);
+    // Every connection drinks from the same channel: the first delivers the
+    // picture, the failure ends it, the retry picks up the pushed frame.
+    const openEvents = vi.fn(() => channel.open());
+    installClient({ snapshot, openEvents });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+    expect(badge().textContent).toBe("Live");
+
+    // The server drops the connection without warning.
+    channel.fail(networkError("The event stream connection was lost"));
+    await waitFor(() => {
+      expect(badge().textContent).toBe("Reconnecting");
+    });
+
+    // The automatic retry reconnects; the reconnected stream delivers a fresh
+    // authoritative snapshot frame and the badge returns to Live.
+    channel.push(snapshotFrame(fleet(allUnits("disarmed"), SEQUENCE + 10)));
+    await waitFor(
+      () => {
+        expect(badge().textContent).toBe("Live");
+      },
+      { timeout: 4000 },
+    );
+  });
+
+  it("says Offline when the service itself cannot be reached", async () => {
+    const snapshot = fleet(allUnits("armed_idle"));
+    const channel = streamChannel([snapshotFrame(snapshot)]);
+    let connections = 0;
+    const openEvents = vi.fn(() => {
+      connections += 1;
+      return connections === 1 ? channel.open() : unreachableStream();
+    });
+    installClient({
+      snapshot,
+      openEvents,
+      getHealth: () => Promise.reject(networkError("The EnergyPod service could not be reached")),
+    });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    channel.fail(networkError("The event stream connection was lost"));
+
+    // The reconnects die at the transport and the health poll cannot reach
+    // the service either: the badge names the service unreachable, never a
+    // calm "live" over data that can no longer refresh.
+    await waitFor(
+      () => {
+        expect(badge().textContent).toContain("Offline");
+      },
+      { timeout: 4000 },
+    );
+  });
+
+  it("shows the calm controller-restart notice when a lost connection resumes", async () => {
+    const snapshot = fleet(allUnits("armed_idle"));
+    const channel = streamChannel([snapshotFrame(snapshot)]);
+    let connections = 0;
+    const openEvents = vi.fn(() => {
+      connections += 1;
+      return connections === 1 ? channel.open() : channel.open();
+    });
+    installClient({ snapshot, openEvents });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+    expect(screen.queryByText(/Connection restored after controller restart/)).toBeNull();
+
+    channel.fail(networkError("The event stream connection was lost"));
+    // Wait for the loss to be observed before arming the recovery frame: the
+    // channel's queue drains ahead of its failure, so a frame pushed while the
+    // dying generator is still parked would be consumed by the dead connection.
+    await waitFor(() => {
+      expect(badge().textContent).toBe("Reconnecting");
+    });
+    channel.push(snapshotFrame(fleet(allUnits("disarmed"), SEQUENCE + 10)));
+
+    // The resume-reconnect is surfaced as a small non-blocking notice: the
+    // operator can finally tell a restart from a stall.
+    const notice = await screen.findByText(/Connection restored after controller restart/, undefined, {
+      timeout: 4000,
+    });
+    expect(notice).toBeVisible();
+    expect(badge().textContent).toBe("Live");
+  });
+});

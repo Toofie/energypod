@@ -1,12 +1,13 @@
 /**
  * Presentational shell chrome: the always-visible fleet banner, the four-fact
- * connection indicator, and the operator-facing disconnected notice. All state
- * lives in AppShell; these components only render it.
+ * connection indicator, the one-glance live-data badge, the controller-restart
+ * notice, and the operator-facing disconnected notice. All state lives in
+ * AppShell; these components only render it.
  */
 import type { ReactElement } from "react";
 import type { UnitModel } from "./fleet";
 import { fleetBanner, UNIT_LABELS } from "./fleet";
-import type { ConsoleData, RefusalEnvelope } from "./useConsoleData";
+import type { ConnectionHealth, ConsoleData, RefusalEnvelope } from "./useConsoleData";
 
 const BADGE_ICONS: Record<string, string> = {
   Inhibited: "■",
@@ -108,6 +109,54 @@ export function ConnectionFacts({ data }: { data: ConsoleData }): ReactElement {
         </li>
       </ul>
     </div>
+  );
+}
+
+/**
+ * The one-glance live-data badge, always visible on every view: never a
+ * technical word in sight — "connection", not the transport. LIVE means data
+ * is flowing; STALE names how long ago the last update landed (a climbing age
+ * must be unmistakable from a healthy picture); RECONNECTING/OFFLINE say the
+ * connection dropped / the service cannot be reached. The dot carries the
+ * state by color AND the word carries it by text, never color alone.
+ */
+export function ConnectionStatusBadge({
+  health,
+  secondsSinceUpdate,
+}: {
+  health: ConnectionHealth;
+  secondsSinceUpdate: number | null;
+}): ReactElement {
+  let text: string;
+  if (health === "live") {
+    text = "Live";
+  } else if (health === "stale") {
+    text = `Stale — last update ${secondsSinceUpdate ?? "many"} s ago`;
+  } else if (health === "offline") {
+    text = "Offline — the EnergyPod service cannot be reached";
+  } else {
+    // The very first connection is still being made; anything later is a
+    // reconnection after a loss.
+    text = secondsSinceUpdate === null ? "Connecting" : "Reconnecting";
+  }
+  return (
+    <p aria-label="Live data" className={`connection-badge connection-badge--${health}`}>
+      <span aria-hidden="true" className="connection-badge-dot" />
+      {text}
+    </p>
+  );
+}
+
+/**
+ * The calm, non-blocking trace of a connection that had to resume — the
+ * operator-visible answer to "when did the controller restart?". It blocks
+ * nothing and is cleared by the next connection loss.
+ */
+export function RestartNotice({ text }: { text: string }): ReactElement {
+  return (
+    <p role="status" className="restart-notice">
+      {text}
+    </p>
   );
 }
 
