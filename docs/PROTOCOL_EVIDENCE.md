@@ -96,7 +96,10 @@ Any implementation must select framing explicitly. A default `ModbusTcpClient` u
 | Deployed units use the IoT layout. | **Verified by live capture (2026-08-22)** | All three layout probes return register 0 = 536 (> 10 selects IoT). Per-unit commissioned topology: MID (192.168.1.11) 6 BIC, RHS (192.168.1.12) 5 BIC — differing topology across the fleet, validating the per-unit commissioning requirement — LHS (192.168.1.13) 6 BIC; enable mask 1 on all. Pinned device identities (RTU ID at 0x8106, low-word-first uint32): MID `0x2C225097`, RHS `0x2C225076`, LHS `0x2C225095`. Control remains observe-only until scaling, direction, freshness, and watchdog timing are validated per unit. |
 
 ## 4a. Live commissioning evidence (2026-08-22, authorized observe-only)
+
+
 ## 4b. Power-direction sign conventions (2026-08-22, three-source reconciliation)
+
 
 Reconciled across the decompiled vendor app, the operator's three prior
 implementations, and live telemetry. The vendor app is a sign-TRANSPARENT
