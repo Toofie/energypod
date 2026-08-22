@@ -110,6 +110,33 @@ From the 32-agent Milestone A implementation review (all P0/P1 were fixed in
 the above classes; the full list lives in the 2026-08-22 review output
 referenced from CONTINUITY.md.)
 
+## Queue: Milestone B residuals (2026-08-22, non-blocking)
+
+1. web/src/api/client.ts openEvents parks at an internal await while idle, so
+   a queued iterator.return() cannot close the OS socket until a frame arrives
+   on the abandoned stream — consumption provably stops (pinned), but the
+   socket lingers. One-line abort parameter on openEvents closes it promptly.
+2. Home/Batteries/Now derive liveness from receiving snapshot frames rather
+   than the plane's exported stale flag; during outages each per-view
+   resubscribe can transiently re-assert "this picture is current" until the
+   shell's failed retry ends it (wording oscillation; data adoption is
+   correctly guarded).
+3. main.tsx mounts on import, so composed.test.tsx replicates the view
+   registry verbatim; exporting the registry (or guarding the mount behind an
+   entry function) would make composition drift between main.tsx and the
+   composed suite a compile error.
+4. web/src/api/client.ts AuditEvent type annotates a `type` field the wire
+   never sends (wire key is `event_type`) and UnitSnapshot.telemetry_age_s is
+   non-nullable while the wire sends null — the documented cast lives in
+   wire.ts auditPage().
+5. Server-side surface gaps the console renders honestly as "No data":
+   snapshot units carry no SOC/temperature/cell/inhibit-cause fields; audit
+   pagination exists but the console's queue item 9 (REST surface) remains
+   the tracking entry.
+6. Visual inspection of all console states requires a display: run
+   `corepack pnpm dev` in web/ against `energypod simulate` for manual review;
+   the automated state/a11y coverage lives in the vitest suites.
+
 ## Queue: Milestone A repair-agent notes (2026-08-22)
 
 - Simulator transport exposes `.pod` for scenario handles; composition maps

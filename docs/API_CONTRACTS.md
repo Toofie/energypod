@@ -167,6 +167,27 @@ priority are rejected. Evaluation returns a short-lived schedule intent, never a
   acknowledgeable through the exact-id acknowledgement endpoint regardless of how many stops
   accumulate, and the idempotency capacity bound never evicts a latched stop.
 
+## Operations surface (Milestone C)
+
+- SQLite durable stores carry a `schema_version` from day one. `energypod db migrate`
+  applies pending migrations transactionally and refuses unknown/newer versions;
+  `energypod db backup --out FILE` produces a consistent snapshot via the SQLite backup
+  API (never a mid-write file copy) and refuses to overwrite an existing file;
+  `energypod db restore --in FILE` validates the schema version and integrity before
+  swapping it in atomically (temp file + rename), and never runs while a server holds
+  the database open (refuses with a clear error).
+- `energypod simulate` mints one deterministic development principal (full scopes,
+  interactive, token printed once to stdout at startup) when no credential store is
+  configured — simulator deployments only, never `run` mode, never against hardware.
+  `run` mode without a credential store stays fail-closed (all bearer auth refused).
+- `GET /healthz` is the only unauthenticated endpoint: liveness only (process up),
+  never readiness, never data. It exists for container orchestration; `/api/v1/health`
+  remains the authenticated three-fact health view.
+- Container image: multi-stage (web build then runtime), non-root user, no secrets
+  baked in, `HEALTHCHECK` against `/healthz`, config mounted read-only, data volume
+  for the SQLite path. Compose ships one controller + the simulator profile for
+  local operation.
+
 ## Application service facade
 
 `energypod.application.service.EnergyServiceFacade` is the only implementation of the
