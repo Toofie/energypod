@@ -294,6 +294,28 @@ class StorageConfig(_FrozenModel):
         return value
 
 
+class ExcessChargingConfig(_FrozenModel):
+    """API_CONTRACTS "Excess-solar accelerated charging (advisory)".
+
+    An absent block is identical to ``enabled: false`` — the feature is
+    inert by default.  Every key carries its commissioned default so an
+    enabled block states only what commissioning chose to override; the
+    cross-fleet relations (cap inside the static unit charge limit, a
+    freshness bound the polling loop can actually satisfy, a hysteresis
+    band below the entry margin, a bounded renewable TTL) are validated on
+    ``ControllerConfig``, where the policy and timing they relate to live.
+    """
+
+    enabled: StrictBool = False
+    export_headroom_margin_w: PositiveStrictInt = 200
+    max_charge_from_export_w: PositiveStrictInt = 2500
+    export_telemetry_max_age_s: PositiveFiniteFloat = 3.0
+    assumed_autonomous_charge_w: PositiveStrictInt = 520
+    min_acceleration_w: PositiveStrictInt = 100
+    exit_hysteresis_w: NonNegativeStrictInt = 50
+    intent_ttl_s: PositiveFiniteFloat = 10.0
+
+
 class ControllerConfig(_FrozenModel):
     schema_version: Annotated[StrictInt, Field(ge=1)]
     revision: Annotated[StrictInt, Field(ge=1)]
@@ -307,6 +329,9 @@ class ControllerConfig(_FrozenModel):
     # in-memory persistence when no database path is configured, so storage
     # is optional; when present it must identify a durable database file.
     storage: StorageConfig | None = None
+    # Declared LAST so its commissioning validator below sees the already
+    # validated mode, timing, and policy fields through ``info.data``.
+    excess_charging: ExcessChargingConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -388,6 +413,70 @@ class ControllerConfig(_FrozenModel):
         ):
             raise ValueError("write-enabled mode requires enabled authentication")
         return authentication
+
+    @field_validator("excess_charging")
+    @classmethod
+    def validate_excess_charging(
+        cls, excess: ExcessChargingConfig | None, info: ValidationInfo
+    ) -> ExcessChargingConfig | None:
+        """The commissioning gates for an ENABLED advisory block (API_CONTRACTS
+        "Excess-solar accelerated charging (advisory)").
+
+        Every gate is scoped to ``enabled=True``: a disabled or absent block
+        changes nothing anywhere.  This is a field validator on the block —
+        not a mode="after" model validator — so the refusal stays attributed
+        to ``excess_charging`` itself even when a sibling field has already
+        failed (a write-enabled deployment missing its policy block), which
+        pydantic would otherwise never reach.
+        """
+        if excess is None or not excess.enabled:
+            return excess
+        values = info.data
+        if values.get("mode") is not ControllerMode.WRITE_ENABLED:
+            raise ValueError(
+                "excess_charging requires mode write_enabled: an observe-only "
+                "composition can never actuate, so an enabled advisory block is "
+                "refused at validation time"
+            )
+        policy = values.get("policy")
+        if policy is None:
+            raise ValueError(
+                "excess_charging requires a policy block: the export bound derives "
+                "from the commissioned static charge limits"
+            )
+        if excess.max_charge_from_export_w > policy.max_unit_charge_w:
+            raise ValueError(
+                "excess_charging.max_charge_from_export_w must not exceed the policy "
+                "max_unit_charge_w: the export cap is one additional min() term and "
+                "can never authorize more than the unit limit"
+            )
+        timing = values.get("timing")
+        if timing is not None:
+            poll_bound = timing.control_period_s + timing.essential_read_timeout_s
+            if excess.export_telemetry_max_age_s <= poll_bound:
+                raise ValueError(
+                    "excess_charging.export_telemetry_max_age_s must exceed "
+                    "timing.control_period_s + timing.essential_read_timeout_s: a "
+                    "fresher demand than the polling loop can ever serve would "
+                    "collapse the bound permanently"
+                )
+            if excess.intent_ttl_s <= timing.control_period_s:
+                raise ValueError(
+                    "excess_charging.intent_ttl_s must exceed timing.control_period_s: "
+                    "the adviser renews exactly once per fleet cycle"
+                )
+        if not 0 < excess.intent_ttl_s <= 300:
+            raise ValueError(
+                "excess_charging.intent_ttl_s must stay inside (0, 300] seconds — the "
+                "REST dispatch cap; the adviser may not out-live ordinary intents"
+            )
+        if excess.exit_hysteresis_w >= excess.min_acceleration_w:
+            raise ValueError(
+                "excess_charging.exit_hysteresis_w must stay strictly below "
+                "min_acceleration_w: the hysteresis band is what keeps a dip between "
+                "the entry and exit thresholds from oscillating"
+            )
+        return excess
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:
