@@ -140,6 +140,17 @@ class TimingConfig(_FrozenModel):
             raise ValueError("complete timing budget must fit inside device command expiry")
         if cadence_budget >= self.device_command_expiry_s:
             raise ValueError("control renewal budget must fit inside device command expiry")
+        # The composition root wires ``write_timeout_s`` as the actor's
+        # heartbeat safety margin and ``control_period_s`` as its heartbeat
+        # interval, so a write timeout that cannot fit strictly inside the
+        # control period is a configuration the runtime can never compose.
+        # Rejecting it here keeps ``check-config`` and ``build_runtime`` in
+        # agreement instead of approving a timing budget that always fails.
+        if self.write_timeout_s >= self.control_period_s:
+            raise ValueError(
+                "write timeout must fit strictly inside the control period: it is wired as "
+                "the heartbeat safety margin inside the heartbeat interval"
+            )
         return self
 
 

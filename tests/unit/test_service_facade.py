@@ -10,6 +10,7 @@ the facade is the only real module under test.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import importlib
 import math
@@ -21,6 +22,24 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+from tests.unit.test_actor import IDENTITY as ACTOR_IDENTITY
+from tests.unit.test_actor import PROFILE as ACTOR_PROFILE
+from tests.unit.test_actor import UNIT_ID as ACTOR_UNIT_ID
+from tests.unit.test_actor import (
+    AuthorizationRecord as ActorAuthorization,
+)
+from tests.unit.test_actor import (
+    EncodedWrite,
+    FakeCommandEncoder,
+    Gate,
+    ObservationRecord,
+    SpyTransport,
+    settle_until,
+)
+from tests.unit.test_actor import FakeAuthorizationRepository as ActorAuthorizationRepository
+from tests.unit.test_actor import FakeClock as ActorClock
+from tests.unit.test_actor import FakeObservationRepository as ActorObservationRepository
 
 SITE_ID = "home"
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -101,9 +120,12 @@ class FakeIntentRepository:
         self.removed: list[str] = []
         self.active_calls: list[float] = []
         self.failing = False
+        # Models a store that refused the stop's intent (capacity exhausted,
+        # transient fault) while later serving removals again.
+        self.add_failing = False
 
     async def add(self, intent: Any) -> None:
-        if self.failing:
+        if self.failing or self.add_failing:
             raise OSError("intent store unavailable")
         self.added.append(intent)
 
@@ -201,6 +223,7 @@ class FakeAuditRepository:
         self.events: list[Any] = list(events)
         self.appended: list[Any] = []
         self.recent_calls: list[int] = []
+        self.recent_cursors: list[int | None] = []
         self.history = history
         self.failing = False
 
@@ -214,6 +237,7 @@ class FakeAuditRepository:
 
     async def recent(self, limit: int, after_sequence: int | None = None) -> tuple[Any, ...]:
         self.recent_calls.append(limit)
+        self.recent_cursors.append(after_sequence)
         if self.failing:
             raise OSError("audit store unavailable")
         window = self.events
@@ -228,12 +252,15 @@ class FakeEventBus:
     def __init__(self, starting_sequence: int = 0, history: list[str] | None = None) -> None:
         self.published: list[dict[str, Any]] = []
         self.sequence_reads = 0
+        self.failing = False
         self._sequence = starting_sequence
         self._history = history
 
     async def publish(self, body: Mapping[str, Any]) -> int:
         if self._history is not None:
             self._history.append("publish")
+        if self.failing:
+            raise OSError("event bus unavailable")
         self.published.append(dict(body))
         self._sequence += 1
         return self._sequence
@@ -329,6 +356,49 @@ class FakeActorHandle:
         del reason
         self.history.append(f"fence:{self.unit_id}")
         return 0
+
+
+@dataclass
+class RealActorHandle:
+    """Facade-facing handle over the production actor, fence included.
+
+    The composed runtime wraps its actors the same way; this local adapter
+    lets the facade be exercised against the real actor without importing the
+    composition root.
+    """
+
+    actor: Any
+
+    @property
+    def unit_id(self) -> str:
+        return self.actor.unit_id
+
+    @property
+    def lifecycle(self) -> Any:
+        return self.actor.lifecycle
+
+    @property
+    def qualified(self) -> bool | None:
+        return self.actor.qualified
+
+    @property
+    def inhibit_latched(self) -> bool:
+        return bool(self.actor.inhibit_latched)
+
+    async def arm(self) -> None:
+        await self.actor.arm()
+
+    async def disarm(self) -> None:
+        await self.actor.disarm()
+
+    async def acknowledge_inhibit(self) -> None:
+        await self.actor.acknowledge_inhibit()
+
+    async def request_bounded_zero(self, reason: str) -> None:
+        await self.actor.request_bounded_zero(reason)
+
+    async def fence(self, reason: str) -> int:
+        return await self.actor.fence(reason)
 
 
 @dataclass
@@ -856,6 +926,25 @@ async def test_recent_audit_over_an_empty_trail_is_terminal(api: Any) -> None:
     assert result["next_cursor"] is None
 
 
+async def test_recent_audit_hands_the_cursor_to_the_audit_port(api: Any) -> None:
+    """The cursor is the audit port's ordering key, not facade bookkeeping."""
+    events = tuple(
+        SimpleNamespace(sequence=number, event_id=f"event-{number}") for number in (9, 8, 7, 6, 5)
+    )
+    rig = make_rig(api, audit_events=events)
+
+    first = await rig.facade.recent_audit(principal=OPERATOR, limit=3)
+    older = await rig.facade.recent_audit(principal=OPERATOR, limit=3, cursor=first["next_cursor"])
+
+    assert rig.audit.recent_cursors == [None, first["next_cursor"]], (
+        "the facade must pass after_sequence through to the audit port verbatim"
+    )
+    # next_cursor is derived from what the store returned, never fabricated.
+    assert first["next_cursor"] == field_of(first["events"][-1], "sequence")
+    assert [field_of(event, "sequence") for event in older["events"]] == [6, 5]
+    assert older["next_cursor"] is None
+
+
 # --- submit_intent ----------------------------------------------------------
 
 
@@ -948,6 +1037,37 @@ async def test_submit_intent_rejects_invalid_payloads_without_storing(
         await rig.facade.submit_intent(**submit_kwargs(**overrides))
 
     assert rig.intents.added == []
+
+
+@pytest.mark.parametrize(
+    "degradation",
+    ["audit_append_fails", "publish_fails"],
+    ids=["audit_failure", "publish_failure"],
+)
+async def test_submit_intent_is_atomic_with_its_audit_and_publication(
+    api: Any, degradation: str
+) -> None:
+    """A dispatch the caller saw fail must leave nothing stored to arbitrate.
+
+    The next kernel tick would otherwise authorize power from an intent whose
+    acceptance was never reported, and the operator's retry would store a
+    duplicate.
+    """
+    rig = make_rig(api)
+    if degradation == "audit_append_fails":
+        rig.audit.failing = True
+    else:
+        rig.bus.failing = True
+
+    with pytest.raises(OSError):
+        await rig.facade.submit_intent(**submit_kwargs())
+
+    assert len(rig.intents.added) == 1, "the intent was committed before the failure"
+    assert rig.intents.removed == [rig.intents.added[0].id], (
+        "the failed acceptance must roll the stored intent back"
+    )
+    live = await rig.intents.active(rig.clock.now)
+    assert not live, "power can never flow from a dispatch the caller saw fail"
 
 
 # --- arm --------------------------------------------------------------------
@@ -1162,6 +1282,216 @@ async def test_emergency_stop_survives_degraded_dependencies(api: Any, deformati
             assert rig.history.index(f"zero:{unit_id}") < audit
     if rig.bus.published:
         assert fence < rig.history.index("publish"), "the stop must fence before publishing"
+
+
+async def test_emergency_stop_fences_each_actor_before_requesting_the_bounded_zero(
+    api: Any,
+) -> None:
+    """The bounded zero alone cannot cancel an in-flight nonzero write.
+
+    Only the actor's fence cancels active authority work, so the stop must
+    fence every affected unit before it requests the bounded zero.
+    """
+    rig = make_rig(api)
+
+    result = await _stop(
+        rig.facade,
+        unit_ids=["pod-a", "pod-b"],
+        reason="halt",
+        idempotency_key="stop-key-f",
+        request_id="request-f",
+    )
+
+    assert result["degraded"] == [], "fencing each actor is a step of the stop"
+    for unit_id in ("pod-a", "pod-b"):
+        assert f"fence:{unit_id}" in rig.history, "every affected actor must be fenced"
+        assert rig.history.index(f"fence:{unit_id}") < rig.history.index(f"zero:{unit_id}"), (
+            "an in-flight nonzero write is cancelled before the bounded zero is requested"
+        )
+
+
+async def test_emergency_stop_cancels_an_inflight_nonzero_write_on_the_real_actor(
+    api: Any,
+) -> None:
+    """P0 regression on the production facade and actor: a dispatched nonzero
+    heartbeat write inside a slow gateway is cancelled by the stop, so no
+    nonzero command can land on the wire after ``emergency_stop`` returns."""
+    actor_module = importlib.import_module("energypod.application.actor")
+    transport = SpyTransport()
+    write_gate = Gate()
+    transport.write_gates.append(write_gate)
+    clock = ActorClock()
+    authorizations = ActorAuthorizationRepository(ActorAuthorization())
+    coordinator = api.AuthorityGenerationCoordinator()
+    actor = actor_module.EnergyPodActor(
+        unit_id=ACTOR_UNIT_ID,
+        transport=transport,
+        clock=clock,
+        observations=ActorObservationRepository(ObservationRecord()),
+        authorizations=authorizations,
+        audit=FakeAuditRepository(),
+        command_encoder=FakeCommandEncoder(),
+        generation_coordinator=coordinator,
+        expected_identity=ACTOR_IDENTITY,
+        expected_profile=ACTOR_PROFILE,
+        expected_cell_count=59,
+        stable_observations_required=1,
+        essential_read_address=0x5000,
+        essential_read_count=7,
+        heartbeat_interval_s=1.0,
+        heartbeat_safety_margin_s=0.2,
+    )
+    await actor.start()
+    await actor.accept_observation(ObservationRecord())
+    await actor.arm()
+    facade = api.EnergyServiceFacade(
+        site_id=SITE_ID,
+        clock=clock,
+        intents=FakeIntentRepository(),
+        observations=FakeObservationRepository(),
+        authorizations=authorizations,
+        audit=FakeAuditRepository(),
+        events=FakeEventBus(),
+        coordinator=coordinator,
+        actors={ACTOR_UNIT_ID: RealActorHandle(actor)},
+    )
+
+    heartbeat = asyncio.create_task(actor.heartbeat_once())
+    entered_write = await settle_until(write_gate.entered.is_set)
+    if not entered_write:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+    assert entered_write, "heartbeat never reached the controlled write boundary"
+
+    result = await facade.emergency_stop(
+        unit_ids=[ACTOR_UNIT_ID],
+        reason="operator halt behind a slow gateway write",
+        principal=OPERATOR,
+        idempotency_key="stop-key-real",
+        request_id="request-real",
+    )
+
+    assert result["status"] == "latched"
+    assert result["degraded"] == [], "fencing the actor is part of the stop, not extra credit"
+    assert any(name == "write:cancelled" for name, _ in transport.history), (
+        "the in-flight nonzero write must be cancelled, not awaited"
+    )
+    # The slow gateway releases only after the stop returned; the cancelled
+    # write can never complete on the wire.
+    write_gate.release.set()
+    await asyncio.gather(heartbeat, return_exceptions=True)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    nonzero = [write for write in transport.writes if write.values[1] != 0]
+    assert nonzero == [], "a nonzero command landed on the wire after the stop returned"
+    assert EncodedWrite(0x0200, (1, 0, 0)) in transport.writes, "the stop still bounded-zeroes"
+    await actor.shutdown()
+
+
+async def test_a_stop_the_store_refused_leaves_no_phantom_latch(api: Any) -> None:
+    """Degraded variant 1: the safety work lands, the store refuses the intent.
+
+    The latch is recorded only after the store holds the intent, so a degraded
+    store leaves nothing half-latched: the error carries the stop id, an
+    acknowledgement truthfully refuses instead of failing forever on a
+    registry entry no removal could satisfy, and a re-issued stop latches and
+    acknowledges exactly once.
+    """
+    rig = make_rig(api)
+    rig.intents.add_failing = True
+
+    with pytest.raises(OSError) as excinfo:
+        await _stop(
+            rig.facade,
+            unit_ids=["pod-a", "pod-b"],
+            reason="halt behind a degraded store",
+            idempotency_key="stop-key-d1",
+            request_id="request-d1",
+        )
+    stop_id = getattr(excinfo.value, "stop_id", None)
+    assert isinstance(stop_id, str) and canonical(stop_id), (
+        "the error path must carry the stop id so the operator can correlate the stop"
+    )
+
+    # The safety sequence still fenced the fleet and the actors and zeroed.
+    assert "fence" in rig.history
+    assert "fence:pod-a" in rig.history and "zero:pod-a" in rig.history
+
+    # The refused intent exists nowhere, so acknowledging it must refuse too.
+    rig.intents.add_failing = False
+    with pytest.raises(LookupError, match="no latched emergency stop"):
+        await rig.facade.acknowledge_emergency_stop(
+            stop_id=stop_id,
+            principal=OPERATOR,
+            idempotency_key="ack-key-d1",
+            request_id="request-a1",
+        )
+    assert rig.intents.removed == []
+
+    # The operator's path forward: re-issue the stop once the store recovered.
+    repeated = await _stop(
+        rig.facade,
+        unit_ids=["pod-a", "pod-b"],
+        reason="halt again",
+        idempotency_key="stop-key-d2",
+        request_id="request-d2",
+    )
+    assert repeated["status"] == "latched"
+    assert repeated["degraded"] == []
+    acknowledged = await rig.facade.acknowledge_emergency_stop(
+        stop_id=repeated["stop_id"],
+        principal=OPERATOR,
+        idempotency_key="ack-key-d2",
+        request_id="request-a2",
+    )
+    assert acknowledged["status"] == "acknowledged"
+    assert rig.intents.removed[-1] == repeated["stop_id"]
+    with pytest.raises(LookupError):
+        await rig.facade.acknowledge_emergency_stop(
+            stop_id=repeated["stop_id"],
+            principal=OPERATOR,
+            idempotency_key="ack-key-d3",
+            request_id="request-a3",
+        )
+
+
+async def test_unknown_unit_stop_error_still_latches_and_carries_the_stop_id(
+    api: Any,
+) -> None:
+    """Degraded variant 2: a stop listing an unknown unit completes the safety
+    sequence for the known units, then raises carrying its id, so the operator
+    can still acknowledge the latched stop."""
+    rig = make_rig(api)
+
+    with pytest.raises(ValueError) as excinfo:
+        await _stop(
+            rig.facade,
+            unit_ids=["pod-a", "pod-ghost"],
+            reason="halt with a typo",
+            idempotency_key="stop-key-d2",
+            request_id="request-d2",
+        )
+    stop_id = getattr(excinfo.value, "stop_id", None)
+    assert isinstance(stop_id, str) and canonical(stop_id)
+
+    assert "fence:pod-a" in rig.history and "zero:pod-a" in rig.history, (
+        "the known units were fenced and zeroed before the error surfaced"
+    )
+    assert any(intent.id == stop_id for intent in rig.intents.added), (
+        "the store was healthy, so the stop intent is latched there too"
+    )
+
+    acknowledged = await rig.facade.acknowledge_emergency_stop(
+        stop_id=stop_id,
+        principal=OPERATOR,
+        idempotency_key="ack-key-d3",
+        request_id="request-a3",
+    )
+
+    assert acknowledged["status"] == "acknowledged"
+    assert rig.intents.removed[-1] == stop_id
+    live = await rig.intents.active(rig.clock.now)
+    assert not any(intent.id == stop_id for intent in live), "the latch must not relatch"
 
 
 async def test_repeated_stops_receive_distinct_acknowledgeable_ids(api: Any) -> None:

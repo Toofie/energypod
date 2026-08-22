@@ -30,6 +30,7 @@ class ObservationRecord:
     sequence: int = 1
     complete: bool = True
     quality: str = "good"
+    active_faults: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -253,6 +254,7 @@ def contract() -> Any:
             (),
             {
                 "EnergyPodActor": actor_module.EnergyPodActor,
+                "InhibitCause": actor_module.InhibitCause,
                 "UnitLifecycle": domain_module.UnitLifecycle,
             },
         )
@@ -267,6 +269,7 @@ def make_actor(
     transport: SpyTransport | None = None,
     observations: FakeObservationRepository | None = None,
     authorizations: FakeAuthorizationRepository | None = None,
+    blocking_fault_codes: frozenset[str] | None = None,
 ) -> tuple[Any, FakeClock, SpyTransport, FakeObservationRepository, FakeAuthorizationRepository]:
     test_clock = clock or FakeClock()
     test_transport = transport or SpyTransport()
@@ -288,6 +291,7 @@ def make_actor(
         essential_read_count=7,
         heartbeat_interval_s=1.0,
         heartbeat_safety_margin_s=0.2,
+        blocking_fault_codes=blocking_fault_codes,
     )
     return actor, test_clock, test_transport, observation_repo, authorization_repo
 
@@ -646,6 +650,206 @@ async def test_inhibit_recovery_requires_qualifying_samples_and_never_bad_ones(
     # Nonzero power still requires an explicit arm after recovery.
     await actor.arm()
     assert actor.lifecycle is contract.UnitLifecycle.ARMED_IDLE
+    await actor.shutdown()
+
+
+# --- latched inhibit causes (ARCHITECTURE 8.1) ------------------------------
+
+
+async def test_blocking_fault_latches_inhibited_until_privileged_acknowledgement(
+    contract: Any,
+) -> None:
+    """A configured blocking fault is a LATCHED cause on the real actor."""
+    actor, _, transport, _, authorizations = make_actor(
+        contract, blocking_fault_codes=frozenset({"Stack_Fault0_3"})
+    )
+    await ready_actor(actor)
+    faulted = ObservationRecord(sequence=2, active_faults=("Stack_Fault0_3",))
+    generation_before = actor.generation
+
+    await actor.accept_observation(faulted)
+
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+    assert actor.inhibit_cause is contract.InhibitCause.LATCHED
+    assert actor.inhibit_latched is True
+    assert actor.generation > generation_before, "the inhibit must fence the generation"
+    assert transport.writes == [EncodedWrite(0x0200, (1, 0, 0))], "the inhibit bounded-zeros"
+    assert any(reason == "blocking_fault_active" for _, reason in authorizations.revocations)
+
+    # A persisting fault holds the latch, and stable samples alone never
+    # clear it: recovery cannot proceed underneath the acknowledgement gate.
+    await actor.accept_observation(faulted)
+    await actor.accept_observation(ObservationRecord(sequence=3))
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+    assert actor.inhibit_latched is True
+
+    # Disarm on an inhibited unit is a no-op and never clears the latch.
+    await actor.disarm()
+    assert actor.inhibit_latched is True
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+
+    # Arming is refused while the latch stands.
+    with pytest.raises(RuntimeError):
+        await actor.arm()
+
+    # Acknowledgement clears only the latch; recovery still needs samples.
+    await actor.acknowledge_inhibit()
+    assert actor.inhibit_latched is False
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED, (
+        "acknowledgement never bypasses the stable-sample recovery path"
+    )
+    await actor.accept_observation(ObservationRecord(sequence=4))
+    assert actor.lifecycle is contract.UnitLifecycle.DISARMED
+    await actor.arm()
+    assert actor.lifecycle is contract.UnitLifecycle.ARMED_IDLE
+
+    # A returning fault re-latches: acknowledgement is per-cause, never a
+    # permanent waiver.
+    await actor.accept_observation(ObservationRecord(sequence=5, active_faults=("Stack_Fault0_3",)))
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+    assert actor.inhibit_latched is True
+    await actor.shutdown()
+
+
+async def test_identity_mismatch_latches_inhibited_until_privileged_acknowledgement(
+    contract: Any,
+) -> None:
+    """ARCHITECTURE 8.1: an identity mismatch is a latched inhibit cause."""
+    actor, _, transport, _, authorizations = make_actor(contract)
+    await ready_actor(actor)
+    generation_before = actor.generation
+
+    await actor.accept_observation(replace(ObservationRecord(), device_identity="BEP-SOMEONE-ELSE"))
+
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+    assert actor.inhibit_cause is contract.InhibitCause.LATCHED
+    assert actor.inhibit_latched is True
+    assert actor.generation > generation_before, "the inhibit must fence the generation"
+    assert transport.writes == [EncodedWrite(0x0200, (1, 0, 0))], "the inhibit bounded-zeros"
+    assert any(reason == "identity_mismatch" for _, reason in authorizations.revocations)
+
+    # A persisting mismatch holds the standing latch without re-fencing churn.
+    await actor.accept_observation(
+        replace(ObservationRecord(sequence=2), device_identity="BEP-SOMEONE-ELSE")
+    )
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+    assert actor.inhibit_latched is True
+
+    # Correct identity alone never clears the latch: the unit stays inhibited
+    # and cannot re-arm without the privileged acknowledgement.
+    await actor.accept_observation(ObservationRecord(sequence=3))
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+    assert actor.inhibit_latched is True
+    with pytest.raises(RuntimeError):
+        await actor.arm()
+
+    # Acknowledgement clears only the latch; stable samples then reach
+    # DISARMED and an explicit arm is still required.
+    await actor.acknowledge_inhibit()
+    assert actor.inhibit_latched is False
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+    await actor.accept_observation(ObservationRecord(sequence=4))
+    assert actor.lifecycle is contract.UnitLifecycle.DISARMED
+    await actor.arm()
+    assert actor.lifecycle is contract.UnitLifecycle.ARMED_IDLE
+
+    # A protocol-profile contradiction latches exactly like the identity one.
+    await actor.accept_observation(ObservationRecord(sequence=5, protocol_profile="iot-v2"))
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+    assert actor.inhibit_latched is True
+    await actor.shutdown()
+
+
+async def test_quality_failure_without_identity_mismatch_never_latches(
+    contract: Any,
+) -> None:
+    """Ordinary quality failures stay non-latched and recover automatically."""
+    actor, _, transport, _, _ = make_actor(contract)
+    await ready_actor(actor)
+
+    await actor.accept_observation(replace(ObservationRecord(), quality="bad"))
+
+    assert actor.lifecycle is contract.UnitLifecycle.OBSERVE_ONLY
+    assert actor.inhibit_cause is None
+    assert actor.inhibit_latched is False
+    assert transport.writes == [], "a quality failure while disarmed writes nothing"
+
+    await actor.accept_observation(ObservationRecord(sequence=2))
+    assert actor.lifecycle is contract.UnitLifecycle.DISARMED, (
+        "recovery from a plain quality failure is automatic"
+    )
+    await actor.shutdown()
+
+
+async def test_absent_identity_is_the_unknown_not_a_latched_mismatch(
+    contract: Any,
+) -> None:
+    """A not-yet-observed identity fails qualification without latching."""
+    actor, _, _, _, _ = make_actor(contract)
+    await actor.start()
+
+    await actor.accept_observation(replace(ObservationRecord(), device_identity=None))
+
+    assert actor.lifecycle is contract.UnitLifecycle.OBSERVE_ONLY
+    assert actor.inhibit_cause is None
+    assert actor.inhibit_latched is False
+    await actor.shutdown()
+
+
+async def test_a_transient_inhibit_cannot_downgrade_a_standing_latch(
+    contract: Any,
+) -> None:
+    """Defense in depth: only acknowledgement may clear a latched cause.
+
+    Lifecycle ordering keeps the transient inhibit paths (heartbeat renewal)
+    out of a latched unit today; this pins the invariant at the one recording
+    point that could forget it.
+    """
+    actor, _, _, _, _ = make_actor(contract, blocking_fault_codes=frozenset({"Stack_Fault0_3"}))
+    await ready_actor(actor)
+    await actor.accept_observation(ObservationRecord(sequence=2, active_faults=("Stack_Fault0_3",)))
+    assert actor.inhibit_latched is True
+
+    actor._record_inhibit_cause(contract.InhibitCause.TRANSIENT)
+
+    assert actor.inhibit_latched is True, "only acknowledgement may clear a latch"
+    assert actor.inhibit_cause is contract.InhibitCause.LATCHED
+    await actor.shutdown()
+
+
+async def test_request_bounded_zero_outranks_a_queued_heartbeat(contract: Any) -> None:
+    """An externally requested bounded zero jumps the mailbox queue.
+
+    The emergency zero is the facade's actuation of last resort; it may not
+    sit behind a queued renewal that would write nonzero power first.
+    """
+    read_gate = Gate()
+    transport = SpyTransport()
+    transport.read_gate = read_gate
+    actor, _, _, _, _ = make_actor(
+        contract,
+        transport=transport,
+        authorizations=FakeAuthorizationRepository(AuthorizationRecord()),
+    )
+    await ready_actor(actor)
+
+    poll = asyncio.create_task(actor.poll_once())
+    entered_read = await settle_until(read_gate.entered.is_set)
+    if not entered_read:
+        poll.cancel()
+        await asyncio.gather(poll, return_exceptions=True)
+    assert entered_read, "poll never reached the controlled read boundary"
+    heartbeat = asyncio.create_task(actor.heartbeat_once())
+    await asyncio.sleep(0)
+    zero = asyncio.create_task(actor.request_bounded_zero("emergency_stop:stop-1"))
+    await asyncio.sleep(0)
+    read_gate.release.set()
+    await asyncio.gather(poll, heartbeat, zero)
+
+    assert transport.writes == [
+        EncodedWrite(0x0200, (1, 0, 0)),
+        EncodedWrite(0x0200, (1, 500, 0)),
+    ], "the bounded zero must be written before the queued heartbeat's renewal"
     await actor.shutdown()
 
 

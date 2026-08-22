@@ -22,13 +22,14 @@ import sqlite3
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
-from types import BuiltinFunctionType, FunctionType, ModuleType
-from typing import Any
+from types import BuiltinFunctionType, FunctionType, ModuleType, SimpleNamespace
+from typing import Any, ClassVar
 
 import pytest
 import yaml
 from fastapi import FastAPI
 from pydantic import ValidationError
+from starlette.datastructures import State
 
 from energypod.runtime.config import ControllerConfig
 
@@ -578,6 +579,27 @@ def test_check_config_reports_a_missing_configuration_file(
     assert audit.issues == []
 
 
+def test_check_config_rejects_a_non_utf8_configuration_file(
+    main_module: ModuleType, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """A UTF-16 BOM artifact fails closed through the structured error path.
+
+    UnicodeDecodeError is a ValueError, not an OSError: without an explicit
+    catch it escapes main() as a raw traceback instead of the contracted
+    ``configuration error: ...`` message and exit code.
+    """
+    template, valid = _discovered_argv(main_module, tmp_path, capsys)
+    path = tmp_path / "utf16.yaml"
+    path.write_bytes("schema_version: 1\n".encode("utf-16"))  # writes a 0xFF 0xFE BOM
+    with SideEffectAudit(allow_config_reads=True) as audit:
+        invocation = call_main(main_module, _replace_path(template, valid, path), capsys)
+    assert not invocation.system_exit_raised, invocation.report()
+    assert invocation.exit_code == 1, invocation.report()
+    assert "configuration error" in invocation.stderr, invocation.report()
+    assert "not valid UTF-8" in invocation.combined_output, invocation.report()
+    assert audit.issues == []
+
+
 # ---------------------------------------------------------------------------
 # run: compose the runtime from the config and hand the app to the runner.
 # ---------------------------------------------------------------------------
@@ -652,7 +674,7 @@ def test_simulate_passes_simulator_mode_through_and_forces_in_memory_persistence
 
 
 @pytest.mark.parametrize("command", ["run", "simulate"])
-@pytest.mark.parametrize("kind", ["invalid", "malformed", "missing"])
+@pytest.mark.parametrize("kind", ["invalid", "malformed", "missing", "non_utf8"])
 def test_run_and_simulate_reject_bad_configurations_fail_closed(
     main_module: ModuleType,
     capsys: pytest.CaptureFixture[str],
@@ -675,6 +697,9 @@ def test_run_and_simulate_reject_bad_configurations_fail_closed(
     elif kind == "malformed":
         path = tmp_path / "garbage.yaml"
         path.write_text("units: [unclosed", encoding="utf-8")
+    elif kind == "non_utf8":
+        path = tmp_path / "utf16.yaml"
+        path.write_bytes(yaml.safe_dump(_valid_payload(database)).encode("utf-16"))
     else:
         path = tmp_path / "absent.yaml"
     runner = ServerRunner()
@@ -707,3 +732,304 @@ def test_serving_failure_exits_cleanly_with_a_nonzero_code(
     invocation = _engaged_invocation(main_module, command, path, capsys, runner, serving=True)
     assert_failed_cleanly(invocation)
     assert len(runner.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Supervision failure must stop serving and make main exit nonzero
+# (API_CONTRACTS "Runtime composition and entry point": supervisor or task
+# failure fences every generation and runs actor shutdown ... before the
+# process exits — the process exits; it may not keep serving the guarded API
+# with control authority dead).
+# ---------------------------------------------------------------------------
+
+
+def _with_exploding_first_tick(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compose for real, then make the kernel die on its very first tick.
+
+    The first-tick failure lands inside the supervision startup window, the
+    one supervisor-failure path that is deterministic under the real clock.
+    """
+    composition = importlib.import_module("energypod.runtime.composition")
+    real_build = composition.build_runtime
+
+    def exploding_build(*args: Any, **kwargs: Any) -> Any:
+        runtime = real_build(*args, **kwargs)
+
+        async def exploding_tick() -> None:
+            raise RuntimeError("supervisor component failed: audit store unavailable")
+
+        monkeypatch.setattr(runtime.kernel, "tick", exploding_tick)
+        return runtime
+
+    monkeypatch.setattr(composition, "build_runtime", exploding_build)
+
+
+class _FakeListener:
+    """Stands in for the bound listener socket; no test may ever bind a port."""
+
+    sockets: ClassVar[list[Any]] = []
+
+    def close(self) -> None:
+        return None
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+def _prevent_listener_sockets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give uvicorn a fake listener so the default runner serves socketless."""
+
+    async def fake_create_server(*args: Any, **kwargs: Any) -> _FakeListener:
+        return _FakeListener()
+
+    monkeypatch.setattr(asyncio.BaseEventLoop, "create_server", fake_create_server)
+
+
+class _ServingAudit:
+    """Side-effect window that ignores only the loop's own wakeup pipe.
+
+    ``asyncio.run`` on Windows unavoidably builds the event loop's self-pipe
+    from a loopback ``socket.socketpair`` (one ephemeral bind plus a connect
+    back) — internal bookkeeping, not serving traffic. The pair is tagged at
+    creation so every other network, process, database, or write attempt in
+    the window still fails the test.
+    """
+
+    def __init__(
+        self, *, allow_config_reads: bool = False, allowed_database: Path | None = None
+    ) -> None:
+        self.allow_config_reads = allow_config_reads
+        self.allowed_database = allowed_database
+        self.issues: list[str] = []
+        self._mark = 0
+        self._bookkeeping: set[int] = set()
+        self._real_socketpair = socket.socketpair
+
+    def _tagging_socketpair(self, *args: Any, **kwargs: Any) -> Any:
+        # Every network event raised while CPython assembles the pair — the
+        # fallback's short-lived listener included — is wakeup bookkeeping.
+        start = len(_AUDIT_EVENTS)
+        try:
+            return self._real_socketpair(*args, **kwargs)
+        finally:
+            for index in range(start, len(_AUDIT_EVENTS)):
+                if _AUDIT_EVENTS[index][0].startswith(_NETWORK_EVENTS):
+                    self._bookkeeping.add(index)
+
+    def __enter__(self) -> _ServingAudit:
+        self._mark = len(_AUDIT_EVENTS)
+        socket.socketpair = self._tagging_socketpair
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        socket.socketpair = self._real_socketpair
+        events = [
+            (event, args)
+            for offset, (event, args) in enumerate(_AUDIT_EVENTS[self._mark :])
+            if self._mark + offset not in self._bookkeeping
+        ]
+        self.issues = _side_effect_violations(
+            events,
+            allow_config_reads=self.allow_config_reads,
+            allowed_database=self.allowed_database,
+        )
+
+
+def test_supervision_failure_through_the_lifespan_exits_nonzero(
+    main_module: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real supervision failure ends the lifespan loudly; main returns nonzero.
+
+    The injected runner drives the composed app through the real ASGI lifespan
+    protocol — the seam the default uvicorn runner uses — and refuses to report
+    a healthy serve when supervision failed during startup.
+    """
+    _forbid_real_serving(monkeypatch)
+    _with_exploding_first_tick(monkeypatch)
+    path = tmp_path / "controller.yaml"
+    _write_valid_config(path, tmp_path / "controller.sqlite3")
+    events: list[dict[str, Any]] = []
+
+    def lifespan_runner(app: Any, *, host: str, port: int) -> None:
+        async def drive() -> None:
+            incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            incoming.put_nowait({"type": "lifespan.startup"})
+
+            async def receive() -> dict[str, Any]:
+                return await incoming.get()
+
+            async def record(message: dict[str, Any]) -> None:
+                events.append(message)
+
+            await app(
+                {"type": "lifespan", "asgi": {"version": "3.0", "spec_version": "2.3"}},
+                receive,
+                record,
+            )
+
+        asyncio.run(drive())
+        if not any(message["type"] == "lifespan.startup.complete" for message in events):
+            raise RuntimeError("the application lifespan never completed startup")
+
+    with _ServingAudit(allow_config_reads=True) as audit:
+        invocation = call_main(main_module, ["simulate", str(path)], capsys, runner=lifespan_runner)
+    assert_failed_cleanly(invocation)
+    assert any(message["type"] == "lifespan.startup.failed" for message in events), events
+    assert "serving failed" in invocation.stderr, invocation.report()
+    assert audit.issues == []
+    assert not (tmp_path / "controller.sqlite3").exists()
+
+
+def test_default_runner_exits_nonzero_when_supervision_fails_during_startup(
+    main_module: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default uvicorn path: supervision failure stops serving, exit 1.
+
+    Drives ``main`` with ``server_runner=None`` — the real uvicorn runner —
+    against a genuinely composed runtime whose kernel dies on its first tick.
+    uvicorn itself exits on a failed lifespan startup; this pins that the
+    process outcome is a structured nonzero return, not a healthy serve.
+    """
+    _with_exploding_first_tick(monkeypatch)
+    _prevent_listener_sockets(monkeypatch)
+    path = tmp_path / "controller.yaml"
+    _write_valid_config(path, tmp_path / "controller.sqlite3")
+    with _ServingAudit(allow_config_reads=True) as audit:
+        capsys.readouterr()
+        exit_code = main_module.main(["simulate", str(path)])
+        captured = capsys.readouterr()
+    assert exit_code == 1, captured.err
+    assert "serving failed" in captured.err
+    assert "supervision failed during startup" in captured.err
+    assert audit.issues == [], "the startup-failure path must never bind a port"
+    assert not (tmp_path / "controller.sqlite3").exists()
+
+
+class _HaltingLifespanApp:
+    """Pure-ASGI app whose supervision dies mid-run, after a healthy startup.
+
+    Models the three ways a halted supervisor becomes observable to serving:
+    ending its lifespan with a failure message, ending it unrequested, or
+    staying suspended while only recording the halt on application state.
+    """
+
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+        self.state = State()
+        self.shutdown_received = False
+        self.served_types: list[str] = []
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "lifespan":
+            self.served_types.append(scope["type"])
+            return
+        first = await receive()
+        assert first["type"] == "lifespan.startup"
+        await send({"type": "lifespan.startup.complete"})
+        if self.mode == "halt_marker":
+            # The lifespan stays suspended: a dead supervisor can still record
+            # the halt on application state, nothing more.
+            self.state.energypod_supervision_halt_reason = "supervisor_failure"
+            message = await receive()
+            assert message["type"] == "lifespan.shutdown"
+            self.shutdown_received = True
+            await send({"type": "lifespan.shutdown.complete"})
+            return
+        await asyncio.sleep(0.05)
+        if self.mode == "shutdown_failed":
+            await send(
+                {
+                    "type": "lifespan.shutdown.failed",
+                    "message": "supervision halted: supervisor_failure",
+                }
+            )
+            return
+        await send({"type": "lifespan.shutdown.complete"})
+
+
+@pytest.mark.parametrize("mode", ["shutdown_failed", "unsolicited_complete", "halt_marker"])
+def test_default_runner_stops_serving_when_the_lifespan_halts_mid_run(
+    main_module: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    """The default runner may not wait forever: a lifespan that ends or halts
+    by itself must stop serving and return a nonzero exit code."""
+    app = _HaltingLifespanApp(mode)
+    composition = importlib.import_module("energypod.runtime.composition")
+
+    def stub_build(*args: Any, **kwargs: Any) -> Any:
+        return SimpleNamespace(app=app, actors={})
+
+    monkeypatch.setattr(composition, "build_runtime", stub_build)
+    _prevent_listener_sockets(monkeypatch)
+    path = tmp_path / "controller.yaml"
+    _write_valid_config(path, tmp_path / "controller.sqlite3")
+    with _ServingAudit(allow_config_reads=True) as audit:
+        capsys.readouterr()
+        exit_code = main_module.main(["simulate", str(path)])
+        captured = capsys.readouterr()
+    assert exit_code == 1, f"serving outlived supervision (mode={mode}): {captured.err}"
+    assert "serving failed" in captured.err
+    if mode == "halt_marker":
+        assert "supervision halted: supervisor_failure" in captured.err
+        assert app.shutdown_received, "stopping serving must still shut the lifespan down cleanly"
+    assert audit.issues == []
+    assert not (tmp_path / "controller.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    ("attribute", "reason", "must_fail"),
+    [
+        ("energypod_supervision_halt_reason", "supervisor_failure", True),
+        ("energypod_supervision_halt_reason", "supervision_shutdown", False),
+        ("supervision_state", "supervisor_failure", True),
+        ("supervision_state", "running", False),
+    ],
+)
+def test_recorded_supervision_halt_decides_the_exit_code(
+    main_module: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    reason: str,
+    must_fail: bool,
+) -> None:
+    """A halt recorded on the app decides the exit even if the runner settled.
+
+    Composition owns recording the halt on application state; main must fail
+    closed on it (and only an operator-driven halt may still exit zero). A
+    supervision-named value that names a failure halts too, while healthy
+    supervision state may never read as a halt.
+    """
+    _forbid_real_serving(monkeypatch)
+    _wrap_build_runtime(monkeypatch)
+    path = tmp_path / "controller.yaml"
+    _write_valid_config(path, tmp_path / "controller.sqlite3")
+    calls: list[Any] = []
+
+    def recording_runner(app: Any, *, host: str, port: int) -> Any:
+        calls.append(app)
+        setattr(app.state, attribute, reason)
+        return _Completed()
+
+    with _ServingAudit(allow_config_reads=True) as audit:
+        invocation = call_main(
+            main_module, ["simulate", str(path)], capsys, runner=recording_runner
+        )
+    assert len(calls) == 1
+    if must_fail:
+        assert invocation.exit_code == 1, invocation.report()
+        assert "supervision halted: supervisor_failure" in invocation.stderr, invocation.report()
+    else:
+        assert invocation.exit_code == 0, invocation.report()
+    assert audit.issues == []

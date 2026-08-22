@@ -379,6 +379,9 @@ class EnergyPodActor:
         if self._latching_fault_present(observation):
             await self._accept_blocking_fault_owned()
             return
+        if self._identity_mismatch(observation):
+            await self._accept_identity_mismatch_owned()
+            return
         if self._qualifies(observation):
             observation_epoch = observation.connection_epoch
             if self._connection_epoch not in {None, observation_epoch}:
@@ -455,6 +458,31 @@ class EnergyPodActor:
             self._stable_observations = 0
             return
         await self._inhibit_owned("blocking_fault_active", InhibitCause.LATCHED)
+
+    def _identity_mismatch(self, observation: Any) -> bool:
+        """Whether the observation contradicts this unit's commissioned identity.
+
+        An absent identity is the honest unknown, not a contradiction: it
+        fails qualification without latching.  A presented-but-different
+        device identity or protocol profile is ARCHITECTURE 8.1's latched
+        "identity mismatch": another device is speaking on this transport, so
+        only a privileged acknowledgement may re-qualify the unit.
+        """
+        identity = getattr(observation, "device_identity", None)
+        if identity is not None and identity != self._expected_identity:
+            return True
+        profile = getattr(observation, "protocol_profile", None)
+        return profile is not None and profile != self._expected_profile
+
+    async def _accept_identity_mismatch_owned(self) -> None:
+        """Latch on an identity mismatch; acknowledgement is the only exit."""
+        if self.lifecycle is UnitLifecycle.INHIBITED and self.inhibit_latched:
+            # The mismatch persists: hold the standing latch and keep the
+            # stable-sample count at zero so recovery cannot proceed
+            # underneath it.
+            self._stable_observations = 0
+            return
+        await self._inhibit_owned("identity_mismatch", InhibitCause.LATCHED)
 
     def _qualifies(self, observation: Any) -> bool:
         complete = getattr(observation, "complete", None)
@@ -643,7 +671,12 @@ class EnergyPodActor:
     def _record_inhibit_cause(self, cause: InhibitCause) -> None:
         # Entering INHIBITED always records a cause class.  Only LATCHED sets
         # the latch; TRANSIENT/QUALIFIED keep the existing stable-sample
-        # recovery behavior (ADR-0003 D5).
+        # recovery behavior (ADR-0003 D5).  A standing latch is never
+        # downgraded by a later non-latched cause: lifecycle ordering keeps
+        # transient inhibit paths out of a latched unit today, and this guard
+        # keeps the latch true even if a future path forgets that ordering.
+        if self.inhibit_latched and cause is not InhibitCause.LATCHED:
+            return
         self.inhibit_cause = cause
         self.inhibit_latched = cause is InhibitCause.LATCHED
 

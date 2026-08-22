@@ -74,12 +74,16 @@ class _Subscription:
         queue_capacity: int,
         cursor: int,
         replay: tuple[dict[str, Any], ...] = (),
-        resync_reason: str | None = None,
+        resync: tuple[str, int] | None = None,
     ) -> None:
         self._bus = bus
         self._cursor = cursor
         self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=queue_capacity)
-        self._pending_resync = resync_reason
+        # (reason, snapshot_sequence): the snapshot point is fixed when the
+        # discontinuity is detected, never restamped from the live sequence at
+        # delivery time, so nothing older than the announced snapshot can be
+        # delivered after the marker.
+        self._pending_resync = resync
         self._closed = False
         for event in replay:
             self._queue.put_nowait(event)
@@ -90,16 +94,23 @@ class _Subscription:
     async def __anext__(self) -> dict[str, Any]:
         if self._closed:
             raise StopAsyncIteration
-        if self._pending_resync is not None:
-            # The marker precedes any queued event so the client learns about
-            # the discontinuity before consuming newer state.
-            reason = self._pending_resync
-            self._pending_resync = None
-            return _resync_marker(reason, self._bus.snapshot_sequence())
-        event = await self._queue.get()
-        if event is None or self._closed:
-            raise StopAsyncIteration
-        return event
+        if self._pending_resync is None:
+            event = await self._queue.get()
+            if event is None or self._closed:
+                raise StopAsyncIteration
+            if self._pending_resync is None:
+                return event
+            # A drop-to-resync fired while this reader was parked on the
+            # queue: the discontinuity precedes the event the queue just
+            # handed over, so the marker still goes first. Requeueing is
+            # safe because the slot this event occupied is now free.
+            self._queue.put_nowait(event)
+        # The marker precedes any queued event so the client learns about
+        # the discontinuity before consuming newer state.
+        reason, snapshot_sequence = self._pending_resync
+        self._pending_resync = None
+        self._drop_superseded(snapshot_sequence)
+        return _resync_marker(reason, snapshot_sequence)
 
     async def aclose(self) -> None:
         self._bus._detach(self)
@@ -116,11 +127,46 @@ class _Subscription:
             self._queue.put_nowait(event)
         except asyncio.QueueFull:
             # Drop-to-resync: discard the backlog, flag the discontinuity, and
-            # keep only the newest event so the live edge always survives.
+            # keep only the newest event so the live edge always survives. The
+            # marker's snapshot point is that surviving event's sequence: every
+            # event queued after the drop is strictly newer, so a client that
+            # resynchronizes from the announced snapshot is never handed
+            # history the snapshot already supersedes.
             while not self._queue.empty():
                 self._queue.get_nowait()
-            self._pending_resync = _RESYNC_SLOW_CONSUMER
+            if self._pending_resync is None:
+                # A later drop while a marker is already pending keeps the
+                # first (oldest) snapshot point: it stays a lower bound for
+                # everything still queued behind the pending marker.
+                self._pending_resync = (_RESYNC_SLOW_CONSUMER, event["sequence"])
             self._queue.put_nowait(event)
+
+    def _drop_superseded(self, snapshot_sequence: int) -> None:
+        """Discard queued events older than the marker's snapshot point.
+
+        By construction the queue only holds events at least as new as the
+        pending marker's snapshot point; draining here keeps that guarantee
+        local to marker delivery instead of trusting every producer of a
+        pending marker. The drain and re-queue are one synchronous section,
+        so no publication can interleave and overflow the queue.
+        """
+        retained: list[dict[str, Any] | None] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(item, dict):
+                sequence = item.get("sequence")
+                if (
+                    isinstance(sequence, int)
+                    and not isinstance(sequence, bool)
+                    and sequence < snapshot_sequence
+                ):
+                    continue
+            retained.append(item)
+        for item in retained:
+            self._queue.put_nowait(item)
 
 
 class EventBus:
@@ -164,20 +210,20 @@ class EventBus:
         nothing. Envelopes are shared between subscribers and the retention
         window and must be treated as immutable.
         """
-        cursor, replay, resync_reason = self._subscription_start(after_sequence)
+        cursor, replay, resync = self._subscription_start(after_sequence)
         subscription = _Subscription(
             self,
             queue_capacity=self._queue_capacity,
             cursor=cursor,
             replay=replay,
-            resync_reason=resync_reason,
+            resync=resync,
         )
         self._subscribers.append(subscription)
         return subscription
 
     def _subscription_start(
         self, after_sequence: int | None
-    ) -> tuple[int, tuple[dict[str, Any], ...], str | None]:
+    ) -> tuple[int, tuple[dict[str, Any], ...], tuple[str, int] | None]:
         if after_sequence is None:
             # A cursor-less subscription is live-only; it never replays.
             return self._sequence, (), None
@@ -187,13 +233,17 @@ class EventBus:
                 # The cursor predates the retained window: events it still
                 # needs were evicted, so resynchronize instead of replaying a
                 # partial history that would look contiguous to the client.
-                return self._sequence, (), _RESYNC_STALE_CURSOR
+                return self._sequence, (), (_RESYNC_STALE_CURSOR, self._sequence)
         replay = tuple(event for event in self._window if event["sequence"] > after_sequence)
-        if len(replay) > self._queue_capacity:
-            # The bounded queue cannot hold the requested window; the
-            # subscriber takes the same resynchronization path as a stale
-            # cursor rather than a silently truncated replay.
-            return self._sequence, (), _RESYNC_STALE_CURSOR
+        if len(replay) >= self._queue_capacity:
+            # The bounded queue must hold the replay AND leave a slot for the
+            # live edge: a replay that exactly fills it would leave the very
+            # first live publish no room, which would annihilate the whole
+            # replay as a spurious slow-consumer drop. Such a subscriber takes
+            # the same resynchronization path as a stale cursor — told up
+            # front, before any replayed event is delivered — rather than a
+            # silently truncated replay.
+            return self._sequence, (), (_RESYNC_STALE_CURSOR, self._sequence)
         return after_sequence, replay, None
 
     def _occurred_at(self) -> str:

@@ -9,13 +9,15 @@ ever published by the control kernel, never by this module.
 
 The safety order inside ``emergency_stop`` is fixed and may not be reordered:
 fence the fleet generation first, then revoke outstanding fleet
-authorizations, then request the bounded zero through the affected actors, and
-only then audit and publish.  A degraded dependency anywhere in that sequence
-may turn the response into an error, but it never removes a step.
+authorizations, then fence every affected actor (cancelling any in-flight
+nonzero heartbeat write), then request the bounded zero through those actors,
+and only then audit and publish.  A degraded dependency anywhere in that
+sequence may turn the response into an error, but it never removes a step.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import math
@@ -111,7 +113,10 @@ class ActorHandle(Protocol):
 
     ``qualified`` and ``inhibit_latched`` are read defensively through
     ``getattr`` because a handle that cannot report them is itself a reason to
-    refuse: an unknown state is never treated as permission.
+    refuse: an unknown state is never treated as permission.  ``fence`` is
+    read the same way: a handle that cannot fence cannot cancel an in-flight
+    nonzero write, so an emergency stop reports the unit as degraded instead
+    of assuming the cancellation happened.
     """
 
     @property
@@ -215,6 +220,19 @@ def _correlation_key(value: Any, name: str) -> str:
     if not isinstance(value, str) or _ID_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{name} must be a canonical identifier")
     return value
+
+
+def _attach_stop_id(error: BaseException, stop_id: str) -> None:
+    """Carry a latched stop's id on an error so it stays correlateable.
+
+    ``emergency_stop`` completes its safety sequence before any caller-facing
+    error surfaces; the guarded boundary must be able to register the id for
+    a later acknowledgement.  Slot-bound exceptions cannot carry the
+    attribute; the id is then simply unavailable to the caller, never
+    fabricated.
+    """
+    with contextlib.suppress(AttributeError, TypeError):
+        error.stop_id = stop_id  # type: ignore[attr-defined]
 
 
 def _requested_power(unit_id: str, intents: Sequence[Any]) -> dict[str, Any]:
@@ -338,6 +356,9 @@ class EnergyServiceFacade:
             isinstance(cursor, bool) or type(cursor) is not int or cursor < 0
         ):
             raise ValueError("cursor must be a non-negative integer")
+        # The cursor is the audit port's own ordering key: it is passed
+        # through as ``after_sequence`` and the next cursor is derived from
+        # what the store returned, never from facade-side bookkeeping.
         events = list(await self._audit.recent(limit=limit, after_sequence=cursor))
         # The cursor names the oldest delivered event so pagination resumes
         # with strictly older facts; a short terminal page leaves no cursor.
@@ -362,7 +383,12 @@ class EnergyServiceFacade:
         idempotency_key: Any,
         request_id: Any,
     ) -> dict[str, Any]:
-        """Accept one intent with a server-assigned revision; grant nothing."""
+        """Accept one intent with a server-assigned revision; grant nothing.
+
+        Acceptance is atomic with its audit and publication: if either fails,
+        the stored intent is rolled back and the error surfaces, so power can
+        never flow from a dispatch the caller saw fail.
+        """
         self._admit(principal, "dispatch")
         units = _validated_units(unit_ids)
         unknown = [unit_id for unit_id in units if unit_id not in self._actors]
@@ -390,35 +416,45 @@ class EnergyServiceFacade:
             actor_identity=principal.subject,
         )
         await self._intents.add(intent)
-        await self._append_audit(
-            self._mutation_audit(
-                event_type="intent_accepted",
-                subject=principal.subject,
-                result="accepted",
-                request_id=request,
-                source=IntentSource.MANUAL,
-                intent_id=intent_id,
-                reason_codes=("accepted",),
-                # Acceptance alone moves no unit; authority comes only from a
-                # kernel tick, so the fleet stays in its non-active state.
-                lifecycle=UnitLifecycle.DISARMED,
-                payload={
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="intent_accepted",
+                    subject=principal.subject,
+                    result="accepted",
+                    request_id=request,
+                    source=IntentSource.MANUAL,
+                    intent_id=intent_id,
+                    reason_codes=("accepted",),
+                    # Acceptance alone moves no unit; authority comes only from a
+                    # kernel tick, so the fleet stays in its non-active state.
+                    lifecycle=UnitLifecycle.DISARMED,
+                    payload={
+                        "direction": resolved_direction.value,
+                        "unit_ids": sorted(units),
+                        "watts": resolved_watts,
+                    },
+                )
+            )
+            await self._publish(
+                "intent.accepted",
+                {
+                    "principal": principal.subject,
+                    "intent_id": intent_id,
                     "direction": resolved_direction.value,
-                    "unit_ids": sorted(units),
                     "watts": resolved_watts,
+                    "unit_ids": sorted(units),
                 },
             )
-        )
-        await self._publish(
-            "intent.accepted",
-            {
-                "principal": principal.subject,
-                "intent_id": intent_id,
-                "direction": resolved_direction.value,
-                "watts": resolved_watts,
-                "unit_ids": sorted(units),
-            },
-        )
+        except Exception:
+            # Acceptance is atomic with its audit and publication: a dispatch
+            # the caller saw fail must leave nothing stored for the kernel to
+            # arbitrate on the next tick.  A rollback failure cannot be
+            # allowed to mask the original error; the stored intent is then
+            # the residual risk the operator still has to see reported.
+            with contextlib.suppress(Exception):
+                await self._intents.remove(intent_id)
+            raise
         return {
             "intent_id": intent_id,
             "acceptance_revision": revision,
@@ -506,7 +542,7 @@ class EnergyServiceFacade:
         idempotency_key: Any,
         request_id: Any,
     ) -> dict[str, Any]:
-        """Latch one fleet stop: fence, revoke, bounded zero, then audit and publish."""
+        """Latch one fleet stop: fence, revoke, fence actors, zero, audit, publish."""
         self._admit(principal, "stop")
         units = _validated_units(unit_ids)
         stop_reason = _reason_text(reason, required=True)
@@ -550,21 +586,45 @@ class EnergyServiceFacade:
             await self._authorizations.revoke(reason=f"emergency_stop:{stop_id}")
         except Exception:
             degraded.append("revocation_unconfirmed")
-        # 3. Record the latch so exact-id acknowledgement can find it, then
-        # store the latched intent best-effort.
-        self._latched_stops[stop_id] = _LatchedStop(
-            stop_id=stop_id,
-            unit_ids=selected,
-            created_at_mono=now_mono,
-            fenced_generation=fenced_generation,
-        )
+        # 3. Fence every affected actor before any potentially blocking store
+        # work: the actor's fence cancels an in-flight nonzero heartbeat write
+        # and publishes its own revocation, so a dispatched nonzero command
+        # can never complete on the wire after this stop returns.  The bounded
+        # zero alone cannot promise that; it only queues behind whatever the
+        # actor is already doing.
+        for unit_id in units:
+            handle = self._actors.get(unit_id)
+            if handle is None:
+                continue
+            fence = getattr(handle, "fence", None)
+            if fence is None:
+                # A handle that cannot fence cannot cancel in-flight authority
+                # work; the stop stays visible as degraded, never assumed safe.
+                degraded.append(f"actor_fence_unavailable:{unit_id}")
+                continue
+            try:
+                await fence(f"emergency_stop:{stop_id}")
+            except Exception:
+                degraded.append(f"actor_fence_failed:{unit_id}")
+        # 4. Store the latched intent, then record the latch here only once
+        # the store holds it: a registry entry without its stored intent is a
+        # phantom latch no acknowledgement could ever satisfy, so a degraded
+        # store leaves nothing half-latched.  The caller sees the failure and
+        # re-issues the stop; the safety work above has already landed.
         store_error: Exception | None = None
         try:
             await self._intents.add(intent)
         except Exception as error:
             store_error = error
             degraded.append("intent_store_unavailable")
-        # 4. Bounded zero through every affected actor handle.
+        else:
+            self._latched_stops[stop_id] = _LatchedStop(
+                stop_id=stop_id,
+                unit_ids=selected,
+                created_at_mono=now_mono,
+                fenced_generation=fenced_generation,
+            )
+        # 5. Bounded zero through every affected actor handle.
         for unit_id in units:
             handle = self._actors.get(unit_id)
             if handle is None:
@@ -574,7 +634,7 @@ class EnergyServiceFacade:
                 await handle.request_bounded_zero(stop_reason)
             except Exception:
                 degraded.append(f"bounded_zero_failed:{unit_id}")
-        # 5/6. Audit and publish only after the safety work has landed.
+        # 6/7. Audit and publish only after the safety work has landed.
         try:
             await self._append_audit(
                 self._mutation_audit(
@@ -615,11 +675,17 @@ class EnergyServiceFacade:
             degraded.append("publish_unavailable")
 
         # The safety sequence is complete; only now may caller-facing errors
-        # surface, and never by undoing any step above.
+        # surface, and never by undoing any step above.  Every error path
+        # carries the stop id: the store-refused stop never latched (so the
+        # operator correlates and re-issues it), while the unknown-unit stop
+        # latched for the known units and stays acknowledgeable by id.
         if store_error is not None:
+            _attach_stop_id(store_error, stop_id)
             raise store_error
         if unknown:
-            raise ValueError(f"unknown units requested for emergency stop: {unknown}")
+            unknown_error = ValueError(f"unknown units requested for emergency stop: {unknown}")
+            _attach_stop_id(unknown_error, stop_id)
+            raise unknown_error
         return {
             "stop_id": stop_id,
             "status": "latched",
@@ -659,7 +725,13 @@ class EnergyServiceFacade:
             )
             if not live:
                 raise LookupError(f"no latched emergency stop with id {stop_id!r}")
-        await self._intents.remove(stop_id)
+        # A fleet-wide registry latch outranks the stored copy: if the intent
+        # was already removed out-of-band, the acknowledgement must still
+        # clear the latch rather than leave a registry entry no retry could
+        # ever satisfy.  Any other store failure propagates before the
+        # registry is consumed, leaving the latch for a retried call.
+        with contextlib.suppress(LookupError):
+            await self._intents.remove(stop_id)
         self._latched_stops.pop(stop_id, None)
         self._acknowledged_stops.add(stop_id)
         await self._append_audit(

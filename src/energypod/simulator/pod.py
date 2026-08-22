@@ -222,12 +222,19 @@ class SimulatedEnergyPod:
 
         The transport enforces the write gate, but the device model refuses a
         malformed frame independently: no caller can half-latch an objective.
+        Shape, header, and both signed-16 payload words are validated and
+        decoded into locals before any instance state changes, so a frame that
+        fails on its last word leaves the latched objective, the watchdog
+        lease, and every served register bit-for-bit unchanged.
         """
-        if len(frame) != 3 or frame[0] != _PQ_HEADER_WORD:
+        if len(frame) != 3 or type(frame[0]) is not int or frame[0] != _PQ_HEADER_WORD:
             raise ValueError("only the evidenced three-register PQ objective is applicable")
-        self._applied_active_w = protocol_codec.decode_signed16(frame[1])
-        self._applied_reactive_var = protocol_codec.decode_signed16(frame[2])
-        self._lease_deadline_mono = float(self._clock.monotonic()) + self._watchdog_timeout_s
+        active_w = protocol_codec.decode_signed16(frame[1])
+        reactive_var = protocol_codec.decode_signed16(frame[2])
+        lease_deadline_mono = float(self._clock.monotonic()) + self._watchdog_timeout_s
+        self._applied_active_w = active_w
+        self._applied_reactive_var = reactive_var
+        self._lease_deadline_mono = lease_deadline_mono
         self._rebuild()
 
     def read(self, address: int, count: int) -> tuple[int, ...]:
@@ -474,6 +481,12 @@ class SimulatedEnergyPod:
         self._blocks[_PARAMETERS_BASE] = parameters
 
     def _served_window(self, address: int, count: int) -> list[int]:
+        # A device serves no window at all for a non-positive or non-integer
+        # register count (an FC03 quantity of 0 is a protocol violation), so
+        # the pod refuses it exactly like an unmapped window instead of
+        # serving a truncated or empty slice.
+        if type(count) is not int or count < 1:
+            raise ValueError("count must define a non-empty register window")
         for base, words in self._blocks.items():
             if base <= address and address + count <= base + len(words):
                 return words[address - base : address + count - base]

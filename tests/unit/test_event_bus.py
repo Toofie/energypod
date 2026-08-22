@@ -274,6 +274,119 @@ async def test_replayed_window_transitions_into_live_events_without_a_gap(
     await close_subscription(iterator)
 
 
+@pytest.mark.parametrize(
+    ("queue_capacity", "published"),
+    [(3, 5), (128, 300)],
+)
+async def test_replay_exactly_at_capacity_is_refused_up_front_not_annihilated(
+    bus_module: Any, queue_capacity: int, published: int
+) -> None:
+    # A replay that exactly fills the per-subscriber queue leaves no slot for
+    # the live edge, so the FIRST live publish would hit the QueueFull drop
+    # path, discard the whole undelivered replay, and surface it as a spurious
+    # slow-consumer resync (the off-by-one). The (128, 300) shape is the
+    # composed runtime (retention=1024, queue_capacity=128): a direct
+    # subscriber exactly 128 behind must not take that path either.
+    bus = make_bus(bus_module, retention=published, queue_capacity=queue_capacity)
+    await publish_events(bus, start=0, count=published)
+    iterator = bus.subscribe(after_sequence=published - queue_capacity)
+    # Replay length is exactly queue_capacity; this is the first live publish.
+    await publish_event(bus, "observation.updated", {"index": published})
+
+    events = await drain(iterator, queue_capacity + 2)
+    assert events, "the subscription must say something after the live publish"
+    assert is_resync_marker(events[0]), (
+        "an exact-capacity replay must be refused with an explicit marker before "
+        f"anything is delivered, saw {events!r}"
+    )
+    numbered = [event["sequence"] for event in events if has_int_sequence(event)]
+    assert numbered == [published + 1], (
+        "the live edge must survive; the replayed window must not be half "
+        f"delivered then silently annihilated, saw {events!r}"
+    )
+    marker = events[0]
+    assert marker["reason"] == "retention_window_exceeded"
+    assert marker["snapshot_sequence"] == published
+    assert all(sequence >= marker["snapshot_sequence"] for sequence in numbered)
+    await close_subscription(iterator)
+
+
+async def test_replay_one_below_capacity_keeps_room_for_the_first_live_publish(
+    bus_module: Any,
+) -> None:
+    # The other side of the off-by-one boundary: a replay of capacity-1 leaves
+    # one reserved slot, so the first live publish must extend the replayed
+    # window contiguously instead of triggering a drop-to-resync.
+    bus = make_bus(bus_module, retention=64, queue_capacity=4)
+    await publish_events(bus, start=0, count=5)
+    iterator = bus.subscribe(after_sequence=2)  # replay [3, 4, 5], one slot free
+    await publish_event(bus, "observation.updated", {"index": 5})  # sequence 6
+    events = await drain(iterator, 6)
+    assert [event["sequence"] for event in events] == [3, 4, 5, 6]
+    assert not any(is_resync_marker(event) for event in events), (
+        "an in-window cursor with queue headroom must see neither a marker nor a skipped live head"
+    )
+    await close_subscription(iterator)
+
+
+@pytest.mark.parametrize("published", [4, 6])
+async def test_no_event_after_a_marker_is_older_than_the_markers_snapshot_point(
+    bus_module: Any, published: int
+) -> None:
+    # Publications continue while the subscriber is gated between the drop and
+    # its first read (all reads happen after the publishes here, which builds
+    # exactly that state deterministically). The marker must not be stamped
+    # with the live sequence at delivery time: a client that resynchronizes
+    # from the announced snapshot would otherwise be handed history that
+    # snapshot already supersedes — the stale replay the marker exists to
+    # prevent. With capacity 2 the drop fires at sequence 3 and publications
+    # run to `published`, so the first drop's snapshot point is 3.
+    bus = make_bus(bus_module, retention=64, queue_capacity=2)
+    iterator = bus.subscribe(after_sequence=0)
+    await publish_events(bus, start=0, count=published)
+
+    marker = await next_event(iterator)
+    assert is_resync_marker(marker), f"expected a discontinuity marker, got {marker!r}"
+    assert marker["reason"] == "slow_subscriber"
+    assert marker["snapshot_sequence"] == 3
+
+    rest = await drain(iterator, published)
+    numbered = [event["sequence"] for event in rest if has_int_sequence(event)]
+    assert numbered, "the live edge must still reach the subscriber after the marker"
+    assert numbered == sorted(set(numbered))
+    assert all(sequence >= marker["snapshot_sequence"] for sequence in numbered), (
+        f"event older than the marker's snapshot point was delivered: {rest!r}"
+    )
+    await close_subscription(iterator)
+
+
+async def test_marker_precedes_the_event_handed_to_a_reader_parked_across_the_drop(
+    bus_module: Any,
+) -> None:
+    # A drop that fires while a consumer is parked inside __anext__ must not
+    # let the parked reader surface the retained event first: downstream
+    # adapters terminate on the first discontinuity they observe, and a
+    # numbered event with a jumped sequence would be misdiagnosed as a gap
+    # instead of carrying the bus's own slow-consumer reason.
+    bus = make_bus(bus_module, retention=64, queue_capacity=4)
+    iterator = bus.subscribe(after_sequence=0)
+    parked = asyncio.create_task(anext(iterator))
+    await asyncio.sleep(0)  # the reader is now parked on the queue getter
+    # One turn of publications: 1..4 fill the queue, 5 triggers the drop while
+    # the reader is still parked, so the queue hands it the retained event.
+    await publish_events(bus, start=0, count=5)
+
+    first = await parked
+    assert is_resync_marker(first), f"the marker must come first, saw {first!r}"
+    assert first["reason"] == "slow_subscriber"
+    assert first["snapshot_sequence"] == 5
+
+    rest = await drain(iterator, 5)
+    numbered = [event["sequence"] for event in rest if has_int_sequence(event)]
+    assert numbered == [5], "only the retained live edge may follow the marker"
+    await close_subscription(iterator)
+
+
 async def test_stale_cursor_resyncs_from_live_edge_instead_of_replaying_history(
     bus_module: Any,
 ) -> None:

@@ -34,6 +34,7 @@ import contextlib
 import hashlib
 import itertools
 import json
+import sqlite3
 import time
 import uuid
 from collections import deque
@@ -61,6 +62,7 @@ from energypod.adapters.persistence.memory import (
     InMemoryObservationRepository,
 )
 from energypod.adapters.persistence.sqlite import (
+    PersistenceBusyError,
     SQLiteAuditRepository,
     SQLiteDatabase,
     SQLiteScheduleRepository,
@@ -103,6 +105,7 @@ _MAX_IN_MEMORY_INTENTS = 4096
 # Commissioning-plausible IoT cell topology for the deterministic simulator:
 # ten cells per BIC, at most the evidenced six-BIC packing.
 _CELLS_PER_BIC = 10
+_TEMPERATURES_PER_BIC = 3
 _MAX_SIMULATOR_BICS = 6
 
 # The only evidenced writable objective is FC16 at 0x0200 with [1, P, Q].
@@ -180,15 +183,57 @@ def _finite_nonnegative(value: Any) -> float | None:
 # ---------------------------------------------------------------------------
 
 
+class _SequencedAuditEvent(AuditEvent):
+    """The audit read model: one durable fact plus its store sequence.
+
+    ``AuditEvent`` is the write model (a fact, immutable, exactly what was
+    appended); the pagination cursor needs the store's own ordering key next
+    to it.  The projection is a subclass so every consumer of ``AuditEvent``
+    — facade snapshots, REST/MCP serialization, audit assertions — keeps
+    working unchanged while ``recent_audit`` can name the oldest delivered
+    fact and resume strictly below it.
+    """
+
+    sequence: int
+
+
+def _with_sequence(event: AuditEvent, sequence: int) -> _SequencedAuditEvent:
+    """Project one stored fact into the sequenced read model."""
+    if type(sequence) is not int or sequence < 0:  # pragma: no cover - store invariant
+        raise ValueError("audit sequence must be a non-negative integer")
+    values = {name: value for name, value in event.__dict__.items() if name != "sequence"}
+    return _SequencedAuditEvent.model_construct(sequence=sequence, **values)
+
+
+def _validate_after_sequence(after_sequence: int | None) -> None:
+    if after_sequence is not None and (
+        type(after_sequence) is not int or isinstance(after_sequence, bool) or after_sequence < 0
+    ):
+        raise ValueError("after_sequence must be a non-negative integer")
+
+
+def _sqlite_busy(exc: sqlite3.OperationalError) -> bool:
+    # Mirrors the durable store's own busy classification so the read bridge
+    # reports contention identically instead of leaking a raw driver error.
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
 class _InMemoryAuditRepository:
-    """Bounded, newest-first audit mirror of the SQLite audit contract."""
+    """Bounded, newest-first audit mirror of the SQLite audit contract.
+
+    Every append takes the next monotone store sequence, so the read model
+    carries the same stable cursor the durable rows provide and the facade can
+    page past one page in database-less deployments too.
+    """
 
     def __init__(self, *, max_events: int) -> None:
         if type(max_events) is not int or max_events <= 0:
             raise ValueError("max_events must be positive")
-        self._events: deque[Any] = deque()
+        self._events: deque[tuple[int, Any]] = deque()
         self._seen_event_ids: set[str] = set()
         self._max_events = max_events
+        self._sequence = 0
 
     def append(self, event: Any) -> None:
         event_id = getattr(event, "event_id", None)
@@ -198,26 +243,76 @@ class _InMemoryAuditRepository:
             # Duplicate audit facts are refused exactly like the durable store.
             raise DuplicateAuditEventError(event_id)
         self._seen_event_ids.add(event_id)
-        self._events.append(event)
+        self._sequence += 1
+        self._events.append((self._sequence, event))
         while len(self._events) > self._max_events:
-            evicted = self._events.popleft()
+            _, evicted = self._events.popleft()
             evicted_id = getattr(evicted, "event_id", None)
             if isinstance(evicted_id, str):
                 self._seen_event_ids.discard(evicted_id)
 
-    def recent(self, *, limit: int, unit_id: str | None = None) -> tuple[Any, ...]:
+    def recent(
+        self, *, limit: int, unit_id: str | None = None, after_sequence: int | None = None
+    ) -> tuple[Any, ...]:
         if type(limit) is not int or limit <= 0:
             raise ValueError("limit must be positive")
         if unit_id is not None and (
             not isinstance(unit_id, str) or not unit_id or unit_id != unit_id.strip()
         ):
             raise ValueError("unit_id must be non-empty and normalized")
+        _validate_after_sequence(after_sequence)
         selected = [
-            event
-            for event in self._events
-            if unit_id is None or getattr(event, "unit_id", None) == unit_id
+            (sequence, event)
+            for sequence, event in self._events
+            if (unit_id is None or getattr(event, "unit_id", None) == unit_id)
+            and (after_sequence is None or sequence < after_sequence)
         ]
-        return tuple(reversed(selected[-limit:]))
+        return tuple(
+            _with_sequence(event, sequence) for sequence, event in reversed(selected[-limit:])
+        )
+
+
+class _SequencedSQLiteAuditRepository(SQLiteAuditRepository):
+    """Composition-owned audit read path over the durable audit rows.
+
+    The durable store owns the ``AUTOINCREMENT`` row sequence; this bridge
+    projects it onto the audit read model and honours the facade cursor, so
+    ``recent_audit`` pages identically whether the deployment persists to
+    SQLite or keeps its audit trail in memory.  Sequences therefore survive a
+    restart with the database that minted them.
+    """
+
+    def recent(
+        self, *, limit: int, unit_id: str | None = None, after_sequence: int | None = None
+    ) -> tuple[Any, ...]:
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be positive")
+        if unit_id is not None and (
+            not isinstance(unit_id, str) or not unit_id or unit_id != unit_id.strip()
+        ):
+            raise ValueError("unit_id must be non-empty and normalized")
+        _validate_after_sequence(after_sequence)
+        query = "SELECT sequence, payload FROM audit_events"
+        parameters: list[Any] = []
+        clauses: list[str] = []
+        if unit_id is not None:
+            clauses.append("unit_id = ?")
+            parameters.append(unit_id)
+        if after_sequence is not None:
+            clauses.append("sequence < ?")
+            parameters.append(after_sequence)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY sequence DESC LIMIT ?"
+        parameters.append(limit)
+        try:
+            with self._database.lock:
+                rows = self._database.connection.execute(query, parameters).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _sqlite_busy(exc):
+                raise PersistenceBusyError("audit database is busy") from exc
+            raise
+        return tuple(_with_sequence(self._decode(row[1]), row[0]) for row in rows)
 
 
 class _InMemoryScheduleRepository:
@@ -323,15 +418,29 @@ class _AsyncObservationRepository:
         return previous
 
 
+class _AuditStore(Protocol):
+    """The audit store shape every composed deployment exposes.
+
+    Both shipped shapes project the store's own ordering key onto the audit
+    read model and honour the facade cursor, so ``recent_audit`` pages the
+    same way in memory-backed and SQLite-backed builds.
+    """
+
+    def append(self, event: Any) -> None: ...
+
+    def recent(
+        self,
+        *,
+        limit: int,
+        unit_id: str | None = None,
+        after_sequence: int | None = None,
+    ) -> tuple[Any, ...]: ...
+
+
 class _AsyncAuditRepository:
     """Awaitable audit port; every durable append is also a bus event."""
 
-    def __init__(
-        self,
-        store: SQLiteAuditRepository | _InMemoryAuditRepository,
-        *,
-        bus: EventBus,
-    ) -> None:
+    def __init__(self, store: _AuditStore, *, bus: EventBus) -> None:
         self._store = store
         self._bus = bus
 
@@ -358,11 +467,9 @@ class _AsyncAuditRepository:
         unit_id: str | None = None,
         after_sequence: int | None = None,
     ) -> tuple[Any, ...]:
-        # Neither shipped audit store projects a pagination cursor, so a
-        # requested cursor fails loudly instead of silently repeating a page.
-        if after_sequence is not None:
-            raise ValueError("the composed audit stores do not support cursor pagination")
-        return self._store.recent(limit=limit, unit_id=unit_id)
+        # The cursor names the oldest fact already delivered; both composed
+        # stores resume strictly below it, never repeating a page.
+        return self._store.recent(limit=limit, unit_id=unit_id, after_sequence=after_sequence)
 
 
 class _AsyncAuthorizationRepository:
@@ -592,6 +699,17 @@ def _production_transport_factory(unit: Any, timeout_s: float) -> Callable[[], W
     return lambda: WaveshareTransport(config=config)
 
 
+class _SimulatorBankMismatchError(RuntimeError):
+    """The served register bank contradicts what the unit is configured for.
+
+    A decode that cannot reconcile the bank it actually read with the unit's
+    configured profile or topology fails the poll: no observation is
+    delivered, qualification can never pass, and control fails closed through
+    telemetry staleness.  Copying the configured expectation into the
+    observation instead would fabricate self-consistent evidence.
+    """
+
+
 class _SimulatorTelemetry:
     """Composition-owned poll -> decode -> deliver strategy over one pod.
 
@@ -604,6 +722,15 @@ class _SimulatorTelemetry:
     the control path sees controllability exactly as the actor holds it.  A
     decode failure propagates: no observation is delivered and control fails
     closed through telemetry staleness.
+
+    The served bank — not the configuration — is the evidence for the decoded
+    profile and the temperature topology: the layout probe word read from the
+    BMS block decides which profile this decode may claim, and the BIC count
+    it reports fixes how many temperature sensors the bank must serve.  The
+    cell window keeps its evidenced ``BIC * 10`` width and the decoded cells
+    are reconciled with the configured ``expected_cell_count``, so a unit
+    whose commissioned topology is not a multiple of ten (the corroborated
+    59-cell packing) can still be qualified against its own expectation.
     """
 
     def __init__(
@@ -652,6 +779,7 @@ class _SimulatorTelemetry:
         fault_codes, warning_codes = self._decode_fault_signals(blocks)
         cells = blocks[self._cell_voltage_window]
         temperatures = blocks[self._cell_temperature_window]
+        served_temperatures = self._verify_served_bank(bms, cells, temperatures)
         return Observation(
             unit_id=self._unit_id,
             device_identity=self._pod.identity,
@@ -675,15 +803,57 @@ class _SimulatorTelemetry:
             dynamic_discharge_limit_w=float(bms[14]),
             expected_cell_count=self._expected_cell_count,
             # Cell blocks: millivolt words and raw-40-offset temperature words.
-            cell_voltages_v=tuple(value / 1000.0 for value in cells),
+            # The evidenced window serves every cell the packing holds; the
+            # unit's commissioned count takes the prefix it declares.
+            cell_voltages_v=tuple(value / 1000.0 for value in cells[: self._expected_cell_count]),
             cell_captured_at_mono=self._pod.cell_captured_at_mono,
             cell_sequence=self._pod.cell_sequence,
-            expected_temperature_count=len(temperatures),
+            expected_temperature_count=served_temperatures,
             temperatures_c=tuple(float(value - 40) for value in temperatures),
             active_faults=fault_codes,
             active_warnings=warning_codes,
             quality={field: DataQuality.GOOD for field in Observation.QUALITY_FIELDS},
         )
+
+    def _verify_served_bank(
+        self, bms: Sequence[int], cells: Sequence[int], temperatures: Sequence[int]
+    ) -> int:
+        """Reconcile the served bank with the configured unit, or fail closed.
+
+        Returns the number of temperature sensors the served topology declares.
+        Every expectation is derived from the words the bank actually served,
+        never echoed from configuration.
+        """
+        probe = register_layout.detect_layout(bms[:7])
+        if probe.layout.value != self._expected_profile:
+            raise _SimulatorBankMismatchError(
+                f"unit {self._unit_id!r} is configured for protocol profile "
+                f"{self._expected_profile!r} but the served register bank reports "
+                f"{probe.layout.value!r}"
+            )
+        if not probe.topology_valid:
+            raise _SimulatorBankMismatchError(
+                f"unit {self._unit_id!r} is served an invalid {probe.layout.value} topology: "
+                f"{probe.bic_count} BICs"
+            )
+        served_cells = probe.bic_count * _CELLS_PER_BIC
+        served_temperatures = probe.bic_count * _TEMPERATURES_PER_BIC
+        if len(cells) != served_cells:
+            raise _SimulatorBankMismatchError(
+                f"unit {self._unit_id!r} served {len(cells)} cell words where its own "
+                f"topology reports {served_cells}"
+            )
+        if len(temperatures) != served_temperatures:
+            raise _SimulatorBankMismatchError(
+                f"unit {self._unit_id!r} served {len(temperatures)} temperature words where "
+                f"its own topology reports {served_temperatures}"
+            )
+        if served_cells < self._expected_cell_count:
+            raise _SimulatorBankMismatchError(
+                f"unit {self._unit_id!r} expects {self._expected_cell_count} cells but the "
+                f"served IoT packing holds {served_cells}"
+            )
+        return served_temperatures
 
     def _decode_fault_signals(
         self, blocks: Mapping[tuple[int, int], tuple[int, ...]]
@@ -738,6 +908,11 @@ class _ActorCommandHandle:
 
     async def request_bounded_zero(self, reason: str) -> None:
         await self._actor.request_bounded_zero(reason)
+
+    async def fence(self, reason: str) -> int:
+        # The facade's emergency stop fences the actor so an in-flight
+        # nonzero heartbeat write is cancelled before the stop returns.
+        return await self._actor.fence(reason)
 
 
 class _UnresolvedCredentialAuthenticator:
@@ -828,6 +1003,11 @@ class _Supervision:
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
         self._stopped = False
+        # Per-actor start reports: an actor loop resolves its own future only
+        # once ``actor.start()`` has actually succeeded, so startup can never
+        # read a lifecycle flip (an actor unwinding a failed connect sets
+        # DISCONNECTED long before its task ends) as a started fleet.
+        self._start_reports: dict[str, asyncio.Future[None]] = {}
 
     async def start(self) -> None:
         if self._stopped:
@@ -835,11 +1015,14 @@ class _Supervision:
         if self._started:
             return
         self._started = True
+        loop = asyncio.get_running_loop()
+        self._start_reports = {actor.unit_id: loop.create_future() for actor in self._actors}
         self._tasks = [
             asyncio.create_task(self._run_kernel(), name="energypod-supervision:kernel"),
             *(
                 asyncio.create_task(
-                    self._run_actor(actor), name=f"energypod-supervision:actor:{actor.unit_id}"
+                    self._run_actor(actor, self._start_reports[actor.unit_id]),
+                    name=f"energypod-supervision:actor:{actor.unit_id}",
                 )
                 for actor in self._actors
             ),
@@ -870,14 +1053,30 @@ class _Supervision:
                 await actor.shutdown()
 
     async def _await_startup(self) -> None:
-        """Startup completes only once every actor left BOOT, or fails loudly."""
+        """Startup completes only once every actor started, or fails loudly.
+
+        A lifecycle that left BOOT is not evidence of a start: an actor whose
+        connect failed flips its own lifecycle while its loop is still
+        unwinding, and a fleet that serves with a dead actor owner has no
+        polls, no observations, and no heartbeats.  Each actor loop therefore
+        reports its own successful start, and any component failure — reported
+        task or start report — fails startup.
+        """
         while True:
             failure = self._failure()
             if failure is not None:
                 raise failure
-            if all(actor.lifecycle is not UnitLifecycle.BOOT for actor in self._actors):
+            if self._all_actors_started():
                 return
             await asyncio.sleep(0)
+
+    def _all_actors_started(self) -> bool:
+        for report in self._start_reports.values():
+            if not report.done() or report.cancelled():
+                return False
+            if report.exception() is not None:
+                return False
+        return True
 
     async def _run_kernel(self) -> None:
         # Tick immediately at startup, then hold the commissioned heartbeat
@@ -886,20 +1085,48 @@ class _Supervision:
             await self._kernel.tick()
             await self._clock.sleep(self._interval_s)
 
-    async def _run_actor(self, actor: EnergyPodActor) -> None:
+    async def _run_actor(self, actor: EnergyPodActor, started: asyncio.Future[None]) -> None:
         # A start failure is a component failure and propagates.  Poll and
         # heartbeat failures are survived: the actor's own state machine
         # fences/inhibits on write failures, and unreadable telemetry fails
         # closed through authorization expiry and kernel staleness checks.
-        await actor.start()
-        while True:
-            await self._clock.sleep(self._interval_s)
-            # Heartbeat first: it consumes authority minted against the
-            # previous observation before a fresh poll invalidates it.
-            with contextlib.suppress(Exception):
-                await actor.heartbeat_once()
-            with contextlib.suppress(Exception):
-                await actor.poll_once()
+        try:
+            await actor.start()
+        except BaseException as error:
+            if not started.done():
+                started.set_exception(error)
+            raise
+        started.set_result(None)
+        poll: asyncio.Task[None] | None = None
+        try:
+            while True:
+                await self._clock.sleep(self._interval_s)
+                # Heartbeat first: it consumes authority minted against the
+                # previous observation before a fresh poll invalidates it.
+                # The heartbeat is awaited while the previous cycle's telemetry
+                # read may still be in dispatch, so the actor's own
+                # overdue-read preemption can abandon that read instead of
+                # delaying the renewal past its safety margin.
+                try:
+                    with contextlib.suppress(Exception):
+                        await actor.heartbeat_once()
+                except asyncio.CancelledError:
+                    # A facade fence (emergency stop) cancels in-flight
+                    # authority work; that borrowed cancellation must not end
+                    # this unit's supervision loop. Genuine shutdown of this
+                    # task carries a real cancellation request, which wins.
+                    task = asyncio.current_task()
+                    if task is None or task.cancelling():
+                        raise
+                if poll is not None:
+                    await asyncio.gather(poll, return_exceptions=True)
+                poll = asyncio.create_task(
+                    _poll_once(actor), name=f"energypod-supervision:poll:{actor.unit_id}"
+                )
+        finally:
+            if poll is not None:
+                poll.cancel()
+                await asyncio.gather(poll, return_exceptions=True)
 
     async def _watch_for_failure(self) -> None:
         if not self._tasks:
@@ -914,19 +1141,32 @@ class _Supervision:
                 exception = task.exception()
                 if exception is not None:
                     return exception
+        for report in self._start_reports.values():
+            if report.done() and not report.cancelled():
+                exception = report.exception()
+                if exception is not None:
+                    return exception
         return None
 
     async def _cancel_tasks(self) -> None:
+        """Cancel every supervision task except the one doing the cancelling.
+
+        The failure watcher runs `_halt`, which runs this method; cancelling
+        the watcher from inside its own halt would abort the halt before the
+        actors' bounded-zero shutdown, and gathering over a set that contains
+        the caller would recurse through the gather's own cancellation.
+        """
+        current = asyncio.current_task()
         watcher, self._watcher = self._watcher, None
-        pending = [*self._tasks]
-        if watcher is not None:
-            pending.append(watcher)
+        pending = [
+            task for task in (*self._tasks, watcher) if task is not None and task is not current
+        ]
+        self._tasks = []
         for task in pending:
             if not task.done():
                 task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
-        self._tasks = []
 
     async def _halt(self, reason: str) -> None:
         """Fence every generation, revoke, stop loops, and shut actors down.
@@ -937,17 +1177,29 @@ class _Supervision:
         change an observer could read as "shutdown started" — cancelled actor
         loops flip their actor to DISCONNECTED as they unwind, so authority
         must already be gone by then.
+
+        Actor shutdown is unconditional: it runs in a ``finally`` so no
+        cancellation or repository failure can leave an actor holding
+        authority, an unbounded objective, or an open transport.
         """
         self._stopped = True
-        with contextlib.suppress(Exception):
-            await self._coordinator.advance(reason=reason)
-        with contextlib.suppress(Exception):
-            await self._authorizations.revoke(reason=reason)
-        # Loops stop before actor shutdown so no start/poll races it.
-        await self._cancel_tasks()
-        for actor in self._actors:
+        try:
             with contextlib.suppress(Exception):
-                await actor.shutdown()
+                await self._coordinator.advance(reason=reason)
+            with contextlib.suppress(Exception):
+                await self._authorizations.revoke(reason=reason)
+            # Loops stop before actor shutdown so no start/poll races it.
+            await self._cancel_tasks()
+        finally:
+            for actor in self._actors:
+                with contextlib.suppress(Exception):
+                    await actor.shutdown()
+
+
+async def _poll_once(actor: EnergyPodActor) -> None:
+    """One supervised telemetry cycle; a poll failure is survived, not fatal."""
+    with contextlib.suppress(Exception):
+        await actor.poll_once()
 
 
 def _attach_lifespan(app: FastAPI, supervision: _Supervision) -> None:
@@ -1090,7 +1342,7 @@ class ComposedRuntime:
     intents: _AsyncIntentRepository
     observations: _AsyncObservationRepository
     authorizations: _AsyncAuthorizationRepository
-    audit: SQLiteAuditRepository | _InMemoryAuditRepository
+    audit: _AuditStore
     schedule: SQLiteScheduleRepository | _InMemoryScheduleRepository
     app: FastAPI
     mcp_server_factory: Callable[..., FastMCP]
@@ -1101,6 +1353,16 @@ def _simulator_pod(
     unit: Any, index: int, clock: Clock, *, command_expiry_s: float
 ) -> SimulatedEnergyPod:
     bic_count = min(_MAX_SIMULATOR_BICS, max(1, -(-unit.expected_cell_count // _CELLS_PER_BIC)))
+    served_cells = bic_count * _CELLS_PER_BIC
+    if served_cells < unit.expected_cell_count:
+        # A cell count the evidenced packing cannot serve is a wiring error,
+        # not a runtime discovery: composing it would boot a unit that can
+        # never present a complete cell window and therefore never qualify.
+        raise ValueError(
+            f"unit {unit.unit_id!r} expects {unit.expected_cell_count} cells but the evidenced "
+            f"IoT packing serves at most {served_cells} cells for a simulated unit; compose a "
+            "count the register plan can serve"
+        )
     # The seed is the unit's configuration position, so identical
     # configurations produce identical register banks across builds.  The
     # device's command lease follows the commissioned expiry evidence, so the
@@ -1114,6 +1376,25 @@ def _simulator_pod(
     )
 
 
+def _validate_actor_timing_wiring(config: ControllerConfig) -> None:
+    """Eager wiring check mirrored from the actor's own constructor.
+
+    ``timing.write_timeout_s`` is wired as the actor's heartbeat safety margin
+    and ``timing.control_period_s`` as its heartbeat interval, so a write
+    timeout that cannot fit strictly inside the control period can never
+    compose.  It is rejected here — before any durable store is opened — so
+    the configuration validator and the composition root agree on exactly the
+    same set of commissionable timing budgets.
+    """
+    margin = float(config.timing.write_timeout_s)
+    interval = float(config.timing.control_period_s)
+    if not 0 <= margin < interval:
+        raise ValueError(
+            "timing.write_timeout_s is wired as the heartbeat safety margin and must fit "
+            "strictly inside timing.control_period_s (the heartbeat interval)"
+        )
+
+
 def build_runtime(
     config: ControllerConfig, *, simulate: bool = False, clock: Clock | None = None
 ) -> ComposedRuntime:
@@ -1121,9 +1402,46 @@ def build_runtime(
 
     Construction is eager and side-effect free apart from opening the durable
     SQLite store when one is configured: no task starts, no socket opens, no
-    transport connects, and nothing is restored from persistence.
+    transport connects, and nothing is restored from persistence.  Wiring is
+    validated before that store opens, and a composition that cannot complete
+    closes it again, so a rejected configuration leaves nothing on disk.
     """
+    _validate_actor_timing_wiring(config)
     resolved_clock = clock if clock is not None else _SystemClock()
+    storage = config.storage
+    if storage is None or simulate:
+        return _build_runtime(
+            config, simulate=simulate, resolved_clock=resolved_clock, database=None
+        )
+    database = SQLiteDatabase(
+        storage.database_path,
+        busy_timeout_ms=storage.busy_timeout_ms,
+    )
+    try:
+        database.open()
+    except BaseException:
+        with contextlib.suppress(Exception):
+            database.close()
+        raise
+    try:
+        return _build_runtime(
+            config, simulate=simulate, resolved_clock=resolved_clock, database=database
+        )
+    except BaseException:
+        # A composition that cannot complete must not leave an open durable
+        # store — and its live WAL siblings — behind on disk.
+        with contextlib.suppress(Exception):
+            database.close()
+        raise
+
+
+def _build_runtime(
+    config: ControllerConfig,
+    *,
+    simulate: bool,
+    resolved_clock: Clock,
+    database: SQLiteDatabase | None,
+) -> ComposedRuntime:
     unit_ids = frozenset(unit.unit_id for unit in config.units)
     process_instance_id = f"energypod-{uuid.uuid4().hex}"
     process_origin_mono = float(resolved_clock.monotonic())
@@ -1133,19 +1451,13 @@ def build_runtime(
     # when a database path is configured and simulator mode is off.  Intents,
     # observations, and authorizations are always process-local so no restored
     # authority can survive a restart (observe-only boot).
-    storage = config.storage
-    if storage is not None and not simulate:
-        database = SQLiteDatabase(
-            storage.database_path,
-            busy_timeout_ms=storage.busy_timeout_ms,
-        )
-        database.open()
-        audit_store: SQLiteAuditRepository | _InMemoryAuditRepository = SQLiteAuditRepository(
-            database
-        )
-        schedule_store: SQLiteScheduleRepository | _InMemoryScheduleRepository = (
-            SQLiteScheduleRepository(database)
-        )
+    audit_store: _AuditStore
+    schedule_store: SQLiteScheduleRepository | _InMemoryScheduleRepository
+    if database is not None:
+        # The audit read path projects the durable row sequence so the facade
+        # cursor pages the same way in every deployment mode.
+        audit_store = _SequencedSQLiteAuditRepository(database)
+        schedule_store = SQLiteScheduleRepository(database)
     else:
         audit_store = _InMemoryAuditRepository(max_events=_MAX_IN_MEMORY_AUDIT_EVENTS)
         schedule_store = _InMemoryScheduleRepository()

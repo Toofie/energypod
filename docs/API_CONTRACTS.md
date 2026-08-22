@@ -265,7 +265,9 @@ coordinator, the event bus, and per-unit actor handles.
 
 - Entering `INHIBITED` records a cause class: `TRANSIENT`, `QUALIFIED`, or `LATCHED`
   (critical blocking faults, identity mismatch, repeated timing failure, or external-writer
-  evidence per policy).
+  evidence per policy). The implemented latched causes in this milestone are critical
+  blocking faults and identity/profile mismatch; repeated-timing-failure and
+  external-writer latching are deferred until their detection is evidence-backed.
 - `TRANSIENT`/`QUALIFIED` recover through stable qualifying samples to `DISARMED` (existing
   behavior). `LATCHED` additionally requires one explicit acknowledgement:
   `POST /api/v1/units/{unit_id}/inhibit/acknowledge`, requiring the `arm` scope and an

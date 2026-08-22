@@ -22,6 +22,7 @@ PROTOCOL_EVIDENCE word orders, never through the production decoder round trip.
 
 from __future__ import annotations
 
+import copy
 import importlib
 import socket
 from types import SimpleNamespace
@@ -119,6 +120,17 @@ async def applied_objectives(transport: Any) -> tuple[int, int]:
         protocol_codec.decode_signed16(registers[17]),  # PCS detail +17: active W
         protocol_codec.decode_signed16(registers[18]),  # PCS detail +18: reactive var
     )
+
+
+def device_state(pod: Any) -> dict[str, Any]:
+    """Deep snapshot of every device-model attribute except the injected clock.
+
+    The clock is the scripted-time source external to the device, so device
+    state is every attribute the model owns; equality of two snapshots is the
+    bit-for-bit "device left unchanged" pin (register bank, latched objective,
+    watchdog lease, sequences, and accumulators included).
+    """
+    return {name: copy.deepcopy(value) for name, value in vars(pod).items() if name != "_clock"}
 
 
 async def read_iot_plan(transport: Any, bic_count: int) -> dict[int, tuple[int, ...]]:
@@ -376,6 +388,55 @@ async def test_refused_writes_never_disturb_a_latched_objective(
 
 
 @pytest.mark.parametrize(
+    "frame",
+    [
+        (1, 32767, 70000),  # second payload word out of range: must not latch 32767 W
+        (1, 70000, 0),  # first payload word out of range
+        (1, -200, 5),  # negative payload word
+        (1, True, 0),  # bool is not a register word
+        (True, 0, 0),  # the header must be the integer 1, not a bool that equals it
+        (2, 0, 0),  # wrong header word
+        (1, 100),  # short frame
+        (1, 100, 100, 100),  # long frame
+        (),  # empty frame
+    ],
+)
+async def test_pod_refuses_malformed_frames_without_half_latching(
+    simulator: Any, frame: tuple[int, ...]
+) -> None:
+    """T-SIM-POD-017 / V-WRITE + INV-EVIDENCE / S0: the device gate is all-or-nothing.
+
+    The pod is exposed directly as the scenario handle (bypassing the transport
+    gate), so the device model must refuse a malformed ``[1, P, Q]`` frame on
+    its own: every frame word is validated before any state changes, so a frame
+    that fails on a later word leaves the latched objective, the watchdog
+    lease, and the whole served register bank bit-for-bit unchanged.
+    """
+    pod, transport, clock = build_unit(simulator, watchdog_timeout_s=2.0)
+    await transport.connect()
+    await transport.write_registers(0x0200, protocol_codec.encode_pq_registers(2200, 0))
+    pod.poll()
+    assert await applied_objectives(transport) == (2200, 0)
+
+    clock.advance(0.5)  # a lease renewed now would land at a distinguishable deadline
+    before_state = device_state(pod)
+    before_image = await read_iot_plan(transport, bic_count=6)
+
+    with pytest.raises(ValueError):
+        pod.apply_pq_frame(frame)
+
+    assert device_state(pod) == before_state, "a refused frame must not touch any device state"
+    assert await read_iot_plan(transport, bic_count=6) == before_image
+    assert await applied_objectives(transport) == (2200, 0)
+
+    # The refused frame renews nothing: the unit still expires at the original
+    # 2.0 s lease deadline (a renewal at the refused-frame instant would hold
+    # the objective for another 2.0 s from t+0.5).
+    clock.advance(1.6)  # 2.1 s after the latch, so past the original deadline
+    assert await measured_battery_watts(pod, transport) == 0
+
+
+@pytest.mark.parametrize(
     ("address", "count"),
     [
         (0x5000, 0),
@@ -397,6 +458,23 @@ async def test_reads_enforce_device_like_boundaries(
 
     with pytest.raises(ValueError):
         await transport.read_holding(address, count)
+
+
+@pytest.mark.parametrize("count", [0, -3])
+async def test_pod_rejects_non_positive_read_windows_like_a_device(
+    simulator: Any, count: int
+) -> None:
+    """T-SIM-POD-018 / INV-DECODE / S1.
+
+    The pod is exposed directly as the scenario handle (bypassing the transport
+    gate), so the device model itself must refuse a non-positive register
+    count like a device refuses an FC03 quantity of 0: never an empty tuple,
+    never a silently truncated window.
+    """
+    pod, _, _ = build_unit(simulator)
+
+    with pytest.raises(ValueError):
+        pod.read(0x5000, count)
 
 
 async def test_connection_boundaries_are_device_like_and_idempotent(simulator: Any) -> None:

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
+from typing import Any
+
 import pytest
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketDenialResponse
@@ -17,7 +21,7 @@ from .conftest import (
 
 def _app(
     service: RecordingEnergyService,
-    source: FakeEventSource,
+    source: Any,
     *,
     trusted_websocket_origins: frozenset[str] | None = None,
 ) -> object:
@@ -273,3 +277,120 @@ def test_client_disconnect_cancels_and_closes_event_subscription() -> None:
         assert websocket.receive_json()["sequence"] == 21
     assert source.subscriptions == [20]
     assert source.closed_subscriptions == 1
+
+
+class _UtcClock:
+    """Deterministic clock for the real EventBus; ambient time is never read."""
+
+    def wall_now(self) -> datetime:
+        return datetime(2026, 8, 21, tzinfo=UTC)
+
+
+class _RealBusSource:
+    """The REAL EventBus behind the adapter's ``EventSource`` seam.
+
+    ``burst_on_subscribe`` publishes that many events in one scheduling turn
+    as soon as the adapter subscribes, while its producer is gated awaiting
+    the next event: the only way a composed runtime produces a bus marker.
+    """
+
+    def __init__(self, bus: Any, *, burst_on_subscribe: int = 0) -> None:
+        self._bus = bus
+        self._burst = burst_on_subscribe
+        self.subscriptions: list[int | None] = []
+        self._pump: Any = None
+
+    def subscribe(self, *, after_sequence: int | None) -> Any:
+        self.subscriptions.append(after_sequence)
+        if self._burst:
+
+            async def pump() -> None:
+                for index in range(self._burst):
+                    await self._bus.publish(
+                        {"type": "observation.updated", "payload": {"index": index}}
+                    )
+
+            # Keep the reference: the loop holds only weak references to tasks.
+            self._pump = asyncio.create_task(pump())
+        return self._bus.subscribe(after_sequence=after_sequence)
+
+
+class _BusSequencedService(RecordingEnergyService):
+    """Snapshot sequence tracks the real bus, optionally behind it."""
+
+    def __init__(
+        self,
+        bus: Any,
+        *,
+        publish_first: int = 0,
+        stale_sequence: int | None = None,
+    ) -> None:
+        super().__init__()
+        self._bus = bus
+        self._publish_first = publish_first
+        self._stale_sequence = stale_sequence
+
+    async def snapshot(self, *, principal: object) -> dict[str, Any]:
+        snapshot = await super().snapshot(principal=principal)
+        for index in range(self._publish_first):
+            await self._bus.publish({"type": "observation.updated", "payload": {"index": index}})
+        live = self._bus.snapshot_sequence()
+        if self._stale_sequence is not None:
+            snapshot["snapshot_sequence"] = self._stale_sequence
+        else:
+            snapshot["snapshot_sequence"] = live
+        return snapshot
+
+
+def test_bus_slow_subscriber_marker_reaches_client_with_true_reason_and_snapshot() -> None:
+    # The bus's drop-to-resync marker is a first-class discontinuity: the
+    # adapter may map it onto its resync_required envelope, but it must carry
+    # the marker's own reason and snapshot point. Relabeling it as
+    # "non_monotonic_event" misdiagnoses an ordinary slow consumer (here a
+    # producer burst the subscriber never got to read) as source corruption.
+    events_module = load_contract_module("energypod.application.events")
+    bus = events_module.EventBus(retention=64, queue_capacity=4, clock=_UtcClock())
+    source = _RealBusSource(bus, burst_on_subscribe=5)  # one past the bus queue bound
+    service = _BusSequencedService(bus)
+    with (
+        TestClient(_app(service, source)) as client,
+        client.websocket_connect(
+            "/api/v1/events", headers={"Authorization": "Bearer viewer-token"}
+        ) as websocket,
+    ):
+        snapshot = websocket.receive_json()
+        terminal = websocket.receive_json()
+
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["sequence"] == 0
+    assert terminal["type"] == "resync_required"
+    assert terminal["reason"] == "slow_subscriber"
+    assert terminal["snapshot_sequence"] == 5
+    assert source.subscriptions == [0]
+
+
+def test_bus_stale_cursor_marker_reaches_client_with_true_reason_and_snapshot() -> None:
+    # Same seam, retention path: a cursor older than the retained window must
+    # arrive as the bus's own reason and snapshot point, not as a fabricated
+    # non_monotonic_event, so the operator and the client see the truth.
+    events_module = load_contract_module("energypod.application.events")
+    bus = events_module.EventBus(retention=8, queue_capacity=64, clock=_UtcClock())
+    source = _RealBusSource(bus)
+    # 30 events publish inside snapshot(); the snapshot then reports a lagging
+    # sequence 0 cursor, which predates the retained window 23..30.
+    service = _BusSequencedService(bus, publish_first=30, stale_sequence=0)
+    with (
+        TestClient(_app(service, source)) as client,
+        client.websocket_connect(
+            "/api/v1/events", headers={"Authorization": "Bearer viewer-token"}
+        ) as websocket,
+    ):
+        snapshot = websocket.receive_json()
+        terminal = websocket.receive_json()
+
+    assert snapshot["type"] == "snapshot"
+    assert snapshot["sequence"] == 0
+    assert terminal["type"] == "resync_required"
+    assert terminal["reason"] == "retention_window_exceeded"
+    assert terminal["snapshot_sequence"] == 30
+    assert source.subscriptions == [0]

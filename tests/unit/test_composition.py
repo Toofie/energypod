@@ -20,9 +20,11 @@ import asyncio
 import contextlib
 import importlib
 import inspect
+import itertools
 import json
 import math
 import socket
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -45,6 +47,7 @@ from energypod.domain import Direction, IntentSource, PowerIntent, UnitLifecycle
 from energypod.domain.audit import AuditEvent
 from energypod.domain.authorization import AuthorizationBatch, AuthorizedSetpoint
 from energypod.runtime.config import ControllerConfig
+from energypod.simulator import SimulatorTransport
 
 UNIT_IDS = ("mid", "rhs")
 UNIT_IDENTITIES = {"mid": "BEP-MID", "rhs": "BEP-RHS"}
@@ -898,3 +901,403 @@ async def test_supervisor_failure_fences_generations_and_runs_actor_shutdown(
         )
     finally:
         await session.close()
+
+
+async def test_mid_run_supervisor_failure_watcher_halts_the_fleet(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ADR-0003 D6 for the failure that happens *after* a healthy boot.
+
+    The startup-window failure above never creates the failure watcher; this
+    scenario starts supervision cleanly, lets it run, and only then fails a
+    component, so the watcher-driven halt path -- fence, revoke, actor
+    shutdown with the bounded-zero contract, no surviving supervision task --
+    is what actually executes.
+    """
+    runtime = compose(tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock())
+    epoch = (await runtime.generation_coordinator.snapshot()).epoch
+    await _settle(
+        runtime.authorizations.publish(_authorization_batch(generation=epoch, issued_at=0.0))
+    )
+    for unit_id in UNIT_IDS:
+        assert await _settle(runtime.authorizations.peek(unit_id)) is not None
+
+    supervised_tick = runtime.kernel.tick
+    ticks = itertools.count()
+
+    async def failing_mid_run() -> None:
+        if next(ticks) >= 3:
+            raise RuntimeError("mid-run supervisor component failed")
+        return await supervised_tick()
+
+    monkeypatch.setattr(runtime.kernel, "tick", failing_mid_run)
+
+    baseline = set(asyncio.all_tasks())
+    session = _LifespanSession(runtime.app)
+    try:
+        session.send("lifespan.startup")
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete")
+            or session.seen("lifespan.startup.failed"),
+            message="the application lifespan never reported supervision startup",
+        )
+        assert session.seen("lifespan.startup.complete"), f"startup failed: {session.events!r}"
+
+        # The halt must come from the failure watcher alone: nothing else is
+        # waiting on a mid-run component failure.
+        await session.pump_until(
+            lambda: _actors_stopped(runtime),
+            message="a mid-run supervisor failure must run actor shutdown",
+        )
+        assert (await runtime.generation_coordinator.snapshot()).epoch > epoch
+        for unit_id in UNIT_IDS:
+            assert await _settle(runtime.authorizations.peek(unit_id)) is None
+        recent = await _settle(runtime.audit.recent(limit=8))
+        assert any(event.event_type == "authorization_revoked" for event in recent), (
+            "the mid-run halt must durably record the fleet revocation"
+        )
+        await session.pump_until(
+            lambda: not asyncio.all_tasks() - baseline - {session.app_task},
+            message="a mid-run supervisor failure must not leave supervision tasks running",
+        )
+
+        # Supervision is one-shot: the lifespan still shuts down cleanly after
+        # the halt instead of trying to restart anything.
+        session.send("lifespan.shutdown")
+        await session.pump_until(
+            lambda: session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed"),
+            message="the application lifespan never reported supervision shutdown",
+        )
+        assert session.seen("lifespan.shutdown.complete"), f"shutdown failed: {session.events!r}"
+    finally:
+        await session.close()
+
+
+async def test_unreachable_gateway_fails_the_application_lifespan_startup(
+    tmp_path: Path,
+) -> None:
+    """A unit whose transport cannot connect must fail startup, not serve.
+
+    ``_await_startup`` may not read "left BOOT" as success while the actor's
+    own task is failing: an unreachable gateway is a dead fleet, and the
+    process must report a failed lifespan startup instead of serving with no
+    polls, no observations, and no heartbeats.
+    """
+    runtime = compose(tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock())
+    assert runtime.simulators is not None
+    runtime.simulators["mid"].drop_link()
+
+    session = _LifespanSession(runtime.app)
+    try:
+        session.send("lifespan.startup")
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete")
+            or session.seen("lifespan.startup.failed"),
+            message="an unreachable gateway must resolve startup, not serve",
+        )
+        assert session.seen("lifespan.startup.failed"), (
+            "a unit that cannot connect must fail the application lifespan startup: "
+            f"{session.events!r}"
+        )
+    finally:
+        await session.close()
+
+
+async def test_simulate_mode_qualifies_the_evidenced_59_cell_topology(
+    tmp_path: Path,
+) -> None:
+    """The corroborated 59-cell topology must be qualifiable in simulate mode.
+
+    The evidenced IoT read plan serves a BIC*10-wide cell window; the composed
+    decode reconciles it with the unit's configured expectation so a count
+    that is not a multiple of ten still reaches DISARMED and arms.  Without
+    that reconciliation the served window (60) can never equal the configured
+    expectation (59) and the unit is silently, permanently uncontrollable.
+    """
+    runtime = compose_write_enabled(
+        tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock()
+    )
+    actor = runtime.actors["mid"]
+    assert runtime.simulators is not None
+    pod = runtime.simulators["mid"]
+    # The evidence-backed register plan is not narrowed: the pod still serves
+    # the full six-BIC packing while the unit expects 59 cells.
+    assert len(pod.read(0x5200, 60)) == 60
+
+    await actor.start()
+    try:
+        for _ in range(runtime.policy.stable_samples_needed_to_rearm):
+            await runtime.clock.sleep(0.05)
+            await actor.poll_once()
+
+        latest = await _settle(runtime.observations.latest("mid"))
+        assert latest is not None, "every poll must deliver an observation"
+        assert latest.expected_cell_count == 59
+        assert len(latest.cell_voltages_v) == 59
+        assert latest.cells_complete
+        assert latest.temperatures_complete
+        # The temperature expectation follows the served topology, not the
+        # length of whatever window happened to be read.
+        assert latest.expected_temperature_count == 18
+        assert latest.protocol_profile == "iot"
+        assert latest.safety_data_complete
+
+        assert actor.qualified is True
+        assert actor.lifecycle is UnitLifecycle.DISARMED
+        result = await _settle(
+            runtime.facade.arm(
+                unit_ids=["mid"],
+                principal=OPERATOR,
+                idempotency_key="arm-59-cell-topology",
+                request_id="request-59-cell-topology",
+            )
+        )
+        outcomes = {unit["unit_id"]: unit["status"] for unit in result["units"]}
+        assert outcomes == {"mid": "armed"}, outcomes
+        assert actor.lifecycle is UnitLifecycle.ARMED_IDLE
+    finally:
+        await _shutdown_actors(runtime)
+
+
+async def test_simulate_mode_rejects_a_cell_count_the_iot_packing_cannot_serve(
+    tmp_path: Path,
+) -> None:
+    """A count the plan cannot serve is a wiring error, not a dead unit.
+
+    Composing a simulated unit whose expected cell count exceeds the evidenced
+    packing would boot a unit that can never present a complete cell window,
+    so construction must fail loudly before any task starts.
+    """
+    payload = _config_payload(tmp_path / "fleet.sqlite3", unit_count=1)
+    payload["units"][0]["expected_cell_count"] = 61
+    config = _validate(payload)
+    with pytest.raises(ValueError, match="expects 61 cells"):
+        _compose_with(config, simulate=True)
+    assert not (tmp_path / "fleet.sqlite3").exists()
+
+
+async def test_simulate_mode_never_qualifies_a_unit_served_the_wrong_layout(
+    tmp_path: Path,
+) -> None:
+    """A legacy-configured unit served an IoT bank must never qualify.
+
+    The decode verifies the served layout probe against the configured
+    profile instead of stamping the configuration into the observation, so a
+    unit whose bank contradicts its configuration fails every poll closed and
+    can never arm on fabricated self-consistent evidence.
+    """
+    payload = _config_payload(tmp_path / "fleet.sqlite3", unit_count=1)
+    payload["units"][0]["protocol_profile"] = "legacy"
+    payload["units"][0]["expected_cell_count"] = 40
+    config = _validate(payload)
+    runtime = _compose_with(config, simulate=True, clock=ScriptedClock())
+
+    actor = runtime.actors["mid"]
+    await actor.start()
+    try:
+        for _ in range(4):
+            await runtime.clock.sleep(0.05)
+            with pytest.raises(RuntimeError, match="configured for protocol profile 'legacy'"):
+                await actor.poll_once()
+
+        assert await _settle(runtime.observations.latest("mid")) is None
+        assert actor.qualified is None
+        assert actor.lifecycle is UnitLifecycle.OBSERVE_ONLY
+        with pytest.raises(RuntimeError, match="not qualified for arming"):
+            await actor.arm()
+    finally:
+        await _shutdown_actors(runtime)
+
+
+def _fast_timing_payload() -> dict[str, Any]:
+    # A commissioned budget with a short control period, so a stalled telemetry
+    # read outruns the renewal deadline quickly in wall-clock terms.
+    return {
+        "device_command_expiry_s": 2.35,
+        "device_command_expiry_evidence": "commissioning://watchdog-trial-2026-08/rev-1",
+        "control_period_s": 0.06,
+        "essential_read_timeout_s": 0.10,
+        "kernel_timeout_s": 0.05,
+        "audit_timeout_s": 0.05,
+        "write_timeout_s": 0.02,
+        "acknowledgement_timeout_s": 0.10,
+        "maximum_jitter_s": 0.10,
+        "renewal_margin_s": 0.50,
+    }
+
+
+async def test_overdue_telemetry_read_does_not_delay_heartbeat_renewal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """API_CONTRACTS "Unit actor": an overdue read is abandoned, never renewed late.
+
+    A telemetry cycle that stalls past the interval-minus-margin deadline must
+    be abandoned by the composed runtime instead of serializing the next
+    heartbeat behind it; the actor's own preemption can only engage while a
+    heartbeat is actually awaiting dispatch, so the composed loop must keep
+    the heartbeat and the overdue poll concurrent.
+    """
+    payload = _write_enabled_payload(tmp_path / "fleet.sqlite3", unit_count=1)
+    payload["timing"] = _fast_timing_payload()
+    config = _validate(payload)
+    interval_s = float(config.timing.control_period_s)
+    margin_s = float(config.timing.write_timeout_s)
+    stall_s = interval_s * 5
+
+    served_read = SimulatorTransport.read_holding
+
+    async def stalling_read(self: Any, address: int, count: int) -> tuple[int, ...]:
+        if address == 0x5200:
+            await asyncio.sleep(stall_s)
+        return await served_read(self, address, count)
+
+    monkeypatch.setattr(SimulatorTransport, "read_holding", stalling_read)
+
+    runtime = _compose_with(config, simulate=True)
+    actor = runtime.actors["mid"]
+    renewals: list[float] = []
+    supervised_heartbeat = actor.heartbeat_once
+
+    async def observed_heartbeat() -> None:
+        await supervised_heartbeat()
+        renewals.append(time.monotonic())
+
+    actor.heartbeat_once = observed_heartbeat  # type: ignore[method-assign]
+
+    session = _LifespanSession(runtime.app)
+    try:
+        session.send("lifespan.startup")
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete")
+            or session.seen("lifespan.startup.failed"),
+            message="the application lifespan never reported supervision startup",
+        )
+        assert session.seen("lifespan.startup.complete"), f"startup failed: {session.events!r}"
+
+        # Two hundred 5 ms pumps bound the wait at one second of wall clock,
+        # far beyond the six renewals a healthy cadence needs.
+        for _ in range(200):
+            if len(renewals) >= 6:
+                break
+            await asyncio.sleep(0.005)
+        assert len(renewals) >= 6, (
+            f"only {len(renewals)} heartbeat renewals completed while the telemetry "
+            "read was overdue"
+        )
+        gaps = [second - first for first, second in itertools.pairwise(renewals)]
+        assert max(gaps) < stall_s / 2, (
+            f"a heartbeat waited {max(gaps):.3f}s behind an overdue telemetry read; the "
+            f"commissioned budget is {interval_s}s with a {margin_s}s safety margin"
+        )
+        # The overdue read was abandoned, never completed into an observation
+        # that the safety path could then mistake for fresh evidence.
+        assert await _settle(runtime.observations.latest("mid")) is None
+
+        session.send("lifespan.shutdown")
+        await session.pump_until(
+            lambda: session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed"),
+            message="the application lifespan never reported supervision shutdown",
+        )
+        assert session.seen("lifespan.shutdown.complete"), f"shutdown failed: {session.events!r}"
+    finally:
+        await session.close()
+
+
+def _paginated_audit_events(count: int) -> tuple[AuditEvent, ...]:
+    return tuple(
+        _prior_active_audit_event("mid").model_copy(update={"event_id": f"page-{number:02d}"})
+        for number in range(count)
+    )
+
+
+async def _assert_pages_without_repeats(runtime: Any, *, limit: int, total: int) -> None:
+    page = await _settle(runtime.facade.recent_audit(principal=OPERATOR, limit=limit))
+    seen: list[int] = []
+    while page["events"]:
+        for event in page["events"]:
+            assert isinstance(event, AuditEvent)
+            assert type(event.sequence) is int and not isinstance(event.sequence, bool)
+        sequences = [event.sequence for event in page["events"]]
+        assert sequences == sorted(sequences, reverse=True), "pages must stay newest-first"
+        seen.extend(sequences)
+        cursor = page["next_cursor"]
+        if not page["events"] or len(page["events"]) < limit:
+            assert cursor is None, "a short terminal page leaves no further cursor"
+            break
+        assert type(cursor) is int and cursor == sequences[-1]
+        page = await _settle(
+            runtime.facade.recent_audit(principal=OPERATOR, limit=limit, cursor=cursor)
+        )
+    assert seen == list(range(total, 0, -1)), f"pagination must cover every fact once: {seen!r}"
+
+
+async def test_composed_audit_cursor_pages_in_every_deployment_mode(tmp_path: Path) -> None:
+    """API_CONTRACTS facade: ``recent_audit`` keeps a stable, resumable cursor.
+
+    The composed stores project their own ordering key onto the audit read
+    model, so a page is never silently the last page while strictly more
+    durable facts exist, and an explicit cursor resumes with strictly older
+    facts instead of raising.
+    """
+    volatile = compose(tmp_path / "fleet.sqlite3", simulate=True)
+    for event in _paginated_audit_events(5):
+        await _settle(volatile.audit.append(event))
+    await _assert_pages_without_repeats(volatile, limit=2, total=5)
+
+    # The durable deployment pages the same way, and its cursor survives a
+    # restart because the sequences belong to the database rows.
+    database = tmp_path / "durable-fleet.sqlite3"
+    durable = compose(database)
+    assert isinstance(durable.audit, SQLiteAuditRepository)
+    for event in _paginated_audit_events(5):
+        await _settle(durable.audit.append(event))
+    await _assert_pages_without_repeats(durable, limit=2, total=5)
+
+    reopened = compose(database)
+    await _settle(
+        reopened.audit.append(
+            _prior_active_audit_event("mid").model_copy(update={"event_id": "page-after-restart"})
+        )
+    )
+    fresh = await _settle(reopened.facade.recent_audit(principal=OPERATOR, limit=1))
+    assert [event.event_id for event in fresh["events"]] == ["page-after-restart"]
+    assert fresh["events"][0].sequence == 6, "durable sequences must continue across restarts"
+
+
+async def test_timing_validation_rejects_a_write_timeout_the_control_period_cannot_fit(
+    tmp_path: Path,
+) -> None:
+    """``check-config`` and ``build_runtime`` must agree on the timing budget.
+
+    The write timeout is wired as the actor's heartbeat safety margin inside
+    the heartbeat interval (the control period), so a configuration whose
+    write timeout cannot fit is rejected at validation time instead of
+    passing ``check-config`` and failing every composition attempt.
+    """
+    payload = _config_payload(tmp_path / "fleet.sqlite3", unit_count=1)
+    payload["timing"] = {**_timing_payload(), "control_period_s": 0.50, "write_timeout_s": 1.00}
+    with pytest.raises(ValidationError, match="write timeout must fit strictly inside"):
+        _validate(payload)
+
+
+async def test_build_runtime_fails_closed_and_leaves_no_database_behind(
+    tmp_path: Path,
+) -> None:
+    """A rejected composition is a wiring error with no filesystem effect.
+
+    The eager actor-wiring check runs before the durable store opens, so even
+    a configuration that bypassed validation cannot leave an open database --
+    or its live WAL siblings -- behind on disk.
+    """
+    database = tmp_path / "leftover.sqlite3"
+    config = _validate(_config_payload(database, unit_count=1))
+    unbudgeted = config.model_copy(
+        update={"timing": config.timing.model_copy(update={"write_timeout_s": 5.0})}
+    )
+    with pytest.raises(ValueError, match="heartbeat safety margin"):
+        _build_runtime(unbudgeted)
+    assert not database.exists()
+    assert not (tmp_path / "leftover.sqlite3-wal").exists()
+    assert not (tmp_path / "leftover.sqlite3-shm").exists()

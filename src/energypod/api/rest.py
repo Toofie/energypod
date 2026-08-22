@@ -395,12 +395,22 @@ def create_api_app(
         payload = body.model_dump(mode="json")
 
         async def invoke() -> dict[str, Any]:
-            result = await service.emergency_stop(
-                **payload,
-                principal=identity,
-                idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
-                request_id=request.state.request_id,
-            )
+            try:
+                result = await service.emergency_stop(
+                    **payload,
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
+            except BaseException as exc:
+                # A degraded stop (store refused, unknown units) may still have
+                # latched known units; register its stop id so the exact-id
+                # acknowledgement endpoint stays usable for recovery.
+                degraded_stop_id = getattr(exc, "stop_id", None)
+                if isinstance(degraded_stop_id, str) and _valid_id(degraded_stop_id):
+                    async with stop_lock:
+                        known_stops[degraded_stop_id] = None
+                raise
             stop_id = result.get("stop_id")
             if isinstance(stop_id, str) and _valid_id(stop_id):
                 # Latched stops are safety-critical state, not a replay cache:
@@ -625,6 +635,17 @@ def _reject_websocket_query_credentials(websocket: WebSocket) -> None:
         raise BoundaryError(401, "authentication_required", "Bearer authentication is required")
 
 
+def _is_sequence_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_discontinuity_marker(event: Mapping[str, Any]) -> bool:
+    """A source-side discontinuity marker (the bus's resync) carries no sequence."""
+    if "sequence" in event:
+        return False
+    return event.get("resync") is True or event.get("type") == "resync"
+
+
 async def _stream_events(
     websocket: WebSocket, source: EventSource, sequence: int, capacity: int
 ) -> None:
@@ -634,14 +655,30 @@ async def _stream_events(
         expected = sequence + 1
         subscription = source.subscribe(after_sequence=sequence)
 
-        async def terminate(reason: str) -> None:
+        async def terminate(reason: str, snapshot_sequence: int | None = None) -> None:
             # Preserve already accepted contiguous events, then make the
             # discontinuity explicit. The bounded queue applies backpressure
             # while the terminal marker waits for one slot.
-            await queue.put({"type": "resync_required", "reason": reason})
+            marker: dict[str, Any] = {"type": "resync_required", "reason": reason}
+            if snapshot_sequence is not None:
+                marker["snapshot_sequence"] = snapshot_sequence
+            await queue.put(marker)
 
         try:
             async for event in subscription:
+                if _is_discontinuity_marker(event):
+                    # A source marker is first-class: its reason is the
+                    # operator's diagnosis (a slow consumer is not stream
+                    # corruption) and its snapshot point is the client's
+                    # recovery cursor, so both must arrive unmangled rather
+                    # than being relabeled as a source-integrity violation.
+                    reason = event.get("reason")
+                    snapshot = event.get("snapshot_sequence")
+                    await terminate(
+                        reason if isinstance(reason, str) and reason else "non_monotonic_event",
+                        snapshot if _is_sequence_int(snapshot) else None,
+                    )
+                    return
                 current = event.get("sequence")
                 if (
                     not isinstance(current, int)
