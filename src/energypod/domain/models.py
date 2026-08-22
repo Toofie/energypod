@@ -142,6 +142,14 @@ class ControlPolicy(BaseModel):
     blocking_fault_codes: frozenset[str]
     blocking_warning_codes: frozenset[str]
     debug_mode_enabled: bool = False
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the
+    # all-or-none export bound triple.  All three None (the default) means
+    # export bounding is not armed and the bound for an optimizer charge
+    # intent is 0 — an advisory charge may flow only from measured, armed
+    # export evidence.
+    export_charge_limit_w: int | None = None
+    export_headroom_margin_w: int | None = None
+    export_telemetry_max_age_s: float | None = None
 
     @field_validator("version")
     @classmethod
@@ -194,6 +202,29 @@ class ControlPolicy(BaseModel):
     def _positive_sample_count(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("stable sample count must be positive")
+        return value
+
+    @field_validator("export_charge_limit_w")
+    @classmethod
+    def _positive_export_limit(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("the armed export charge limit must be positive")
+        return value
+
+    @field_validator("export_headroom_margin_w")
+    @classmethod
+    def _nonnegative_export_margin(cls, value: int | None) -> int | None:
+        # A zero margin is legal commissioning (every measured watt of export
+        # is then eligible); only a negative margin would invent export.
+        if value is not None and value < 0:
+            raise ValueError("the armed export headroom margin must be non-negative")
+        return value
+
+    @field_validator("export_telemetry_max_age_s")
+    @classmethod
+    def _positive_export_age(cls, value: float | None) -> float | None:
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError("the armed export telemetry age bound must be positive")
         return value
 
     @field_validator(
@@ -257,6 +288,19 @@ class ControlPolicy(BaseModel):
             raise ValueError("heartbeat interval must be shorter than authorization lifetime")
         if self.debug_mode_enabled:
             raise ValueError("debug mode is excluded from the production control policy")
+        # The export bound triple is all-or-none: a partially armed triple
+        # would let the bound run with, say, a missing freshness bound and no
+        # way to judge staleness.  Disarmed means all three keys are None.
+        export_armed = (
+            self.export_charge_limit_w is not None,
+            self.export_headroom_margin_w is not None,
+            self.export_telemetry_max_age_s is not None,
+        )
+        if any(export_armed) and not all(export_armed):
+            raise ValueError(
+                "the export bound triple must be armed all-or-none: export_charge_limit_w, "
+                "export_headroom_margin_w, export_telemetry_max_age_s"
+            )
         return self
 
 

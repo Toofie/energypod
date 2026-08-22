@@ -74,12 +74,17 @@ class FleetAllocation(BaseModel):
 
 
 def allocate_fleet_power(
-    intent: PowerIntent, headrooms: tuple[UnitHeadroom, ...]
+    intent: PowerIntent,
+    headrooms: tuple[UnitHeadroom, ...],
+    *,
+    export_cap_w: int | None = None,
 ) -> FleetAllocation:
     if type(intent) is not PowerIntent:
         raise TypeError("intent must be a PowerIntent")
     if type(headrooms) is not tuple or any(type(item) is not UnitHeadroom for item in headrooms):
         raise TypeError("headrooms must be a tuple of UnitHeadroom values")
+    if export_cap_w is not None and (type(export_cap_w) is not int or export_cap_w < 0):
+        raise ValueError("export cap must be a non-negative integer")
     by_id: dict[str, UnitHeadroom] = {}
     for item in headrooms:
         if item.unit_id in by_id:
@@ -97,7 +102,14 @@ def allocate_fleet_power(
     missing = set(selected) - set(by_id)
     if missing:
         raise ValueError(f"missing headroom for selected units: {sorted(missing)}")
-    remaining = intent.watts
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the
+    # measured-export bound is ONE additional min() term on the effective
+    # demand.  It can only lower power below today's limits and — crucially
+    # for the all-zero doctrine — a cap of 0 stays a legitimate allocation
+    # (every selected unit proposes explicit non-participation), never an
+    # error and never a reversal.
+    demand = intent.watts if export_cap_w is None else min(intent.watts, export_cap_w)
+    remaining = demand
     allocations: dict[str, int] = {}
     for unit_id in selected:
         headroom = by_id[unit_id]
@@ -110,10 +122,14 @@ def allocate_fleet_power(
             )
         allocations[unit_id] = min(remaining, capacity)
         remaining -= allocations[unit_id]
+    # The unallocated remainder keeps absorbing whatever the cap (or headroom)
+    # denied, so the exact-sum invariants are unchanged: allocated plus
+    # unallocated equals the intent's own request.
+    allocated_watts = demand - remaining
     return FleetAllocation(
         direction=intent.direction,
         allocations=allocations,
         requested_watts=intent.watts,
-        allocated_watts=intent.watts - remaining,
-        unallocated_watts=remaining,
+        allocated_watts=allocated_watts,
+        unallocated_watts=intent.watts - allocated_watts,
     )
