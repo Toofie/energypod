@@ -67,6 +67,13 @@ class Observation(BaseModel):
             "temperatures_c",
         }
     )
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the two
+    # per-pod CT power words (PCS 0x1000+17/+20, PROTOCOL_EVIDENCE 4c) are
+    # ADVISORY telemetry.  They gate export-bounded control through their own
+    # fail-closed bound, never through the safety-critical completeness set,
+    # so a deployment whose read plan does not serve the PCS block keeps fully
+    # qualified observations for ordinary control.
+    ADVISORY_QUALITY_FIELDS: ClassVar[frozenset[str]] = frozenset({"grid_power_w", "load_power_w"})
     model_config = ConfigDict(
         frozen=True, strict=True, extra="forbid", arbitrary_types_allowed=True
     )
@@ -87,6 +94,11 @@ class Observation(BaseModel):
     pack_current_a: float | None
     dynamic_charge_limit_w: float | None
     dynamic_discharge_limit_w: float | None
+    # Advisory per-pod CT power (signed; negative grid = import, positive =
+    # export — PROTOCOL_EVIDENCE 4b/4c).  ``None`` when the poll did not
+    # serve the PCS live block; never zero-filled.
+    grid_power_w: float | None = None
+    load_power_w: float | None = None
     expected_cell_count: int | None = None
     cell_voltages_v: tuple[float, ...]
     cell_captured_at_mono: float | None = None
@@ -153,7 +165,13 @@ class Observation(BaseModel):
             raise ValueError("percentage must be finite and between zero and 100")
         return value
 
-    @field_validator("battery_watts", "pack_voltage_v", "pack_current_a")
+    @field_validator(
+        "battery_watts",
+        "pack_voltage_v",
+        "pack_current_a",
+        "grid_power_w",
+        "load_power_w",
+    )
     @classmethod
     def _finite_measurement(cls, value: float | None) -> float | None:
         if value is not None and not math.isfinite(value):
@@ -185,7 +203,13 @@ class Observation(BaseModel):
     @classmethod
     def _quality(cls, value: Mapping[str, DataQuality]) -> Mapping[str, DataQuality]:
         copied = dict(value)
-        if set(copied) != cls.QUALITY_FIELDS:
+        # Exactly the ten safety-critical fields, or those plus the two
+        # advisory CT fields: the wire decoder always emits the twelve-key
+        # shape (MISSING for unserved sources), while older producers and the
+        # ten-field test fixtures keep the original shape.  Anything else is a
+        # malformed quality map, not a partial view to forgive.
+        allowed = (cls.QUALITY_FIELDS, cls.QUALITY_FIELDS | cls.ADVISORY_QUALITY_FIELDS)
+        if set(copied) not in allowed:
             raise ValueError("quality must contain exactly the declared telemetry fields")
         if any(type(item) is not DataQuality for item in copied.values()):
             raise TypeError("quality values must be DataQuality members")
