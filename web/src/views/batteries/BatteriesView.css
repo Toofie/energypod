@@ -140,6 +140,24 @@ button:focus-visible {
   font-size: 0.9em;
 }
 
+/* Text-readable value grids (UI_CONTRACTS "Cells"): every value is text
+   first; the grid layout is a density aid, never the only carrier. */
+.cell-grid,
+.temp-grid {
+  list-style: none;
+  margin: 0.25rem 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(7rem, 1fr));
+  gap: 0.2rem 0.6rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.cell-grid li,
+.temp-grid li {
+  font-size: 0.9rem;
+}
+
 .dialog {
   position: fixed;
   inset: 25% auto auto 50%;

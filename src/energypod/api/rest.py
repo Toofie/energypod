@@ -48,6 +48,7 @@ class Authenticator(Protocol):
 class EnergyService(Protocol):
     async def snapshot(self, *, principal: Principal) -> dict[str, Any]: ...
     async def health(self, *, principal: Principal) -> dict[str, Any]: ...
+    async def unit_detail(self, *, principal: Principal, unit_id: str) -> dict[str, Any]: ...
     async def recent_audit(
         self, *, principal: Principal, limit: int, cursor: int | None = None
     ) -> dict[str, Any]: ...
@@ -473,6 +474,16 @@ def create_api_app(
         # ``after_sequence`` is the previous page's oldest-delivered cursor; the
         # facade derives the next cursor from what the store returned.
         return await service.recent_audit(principal=identity, limit=limit, cursor=after_sequence)
+
+    @app.get(f"{API_PREFIX}/units/{{unit_id}}")
+    async def get_unit_detail(unit_id: str, identity: Principal = observe_dependency) -> Any:
+        """Full latest-observation projection for one unit (observe scope)."""
+        if not _valid_id(unit_id):
+            raise BoundaryError(422, "validation_error", "Invalid unit identifier")
+        try:
+            return await service.unit_detail(principal=identity, unit_id=unit_id)
+        except LookupError as exc:
+            raise BoundaryError(404, "unit_not_found", "The unit identifier is not known") from exc
 
     @app.post(f"{API_PREFIX}/intents", status_code=202)
     async def submit_intent(

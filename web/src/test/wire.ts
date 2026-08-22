@@ -21,11 +21,21 @@
  *   integer `sequence`. The wire key for the kind of an entry is `event_type`
  *   (there is no `type` field on the audit wire).
  * - Snapshot, unit view, and health: `EnergyServiceFacade.snapshot` /
- *   `_unit_view` / `health` (service.py). The snapshot unit carries exactly
+ *   `_unit_view` / `health` (service.py). The snapshot unit carries
  *   `unit_id, lifecycle, telemetry_age_s, quality, requested_power,
- *   authorized_power, measured_watts` — no charge, temperature, cell, or
- *   inhibit fields — and `quality` is the facade's own projection vocabulary
- *   `good | degraded | bad | missing` (never `stale`/`suspect`).
+ *   authorized_power, measured_watts` plus the amended-contract nullable
+ *   `telemetry` summary projection (API_CONTRACTS.md "Application service
+ *   facade": `soc_pct` … `active_warnings`, every field null when that datum
+ *   is absent, never zero-filled) — still no `inhibit` field — and `quality`
+ *   is the facade's own projection vocabulary `good | degraded | bad |
+ *   missing` (never `stale`/`suspect`).
+ * - Unit detail: `unit_detail(principal, unit_id)` — REST
+ *   `GET /api/v1/units/{unit_id}` — the full latest-observation projection:
+ *   identity (`device_identity`), `protocol_profile`, `connection_epoch`,
+ *   telemetry and cell sequences and capture times, every scalar the
+ *   telemetry summary carries, the complete `cell_voltages_v` and
+ *   `temperatures_c` arrays, the per-field `quality` map, faults, and
+ *   warnings. Unknown unit ids are refused with the structured envelope.
  *
  * Views and suites import from here so a fabricated wire shape cannot be
  * written twice. Anything the server does not send is absent from these
@@ -442,6 +452,13 @@ export interface WireUnitSnapshot {
   readonly requested_power: WirePower;
   readonly authorized_power: WirePower | null;
   readonly measured_watts: number | null;
+  /**
+   * The amended-contract nullable telemetry summary projection from the latest
+   * observation. Absent (`null`) when the unit has no observation at all;
+   * present-but-null fields mean that single datum was absent — never
+   * zero-filled (API_CONTRACTS.md "Application service facade").
+   */
+  readonly telemetry: WireTelemetrySummary | null;
   readonly inhibit?: WireInhibitState | null;
 }
 
@@ -463,6 +480,7 @@ export function unitSnapshot(spec: Partial<WireUnitSnapshot> & { unit_id: string
     requested_power: spec.requested_power ?? { direction: "idle", watts: 0 },
     authorized_power: spec.authorized_power === undefined ? null : spec.authorized_power,
     measured_watts: spec.measured_watts === undefined ? 0 : spec.measured_watts,
+    telemetry: spec.telemetry === undefined ? null : spec.telemetry,
   };
   return spec.inhibit === undefined ? base : { ...base, inhibit: spec.inhibit };
 }
@@ -498,6 +516,338 @@ export function snapshot(
     snapshot_sequence: spec.snapshot_sequence ?? 4100,
     captured_at: spec.captured_at ?? DEFAULT_OCCURRED_AT,
     units: [...units],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry summary + unit detail (API_CONTRACTS.md "Application service
+// facade"; observation fields: src/energypod/domain/observations.py)
+// ---------------------------------------------------------------------------
+
+/**
+ * The observation's own telemetry fields, exactly as the domain's per-field
+ * `quality` map keys them (Observation.QUALITY_FIELDS). Note the observation
+ * spells SOC `system_soc_pct` while the projections spell it `soc_pct`.
+ */
+export const TELEMETRY_QUALITY_FIELDS: readonly string[] = [
+  "system_soc_pct",
+  "bms_soc_pct",
+  "soh_pct",
+  "battery_watts",
+  "pack_voltage_v",
+  "pack_current_a",
+  "dynamic_charge_limit_w",
+  "dynamic_discharge_limit_w",
+  "cell_voltages_v",
+  "temperatures_c",
+];
+
+/** The observation's DataQuality vocabulary (lowercase StrEnum values). */
+export const DATA_QUALITY_VALUES: readonly string[] = [
+  "good",
+  "stale",
+  "missing",
+  "bad",
+  "suspect",
+];
+
+/**
+ * The nullable per-unit telemetry summary the amended snapshot contract adds:
+ * every field is null when that datum is absent from the observation, never
+ * zero-filled or fabricated.
+ */
+export interface WireTelemetrySummary {
+  readonly soc_pct: number | null;
+  readonly bms_soc_pct: number | null;
+  readonly soh_pct: number | null;
+  readonly pack_voltage_v: number | null;
+  readonly pack_current_a: number | null;
+  readonly battery_watts: number | null;
+  readonly dynamic_charge_limit_w: number | null;
+  readonly dynamic_discharge_limit_w: number | null;
+  readonly cell_count: number | null;
+  readonly cell_min_v: number | null;
+  readonly cell_max_v: number | null;
+  readonly cell_spread_mv: number | null;
+  readonly temperature_min_c: number | null;
+  readonly temperature_max_c: number | null;
+  readonly active_faults: readonly string[] | null;
+  readonly active_warnings: readonly string[] | null;
+}
+
+/**
+ * A telemetry summary fixture. Defaults are the mandated live-capture decode
+ * for MID (docs/evidence/field-mapping-2026-08-22.md): SOC 10 %, pack
+ * 192.4 V, 60 cells spanning 3.205-3.209 V, 23-28 °C, the two fleet-wide
+ * calibration warnings, no faults. Scalars the mandate does not name stay
+ * null — an honest absent datum, never a stand-in value.
+ */
+export function telemetrySummary(spec: Partial<WireTelemetrySummary> = {}): WireTelemetrySummary {
+  return {
+    soc_pct: spec.soc_pct === undefined ? 10 : spec.soc_pct,
+    bms_soc_pct: spec.bms_soc_pct === undefined ? null : spec.bms_soc_pct,
+    soh_pct: spec.soh_pct === undefined ? null : spec.soh_pct,
+    pack_voltage_v: spec.pack_voltage_v === undefined ? 192.4 : spec.pack_voltage_v,
+    pack_current_a: spec.pack_current_a === undefined ? null : spec.pack_current_a,
+    battery_watts: spec.battery_watts === undefined ? null : spec.battery_watts,
+    dynamic_charge_limit_w:
+      spec.dynamic_charge_limit_w === undefined ? null : spec.dynamic_charge_limit_w,
+    dynamic_discharge_limit_w:
+      spec.dynamic_discharge_limit_w === undefined ? null : spec.dynamic_discharge_limit_w,
+    cell_count: spec.cell_count === undefined ? 60 : spec.cell_count,
+    cell_min_v: spec.cell_min_v === undefined ? 3.205 : spec.cell_min_v,
+    cell_max_v: spec.cell_max_v === undefined ? 3.209 : spec.cell_max_v,
+    cell_spread_mv: spec.cell_spread_mv === undefined ? 4 : spec.cell_spread_mv,
+    temperature_min_c: spec.temperature_min_c === undefined ? 23 : spec.temperature_min_c,
+    temperature_max_c: spec.temperature_max_c === undefined ? 28 : spec.temperature_max_c,
+    active_faults: spec.active_faults === undefined ? [] : spec.active_faults,
+    active_warnings:
+      spec.active_warnings === undefined
+        ? ["PCS_Warning0_1", "DCDC_Warning0_1"]
+        : spec.active_warnings,
+  };
+}
+
+/**
+ * The full latest-observation projection `GET /api/v1/units/{unit_id}` returns
+ * (API_CONTRACTS.md "Application service facade"): identity, protocol profile,
+ * connection epoch, telemetry and cell sequences and capture times, every
+ * scalar the summary carries, the complete cell-voltage and temperature
+ * arrays, the per-field quality map, faults, and warnings.
+ */
+export interface WireUnitDetail {
+  readonly unit_id: string;
+  readonly lifecycle: string | null;
+  readonly device_identity: string | null;
+  readonly protocol_profile: string | null;
+  readonly connection_epoch: number | null;
+  readonly wall_timestamp: string | null;
+  readonly captured_at_mono: number | null;
+  readonly sequence: number | null;
+  readonly cell_captured_at_mono: number | null;
+  readonly cell_sequence: number | null;
+  readonly soc_pct: number | null;
+  readonly bms_soc_pct: number | null;
+  readonly soh_pct: number | null;
+  readonly pack_voltage_v: number | null;
+  readonly pack_current_a: number | null;
+  readonly battery_watts: number | null;
+  readonly dynamic_charge_limit_w: number | null;
+  readonly dynamic_discharge_limit_w: number | null;
+  readonly cell_count: number | null;
+  readonly cell_min_v: number | null;
+  readonly cell_max_v: number | null;
+  readonly cell_spread_mv: number | null;
+  readonly temperature_min_c: number | null;
+  readonly temperature_max_c: number | null;
+  readonly active_faults: readonly string[] | null;
+  readonly active_warnings: readonly string[] | null;
+  readonly cell_voltages_v: readonly number[] | null;
+  readonly temperatures_c: readonly number[] | null;
+  readonly quality: Readonly<Record<string, string>> | null;
+}
+
+/**
+ * Per-unit facts from the 2026-08-22 live capture (the mandate's decoded
+ * values, with the remaining scalars anchored in
+ * docs/evidence/field-mapping-2026-08-22.md: SOH 100 % everywhere, BMS
+ * dynamic power limits, ASCII serial numbers, RTU ids). Battery watts and
+ * pack current are signed: negative discharges, so V x I = P holds.
+ */
+interface FleetUnitFacts {
+  readonly soc: number;
+  readonly bmsSoc: number;
+  readonly soh: number;
+  readonly packVoltageV: number;
+  readonly packCurrentA: number;
+  readonly batteryWatts: number;
+  readonly chargeLimitW: number;
+  readonly dischargeLimitW: number;
+  readonly cellCount: number;
+  readonly cellMinV: number;
+  readonly cellMaxV: number;
+  readonly tempMinC: number;
+  readonly tempMaxC: number;
+  readonly serial: string;
+  readonly rtuId: string;
+}
+
+const FLEET_FACTS: Record<string, FleetUnitFacts> = {
+  MID: {
+    soc: 10,
+    bmsSoc: 10,
+    soh: 100,
+    packVoltageV: 192.4,
+    packCurrentA: 0,
+    batteryWatts: 0,
+    chargeLimitW: 7692,
+    // SOC 10 %: the BMS inhibits discharge (limit 0 W) — the captured state.
+    dischargeLimitW: 0,
+    cellCount: 60,
+    cellMinV: 3.205,
+    cellMaxV: 3.209,
+    tempMinC: 23,
+    tempMaxC: 28,
+    serial: "BEP0005KXX11B10500151",
+    rtuId: "0x2C225097",
+  },
+  RHS: {
+    soc: 68,
+    bmsSoc: 68,
+    soh: 100,
+    packVoltageV: 164.5,
+    packCurrentA: -6.9,
+    batteryWatts: -1132,
+    chargeLimitW: 6532,
+    dischargeLimitW: 6532,
+    cellCount: 50,
+    cellMinV: 3.289,
+    cellMaxV: 3.292,
+    tempMinC: 23,
+    tempMaxC: 27,
+    serial: "BEP0005KXX11B10500118",
+    rtuId: "0x2C225076",
+  },
+  LHS: {
+    soc: 48,
+    bmsSoc: 48,
+    soh: 100,
+    packVoltageV: 196.8,
+    packCurrentA: -9.4,
+    batteryWatts: -1846,
+    chargeLimitW: 7812,
+    dischargeLimitW: 7812,
+    cellCount: 60,
+    cellMinV: 3.277,
+    cellMaxV: 3.283,
+    tempMinC: 23,
+    tempMaxC: 27,
+    serial: "BEP0005KXX11B10500149",
+    rtuId: "0x2C225095",
+  },
+};
+
+/** Evenly distributed cell voltages in mV resolution (the wire stores mV). */
+function cellVoltages(count: number, minV: number, maxV: number): number[] {
+  const minMv = Math.round(minV * 1000);
+  const maxMv = Math.round(maxV * 1000);
+  const values: number[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const millivolts =
+      count === 1 ? minMv : Math.round(minMv + ((maxMv - minMv) * index) / (count - 1));
+    values.push(millivolts / 1000);
+  }
+  return values;
+}
+
+/** Sensor temperatures across the pack (pole+ / cells / pole- triples). */
+function temperatures(count: number, minC: number, maxC: number): number[] {
+  const values: number[] = [];
+  for (let index = 0; index < count; index += 1) {
+    const raw = count === 1 ? minC : minC + ((maxC - minC) * index) / (count - 1);
+    values.push(Math.round(raw));
+  }
+  return values;
+}
+
+function allGoodQuality(): Record<string, string> {
+  const quality: Record<string, string> = {};
+  for (const field of TELEMETRY_QUALITY_FIELDS) {
+    quality[field] = "good";
+  }
+  return quality;
+}
+
+/** The capture's commissioned topology: BIC x 3 temperature sensors per unit. */
+function temperatureSensorCount(cellCount: number): number {
+  return (cellCount / 10) * 3;
+}
+
+/**
+ * A unit-detail fixture for one of the three captured units (MID / RHS / LHS);
+ * any other id gets the same generic shape with an honest absent identity.
+ * Overrides win field-by-field, and explicit nulls are preserved.
+ */
+export function unitDetail(unitId: string, spec: Partial<WireUnitDetail> = {}): WireUnitDetail {
+  const facts = FLEET_FACTS[unitId];
+  const cellCount = facts?.cellCount ?? 60;
+  const cells = cellVoltages(cellCount, facts?.cellMinV ?? 3.205, facts?.cellMaxV ?? 3.209);
+  const temperatureCount = temperatureSensorCount(facts?.cellCount ?? 60);
+  const temps = temperatures(temperatureCount, facts?.tempMinC ?? 23, facts?.tempMaxC ?? 28);
+  const base: WireUnitDetail = {
+    unit_id: unitId,
+    lifecycle: "disarmed",
+    device_identity: facts === undefined ? null : `${facts.serial} (RTU ${facts.rtuId})`,
+    protocol_profile: "iot",
+    connection_epoch: 3,
+    wall_timestamp: DEFAULT_OCCURRED_AT,
+    captured_at_mono: 75_231.5,
+    sequence: 410_200,
+    cell_captured_at_mono: 75_228.0,
+    cell_sequence: 41_019,
+    soc_pct: facts === undefined ? null : facts.soc,
+    bms_soc_pct: facts === undefined ? null : facts.bmsSoc,
+    soh_pct: facts === undefined ? null : facts.soh,
+    pack_voltage_v: facts === undefined ? null : facts.packVoltageV,
+    pack_current_a: facts === undefined ? null : facts.packCurrentA,
+    battery_watts: facts === undefined ? null : facts.batteryWatts,
+    dynamic_charge_limit_w: facts === undefined ? null : facts.chargeLimitW,
+    dynamic_discharge_limit_w: facts === undefined ? null : facts.dischargeLimitW,
+    cell_count: facts === undefined ? null : facts.cellCount,
+    cell_min_v: facts === undefined ? null : facts.cellMinV,
+    cell_max_v: facts === undefined ? null : facts.cellMaxV,
+    cell_spread_mv:
+      facts === undefined
+        ? null
+        : Math.round((facts.cellMaxV - facts.cellMinV) * 1000),
+    temperature_min_c: facts === undefined ? null : facts.tempMinC,
+    temperature_max_c: facts === undefined ? null : facts.tempMaxC,
+    active_faults: [],
+    active_warnings: ["PCS_Warning0_1", "DCDC_Warning0_1"],
+    cell_voltages_v: cells,
+    temperatures_c: temps,
+    quality: allGoodQuality(),
+  };
+  return { ...base, ...spec };
+}
+
+/**
+ * The projection with every datum absent — the honest shape the facade builds
+ * for a commissioned unit that has not published measurements (contract and
+ * service.py `_unit_projection`: null, never zero-filled, never empty arrays
+ * standing in for absent data).
+ */
+export function emptyUnitDetail(unitId: string): WireUnitDetail {
+  return {
+    unit_id: unitId,
+    lifecycle: null,
+    device_identity: null,
+    protocol_profile: null,
+    connection_epoch: null,
+    wall_timestamp: null,
+    captured_at_mono: null,
+    sequence: null,
+    cell_captured_at_mono: null,
+    cell_sequence: null,
+    soc_pct: null,
+    bms_soc_pct: null,
+    soh_pct: null,
+    pack_voltage_v: null,
+    pack_current_a: null,
+    battery_watts: null,
+    dynamic_charge_limit_w: null,
+    dynamic_discharge_limit_w: null,
+    cell_count: null,
+    cell_min_v: null,
+    cell_max_v: null,
+    cell_spread_mv: null,
+    temperature_min_c: null,
+    temperature_max_c: null,
+    active_faults: null,
+    active_warnings: null,
+    cell_voltages_v: null,
+    temperatures_c: null,
+    quality: null,
   };
 }
 

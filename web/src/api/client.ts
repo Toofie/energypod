@@ -63,6 +63,47 @@ export interface Snapshot {
   units: UnitSnapshot[];
 }
 
+/**
+ * The full latest-observation projection `GET /api/v1/units/{unit_id}` returns
+ * (API_CONTRACTS.md, "Application service facade" — `unit_detail`): identity,
+ * protocol profile, connection epoch, telemetry and cell sequences and capture
+ * times, the scalar measurements, the complete cell-voltage and temperature
+ * arrays, the per-field quality map, faults, and warnings. Every measurement
+ * field is null when that datum was absent — the client passes the projection
+ * through without interpretation.
+ */
+export interface UnitDetail {
+  unit_id: string;
+  lifecycle: string | null;
+  device_identity: string | null;
+  protocol_profile: string | null;
+  connection_epoch: number | null;
+  wall_timestamp: string | null;
+  captured_at_mono: number | null;
+  sequence: number | null;
+  cell_captured_at_mono: number | null;
+  cell_sequence: number | null;
+  soc_pct: number | null;
+  bms_soc_pct: number | null;
+  soh_pct: number | null;
+  pack_voltage_v: number | null;
+  pack_current_a: number | null;
+  battery_watts: number | null;
+  dynamic_charge_limit_w: number | null;
+  dynamic_discharge_limit_w: number | null;
+  cell_count: number | null;
+  cell_min_v: number | null;
+  cell_max_v: number | null;
+  cell_spread_mv: number | null;
+  temperature_min_c: number | null;
+  temperature_max_c: number | null;
+  active_faults: string[] | null;
+  active_warnings: string[] | null;
+  cell_voltages_v: number[] | null;
+  temperatures_c: number[] | null;
+  quality: Record<string, string> | null;
+}
+
 /** Wire shape from the facade: liveness, dependency readiness, and control
  * readiness are three separate facts, each with its own reason list. */
 export interface Health {
@@ -127,6 +168,8 @@ export function isUnauthorizedError(error: unknown): error is ApiClientError {
 export interface ApiClient {
   getSnapshot(): Promise<Snapshot>;
   getHealth(): Promise<Health>;
+  /** One unit's full latest-observation projection (observe scope). */
+  getUnitDetail(unitId: string): Promise<UnitDetail>;
   getAudit(limit: number, afterSequence?: number): Promise<AuditPage>;
   /** The optional key reuses one idempotency key across retries of a single
    * operator action; omitted, a fresh key is generated per call. */
@@ -388,6 +431,8 @@ export function createApiClient(token: string): ApiClient {
   return {
     getSnapshot: () => request<Snapshot>("/api/v1/snapshot"),
     getHealth: () => request<Health>("/api/v1/health"),
+    getUnitDetail: (unitId: string) =>
+      request<UnitDetail>(`/api/v1/units/${encodeURIComponent(unitId)}`),
     getAudit: (limit: number, afterSequence?: number) => {
       const params = new URLSearchParams({ limit: String(limit) });
       if (afterSequence !== undefined) {

@@ -57,10 +57,12 @@ import {
   observationPublished,
   snapshot as wireSnapshot,
   snapshotFrame,
+  telemetrySummary,
   unitArmed,
+  unitDetail,
   unitSnapshot,
 } from "../test/wire";
-import type { WireAuditEvent, WireSnapshot } from "../test/wire";
+import type { WireAuditEvent, WireSnapshot, WireUnitDetail } from "../test/wire";
 
 // ---------------------------------------------------------------------------
 // The production composition (web/src/main.tsx, replicated verbatim)
@@ -176,6 +178,12 @@ class ComposedHarness {
   world: WireSnapshot;
   healthValue: Health;
   auditEvents: WireAuditEvent[] = [];
+  /** Full latest-observation projections served by GET /api/v1/units/{id}. */
+  unitDetails: Record<string, WireUnitDetail> = {
+    MID: unitDetail("MID"),
+    RHS: unitDetail("RHS"),
+    LHS: unitDetail("LHS"),
+  };
   /** While false, the ticket handshake is refused: the service is down. */
   up = true;
   armRows: WireOutcomeRow[] | null = null;
@@ -251,6 +259,19 @@ class ComposedHarness {
     }
     if (method === "GET" && path === "/api/v1/health") {
       return jsonResponse(200, this.healthValue);
+    }
+    if (method === "GET" && path.startsWith("/api/v1/units/")) {
+      // rest.py: the unit detail read, with unknown ids refused through the
+      // structured envelope exactly as every other guarded route.
+      const unitId = decodeURIComponent(path.slice("/api/v1/units/".length));
+      const detail = this.unitDetails[unitId];
+      if (detail === undefined) {
+        return jsonResponse(
+          404,
+          errorBody("unknown_unit", `No such unit: ${unitId}`),
+        );
+      }
+      return jsonResponse(200, detail);
     }
     if (method === "GET" && path.startsWith("/api/v1/audit")) {
       return jsonResponse(200, auditPage(this.auditEvents, null));
@@ -613,6 +634,70 @@ describe("Composed console — a mid-session emergency stop", () => {
 // 4. Batteries and Activity render the REAL event/audit shapes
 // ---------------------------------------------------------------------------
 
+/** The captured fleet with every unit's real telemetry block on the wire. */
+function worldTelemetry(): WireSnapshot {
+  return wireSnapshot(
+    [
+      unitSnapshot({
+        unit_id: "MID",
+        lifecycle: "disarmed",
+        telemetry_age_s: 2,
+        measured_watts: 0,
+        telemetry: telemetrySummary({
+          soh_pct: 100,
+          battery_watts: 0,
+          pack_current_a: 0,
+          dynamic_charge_limit_w: 7692,
+          dynamic_discharge_limit_w: 0,
+        }),
+      }),
+      unitSnapshot({
+        unit_id: "RHS",
+        lifecycle: "disarmed",
+        telemetry_age_s: 3,
+        measured_watts: null,
+        telemetry: telemetrySummary({
+          soc_pct: 68,
+          pack_voltage_v: 164.5,
+          pack_current_a: -6.9,
+          battery_watts: -1132,
+          soh_pct: 100,
+          dynamic_charge_limit_w: 6532,
+          dynamic_discharge_limit_w: 6532,
+          cell_count: 50,
+          cell_min_v: 3.289,
+          cell_max_v: 3.292,
+          cell_spread_mv: 3,
+          temperature_min_c: 23,
+          temperature_max_c: 27,
+        }),
+      }),
+      unitSnapshot({
+        unit_id: "LHS",
+        lifecycle: "disarmed",
+        telemetry_age_s: 5,
+        measured_watts: null,
+        telemetry: telemetrySummary({
+          soc_pct: 48,
+          pack_voltage_v: 196.8,
+          pack_current_a: -9.4,
+          battery_watts: -1846,
+          soh_pct: 100,
+          dynamic_charge_limit_w: 7812,
+          dynamic_discharge_limit_w: 7812,
+          cell_count: 60,
+          cell_min_v: 3.277,
+          cell_max_v: 3.283,
+          cell_spread_mv: 6,
+          temperature_min_c: 23,
+          temperature_max_c: 27,
+        }),
+      }),
+    ],
+    { snapshot_sequence: 4300, captured_at: OCCURRED_AT },
+  );
+}
+
 describe("Composed console — Batteries on the real wire", () => {
   it("renders cards from the snapshot, observation.published tracks, and the audit Events tab holds", async () => {
     const user = userEvent.setup();
@@ -647,13 +732,13 @@ describe("Composed console — Batteries on the real wire", () => {
 
     await user.click(screen.getByRole("link", { name: "Batteries" }));
 
-    // The real snapshot shape: measured power renders; charge/temperature are
-    // named as missing (the wire carries no such fields), never invented.
+    // The real snapshot shape: measured power renders; charge, pack voltage,
+    // temperature, and cell spread are named as missing (this world's units
+    // carry no telemetry block), never invented.
     const midCard = await screen.findByRole("group", { name: "MID" });
     expect(within(midCard).getByText(/Discharging 1,200 W/)).toBeInTheDocument();
-    // Charge, temperature, and cell spread: three separately named gaps.
     await waitFor(() => {
-      expect(within(midCard).getAllByText(/^No data \(last update/)).toHaveLength(3);
+      expect(within(midCard).getAllByText(/^No data \(last update/)).toHaveLength(4);
     });
     expect(within(midCard).getByText("No data", { exact: true })).toBeInTheDocument();
 
@@ -676,6 +761,68 @@ describe("Composed console — Batteries on the real wire", () => {
     expect(screen.getByText(/Arm request: Armed/)).toBeInTheDocument();
     // RHS's entry is another unit's history: not shown under MID.
     expect(screen.queryByText(/Power decision/)).toBeNull();
+  });
+
+  it("renders telemetry cards from the snapshot block and the Cells tab from the real unit-detail read", async () => {
+    const user = userEvent.setup();
+    const harness = new ComposedHarness(worldTelemetry());
+    harness.install();
+    render(<AppShell views={views} />);
+    await unlock(user);
+    await waitFor(() => {
+      expect(factText(/event stream/i)).toContain("Yes — live");
+    });
+
+    // Home first: the reserve question now answers from per-unit SOC.
+    expect(
+      await screen.findByText(/Fleet charge level: 42% on average across all pods/i),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("link", { name: "Batteries" }));
+
+    // Cards render the captured decode per unit, bound to the unit id.
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    expect(midCard).toHaveTextContent(/charge level:\s*10%/i);
+    expect(midCard).toHaveTextContent(/pack voltage:\s*192\.4 V/i);
+    expect(midCard).toHaveTextContent(/cell spread:\s*4 mV across 60 cells/i);
+    expect(midCard).toHaveTextContent(/temperature:\s*23 °C to 28 °C/i);
+    expect(midCard).toHaveTextContent(/warnings:\s*PCS Warning0 1, DCDC Warning0 1/i);
+
+    const rhsCard = screen.getByRole("group", { name: "RHS" });
+    expect(rhsCard).toHaveTextContent(/charge level:\s*68%/i);
+    // measured_watts is null in this world: the figure is the telemetry
+    // block's own signed battery watts, carried by the direction word.
+    expect(rhsCard).toHaveTextContent(/power:\s*discharging 1,132 W/i);
+
+    const lhsCard = screen.getByRole("group", { name: "LHS" });
+    expect(lhsCard).toHaveTextContent(/charge level:\s*48%/i);
+    expect(lhsCard).toHaveTextContent(/pack voltage:\s*196\.8 V/i);
+
+    // The Summary tab's identity comes from the on-demand REST read.
+    await user.click(within(midCard).getByRole("button", { name: "MID" }));
+    const summary = await screen.findByRole("tabpanel");
+    await waitFor(() => {
+      expect(summary).toHaveTextContent(
+        /identity:\s*BEP0005KXX11B10500151 \(RTU 0x2C225097\), profile iot/i,
+      );
+    });
+
+    // The Cells tab renders the full captured distribution for MID.
+    await user.click(screen.getByRole("tab", { name: "Cells" }));
+    const cells = await screen.findByRole("tabpanel");
+    await waitFor(() => {
+      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.205 V/i);
+      expect(cells).toHaveTextContent(/maximum cell voltage:\s*3\.209 V/i);
+      expect(cells).toHaveTextContent(/voltage spread:\s*4 mV/i);
+    });
+    const grid = within(cells).getByRole("list", { name: /cell voltages/i });
+    expect(within(grid).getAllByRole("listitem")).toHaveLength(60);
+
+    // The unit-detail read went out authenticated over the real client, to
+    // the exact opened unit's path — once for the opened unit.
+    const detailReads = harness.requestsFor("GET", "/api/v1/units/MID");
+    expect(detailReads).toHaveLength(1);
+    expect(detailReads[0]!.headers.Authorization).toBe(`Bearer ${OPERATOR_TOKEN}`);
   });
 });
 

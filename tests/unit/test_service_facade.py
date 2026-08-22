@@ -111,6 +111,147 @@ def good_quality() -> dict[str, str]:
     return {field: "good" for field in QUALITY_FIELDS}
 
 
+TELEMETRY_SUMMARY_FIELDS = (
+    "soc_pct",
+    "bms_soc_pct",
+    "soh_pct",
+    "pack_voltage_v",
+    "pack_current_a",
+    "battery_watts",
+    "dynamic_charge_limit_w",
+    "dynamic_discharge_limit_w",
+    "cell_count",
+    "cell_min_v",
+    "cell_max_v",
+    "cell_spread_mv",
+    "temperature_min_c",
+    "temperature_max_c",
+    "active_faults",
+    "active_warnings",
+)
+
+# Live-decoded reference values from the first hardware capture
+# (docs/CONTINUITY.md evidence log): MID 10% / 192.4 V / 60 cells at
+# 3.205-3.209 V / 23-28 C; RHS 68% / 164.5 V / 50 cells at 3.289-3.292 V;
+# LHS 48% / 196.8 V / 60 cells.  All units carry both warnings and no faults.
+FLEET_WARNINGS = ("DCDC_Warning0_1", "PCS_Warning0_1")
+MID_IDENTITY = "BEP0005KXX11B10500055"
+
+
+def decoded_observation(
+    api: Any,
+    *,
+    unit_id: str,
+    soc_pct: float,
+    pack_voltage_v: float,
+    cell_count: int,
+    cell_low_v: float,
+    cell_high_v: float,
+    temperatures_c: tuple[float, ...],
+    battery_watts: float,
+    pack_current_a: float,
+    bms_soc_pct: float | None = None,
+    soh_pct: float | None = None,
+    dynamic_charge_limit_w: float | None = None,
+    dynamic_discharge_limit_w: float | None = None,
+    sequence: int = 41,
+    captured_at_mono: float = 99.5,
+    cell_sequence: int = 12,
+    cell_captured_at_mono: float = 98.0,
+    connection_epoch: int = 3,
+) -> Any:
+    """Build one real domain Observation carrying the captured fleet values."""
+    steps = max(1, round((cell_high_v - cell_low_v) / 0.001))
+    ladder = [cell_low_v + step * 0.001 for step in range(steps)]
+    ladder.append(cell_high_v)
+    cells = tuple(ladder[index % len(ladder)] for index in range(cell_count))
+    return api.Observation(
+        unit_id=unit_id,
+        device_identity=MID_IDENTITY,
+        connection_epoch=connection_epoch,
+        wall_timestamp=datetime(2026, 8, 22, 0, 4, 5, tzinfo=UTC),
+        captured_at_mono=captured_at_mono,
+        sequence=sequence,
+        lifecycle=api.UnitLifecycle.DISARMED,
+        protocol_profile="iot-v1",
+        system_soc_pct=soc_pct,
+        bms_soc_pct=soc_pct if bms_soc_pct is None else bms_soc_pct,
+        soh_pct=soh_pct,
+        battery_watts=battery_watts,
+        pack_voltage_v=pack_voltage_v,
+        pack_current_a=pack_current_a,
+        dynamic_charge_limit_w=dynamic_charge_limit_w,
+        dynamic_discharge_limit_w=dynamic_discharge_limit_w,
+        expected_cell_count=cell_count,
+        cell_voltages_v=cells,
+        cell_captured_at_mono=cell_captured_at_mono,
+        cell_sequence=cell_sequence,
+        expected_temperature_count=len(temperatures_c),
+        temperatures_c=temperatures_c,
+        active_faults=frozenset(),
+        active_warnings=frozenset(FLEET_WARNINGS),
+        quality={field: api.DataQuality.GOOD for field in QUALITY_FIELDS},
+    )
+
+
+def mid_observation(api: Any) -> Any:
+    return decoded_observation(
+        api,
+        unit_id="MID",
+        soc_pct=10.0,
+        pack_voltage_v=192.4,
+        cell_count=60,
+        cell_low_v=3.205,
+        cell_high_v=3.209,
+        temperatures_c=(23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 24.5, 25.5),
+        battery_watts=2405.0,
+        pack_current_a=12.5,
+        soh_pct=99.0,
+        dynamic_charge_limit_w=2500.0,
+        dynamic_discharge_limit_w=3000.0,
+    )
+
+
+def rhs_observation(api: Any) -> Any:
+    return decoded_observation(
+        api,
+        unit_id="RHS",
+        soc_pct=68.0,
+        pack_voltage_v=164.5,
+        cell_count=50,
+        cell_low_v=3.289,
+        cell_high_v=3.292,
+        temperatures_c=(25.0, 26.5),
+        battery_watts=1192.0,
+        pack_current_a=7.25,
+        soh_pct=98.0,
+        dynamic_charge_limit_w=2000.0,
+        dynamic_discharge_limit_w=2500.0,
+        sequence=12,
+        cell_sequence=3,
+    )
+
+
+def lhs_observation(api: Any) -> Any:
+    return decoded_observation(
+        api,
+        unit_id="LHS",
+        soc_pct=48.0,
+        pack_voltage_v=196.8,
+        cell_count=60,
+        cell_low_v=3.310,
+        cell_high_v=3.314,
+        temperatures_c=(22.5, 23.5),
+        battery_watts=0.0,
+        pack_current_a=0.0,
+        soh_pct=97.0,
+        dynamic_charge_limit_w=2800.0,
+        dynamic_discharge_limit_w=2800.0,
+        sequence=27,
+        cell_sequence=9,
+    )
+
+
 class FakeIntentRepository:
     """Async intent port; emergency-stop intents stay active until removed."""
 
@@ -153,7 +294,7 @@ class FakeIntentRepository:
 
 
 class FakeObservationRepository:
-    def __init__(self, latest: Mapping[str, Telemetry] | None = None) -> None:
+    def __init__(self, latest: Mapping[str, Any] | None = None) -> None:
         self.latest_values = dict(latest or {})
         self.calls: list[str] = []
         self.failing = False
@@ -462,6 +603,8 @@ def api() -> SimpleNamespace:
             IntentSource=domain.IntentSource,
             PowerIntent=domain.PowerIntent,
             UnitLifecycle=domain.UnitLifecycle,
+            Observation=domain.Observation,
+            DataQuality=domain.DataQuality,
         )
     except (ImportError, AttributeError) as error:
         pytest.fail(
@@ -473,7 +616,7 @@ def make_rig(
     api: Any,
     *,
     units: Mapping[str, Mapping[str, Any]] | None = None,
-    telemetry: Mapping[str, Telemetry] | None = None,
+    telemetry: Mapping[str, Any] | None = None,
     capabilities: Mapping[str, Capability] | None = None,
     seeded_intents: tuple[Any, ...] = (),
     audit_events: tuple[Any, ...] = (),
@@ -596,6 +739,8 @@ async def _invoke(
         return await facade.snapshot(principal=principal)
     if operation == "health":
         return await facade.health(principal=principal)
+    if operation == "unit_detail":
+        return await facade.unit_detail(principal=principal, unit_id="pod-a")
     if operation == "recent_audit":
         return await facade.recent_audit(principal=principal, limit=5)
     if operation == "submit_intent":
@@ -806,6 +951,271 @@ async def test_snapshot_is_read_only_and_never_triggers_control(api: Any) -> Non
     assert rig.bus.published == []
     assert rig.intents.added == []
     assert rig.authorizations.published == []
+    assert rig.history == []
+
+
+# --- snapshot telemetry summary (API_CONTRACTS facade amendment) -------------
+
+
+async def test_snapshot_telemetry_summary_projects_the_decoded_fleet(api: Any) -> None:
+    rig = make_rig(
+        api,
+        units={"MID": {}, "RHS": {}, "LHS": {}},
+        telemetry={
+            "MID": mid_observation(api),
+            "RHS": rhs_observation(api),
+            "LHS": lhs_observation(api),
+        },
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["MID"]["telemetry"] == {
+        "soc_pct": 10.0,
+        "bms_soc_pct": 10.0,
+        "soh_pct": 99.0,
+        "pack_voltage_v": 192.4,
+        "pack_current_a": 12.5,
+        "battery_watts": 2405.0,
+        "dynamic_charge_limit_w": 2500.0,
+        "dynamic_discharge_limit_w": 3000.0,
+        "cell_count": 60,
+        "cell_min_v": 3.205,
+        "cell_max_v": 3.209,
+        "cell_spread_mv": pytest.approx(4.0),
+        "temperature_min_c": 23.0,
+        "temperature_max_c": 28.0,
+        "active_faults": [],
+        "active_warnings": ["DCDC_Warning0_1", "PCS_Warning0_1"],
+    }
+    assert units["RHS"]["telemetry"] == {
+        "soc_pct": 68.0,
+        "bms_soc_pct": 68.0,
+        "soh_pct": 98.0,
+        "pack_voltage_v": 164.5,
+        "pack_current_a": 7.25,
+        "battery_watts": 1192.0,
+        "dynamic_charge_limit_w": 2000.0,
+        "dynamic_discharge_limit_w": 2500.0,
+        "cell_count": 50,
+        "cell_min_v": 3.289,
+        "cell_max_v": 3.292,
+        "cell_spread_mv": pytest.approx(3.0),
+        "temperature_min_c": 25.0,
+        "temperature_max_c": 26.5,
+        "active_faults": [],
+        "active_warnings": ["DCDC_Warning0_1", "PCS_Warning0_1"],
+    }
+    assert units["LHS"]["telemetry"] == {
+        "soc_pct": 48.0,
+        "bms_soc_pct": 48.0,
+        "soh_pct": 97.0,
+        "pack_voltage_v": 196.8,
+        "pack_current_a": 0.0,
+        "battery_watts": 0.0,
+        "dynamic_charge_limit_w": 2800.0,
+        "dynamic_discharge_limit_w": 2800.0,
+        "cell_count": 60,
+        "cell_min_v": 3.310,
+        "cell_max_v": 3.314,
+        "cell_spread_mv": pytest.approx(4.0),
+        "temperature_min_c": 22.5,
+        "temperature_max_c": 23.5,
+        "active_faults": [],
+        "active_warnings": ["DCDC_Warning0_1", "PCS_Warning0_1"],
+    }
+    # A genuinely measured zero stays zero; it is never promoted to a value.
+    assert units["LHS"]["measured_watts"] == 0.0
+
+
+async def test_snapshot_telemetry_summary_is_null_without_any_observation(
+    api: Any,
+) -> None:
+    rig = make_rig(api, units={"MID": {}, "RHS": {}}, telemetry={"MID": mid_observation(api)})
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["MID"]["telemetry"] is not None
+    silent = units["RHS"]
+    assert silent["telemetry"] is None, "no observation means no summary, never zeros"
+    assert silent["telemetry_age_s"] is None
+    assert silent["measured_watts"] is None
+
+
+async def test_snapshot_telemetry_summary_renders_nulls_never_zeros_for_partial_observations(
+    api: Any,
+) -> None:
+    # A partial observation: capture time, watts, and quality only.  Every
+    # datum it lacks must surface as null, never as a fabricated zero.
+    partial = Telemetry("MID", 99.5, 1234.0, good_quality())
+    rig = make_rig(api, units={"MID": {}}, telemetry={"MID": partial})
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    telemetry = units["MID"]["telemetry"]
+    assert telemetry is not None
+    for field in TELEMETRY_SUMMARY_FIELDS:
+        if field == "battery_watts":
+            continue
+        assert telemetry[field] is None, f"{field} must be null for a partial observation"
+    assert telemetry["battery_watts"] == 1234.0
+
+
+async def test_snapshot_telemetry_summary_nulls_derived_stats_for_empty_arrays(
+    api: Any,
+) -> None:
+    empty_cells = api.Observation(
+        unit_id="MID",
+        connection_epoch=3,
+        wall_timestamp=datetime(2026, 8, 22, 0, 4, 5, tzinfo=UTC),
+        captured_at_mono=99.5,
+        sequence=41,
+        lifecycle=api.UnitLifecycle.DISARMED,
+        protocol_profile="iot-v1",
+        system_soc_pct=10.0,
+        bms_soc_pct=None,
+        soh_pct=None,
+        battery_watts=None,
+        pack_voltage_v=192.4,
+        pack_current_a=None,
+        dynamic_charge_limit_w=None,
+        dynamic_discharge_limit_w=None,
+        cell_voltages_v=(),
+        temperatures_c=(),
+        active_faults=frozenset(),
+        active_warnings=frozenset(FLEET_WARNINGS),
+        quality={field: api.DataQuality.GOOD for field in QUALITY_FIELDS},
+    )
+    rig = make_rig(api, units={"MID": {}}, telemetry={"MID": empty_cells})
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    telemetry = units["MID"]["telemetry"]
+    assert telemetry is not None
+    assert telemetry["soc_pct"] == 10.0
+    assert telemetry["pack_voltage_v"] == 192.4
+    for field in (
+        "cell_count",
+        "cell_min_v",
+        "cell_max_v",
+        "cell_spread_mv",
+        "temperature_min_c",
+        "temperature_max_c",
+    ):
+        assert telemetry[field] is None, f"{field} must be null for empty arrays, never zero"
+
+
+# --- unit_detail ---------------------------------------------------------------
+
+
+async def test_unit_detail_returns_the_full_latest_observation_projection(api: Any) -> None:
+    observation = mid_observation(api)
+    rig = make_rig(api, units={"MID": {}, "RHS": {}}, telemetry={"MID": observation})
+
+    detail = await rig.facade.unit_detail(principal=OPERATOR, unit_id="MID")
+
+    assert detail["unit_id"] == "MID"
+    assert detail["device_identity"] == MID_IDENTITY
+    assert detail["protocol_profile"] == "iot-v1"
+    assert detail["connection_epoch"] == 3
+    assert detail["lifecycle"] == "disarmed"
+    assert detail["sequence"] == 41
+    assert detail["captured_at_mono"] == 99.5
+    assert detail["cell_sequence"] == 12
+    assert detail["cell_captured_at_mono"] == 98.0
+    assert detail["wall_timestamp"] == observation.wall_timestamp.isoformat()
+    # The summary scalars are carried unchanged into the detail view.
+    for field, value in (
+        ("soc_pct", 10.0),
+        ("bms_soc_pct", 10.0),
+        ("soh_pct", 99.0),
+        ("pack_voltage_v", 192.4),
+        ("pack_current_a", 12.5),
+        ("battery_watts", 2405.0),
+        ("dynamic_charge_limit_w", 2500.0),
+        ("dynamic_discharge_limit_w", 3000.0),
+        ("cell_count", 60),
+        ("cell_min_v", 3.205),
+        ("cell_max_v", 3.209),
+        ("temperature_min_c", 23.0),
+        ("temperature_max_c", 28.0),
+    ):
+        assert detail[field] == value
+    assert detail["cell_spread_mv"] == pytest.approx(4.0)
+    assert detail["cell_voltages_v"] == list(observation.cell_voltages_v)
+    assert len(detail["cell_voltages_v"]) == 60
+    assert detail["temperatures_c"] == list(observation.temperatures_c)
+    assert detail["quality"] == {field: "good" for field in QUALITY_FIELDS}
+    assert detail["active_faults"] == []
+    assert detail["active_warnings"] == ["DCDC_Warning0_1", "PCS_Warning0_1"]
+    # The detail reads exactly one unit's latest observation.
+    assert rig.observations.calls == ["latest:MID"]
+
+
+async def test_unit_detail_for_a_known_unit_without_observations_projects_nulls(
+    api: Any,
+) -> None:
+    rig = make_rig(api, units={"MID": {}, "RHS": {}}, telemetry={"MID": mid_observation(api)})
+
+    detail = await rig.facade.unit_detail(principal=OPERATOR, unit_id="RHS")
+
+    assert detail["unit_id"] == "RHS"
+    for field in (
+        "device_identity",
+        "protocol_profile",
+        "connection_epoch",
+        "lifecycle",
+        "sequence",
+        "captured_at_mono",
+        "cell_sequence",
+        "cell_captured_at_mono",
+        "wall_timestamp",
+        "cell_voltages_v",
+        "temperatures_c",
+        "quality",
+        *TELEMETRY_SUMMARY_FIELDS,
+    ):
+        assert detail[field] is None, f"{field} must be null before the first observation"
+    assert rig.observations.calls == ["latest:RHS"]
+
+
+async def test_unit_detail_refuses_unknown_units_without_reading_the_store(
+    api: Any,
+) -> None:
+    rig = make_rig(api, units={"MID": {}}, telemetry={"MID": mid_observation(api)})
+
+    with pytest.raises(LookupError):
+        await rig.facade.unit_detail(principal=OPERATOR, unit_id="pod-ghost")
+
+    assert rig.observations.calls == []
+    with pytest.raises(ValueError):
+        await rig.facade.unit_detail(principal=OPERATOR, unit_id="not canonical!")
+
+
+async def test_unit_detail_requires_the_observe_scope(api: Any) -> None:
+    rig = make_rig(api, telemetry={"MID": mid_observation(api)})
+    sightless = replace(OPERATOR, scopes=frozenset({"dispatch"}))
+
+    with pytest.raises(PermissionError):
+        await rig.facade.unit_detail(principal=sightless, unit_id="MID")
+
+    assert rig.recorder_activity() == []
+
+
+async def test_unit_detail_is_a_pure_read_of_repository_state(api: Any) -> None:
+    rig = make_rig(api, units={"MID": {}}, telemetry={"MID": mid_observation(api)})
+
+    await rig.facade.unit_detail(principal=OPERATOR, unit_id="MID")
+
+    assert rig.audit.appended == []
+    assert rig.bus.published == []
+    assert rig.intents.added == []
+    assert rig.authorizations.published == []
+    assert rig.authorizations.peek_calls == []
     assert rig.history == []
 
 
@@ -1753,6 +2163,7 @@ async def test_acknowledge_inhibit_requires_arm_scope_and_an_interactive_princip
     [
         "snapshot",
         "health",
+        "unit_detail",
         "recent_audit",
         "submit_intent",
         "arm",

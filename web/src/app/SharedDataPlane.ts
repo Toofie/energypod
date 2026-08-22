@@ -296,6 +296,7 @@ export function sharedClient(plane: SharedDataPlane, real: ApiClient): ApiClient
   return {
     getSnapshot: () => plane.snapshot(),
     getHealth: () => plane.health(),
+    getUnitDetail: (unitId) => real.getUnitDetail(unitId),
     getAudit: (limit, afterSequence) => real.getAudit(limit, afterSequence),
     postIntent: (body, idempotencyKey) => real.postIntent(body, idempotencyKey),
     postArm: (unitIds, idempotencyKey) => real.postArm(unitIds, idempotencyKey),

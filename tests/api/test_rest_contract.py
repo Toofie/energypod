@@ -10,6 +10,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from .conftest import (
+    MID_TELEMETRY_SUMMARY,
+    UNIT_DETAIL_PROJECTIONS,
     FakeAuthenticator,
     FakeEventSource,
     MutableMonotonicClock,
@@ -117,6 +119,115 @@ def test_viewer_can_read_snapshot_and_health_but_not_audit(
     assert health.status_code == 200
     assert set(health.json()) == {"liveness", "service_readiness", "control_readiness"}
     _assert_error(audit, 403, "insufficient_scope")
+
+
+def test_snapshot_serves_the_nullable_telemetry_summary_block(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """API_CONTRACTS facade amendment: every snapshot unit carries a nullable
+    telemetry summary; absent data is null, never zero-filled."""
+    with _client(service, authenticator) as client:
+        response = client.get(f"{API}/snapshot", headers=_auth("viewer-token"))
+
+    assert response.status_code == 200
+    units = {unit["unit_id"]: unit for unit in response.json()["units"]}
+    assert units["pod-a"]["telemetry"] == MID_TELEMETRY_SUMMARY
+    without_observation = units["pod-b"]
+    assert without_observation["telemetry"] is None
+    assert without_observation["measured_watts"] is None
+
+
+def test_unit_detail_requires_authentication_and_observe_scope(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        unauthenticated = client.get(f"{API}/units/MID")
+        audit_only = client.get(f"{API}/units/MID", headers=_auth("audit-only-token"))
+        viewer = client.get(f"{API}/units/MID", headers=_auth("viewer-token"))
+
+    _assert_error(unauthenticated, 401, "authentication_required")
+    _assert_error(audit_only, 403, "insufficient_scope")
+    assert viewer.status_code == 200
+    forwarded = [values for name, values in service.calls if name == "unit_detail"]
+    assert len(forwarded) == 1
+    assert forwarded[0]["unit_id"] == "MID"
+    assert forwarded[0]["principal"].subject == "person:viewer"
+
+
+def test_unit_detail_serves_the_full_latest_observation_projection(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        response = client.get(f"{API}/units/MID", headers=_auth("viewer-token"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == UNIT_DETAIL_PROJECTIONS["MID"]
+    # Live-decoded reference values survive the boundary unchanged.
+    assert body["device_identity"] == "BEP0005KXX11B10500055"
+    assert body["soc_pct"] == 10.0
+    assert body["pack_voltage_v"] == 192.4
+    assert body["cell_count"] == 60
+    assert len(body["cell_voltages_v"]) == 60
+    assert body["cell_min_v"] == 3.205
+    assert body["cell_max_v"] == 3.209
+    assert body["temperature_min_c"] == 23.0
+    assert body["temperature_max_c"] == 28.0
+    assert body["active_warnings"] == ["DCDC_Warning0_1", "PCS_Warning0_1"]
+    assert body["active_faults"] == []
+    assert set(body["quality"]) == {
+        "system_soc_pct",
+        "bms_soc_pct",
+        "soh_pct",
+        "battery_watts",
+        "pack_voltage_v",
+        "pack_current_a",
+        "dynamic_charge_limit_w",
+        "dynamic_discharge_limit_w",
+        "cell_voltages_v",
+        "temperatures_c",
+    }
+
+
+def test_unit_detail_passes_null_fields_through_unchanged(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """A commissioned unit without observations projects nulls, never zeros."""
+    with _client(service, authenticator) as client:
+        response = client.get(f"{API}/units/pod-empty", headers=_auth("viewer-token"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body == UNIT_DETAIL_PROJECTIONS["pod-empty"]
+    for field in (
+        "soc_pct",
+        "pack_voltage_v",
+        "battery_watts",
+        "cell_count",
+        "cell_spread_mv",
+        "temperature_min_c",
+        "active_faults",
+        "active_warnings",
+        "cell_voltages_v",
+        "temperatures_c",
+        "quality",
+        "sequence",
+    ):
+        assert body[field] is None, f"{field} must be null, never a fabricated zero"
+
+
+def test_unit_detail_refuses_unknown_and_malformed_unit_ids(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        malformed = client.get(f"{API}/units/-pod", headers=_auth("viewer-token"))
+        unknown = client.get(f"{API}/units/pod-ghost", headers=_auth("viewer-token"))
+
+    _assert_error(malformed, 422, "validation_error")
+    _assert_error(unknown, 404, "unit_not_found")
+    # Only the well-formed but unknown probe reaches the service.
+    forwarded = [values for name, values in service.calls if name == "unit_detail"]
+    assert [values["unit_id"] for values in forwarded] == ["pod-ghost"]
 
 
 def test_auditor_read_is_bounded_and_reaches_the_service(
@@ -972,6 +1083,7 @@ def test_healthz_is_a_get_only_deterministic_probe(
         ("GET", "/snapshot", None),
         ("GET", "/health", None),
         ("GET", "/audit", None),
+        ("GET", "/units/MID", None),
         (
             "POST",
             "/intents",

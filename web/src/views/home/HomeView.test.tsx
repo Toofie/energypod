@@ -73,6 +73,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
 import type { ApiClient } from "../../api/client";
+import { telemetrySummary, type WireTelemetrySummary } from "../../test/wire";
 import { HomeView } from "./HomeView";
 
 vi.mock("../../api/client", async (importOriginal) => {
@@ -107,6 +108,8 @@ interface UnitView {
   requested_power: PowerFigure;
   authorized_power: PowerFigure | null;
   measured_watts: number | null;
+  /** The amended snapshot contract's nullable telemetry block (wire.ts). */
+  telemetry?: WireTelemetrySummary | null;
 }
 
 interface FleetView {
@@ -421,6 +424,58 @@ describe("HomeView", () => {
     expect(entry.textContent ?? "").toMatch(
       /(?:limit\w*|reduc\w*|holding back|less than requested)[^\d]{0,40}1,?200/i,
     );
+  });
+
+  it("derives the fleet reserve from per-unit state of charge: the pinned average over reporting pods", async () => {
+    // The 2026-08-22 capture decode: MID 10 %, RHS 68 %, LHS 48 % — the fleet
+    // figure is their average (42 %), each row naming its own pod's reading.
+    const snapshot = fleet([
+      unit({ unit_id: "pod-mid", telemetry: telemetrySummary({ soc_pct: 10 }) }),
+      unit({ unit_id: "pod-rhs", telemetry: telemetrySummary({ soc_pct: 68 }) }),
+      unit({ unit_id: "pod-lhs", telemetry: telemetrySummary({ soc_pct: 48 }) }),
+    ]);
+    installClient({ snapshot });
+    renderHome();
+
+    const reserveRegion = await screen.findByRole("region", { name: RESERVE_REGION });
+    expectVisibleText(reserveRegion, /Fleet charge level: 42% on average across all pods/i);
+
+    const breakdown = within(reserveRegion).getByRole("list", {
+      name: /per.?unit|breakdown/i,
+    });
+    expect(
+      within(breakdown).getByRole("listitem", { name: /pod-mid charge level/i }),
+    ).toHaveTextContent(/10% charged/);
+    expect(
+      within(breakdown).getByRole("listitem", { name: /pod-rhs charge level/i }),
+    ).toHaveTextContent(/68% charged/);
+    expect(
+      within(breakdown).getByRole("listitem", { name: /pod-lhs charge level/i }),
+    ).toHaveTextContent(/48% charged/);
+  });
+
+  it("averages only the pods reporting a charge reading and names the silent pod's gap", async () => {
+    const snapshot = fleet([
+      unit({ unit_id: "pod-mid", telemetry: telemetrySummary({ soc_pct: 10 }) }),
+      unit({ unit_id: "pod-rhs", telemetry: telemetrySummary({ soc_pct: 68 }) }),
+      // No observation: a silent pod is not an empty battery — it contributes
+      // nothing to the average and its row stays honestly not-available.
+      unit({ unit_id: "pod-lhs", telemetry: null, measured_watts: null }),
+    ]);
+    installClient({ snapshot });
+    renderHome();
+
+    const reserveRegion = await screen.findByRole("region", { name: RESERVE_REGION });
+    expectVisibleText(
+      reserveRegion,
+      /Fleet charge level: 39% on average across the 2 pods reporting a charge reading/i,
+    );
+    const breakdown = within(reserveRegion).getByRole("list", {
+      name: /per.?unit|breakdown/i,
+    });
+    const silent = within(breakdown).getByRole("listitem", { name: /pod-lhs charge level/i });
+    expect(silent).toHaveTextContent(/charge level not available/i);
+    expect(silent.textContent ?? "").not.toMatch(/%/);
   });
 
   it("shows the next planned action's direction and watts while an intent is active", async () => {

@@ -13,11 +13,22 @@
  * Wire truth this view is built on (src/energypod/application/service.py,
  * runtime/composition.py, api/rest.py — mirrored in web/src/test/wire.ts):
  *
- * - The snapshot unit carries exactly `unit_id, lifecycle, telemetry_age_s,
- *   quality, requested_power, authorized_power, measured_watts`. There is no
- *   charge, temperature, cell, or warning field anywhere on the snapshot, so
- *   those card fields render "No data" (named, with age) until the service
- *   exposes them — never an invented value.
+ * - The snapshot unit carries `unit_id, lifecycle, telemetry_age_s, quality,
+ *   requested_power, authorized_power, measured_watts` plus the amended
+ *   nullable `telemetry` summary projection (API_CONTRACTS.md "Application
+ *   service facade"): `soc_pct` … `active_warnings`, every field null when
+ *   that datum is absent — never zero-filled. Card fields read exactly that
+ *   projection; a null telemetry block or a null field renders "No data"
+ *   (named, with age), never an invented value.
+ * - `GET /api/v1/units/{unit_id}` returns the full latest-observation
+ *   projection for one unit: identity (`device_identity`),
+ *   `protocol_profile`, `connection_epoch`, telemetry and cell sequences and
+ *   capture times, the scalar measurements, the complete `cell_voltages_v`
+ *   and `temperatures_c` arrays, the per-field `quality` map, faults, and
+ *   warnings. The view fetches it on demand when a unit is opened (the Cells
+ *   tab's distribution and the Summary tab's identity come from it) with its
+ *   own loading / error / disconnected states; unknown ids are refused with
+ *   the structured envelope, rendered verbatim.
  * - `quality` is the facade's own projection vocabulary
  *   `good | degraded | bad | missing`; "degraded" already encodes telemetry
  *   past the service's 30 s good bound, so staleness marking keys on it.
@@ -81,6 +92,29 @@ interface LatchState {
   reason_code: string | null;
 }
 
+/**
+ * The nullable telemetry summary projection the snapshot carries (defensively
+ * parsed; every field null when that datum was absent from the observation).
+ */
+interface TelemetryView {
+  readonly socPct: number | null;
+  readonly bmsSocPct: number | null;
+  readonly sohPct: number | null;
+  readonly packVoltageV: number | null;
+  readonly packCurrentA: number | null;
+  readonly batteryWatts: number | null;
+  readonly dynamicChargeLimitW: number | null;
+  readonly dynamicDischargeLimitW: number | null;
+  readonly cellCount: number | null;
+  readonly cellMinV: number | null;
+  readonly cellMaxV: number | null;
+  readonly cellSpreadMv: number | null;
+  readonly temperatureMinC: number | null;
+  readonly temperatureMaxC: number | null;
+  readonly activeFaults: readonly string[] | null;
+  readonly activeWarnings: readonly string[] | null;
+}
+
 interface ViewUnit {
   unit_id: string;
   lifecycle: string;
@@ -89,8 +123,25 @@ interface ViewUnit {
   requested_power: WirePower;
   authorized_power: WirePower | null;
   measured_watts: number | null;
+  telemetry: TelemetryView | null;
   inhibit: LatchState | null;
 }
+
+/** The GET /api/v1/units/{id} projection, parsed just as defensively. */
+interface UnitDetailView {
+  readonly deviceIdentity: string | null;
+  readonly protocolProfile: string | null;
+  readonly connectionEpoch: number | null;
+  readonly wallTimestamp: string | null;
+  readonly sequence: number | null;
+  readonly cellSequence: number | null;
+  readonly telemetry: TelemetryView;
+  readonly cellVoltages: readonly number[];
+  readonly temperatures: readonly number[];
+  readonly quality: Readonly<Record<string, string>>;
+}
+
+type DetailPhase = "loading" | "ready" | "error";
 
 interface FleetState {
   siteId: string;
@@ -220,6 +271,25 @@ function formatWatts(watts: number): string {
   return Math.round(Math.abs(watts)).toLocaleString("en-US");
 }
 
+/** One decimal at most, trailing zeros dropped: 10 -> "10%", 48.5 -> "48.5%". */
+function formatPercent(value: number): string {
+  return `${Number(value.toFixed(1))}%`;
+}
+
+/** Pack voltage keeps its wire precision (192.4 V, 164.5 V). */
+function formatPackVolts(value: number): string {
+  return `${Number(value.toFixed(1))} V`;
+}
+
+/** Cell voltage is mV-resolution data: always three decimals. */
+function formatCellVolts(value: number): string {
+  return `${value.toFixed(3)} V`;
+}
+
+function formatCelsius(value: number): string {
+  return `${Number(value.toFixed(1))} °C`;
+}
+
 function directionWord(direction: string): string {
   if (direction === "charge") {
     return "Charging";
@@ -230,13 +300,22 @@ function directionWord(direction: string): string {
   return "Idle";
 }
 
+/** A battery warning/fault code with its underscores as spaces (the codes are
+ * device families like `PCS_Warning0_1`; no vendor text table exists). */
+function warningWord(code: string): string {
+  return code.replace(/_+/g, " ");
+}
+
 /** Card power phrase: the measured figure only, its sign carried by the
- * direction word — a clamped action must never read as the request. A unit
- * whose telemetry is marked missing carries no measurement at all, so a
- * zeroed wire field is never dressed up as a reading. */
+ * direction word — a clamped action must never read as the request. The
+ * telemetry block's `battery_watts` is the observation's own signed figure;
+ * `measured_watts` is the same datum the facade projects, so either may carry
+ * the row. A unit whose telemetry is marked missing carries no measurement at
+ * all, so a zeroed wire field is never dressed up as a reading. */
 function cardPowerText(unit: ViewUnit): string {
   const telemetryMissing = unit.quality === "missing" || unit.lifecycle === "disconnected";
-  const measured = telemetryMissing ? null : unit.measured_watts;
+  const fromTelemetry = telemetryMissing ? null : unit.telemetry?.batteryWatts ?? null;
+  const measured = fromTelemetry ?? (telemetryMissing ? null : unit.measured_watts);
   if (measured === null) {
     return "No data";
   }
@@ -248,6 +327,69 @@ function cardPowerText(unit: ViewUnit): string {
   }
   const fallback = unit.authorized_power?.direction ?? unit.requested_power.direction;
   return `${directionWord(fallback)} 0 W`;
+}
+
+/** Charge row: the telemetry block's SOC, or the named gap. */
+function cardChargeText(unit: ViewUnit): string {
+  const soc = unit.telemetry?.socPct;
+  if (soc === null || soc === undefined) {
+    return missingText(unit.telemetry_age_s);
+  }
+  return formatPercent(soc);
+}
+
+/** Pack voltage row: present only as the observation reported it. */
+function cardPackVoltageText(unit: ViewUnit): string {
+  const volts = unit.telemetry?.packVoltageV;
+  if (volts === null || volts === undefined) {
+    return missingText(unit.telemetry_age_s);
+  }
+  return formatPackVolts(volts);
+}
+
+/** Cell spread row: spread first, the population it was measured over named. */
+function cardCellSpreadText(unit: ViewUnit): string {
+  const telemetry = unit.telemetry;
+  const spread = telemetry?.cellSpreadMv ?? null;
+  const count = telemetry?.cellCount ?? null;
+  if (spread === null && count === null) {
+    return missingText(unit.telemetry_age_s);
+  }
+  if (spread === null) {
+    return `${count} cells`;
+  }
+  if (count === null) {
+    return `${spread} mV spread`;
+  }
+  return `${spread} mV across ${count} cells`;
+}
+
+/** Temperature row: the observed range, min to max. */
+function cardTemperatureText(unit: ViewUnit): string {
+  const min = unit.telemetry?.temperatureMinC ?? null;
+  const max = unit.telemetry?.temperatureMaxC ?? null;
+  if (min === null && max === null) {
+    return missingText(unit.telemetry_age_s);
+  }
+  if (min === null) {
+    return `up to ${formatCelsius(max as number)}`;
+  }
+  if (max === null) {
+    return `from ${formatCelsius(min)}`;
+  }
+  return `${formatCelsius(min)} to ${formatCelsius(max)}`;
+}
+
+/** Warnings row: the block's own words; an empty list is a real "None". */
+function cardWarningsText(unit: ViewUnit): string {
+  const warnings = unit.telemetry?.activeWarnings;
+  if (warnings === null || warnings === undefined) {
+    return "No data";
+  }
+  if (warnings.length === 0) {
+    return "None";
+  }
+  return warnings.map(warningWord).join(", ");
 }
 
 function ageText(seconds: number | null): string {
@@ -310,6 +452,90 @@ function parsePower(value: unknown): WirePower | null {
   return null;
 }
 
+function parseStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  return value.filter((code): code is string => typeof code === "string" && code !== "");
+}
+
+/**
+ * The telemetry projection's own field names — shared by the snapshot's
+ * nested `telemetry` block and the unit detail's flat projection — with every
+ * absent datum staying null.
+ */
+function parseTelemetryFields(value: Record<string, unknown>): TelemetryView {
+  return {
+    socPct: parseNumber(value.soc_pct),
+    bmsSocPct: parseNumber(value.bms_soc_pct),
+    sohPct: parseNumber(value.soh_pct),
+    packVoltageV: parseNumber(value.pack_voltage_v),
+    packCurrentA: parseNumber(value.pack_current_a),
+    batteryWatts: parseNumber(value.battery_watts),
+    dynamicChargeLimitW: parseNumber(value.dynamic_charge_limit_w),
+    dynamicDischargeLimitW: parseNumber(value.dynamic_discharge_limit_w),
+    cellCount:
+      typeof value.cell_count === "number" &&
+      Number.isInteger(value.cell_count) &&
+      value.cell_count >= 0
+        ? value.cell_count
+        : null,
+    cellMinV: parseNumber(value.cell_min_v),
+    cellMaxV: parseNumber(value.cell_max_v),
+    cellSpreadMv: parseNumber(value.cell_spread_mv),
+    temperatureMinC: parseNumber(value.temperature_min_c),
+    temperatureMaxC: parseNumber(value.temperature_max_c),
+    activeFaults: parseStringArray(value.active_faults),
+    activeWarnings: parseStringArray(value.active_warnings),
+  };
+}
+
+/** The snapshot's nested, nullable telemetry block. */
+function parseTelemetry(value: unknown): TelemetryView | null {
+  return isRecord(value) ? parseTelemetryFields(value) : null;
+}
+
+function parseNumberArray(value: unknown): number[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter(
+    (entry): entry is number => typeof entry === "number" && Number.isFinite(entry),
+  );
+}
+
+function parseQualityMap(value: unknown): Record<string, string> {
+  if (!isRecord(value)) {
+    return {};
+  }
+  const quality: Record<string, string> = {};
+  for (const [field, word] of Object.entries(value)) {
+    if (typeof word === "string" && word !== "") {
+      quality[field] = word;
+    }
+  }
+  return quality;
+}
+
+/** The GET /api/v1/units/{id} projection; nothing is trusted, nothing made up. */
+function parseUnitDetail(raw: unknown): UnitDetailView | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  return {
+    deviceIdentity: typeof raw.device_identity === "string" ? raw.device_identity : null,
+    protocolProfile: typeof raw.protocol_profile === "string" ? raw.protocol_profile : null,
+    connectionEpoch: parseNumber(raw.connection_epoch),
+    wallTimestamp: typeof raw.wall_timestamp === "string" ? raw.wall_timestamp : null,
+    sequence: parseNumber(raw.sequence),
+    cellSequence: parseNumber(raw.cell_sequence),
+    telemetry: parseTelemetryFields(raw),
+    cellVoltages: parseNumberArray(raw.cell_voltages_v),
+    temperatures: parseNumberArray(raw.temperatures_c),
+    quality: parseQualityMap(raw.quality),
+  };
+}
+
 function parseUnit(record: Record<string, unknown>): ViewUnit | null {
   if (typeof record.unit_id !== "string") {
     return null;
@@ -334,6 +560,7 @@ function parseUnit(record: Record<string, unknown>): ViewUnit | null {
     requested_power: parsePower(record.requested_power) ?? { direction: "idle", watts: 0 },
     authorized_power: parsePower(record.authorized_power),
     measured_watts: parseNumber(record.measured_watts),
+    telemetry: parseTelemetry(record.telemetry),
     inhibit,
   };
 }
@@ -430,9 +657,6 @@ function FleetCard({
 }: FleetCardProps): JSX.Element {
   const telemetryAge = unit.telemetry_age_s;
   const dimmed = isStaleData(unit);
-  const charge = missingText(telemetryAge);
-  const temperature = missingText(telemetryAge);
-  const cellSpread = missingText(telemetryAge);
   return (
     <div
       role="group"
@@ -448,16 +672,19 @@ function FleetCard({
         <b>Availability:</b> {availabilityWord(unit.lifecycle)}
       </p>
       <p>
-        <b>Charge level:</b> {charge}
+        <b>Charge level:</b> {cardChargeText(unit)}
       </p>
       <p>
         <b>Power:</b> {cardPowerText(unit)}
       </p>
       <p>
-        <b>Temperature:</b> {temperature}
+        <b>Pack voltage:</b> {cardPackVoltageText(unit)}
       </p>
       <p>
-        <b>Cell spread:</b> {cellSpread}
+        <b>Temperature:</b> {cardTemperatureText(unit)}
+      </p>
+      <p>
+        <b>Cell spread:</b> {cardCellSpreadText(unit)}
       </p>
       <p>
         <b>Data age:</b> {ageText(telemetryAge)}
@@ -467,7 +694,7 @@ function FleetCard({
         <b>Last observation:</b> {observationText(observation)}
       </p>
       <p className="warnings">
-        <b>Warnings:</b> No data
+        <b>Warnings:</b> {cardWarningsText(unit)}
       </p>
       {unit.inhibit !== null ? (
         <p className="latch">
@@ -511,14 +738,23 @@ interface UnitDetailProps {
   auditPage: AuditPage | null;
   auditError: ErrorView | null;
   onRetryAudit: () => void;
+  detailData: UnitDetailView | null;
+  detailPhase: DetailPhase;
+  detailError: ErrorView | null;
+  onRetryDetail: () => void;
+  detailDisconnected: boolean;
 }
 
 function SummaryPanel({
   unit,
   observation,
+  detailData,
+  detailPhase,
 }: {
   unit: ViewUnit;
   observation: ObservationTrack | undefined;
+  detailData: UnitDetailView | null;
+  detailPhase: DetailPhase;
 }): JSX.Element {
   const requested = unit.requested_power;
   const allowed = unit.authorized_power;
@@ -527,10 +763,28 @@ function SummaryPanel({
     measured === null
       ? "no data"
       : `${directionWord(measured > 0 ? "charge" : measured < 0 ? "discharge" : "idle").toLowerCase()} ${formatWatts(measured)} W`;
+  const telemetry = unit.telemetry;
+  const soc = telemetry?.socPct ?? null;
+  const soh = telemetry?.sohPct ?? null;
+  const chargeLimit = telemetry?.dynamicChargeLimitW ?? null;
+  const dischargeLimit = telemetry?.dynamicDischargeLimitW ?? null;
+  const identity =
+    detailPhase === "loading"
+      ? "loading the unit's identity…"
+      : detailData === null || detailData.deviceIdentity === null
+        ? "not available from this snapshot"
+        : `${detailData.deviceIdentity}${
+            detailData.protocolProfile === null ? "" : `, profile ${detailData.protocolProfile}`
+          }`;
   return (
     <div>
       <p>
         <b>Condition:</b> {availabilityWord(unit.lifecycle)} (data quality: {unit.quality})
+      </p>
+      <p>
+        <b>Charge level:</b>{" "}
+        {soc === null ? missingText(unit.telemetry_age_s) : formatPercent(soc)}
+        {soh === null ? "" : `; state of health ${formatPercent(soh)}`}
       </p>
       <p>
         <b>Power:</b> requested {directionWord(requested.direction).toLowerCase()}{" "}
@@ -547,6 +801,17 @@ function SummaryPanel({
           : `Allowed ${directionWord(allowed.direction).toLowerCase()} up to ${formatWatts(allowed.watts)} W`}
       </p>
       <p>
+        <b>Device limits (dynamic):</b>{" "}
+        {chargeLimit === null && dischargeLimit === null
+          ? missingText(unit.telemetry_age_s)
+          : `charge up to ${chargeLimit === null ? "no data" : `${formatWatts(chargeLimit)} W`}, discharge up to ${
+              dischargeLimit === null ? "no data" : `${formatWatts(dischargeLimit)} W`
+            }`}
+      </p>
+      <p>
+        <b>Identity:</b> {identity}
+      </p>
+      <p>
         <b>Communications:</b> last telemetry {ageText(unit.telemetry_age_s)}, quality{" "}
         {unit.quality}; last observation {observationText(observation)}
       </p>
@@ -557,30 +822,150 @@ function SummaryPanel({
   );
 }
 
+/** Present-or-missing per field of the snapshot's telemetry summary block. */
+function summaryCompleteness(telemetry: TelemetryView): Record<string, string> {
+  return {
+    "state of charge": telemetry.socPct === null ? "missing" : "present",
+    "state of health": telemetry.sohPct === null ? "missing" : "present",
+    "pack voltage": telemetry.packVoltageV === null ? "missing" : "present",
+    "pack current": telemetry.packCurrentA === null ? "missing" : "present",
+    "battery power": telemetry.batteryWatts === null ? "missing" : "present",
+    "dynamic limits":
+      telemetry.dynamicChargeLimitW === null && telemetry.dynamicDischargeLimitW === null
+        ? "missing"
+        : "present",
+    "cell readings": telemetry.cellCount === null ? "missing" : "present",
+    temperatures:
+      telemetry.temperatureMinC === null && telemetry.temperatureMaxC === null
+        ? "missing"
+        : "present",
+    faults: telemetry.activeFaults === null ? "missing" : "present",
+    warnings: telemetry.activeWarnings === null ? "missing" : "present",
+  };
+}
+
+/** Data completeness from the detail's own arrays and quality map. */
+function completenessText(detail: UnitDetailView): string {
+  const cells = detail.cellVoltages.length;
+  const expectedCells = detail.telemetry.cellCount;
+  const temps = detail.temperatures.length;
+  const qualityEntries = Object.entries(detail.quality);
+  const notGood = qualityEntries.filter(([, word]) => word !== "good");
+  if (cells === 0 && temps === 0 && qualityEntries.length === 0) {
+    return "no cell or temperature readings are available for this unit yet";
+  }
+  const parts: string[] = [];
+  parts.push(
+    expectedCells === null
+      ? `${cells} cell voltages reported`
+      : `${cells} of ${expectedCells} cells reporting`,
+  );
+  parts.push(`${temps} temperature reading${temps === 1 ? "" : "s"}`);
+  if (qualityEntries.length === 0) {
+    parts.push("quality map not carried");
+  } else if (notGood.length === 0) {
+    parts.push("all telemetry fields good quality");
+  } else {
+    parts.push(
+      `quality: ${notGood.map(([field, word]) => `${field} ${word}`).join(", ")}`,
+    );
+  }
+  return parts.join("; ");
+}
+
 function CellsPanel({
   unit,
+  detailData,
+  detailPhase,
+  detailError,
+  onRetry,
+  disconnected,
 }: {
   unit: ViewUnit;
+  detailData: UnitDetailView | null;
+  detailPhase: DetailPhase;
+  detailError: ErrorView | null;
+  onRetry: () => void;
+  disconnected: boolean;
 }): JSX.Element {
   const age = unit.telemetry_age_s;
+  if (detailPhase === "loading") {
+    return (
+      <div>
+        <p role="status" aria-label="Loading cell detail">
+          Loading the cell and temperature detail…
+        </p>
+      </div>
+    );
+  }
+  if (detailData === null) {
+    if (detailError !== null) {
+      return (
+        <div role="alert">
+          <p>{detailError.code}</p>
+          <p>{detailError.message}</p>
+          <button type="button" onClick={onRetry}>
+            Try again
+          </button>
+        </div>
+      );
+    }
+    return (
+      <p>No cell detail is available for this unit right now. Open the unit again to retry.</p>
+    );
+  }
+  const telemetry = detailData.telemetry;
+  const cellMin = telemetry.cellMinV;
+  const cellMax = telemetry.cellMaxV;
+  const spread = telemetry.cellSpreadMv;
+  const tempMin = telemetry.temperatureMinC;
+  const tempMax = telemetry.temperatureMaxC;
   return (
     <div>
+      {disconnected && (
+        <p role="status" className="disconnected">
+          Disconnected from live updates — showing the last known cell readings.
+        </p>
+      )}
       <p>
-        <b>Minimum cell voltage:</b> {missingText(age)}
+        <b>Minimum cell voltage:</b>{" "}
+        {cellMin === null ? missingText(age) : formatCellVolts(cellMin)}
       </p>
       <p>
-        <b>Maximum cell voltage:</b> {missingText(age)}
+        <b>Maximum cell voltage:</b>{" "}
+        {cellMax === null ? missingText(age) : formatCellVolts(cellMax)}
       </p>
       <p>
-        <b>Voltage spread:</b> {missingText(age)}
+        <b>Voltage spread:</b> {spread === null ? missingText(age) : `${spread} mV`}
       </p>
       <p>
-        <b>Temperature range:</b> {missingText(age)}
+        <b>Temperature range:</b>{" "}
+        {tempMin === null && tempMax === null
+          ? missingText(age)
+          : `${tempMin === null ? "no data" : formatCelsius(tempMin)} to ${
+              tempMax === null ? "no data" : formatCelsius(tempMax)
+            }`}
       </p>
+      {detailData.cellVoltages.length > 0 ? (
+        <ul className="cell-grid" aria-label="Cell voltages">
+          {detailData.cellVoltages.map((volts, index) => (
+            <li key={index}>{`Cell ${index + 1}: ${formatCellVolts(volts)}`}</li>
+          ))}
+        </ul>
+      ) : (
+        <p>No individual cell voltages are carried by this reading.</p>
+      )}
+      {detailData.temperatures.length > 0 ? (
+        <ul className="temp-grid" aria-label="Temperature sensors">
+          {detailData.temperatures.map((celsius, index) => (
+            <li key={index}>{`Sensor ${index + 1}: ${formatCelsius(celsius)}`}</li>
+          ))}
+        </ul>
+      ) : (
+        <p>No individual temperature readings are carried by this observation.</p>
+      )}
       <p>
-        <b>Data completeness:</b> the snapshot and the observation event carry no cell or
-        temperature readings, so every value above is named as missing rather than estimated
-        ({ageText(age)}).
+        <b>Data completeness:</b> {completenessText(detailData)} ({ageText(age)}).
       </p>
     </div>
   );
@@ -665,16 +1050,31 @@ function DetailsPanel({
   observation,
   siteId,
   capturedAt,
+  detailData,
 }: {
   unit: ViewUnit;
   observation: ObservationTrack | undefined;
   siteId: string;
   capturedAt: string;
+  detailData: UnitDetailView | null;
 }): JSX.Element {
   const observationEpoch =
     observation?.connectionEpoch === null || observation === undefined
       ? "not available"
       : String(observation.connectionEpoch);
+  const detailEpoch =
+    detailData === null || detailData.connectionEpoch === null
+      ? "not available"
+      : String(detailData.connectionEpoch);
+  const detailSequence = detailData === null ? null : detailData.sequence;
+  const detailCellSequence = detailData === null ? null : detailData.cellSequence;
+  const qualityMap = detailData === null ? null : detailData.quality;
+  const qualityText =
+    qualityMap === null
+      ? "not carried by this reading"
+      : Object.entries(qualityMap)
+          .map(([field, word]) => `${field}: ${word}`)
+          .join(", ");
   return (
     <div>
       <p>
@@ -686,13 +1086,23 @@ function DetailsPanel({
       </p>
       <p>
         <b>Observation detail:</b> last observation {observationText(observation)}; connection
-        epoch {observationEpoch}; measurement detail (charge, cells, temperatures) not carried
-        by the snapshot or the observation event
+        epoch {observationEpoch}; observation connection epoch {detailEpoch}
+        {detailSequence === null ? "" : `; telemetry sequence ${detailSequence}`}
+        {detailCellSequence === null ? "" : `; cell sequence ${detailCellSequence}`}
       </p>
       <p>
         <b>Measurement completeness:</b>{" "}
         {unit.measured_watts === null ? "measured power missing" : "measured power present"};
-        charge, cell, and temperature detail missing
+        {unit.telemetry === null
+          ? " telemetry summary not carried by this snapshot"
+          : ` telemetry summary carried (${Object.entries(
+              summaryCompleteness(unit.telemetry),
+            )
+              .map(([field, word]) => `${field} ${word}`)
+              .join(", ")})`}
+      </p>
+      <p>
+        <b>Per-field quality map:</b> {qualityText}
       </p>
       <p>
         <b>Unit ID:</b> {unit.unit_id}
@@ -730,6 +1140,11 @@ function UnitDetail({
   auditPage,
   auditError,
   onRetryAudit,
+  detailData,
+  detailPhase,
+  detailError,
+  onRetryDetail,
+  detailDisconnected,
 }: UnitDetailProps): JSX.Element {
   const tabRefs = useRef<Partial<Record<TabKey, HTMLButtonElement>>>({});
 
@@ -791,8 +1206,24 @@ function UnitDetail({
         id={`panel-${unit.unit_id}-${tab}`}
         aria-labelledby={`tab-${unit.unit_id}-${tab}`}
       >
-        {tab === "summary" && <SummaryPanel unit={unit} observation={observation} />}
-        {tab === "cells" && <CellsPanel unit={unit} />}
+        {tab === "summary" && (
+          <SummaryPanel
+            unit={unit}
+            observation={observation}
+            detailData={detailData}
+            detailPhase={detailPhase}
+          />
+        )}
+        {tab === "cells" && (
+          <CellsPanel
+            unit={unit}
+            detailData={detailData}
+            detailPhase={detailPhase}
+            detailError={detailError}
+            onRetry={onRetryDetail}
+            disconnected={detailDisconnected}
+          />
+        )}
         {tab === "events" && (
           <EventsPanel
             unitId={unit.unit_id}
@@ -807,6 +1238,7 @@ function UnitDetail({
             observation={observation}
             siteId={siteId}
             capturedAt={capturedAt}
+            detailData={detailData}
           />
         )}
       </div>
@@ -956,6 +1388,14 @@ export function BatteriesView({
   const [ackPending, setAckPending] = useState(false);
   const [auditPage, setAuditPage] = useState<AuditPage | null>(null);
   const [auditError, setAuditError] = useState<ErrorView | null>(null);
+  /**
+   * The on-demand unit-detail read (GET /api/v1/units/{id}): fetched when a
+   * unit is opened, with its own loading / error phases so the Cells and
+   * Summary tabs can name exactly where their facts came from.
+   */
+  const [detailData, setDetailData] = useState<UnitDetailView | null>(null);
+  const [detailPhase, setDetailPhase] = useState<DetailPhase>("loading");
+  const [detailError, setDetailError] = useState<ErrorView | null>(null);
 
   const cursorRef = useRef<number | undefined>(undefined);
   const streamStartedRef = useRef(false);
@@ -1036,6 +1476,42 @@ export function BatteriesView({
   useEffect(() => {
     void fetchAudit();
   }, [fetchAudit]);
+
+  /** The on-demand unit-detail read; the server alone says what it carries. */
+  const fetchUnitDetail = useCallback(
+    async (unitId: string): Promise<void> => {
+      setDetailPhase("loading");
+      setDetailError(null);
+      try {
+        const raw = await client.getUnitDetail(unitId);
+        const parsed = parseUnitDetail(raw);
+        if (parsed === null) {
+          setDetailPhase("error");
+          setDetailError({
+            code: "unreadable_unit_detail",
+            message: "The unit detail response could not be read.",
+            request_id: null,
+          });
+          return;
+        }
+        setDetailData(parsed);
+        setDetailPhase("ready");
+      } catch (error) {
+        setDetailPhase("error");
+        setDetailError(toErrorView(error));
+      }
+    },
+    [client],
+  );
+
+  // Opening a unit fetches its full projection once; the retry path re-runs it.
+  const openUnitId = detail === null ? null : detail.unitId;
+  useEffect(() => {
+    if (openUnitId === null) {
+      return;
+    }
+    void fetchUnitDetail(openUnitId);
+  }, [openUnitId, fetchUnitDetail]);
 
   // Live events: resync when the service says so, retry with the last
   // delivered sequence as the cursor when the connection drops. Only frames
@@ -1255,6 +1731,15 @@ export function BatteriesView({
             auditPage={auditPage}
             auditError={auditError}
             onRetryAudit={() => void fetchAudit()}
+            detailData={detailData}
+            detailPhase={detailPhase}
+            detailError={detailError}
+            onRetryDetail={() => {
+              if (openUnitId !== null) {
+                void fetchUnitDetail(openUnitId);
+              }
+            }}
+            detailDisconnected={connection === "disconnected" || streamLost}
           />
         ))}
       {ackUnitId !== null && ackUnit !== undefined && (

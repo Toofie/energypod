@@ -15,8 +15,12 @@
  * - Requested, allowed, and actual are three separately labeled figures, each
  *   binding its own magnitude, so a limited action is never presented as
  *   delivered.
- * - The snapshot carries no charge level, so reserve says "not available"
- *   rather than inventing a percentage.
+ * - Fleet reserve derives from the snapshot units' own `telemetry.soc_pct`
+ *   (API_CONTRACTS.md "Application service facade"): the fleet figure is the
+ *   average of the pods reporting a charge reading — pinned choice, computed
+ *   over reporting pods only — and each breakdown row names its own SOC. A
+ *   pod without a reading says "not available"; nothing is ever zero-filled
+ *   into a percentage.
  * - No pinned wire source carries intent expiry, so the next-action region
  *   shows direction and watts only.
  * - Missing telemetry is named ("not available"), never zero-filled.
@@ -87,6 +91,11 @@ interface PowerFigureView {
   watts: number;
 }
 
+/** The snapshot's nullable telemetry block — the reserve question needs SOC. */
+interface TelemetrySummaryView {
+  socPct: number | null;
+}
+
 interface UnitView {
   unit_id: string;
   lifecycle: string;
@@ -95,6 +104,7 @@ interface UnitView {
   requested_power: PowerFigureView;
   authorized_power: PowerFigureView | null;
   measured_watts: number | null;
+  telemetry: TelemetrySummaryView | null;
 }
 
 interface SnapshotView {
@@ -116,6 +126,19 @@ function readPowerFigure(value: unknown): PowerFigureView | null {
   };
 }
 
+/** The telemetry block's SOC, read defensively; absent stays null. */
+function readTelemetrySoc(value: unknown): TelemetrySummaryView | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const soc = record.soc_pct;
+  return {
+    socPct:
+      typeof soc === "number" && Number.isFinite(soc) && soc >= 0 && soc <= 100 ? soc : null,
+  };
+}
+
 function readUnit(value: unknown): UnitView | null {
   if (value === null || typeof value !== "object") {
     return null;
@@ -132,6 +155,7 @@ function readUnit(value: unknown): UnitView | null {
     requested_power: readPowerFigure(record.requested_power) ?? { direction: "idle", watts: 0 },
     authorized_power: readPowerFigure(record.authorized_power),
     measured_watts: typeof record.measured_watts === "number" ? record.measured_watts : null,
+    telemetry: readTelemetrySoc(record.telemetry),
   };
 }
 
@@ -252,6 +276,35 @@ function dataAgeText(ageSeconds: number | null): string {
     return `Data age: ${ageSeconds} s old — this reading is stale`;
   }
   return `Data age: ${ageSeconds} s`;
+}
+
+/**
+ * Fleet reserve, pinned derivation: the average of the pods that ARE
+ * reporting a charge reading (`telemetry.soc_pct`). Pods without a reading
+ * never contribute — a silent pod is not an empty battery — and a fleet with
+ * no readings at all says so instead of inventing a percentage.
+ */
+function fleetReserveText(units: UnitView[]): string {
+  const readings = units
+    .map((unit) => unit.telemetry?.socPct ?? null)
+    .filter((soc): soc is number => soc !== null);
+  if (readings.length === 0) {
+    return "not available — no pod is reporting a charge reading yet";
+  }
+  const average = readings.reduce((total, soc) => total + soc, 0) / readings.length;
+  const scope =
+    readings.length === units.length
+      ? "on average across all pods"
+      : `on average across the ${readings.length} pod${
+          readings.length === 1 ? "" : "s"
+        } reporting a charge reading`;
+  return `${Number(average.toFixed(1))}% ${scope}`;
+}
+
+/** One pod's own charge figure, or the named gap. */
+function unitReserveText(unit: UnitView): string {
+  const soc = unit.telemetry?.socPct ?? null;
+  return soc === null ? "charge level not available" : `${Number(soc.toFixed(1))}% charged`;
 }
 
 function allowedText(unit: UnitView): string {
@@ -818,8 +871,7 @@ export function HomeView({ client }: HomeViewProps) {
         ) : (
           <>
             <p className="home-reserve-total">
-              Fleet charge level: not available — the snapshot does not carry a charge reading
-              yet.
+              Fleet charge level: {fleetReserveText(units)}.
             </p>
             <ul className="home-reserve-list" aria-label="Per-unit battery breakdown">
               {units.map((unit) => (
@@ -828,7 +880,7 @@ export function HomeView({ client }: HomeViewProps) {
                   className="home-reserve-item"
                   aria-label={`${unit.unit_id} charge level`}
                 >
-                  {unit.unit_id}: charge level not available
+                  {unit.unit_id}: {unitReserveText(unit)}
                 </li>
               ))}
             </ul>

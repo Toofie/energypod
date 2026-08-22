@@ -56,6 +56,54 @@ const HEALTH = {
   control_readiness: { ready: false, reasons: ["no_unit_qualified"] },
 };
 
+// One unit's full latest-observation projection (API_CONTRACTS.md
+// "Application service facade" — `unit_detail`, REST GET /api/v1/units/{id}).
+// The client is a typed passthrough: it must not interpret, rename, or
+// zero-fill any measurement. Values are the 2026-08-22 live-capture decode
+// for MID; nulls are null on the wire, never zeros.
+const UNIT_DETAIL = {
+  unit_id: "MID",
+  lifecycle: "disarmed",
+  device_identity: "BEP0005KXX11B10500151 (RTU 0x2C225097)",
+  protocol_profile: "iot",
+  connection_epoch: 3,
+  wall_timestamp: "2026-08-22T10:00:00Z",
+  captured_at_mono: 75231.5,
+  sequence: 410200,
+  cell_captured_at_mono: 75228.0,
+  cell_sequence: 41019,
+  soc_pct: 10,
+  bms_soc_pct: 10,
+  soh_pct: 100,
+  pack_voltage_v: 192.4,
+  pack_current_a: 0,
+  battery_watts: 0,
+  dynamic_charge_limit_w: 7692,
+  dynamic_discharge_limit_w: 0,
+  cell_count: 60,
+  cell_min_v: 3.205,
+  cell_max_v: 3.209,
+  cell_spread_mv: 4,
+  temperature_min_c: 23,
+  temperature_max_c: 28,
+  active_faults: [],
+  active_warnings: ["PCS_Warning0_1", "DCDC_Warning0_1"],
+  cell_voltages_v: [3.205, 3.206, 3.207, 3.208, 3.209],
+  temperatures_c: [23, 24, 25, 26, 27, 28],
+  quality: {
+    system_soc_pct: "good",
+    bms_soc_pct: "good",
+    soh_pct: "good",
+    battery_watts: "good",
+    pack_voltage_v: "good",
+    pack_current_a: "good",
+    dynamic_charge_limit_w: "good",
+    dynamic_discharge_limit_w: "good",
+    cell_voltages_v: "good",
+    temperatures_c: "good",
+  },
+};
+
 const AUDIT_PAGE = {
   events: [
     {
@@ -213,6 +261,20 @@ describe("createApiClient REST boundary", () => {
     expect(call.headers?.Authorization).toBe(BEARER);
   });
 
+  it("fetches one unit's full telemetry detail as an uninterpreted passthrough", async () => {
+    fetchMock.mockResolvedValue(jsonResponse(UNIT_DETAIL));
+    const detail = await client.getUnitDetail("MID");
+    // The projection arrives exactly as the facade serialized it: nulls stay
+    // null, arrays stay arrays, and no measurement is renamed or zero-filled.
+    expect(detail).toEqual(UNIT_DETAIL);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const call = lastCall();
+    expect(call.path).toBe("/api/v1/units/MID");
+    expect(call.method).toBe("GET");
+    expect(call.headers?.Authorization).toBe(BEARER);
+    expect(call.headers?.["Idempotency-Key"]).toBeUndefined();
+  });
+
   it("loads a page of audit history with a limit and no cursor on the first page", async () => {
     fetchMock.mockResolvedValue(jsonResponse(AUDIT_PAGE));
     const page = await client.getAudit(50);
@@ -254,6 +316,7 @@ describe("createApiClient REST boundary", () => {
     fetchMock.mockResolvedValue(jsonResponse({}));
     await client.getSnapshot();
     await client.getHealth();
+    await client.getUnitDetail("MID");
     await client.getAudit(10);
     await client.postIntent({ unit_ids: ["MID"], direction: "charge", watts: 900, ttl_s: 60 });
     await client.postArm(["MID"]);
@@ -261,12 +324,12 @@ describe("createApiClient REST boundary", () => {
     await client.postEmergencyStop(["MID"], "test stop");
     await client.postStopAcknowledgement("stop-1");
     await client.postInhibitAcknowledgement("LHS");
-    expect(fetchMock).toHaveBeenCalledTimes(9);
+    expect(fetchMock).toHaveBeenCalledTimes(10);
     const keys: string[] = [];
     for (const [index, call] of fetchMock.mock.calls.entries()) {
       const init = (call[1] ?? {}) as { headers?: Record<string, string> };
       const key = init.headers?.["Idempotency-Key"];
-      if (index < 3) {
+      if (index < 4) {
         // Reads carry no key: only mutations are idempotancy-guarded.
         expect(key).toBeUndefined();
       } else {

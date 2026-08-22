@@ -47,6 +47,28 @@ _ARMED_LIFECYCLES: Final[frozenset[str]] = frozenset({"armed_idle", "active"})
 _FACADE_POLICY_VERSION: Final[str] = "facade"
 _MAX_REASON_LENGTH: Final[int] = 500
 
+# API_CONTRACTS "Application service facade": the nullable per-unit telemetry
+# summary field set.  Every field is null when the observation lacks that
+# datum, never zero-filled or fabricated.
+_TELEMETRY_SUMMARY_FIELDS: Final[tuple[str, ...]] = (
+    "soc_pct",
+    "bms_soc_pct",
+    "soh_pct",
+    "pack_voltage_v",
+    "pack_current_a",
+    "battery_watts",
+    "dynamic_charge_limit_w",
+    "dynamic_discharge_limit_w",
+    "cell_count",
+    "cell_min_v",
+    "cell_max_v",
+    "cell_spread_mv",
+    "temperature_min_c",
+    "temperature_max_c",
+    "active_faults",
+    "active_warnings",
+)
+
 
 class Principal(Protocol):
     """Authenticated caller identity, as validated by the guarded boundary."""
@@ -81,6 +103,8 @@ class IntentRepository(Protocol):
 
 
 class ObservationRepository(Protocol):
+    async def latest(self, unit_id: str) -> Any | None: ...
+
     async def all_latest(self) -> dict[str, Any]: ...
 
 
@@ -251,6 +275,116 @@ def _authorized_projection(capability: Any) -> dict[str, Any] | None:
     return {"direction": _enum_value(capability.direction), "watts": int(capability.watts)}
 
 
+def _optional_float(raw: Any) -> float | None:
+    if isinstance(raw, int | float) and not isinstance(raw, bool):
+        return float(raw)
+    return None
+
+
+def _optional_int(raw: Any) -> int | None:
+    if type(raw) is int:
+        return raw
+    return None
+
+
+def _optional_text(raw: Any) -> str | None:
+    return raw if isinstance(raw, str) else None
+
+
+def _optional_codes(raw: Any) -> list[str] | None:
+    """Sorted code list for a present fault/warning set; null when absent."""
+    if isinstance(raw, frozenset | set | tuple | list):
+        return sorted(str(code) for code in raw)
+    return None
+
+
+def _numeric_series(raw: Any) -> tuple[float, ...] | None:
+    """Numeric view of a cell/temperature array; empty arrays project null."""
+    if not isinstance(raw, Sequence) or isinstance(raw, str | bytes):
+        return None
+    values = tuple(
+        float(item) for item in raw if isinstance(item, int | float) and not isinstance(item, bool)
+    )
+    return values or None
+
+
+def _telemetry_summary(observation: Any) -> dict[str, Any] | None:
+    """Nullable summary projection of one latest observation.
+
+    ``None`` means the unit has no observation at all.  Inside the block every
+    field is null when that datum is absent from the observation, never
+    zero-filled: an absent cell array is not a 0 V pack.
+    """
+    if observation is None:
+        return None
+    cells = _numeric_series(getattr(observation, "cell_voltages_v", None))
+    cell_min = min(cells, default=None) if cells is not None else None
+    cell_max = max(cells, default=None) if cells is not None else None
+    spread_v = None if cell_min is None or cell_max is None else cell_max - cell_min
+    temperatures = _numeric_series(getattr(observation, "temperatures_c", None))
+    return {
+        "soc_pct": _optional_float(getattr(observation, "system_soc_pct", None)),
+        "bms_soc_pct": _optional_float(getattr(observation, "bms_soc_pct", None)),
+        "soh_pct": _optional_float(getattr(observation, "soh_pct", None)),
+        "pack_voltage_v": _optional_float(getattr(observation, "pack_voltage_v", None)),
+        "pack_current_a": _optional_float(getattr(observation, "pack_current_a", None)),
+        "battery_watts": _optional_float(getattr(observation, "battery_watts", None)),
+        "dynamic_charge_limit_w": _optional_float(
+            getattr(observation, "dynamic_charge_limit_w", None)
+        ),
+        "dynamic_discharge_limit_w": _optional_float(
+            getattr(observation, "dynamic_discharge_limit_w", None)
+        ),
+        "cell_count": len(cells) if cells is not None else None,
+        "cell_min_v": cell_min,
+        "cell_max_v": cell_max,
+        "cell_spread_mv": None if spread_v is None else spread_v * 1000.0,
+        "temperature_min_c": (
+            min(temperatures, default=None) if temperatures is not None else None
+        ),
+        "temperature_max_c": (
+            max(temperatures, default=None) if temperatures is not None else None
+        ),
+        "active_faults": _optional_codes(getattr(observation, "active_faults", None)),
+        "active_warnings": _optional_codes(getattr(observation, "active_warnings", None)),
+    }
+
+
+def _unit_projection(unit_id: str, observation: Any) -> dict[str, Any]:
+    """Full single-unit projection served by ``unit_detail``.
+
+    A commissioned unit that has not published an observation yet is known but
+    silent: the projection exists and every datum is null, never fabricated.
+    """
+    cells = _numeric_series(getattr(observation, "cell_voltages_v", None))
+    temperatures = _numeric_series(getattr(observation, "temperatures_c", None))
+    wall = getattr(observation, "wall_timestamp", None)
+    lifecycle = getattr(observation, "lifecycle", None)
+    quality = getattr(observation, "quality", None)
+    return {
+        "unit_id": unit_id,
+        "device_identity": _optional_text(getattr(observation, "device_identity", None)),
+        "protocol_profile": _optional_text(getattr(observation, "protocol_profile", None)),
+        "connection_epoch": _optional_int(getattr(observation, "connection_epoch", None)),
+        "lifecycle": None if lifecycle is None else _enum_value(lifecycle),
+        "sequence": _optional_int(getattr(observation, "sequence", None)),
+        "captured_at_mono": _optional_float(getattr(observation, "captured_at_mono", None)),
+        "cell_sequence": _optional_int(getattr(observation, "cell_sequence", None)),
+        "cell_captured_at_mono": _optional_float(
+            getattr(observation, "cell_captured_at_mono", None)
+        ),
+        "wall_timestamp": wall.isoformat() if isinstance(wall, datetime) else None,
+        **(_telemetry_summary(observation) or dict.fromkeys(_TELEMETRY_SUMMARY_FIELDS)),
+        "cell_voltages_v": list(cells) if cells is not None else None,
+        "temperatures_c": list(temperatures) if temperatures is not None else None,
+        "quality": (
+            {str(field): _enum_value(value) for field, value in sorted(quality.items())}
+            if isinstance(quality, Mapping)
+            else None
+        ),
+    }
+
+
 class EnergyServiceFacade:
     """Fleet-level application service behind the guarded REST and MCP adapters."""
 
@@ -309,6 +443,21 @@ class EnergyServiceFacade:
             "captured_at": self._clock.wall_now().isoformat(),
             "units": units,
         }
+
+    async def unit_detail(self, *, principal: Principal, unit_id: Any) -> dict[str, Any]:
+        """Project one unit's latest observation; a read-only repository view.
+
+        Unknown unit ids are refused.  A known unit that has not published an
+        observation yet projects nulls for every datum, never zero-filled or
+        fabricated values.  This performs no I/O beyond the one repository
+        read and never triggers control.
+        """
+        self._admit(principal, "observe")
+        canonical_unit = _correlation_key(unit_id, "unit_id")
+        if canonical_unit not in self._actors:
+            raise LookupError(f"no unit with id {canonical_unit!r}")
+        observation = await self._observations.latest(canonical_unit)
+        return _unit_projection(canonical_unit, observation)
 
     async def health(self, *, principal: Principal) -> dict[str, Any]:
         """Separate process liveness, dependency readiness, and control readiness."""
@@ -864,6 +1013,7 @@ class EnergyServiceFacade:
             "requested_power": _requested_power(unit_id, active_intents),
             "authorized_power": _authorized_projection(capability),
             "measured_watts": measured_watts,
+            "telemetry": _telemetry_summary(telemetry),
         }
 
     def _quality_projection(self, telemetry: Any, age_s: float | None) -> str:

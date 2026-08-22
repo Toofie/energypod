@@ -168,6 +168,7 @@ let client: ApiClient;
 const makeClient = (): ApiClient => ({
   getSnapshot: vi.fn(),
   getHealth: vi.fn(),
+  getUnitDetail: vi.fn(),
   getAudit: vi.fn(),
   postIntent: vi.fn(),
   postArm: vi.fn(),

@@ -11,12 +11,18 @@
  *   `createApiClient` replaced and every other canonical export preserved;
  *   rejections are real `ApiClientError` values carrying the envelope
  *   verbatim plus a status.
- * - The snapshot unit carries exactly `unit_id, lifecycle, telemetry_age_s,
- *   quality, requested_power, authorized_power, measured_watts` (service.py
- *   `_unit_view`). There is no charge, temperature, cell, or warning field on
- *   any wire the service sends, so the contracted card fields for those facts
- *   are pinned as named-missing ("No data", with age) and never as values —
- *   the "never fabricate or zero-fill" pin, applied to the real wire.
+ * - The snapshot unit carries `unit_id, lifecycle, telemetry_age_s, quality,
+ *   requested_power, authorized_power, measured_watts` plus the amended
+ *   nullable `telemetry` summary block (API_CONTRACTS.md "Application service
+ *   facade"; wire.ts `telemetrySummary`): the card's charge, pack voltage,
+ *   power, cell count+spread, temperature range, and warnings render from it,
+ *   and a null block or null field is pinned as named-missing ("No data",
+ *   with age) — never an invented value.
+ * - `GET /api/v1/units/{unit_id}` (wire.ts `unitDetail`) is the full
+ *   latest-observation projection; the Cells tab's distribution, the
+ *   temperatures, data completeness, and the Summary tab's identity render
+ *   from that on-demand read, with its own loading / error / disconnected
+ *   states. `emptyUnitDetail` is the honest every-datum-absent projection.
  * - `quality` is the facade projection vocabulary good/degraded/bad/missing;
  *   "degraded" already means past the service's 30 s good bound.
  * - The only observation event is `observation.published` with the minimal
@@ -46,12 +52,16 @@ import {
 import {
   auditEvent,
   auditPage,
+  emptyUnitDetail,
   observationPublished,
   snapshot,
   snapshotFrame,
+  telemetrySummary,
+  unitDetail,
   unitSnapshot,
   withInhibit,
   type WireSnapshot,
+  type WireUnitDetail,
   type WireUnitSnapshot,
 } from "../../test/wire";
 import { BatteriesView } from "./BatteriesView";
@@ -65,6 +75,7 @@ const CAPTURED_AT = "2026-08-22T10:00:00Z";
 
 interface MockedClient {
   getSnapshot: Mock<() => Promise<WireSnapshot>>;
+  getUnitDetail: Mock<(unitId: string) => Promise<WireUnitDetail>>;
   getAudit: Mock<(limit: number, afterSequence?: number) => Promise<AuditPage>>;
   postInhibitAcknowledgement: Mock<(unitId: string) => Promise<Record<string, unknown>>>;
   openEvents: Mock<(afterSequence?: number) => AsyncIterable<StreamEvent>>;
@@ -73,6 +84,7 @@ interface MockedClient {
 function makeClient(): MockedClient {
   const client: MockedClient = {
     getSnapshot: vi.fn<() => Promise<WireSnapshot>>(),
+    getUnitDetail: vi.fn<(unitId: string) => Promise<WireUnitDetail>>(),
     getAudit: vi.fn<(limit: number, afterSequence?: number) => Promise<AuditPage>>(),
     postInhibitAcknowledgement: vi.fn<
       (unitId: string) => Promise<Record<string, unknown>>
@@ -80,6 +92,10 @@ function makeClient(): MockedClient {
     openEvents: vi.fn<(afterSequence?: number) => AsyncIterable<StreamEvent>>(),
   };
   client.getAudit.mockResolvedValue(auditPage([]));
+  // A unit with no observation answers with the honest empty projection.
+  client.getUnitDetail.mockImplementation((unitId: string) =>
+    Promise.resolve(emptyUnitDetail(unitId)),
+  );
   return client;
 }
 
@@ -313,6 +329,260 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     expect(mid).toHaveTextContent(/950\s*W/);
     expect(mid).not.toHaveTextContent(/2,?400/);
     expect(mid).not.toHaveTextContent(/-950/);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Telemetry rendering (API_CONTRACTS.md "Application service facade")
+  // ---------------------------------------------------------------------------
+
+  /** The captured fleet, each unit carrying its real decoded telemetry. */
+  const TELEMETRY_SNAPSHOT: WireSnapshot = snapshot(
+    [
+      // MID: the mandate's values (SOC 10 %, 192.4 V, 60 cells 3.205-3.209 V,
+      // 23-28 °C) with the evidence-anchored SOH and dynamic limits.
+      unitSnapshot({
+        unit_id: "MID",
+        lifecycle: "disarmed",
+        telemetry_age_s: 2,
+        measured_watts: 0,
+        telemetry: telemetrySummary({
+          soh_pct: 100,
+          battery_watts: 0,
+          pack_current_a: 0,
+          dynamic_charge_limit_w: 7692,
+          dynamic_discharge_limit_w: 0,
+        }),
+      }),
+      // RHS: discharging per its telemetry block, with measured_watts null —
+      // the card's power figure can only come from the telemetry block.
+      unitSnapshot({
+        unit_id: "RHS",
+        lifecycle: "disarmed",
+        telemetry_age_s: 3,
+        measured_watts: null,
+        telemetry: telemetrySummary({
+          soc_pct: 68,
+          pack_voltage_v: 164.5,
+          pack_current_a: -6.9,
+          battery_watts: -1132,
+          soh_pct: 100,
+          dynamic_charge_limit_w: 6532,
+          dynamic_discharge_limit_w: 6532,
+          cell_count: 50,
+          cell_min_v: 3.289,
+          cell_max_v: 3.292,
+          cell_spread_mv: 3,
+          temperature_min_c: 23,
+          temperature_max_c: 27,
+        }),
+      }),
+      // LHS: no observation at all — the honest nullable block.
+      unitSnapshot({
+        unit_id: "LHS",
+        lifecycle: "observe_only",
+        telemetry_age_s: 4,
+        measured_watts: null,
+        telemetry: null,
+      }),
+    ],
+    { snapshot_sequence: 4400, captured_at: CAPTURED_AT },
+  );
+
+  it("renders card charge, pack voltage, power, cell count+spread, temperature range, and warnings from the telemetry block", async () => {
+    renderView(healthyClient(TELEMETRY_SNAPSHOT, fleetEvents(TELEMETRY_SNAPSHOT)));
+
+    const mid = await screen.findByRole("group", { name: "MID" });
+    expect(mid).toHaveTextContent(/charge level:\s*10%/i);
+    expect(mid).toHaveTextContent(/pack voltage:\s*192\.4\s*V/i);
+    expect(mid).toHaveTextContent(/cell spread:\s*4\s*mV across 60 cells/i);
+    expect(mid).toHaveTextContent(/temperature:\s*23\s*°C to 28\s*°C/i);
+    // warnings are the fleet-wide calibration warnings, in words
+    expect(mid).toHaveTextContent(/warnings:\s*PCS Warning0 1, DCDC Warning0 1/i);
+
+    const rhs = screen.getByRole("group", { name: "RHS" });
+    expect(rhs).toHaveTextContent(/charge level:\s*68%/i);
+    expect(rhs).toHaveTextContent(/pack voltage:\s*164\.5\s*V/i);
+    expect(rhs).toHaveTextContent(/cell spread:\s*3\s*mV across 50 cells/i);
+    expect(rhs).toHaveTextContent(/temperature:\s*23\s*°C to 27\s*°C/i);
+    // measured_watts is null on the wire: this figure can only be the
+    // telemetry block's own signed battery watts, sign carried by the word.
+    expect(rhs).toHaveTextContent(/power:\s*discharging 1,132 W/i);
+    expect(rhs).not.toHaveTextContent(/-1,?132/);
+
+    // A unit without an observation keeps every one of those fields honest.
+    const lhs = screen.getByRole("group", { name: "LHS" });
+    for (const label of [/charge level/i, /pack voltage/i, /temperature/i, /cell spread/i]) {
+      expect(tightestText(lhs, label, /no data/i)).not.toMatch(/%|V\b|mV|°/);
+    }
+    expect(lhs).toHaveTextContent(/warnings:\s*no data/i);
+    expect(lhs).not.toHaveTextContent(/%/);
+    expect(lhs).not.toHaveTextContent(/°/);
+    expect(lhs).not.toHaveTextContent(/\d+\s*W/);
+  });
+
+  it("renders an explicit empty warning list as none, distinct from absent warnings", async () => {
+    const quiet: WireSnapshot = {
+      ...TELEMETRY_SNAPSHOT,
+      units: TELEMETRY_SNAPSHOT.units.map((u) =>
+        u.unit_id === "MID"
+          ? { ...u, telemetry: telemetrySummary({ active_warnings: [] }) }
+          : u,
+      ),
+    };
+    renderView(healthyClient(quiet, fleetEvents(quiet)));
+
+    const mid = await screen.findByRole("group", { name: "MID" });
+    expect(mid).toHaveTextContent(/warnings:\s*none/i);
+    expect(mid).not.toHaveTextContent(/PCS Warning/i);
+  });
+
+  it("fetches the unit detail on open and renders the full Cells distribution, temperatures, and completeness", async () => {
+    const user = userEvent.setup();
+    const client = healthyClient(TELEMETRY_SNAPSHOT, fleetEvents(TELEMETRY_SNAPSHOT));
+    client.getUnitDetail.mockResolvedValue(unitDetail("MID"));
+    renderView(client);
+
+    await user.click(await screen.findByRole("button", { name: "MID" }));
+    // The on-demand read went to exactly the opened unit's endpoint path.
+    await waitFor(() => expect(client.getUnitDetail).toHaveBeenCalledWith("MID"));
+    expect(client.getUnitDetail).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("tab", { name: "Cells" }));
+    const cells = await screen.findByRole("tabpanel");
+    await waitFor(() => {
+      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.205 V/i);
+      expect(cells).toHaveTextContent(/maximum cell voltage:\s*3\.209 V/i);
+      expect(cells).toHaveTextContent(/voltage spread:\s*4 mV/i);
+      expect(cells).toHaveTextContent(/temperature range:\s*23 °C to 28 °C/i);
+    });
+
+    // The complete per-cell distribution is text-readable: every one of the
+    // 60 captured cells, first to last.
+    const grid = within(cells).getByRole("list", { name: /cell voltages/i });
+    const cellItems = within(grid).getAllByRole("listitem");
+    expect(cellItems).toHaveLength(60);
+    expect(cellItems[0]!.textContent).toBe("Cell 1: 3.205 V");
+    expect(cellItems[59]!.textContent).toBe("Cell 60: 3.209 V");
+
+    // The temperature sensors render as values too (BIC x 3 = 18 sensors).
+    const sensors = within(cells).getByRole("list", { name: /temperature sensors/i });
+    const sensorItems = within(sensors).getAllByRole("listitem");
+    expect(sensorItems).toHaveLength(18);
+    expect(sensorItems[0]!.textContent).toBe("Sensor 1: 23 °C");
+    expect(sensorItems[17]!.textContent).toBe("Sensor 18: 28 °C");
+
+    // Data completeness states the population and the quality map's verdict.
+    expect(cells).toHaveTextContent(/60 of 60 cells reporting/i);
+    expect(cells).toHaveTextContent(/18 temperature readings/i);
+    expect(cells).toHaveTextContent(/all telemetry fields good quality/i);
+  });
+
+  it("shows the Cells tab's own loading state until the detail read lands", async () => {
+    const user = userEvent.setup();
+    const client = healthyClient(TELEMETRY_SNAPSHOT, fleetEvents(TELEMETRY_SNAPSHOT));
+    let resolveDetail!: (value: WireUnitDetail) => void;
+    client.getUnitDetail.mockReturnValueOnce(
+      new Promise<WireUnitDetail>((resolve) => {
+        resolveDetail = resolve;
+      }),
+    );
+    renderView(client);
+
+    await user.click(await screen.findByRole("button", { name: "MID" }));
+    await user.click(screen.getByRole("tab", { name: "Cells" }));
+    expect(await screen.findByRole("status", { name: /loading cell detail/i })).toBeInTheDocument();
+    // No distribution can render while the read is pending — never a guess.
+    const pending = screen.getByRole("tabpanel");
+    expect(pending).not.toHaveTextContent(/3\.205/);
+
+    resolveDetail(unitDetail("MID"));
+    await waitFor(() => {
+      expect(screen.getByRole("tabpanel")).toHaveTextContent(/minimum cell voltage:\s*3\.205 V/i);
+    });
+  });
+
+  it("surfaces a refused unit-detail read verbatim and recovers on its own retry", async () => {
+    const user = userEvent.setup();
+    const client = healthyClient(TELEMETRY_SNAPSHOT, fleetEvents(TELEMETRY_SNAPSHOT));
+    client.getUnitDetail
+      .mockRejectedValueOnce(
+        new ApiClientError({
+          status: 503,
+          code: "unit_detail_unavailable",
+          message: "The unit detail could not be read right now.",
+          details: null,
+          request_id: "req-ud-1",
+        }),
+      )
+      .mockResolvedValueOnce(unitDetail("MID"));
+    renderView(client);
+
+    await user.click(await screen.findByRole("button", { name: "MID" }));
+    await user.click(screen.getByRole("tab", { name: "Cells" }));
+
+    // The refusal envelope renders verbatim, with the retry owned by the tab.
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText("unit_detail_unavailable")).toBeInTheDocument();
+    expect(
+      within(alert).getByText("The unit detail could not be read right now."),
+    ).toBeInTheDocument();
+
+    await user.click(within(alert).getByRole("button", { name: /try again/i }));
+    const cells = await screen.findByRole("tabpanel");
+    await waitFor(() => {
+      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.205 V/i);
+    });
+    expect(client.getUnitDetail).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows state of charge, state of health, dynamic limits, and identity on the Summary tab", async () => {
+    const user = userEvent.setup();
+    const client = healthyClient(TELEMETRY_SNAPSHOT, fleetEvents(TELEMETRY_SNAPSHOT));
+    client.getUnitDetail.mockResolvedValue(unitDetail("MID"));
+    renderView(client);
+
+    await user.click(await screen.findByRole("button", { name: "MID" }));
+    const summary = await screen.findByRole("tabpanel");
+    // SOC and SOH come from the snapshot's telemetry block.
+    await waitFor(() => {
+      expect(summary).toHaveTextContent(/charge level:\s*10%; state of health 100%/i);
+      // The device's own dynamic limits, including the SOC-10 % discharge inhibit.
+      expect(summary).toHaveTextContent(
+        /device limits \(dynamic\): charge up to 7,692 W, discharge up to 0 W/i,
+      );
+      // Identity comes from the on-demand unit detail: serial, RTU id, profile.
+      expect(summary).toHaveTextContent(/identity:\s*BEP0005KXX11B10500151 \(RTU 0x2C225097\), profile iot/i);
+    });
+  });
+
+  it("names the identity gap while the detail read has not landed", async () => {
+    const user = userEvent.setup();
+    const client = healthyClient(TELEMETRY_SNAPSHOT, fleetEvents(TELEMETRY_SNAPSHOT));
+    client.getUnitDetail.mockReturnValue(new Promise<WireUnitDetail>(() => {}));
+    renderView(client);
+
+    await user.click(await screen.findByRole("button", { name: "MID" }));
+    const summary = await screen.findByRole("tabpanel");
+    expect(summary).toHaveTextContent(/identity:\s*loading the unit's identity…/i);
+    expect(summary).not.toHaveTextContent(/BEP0005/i);
+  });
+
+  it("keeps the last cell detail visible with a disconnected notice when the live connection is lost", async () => {
+    const user = userEvent.setup();
+    const client = healthyClient(TELEMETRY_SNAPSHOT, fleetEvents(TELEMETRY_SNAPSHOT));
+    client.getUnitDetail.mockResolvedValue(unitDetail("MID"));
+    renderView(client, "disconnected");
+
+    await user.click(await screen.findByRole("button", { name: "MID" }));
+    await user.click(screen.getByRole("tab", { name: "Cells" }));
+    const cells = await screen.findByRole("tabpanel");
+    await waitFor(() => {
+      // the disconnected notice names the state...
+      expect(cells).toHaveTextContent(/disconnected from live updates/i);
+      expect(cells).toHaveTextContent(/showing the last known cell readings/i);
+      // ...while the values stay on screen, dimmed-not-hidden
+      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.205 V/i);
+    });
   });
 
   it("shows a loading skeleton and no unit cards until the snapshot lands", async () => {
@@ -550,16 +820,19 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     await user.keyboard("{Enter}");
 
     const cells = await screen.findByRole("tabpanel");
-    // min/max/spread are named fields with their missing-ness stated as text,
-    // never colour alone — and never an invented reading
-    expect(cells).toHaveTextContent(/minimum cell voltage:\s*no data/i);
-    expect(cells).toHaveTextContent(/maximum cell voltage:\s*no data/i);
-    expect(cells).toHaveTextContent(/voltage spread:\s*no data/i);
-    expect(cells).toHaveTextContent(/temperature range:\s*no data/i);
-    expect(cells).not.toHaveTextContent(/mV/);
-    // data completeness states what the wire carries
-    expect(cells).toHaveTextContent(/complet/i);
-    expect(cells).toHaveTextContent(/no cell or temperature readings/i);
+    // The unit-detail read settles first (the empty projection: every datum
+    // absent), then min/max/spread are named fields with their missing-ness
+    // stated as text, never colour alone — and never an invented reading.
+    await waitFor(() => {
+      expect(cells).toHaveTextContent(/minimum cell voltage:\s*no data/i);
+      expect(cells).toHaveTextContent(/maximum cell voltage:\s*no data/i);
+      expect(cells).toHaveTextContent(/voltage spread:\s*no data/i);
+      expect(cells).toHaveTextContent(/temperature range:\s*no data/i);
+      expect(cells).not.toHaveTextContent(/mV/);
+      // data completeness states what the wire carries
+      expect(cells).toHaveTextContent(/complet/i);
+      expect(cells).toHaveTextContent(/no cell or temperature readings/i);
+    });
 
     // Details is reachable by keyboard and carries the data-quality map
     await user.keyboard("{ArrowRight}");

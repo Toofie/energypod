@@ -56,6 +56,92 @@ class FakeAuthenticator:
         return PRINCIPALS.get(bearer_token)
 
 
+def _cell_ladder(low_v: float, high_v: float, count: int) -> list[float]:
+    """Deterministic cell-voltage ladder whose endpoints are exact literals."""
+    steps = max(1, round((high_v - low_v) / 0.001))
+    ladder = [low_v + step * 0.001 for step in range(steps)]
+    ladder.append(high_v)
+    return [ladder[index % len(ladder)] for index in range(count)]
+
+
+# API_CONTRACTS "Application service facade": the snapshot carries a nullable
+# per-unit telemetry summary; every field is null when the observation lacks
+# that datum, never zero-filled.  These are the live-decoded reference values
+# (MID 10% / 192.4 V / 60 cells 3.205-3.209 V / 23-28 C, both warnings, no
+# faults) so the boundary round-trips exactly what the facade derives.
+MID_TELEMETRY_SUMMARY: dict[str, Any] = {
+    "soc_pct": 10.0,
+    "bms_soc_pct": 10.0,
+    "soh_pct": 99.0,
+    "pack_voltage_v": 192.4,
+    "pack_current_a": 12.5,
+    "battery_watts": 2405.0,
+    "dynamic_charge_limit_w": 2500.0,
+    "dynamic_discharge_limit_w": 3000.0,
+    "cell_count": 60,
+    "cell_min_v": 3.205,
+    "cell_max_v": 3.209,
+    "cell_spread_mv": (3.209 - 3.205) * 1000.0,
+    "temperature_min_c": 23.0,
+    "temperature_max_c": 28.0,
+    "active_faults": [],
+    "active_warnings": ["DCDC_Warning0_1", "PCS_Warning0_1"],
+}
+
+MID_TEMPERATURES_C: list[float] = [23.0, 24.0, 25.0, 26.0, 27.0, 28.0, 24.5, 25.5]
+
+# The full single-unit projection served by GET /api/v1/units/{unit_id}: the
+# summary scalars plus identity, sequences, capture times, the complete arrays,
+# and the per-field quality map.
+UNIT_DETAIL_PROJECTIONS: dict[str, dict[str, Any]] = {
+    "MID": {
+        "unit_id": "MID",
+        "device_identity": "BEP0005KXX11B10500055",
+        "protocol_profile": "iot-v1",
+        "connection_epoch": 3,
+        "lifecycle": "disarmed",
+        "sequence": 41,
+        "captured_at_mono": 99.5,
+        "cell_sequence": 12,
+        "cell_captured_at_mono": 98.0,
+        "wall_timestamp": "2026-08-22T00:04:05+00:00",
+        **MID_TELEMETRY_SUMMARY,
+        "cell_voltages_v": _cell_ladder(3.205, 3.209, 60),
+        "temperatures_c": list(MID_TEMPERATURES_C),
+        "quality": {
+            "battery_watts": "good",
+            "bms_soc_pct": "good",
+            "cell_voltages_v": "good",
+            "dynamic_charge_limit_w": "good",
+            "dynamic_discharge_limit_w": "good",
+            "pack_current_a": "good",
+            "pack_voltage_v": "good",
+            "soh_pct": "good",
+            "system_soc_pct": "good",
+            "temperatures_c": "good",
+        },
+    },
+    # A commissioned unit that has not published an observation yet: the
+    # projection exists, and every telemetry datum is null, never zero.
+    "pod-empty": {
+        "unit_id": "pod-empty",
+        "device_identity": None,
+        "protocol_profile": None,
+        "connection_epoch": None,
+        "lifecycle": None,
+        "sequence": None,
+        "captured_at_mono": None,
+        "cell_sequence": None,
+        "cell_captured_at_mono": None,
+        "wall_timestamp": None,
+        **dict.fromkeys(MID_TELEMETRY_SUMMARY),
+        "cell_voltages_v": None,
+        "temperatures_c": None,
+        "quality": None,
+    },
+}
+
+
 @dataclass
 class RecordingEnergyService:
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
@@ -76,9 +162,27 @@ class RecordingEnergyService:
                     "requested_power": {"direction": "idle", "watts": 0},
                     "authorized_power": {"direction": "idle", "watts": 0},
                     "measured_watts": 0,
-                }
+                    "telemetry": dict(MID_TELEMETRY_SUMMARY),
+                },
+                {
+                    "unit_id": "pod-b",
+                    "lifecycle": "disarmed",
+                    "telemetry_age_s": None,
+                    "quality": "missing",
+                    "requested_power": {"direction": "idle", "watts": 0},
+                    "authorized_power": None,
+                    "measured_watts": None,
+                    "telemetry": None,
+                },
             ],
         }
+
+    async def unit_detail(self, *, principal: Principal, unit_id: str) -> dict[str, Any]:
+        self.calls.append(("unit_detail", {"principal": principal, "unit_id": unit_id}))
+        projection = UNIT_DETAIL_PROJECTIONS.get(unit_id)
+        if projection is None:
+            raise LookupError(f"no unit with id {unit_id!r}")
+        return projection
 
     async def health(self, *, principal: Principal) -> dict[str, Any]:
         self.calls.append(("health", {"principal": principal}))
