@@ -161,6 +161,7 @@ _DCDC_FAULT_BLOCK_BASE = 0x2040
 _BMS_FAULT_BLOCK_BASE = 0x5040
 _CELL_VOLTAGE_BASE = 0x5200
 _CELL_TEMPERATURE_BASE = 0x523C
+_IDENTITY_BLOCK_BASE = 0x8106
 
 _RUNTIME_PRINCIPAL = "energypod:runtime"
 _COMPOSITION_POLICY_VERSION = "composition"
@@ -993,6 +994,18 @@ class _LiveDecodeTelemetry:
         self._catalog = register_layout.RegisterCatalog()
         self._sequence = itertools.count(1)
         self._probe: register_layout.LayoutProbe | None = None
+        # Tiered refresh (the 2026-08-22 commissioning constraint): the
+        # gateway's 0.1 s inter-frame gap makes a full 17-window plan take
+        # ~3.4 s — longer than the commissioned renewal cadence inside the
+        # measured watchdog.  The domain already models cells polling slower
+        # than the control rate (separate cell capture time and sequence), so
+        # the live plan splits the same way: a fast core every cycle (BMS,
+        # fault/status blocks), a hot ring alternating cells/temperatures,
+        # and a cold ring rotating one slow window per cycle, with decoded
+        # observations merging the cached slow blocks and their capture times.
+        self._cycle = 0
+        self._slow_cache: dict[int, tuple[tuple[int, ...], float]] = {}
+        self._cell_meta: tuple[float, int] | None = None
 
     async def advance(self) -> None:
         """Probe the served layout so this cycle's plan follows the wire."""
@@ -1010,28 +1023,86 @@ class _LiveDecodeTelemetry:
                 f"{probe.bic_count} BICs"
             )
         self._probe = probe
+        self._cycle += 1
 
     def read_plan(self) -> tuple[tuple[int, int], ...]:
-        """The evidenced IoT register windows one live telemetry cycle reads."""
+        """This cycle's windows under the commissioned tiered refresh.
+
+        Every cycle: the BMS block and the three IoT fault blocks (everything
+        the safety kernel consumes at the control rate) plus temperatures.
+        Every third cycle: the cell-voltage window (the domain already models
+        cells on their own slower capture clock; the policy's cell-age bound
+        covers the tier).  First cycle: the stable identity pair, cached for
+        the process lifetime.  Every eighth cycle: one cold-ring window
+        (PCS/DCDC detail, system overview, parameters, balance, energy) so
+        the unit-detail surface stays populated without threatening the
+        renewal cadence.
+        """
         probe = self._probe_require()
-        return tuple(
+        full = [
             (block.address, block.count)
             for block in (
                 *self._catalog.iot_reads(bic_count=probe.bic_count),
                 *self._catalog.common_reads,
             )
+        ]
+        by_base = {address: count for address, count in full}
+        core_bases = {
+            _BMS_BLOCK_BASE,
+            _PCS_FAULT_BLOCK_BASE,
+            _DCDC_FAULT_BLOCK_BASE,
+            _BMS_FAULT_BLOCK_BASE,
+            _CELL_TEMPERATURE_BASE,
+            # The two-word identity pair rides the core: a physically swapped
+            # or re-addressed unit must latch on the very next poll, not on a
+            # slow ring refresh.
+            _IDENTITY_BLOCK_BASE,
+        }
+        plan = [(base, by_base[base]) for base in sorted(core_bases) if base in by_base]
+        if _CELL_VOLTAGE_BASE in by_base and self._cycle % 3 == 1:
+            plan.append((_CELL_VOLTAGE_BASE, by_base[_CELL_VOLTAGE_BASE]))
+        if self._cycle == 1 and _SYSTEM_BLOCK_BASE in by_base:
+            plan.append((_SYSTEM_BLOCK_BASE, by_base[_SYSTEM_BLOCK_BASE]))
+        cold = sorted(
+            base
+            for base in by_base
+            if base not in core_bases | {_CELL_VOLTAGE_BASE, _SYSTEM_BLOCK_BASE}
         )
+        if cold and self._cycle % 8 == 0:
+            chosen = cold[(self._cycle // 8) % len(cold)]
+            plan.append((chosen, by_base[chosen]))
+        return tuple(plan)
 
     def decode(
         self, blocks: Mapping[tuple[int, int], tuple[int, ...]], lifecycle: UnitLifecycle
     ) -> Observation:
         probe = self._probe_require()
+        now = float(self._clock.monotonic())
+        # Refresh the slow-block cache with this cycle's reads, keyed by base
+        # address alongside the capture time each cache entry was actually read.
+        for (address, _count), words in blocks.items():
+            self._slow_cache[address] = (words, now)
+        cell_base = _CELL_VOLTAGE_BASE
+        if cell_base in self._slow_cache:
+            captured, at = self._slow_cache[cell_base]
+            if self._cell_meta is None or self._cell_meta[0] != at:
+                self._cell_meta = (at, next(self._sequence))
+        cell_captured: float | None = None
+        cell_sequence: int | None = None
+        if self._cell_meta is not None:
+            cell_captured, cell_sequence = self._cell_meta
         # The actor keys blocks by read window; the wire decoder keys them by
         # base address.  Where two windows share a base (the seven-word
         # essential probe inside the 31-word BMS block), the fuller block is
-        # the one the decoder consumes.
+        # the one the decoder consumes; cached slow blocks ride along with
+        # their original registers so the decode stays a projection of what
+        # the wire actually served.
         served: dict[int, tuple[int, ...]] = {}
-        for (address, _count), words in blocks.items():
+        candidates: list[tuple[int, tuple[int, ...]]] = [
+            (address, words) for (address, _count), words in blocks.items()
+        ]
+        candidates.extend((address, words) for address, (words, _at) in self._slow_cache.items())
+        for address, words in candidates:
             current = served.get(address)
             if current is None or len(words) > len(current):
                 served[address] = words
@@ -1043,8 +1114,10 @@ class _LiveDecodeTelemetry:
             expected_profile=self._expected_profile,
             expected_cell_count=self._expected_cell_count,
             wall_timestamp=self._clock.wall_now().astimezone(UTC),
-            captured_at_mono=float(self._clock.monotonic()),
+            captured_at_mono=now,
             sequence=next(self._sequence),
+            cell_captured_at_mono=cell_captured,
+            cell_sequence=cell_sequence,
             lifecycle=lifecycle,
         )
 

@@ -779,9 +779,25 @@ async def test_replayed_live_capture_serves_the_full_run_mode_read_plan(
             assert wired[0].port == expectation.port
             assert wired[0].device_id == expectation.device_id
             windows = journal.windows_for(expectation.host)
-            assert windows >= _expected_window_plan(expectation.bic_count), (
-                f"{expectation.unit_id} read {sorted(windows)}; the evidenced per-unit plan "
-                "must be read in full"
+            # Commissioned tiered refresh (2026-08-22): one cycle reads the
+            # control-rate core (BMS, the three fault blocks, temperatures,
+            # the identity pair) plus the cycle-1 bootstrap windows (cells and
+            # the system overview); the remaining evidenced windows rotate on
+            # slower tiers, so the full plan is covered across cycles, not
+            # within one.
+            core = {
+                (0x5000, 31),
+                (0x1040, 22),
+                (0x2040, 22),
+                (0x5040, 22),
+                (0x523C, expectation.bic_count * 3),
+                (0x8106, 2),
+                (0x5200, min(expectation.bic_count * 10, 100)),
+                (0x0100, 61),
+            }
+            assert windows >= core, (
+                f"{expectation.unit_id} read {sorted(windows)}; one cycle must read "
+                "the control-rate core plus the cycle-1 bootstrap windows"
             )
             assert (0x5000, 7) in windows, "the essential layout probe stays part of the cycle"
     finally:

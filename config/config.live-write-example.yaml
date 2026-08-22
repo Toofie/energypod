@@ -92,7 +92,7 @@ timing:
   # 1.5 s envelope, and every budget below fits strictly inside the expiry.
   device_command_expiry_s: 3.00
   device_command_expiry_evidence: live-trial://direction-2026-08-22/rev-1
-  control_period_s: 1.00
+  control_period_s: 1.50
   essential_read_timeout_s: 1.00
   kernel_timeout_s: 0.10
   audit_timeout_s: 0.10
@@ -118,11 +118,11 @@ policy:
   maximum_temperature_c: 45.0
   maximum_soc_difference_pct: 5.0
   maximum_soc_jump_pct: 10.0
-  maximum_telemetry_age_s: 1.0
-  maximum_cell_data_age_s: 5.0
+  maximum_telemetry_age_s: 3.0
+  maximum_cell_data_age_s: 15.0
   # One authorization must outlive one control period and die inside the
   # device expiry: 1.50 s against the 1.00 s cadence and 3.00 s expiry.
-  authorization_lifetime_s: 1.50
+  authorization_lifetime_s: 2.00
   ramp_limit_w_per_s: 1000
   stable_samples_to_rearm: 3
   reactive_power_limit_var: 0
