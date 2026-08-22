@@ -366,6 +366,29 @@ direction, freshness, and watchdog timing per physical unit.
 - 2026-08-21: Committed the baseline as `1552202` and dispatched five disjoint
   implementation streams: domain/allocation; config/schedule/persistence;
   arbiter/safety/kernel; protocol/transport; and sole-owner actor.
+- 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
+  found and fixed by in-process stall diagnostics with halt-evidence
+  instrumentation: (1) the kernel treated a publish-time
+  StaleGenerationError (the repository CAS legitimately fencing a cycle
+  minted just before an actor fence) as a component failure, halting the
+  fleet — now handled as a fenced cycle (5a27796); (2) independent
+  kernel/actor/poll timers meant a fresh poll landed between mint and
+  heartbeat with near certainty, so the sequence-bound single-use
+  authorization was stale at consumption and no write ever happened —
+  replaced by one fleet cycle (heartbeat -> bounded concurrent polls ->
+  kernel tick) making consumption deterministic (c75ec13). The console's
+  vite proxy also needed a restart after backend restarts (stale keep-alive
+  sockets produced 502s). VERIFICATION SWEEP (operator-requested): each
+  battery 500 W charge and discharge for one minute — mid/rhs/lhs charge
+  flowed continuously (-346..-481 / -378..-477 / -216..-354 W measured),
+  rhs/lhs discharge flowed continuously (+558..+690 / +608..+728 W), MID
+  discharge correctly REFUSED at the 10% SOC floor (armed_idle, kernel
+  rejection, house baseline continued) — the safety system working as
+  designed. Follow-ups: the stalled-at-59% full-suite run under live load
+  (0 failures; targeted families 100/100 green in isolation) should be
+  re-run without the live controller competing; halt evidence should be
+  surfaced through /api/v1/health.
+
 - 2026-08-22: LIVE CONTROL COMMISSIONED. Write-enabled run mode landed
   contract-first (ea62398: policy qualification threshold, config gates for
   live-trial expiry evidence and the 1.5 s renewal envelope, arm-time
