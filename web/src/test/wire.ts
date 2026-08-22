@@ -556,6 +556,8 @@ export const DATA_QUALITY_VALUES: readonly string[] = [
  * every field is null when that datum is absent from the observation, never
  * zero-filled or fabricated.
  */
+/** Wire sign convention (PROTOCOL_EVIDENCE 4b, live-proven): battery
+ * watts/current POSITIVE = DISCHARGE, negative = CHARGE. */
 export interface WireTelemetrySummary {
   readonly soc_pct: number | null;
   readonly bms_soc_pct: number | null;
@@ -696,8 +698,8 @@ const FLEET_FACTS: Record<string, FleetUnitFacts> = {
     bmsSoc: 68,
     soh: 100,
     packVoltageV: 164.5,
-    packCurrentA: -6.9,
-    batteryWatts: -1132,
+    packCurrentA: 6.9,
+    batteryWatts: 1132,
     chargeLimitW: 6532,
     dischargeLimitW: 6532,
     cellCount: 50,
@@ -713,8 +715,8 @@ const FLEET_FACTS: Record<string, FleetUnitFacts> = {
     bmsSoc: 48,
     soh: 100,
     packVoltageV: 196.8,
-    packCurrentA: -9.4,
-    batteryWatts: -1846,
+    packCurrentA: 9.4,
+    batteryWatts: 1846,
     chargeLimitW: 7812,
     dischargeLimitW: 7812,
     cellCount: 60,

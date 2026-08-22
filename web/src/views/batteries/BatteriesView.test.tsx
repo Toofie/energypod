@@ -130,7 +130,7 @@ const HEALTHY_SNAPSHOT: WireSnapshot = snapshot(
       telemetry_age_s: 2,
       requested_power: { direction: "discharge", watts: 2400 },
       authorized_power: { direction: "discharge", watts: 2400 },
-      measured_watts: -2400,
+      measured_watts: 2400,
     }),
     unitSnapshot({ unit_id: "RHS", lifecycle: "disarmed", telemetry_age_s: 5 }),
   ],
@@ -307,7 +307,7 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
   });
 
   it("shows the power actually delivered, never the request, when the safety system clamps the action", async () => {
-    // requested 2,400 W, authorized 1,000 W, measured -950 W: a limited
+    // requested 2,400 W, authorized 1,000 W, measured 950 W: a limited
     // action must never be presented as the full request or as what flows.
     const clamped: WireSnapshot = {
       ...HEALTHY_SNAPSHOT,
@@ -317,7 +317,7 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
               ...u,
               requested_power: { direction: "discharge", watts: 2400 },
               authorized_power: { direction: "discharge", watts: 1000 },
-              measured_watts: -950,
+              measured_watts: 950,
             }
           : u,
       ),
@@ -364,7 +364,7 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
           soc_pct: 68,
           pack_voltage_v: 164.5,
           pack_current_a: -6.9,
-          battery_watts: -1132,
+          battery_watts: 1132,
           soh_pct: 100,
           dynamic_charge_limit_w: 6532,
           dynamic_discharge_limit_w: 6532,
@@ -672,7 +672,7 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
           telemetry_age_s: 2,
           requested_power: { direction: "discharge", watts: 2400 },
           authorized_power: { direction: "discharge", watts: 2400 },
-          measured_watts: -2400,
+          measured_watts: 2400,
         }),
         unitSnapshot({
           unit_id: "LHS",

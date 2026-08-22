@@ -319,11 +319,13 @@ function cardPowerText(unit: ViewUnit): string {
   if (measured === null) {
     return "No data";
   }
+  // Wire convention (PROTOCOL_EVIDENCE 4b, live-proven): a POSITIVE battery
+  // watt figure is DISCHARGE, negative is CHARGE.
   if (measured > 0) {
-    return `Charging ${formatWatts(measured)} W`;
+    return `Discharging ${formatWatts(measured)} W`;
   }
   if (measured < 0) {
-    return `Discharging ${formatWatts(measured)} W`;
+    return `Charging ${formatWatts(Math.abs(measured))} W`;
   }
   const fallback = unit.authorized_power?.direction ?? unit.requested_power.direction;
   return `${directionWord(fallback)} 0 W`;
@@ -762,7 +764,7 @@ function SummaryPanel({
   const actual =
     measured === null
       ? "no data"
-      : `${directionWord(measured > 0 ? "charge" : measured < 0 ? "discharge" : "idle").toLowerCase()} ${formatWatts(measured)} W`;
+      : `${directionWord(measured > 0 ? "discharge" : measured < 0 ? "charge" : "idle").toLowerCase()} ${formatWatts(Math.abs(measured))} W`;
   const telemetry = unit.telemetry;
   const soc = telemetry?.socPct ?? null;
   const soh = telemetry?.sohPct ?? null;
