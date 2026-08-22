@@ -167,6 +167,35 @@ priority are rejected. Evaluation returns a short-lived schedule intent, never a
   acknowledgeable through the exact-id acknowledgement endpoint regardless of how many stops
   accumulate, and the idempotency capacity bound never evicts a latched stop.
 
+## Write-enabled run mode (live control)
+
+- Write-enabled control composes ONLY when `mode: write_enabled` AND a
+  policy AND enabled authentication are all configured (existing config
+  gate) AND `timing.device_command_expiry_evidence` references the measured
+  live watchdog trial (the 2026-08-22 direction trial measured an unrenewed
+  objective expiry of ~3.5-4.0 s). The existing complete-budget validator
+  must pass against that commissioned expiry: renewal cadence
+  (`control_period_s`) plus write timeout plus margin fit strictly inside it
+  (vendor 1 s and prior-integration 1.5 s cadences are the corroborated
+  envelope; the commissioned cadence must not exceed them).
+- In write-enabled mode the run-mode actor's stable-qualification threshold
+  is the policy's `stable_samples_needed_to_rearm` (identity-pinned live
+  decode qualifies a unit exactly as the simulator does); observe-only mode
+  keeps the structural never-qualify wiring unchanged.
+- External-writer preflight: at arm time (transition into ARMED_IDLE) the
+  actor reads the served PQ objective readback (IoT 0x1060+17/+18). Any
+  nonzero objective it did not itself write latches INHIBITED with cause
+  `external_writer` (privileged acknowledgement required, re-latching while
+  the foreign objective persists); an unreadable readback refuses the arm
+  fail-closed. This makes single-writer authority structural, not assumed.
+- The only writable registers remain `[1, signed P, signed Q]` at `0x0200`
+  (negative P = charge, positive P = discharge — live-proven 2026-08-22);
+  the transport write gate is unchanged and no other address is writable by
+  any composition, mode, or tool.
+- Emergency stop, fence, and shutdown behavior are unchanged and dominate
+  renewal; a latched stop or inhibit during ACTIVE stops renewal writes
+  immediately and issues the bounded zero.
+
 ## Operations surface (Milestone C)
 
 - SQLite durable stores carry a `schema_version` from day one. `energypod db migrate`
