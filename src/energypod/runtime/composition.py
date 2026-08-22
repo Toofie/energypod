@@ -1225,6 +1225,11 @@ class _ActorCommandHandle:
     def inhibit_latched(self) -> bool:
         return bool(self._actor.inhibit_latched)
 
+    @property
+    def inhibit_cause(self) -> Any:
+        """The actor's recorded inhibit cause; ``None`` while never latched."""
+        return self._actor.inhibit_cause
+
     async def arm(self) -> None:
         await self._actor.arm()
 

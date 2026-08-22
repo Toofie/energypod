@@ -26,6 +26,7 @@ import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from datetime import UTC, datetime
 from typing import Any, Final, Protocol
 
@@ -175,6 +176,11 @@ class _LatchedStop:
     unit_ids: frozenset[str]
     created_at_mono: float
     fenced_generation: int | None
+    # Snapshot truth for consoles (2026-08-23): a latch observed only through
+    # events leaves a console opened after the latch showing nothing.
+    principal: str = ""
+    latched_at_wall: datetime = datetime(1970, 1, 1, tzinfo=UTC)
+    reason_codes: tuple[str, ...] = ("latched",)
 
 
 def _enum_value(raw: Any) -> str:
@@ -458,6 +464,24 @@ class EnergyServiceFacade:
             "snapshot_sequence": sequence,
             "captured_at": self._clock.wall_now().isoformat(),
             "units": units,
+            # Console truth (2026-08-23): a latched emergency stop must be
+            # visible in a snapshot taken after the latch event, not only on
+            # the event stream.  Only non-acknowledged latches appear -- an
+            # acknowledged stop leaves the list, exactly as it leaves the
+            # registry -- and a null unit_ids means the stop fenced the whole
+            # fleet this facade serves.
+            "active_stops": [
+                {
+                    "stop_id": stop.stop_id,
+                    "latched_at": stop.latched_at_wall.isoformat(),
+                    "principal": stop.principal,
+                    "reason_codes": list(stop.reason_codes),
+                    "unit_ids": (
+                        None if self._is_fleet_wide(stop.unit_ids) else sorted(stop.unit_ids)
+                    ),
+                }
+                for stop in self._latched_stops.values()
+            ],
         }
 
     async def unit_detail(self, *, principal: Principal, unit_id: Any) -> dict[str, Any]:
@@ -900,6 +924,9 @@ class EnergyServiceFacade:
                 unit_ids=selected,
                 created_at_mono=now_mono,
                 fenced_generation=fenced_generation,
+                principal=principal.subject,
+                latched_at_wall=self._clock.wall_now().astimezone(UTC),
+                reason_codes=("latched",),
             )
         # 5. Bounded zero through every affected actor handle.
         for unit_id in units:
@@ -950,6 +977,14 @@ class EnergyServiceFacade:
             )
         except Exception:
             degraded.append("publish_unavailable")
+
+        # The latch record the snapshot serves carries the FINAL degraded
+        # state of the stop, exactly as its audit event does.
+        latched = self._latched_stops.get(stop_id)
+        if latched is not None:
+            self._latched_stops[stop_id] = dataclass_replace(
+                latched, reason_codes=tuple(degraded) if degraded else ("latched",)
+            )
 
         # The safety sequence is complete; only now may caller-facing errors
         # surface, and never by undoing any step above.  Every error path
@@ -1137,6 +1172,8 @@ class EnergyServiceFacade:
         # peek() is the granted non-consuming projection read; current() is
         # reserved for control and a snapshot must never burn a capability.
         capability = await self._authorizations.peek(unit_id)
+        inhibit_latched = bool(getattr(handle, "inhibit_latched", False))
+        inhibit_cause = getattr(handle, "inhibit_cause", None)
         return {
             "unit_id": unit_id,
             "lifecycle": _enum_value(getattr(handle, "lifecycle", None)),
@@ -1146,6 +1183,13 @@ class EnergyServiceFacade:
             "authorized_power": _authorized_projection(capability),
             "measured_watts": measured_watts,
             "telemetry": _telemetry_summary(telemetry),
+            # Inhibit truth for the console's latch affordance: the boolean is
+            # the actor's live latch state; the cause names WHY it latched and
+            # is null whenever the unit is not latched.
+            "inhibit_latched": inhibit_latched,
+            "inhibit_cause": _enum_value(inhibit_cause)
+            if inhibit_latched and inhibit_cause is not None
+            else None,
         }
 
     def _quality_projection(self, telemetry: Any, age_s: float | None) -> str:

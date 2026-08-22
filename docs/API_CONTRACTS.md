@@ -236,6 +236,15 @@ coordinator, the event bus, and per-unit actor handles.
   `active_faults`, `active_warnings` — every field null when that datum is absent from the
   observation, never zero-filled or fabricated. It performs no I/O beyond repository reads and
   never triggers control.
+- The snapshot also carries the live emergency-stop latch state (2026-08-23): `active_stops` is a
+  list, empty when nothing is latched, with one entry per non-acknowledged latched stop —
+  `{"stop_id": str, "latched_at": iso-8601 str, "principal": str, "reason_codes": [str],
+  "unit_ids": [str] | null}` where `unit_ids` is `null` exactly when the stop fenced the whole
+  fleet this facade serves. An acknowledged stop leaves the list; a restart starts with none
+  (the latch registry is process-local by design — the snapshot simply tells the truth). Each
+  unit view additionally carries `inhibit_latched: bool` and `inhibit_cause: str | null` (the
+  actor's recorded latch cause, null whenever the unit is not latched) so a console opened after
+  a latch renders the release affordance from the snapshot alone.
 - `unit_detail(principal, unit_id)` (REST `GET /api/v1/units/{unit_id}`, `observe` scope)
   returns the full latest observation projection for one unit: identity (`device_identity`),
   `protocol_profile`, `connection_epoch`, telemetry and cell sequences and capture times, all
