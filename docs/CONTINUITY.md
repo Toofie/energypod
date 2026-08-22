@@ -366,7 +366,28 @@ direction, freshness, and watchdog timing per physical unit.
 - 2026-08-21: Committed the baseline as `1552202` and dispatched five disjoint
   implementation streams: domain/allocation; config/schedule/persistence;
   arbiter/safety/kernel; protocol/transport; and sole-owner actor.
-- 2026-08-21: First implementation milestone. All five streams plus the
+- 2026-08-22: Milestone A contracts and red-phase test baseline accepted.
+  ADR-0003 fixed the composition/facade/event-bus/simulator/inhibit design;
+  API_CONTRACTS.md gained the service-facade, event-bus, composition,
+  simulator, and inhibit-acknowledgement sections (plus granted ports:
+  peek, actor bounded-zero request, fence revocation, main server_runner
+  seam). Six author agents wrote tests/unit/test_service_facade.py (66),
+  test_event_bus.py, tests/simulator/test_simulated_pod.py,
+  test_composition.py, test_main_entry.py, and
+  tests/golden/test_golden_scenarios.py; six adversarial reviewers produced
+  19 P1 + 25 P2 findings; all were resolved (grants vs repairs) and the
+  repairs applied by four agents (one interrupted run was restarted
+  cleanly after two agents died). Committed as 1fc9ed3, 816be76, 2536ed6.
+  State: 916 tests collect; the 791 pre-existing tests pass; the new
+  Milestone A suites fail cleanly on absent production modules (correct
+  red phase). EXACT NEXT STEP: dispatch the Milestone A implementation
+  workflow — disjoint implementers for energypod/application/service.py,
+  energypod/application/events.py, energypod/simulator/{pod,transport}.py,
+  energypod/runtime/composition.py, and energypod/main.py against the
+  accepted tests — then implementation review, integration (full suite
+  green), mutation testing on the new critical modules, and the Milestone
+  A commit. Then reason-code pinning + latched inhibit (already contracted
+  in D5), then Milestone B (UI) and Milestone C (packaging/ops/e2e).
   REST/WebSocket/MCP boundary delivered; 729 tests pass; Ruff lint/format and
   mypy strict pass. Ran the independent adversarial implementation review as a
   36-agent workflow (8 reviewers + two-lens verification of each P0/P1): 0 P0,
