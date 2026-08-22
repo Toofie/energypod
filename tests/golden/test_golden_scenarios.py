@@ -214,9 +214,7 @@ def fleet_config(database: Path) -> ControllerConfig:
         ],
         "timing": {
             "device_command_expiry_s": DEVICE_COMMAND_EXPIRY_S,
-            "device_command_expiry_evidence": (
-                "commissioning://golden-watchdog-trial-2026-08/rev-1"
-            ),
+            "device_command_expiry_evidence": ("live-trial://direction-2026-08-22/rev-1"),
             "control_period_s": CONTROL_PERIOD_S,
             "essential_read_timeout_s": 0.10,
             "kernel_timeout_s": 0.05,

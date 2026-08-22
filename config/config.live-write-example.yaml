@@ -1,0 +1,142 @@
+# EnergyPod controller — LIVE WRITE-ENABLED example, commissioned against the
+# authorized 2026-08-22 evidence: the captures (docs/evidence/
+# live-capture-2026-08-22.json and live-capture-followup-2026-08-22.json,
+# decoded per docs/evidence/field-mapping-2026-08-22.md) and the direction
+# trial that measured the wire behavior write-enabled control stands on
+# (negative P = CHARGE, positive P = DISCHARGE at the 0x0200 [1, P, Q]
+# objective; unrenewed objective expiry ~3.5-4.0 s).
+#
+# This file is an EXAMPLE, not a deployment artifact: copy it, re-verify every
+# per-unit fact against your own commissioning captures, and never point a
+# controller at hardware before then.
+#
+# Safety posture of this file:
+#   - mode write_enabled composes ONLY because every gate holds
+#     (API_CONTRACTS "Write-enabled run mode"): a control policy, enabled
+#     authentication, `device_command_expiry_evidence` that references the
+#     measured live watchdog trial (the live-trial:// spelling below — the
+#     observe-only placeholder spellings are refused in this mode), and a
+#     renewal cadence inside the corroborated envelope (vendor 1 s and
+#     prior-integration 1.5 s cadences; the 1.0 s control period here) whose
+#     cadence budget fits strictly inside the commissioned 3.0 s expiry,
+#     itself inside the measured ~3.5-4.0 s watchdog window with margin.
+#   - Single-writer authority is structural, not assumed: at arm time the
+#     actor reads the served PQ objective readback (IoT 0x1060+17/+18) and a
+#     nonzero objective it did not itself write latches INHIBITED with cause
+#     `external_writer` until a privileged acknowledgement clears it.
+#   - The only writable registers remain [1, signed P, signed Q] at 0x0200;
+#     no other address is writable by any composition, mode, or tool.
+#     Emergency stop, fence, and shutdown dominate renewal and issue the
+#     bounded zero [1, 0, 0].
+#   - Per-unit facts below are the live ones the captures pinned: gateway
+#     endpoints, device id 4, the wire identity decoded from the 0x8106 RTU-ID
+#     pair (low word first, rendered byd-{rtu_id:08x}), and the commissioned
+#     cell topology (MID 6 BIC / 60 cells, RHS 5 BIC / 50 cells, LHS 6 BIC /
+#     60 cells).  A wrong expected_identity latches the unit INHIBITED
+#     (identity mismatch); the observation always reports the identity the
+#     hardware served, never this configuration.
+#   - NO SECRET IS STORED HERE.  `authentication.operator_credential_ref` is a
+#     secret *reference* naming the operator credential store; the deployment
+#     resolves it to a credential file (the FileCredentialStore JSON mapping
+#     of bearer tokens to principals) mounted read-only, and the controller is
+#     handed that store at startup.  The credential file itself — tokens,
+#     subjects, scopes — lives outside this configuration and outside the
+#     repository.  Do not inline tokens, keys, or passwords anywhere in this
+#     file.
+#   - The timing block is the commissioned write budget: the complete
+#     operation budget (2.40 s) and the renewal cadence budget (1.60 s) both
+#     fit strictly inside the 3.00 s device command expiry, and the 0.50 s
+#     write timeout fits strictly inside the 1.00 s control period.
+#   - The database path stays on the /var/lib/energypod data volume so
+#     `energypod db backup`/`restore` see one durable store, and is distinct
+#     from the observe-only deployment's database.
+schema_version: 1
+revision: 3
+mode: write_enabled
+
+site:
+  site_id: home
+  timezone: Australia/Brisbane
+  expected_unit_count: 3
+
+units:
+  - unit_id: mid
+    display_name: Middle Pod
+    endpoint: { host: 192.168.1.11, port: 4196 }
+    transport_profile: waveshare_rtu_over_tcp
+    protocol_profile: iot
+    device_id: 4
+    expected_identity: byd-2c225097
+    expected_cell_count: 60
+  - unit_id: rhs
+    display_name: Right Pod
+    endpoint: { host: 192.168.1.12, port: 4196 }
+    transport_profile: waveshare_rtu_over_tcp
+    protocol_profile: iot
+    device_id: 4
+    expected_identity: byd-2c225076
+    expected_cell_count: 50
+  - unit_id: lhs
+    display_name: Left Pod
+    endpoint: { host: 192.168.1.13, port: 4196 }
+    transport_profile: waveshare_rtu_over_tcp
+    protocol_profile: iot
+    device_id: 4
+    expected_identity: byd-2c225095
+    expected_cell_count: 60
+
+timing:
+  # The 2026-08-22 direction trial measured the unrenewed objective expiry at
+  # ~3.5-4.0 s; the commissioned 3.00 s expiry sits inside that window with
+  # margin, the 1.00 s renewal cadence sits inside the corroborated 1 s /
+  # 1.5 s envelope, and every budget below fits strictly inside the expiry.
+  device_command_expiry_s: 3.00
+  device_command_expiry_evidence: live-trial://direction-2026-08-22/rev-1
+  control_period_s: 1.00
+  essential_read_timeout_s: 1.00
+  kernel_timeout_s: 0.10
+  audit_timeout_s: 0.10
+  write_timeout_s: 0.50
+  acknowledgement_timeout_s: 0.10
+  maximum_jitter_s: 0.10
+  renewal_margin_s: 0.50
+  inter_request_delay_s: 0.10
+
+policy:
+  version: 4
+  threshold_provenance: live-commissioning-2026-08-22
+  max_fleet_charge_w: 6000
+  max_fleet_discharge_w: 6000
+  max_unit_charge_w: 2500
+  max_unit_discharge_w: 2500
+  minimum_soc_pct: 10.0
+  maximum_soc_pct: 95.0
+  minimum_cell_v: 2.80
+  maximum_cell_v: 3.65
+  maximum_cell_imbalance_v: 0.050
+  minimum_temperature_c: 0.0
+  maximum_temperature_c: 45.0
+  maximum_soc_difference_pct: 5.0
+  maximum_soc_jump_pct: 10.0
+  maximum_telemetry_age_s: 1.0
+  maximum_cell_data_age_s: 5.0
+  # One authorization must outlive one control period and die inside the
+  # device expiry: 1.50 s against the 1.00 s cadence and 3.00 s expiry.
+  authorization_lifetime_s: 1.50
+  ramp_limit_w_per_s: 1000
+  stable_samples_to_rearm: 3
+  reactive_power_limit_var: 0
+  blocking_fault_codes:
+    - PCS_EE_CALIBRATION_OUT_OF_RANGE
+    - DCDC_EE_CALIBRATION_OUT_OF_RANGE
+  debug_modes_enabled: false
+
+authentication:
+  enabled: true
+  operator_credential_ref: secret://var/live-credentials.json
+  trusted_proxy_cidrs:
+    - 192.168.1.0/24
+
+storage:
+  database_path: var/live-write.sqlite3
+  busy_timeout_ms: 250

@@ -810,7 +810,7 @@ async def test_a_transient_inhibit_cannot_downgrade_a_standing_latch(
     await actor.accept_observation(ObservationRecord(sequence=2, active_faults=("Stack_Fault0_3",)))
     assert actor.inhibit_latched is True
 
-    actor._record_inhibit_cause(contract.InhibitCause.TRANSIENT)
+    actor._record_inhibit_cause(contract.InhibitCause.TRANSIENT, "transient_probe")
 
     assert actor.inhibit_latched is True, "only acknowledgement may clear a latch"
     assert actor.inhibit_cause is contract.InhibitCause.LATCHED

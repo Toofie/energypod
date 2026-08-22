@@ -28,13 +28,16 @@ Three bridging decisions live in this module and nowhere else:
 - Run mode (``simulate=False``) wires each actor a decode-driven telemetry
   strategy over the production transport: the served layout probe decides the
   register plan, and the production wire decoder turns the served blocks into
-  the domain observation.  Run-mode observe-only is structural, not a mode
-  flag the composition checks: the actor's stable-sample qualification
-  threshold is wired beyond any reachable count because the per-unit
-  commissioning evidence that would justify qualification (verified sign
-  conventions, watchdog timing, string-identity binding — field-mapping
-  2026-08-22 section 7) is not composed, so no amount of coherent telemetry
-  can ever carry a live unit into DISARMED or mint authority for it.
+  the domain observation.  Run mode is commissioned per configuration mode
+  (API_CONTRACTS "Write-enabled run mode"): ``observe_only`` stays structural
+  — the actor's stable-sample qualification threshold is wired beyond any
+  reachable count, so no amount of coherent telemetry can ever carry a live
+  unit into DISARMED or mint authority for it — while ``write_enabled``
+  (policy, enabled authentication, and the measured live-trial expiry evidence
+  all validated at configuration time) composes the policy's qualification
+  threshold and pins the served PQ objective readback as the actor's arm-time
+  external-writer preflight, so single-writer authority is established from
+  the served registers, never assumed.
 """
 
 from __future__ import annotations
@@ -100,7 +103,7 @@ from energypod.domain import (
 )
 from energypod.domain.audit import AuditEvent, DuplicateAuditEventError
 from energypod.domain.schedule import SchedulePlan, ScheduleVersionConflict
-from energypod.runtime.config import ControllerConfig
+from energypod.runtime.config import ControllerConfig, ControllerMode
 from energypod.runtime.credentials import FileCredentialStore
 from energypod.simulator import SimulatedEnergyPod, SimulatorTransport
 
@@ -124,17 +127,28 @@ _MAX_SIMULATOR_BICS = 6
 # The only evidenced writable objective is FC16 at 0x0200 with [1, P, Q].
 _PQ_OBJECTIVE_ADDRESS = 0x0200
 
-# Run mode composes no interactive qualification path (PROTOCOL_EVIDENCE
-# section 4a; field-mapping 2026-08-22 section 7): actuation stays gated on
-# per-unit commissioning evidence — verified power-direction signs, watchdog
-# renewal timing, and the string-identity binding strategy — that no run-mode
-# composition holds.  The actor's stable-sample threshold is therefore wired
+# The served PQ objective readback (IoT PCS detailed-state block 0x1060,
+# active/reactive power objectives at offsets +17/+18): PROTOCOL_EVIDENCE 4b —
+# the live -200 W commissioning write read back immediately at 0x1060+17, and
+# the authorized 2026-08-22 captures baseline both words at zero.  A
+# write-enabled run-mode composition pins this window as the actor's arm-time
+# external-writer preflight port, so sole-writer authority is proven from the
+# served registers before the unit may ever transition into ARMED_IDLE.
+_OBJECTIVE_READBACK_ADDRESS = 0x1060 + 17
+
+# Observe-only run mode composes no interactive qualification path
+# (PROTOCOL_EVIDENCE section 4a; field-mapping 2026-08-22 section 7):
+# actuation stays gated on per-unit commissioning evidence the composition
+# does not hold.  The actor's stable-sample threshold is therefore wired
 # beyond any count a process could ever reach (one sample per telemetry cycle
 # at the 0.40 s commissioned cadence would need ~10^12 years to reach 2^63-1),
 # so a live unit can never cross into DISARMED through telemetry alone, the
 # facade always sees an unqualified unit, and the only register write run mode
 # can ever issue is the bounded stop triple.  Observe-only is structural, not
-# a mode flag the composition re-checks anywhere else.
+# a mode flag the composition re-checks anywhere else; write-enabled run mode
+# (API_CONTRACTS "Write-enabled run mode") composes the policy's threshold
+# instead, on the strength of the measured live-trial evidence the
+# configuration validator already demanded.
 _RUN_MODE_STABLE_SAMPLES_REQUIRED = 2**63 - 1
 
 # Register windows the simulator telemetry decode consumes (PROTOCOL_EVIDENCE
@@ -1796,6 +1810,18 @@ def _build_runtime(
 
     # --- one sole-owner actor per configured unit ---------------------------
     probe = RegisterCatalog().layout_probe
+    # Run mode's qualification path is decided here, once, from the validated
+    # configuration mode (API_CONTRACTS "Write-enabled run mode"): a
+    # write-enabled deployment — which the configuration validator already
+    # forced to carry a policy, enabled authentication, the measured
+    # live-trial expiry evidence, and a cadence inside the corroborated
+    # envelope — composes the policy's stable-sample threshold and the
+    # arm-time external-writer preflight over the served objective readback;
+    # an observe-only deployment keeps the structural never-qualify wiring
+    # and today's arm path, exactly as before.  Simulate mode keeps the
+    # commissioning threshold it always had; its deterministic device models
+    # own the watchdog and writer behaviors the live preflight probes for.
+    write_enabled = config.mode is ControllerMode.WRITE_ENABLED
     actors: dict[str, EnergyPodActor] = {}
     simulators: dict[str, SimulatedEnergyPod] | None = {} if simulate else None
     for index, unit in enumerate(config.units):
@@ -1856,13 +1882,14 @@ def _build_runtime(
             expected_identity=unit.expected_identity,
             expected_profile=unit.protocol_profile.value,
             expected_cell_count=unit.expected_cell_count,
-            # Structural observe-only for run mode: the qualification threshold
-            # is wired beyond any reachable count because the per-unit
-            # commissioning evidence that would justify qualification is not
-            # composed.  Simulate mode keeps the policy's commissioning path.
+            # Structural observe-only for observe-only run mode: the
+            # qualification threshold is wired beyond any reachable count
+            # because the per-unit commissioning evidence that would justify
+            # qualification is not composed.  Write-enabled run mode and
+            # simulate mode compose the policy's commissioning count.
             stable_observations_required=(
                 policy.stable_samples_needed_to_rearm
-                if simulate
+                if simulate or write_enabled
                 else _RUN_MODE_STABLE_SAMPLES_REQUIRED
             ),
             essential_read_address=probe.address,
@@ -1872,6 +1899,15 @@ def _build_runtime(
             # renewal may eat into before its deadline, and the bound on the
             # bounded-zero attempt.
             heartbeat_safety_margin_s=config.timing.write_timeout_s,
+            # The arm-time external-writer preflight port (API_CONTRACTS
+            # "Write-enabled run mode", bullet 3): pinned only for a
+            # write-enabled run-mode composition, so the actor proves sole-
+            # writer authority by reading the served PQ objective readback
+            # before ARMED_IDLE.  Observe-only run mode and simulate mode pass
+            # the default None and keep today's arm path exactly.
+            objective_readback_address=(
+                _OBJECTIVE_READBACK_ADDRESS if write_enabled and not simulate else None
+            ),
             blocking_fault_codes=frozenset(policy.blocking_fault_codes),
             telemetry=telemetry,
         )

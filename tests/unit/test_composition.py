@@ -134,7 +134,7 @@ def _timing_payload() -> dict[str, Any]:
     # numbers satisfy every cross-validated timing budget.
     return {
         "device_command_expiry_s": 2.35,
-        "device_command_expiry_evidence": "commissioning://watchdog-trial-2026-08/rev-1",
+        "device_command_expiry_evidence": "live-trial://direction-2026-08-22/rev-1",
         "control_period_s": 0.40,
         "essential_read_timeout_s": 0.10,
         "kernel_timeout_s": 0.05,
@@ -1141,7 +1141,7 @@ def _fast_timing_payload() -> dict[str, Any]:
     # read outruns the renewal deadline quickly in wall-clock terms.
     return {
         "device_command_expiry_s": 2.35,
-        "device_command_expiry_evidence": "commissioning://watchdog-trial-2026-08/rev-1",
+        "device_command_expiry_evidence": "live-trial://direction-2026-08-22/rev-1",
         "control_period_s": 0.06,
         "essential_read_timeout_s": 0.10,
         "kernel_timeout_s": 0.05,

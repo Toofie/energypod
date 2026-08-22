@@ -226,7 +226,7 @@ def _live_timing_payload() -> dict[str, Any]:
     # cross-validated timing invariant holds for these numbers.
     return {
         "device_command_expiry_s": 2.35,
-        "device_command_expiry_evidence": "commissioning://watchdog-trial-2026-08/rev-1",
+        "device_command_expiry_evidence": "live-trial://direction-2026-08-22/rev-1",
         "control_period_s": 0.40,
         "essential_read_timeout_s": 0.10,
         "kernel_timeout_s": 0.05,

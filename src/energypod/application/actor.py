@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Final
@@ -24,6 +25,12 @@ _POLL_PRIORITY: Final = 20
 # An externally requested bounded zero outranks every scheduled operation
 # except terminal shutdown; the facade enqueues it for emergency stops.
 _ZERO_PRIORITY: Final = -1
+# The served PQ objective readback window the arm-time external-writer
+# preflight reads (PROTOCOL_EVIDENCE 4b: IoT PCS block 0x1060, active and
+# reactive power objectives at +17/+18; the live -200 W commissioning write
+# read back immediately at +17).  Exactly this pair is read, through the one
+# transport this actor owns, inside the arm mailbox dispatch.
+_OBJECTIVE_READBACK_COUNT: Final = 2
 
 
 class InhibitCause(StrEnum):
@@ -63,6 +70,7 @@ class EnergyPodActor:
         essential_read_count: int,
         heartbeat_interval_s: float,
         heartbeat_safety_margin_s: float,
+        objective_readback_address: int | None = None,
         blocking_fault_codes: frozenset[str] | None = None,
         telemetry: Any | None = None,
     ) -> None:
@@ -72,6 +80,8 @@ class EnergyPodActor:
             raise ValueError("heartbeat_interval_s must be positive")
         if not 0 <= heartbeat_safety_margin_s < heartbeat_interval_s:
             raise ValueError("heartbeat safety margin must be within the interval")
+        if objective_readback_address is not None and objective_readback_address < 0:
+            raise ValueError("objective_readback_address must be non-negative")
         if blocking_fault_codes is not None and any(
             not code or code != code.strip() for code in blocking_fault_codes
         ):
@@ -91,6 +101,12 @@ class EnergyPodActor:
         self._stable_required = stable_observations_required
         self._essential_address = essential_read_address
         self._essential_count = essential_read_count
+        # Optional arm-time external-writer preflight port (API_CONTRACTS
+        # "Write-enabled run mode", bullet 3): the composition root pins the
+        # served PQ objective readback window's base address (IoT 0x1060+17)
+        # in write-enabled mode.  ``None`` — the default — keeps the arm path
+        # exactly as it is today, so observe-only wiring is unchanged.
+        self._objective_readback_address = objective_readback_address
         self._heartbeat_interval = heartbeat_interval_s
         self._heartbeat_margin = heartbeat_safety_margin_s
         self._blocking_fault_codes = frozenset(blocking_fault_codes or ())
@@ -109,10 +125,23 @@ class EnergyPodActor:
         # DISARMED (API_CONTRACTS "Inhibit acknowledgement").
         self.inhibit_cause: InhibitCause | None = None
         self.inhibit_latched = False
+        # Operator-visible inhibit reason string (``external_writer``,
+        # ``identity_mismatch``, ...): recorded with every inhibit next to the
+        # cause class, cleared only by the same stable-sample recovery that
+        # clears the cause, so the privileged acknowledgement path and the
+        # facade surface can name why the unit latched.
+        self.inhibit_reason: str | None = None
         self._connection_epoch: int | None = None
         self._latest_observation: Any | None = None
         self._stable_observations = 0
         self._used_cycles: set[tuple[int, int]] = set()
+        # The last PQ objective (signed active, reactive power) this actor
+        # itself applied, so the arm-time external-writer preflight can tell
+        # its own standing objective — left applied across a disarm, for
+        # example — from a foreign writer's.  ``None`` (nothing written by
+        # this actor) makes any nonzero readback foreign: a fresh process
+        # cannot inherit provenance.
+        self._applied_objective: tuple[int, int] | None = None
 
         self._mailbox: asyncio.PriorityQueue[tuple[int, int, _Message]] = asyncio.PriorityQueue()
         self._sequence = itertools.count()
@@ -358,7 +387,7 @@ class EnergyPodActor:
         if operation == "observation":
             return await self._accept_observation_owned(argument)
         if operation == "arm":
-            return self._arm_owned()
+            return await self._arm_owned()
         if operation == "disarm":
             return await self._disarm_owned()
         if operation == "poll":
@@ -406,6 +435,7 @@ class EnergyPodActor:
             ):
                 self.lifecycle = UnitLifecycle.DISARMED
                 self.inhibit_cause = None
+                self.inhibit_reason = None
         else:
             self._stable_observations = 0
             if self.lifecycle not in {
@@ -512,7 +542,7 @@ class EnergyPodActor:
             and cell_count_ok
         )
 
-    def _arm_owned(self) -> None:
+    async def _arm_owned(self) -> None:
         if self._stopping:
             return
         if (
@@ -521,7 +551,65 @@ class EnergyPodActor:
             or self._stable_observations < self._stable_required
         ):
             raise RuntimeError("unit is not qualified for arming")
+        # The external-writer preflight is arm-gated: it runs exactly once per
+        # arm attempt, inside this mailbox dispatch, before ARMED_IDLE — never
+        # per heartbeat.
+        await self._verify_sole_writer_owned()
         self.lifecycle = UnitLifecycle.ARMED_IDLE
+
+    async def _verify_sole_writer_owned(self) -> None:
+        """Refuse the arm unless this actor is the sole PQ writer.
+
+        API_CONTRACTS "Write-enabled run mode", bullet 3: at arm time the
+        actor reads the served PQ objective readback through its own
+        transport.  Any nonzero objective it did not itself write means
+        another writer holds the unit, so the arm is refused and the unit
+        latches INHIBITED with cause ``external_writer`` (privileged
+        acknowledgement required, and the preflight re-latches while the
+        foreign objective persists).  An unreadable readback also refuses the
+        arm, fail-closed, but as a non-latched transient so ordinary
+        stable-sample recovery suffices once it reads back zero.  The port is
+        unset (``None``) in observe-only wiring and the probe is skipped
+        entirely.
+
+        An objective this actor itself applied — the standing objective left
+        on the device across a disarm, or the bounded zero an inhibit or stop
+        delivered — is not a foreign writer: the preflight compares the served
+        pair against the last objective this actor wrote, and a fresh actor
+        that has written nothing treats every nonzero readback as foreign
+        because it cannot inherit provenance from a previous process.
+        """
+        address = self._objective_readback_address
+        if address is None:
+            return
+        try:
+            readback = tuple(await self._transport.read_holding(address, _OBJECTIVE_READBACK_COUNT))
+            if len(readback) < _OBJECTIVE_READBACK_COUNT:
+                raise ValueError("objective readback did not cover P and Q")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self._inhibit_owned("objective_readback_unreadable", InhibitCause.TRANSIENT)
+            raise RuntimeError(
+                f"{self.unit_id}: arm refused, the served PQ objective readback is unreadable"
+            ) from error
+        served = (self._signed_objective(readback[0]), self._signed_objective(readback[1]))
+        if served != (0, 0) and served != self._applied_objective:
+            await self._inhibit_owned("external_writer", InhibitCause.LATCHED)
+            raise RuntimeError(
+                f"{self.unit_id}: arm refused, an external writer holds the PQ "
+                f"objective (P={served[0]}, Q={served[1]})"
+            )
+
+    @staticmethod
+    def _signed_objective(word: int) -> int:
+        """Decode one readback word as the signed PQ objective being served.
+
+        The firmware serves two's-complement int16 words (the live -200 W
+        charge objective read back as 0xFF38); words already decoded as
+        negative by an adapter pass through unchanged.
+        """
+        return word - 0x10000 if word > 0x7FFF else word
 
     async def _disarm_owned(self) -> None:
         # An unarmed or inhibited unit has nothing to drop; an armed unit loses
@@ -599,10 +687,13 @@ class EnergyPodActor:
             self.lifecycle = UnitLifecycle.INHIBITED
             # A transport failure is one failed renewal attempt: transient, so
             # the existing stable-sample recovery path is unchanged.
-            self._record_inhibit_cause(InhibitCause.TRANSIENT)
+            self._record_inhibit_cause(InhibitCause.TRANSIENT, "write_failed")
             await self._attempt_zero_owned()
             await self._revoke("write_failed")
             return
+        # The device now serves this objective; remembering it lets the next
+        # arm-time preflight recognize this actor's own standing objective.
+        self._record_applied_objective(encoded.values)
 
         # A cancellation-resistant adapter may acknowledge after replacement.
         # Never let that stale result restore ACTIVE authority.
@@ -664,21 +755,23 @@ class EnergyPodActor:
         self._used_cycles.clear()
         self._stable_observations = 0
         self.lifecycle = UnitLifecycle.INHIBITED
-        self._record_inhibit_cause(cause)
+        self._record_inhibit_cause(cause, reason)
         await self._attempt_zero_owned()
         await self._revoke(reason)
 
-    def _record_inhibit_cause(self, cause: InhibitCause) -> None:
-        # Entering INHIBITED always records a cause class.  Only LATCHED sets
-        # the latch; TRANSIENT/QUALIFIED keep the existing stable-sample
-        # recovery behavior (ADR-0003 D5).  A standing latch is never
-        # downgraded by a later non-latched cause: lifecycle ordering keeps
-        # transient inhibit paths out of a latched unit today, and this guard
-        # keeps the latch true even if a future path forgets that ordering.
+    def _record_inhibit_cause(self, cause: InhibitCause, reason: str) -> None:
+        # Entering INHIBITED always records a cause class and its operator-
+        # visible reason string.  Only LATCHED sets the latch; TRANSIENT/
+        # QUALIFIED keep the existing stable-sample recovery behavior
+        # (ADR-0003 D5).  A standing latch is never downgraded by a later
+        # non-latched cause: lifecycle ordering keeps transient inhibit paths
+        # out of a latched unit today, and this guard keeps the latch — and
+        # its reason — true even if a future path forgets that ordering.
         if self.inhibit_latched and cause is not InhibitCause.LATCHED:
             return
         self.inhibit_cause = cause
         self.inhibit_latched = cause is InhibitCause.LATCHED
+        self.inhibit_reason = reason
 
     async def _advance_generation(self, reason: str) -> int:
         snapshot = await self._generation_coordinator.advance(reason=reason)
@@ -699,6 +792,16 @@ class EnergyPodActor:
                 await self._transport.write_registers(zero.address, zero.values)
         except (Exception, asyncio.CancelledError):
             return
+        self._record_applied_objective(zero.values)
+
+    def _record_applied_objective(self, values: Sequence[int]) -> None:
+        """Remember the [1, P, Q] objective frame this actor just applied."""
+        if len(values) < 3:
+            return
+        self._applied_objective = (
+            self._signed_objective(int(values[1])),
+            self._signed_objective(int(values[2])),
+        )
 
     async def _stop_owned(self) -> None:
         await self._attempt_zero_owned()

@@ -53,6 +53,33 @@ NonNegativeFiniteFloat = Annotated[StrictFloat, Field(ge=0, allow_inf_nan=False)
 PositiveStrictInt = Annotated[StrictInt, Field(gt=0)]
 NonNegativeStrictInt = Annotated[StrictInt, Field(ge=0)]
 
+# API_CONTRACTS "Write-enabled run mode" (live control): the commissioned
+# renewal cadence may not exceed the corroborated envelope — the vendor 1 s and
+# prior-integration 1.5 s cadences — and the device command expiry a write-
+# enabled deployment commissions against must be backed by the measured live
+# watchdog trial (the 2026-08-22 direction trial, unrenewed expiry ~3.5-4.0 s).
+_MAXIMUM_WRITE_ENABLED_CONTROL_PERIOD_S = 1.5
+_LIVE_TRIAL_EVIDENCE_SCHEME = "live-trial://"
+_LIVE_TRIAL_PLACEHOLDER_SEGMENTS = frozenset({"tbd", "todo", "placeholder", "none", "unknown"})
+
+
+def _references_measured_live_trial(evidence: str) -> bool:
+    """Whether an expiry-evidence reference names a measured live trial.
+
+    The commissioned spelling is ``live-trial://direction-2026-08-22/rev-1``:
+    the scheme asserts the reference is a measured live watchdog trial, and
+    every ``/``-separated segment of the reference must be concrete — the
+    observe-only placeholder spellings (``commissioning://...``), bare TODOs,
+    and ``live-trial://tbd`` all fail, because none of them names the trial
+    whose measurement the commissioned expiry stands on.
+    """
+    if not evidence.startswith(_LIVE_TRIAL_EVIDENCE_SCHEME):
+        return False
+    segments = evidence[len(_LIVE_TRIAL_EVIDENCE_SCHEME) :].split("/")
+    if not segments or any(not segment for segment in segments):
+        return False
+    return all(segment.lower() not in _LIVE_TRIAL_PLACEHOLDER_SEGMENTS for segment in segments)
+
 
 def _plain(value: str, *, label: str) -> str:
     if value != value.strip() or not value:
@@ -140,11 +167,14 @@ class TimingConfig(_FrozenModel):
             + self.maximum_jitter_s
             + self.renewal_margin_s
         )
-        cadence_budget = self.control_period_s + self.maximum_jitter_s + self.renewal_margin_s
         if operation_budget >= self.device_command_expiry_s:
             raise ValueError("complete timing budget must fit inside device command expiry")
-        if cadence_budget >= self.device_command_expiry_s:
-            raise ValueError("control renewal budget must fit inside device command expiry")
+        # The renewal-cadence obligation (control period + jitter + margin
+        # strictly inside the device command expiry) is mode-scoped: only a
+        # composition that writes owes the device's watchdog a renewal cadence,
+        # so that check lives with the mode in ``ControllerConfig`` (observe
+        # -only deployments keep slower cadences against their placeholder
+        # expiry doctrine; API_CONTRACTS "Write-enabled run mode").
         # The composition root wires ``write_timeout_s`` as the actor's
         # heartbeat safety margin and ``control_period_s`` as its heartbeat
         # interval, so a write timeout that cannot fit strictly inside the
@@ -277,6 +307,43 @@ class ControllerConfig(_FrozenModel):
     # in-memory persistence when no database path is configured, so storage
     # is optional; when present it must identify a durable database file.
     storage: StorageConfig | None = None
+
+    @field_validator("timing")
+    @classmethod
+    def validate_write_enabled_timing(cls, timing: TimingConfig, info: object) -> TimingConfig:
+        """The write-enabled commissioning gates (API_CONTRACTS "Write-enabled
+        run mode", bullet 1).
+
+        Only a composition that writes owes the device's watchdog a renewal
+        cadence, so every check here is scoped to ``write_enabled`` and
+        observe-only deployments keep their slower cadences against the
+        placeholder expiry doctrine (the 9.0 s observe-only spelling,
+        PROTOCOL_EVIDENCE 4b).  Write-enabled control commissions only against
+        the measured live watchdog trial — the 2026-08-22 direction trial that
+        measured the unrenewed objective expiry at ~3.5-4.0 s — and its
+        renewal cadence may not exceed the corroborated envelope (the vendor
+        1 s and prior-integration 1.5 s cadences).
+        """
+        if getattr(info, "data", {}).get("mode") is not ControllerMode.WRITE_ENABLED:
+            return timing
+        cadence_budget = timing.control_period_s + timing.maximum_jitter_s + timing.renewal_margin_s
+        if cadence_budget >= timing.device_command_expiry_s:
+            raise ValueError("control renewal budget must fit inside device command expiry")
+        if timing.control_period_s > _MAXIMUM_WRITE_ENABLED_CONTROL_PERIOD_S:
+            raise ValueError(
+                "timing.control_period_s exceeds the corroborated write-enabled renewal "
+                f"cadence envelope (vendor 1 s and prior-integration "
+                f"{_MAXIMUM_WRITE_ENABLED_CONTROL_PERIOD_S} s): the commissioned cadence "
+                "must not exceed them"
+            )
+        if not _references_measured_live_trial(timing.device_command_expiry_evidence):
+            raise ValueError(
+                "timing.device_command_expiry_evidence must reference the measured live "
+                "watchdog trial (a live-trial:// reference, e.g. the 2026-08-22 direction "
+                "trial that measured the ~3.5-4.0 s unrenewed objective expiry) to "
+                "commission write-enabled control"
+            )
+        return timing
 
     @field_validator("units")
     @classmethod

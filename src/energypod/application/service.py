@@ -1077,6 +1077,13 @@ class EnergyServiceFacade:
             await handle.arm()
         except Exception:
             # An actor-side refusal can only be discovered by attempting it.
+            # An attempt that left the unit holding a latched inhibit (the
+            # arm-time external-writer preflight refusing a foreign PQ
+            # objective, API_CONTRACTS "Write-enabled run mode") reports the
+            # standing latch as the operator reason: the refusal cause is the
+            # latch, and the privileged acknowledgement is the documented exit.
+            if bool(getattr(handle, "inhibit_latched", False)):
+                return {"unit_id": unit_id, "status": "refused", "reason": "inhibit_latched"}
             return {"unit_id": unit_id, "status": "refused", "reason": "actor_failure"}
         return {"unit_id": unit_id, "status": "armed", "reason": "armed"}
 
