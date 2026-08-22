@@ -56,6 +56,17 @@ class SafetyKernel:
                 tuple(self._zero_setpoint(p, now_mono) for p in proposals),
                 ("stop_authorized",),
             )
+        if all(p.watts == 0 for p in proposals):
+            # An ACTIVE intent whose allocation contains no deliverable watts
+            # anywhere (2026-08-23 live fleet halt: a single-unit charge into
+            # lhs while its BMS dynamic charge limit was 0 W). The honest
+            # answer is a rejected decision the kernel audits every tick —
+            # never an exception, and never an "authorized" empty grant.
+            return ControlDecision(
+                DecisionStatus.REJECTED,
+                tuple(self._zero_setpoint(p, now_mono) for p in proposals),
+                ("zero_dynamic_capability",),
+            )
 
         reasons: set[str] = set()
         limits: dict[str, int] = {}

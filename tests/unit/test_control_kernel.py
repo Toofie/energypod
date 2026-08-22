@@ -430,6 +430,47 @@ async def test_partially_eligible_fleet_mints_authority_only_for_participating_u
     assert authorized.direction is value.direction
 
 
+async def test_single_unit_intent_with_zero_allocation_is_rejected_not_crashing(
+    api: Any,
+) -> None:
+    """2026-08-23 live fleet halt (SUPERVISOR FAILURE, ValueError at the
+    matcher): a single-unit charge into lhs while its BMS dynamic charge
+    limit was 0 W produced a one-proposal ALL-zero allocation, and the
+    matcher's all-zero guard raised, ending the fleet task. An allocation
+    with no deliverable watts is legitimate input: the kernel must accept
+    it, audit the (rejected) decision, revoke, and keep ticking."""
+    from dataclasses import replace as _replace
+
+    value = intent(api, units=frozenset({"lhs"}))
+    proposals = proposals_for(value)
+    all_zero = (_replace(proposals[0], watts=0),)
+    outcome = Decision(
+        api.DecisionStatus.REJECTED,
+        (Setpoint("lhs", value.direction, 0, value.id),),
+        ("zero_dynamic_capability",),
+    )
+    kernel, history, auth, audit, allocator, safety = make_kernel(api, value, outcome)
+    allocator.output = all_zero
+    decision = await kernel.tick()
+
+    assert decision is outcome
+    assert history == [
+        "intents",
+        "current",
+        "previous",
+        "select",
+        "allocate",
+        "safety",
+        "audit",
+        "revoke",
+    ]
+    assert auth.published == []
+    assert audit.events
+    # The fleet survives: the next tick also completes without raising.
+    decision_two = await kernel.tick()
+    assert decision_two is outcome
+
+
 @pytest.mark.parametrize("shape", ["missing", "duplicate", "extra"])
 async def test_missing_duplicate_or_extra_setpoint_rejects_whole_batch(api: Any, shape: str):
     value = intent(api)

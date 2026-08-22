@@ -784,6 +784,29 @@ def test_zero_watt_non_participant_cannot_veto_the_fleet(api: SimpleNamespace) -
     assert setpoints_by_unit(decision)["mid"].watts == 0
 
 
+@pytest.mark.parametrize("direction", ["CHARGE", "DISCHARGE"])
+def test_active_intent_with_no_deliverable_watts_is_rejected_not_crashing(
+    api: SimpleNamespace, direction: str
+) -> None:
+    """2026-08-23 live fleet halt: a single-unit charge into a pod whose BMS
+    dynamic limit is 0 W (lhs at 98% SOC) yields an ALL-zero allocation. That
+    is a legitimate "nothing deliverable" outcome — the honest answer is a
+    REJECTED decision the kernel audits each tick, never an exception that
+    ends the fleet task."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(
+            api,
+            direction=getattr(api.Direction, direction),
+            watts_by_unit={"lhs": 0},
+        ),
+        current_observations={"lhs": make_observation(api, unit_id="lhs")},
+    )
+
+    assert_rejected(decision, api)
+    assert "zero_dynamic_capability" in reasons(decision)
+
+
 def test_ramp_limit_uses_current_signed_battery_power_and_control_interval(
     api: SimpleNamespace,
 ) -> None:
