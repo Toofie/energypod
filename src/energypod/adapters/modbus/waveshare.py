@@ -84,6 +84,7 @@ class WaveshareTransport:
         self._close_lock = asyncio.Lock()
         self._connected = False
         self._closed = False
+        self._client_factory = client_factory
         # RTU-over-TCP gateways bridge to a half-duplex RS-485 bus: requests
         # fired back-to-back can make the gateway answer out of order (the
         # live commissioning capture observed stale/mismatched PDUs until the
@@ -141,6 +142,20 @@ class WaveshareTransport:
         self._connected = False
         with contextlib.suppress(Exception):
             await self._client.close()
+        # A closed pymodbus client with reconnect_delay=0 never re-establishes
+        # itself (observed live: the LHS transport stayed connectionless for
+        # hours while the gateway happily accepted fresh connections). The
+        # resync therefore rebuilds the client from the factory so the next
+        # operation connects on a genuinely new socket.
+        with contextlib.suppress(Exception):
+            self._client = self._client_factory(
+                self._config.host,
+                port=self._config.port,
+                framer=FramerType.RTU,
+                timeout=self._config.timeout_s,
+                retries=self._config.retries,
+                reconnect_delay=self._config.reconnect_delay_s,
+            )
 
     async def read_holding(self, address: int, count: int) -> tuple[int, ...]:
         self._validate_address_count(address, count)
