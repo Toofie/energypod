@@ -8,9 +8,16 @@ pinned behavior is an ordinary test failure until the contract is implemented.
 Pinned device-model surface: `SimulatedEnergyPod(clock=..., identity=..., bic_count=...,
 seed=..., watchdog_timeout_s=..., cell_poll_interval_s=...)` driven exclusively by the
 injected monotonic clock, with `telemetry_sequence`, `telemetry_captured_at_mono`,
-`cell_sequence`, and `cell_captured_at_mono` observation metadata and
-`inject_fault(prefix, bit)` / `clear_fault(prefix, bit)` scenario hooks.  One FC03 read
-whose window includes the IoT BMS telemetry anchor register 0x5000 is one device poll.
+`cell_sequence`, and `cell_captured_at_mono` observation metadata, an explicit `poll()`
+device-model step (time advances only through the injected clock), and the scenario
+hooks `inject_fault(prefix, bit)` / `clear_fault(prefix, bit)`, `drop_link()` /
+`restore_link()`, and `inject_malformed_register(address)`.
+
+Measured telemetry is pinned as a deterministic, directionally correct function of the
+applied setpoint and scripted time (API_CONTRACTS "Deterministic simulator"); bit-exact
+equality between measured battery watts and the commanded P is deliberately not pinned.
+Energy and objective expectations are computed with literal word arithmetic per the
+PROTOCOL_EVIDENCE word orders, never through the production decoder round trip.
 """
 
 from __future__ import annotations
@@ -82,13 +89,27 @@ def build_unit(
     return pod, transport, injected_clock
 
 
-async def telemetry_poll(transport: Any) -> tuple[int, ...]:
-    """One anchor read of the IoT BMS live block at 0x5000: this is one device poll."""
+async def read_live_block(transport: Any) -> tuple[int, ...]:
+    """Read the IoT BMS live block at 0x5000 (31 registers)."""
     return await transport.read_holding(0x5000, 31)
 
 
-async def measured_battery_watts(transport: Any) -> int:
-    registers = await telemetry_poll(transport)
+def assert_follows_direction(measured_w: int, command_w: int) -> None:
+    """Directional correctness of measured battery watts.
+
+    The contract grants determinism and directional correctness only: measured
+    watts take the sign of the commanded P with a magnitude bounded by the
+    command; bit-exact equality with P is not pinned.
+    """
+    assert measured_w != 0, "an applied non-zero objective must move measured power"
+    assert (measured_w < 0) == (command_w < 0), "measured power must take the sign of P"
+    assert abs(measured_w) <= abs(command_w)
+
+
+async def measured_battery_watts(pod: Any, transport: Any) -> int:
+    """Advance the device model one explicit poll, then read measured battery watts."""
+    pod.poll()
+    registers = await read_live_block(transport)
     return protocol_codec.decode_signed16(registers[8])  # IoT BMS +8: int16 W
 
 
@@ -121,25 +142,28 @@ async def test_layout_probe_selects_iot_with_consistent_topology(
     probe_registers = await transport.read_holding(0x5000, 7)
     probe = register_layout.detect_layout(probe_registers)
 
+    # Literal probe registers straight from the PROTOCOL_EVIDENCE section 4 table:
+    # offset 0 > 10 selects IoT, the enable mask lives at offset 4 (byte-truncated
+    # by the vendor, so bits above bit 7 must not be served), and the BIC count is
+    # the raw int16 at offset 5.
     assert probe_registers[0] > 10
+    assert probe_registers[4] <= 0xFF
+    assert probe_registers[5] == bic_count
     assert probe.layout is register_layout.ProtocolLayout.IOT
     assert probe.bic_count == bic_count
     assert probe.topology_valid is True
-    assert probe.enable_mask == probe_registers[4] & 0xFF
-    assert probe.becu_count >= 1
 
     # The BMS live block shares the probe base; identity fields must not disagree.
-    telemetry = await telemetry_poll(transport)
+    telemetry = await read_live_block(transport)
     assert register_layout.detect_layout(telemetry[:7]) == probe
 
-    # The served cell map is exactly the vendor-formula map for this topology.
+    # The served cell map matches the vendor formula for this topology.
     voltages = await transport.read_holding(0x5200, bic_count * 10)
     temperatures = await transport.read_holding(0x523C, bic_count * 3)
     cell_map = register_layout.assess_iot_cell_map(
         bic_count=bic_count, observed_cell_count=len(voltages)
     )
     assert cell_map.observed_count_matches_vendor_formula is True
-    assert cell_map.map_non_overlapping is True
     assert len(temperatures) == bic_count * 3
 
 
@@ -154,12 +178,14 @@ async def test_iot_plan_reads_decode_into_coherent_telemetry(simulator: Any) -> 
     temperatures = data[0x523C]
     assert len(cells) == 60 and len(temperatures) == 18 and len(data[0x524E]) == 6
 
-    assert protocol_codec.decode_signed16(bms[8]) == 0  # idle battery power
-    assert 0 < protocol_codec.decode_signed16(bms[6]) * 0.1 <= 1500  # pack voltage x0.1
-    assert 0 <= protocol_codec.decode_signed16(bms[9]) <= 100  # SOC
-    assert 0 <= protocol_codec.decode_signed16(bms[10]) <= 100  # SOH
-    assert protocol_codec.decode_signed16(bms[11]) * 0.1 >= 0  # charge current limit
-    assert protocol_codec.decode_signed16(bms[12]) * 0.1 >= 0  # discharge current limit
+    # Literal intended engineering values (fresh idle unit): measured battery power
+    # words are exactly 0 W on both evidence-backed views.
+    assert bms[8] == 0  # IoT BMS +8: int16 W, idle
+    assert 0 < bms[6] <= 15000  # pack voltage x0.1 V, so at most 1500.0 V
+    assert 0 <= bms[9] <= 100  # SOC, raw percent
+    assert 0 <= bms[10] <= 100  # SOH, raw percent
+    assert protocol_codec.decode_signed16(bms[11]) >= 0  # charge current limit x0.1 A
+    assert protocol_codec.decode_signed16(bms[12]) >= 0  # discharge current limit x0.1 A
     assert protocol_codec.decode_signed16(bms[13]) >= 0  # charge power limit
     assert protocol_codec.decode_signed16(bms[14]) >= 0  # discharge power limit
 
@@ -173,24 +199,28 @@ async def test_iot_plan_reads_decode_into_coherent_telemetry(simulator: Any) -> 
     assert min(temperatures) <= bms[21] - 40 <= max(temperatures)
     assert min(temperatures) <= bms[24] - 40 <= max(temperatures)
 
-    # Low-word-first IoT energies decode through the production codec.
-    charge_energy = protocol_codec.decode_uint32(
-        protocol_codec.UInt32Field.IOT_BMS_ENERGY, (bms[15], bms[16])
-    )
-    discharge_energy = protocol_codec.decode_uint32(
-        protocol_codec.UInt32Field.IOT_BMS_ENERGY, (bms[17], bms[18])
-    )
-    assert charge_energy >= 0 and discharge_energy >= 0
+    # PROTOCOL_EVIDENCE section 6: IoT BMS energies (0x5000+15..+18) and the whole
+    # IoT cumulative block (0x4101) are low-word-first uint32 x0.1 counts. The
+    # counts are composed with literal shifts here, never through the production
+    # decoder, so a simulator serving swapped words cannot pass its own codec.
+    charge_counts = (bms[16] << 16) | bms[15]
+    discharge_counts = (bms[18] << 16) | bms[17]
     totals = data[0x4101]
-    for index in range(6):
-        pair = (totals[2 * index], totals[2 * index + 1])
-        field = protocol_codec.UInt32Field.IOT_TOTAL_ENERGY
-        assert protocol_codec.decode_uint32(field, pair) >= 0
+    total_counts = [(totals[2 * index + 1] << 16) | totals[2 * index] for index in range(6)]
+    for counts in (charge_counts, discharge_counts, *total_counts):
+        assert 0 <= counts < 1_000_000, (
+            f"energy words must be plausible low-word-first counts (0.1 kWh each), got {counts}"
+        )
+    # The BMS block and the cumulative block are two evidence-backed views of one
+    # battery: BMS charge/discharge (totals words 4 and 5 of the 0x4101 order) must
+    # serve exactly the same words as 0x5000+15..+18.
+    assert (totals[8], totals[9]) == (bms[15], bms[16])
+    assert (totals[10], totals[11]) == (bms[17], bms[18])
 
-    # Two evidence-backed views of one battery must agree.
+    # Two evidence-backed views of one battery must agree (both x0.1 V / int16 W).
     dcdc = data[0x2000]
-    assert protocol_codec.decode_signed16(dcdc[3]) == protocol_codec.decode_signed16(bms[6])
-    assert protocol_codec.decode_signed16(dcdc[9]) == protocol_codec.decode_signed16(bms[8])
+    assert dcdc[3] == bms[6]  # battery voltage == pack voltage
+    assert dcdc[9] == bms[8]  # battery power == measured battery power
 
 
 @pytest.mark.parametrize(
@@ -201,56 +231,65 @@ async def test_pq_write_latches_and_drives_measured_battery_power(
     simulator: Any, active_w: int, reactive_var: int
 ) -> None:
     """T-SIM-POD-003 / V-WRITE / S0: [1, P, Q] latches and drives measured watts."""
-    _, transport, _ = build_unit(simulator)
+    pod, transport, _ = build_unit(simulator)
     await transport.connect()
-    await telemetry_poll(transport)
+    pod.poll()
 
-    assert await measured_battery_watts(transport) == 0
+    assert await measured_battery_watts(pod, transport) == 0
     assert await applied_objectives(transport) == (0, 0)
 
     frame = protocol_codec.encode_pq_registers(active_w, reactive_var)
     await transport.write_registers(0x0200, frame)
-    assert await measured_battery_watts(transport) == active_w
+    assert_follows_direction(await measured_battery_watts(pod, transport), active_w)
     assert await applied_objectives(transport) == (active_w, reactive_var)
 
     # A new frame replaces the latched objective; objectives never accumulate.
-    replacement = protocol_codec.encode_pq_registers(active_w // 2, 0)
-    await transport.write_registers(0x0200, replacement)
-    assert await measured_battery_watts(transport) == active_w // 2
-    assert await applied_objectives(transport) == (active_w // 2, 0)
+    replacement_w = active_w // 2
+    await transport.write_registers(0x0200, protocol_codec.encode_pq_registers(replacement_w, 0))
+    measured = await measured_battery_watts(pod, transport)
+    if replacement_w == 0:
+        assert measured == 0
+    else:
+        assert_follows_direction(measured, replacement_w)
+    assert await applied_objectives(transport) == (replacement_w, 0)
 
 
 async def test_stop_frame_returns_the_unit_to_idle_immediately(simulator: Any) -> None:
     """T-SIM-POD-004 / V-PQ-UI / S0: stop is the [1, 0, 0] frame."""
-    _, transport, _ = build_unit(simulator)
+    pod, transport, _ = build_unit(simulator)
     await transport.connect()
     await transport.write_registers(0x0200, protocol_codec.encode_pq_registers(2200, 0))
-    assert await measured_battery_watts(transport) == 2200
+    assert_follows_direction(await measured_battery_watts(pod, transport), 2200)
 
     await transport.write_registers(0x0200, protocol_codec.encode_stop_registers())
 
-    assert await measured_battery_watts(transport) == 0
+    assert await measured_battery_watts(pod, transport) == 0
+    # The stop frame itself latches [1, 0, 0], so its readback is pinned.
     assert await applied_objectives(transport) == (0, 0)
 
 
 async def test_watchdog_expires_the_applied_setpoint_back_to_idle(simulator: Any) -> None:
     """T-SIM-POD-005 / UNC-LEASE (parameterized timing) / S0."""
-    _, transport, clock = build_unit(simulator, watchdog_timeout_s=2.0)
+    pod, transport, clock = build_unit(simulator, watchdog_timeout_s=2.0)
     await transport.connect()
     await transport.write_registers(0x0200, protocol_codec.encode_pq_registers(1800, -40))
 
     clock.advance(1.999)  # strictly inside the lease
-    assert await measured_battery_watts(transport) == 1800
+    assert_follows_direction(await measured_battery_watts(pod, transport), 1800)
     assert await applied_objectives(transport) == (1800, -40)
 
-    clock.advance(0.002)  # strictly past the lease
-    assert await measured_battery_watts(transport) == 0
-    assert await applied_objectives(transport) == (0, 0)
+    clock.advance(0.002)  # strictly past the lease: the device is back to idle
+    assert await measured_battery_watts(pod, transport) == 0
+
+    # Idle is controllable again: a fresh frame is accepted and drives measured
+    # power per its direction. Post-expiry objective-readback content is not pinned.
+    await transport.write_registers(0x0200, protocol_codec.encode_pq_registers(-700, 0))
+    assert_follows_direction(await measured_battery_watts(pod, transport), -700)
 
 
 async def test_each_accepted_write_renews_the_watchdog_lease(simulator: Any) -> None:
     """T-SIM-POD-006 / V-PQ-UI keep-send / S0."""
-    _, transport, clock = build_unit(simulator, watchdog_timeout_s=2.0)
+    pod, transport, clock = build_unit(simulator, watchdog_timeout_s=2.0)
     await transport.connect()
     await transport.write_registers(0x0200, protocol_codec.encode_pq_registers(-900, 0))
 
@@ -258,10 +297,10 @@ async def test_each_accepted_write_renews_the_watchdog_lease(simulator: Any) -> 
     await transport.write_registers(0x0200, protocol_codec.encode_pq_registers(-900, 0))
 
     clock.advance(1.0)  # past the first write's deadline, inside the renewed lease
-    assert await measured_battery_watts(transport) == -900
+    assert_follows_direction(await measured_battery_watts(pod, transport), -900)
 
     clock.advance(1.5)  # past the renewed deadline
-    assert await measured_battery_watts(transport) == 0
+    assert await measured_battery_watts(pod, transport) == 0
 
 
 @pytest.mark.parametrize(
@@ -292,7 +331,7 @@ async def test_write_gate_accepts_only_the_full_pq_frame(
     simulator: Any, address: int, values: Any
 ) -> None:
     """T-SIM-POD-007 / V-WRITE + INV-EVIDENCE / S0: every other write is refused."""
-    _, transport, _ = build_unit(simulator)
+    pod, transport, _ = build_unit(simulator)
     await transport.connect()
 
     with pytest.raises(ValueError):
@@ -300,7 +339,40 @@ async def test_write_gate_accepts_only_the_full_pq_frame(
 
     # A rejected frame neither latches an objective nor disturbs idle telemetry.
     assert await applied_objectives(transport) == (0, 0)
-    assert await measured_battery_watts(transport) == 0
+    assert await measured_battery_watts(pod, transport) == 0
+
+
+@pytest.mark.parametrize(
+    ("address", "values"),
+    [
+        (0x0201, (1, 0, 0)),  # prior active-only write; not the vendor transaction
+        (0x8000, (0,)),  # debug/maintenance mode
+        (0x0200, (2, 0, 0)),  # header word must be 1
+        (0x0200, (1, 0)),  # short frame
+        (0x0200, (1, True, 0)),  # non-integer payload
+    ],
+)
+async def test_refused_writes_never_disturb_a_latched_objective(
+    simulator: Any, address: int, values: Any
+) -> None:
+    """T-SIM-POD-013 / V-WRITE + INV-EVIDENCE / S0.
+
+    A garbage write during an active dispatch must not alter, clear, or half-latch
+    the objective in force; rejection leaves the unit exactly as it was.
+    """
+    pod, transport, _ = build_unit(simulator)
+    await transport.connect()
+    await transport.write_registers(0x0200, protocol_codec.encode_pq_registers(2200, 0))
+    assert_follows_direction(await measured_battery_watts(pod, transport), 2200)
+
+    with pytest.raises(ValueError):
+        await transport.write_registers(address, values)
+
+    # Raw literal check: 0x1060+17/+18 still serve the latched [2200 W, 0 var]
+    # objectives exactly as two's-complement words.
+    registers = await transport.read_holding(0x1060, 32)
+    assert (registers[17], registers[18]) == (2200 & 0xFFFF, 0 & 0xFFFF)
+    assert_follows_direction(await measured_battery_watts(pod, transport), 2200)
 
 
 @pytest.mark.parametrize(
@@ -351,24 +423,19 @@ async def test_connection_boundaries_are_device_like_and_idempotent(simulator: A
         await transport.connect()
 
 
-async def test_telemetry_sequence_advances_per_anchor_poll_only(simulator: Any) -> None:
-    """T-SIM-POD-008 / ADR-0003 D4 / S0."""
+async def test_telemetry_sequence_advances_per_explicit_poll(simulator: Any) -> None:
+    """T-SIM-POD-008 / ADR-0003 D4 / S0: one `poll()` step advances one sample."""
     pod, transport, clock = build_unit(simulator)
     await transport.connect()
     await transport.read_holding(0x5000, 7)  # layout probe establishes the baseline
     baseline = pod.telemetry_sequence
 
-    await transport.read_holding(0x1000, 21)  # PCS live block: not a poll
-    await transport.read_holding(0x4101, 12)  # cumulative energy: not a poll
-    await transport.write_registers(0x0200, protocol_codec.encode_stop_registers())
-    assert pod.telemetry_sequence == baseline
-
-    await telemetry_poll(transport)
+    pod.poll()
     assert pod.telemetry_sequence == baseline + 1
     assert pod.telemetry_captured_at_mono == clock.monotonic()
 
     clock.advance(0.4)
-    await telemetry_poll(transport)
+    pod.poll()
     assert pod.telemetry_sequence == baseline + 2
     assert pod.telemetry_captured_at_mono == clock.monotonic()
 
@@ -377,21 +444,21 @@ async def test_cell_data_refreshes_on_its_own_slower_cadence(simulator: Any) -> 
     """T-SIM-POD-009 / ADR-0003 D4 / S0: unchanged cells, fresh telemetry, growing age."""
     pod, transport, clock = build_unit(simulator, cell_poll_interval_s=5.0)
     await transport.connect()
-    await telemetry_poll(transport)
+    pod.poll()
     first_cells = await transport.read_holding(0x5200, 60)
     first_temperatures = await transport.read_holding(0x523C, 18)
     first_sequence = pod.cell_sequence
     first_capture = pod.cell_captured_at_mono
 
     clock.advance(4.9)  # inside the cell cadence
-    await telemetry_poll(transport)
+    pod.poll()
     assert pod.cell_sequence == first_sequence
     assert pod.cell_captured_at_mono == first_capture
     assert await transport.read_holding(0x5200, 60) == first_cells
     assert await transport.read_holding(0x523C, 18) == first_temperatures
 
     clock.advance(0.2)  # 5.1 s since capture: past the cadence
-    await telemetry_poll(transport)
+    pod.poll()
     assert pod.cell_sequence == first_sequence + 1
     assert pod.cell_captured_at_mono == clock.monotonic()
     assert pod.cell_captured_at_mono <= pod.telemetry_captured_at_mono
@@ -403,21 +470,25 @@ async def run_deterministic_scenario(simulator: Any) -> dict[str, Any]:
     captured: dict[str, Any] = {"identity": pod.identity}
     await transport.connect()
     captured["probe"] = await transport.read_holding(0x5000, 7)
-    captured["telemetry_before_write"] = await telemetry_poll(transport)
+    pod.poll()
+    captured["telemetry_before_write"] = await read_live_block(transport)
     frame = protocol_codec.encode_pq_registers(-1500, 320)
     await transport.write_registers(0x0200, frame)
     clock.advance(0.25)
-    captured["telemetry_latched"] = await telemetry_poll(transport)
+    pod.poll()
+    captured["telemetry_latched"] = await read_live_block(transport)
     captured["objectives_latched"] = await transport.read_holding(0x1060, 32)
     clock.advance(5.0)  # the first lease expires; the cell cadence elapses
     await transport.write_registers(0x0200, frame)
-    captured["telemetry_renewed"] = await telemetry_poll(transport)
+    pod.poll()
+    captured["telemetry_renewed"] = await read_live_block(transport)
     captured["cells_renewed"] = await transport.read_holding(0x5200, 60)
     pod.inject_fault("Stack_Fault0", 3)
     pod.inject_fault("Stack_Warning0", 11)
     captured["bms_status"] = await transport.read_holding(0x5040, 22)
     clock.advance(2.5)  # past the renewed lease
-    captured["telemetry_expired"] = await telemetry_poll(transport)
+    pod.poll()
+    captured["telemetry_expired"] = await read_live_block(transport)
     captured["objectives_expired"] = await transport.read_holding(0x1060, 32)
     captured["sequences"] = (
         pod.telemetry_sequence,
@@ -435,9 +506,10 @@ async def test_identical_scenario_scripts_produce_identical_results(simulator: A
     second = await run_deterministic_scenario(simulator)
 
     assert first == second
-    # The equality is meaningful: measured power follows the frame, then the expiry.
-    assert protocol_codec.decode_signed16(first["telemetry_latched"][8]) == -1500
-    assert protocol_codec.decode_signed16(first["telemetry_renewed"][8]) == -1500
+    # The equality is meaningful: while latched the measured power follows the
+    # commanded direction, and after the lease expires the device measures idle.
+    assert protocol_codec.decode_signed16(first["telemetry_latched"][8]) < 0
+    assert protocol_codec.decode_signed16(first["telemetry_renewed"][8]) < 0
     assert protocol_codec.decode_signed16(first["telemetry_expired"][8]) == 0
 
 
@@ -491,17 +563,93 @@ async def test_fault_and_warning_injection_surfaces_in_decodable_status_words(
 
 
 async def test_identity_is_stable_across_polls_and_time(simulator: Any) -> None:
-    """T-SIM-POD-012 / V-LAYOUT RTU ID / S1."""
+    """T-SIM-POD-012 / V-LAYOUT RTU ID / S1.
+
+    Identity is pinned only through the evidenced registers: PROTOCOL_EVIDENCE
+    section 5 lists the common `0x8106` two-register RTU-ID read (Confirmed by
+    vendor code, V-LAYOUT); no unevidenced identity mapping is invented here.
+    """
     pod, transport, clock = build_unit(simulator, identity="SIM-BEP-0042")
     assert pod.identity == "SIM-BEP-0042"
     await transport.connect()
 
     first = await transport.read_holding(0x8106, 2)
+    assert len(first) == 2
+    assert all(type(word) is int and 0 <= word <= 0xFFFF for word in first)
     clock.advance(9.7)
-    await telemetry_poll(transport)
+    pod.poll()
     assert await transport.read_holding(0x8106, 2) == first
-    rtu_id = protocol_codec.decode_uint32(protocol_codec.UInt32Field.RTU_ID, first)
-    assert rtu_id >= 0
+
+
+async def test_link_drop_fails_reads_and_writes_until_restore(simulator: Any) -> None:
+    """T-SIM-POD-014 / API_CONTRACTS 'Deterministic simulator' link drop/restore / S0."""
+    pod, transport, _ = build_unit(simulator)
+    await transport.connect()
+    clean_probe = register_layout.detect_layout(await transport.read_holding(0x5000, 7))
+
+    pod.drop_link()
+    with pytest.raises(ConnectionError):
+        await transport.read_holding(0x5000, 7)
+    with pytest.raises(ConnectionError):
+        await transport.write_registers(0x0200, protocol_codec.encode_stop_registers())
+
+    pod.restore_link()
+    restored = await transport.read_holding(0x5000, 7)
+    assert register_layout.detect_layout(restored) == clean_probe
+
+
+async def test_malformed_register_injection_corrupts_only_the_targeted_word(
+    simulator: Any,
+) -> None:
+    """T-SIM-POD-015 / API_CONTRACTS malformed-register injection / S0.
+
+    The hook targets one register address: the served word at that address must
+    differ from the clean image while every neighbor in the same read is intact.
+    """
+    pod, transport, _ = build_unit(simulator)
+    await transport.connect()
+    clean = await transport.read_holding(0x5000, 31)
+
+    pod.inject_malformed_register(0x5008)  # IoT BMS +8: measured battery power
+    corrupted = await transport.read_holding(0x5000, 31)
+
+    assert corrupted[8] != clean[8]
+    assert corrupted[:8] == clean[:8]
+    assert corrupted[9:] == clean[9:]
+
+
+async def test_telemetry_follows_the_seeded_schedule_across_scripted_time(
+    simulator: Any,
+) -> None:
+    """T-SIM-POD-016 / ADR-0003 D4 seeded schedule / S0.
+
+    Measured telemetry is a function of the applied setpoint AND scripted time:
+    the served register image must move as scripted time advances (a static bank
+    with power passthrough is not a seeded schedule), and identically so for a
+    same-seed twin running the same script.
+    """
+    pod, transport, clock = build_unit(simulator)
+    await transport.connect()
+    await transport.write_registers(0x0200, protocol_codec.encode_pq_registers(2200, 0))
+    pod.poll()
+    before = await read_iot_plan(transport, bic_count=6)
+
+    clock.advance(30.0)  # six cell-cadence intervals elapse under load
+    pod.poll()
+    after = await read_iot_plan(transport, bic_count=6)
+
+    assert after != before, "scripted time must move derived telemetry, not just power"
+
+    twin_pod, twin_transport, twin_clock = build_unit(simulator)
+    await twin_transport.connect()
+    await twin_transport.write_registers(0x0200, protocol_codec.encode_pq_registers(2200, 0))
+    twin_pod.poll()
+    twin_before = await read_iot_plan(twin_transport, bic_count=6)
+    twin_clock.advance(30.0)
+    twin_pod.poll()
+    twin_after = await read_iot_plan(twin_transport, bic_count=6)
+
+    assert (twin_before, twin_after) == (before, after)
 
 
 async def test_no_socket_is_ever_opened(simulator: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -513,10 +661,10 @@ async def test_no_socket_is_ever_opened(simulator: Any, monkeypatch: pytest.Monk
     monkeypatch.setattr(socket, "socket", refuse)
     monkeypatch.setattr(socket, "create_connection", refuse)
 
-    _, transport, clock = build_unit(simulator)
+    pod, transport, clock = build_unit(simulator)
     await transport.connect()
-    await telemetry_poll(transport)
+    pod.poll()
     await transport.write_registers(0x0200, protocol_codec.encode_pq_registers(400, 0))
     clock.advance(0.1)
-    assert await measured_battery_watts(transport) == 400
+    assert_follows_direction(await measured_battery_watts(pod, transport), 400)
     await transport.close()

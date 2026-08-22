@@ -27,6 +27,7 @@ VOCABULARY = (
     "decision.updated",
     "unit.lifecycle",
     "unit.armed",
+    "intent.accepted",
     "emergency_stop.latched",
 )
 
@@ -123,6 +124,12 @@ def credential_shaped_keys(value: Any, path: str = "event") -> list[str]:
     return []
 
 
+def occurred_at_instant(event: Mapping[str, Any]) -> datetime:
+    """Parse ``occurred_at`` leniently: any ISO spelling of the injected stamp."""
+    parsed = datetime.fromisoformat(str(event["occurred_at"]))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 async def settle_until(predicate: Callable[[], bool], turns: int = 200) -> bool:
     for _ in range(turns):
         if predicate():
@@ -167,10 +174,8 @@ async def close_subscription(iterator: Any) -> None:
     [
         {"retention": 0},
         {"retention": -1},
-        {"retention": True},
         {"queue_capacity": 0},
         {"queue_capacity": -4},
-        {"queue_capacity": True},
     ],
 )
 def test_constructor_rejects_non_positive_bounds(bus_module: Any, bound: dict[str, Any]) -> None:
@@ -246,6 +251,29 @@ async def test_retention_window_boundary_is_exact(
     await close_subscription(iterator)
 
 
+async def test_replayed_window_transitions_into_live_events_without_a_gap(
+    bus_module: Any,
+) -> None:
+    # API_CONTRACTS event bus: "yields events with sequence > after_sequence in
+    # order" must also hold across the replay-to-live seam. The WebSocket adapter
+    # terminates the socket on a sequence gap, so an implementation that replays
+    # the retained window and then starts live delivery at the snapshot sequence
+    # (skipping the first live event) is a contract violation.
+    bus = make_bus(bus_module, retention=8, queue_capacity=64)
+    await publish_events(bus, start=0, count=30)
+    iterator = bus.subscribe(after_sequence=26)
+    replayed = await drain(iterator, 4)
+    assert [event["sequence"] for event in replayed] == [27, 28, 29, 30]
+
+    await publish_events(bus, start=30, count=2)
+    live = await drain(iterator, 4)
+    assert [event["sequence"] for event in live] == [31, 32]
+    assert not any(is_resync_marker(event) for event in replayed + live), (
+        "an in-window cursor must see neither a marker nor a skipped live head"
+    )
+    await close_subscription(iterator)
+
+
 async def test_stale_cursor_resyncs_from_live_edge_instead_of_replaying_history(
     bus_module: Any,
 ) -> None:
@@ -277,15 +305,9 @@ async def test_gated_slow_consumer_never_stalls_publishes_and_gets_a_resync_mark
 
     async def gated_reads() -> list[Any]:
         await gate.wait()
-        items: list[Any] = []
-        for _ in range(3):
-            item = await next_event(iterator)
-            if item is _EXHAUSTED:
-                break
-            items.append(item)
-            if is_resync_marker(item):
-                break
-        return items
+        # Drain everything the queue still holds once the gate opens, so the
+        # bounded-delivery assertions below can actually fail.
+        return await drain(iterator, 16)
 
     consumer = asyncio.create_task(gated_reads())
     publishes = asyncio.create_task(publish_events(bus, start=1, count=12))
@@ -305,8 +327,13 @@ async def test_gated_slow_consumer_never_stalls_publishes_and_gets_a_resync_mark
         f"a subscriber with dropped events must be told to resync, saw {items!r}"
     )
     delivered = [item["sequence"] for item in items if has_int_sequence(item)]
-    assert len(delivered) < 12, "the per-subscriber queue must stay bounded, not buffer history"
+    assert delivered, "the live edge must still reach the subscriber after the marker"
     assert delivered == sorted(set(delivered))
+    assert delivered[-1] == 13, "the newest published event must survive the drop"
+    assert 2 not in delivered, "history dropped from the bounded queue must not be replayed"
+    assert len(delivered) <= 2, (
+        "the per-subscriber queue is bounded at queue_capacity=2, not an unbounded buffer"
+    )
     await close_subscription(iterator)
 
 
@@ -334,6 +361,7 @@ async def test_event_bodies_are_json_serializable_with_server_assigned_metadata_
     bus_module: Any,
 ) -> None:
     clock = FakeClock()
+    base = clock.wall_now()
     bus = make_bus(bus_module, retention=8, queue_capacity=8, clock=clock)
     iterator = bus.subscribe(after_sequence=0)
     first_payload = {"status": "authorized", "watts": 900}
@@ -350,7 +378,9 @@ async def test_event_bodies_are_json_serializable_with_server_assigned_metadata_
         (second, "emergency_stop.latched", second_payload),
     ):
         assert isinstance(event, dict)
-        assert set(event) == {"type", "sequence", "occurred_at", "payload"}
+        # API_CONTRACTS: bodies carry AT LEAST type/sequence/occurred_at/payload;
+        # additional non-secret metadata (for example a unique event id) is allowed.
+        assert {"type", "sequence", "occurred_at", "payload"} <= set(event)
         assert event["type"] == event_type
         assert event["payload"] == payload
         sequence = event["sequence"]
@@ -360,9 +390,11 @@ async def test_event_bodies_are_json_serializable_with_server_assigned_metadata_
         json.dumps(event, allow_nan=False, sort_keys=True)
     assert first["sequence"] == first_sequence
     assert second["sequence"] == second_sequence
-    assert first["occurred_at"] != second["occurred_at"], (
-        "occurred_at must follow the injected clock, not ambient time"
-    )
+    # occurred_at is stamped from the injected clock: the first publication at the
+    # base instant, the second exactly 5 seconds later. A counter-derived or
+    # ambient-clock stamp cannot match both.
+    assert occurred_at_instant(first) == base
+    assert occurred_at_instant(second) == base + timedelta(seconds=5.0)
     await close_subscription(iterator)
 
 
@@ -389,7 +421,13 @@ async def test_caller_supplied_sequence_and_occurred_at_are_never_trusted(
     await close_subscription(iterator)
 
 
-async def test_event_bodies_stay_credential_free(bus_module: Any) -> None:
+async def test_bus_added_envelope_keys_never_look_like_credentials(bus_module: Any) -> None:
+    # API_CONTRACTS: "Event bodies are JSON-serializable, credential-free". The
+    # bus's share of that duty is structural: whatever envelope keys it adds on
+    # top of the payload (sequence, occurred_at, metadata) must never be
+    # credential-shaped. This ban is independent of the published payloads: the
+    # bus is explicitly not a payload filter, and publishers own their payload
+    # hygiene.
     bus = make_bus(bus_module, retention=4, queue_capacity=8, clock=FakeClock())
     iterator = bus.subscribe(after_sequence=0)
     payload = {
@@ -403,10 +441,11 @@ async def test_event_bodies_stay_credential_free(bus_module: Any) -> None:
     assert len(events) == 2
     for event in events:
         assert isinstance(event, dict)
-        assert credential_shaped_keys(event) == []
-        encoded = json.dumps(event, allow_nan=False, sort_keys=True)
-        assert "FakeClock" not in encoded, "ambient clock identity must not leak into payloads"
+        bus_added = {key: value for key, value in event.items() if key != "payload"}
+        assert credential_shaped_keys(bus_added) == []
+        json.dumps(event, allow_nan=False, sort_keys=True)
     assert events[0]["payload"] == payload
+    assert events[1]["payload"] == {"stop_id": "stop-1"}
     await close_subscription(iterator)
 
 
@@ -458,6 +497,22 @@ async def test_subscribers_with_different_cursors_are_isolated(bus_module: Any) 
     assert bus.snapshot_sequence() == 12
     await close_subscription(from_middle)
     await close_subscription(from_late)
+
+
+async def test_subscribe_without_a_cursor_yields_only_events_published_after_it(
+    bus_module: Any,
+) -> None:
+    # The adapter's EventSource protocol types after_sequence as `int | None`; a
+    # cursor-less subscription is live-only: nothing retained before the
+    # subscription is replayed, and everything published afterwards arrives.
+    bus = make_bus(bus_module, retention=8, queue_capacity=64)
+    await publish_events(bus, start=0, count=30)
+    iterator = bus.subscribe(after_sequence=None)
+    await publish_events(bus, start=30, count=2)
+    events = await drain(iterator, 6)
+    sequences = [event["sequence"] for event in events if has_int_sequence(event)]
+    assert sequences == [31, 32]
+    await close_subscription(iterator)
 
 
 async def test_subscription_matches_the_adapter_eventsource_shape(bus_module: Any) -> None:

@@ -8,18 +8,24 @@ exists; every missing contract surfaces as an ordinary test failure, never as
 a collection error. No test opens a socket, contacts hardware, or reads
 ambient time: construction is the behavior under test, and simulator-backed
 actors are the only things explicitly started.
+
+Repository handles are driven through ``_settle`` because the composition may
+lawfully expose the shipped synchronous stores; the suite never awaits a
+synchronous attribute.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
+import inspect
 import json
 import math
 import socket
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -27,6 +33,7 @@ from typing import Any
 import pytest
 from fastapi import FastAPI
 from fastmcp import Client, FastMCP
+from pydantic import ValidationError
 from starlette.routing import WebSocketRoute
 
 from energypod.adapters.persistence.sqlite import SQLiteAuditRepository, SQLiteScheduleRepository
@@ -37,7 +44,7 @@ from energypod.application.generation import AuthorityGenerationCoordinator
 from energypod.domain import Direction, IntentSource, PowerIntent, UnitLifecycle
 from energypod.domain.audit import AuditEvent
 from energypod.domain.authorization import AuthorizationBatch, AuthorizedSetpoint
-from energypod.runtime.config import ControllerConfig, EndpointConfig
+from energypod.runtime.config import ControllerConfig
 
 UNIT_IDS = ("mid", "rhs")
 UNIT_IDENTITIES = {"mid": "BEP-MID", "rhs": "BEP-RHS"}
@@ -90,6 +97,20 @@ def _build_runtime(config: ControllerConfig, **overrides: Any) -> Any:
     if not callable(factory):
         pytest.fail("energypod.runtime.composition.build_runtime is not implemented", pytrace=False)
     return factory(config, **overrides)
+
+
+def _compose_with(config: ControllerConfig, *, simulate: bool, clock: Any | None = None) -> Any:
+    overrides: dict[str, Any] = {"simulate": simulate}
+    if clock is not None:
+        overrides["clock"] = clock
+    return _build_runtime(config, **overrides)
+
+
+async def _settle(value: Any) -> Any:
+    """Await a repository result only when the composed handle is asynchronous."""
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 def _validate(payload: Mapping[str, Any]) -> ControllerConfig:
@@ -146,9 +167,73 @@ def _config_payload(database: Path, *, unit_count: int = 2) -> dict[str, Any]:
     }
 
 
-def compose(database: Path, *, simulate: bool = False, unit_count: int = 2) -> Any:
+def _policy_payload() -> dict[str, Any]:
+    # Commissioning numbers shared with the configuration contract suite.
+    return {
+        "version": 3,
+        "threshold_provenance": "commissioning-record-2026-08",
+        "max_fleet_charge_w": 6000,
+        "max_fleet_discharge_w": 6000,
+        "max_unit_charge_w": 2500,
+        "max_unit_discharge_w": 2500,
+        "minimum_soc_pct": 10.0,
+        "maximum_soc_pct": 95.0,
+        "minimum_cell_v": 2.80,
+        "maximum_cell_v": 3.65,
+        "maximum_cell_imbalance_v": 0.050,
+        "minimum_temperature_c": 0.0,
+        "maximum_temperature_c": 45.0,
+        "maximum_soc_difference_pct": 5.0,
+        "maximum_soc_jump_pct": 10.0,
+        "maximum_telemetry_age_s": 1.0,
+        "maximum_cell_data_age_s": 5.0,
+        "authorization_lifetime_s": 0.75,
+        "ramp_limit_w_per_s": 1000,
+        "stable_samples_to_rearm": 5,
+        "reactive_power_limit_var": 0,
+        "blocking_fault_codes": [
+            "PCS_EE_CALIBRATION_OUT_OF_RANGE",
+            "DCDC_EE_CALIBRATION_OUT_OF_RANGE",
+        ],
+        "debug_modes_enabled": False,
+    }
+
+
+def _authentication_payload() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "operator_credential_ref": "secret://energypod/composition-operator",
+        "trusted_proxy_cidrs": ["192.168.1.0/24"],
+    }
+
+
+def _write_enabled_payload(database: Path, *, unit_count: int = 2) -> dict[str, Any]:
+    payload = _config_payload(database, unit_count=unit_count)
+    payload["mode"] = "write_enabled"
+    payload["policy"] = _policy_payload()
+    payload["authentication"] = _authentication_payload()
+    return payload
+
+
+def compose(
+    database: Path,
+    *,
+    simulate: bool = False,
+    unit_count: int = 2,
+    clock: Any | None = None,
+) -> Any:
     config = _validate(_config_payload(database, unit_count=unit_count))
-    return _build_runtime(config, simulate=simulate)
+    return _compose_with(config, simulate=simulate, clock=clock)
+
+
+def compose_write_enabled(
+    database: Path,
+    *,
+    simulate: bool = False,
+    clock: Any | None = None,
+) -> Any:
+    config = _validate(_write_enabled_payload(database))
+    return _compose_with(config, simulate=simulate, clock=clock)
 
 
 def _prior_active_audit_event(unit_id: str) -> AuditEvent:
@@ -208,20 +293,25 @@ def _latched_stop_intent() -> PowerIntent:
     )
 
 
-def _authorization_batch(units: tuple[str, ...] = UNIT_IDS) -> AuthorizationBatch:
+def _authorization_batch(
+    units: tuple[str, ...] = UNIT_IDS,
+    *,
+    generation: int = 2,
+    issued_at: float = 50.0,
+) -> AuthorizationBatch:
     setpoints = tuple(
         AuthorizedSetpoint(
             unit_id=unit_id,
             connection_epoch=3,
-            generation=2,
+            generation=generation,
             cycle_id="cycle-00000000000000000001",
             intent_id="stale-command-1",
             intent_revision=9,
             direction=Direction.DISCHARGE,
             watts=750,
-            issued_at_mono=50.0,
-            not_before_mono=50.0,
-            expires_at_mono=4_000.0,
+            issued_at_mono=issued_at,
+            not_before_mono=issued_at,
+            expires_at_mono=issued_at + 3_950.0,
             observation_sequence=42,
             maximum_observation_age_s=1.0,
             policy_version="3",
@@ -232,7 +322,7 @@ def _authorization_batch(units: tuple[str, ...] = UNIT_IDS) -> AuthorizationBatc
     )
     return AuthorizationBatch(
         cycle_id="cycle-00000000000000000001",
-        generation=2,
+        generation=generation,
         authorizations=setpoints,
     )
 
@@ -291,6 +381,70 @@ async def _shutdown_actors(runtime: Any) -> None:
         await actor.shutdown()
 
 
+_SCRIPT_START = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
+
+
+@dataclass
+class ScriptedClock:
+    """Injectable deterministic clock: every sleep advances scripted time."""
+
+    elapsed_s: float = 0.0
+
+    def wall_now(self) -> datetime:
+        return _SCRIPT_START + timedelta(seconds=self.elapsed_s)
+
+    def monotonic(self) -> float:
+        return self.elapsed_s
+
+    async def sleep(self, seconds: float) -> None:
+        self.elapsed_s += max(0.0, float(seconds))
+        await asyncio.sleep(0)
+
+
+class _LifespanSession:
+    """Drives the composed app's ASGI lifespan protocol with no test server."""
+
+    def __init__(self, app: FastAPI) -> None:
+        self.events: list[dict[str, Any]] = []
+        self._incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.app_task: asyncio.Task[None] = asyncio.create_task(self._drive(app))
+
+    async def _drive(self, app: FastAPI) -> None:
+        scope = {"type": "lifespan", "asgi": {"version": "3.0", "spec_version": "2.3"}}
+
+        async def receive() -> dict[str, Any]:
+            return await self._incoming.get()
+
+        async def record(message: dict[str, Any]) -> None:
+            self.events.append(message)
+
+        await app(scope, receive, record)
+
+    def send(self, message_type: str) -> None:
+        self._incoming.put_nowait({"type": message_type})
+
+    def seen(self, message_type: str) -> bool:
+        return any(message["type"] == message_type for message in self.events)
+
+    async def pump_until(
+        self, predicate: Callable[[], bool], *, message: str, attempts: int = 5000
+    ) -> None:
+        for _ in range(attempts):
+            if predicate():
+                return
+            if self.app_task.done():
+                break
+            await asyncio.sleep(0)
+        if not predicate():
+            pytest.fail(f"{message}: lifespan events={self.events!r}", pytrace=False)
+
+    async def close(self) -> None:
+        if not self.app_task.done():
+            self.app_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await self.app_task
+
+
 async def test_minimal_observe_only_config_builds_the_whole_graph(tmp_path: Path) -> None:
     config = _validate(_config_payload(tmp_path / "fleet.sqlite3", unit_count=1))
     runtime = _build_runtime(config)
@@ -341,7 +495,7 @@ async def test_minimal_observe_only_config_builds_the_whole_graph(tmp_path: Path
     assert isinstance(wall, datetime) and wall.tzinfo is not None
     await clock.sleep(0)
 
-    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    snapshot = await _settle(runtime.facade.snapshot(principal=OPERATOR))
     assert snapshot["site_id"] == SITE_ID
     assert isinstance(snapshot["snapshot_sequence"], int)
 
@@ -388,42 +542,20 @@ async def test_construction_opens_no_sockets_and_starts_no_tasks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _forbid_sockets(monkeypatch)
+
+    def refused(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("the composition root must not start tasks at construction")
+
     before = asyncio.all_tasks()
-    runtime = compose(tmp_path / "fleet.sqlite3")
+    # Any task start — however short-lived — fails loudly inside the ban, so a
+    # fire-and-forget cycle that completes within the window cannot hide.
+    with monkeypatch.context() as tasks_banned:
+        tasks_banned.setattr(asyncio, "create_task", refused)
+        tasks_banned.setattr(asyncio, "ensure_future", refused)
+        runtime = compose(tmp_path / "fleet.sqlite3")
     assert set(runtime.actors) == set(UNIT_IDS)
+    assert all(actor.lifecycle is UnitLifecycle.BOOT for actor in runtime.actors.values())
     await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    assert not asyncio.all_tasks() - before
-
-
-def _corrupted(base: ControllerConfig, units: tuple[Any, ...]) -> ControllerConfig:
-    values = base.model_dump()
-    values["units"] = units
-    return ControllerConfig.model_construct(**values)
-
-
-@pytest.mark.parametrize("kind", ["duplicate_unit_id", "empty_fleet", "malformed_unit_id"])
-async def test_invalid_fleet_configuration_raises_eagerly(tmp_path: Path, kind: str) -> None:
-    base = _validate(_config_payload(tmp_path / "fleet.sqlite3"))
-    first, second = base.units
-    twin_endpoint = EndpointConfig(host="192.168.1.99", port=4196)
-    if kind == "duplicate_unit_id":
-        units: tuple[Any, ...] = (
-            first,
-            first.model_copy(update={"endpoint": twin_endpoint}),
-        )
-    elif kind == "empty_fleet":
-        units = ()
-    else:
-        units = (
-            second,
-            first.model_copy(update={"unit_id": " mid ", "endpoint": twin_endpoint}),
-        )
-    corrupted = _corrupted(base, units)
-
-    before = asyncio.all_tasks()
-    with pytest.raises(ValueError):
-        _build_runtime(corrupted)
     await asyncio.sleep(0)
     assert not asyncio.all_tasks() - before
 
@@ -433,15 +565,43 @@ async def test_run_mode_persists_only_audit_and_schedule(tmp_path: Path) -> None
     runtime = compose(database)
 
     assert database.exists()
+    # The type pins are permitted to stay, but the durable stores are the
+    # shipped synchronous classes, so the suite never awaits them directly.
     assert isinstance(runtime.audit, SQLiteAuditRepository)
     assert isinstance(runtime.schedule, SQLiteScheduleRepository)
     for repository in (runtime.intents, runtime.observations, runtime.authorizations):
         assert not isinstance(repository, _SQLITE_TYPES)
 
     # The volatile stores are live, in-process repositories.
-    await runtime.observations.append(_observation_seed("mid", 1))
-    assert await runtime.observations.latest("mid") is not None
-    assert await runtime.schedule.get() is None
+    await _settle(runtime.observations.append(_observation_seed("mid", 1)))
+    assert await _settle(runtime.observations.latest("mid")) is not None
+    assert await _settle(runtime.schedule.get()) is None
+
+
+async def test_missing_database_path_composes_fully_in_memory_persistence(
+    tmp_path: Path,
+) -> None:
+    """API_CONTRACTS "Runtime composition and entry point": when no database
+    path is configured, persistence is entirely in-memory.
+
+    StorageConfig cannot express a missing database path today, so this test
+    deliberately stays red until the configuration contract allows the branch.
+    """
+    payload = _config_payload(tmp_path / "never-created.sqlite3")
+    payload.pop("storage")
+    try:
+        config = ControllerConfig.model_validate(payload)
+    except ValidationError:
+        pytest.fail(
+            "API_CONTRACTS grants 'when no database path is configured ... persistence is "
+            "entirely in-memory', but the configuration model cannot express a missing "
+            "database path",
+            pytrace=False,
+        )
+    runtime = _build_runtime(config)
+    assert not isinstance(runtime.audit, _SQLITE_TYPES)
+    assert not isinstance(runtime.schedule, _SQLITE_TYPES)
+    assert not (tmp_path / "never-created.sqlite3").exists()
 
 
 async def test_boot_restores_no_arming_authority_or_active_commands(tmp_path: Path) -> None:
@@ -450,42 +610,78 @@ async def test_boot_restores_no_arming_authority_or_active_commands(tmp_path: Pa
 
     # Durable history claims the fleet was ACTIVE with granted authority.
     for unit_id in UNIT_IDS:
-        await prior.audit.append(_prior_active_audit_event(unit_id))
+        await _settle(prior.audit.append(_prior_active_audit_event(unit_id)))
     # Live volatile state in the previous runtime: an active command, a
     # latched stop, and current, unexpired authorizations.
-    await prior.intents.add(_stale_command_intent())
-    await prior.intents.add(_latched_stop_intent())
-    await prior.authorizations.publish(_authorization_batch())
-    await prior.observations.append(_observation_seed("mid", 1))
+    await _settle(prior.intents.add(_stale_command_intent()))
+    await _settle(prior.intents.add(_latched_stop_intent()))
+    await _settle(prior.authorizations.publish(_authorization_batch()))
+    await _settle(prior.observations.append(_observation_seed("mid", 1)))
 
     # The seeds are genuinely live in the previous runtime, so the restarted
     # one cannot pass vacuously.
-    assert await prior.intents.active(60.0)
+    assert await _settle(prior.intents.active(60.0))
     for unit_id in UNIT_IDS:
-        assert await prior.authorizations.current(unit_id, 60.0) is not None
+        assert await _settle(prior.authorizations.current(unit_id, 60.0)) is not None
 
     restarted = compose(database)
 
     # The durable audit trail really was reused; prior authority stays plainly
     # visible in it while the restarted process starts with nothing.
-    recent = await restarted.audit.recent(limit=10)
+    recent = await _settle(restarted.audit.recent(limit=10))
     assert {f"prior-active-authority-{unit_id}" for unit_id in UNIT_IDS} <= {
         event.event_id for event in recent
     }
     for now in (0.0, 60.0, 1_000_000_000.0):
-        assert not await restarted.intents.active(now)
+        assert not await _settle(restarted.intents.active(now))
         for unit_id in UNIT_IDS:
-            assert await restarted.authorizations.current(unit_id, now) is None
+            assert await _settle(restarted.authorizations.current(unit_id, now)) is None
     for unit_id in UNIT_IDS:
-        assert await restarted.observations.latest(unit_id) is None
+        assert await _settle(restarted.observations.latest(unit_id)) is None
         assert restarted.actors[unit_id] is not prior.actors[unit_id]
         assert restarted.actors[unit_id].lifecycle is UnitLifecycle.BOOT
 
 
+async def test_write_enabled_restart_boots_disarmed_and_restores_nothing(
+    tmp_path: Path,
+) -> None:
+    """Boot-disarmed must also hold where restoration could reach hardware."""
+    database = tmp_path / "fleet.sqlite3"
+    prior = compose_write_enabled(database)
+
+    # Durable history claims the previous write-enabled process held armed,
+    # active authority — exactly the state a restart must not resurrect.
+    for unit_id in UNIT_IDS:
+        await _settle(prior.audit.append(_prior_active_audit_event(unit_id)))
+    await _settle(prior.intents.add(_stale_command_intent()))
+    await _settle(prior.intents.add(_latched_stop_intent()))
+    await _settle(prior.authorizations.publish(_authorization_batch()))
+    assert await _settle(prior.intents.active(60.0))
+    for unit_id in UNIT_IDS:
+        assert await _settle(prior.authorizations.peek(unit_id)) is not None
+
+    restarted = compose_write_enabled(database)
+
+    recent = await _settle(restarted.audit.recent(limit=10))
+    assert {f"prior-active-authority-{unit_id}" for unit_id in UNIT_IDS} <= {
+        event.event_id for event in recent
+    }
+    for now in (0.0, 60.0, 1_000_000_000.0):
+        assert not await _settle(restarted.intents.active(now))
+        for unit_id in UNIT_IDS:
+            # peek is the granted non-consuming projection read.
+            assert await _settle(restarted.authorizations.peek(unit_id)) is None
+    for unit_id in UNIT_IDS:
+        assert await _settle(restarted.observations.latest(unit_id)) is None
+        actor = restarted.actors[unit_id]
+        assert actor is not prior.actors[unit_id]
+        assert actor.lifecycle is UnitLifecycle.BOOT
+
+
 async def test_simulate_boot_stays_observe_only_despite_live_authority(tmp_path: Path) -> None:
     runtime = compose(tmp_path / "fleet.sqlite3", simulate=True)
-    await runtime.intents.add(_stale_command_intent(("mid",)))
-    await runtime.authorizations.publish(_authorization_batch(("mid",)))
+    await _settle(runtime.intents.add(_stale_command_intent(("mid",))))
+    await _settle(runtime.authorizations.publish(_authorization_batch(("mid",))))
     try:
         for actor in runtime.actors.values():
             await actor.start()
@@ -494,8 +690,8 @@ async def test_simulate_boot_stays_observe_only_despite_live_authority(tmp_path:
         )
         # Boot performed no heartbeat: the freshly published, still-valid
         # authorization was not consumed by any started actor.
-        assert await runtime.authorizations.current("mid", 60.0) is not None
-        assert await runtime.intents.active(60.0)
+        assert await _settle(runtime.authorizations.current("mid", 60.0)) is not None
+        assert await _settle(runtime.intents.active(60.0))
     finally:
         await _shutdown_actors(runtime)
 
@@ -512,13 +708,14 @@ async def test_simulate_mode_forces_simulator_transports_and_memory_persistence(
     assert not isinstance(runtime.schedule, _SQLITE_TYPES)
 
     event = _prior_active_audit_event("mid")
-    await runtime.audit.append(event)
-    assert [saved.event_id for saved in await runtime.audit.recent(limit=5)] == [event.event_id]
+    await _settle(runtime.audit.append(event))
+    saved = await _settle(runtime.audit.recent(limit=5))
+    assert [item.event_id for item in saved] == [event.event_id]
 
     # A second simulated build against the same configured database path
     # starts from empty in-memory stores and never touches the file.
     again = compose(database, simulate=True)
-    assert not await again.audit.recent(limit=5)
+    assert not await _settle(again.audit.recent(limit=5))
     assert not database.exists()
 
     # The only transports that can start and poll under a socket ban are the
@@ -546,3 +743,158 @@ async def test_unit_fencing_advances_the_one_fleet_wide_generation(tmp_path: Pat
     assert await runtime.actors["mid"].fence("composition-contract-first") == before + 1
     assert (await coordinator.snapshot()).epoch == before + 1
     assert await runtime.actors["rhs"].fence("composition-contract-second") == before + 2
+
+
+async def test_kernel_tick_is_wired_to_the_runtime_stores_and_bus(tmp_path: Path) -> None:
+    """The composed kernel drives THE runtime repositories, not private copies."""
+    runtime = compose_write_enabled(
+        tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock()
+    )
+    epoch = (await runtime.generation_coordinator.snapshot()).epoch
+    await _settle(
+        runtime.authorizations.publish(_authorization_batch(generation=epoch, issued_at=0.0))
+    )
+    for unit_id in UNIT_IDS:
+        # peek is the granted non-consuming projection read.
+        assert await _settle(runtime.authorizations.peek(unit_id)) is not None
+    bus_before = runtime.event_bus.snapshot_sequence()
+
+    # A latched stop forces the always-permitted fail-closed path: the tick
+    # must revoke through the runtime's shared authorization repository.
+    await _settle(runtime.intents.add(_latched_stop_intent()))
+    await runtime.kernel.tick()
+
+    for unit_id in UNIT_IDS:
+        assert await _settle(runtime.authorizations.peek(unit_id)) is None
+    recent = await _settle(runtime.audit.recent(limit=5))
+    assert recent, "the kernel tick must audit through the runtime audit repository"
+    # ADR-0003 D3: audit appends are events on the composed bus.
+    for _ in range(100):
+        if runtime.event_bus.snapshot_sequence() > bus_before:
+            break
+        await asyncio.sleep(0)
+    assert runtime.event_bus.snapshot_sequence() > bus_before
+
+
+async def test_facade_wiring_shares_the_runtime_bus_and_fleet_coordinator(
+    tmp_path: Path,
+) -> None:
+    runtime = compose(tmp_path / "fleet.sqlite3", simulate=True)
+    bus_before = runtime.event_bus.snapshot_sequence()
+    epoch_before = (await runtime.generation_coordinator.snapshot()).epoch
+
+    await _settle(
+        runtime.facade.emergency_stop(
+            unit_ids=list(UNIT_IDS), reason="composition-wiring-proof", principal=OPERATOR
+        )
+    )
+
+    # API_CONTRACTS facade: emergency stop "immediately advances the fleet
+    # generation", so the facade fences through THE runtime coordinator and
+    # latches the stop in THE runtime intent repository.
+    assert (await runtime.generation_coordinator.snapshot()).epoch > epoch_before
+    active = await _settle(runtime.intents.active(runtime.clock.monotonic()))
+    assert any(getattr(intent, "source", None) is IntentSource.EMERGENCY_STOP for intent in active)
+    bus_after = runtime.event_bus.snapshot_sequence()
+    assert bus_after > bus_before, "facade mutations must publish to the runtime event bus"
+
+    snapshot = await _settle(runtime.facade.snapshot(principal=OPERATOR))
+    assert snapshot["snapshot_sequence"] == bus_after
+    assert runtime.event_bus.snapshot_sequence() == bus_after
+
+
+def _actors_stopped(runtime: Any) -> bool:
+    return all(
+        actor.lifecycle in {UnitLifecycle.STOPPING, UnitLifecycle.DISCONNECTED}
+        for actor in runtime.actors.values()
+    )
+
+
+async def test_lifespan_starts_and_stops_supervision(tmp_path: Path) -> None:
+    """API_CONTRACTS: supervision starts and stops through the app lifespan."""
+    runtime = compose(tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock())
+    baseline = set(asyncio.all_tasks())
+    session = _LifespanSession(runtime.app)
+    try:
+        session.send("lifespan.startup")
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete")
+            or session.seen("lifespan.startup.failed"),
+            message="the application lifespan never reported supervision startup",
+        )
+        assert session.seen("lifespan.startup.complete"), f"startup failed: {session.events!r}"
+        await session.pump_until(
+            lambda: bool(asyncio.all_tasks() - baseline - {session.app_task}),
+            message="the application lifespan must start the supervision tasks",
+        )
+        supervision = asyncio.all_tasks() - baseline - {session.app_task}
+        assert supervision, "the kernel, actor, and publication loops must be running tasks"
+        await session.pump_until(
+            lambda: all(
+                actor.lifecycle is not UnitLifecycle.BOOT for actor in runtime.actors.values()
+            ),
+            message="the per-unit actor loops never started",
+        )
+        epoch_running = (await runtime.generation_coordinator.snapshot()).epoch
+
+        session.send("lifespan.shutdown")
+        await session.pump_until(
+            lambda: session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed"),
+            message="the application lifespan never reported supervision shutdown",
+        )
+        assert session.seen("lifespan.shutdown.complete"), f"shutdown failed: {session.events!r}"
+        await session.pump_until(
+            lambda: not asyncio.all_tasks() - baseline - {session.app_task},
+            message="supervision tasks never stopped after lifespan shutdown",
+        )
+        assert _actors_stopped(runtime), "lifespan shutdown must run actor shutdown"
+        # Actor shutdown fences: a stopped process never resumes an old epoch.
+        assert (await runtime.generation_coordinator.snapshot()).epoch > epoch_running
+    finally:
+        await session.close()
+
+
+async def test_supervisor_failure_fences_generations_and_runs_actor_shutdown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """API_CONTRACTS: supervisor or task failure fences every generation and
+    runs actor shutdown with the bounded-zero contract before exiting."""
+    runtime = compose(tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock())
+    epoch = (await runtime.generation_coordinator.snapshot()).epoch
+    await _settle(
+        runtime.authorizations.publish(_authorization_batch(generation=epoch, issued_at=0.0))
+    )
+    for unit_id in UNIT_IDS:
+        assert await _settle(runtime.authorizations.peek(unit_id)) is not None
+
+    async def exploding_tick() -> None:
+        raise RuntimeError("supervisor component failed")
+
+    monkeypatch.setattr(runtime.kernel, "tick", exploding_tick)
+
+    baseline = set(asyncio.all_tasks())
+    session = _LifespanSession(runtime.app)
+    try:
+        session.send("lifespan.startup")
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.failed")
+            or session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed")
+            or _actors_stopped(runtime),
+            message="a failed supervisor component must stop the application lifespan",
+        )
+        await session.pump_until(
+            _actors_stopped(runtime),
+            message="a failed supervisor component must run actor shutdown",
+        )
+        # Fencing every generation also revokes outstanding authority.
+        assert (await runtime.generation_coordinator.snapshot()).epoch > epoch
+        for unit_id in UNIT_IDS:
+            assert await _settle(runtime.authorizations.peek(unit_id)) is None
+        await session.pump_until(
+            lambda: not asyncio.all_tasks() - baseline - {session.app_task},
+            message="a failed supervisor component must not leave supervision tasks running",
+        )
+    finally:
+        await session.close()

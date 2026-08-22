@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import itertools
 from collections.abc import Iterator
 from contextlib import suppress
@@ -32,7 +33,7 @@ from typing import Any
 
 import pytest
 
-from energypod.domain import DataQuality, IntentSource, UnitLifecycle
+from energypod.domain import DataQuality, DecisionStatus, IntentSource, UnitLifecycle
 from energypod.runtime.config import ControllerConfig
 
 SITE_ID = "home"
@@ -44,17 +45,24 @@ EXPECTED_CELL_COUNT = 60
 # satisfies the cross-validated control budget; the ramp limit makes one
 # heartbeat's ramp allowance exactly 300 W, which is the bound the safety
 # kernel alone owns (the allocator distributes capacity, not ramp rate).
+# API_CONTRACTS (runtime composition) pins the mapping
+# ControlPolicy.heartbeat_interval_s <- timing.control_period_s, so the
+# allowance is RAMP_LIMIT_W_PER_S * CONTROL_PERIOD_S; the over-headroom
+# scenario asserts that mapping explicitly before relying on the number.
 CONTROL_PERIOD_S = 0.40
 DEVICE_COMMAND_EXPIRY_S = 2.35
 AUTHORIZATION_LIFETIME_S = 1.2
+MAXIMUM_TELEMETRY_AGE_S = 2.0
+STABLE_SAMPLES_TO_REARM = 2
 STATIC_UNIT_LIMIT_W = 3000
 FLEET_LIMIT_W = 3000
 RAMP_LIMIT_W_PER_S = 750
 RAMP_ALLOWANCE_W = int(RAMP_LIMIT_W_PER_S * CONTROL_PERIOD_S)
 
 # 250 W sits inside every safety bound (static, dynamic, ramp) so a healthy
-# dispatch is authorized exactly as requested; 12 kW is four times the static
-# unit limit, so the kernel must bound it and audit the clamp reason.
+# dispatch is authorized exactly as requested; 12 kW exceeds every bound at
+# once -- the one-heartbeat ramp allowance is the binding term -- so the
+# kernel must bound it and audit the clamp reason.
 HEALTHY_DISPATCH_W = 250
 OVER_HEADROOM_REQUEST_W = 12_000
 MIN_DEVICE_HEADROOM_W = 400
@@ -73,6 +81,7 @@ PROCESS_IDENTITY_FIELDS = (
 )
 
 _IDLE: Any = object()
+_ABSENT: Any = object()
 
 
 @dataclass(frozen=True)
@@ -233,11 +242,11 @@ def fleet_config(database: Path) -> ControllerConfig:
             "maximum_temperature_c": 60.0,
             "maximum_soc_difference_pct": 5.0,
             "maximum_soc_jump_pct": 5.0,
-            "maximum_telemetry_age_s": 2.0,
+            "maximum_telemetry_age_s": MAXIMUM_TELEMETRY_AGE_S,
             "maximum_cell_data_age_s": 10.0,
             "authorization_lifetime_s": AUTHORIZATION_LIFETIME_S,
             "ramp_limit_w_per_s": RAMP_LIMIT_W_PER_S,
-            "stable_samples_to_rearm": 2,
+            "stable_samples_to_rearm": STABLE_SAMPLES_TO_REARM,
             "reactive_power_limit_var": 0,
             "blocking_fault_codes": ["Stack_Fault0_3"],
             "debug_modes_enabled": False,
@@ -265,14 +274,22 @@ def _composition_factory() -> Any:
 
 def compose_runtime(config: ControllerConfig, clock: ManualClock) -> Any:
     factory = _composition_factory()
-    try:
-        runtime = factory(config, simulate=True, clock=clock)
-    except TypeError as error:
-        pytest.fail(
-            "build_runtime must accept simulate= plus an injected deterministic "
-            f"clock= so golden scenarios step manually: {error}",
-            pytrace=False,
-        )
+    # Probe the signature without executing the factory, so a missing
+    # parameter is reported as a contract gap while genuine implementation
+    # errors inside a correctly shaped build propagate as ordinary failures.
+    signature = inspect.signature(factory)
+    takes_keywords = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+    for name in ("simulate", "clock"):
+        if name not in signature.parameters and not takes_keywords:
+            pytest.fail(
+                "build_runtime must accept simulate= plus an injected deterministic "
+                f"clock= so golden scenarios step manually; no {name!r} parameter",
+                pytrace=False,
+            )
+    runtime = factory(config, simulate=True, clock=clock)
     assert runtime.clock is clock, "the injected manual clock must be the composed clock"
     return runtime
 
@@ -362,8 +379,11 @@ class Harness:
         assert view["authorized"] is None, "acceptance never grants authority"
         assert view["measured"] is None
         assert type(view["acceptance_revision"]) is int
-        assert any("intent" in event["type"] for event in fresh), (
-            f"intent acceptance must be published, saw {[e['type'] for e in fresh]}"
+        # The event-bus vocabulary pins `intent.accepted` for facade intent
+        # acceptance (API_CONTRACTS, event bus).
+        assert "intent.accepted" in [event["type"] for event in fresh], (
+            "intent acceptance must publish the contracted intent.accepted event, "
+            f"saw {[event['type'] for event in fresh]}"
         )
         return view
 
@@ -393,6 +413,14 @@ class Harness:
     async def audit(self, limit: int = 32) -> list[Any]:
         result = await self.runtime.facade.recent_audit(principal=OPERATOR, limit=limit)
         return list(result["events"])
+
+    async def control_decisions(self) -> list[Any]:
+        """The audited control_decision records, newest-first."""
+        return [
+            event
+            for event in await self.audit()
+            if getattr(event, "event_type", "") == "control_decision"
+        ]
 
     async def operator_emergency_stop(self, reason: str) -> dict[str, Any]:
         epoch_before = (await self.runtime.generation_coordinator.snapshot()).epoch
@@ -454,25 +482,63 @@ class Harness:
 
 
 def simulator_handle(runtime: Any) -> Any:
-    """Resolve the composed per-unit simulator scenario hook surface."""
+    """Resolve the composed per-unit simulator scenario hook surface.
+
+    Only absence is a contract failure: attribute presence is probed without
+    executing descriptors, and a raising getter or a broken handle propagates
+    as an ordinary implementation failure.
+    """
+    if inspect.getattr_static(runtime, "simulators", _ABSENT) is _ABSENT:
+        pytest.fail(
+            "the simulate runtime must expose per-unit scenario handles at runtime.simulators",
+            pytrace=False,
+        )
     try:
         handle = runtime.simulators[UNIT_ID]
-    except (AttributeError, KeyError, TypeError) as error:
+    except KeyError:
         pytest.fail(
-            "the simulate runtime must expose per-unit scenario handles at "
-            f"runtime.simulators[{UNIT_ID!r}]: {error}",
+            f"the simulate runtime must expose per-unit scenario handles at "
+            f"runtime.simulators[{UNIT_ID!r}]",
             pytrace=False,
         )
     for hook in ("drop_link", "restore_link"):
-        if not callable(getattr(handle, hook, None)):
+        if not callable(inspect.getattr_static(handle, hook, None)):
             pytest.fail(f"the simulator scenario handle must provide {hook}()", pytrace=False)
-    epoch = getattr(handle, "connection_epoch", None)
+    if inspect.getattr_static(handle, "connection_epoch", _ABSENT) is _ABSENT:
+        pytest.fail(
+            "the simulator scenario handle must expose connection_epoch",
+            pytrace=False,
+        )
+    epoch = handle.connection_epoch
     if not isinstance(epoch, int) or isinstance(epoch, bool):
         pytest.fail(
             "the simulator scenario handle must expose connection_epoch",
             pytrace=False,
         )
     return handle
+
+
+def composed_policy(runtime: Any) -> Any:
+    """Resolve the composed ControlPolicy so its timing mapping is checkable.
+
+    API_CONTRACTS (runtime composition) grants the derivation
+    ``ControlPolicy.heartbeat_interval_s`` <- ``timing.control_period_s``;
+    whichever handle carries the policy, the over-headroom scenario must be
+    able to verify that derivation before relying on its golden ramp number.
+    """
+    kernel = getattr(runtime, "kernel", None)
+    for candidate in (
+        getattr(runtime, "policy", None),
+        getattr(kernel, "policy", None),
+        getattr(kernel, "_policy", None),
+    ):
+        if candidate is not None:
+            return candidate
+    pytest.fail(
+        "the composed runtime must expose its ControlPolicy (runtime.policy or "
+        "the kernel policy) so heartbeat_interval_s is verifiable",
+        pytrace=False,
+    )
 
 
 def assert_healthy_observation(observation: Any) -> None:
@@ -561,6 +627,26 @@ def audit_projection(events: list[Any]) -> list[dict[str, Any]]:
             record[key] = getattr(value, "value", value)
         projected.append(record)
     return projected
+
+
+def assert_audit_projection_is_fully_populated(projection: list[dict[str, Any]]) -> None:
+    """The determinism comparison must not pass vacuously on absent facts.
+
+    Both runs project missing attributes as ``None``, so presence and
+    canonical types are asserted before the two runs are ever compared.
+    """
+    assert projection, "the golden script must leave an audit trail"
+    decisions = [record for record in projection if record["event_type"] == "control_decision"]
+    assert decisions, "the audit projection must contain control_decision records"
+    for record in decisions:
+        reason_codes = record["reason_codes"]
+        assert isinstance(reason_codes, tuple) and all(
+            isinstance(code, str) for code in reason_codes
+        ), f"reason_codes must be a canonical tuple of strings: {record}"
+        for field in ("cycle_id", "generation", "policy_version"):
+            assert record[field] is not None, (
+                f"control_decision audit events must carry {field}: {record}"
+            )
 
 
 async def bring_up_armed(harness: Harness) -> Any:
@@ -699,7 +785,7 @@ async def test_healthy_dispatch_applies_exactly_the_authorized_setpoint(
     types = bus_types(events)
     poll_at = _first_index(types, ("observation",))
     armed_at = _first_index(types, ("armed",), after=poll_at)
-    intent_at = _first_index(types, ("intent",), after=armed_at)
+    intent_at = _first_index(types, ("intent.accepted",), after=armed_at)
     decision_at = _first_index(types, ("decision", "audit", "control"), after=intent_at)
     assert poll_at < armed_at < intent_at < decision_at, types
     assert sum(1 for kind in types if "observation" in kind) >= 4, types
@@ -711,6 +797,15 @@ async def test_over_headroom_dispatch_is_clamped_to_the_safety_bound(
     """Scenario 2: the kernel bounds the request and audits the clamp reason."""
     harness = await compose_harness(tmp_path / "fleet.sqlite3")
     try:
+        # The ramp allowance below is ramp_limit_w_per_s * heartbeat_interval_s,
+        # and API_CONTRACTS (runtime composition) pins heartbeat_interval_s <-
+        # timing.control_period_s; assert the mapping so a mis-mapped policy
+        # fails here with its cause instead of as a confusing clamp mismatch.
+        policy = composed_policy(harness.runtime)
+        assert policy.heartbeat_interval_s == CONTROL_PERIOD_S, (
+            "build_runtime must derive ControlPolicy.heartbeat_interval_s from "
+            f"timing.control_period_s (API_CONTRACTS), saw {policy.heartbeat_interval_s!r}"
+        )
         evidence = await bring_up_armed(harness)
         view = await harness.operator_dispatch(OVER_HEADROOM_REQUEST_W)
         await harness.control_tick()
@@ -830,6 +925,140 @@ async def test_watchdog_expiry_returns_the_unit_to_idle_without_heartbeats(
     assert unit_view(final)["measured_watts"] == 0
 
 
+async def test_stale_safety_inputs_fail_closed_to_zero_authority(tmp_path: Path) -> None:
+    """Stale telemetry must reject nonzero power and leave nothing grantable."""
+    harness = await compose_harness(tmp_path / "fleet.sqlite3")
+    try:
+        await bring_up_armed(harness)
+        view = await harness.operator_dispatch(HEALTHY_DISPATCH_W)
+        await harness.control_tick()
+        live = await harness.snapshot()
+        assert unit_view(live)["authorized_power"] == {
+            "direction": "discharge",
+            "watts": HEALTHY_DISPATCH_W,
+        }, "the healthy cycle must hold live authority before the evidence goes stale"
+
+        # Let the only observation age past maximum_telemetry_age_s with no poll.
+        harness.clock.advance(MAXIMUM_TELEMETRY_AGE_S + 0.5)
+        decision = await harness.control_tick()
+        stale_snapshot = await harness.snapshot()
+        await harness.device_heartbeat()
+        stale = await harness.device_poll()
+        decisions = [
+            event
+            for event in await harness.control_decisions()
+            if getattr(event, "intent_id", None) == view["intent_id"]
+        ]
+    finally:
+        await harness.shutdown()
+
+    assert decision.status is DecisionStatus.REJECTED, decision.status
+    assert "telemetry_stale" in decision.reason_codes, decision.reason_codes
+    assert all(setpoint.watts == 0 for setpoint in decision.setpoints), (
+        "a rejected cycle authorizes no nonzero setpoint"
+    )
+    assert unit_view(stale_snapshot)["authorized_power"] is None, (
+        "stale evidence must leave no grantable authority"
+    )
+    assert stale.battery_watts == 0, "no write may reach the pod on stale evidence"
+
+    assert len(decisions) == 2, "the healthy and the stale cycle must both be audited"
+    stale_event, healthy_event = decisions  # recent_audit is newest-first
+    assert healthy_event.result == "authorized"
+    assert stale_event.result == "rejected"
+    assert stale_event.authorized_active_w == 0
+    assert "telemetry_stale" in stale_event.reason_codes, stale_event.reason_codes
+
+
+async def test_consumed_authorization_cannot_be_replayed_by_a_second_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """A heartbeat consumes the capability once; only a fresh tick re-grants."""
+    harness = await compose_harness(tmp_path / "fleet.sqlite3")
+    try:
+        await bring_up_armed(harness)
+        await harness.operator_dispatch(HEALTHY_DISPATCH_W)
+        await harness.control_tick()
+        await harness.device_heartbeat()
+        applied = await harness.device_poll()
+        assert applied.battery_watts == float(HEALTHY_DISPATCH_W)
+        consumed = await harness.snapshot()
+        assert unit_view(consumed)["authorized_power"] is None, (
+            "the first heartbeat consumed the single-use capability"
+        )
+
+        idled = await harness.device_poll(advance_s=2.5)
+        assert idled.battery_watts == 0, "the device lease lapses without a renewal write"
+        ticks_before = await harness.control_decisions()
+
+        await harness.device_heartbeat()
+        replayed = await harness.device_poll()
+        replay_snapshot = await harness.snapshot()
+        ticks_after = await harness.control_decisions()
+    finally:
+        await harness.shutdown()
+
+    assert replayed.battery_watts == 0, (
+        "a second heartbeat without a fresh kernel cycle must not write again"
+    )
+    assert unit_view(replay_snapshot)["authorized_power"] is None, (
+        "a consumed capability can never be replayed into a new grant"
+    )
+    assert len(ticks_after) == len(ticks_before) == 1, (
+        "only a kernel tick mints control cycles; the replayed heartbeat mints none"
+    )
+
+
+async def test_renewal_in_one_generation_reauthorizes_with_a_fresh_cycle_id(
+    tmp_path: Path,
+) -> None:
+    """Repeated cycles in one healthy generation are the loop's normal mode."""
+    harness = await compose_harness(tmp_path / "fleet.sqlite3")
+    try:
+        await bring_up_armed(harness)
+        view = await harness.operator_dispatch(HEALTHY_DISPATCH_W)
+        await harness.control_tick()
+        await harness.device_heartbeat()
+        driving = await harness.device_poll()
+        assert driving.battery_watts == float(HEALTHY_DISPATCH_W)
+        assert driving.lifecycle is UnitLifecycle.ACTIVE
+        generation = await harness.generation()
+        consumed = await harness.snapshot()
+        assert unit_view(consumed)["authorized_power"] is None, (
+            "the first heartbeat consumed the single-use capability"
+        )
+
+        await harness.control_tick()
+        generation_after = await harness.generation()
+        renewed_authorization = await harness.snapshot()
+        await harness.device_heartbeat()
+        renewed = await harness.device_poll()
+        decisions = [
+            event
+            for event in await harness.control_decisions()
+            if getattr(event, "intent_id", None) == view["intent_id"]
+        ]
+    finally:
+        await harness.shutdown()
+
+    assert generation_after == generation, "a healthy renewal must not fence the generation"
+    assert unit_view(renewed_authorization)["authorized_power"] == {
+        "direction": "discharge",
+        "watts": HEALTHY_DISPATCH_W,
+    }, "the renewal cycle must publish fresh single-use authority"
+    assert renewed.battery_watts == float(HEALTHY_DISPATCH_W), (
+        "the renewal write must keep driving the pod at the authorized setpoint"
+    )
+
+    assert len(decisions) == 2, "each cycle audits exactly one correlated record"
+    renewal, first = decisions  # recent_audit is newest-first
+    assert first.result == "authorized" and renewal.result == "authorized"
+    assert renewal.cycle_id != first.cycle_id, "every renewal receives a fresh cycle_id"
+    assert renewal.generation == first.generation == generation
+    assert renewal.authorized_active_w == HEALTHY_DISPATCH_W
+    assert renewal.reason_codes == ("safety_checks_passed",)
+
+
 async def test_reconnect_bumps_the_epoch_and_requires_requalification(
     tmp_path: Path,
 ) -> None:
@@ -853,8 +1082,17 @@ async def test_reconnect_bumps_the_epoch_and_requires_requalification(
 
         reconnected = await harness.device_poll()
         assert reconnected.connection_epoch == epoch_before + 1
-        assert harness.runtime.actors[UNIT_ID].lifecycle is UnitLifecycle.OBSERVE_ONLY, (
-            "stable samples never span reconnects"
+        # Exact intermediate states are the actor's own state machine; the
+        # granted invariants are that the fenced epoch holds no control
+        # authority and that re-qualification needs the configured
+        # stable-sample count of new-epoch polls.
+        fenced_lifecycle = harness.runtime.actors[UNIT_ID].lifecycle
+        assert fenced_lifecycle not in {UnitLifecycle.ARMED_IDLE, UnitLifecycle.ACTIVE}, (
+            "the first new-epoch poll must leave the unit without control authority"
+        )
+        assert fenced_lifecycle is not UnitLifecycle.DISARMED, (
+            "one new-epoch poll is fewer stable samples than the configured "
+            f"stable_samples_to_rearm={STABLE_SAMPLES_TO_REARM}"
         )
         assert await harness.generation() > tick_generation, (
             "the reconnect must fence the generation"
@@ -862,10 +1100,8 @@ async def test_reconnect_bumps_the_epoch_and_requires_requalification(
         refused_snapshot = await harness.snapshot()
         await harness.device_heartbeat()
         refused = await harness.device_poll()
-
-        await harness.device_poll()
         assert harness.runtime.actors[UNIT_ID].lifecycle is UnitLifecycle.DISARMED, (
-            "stable samples in the new epoch re-qualify the unit to disarmed"
+            f"{STABLE_SAMPLES_TO_REARM} stable new-epoch polls must re-qualify the unit to disarmed"
         )
         await harness.operator_arm()
         requalified = await harness.device_poll()
@@ -882,6 +1118,9 @@ async def test_reconnect_bumps_the_epoch_and_requires_requalification(
         "direction": "discharge",
         "watts": HEALTHY_DISPATCH_W,
     }, "a live authorization existed before the reconnect"
+    # API_CONTRACTS (unit actor): a unit fence -- including reconnect fences --
+    # revokes that unit's outstanding authorizations, and the snapshot
+    # projection must reflect the revocation.
     assert unit_view(refused_snapshot)["authorized_power"] is None, (
         "the reconnected epoch must refuse the stale authorization"
     )
@@ -910,6 +1149,7 @@ async def test_identical_scripts_produce_identical_audit_and_bus_streams(
                 "measured": capture["measured"].battery_watts,
             }
         )
+        assert_audit_projection_is_fully_populated(runs[-1]["audit"])
 
     left, right = runs
     assert left["audit"] == right["audit"], (

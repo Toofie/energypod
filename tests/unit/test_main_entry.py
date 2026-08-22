@@ -13,8 +13,12 @@ audit hook over import/CLI activity and tmp_path fixtures for every file.
 
 from __future__ import annotations
 
+import asyncio
+import enum
 import importlib
 import os
+import socket
+import sqlite3
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
@@ -41,6 +45,7 @@ API_ROUTE_PATHS = frozenset({"/api/v1/snapshot", "/api/v1/health"})
 _NETWORK_EVENTS = ("socket.connect", "socket.bind", "socket.getaddrinfo", "socket.sendto")
 _PROCESS_EVENTS = ("subprocess.", "os.system", "os.posix_spawn")
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+_TEMPORARY_FLAG = getattr(os, "O_TEMPORARY", 0)
 _COMPILED_SUFFIXES = frozenset({".pyc", ".pyo"})
 _CONFIGURATION_SUFFIXES = frozenset(
     {".yaml", ".yml", ".toml", ".json", ".ini", ".cfg", ".db", ".sqlite", ".sqlite3"}
@@ -77,23 +82,40 @@ def _has_write_intent(args: tuple[Any, ...]) -> bool:
     return bool(flags & _WRITE_FLAGS)
 
 
+def _open_flags(args: tuple[Any, ...]) -> int:
+    return args[2] if len(args) > 2 and isinstance(args[2], int) else 0
+
+
+def _database_paths(database: Path) -> frozenset[str]:
+    """The configured database file plus its sqlite journal/WAL siblings."""
+    text = str(database)
+    candidates = (text, f"{text}-journal", f"{text}-wal", f"{text}-shm")
+    return frozenset(os.path.normcase(candidate) for candidate in candidates)
+
+
 def _side_effect_violations(
     events: list[tuple[str, tuple[Any, ...]]],
     *,
     allow_config_reads: bool,
-    allow_database: bool,
+    allowed_database: Path | None,
 ) -> list[str]:
     """Classify recorded audit events into human-readable contract breaches."""
+    allowed_paths = (
+        _database_paths(allowed_database) if allowed_database is not None else frozenset()
+    )
     issues: list[str] = []
     for event, args in events:
         if event.startswith(_NETWORK_EVENTS):
             issues.append(f"network activity: {event}")
         elif event.startswith(_PROCESS_EVENTS):
             issues.append(f"process activity: {event}")
-        elif allow_database:
-            continue
         elif event.startswith("sqlite3."):
-            issues.append("database connection opened")
+            if allowed_database is None:
+                issues.append("database connection opened")
+            elif event == "sqlite3.connect":
+                target = args[0] if args and isinstance(args[0], str | os.PathLike) else None
+                if target is None or os.path.normcase(str(target)) not in allowed_paths:
+                    issues.append(f"database connection outside the configured store: {target}")
         elif event == "open":
             if not args or not isinstance(args[0], str | os.PathLike):
                 # fd-based opens duplicate a path-based open already classified.
@@ -107,6 +129,12 @@ def _side_effect_violations(
                 and not _inside_pycache(path)
                 and suffix not in (_COMPILED_SUFFIXES)
             ):
+                if os.path.normcase(path) in allowed_paths:
+                    continue
+                if allowed_database is not None and _open_flags(args) & _TEMPORARY_FLAG:
+                    # sqlite scratch files vanish on close; only their
+                    # connection target is attributable.
+                    continue
                 issues.append(f"file created or written: {path}")
     return issues
 
@@ -116,7 +144,7 @@ class SideEffectAudit:
     """Scoped window over the process audit log; issues are asserted by tests."""
 
     allow_config_reads: bool = False
-    allow_database: bool = False
+    allowed_database: Path | None = None
     issues: list[str] = field(default_factory=list)
     _mark: int = field(default=0, init=False, repr=False)
 
@@ -128,7 +156,7 @@ class SideEffectAudit:
         self.issues = _side_effect_violations(
             _AUDIT_EVENTS[self._mark :],
             allow_config_reads=self.allow_config_reads,
-            allow_database=self.allow_database,
+            allowed_database=self.allowed_database,
         )
 
 
@@ -137,17 +165,32 @@ class SideEffectAudit:
 # ---------------------------------------------------------------------------
 
 
+class _Completed:
+    """Zero-value awaitable: the injected runner may be called or awaited."""
+
+    def __await__(self) -> Any:
+        yield
+        return None
+
+
 @dataclass
 class ServerRunner:
-    """Injected serving seam: records the app and serving args instead of serving."""
+    """Injected serving seam: records the app and serving args instead of serving.
 
-    calls: list[tuple[Any, dict[str, Any]]] = field(default_factory=list)
+    API_CONTRACTS "Runtime composition and entry point" grants
+    ``main(argv, server_runner=None)`` with an injected async server runner
+    receiving the built app and serving parameters, so the spy tolerates being
+    called, awaited, or both, and records positional spellings too.
+    """
+
+    calls: list[tuple[Any, tuple[Any, ...], dict[str, Any]]] = field(default_factory=list)
     failure: BaseException | None = None
 
-    def __call__(self, app: Any, *args: Any, **kwargs: Any) -> None:
-        self.calls.append((app, kwargs))
+    def __call__(self, app: Any, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append((app, args, kwargs))
         if self.failure is not None:
             raise self.failure
+        return _Completed()
 
 
 @dataclass
@@ -169,6 +212,11 @@ class Invocation:
             f"system_exit_raised={self.system_exit_raised} "
             f"stdout={self.stdout!r} stderr={self.stderr!r}"
         )
+
+
+def assert_failed_cleanly(invocation: Invocation) -> None:
+    """Error paths may return a nonzero code or raise SystemExit carrying one."""
+    assert isinstance(invocation.exit_code, int) and invocation.exit_code != 0, invocation.report()
 
 
 def call_main(
@@ -201,7 +249,11 @@ def _engaged_invocation(
     *,
     serving: bool,
 ) -> Invocation:
-    """Try both conventional config spellings; return the one the CLI accepted."""
+    """Try both granted config spellings; return the one the CLI accepted.
+
+    API_CONTRACTS "Runtime composition and entry point": both ``--config PATH``
+    and a positional ``PATH`` are accepted spellings.
+    """
     attempts: list[Invocation] = []
     for argv in ([command, "--config", str(path)], [command, str(path)]):
         before = len(runner.calls)
@@ -260,6 +312,22 @@ def _composition_call(spy: CompositionSpy | None) -> tuple[tuple[Any, ...], dict
             pytrace=False,
         )
     return spy.calls[0]
+
+
+def _serving_parameter(
+    positional: tuple[Any, ...], keyword: dict[str, Any], name: str, index: int
+) -> Any:
+    """Read one serving parameter from either spelling of the runner call."""
+    if name in keyword:
+        return keyword[name]
+    return positional[index] if len(positional) > index else None
+
+
+def _simulate_argument(positional: tuple[Any, ...], keyword: dict[str, Any]) -> Any:
+    """build_runtime's simulate flag, positional (second argument) or keyword."""
+    if "simulate" in keyword:
+        return keyword["simulate"]
+    return positional[1] if len(positional) > 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -369,18 +437,29 @@ def main_module() -> ModuleType:
 # Import purity (ADR-0003 D6: importable with no side effects at import time).
 # ---------------------------------------------------------------------------
 
-_IMPORT_SAFE_ATTRIBUTES = (
-    ModuleType,
-    type,
-    FunctionType,
-    BuiltinFunctionType,
-    str,
-    int,
-    float,
-    bool,
-    bytes,
-    type(None),
+_RUNTIME_CONSTRUCTION_TYPES: tuple[type, ...] = (
+    FastAPI,
+    asyncio.AbstractEventLoop,
+    socket.socket,
+    sqlite3.Connection,
 )
+_CODE_ATTRIBUTES = (FunctionType, BuiltinFunctionType, type, ModuleType, enum.Enum)
+
+
+def _is_runtime_construction(value: Any) -> bool:
+    """Behavioral test: is this module global a constructed runtime object?
+
+    Module constants and ``from __future__`` imports are explicitly permitted
+    by the grant; only runtime constructions fail the pin.
+    """
+    if isinstance(value, _RUNTIME_CONSTRUCTION_TYPES):
+        return True
+    module = getattr(value, "__module__", "")
+    return (
+        isinstance(module, str)
+        and module.startswith("energypod.")
+        and not isinstance(value, _CODE_ATTRIBUTES)
+    )
 
 
 def test_import_is_side_effect_free_and_constructs_nothing() -> None:
@@ -396,7 +475,7 @@ def test_import_is_side_effect_free_and_constructs_nothing() -> None:
     constructed = {
         name: type(value).__name__
         for name, value in vars(module).items()
-        if not name.startswith("_") and not isinstance(value, _IMPORT_SAFE_ATTRIBUTES)
+        if not name.startswith("_") and _is_runtime_construction(value)
     }
     assert constructed == {}, "importing energypod.main must not construct runtime state"
 
@@ -406,10 +485,7 @@ def test_missing_command_prints_usage_without_building_anything(
 ) -> None:
     with SideEffectAudit() as audit:
         invocation = call_main(main_module, [], capsys)
-    assert not invocation.system_exit_raised, (
-        "main must return an exit code, not raise SystemExit: " + invocation.report()
-    )
-    assert isinstance(invocation.exit_code, int) and invocation.exit_code != 0
+    assert_failed_cleanly(invocation)
     assert "usage" in invocation.combined_output.lower(), invocation.report()
     assert invocation.runner.calls == []
     assert audit.issues == []
@@ -420,8 +496,7 @@ def test_unknown_command_prints_usage_without_building_anything(
 ) -> None:
     with SideEffectAudit() as audit:
         invocation = call_main(main_module, ["teleport"], capsys)
-    assert not invocation.system_exit_raised, invocation.report()
-    assert isinstance(invocation.exit_code, int) and invocation.exit_code != 0
+    assert_failed_cleanly(invocation)
     assert "usage" in invocation.combined_output.lower(), invocation.report()
     assert invocation.runner.calls == []
     assert audit.issues == []
@@ -471,8 +546,7 @@ def test_check_config_rejects_invalid_configuration(
     _write_yaml(path, payload)
     with SideEffectAudit(allow_config_reads=True) as audit:
         invocation = call_main(main_module, _replace_path(template, valid, path), capsys)
-    assert not invocation.system_exit_raised, invocation.report()
-    assert isinstance(invocation.exit_code, int) and invocation.exit_code != 0
+    assert_failed_cleanly(invocation)
     assert invocation.combined_output.strip() != ""
     assert audit.issues == []
     assert not database.exists()
@@ -487,8 +561,7 @@ def test_check_config_rejects_malformed_yaml(
     path.write_text("units: [unclosed", encoding="utf-8")
     with SideEffectAudit(allow_config_reads=True) as audit:
         invocation = call_main(main_module, _replace_path(template, valid, path), capsys)
-    assert not invocation.system_exit_raised, invocation.report()
-    assert isinstance(invocation.exit_code, int) and invocation.exit_code != 0
+    assert_failed_cleanly(invocation)
     assert invocation.combined_output.strip() != ""
     assert audit.issues == []
 
@@ -500,8 +573,7 @@ def test_check_config_reports_a_missing_configuration_file(
     missing = tmp_path / "absent.yaml"
     with SideEffectAudit(allow_config_reads=True) as audit:
         invocation = call_main(main_module, _replace_path(template, valid, missing), capsys)
-    assert not invocation.system_exit_raised, invocation.report()
-    assert isinstance(invocation.exit_code, int) and invocation.exit_code != 0
+    assert_failed_cleanly(invocation)
     assert "absent.yaml" in invocation.combined_output, invocation.report()
     assert audit.issues == []
 
@@ -523,26 +595,28 @@ def test_run_hands_the_composed_app_to_the_injected_server_runner(
     path = tmp_path / "controller.yaml"
     _write_valid_config(path, database)
     runner = ServerRunner()
-    with SideEffectAudit(allow_config_reads=True, allow_database=True) as audit:
+    with SideEffectAudit(allow_config_reads=True, allowed_database=database) as audit:
         invocation = _engaged_invocation(main_module, "run", path, capsys, runner, serving=True)
     assert not invocation.system_exit_raised, invocation.report()
     assert invocation.exit_code == 0, invocation.report()
     assert len(runner.calls) == 1, f"expected exactly one serving call: {invocation.report()}"
-    app, serving_kwargs = runner.calls[0]
+    app, serving_args, serving_kwargs = runner.calls[0]
     assert isinstance(app, FastAPI)
     assert {getattr(route, "path", "") for route in app.routes} >= API_ROUTE_PATHS
-    host = serving_kwargs.get("host")
+    host = _serving_parameter(serving_args, serving_kwargs, "host", 0)
     if host is not None:
         assert isinstance(host, str) and host
-    port = serving_kwargs.get("port")
+    port = _serving_parameter(serving_args, serving_kwargs, "port", 1)
     if port is not None:
         assert isinstance(port, int) and 1 <= port <= 65535
+    # Granted: supervision starts and stops through the application lifespan
+    # the runner drives, so an injected runner performs no network activity.
     assert audit.issues == [], "serving must never start with an injected runner"
 
     args, kwargs = _composition_call(spy)
     config = args[0] if args else kwargs.get("config")
     assert Path(getattr(config, "storage", None).database_path) == database
-    assert not kwargs.get("simulate"), "run must not force simulator mode"
+    assert not _simulate_argument(args, kwargs), "run must not force simulator mode"
     assert database.exists(), "run must honor the configured durable database path"
 
 
@@ -565,16 +639,56 @@ def test_simulate_passes_simulator_mode_through_and_forces_in_memory_persistence
     assert not invocation.system_exit_raised, invocation.report()
     assert invocation.exit_code == 0, invocation.report()
     assert len(runner.calls) == 1, invocation.report()
-    app, _ = runner.calls[0]
+    app, _, _ = runner.calls[0]
     assert isinstance(app, FastAPI)
     assert {getattr(route, "path", "") for route in app.routes} >= API_ROUTE_PATHS
     assert audit.issues == [], "the simulator never opens sockets or databases"
     assert not database.exists(), "simulate must force in-memory persistence"
     assert {child.name for child in tmp_path.iterdir()} == {"controller.yaml"}
-    _, kwargs = _composition_call(spy)
-    assert kwargs.get("simulate") is True, (
+    args, kwargs = _composition_call(spy)
+    assert _simulate_argument(args, kwargs) is True, (
         "simulate must pass simulator mode through to build_runtime"
     )
+
+
+@pytest.mark.parametrize("command", ["run", "simulate"])
+@pytest.mark.parametrize("kind", ["invalid", "malformed", "missing"])
+def test_run_and_simulate_reject_bad_configurations_fail_closed(
+    main_module: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    kind: str,
+) -> None:
+    """A bad configuration must fail before any composition or serving."""
+    _forbid_real_serving(monkeypatch)
+    spy = _wrap_build_runtime(monkeypatch)
+    template, valid = _discovered_argv(main_module, tmp_path, capsys)
+    database = tmp_path / "must-not-exist.sqlite3"
+    if kind == "invalid":
+        payload = _invalid_payload(database, "unit_count_mismatch")
+        with pytest.raises(ValidationError):
+            ControllerConfig.model_validate(payload)
+        path = tmp_path / "invalid.yaml"
+        _write_yaml(path, payload)
+    elif kind == "malformed":
+        path = tmp_path / "garbage.yaml"
+        path.write_text("units: [unclosed", encoding="utf-8")
+    else:
+        path = tmp_path / "absent.yaml"
+    runner = ServerRunner()
+    with SideEffectAudit(allow_config_reads=True) as audit:
+        invocation = call_main(
+            main_module, _replace_path(template, valid, path), capsys, runner=runner
+        )
+    assert_failed_cleanly(invocation)
+    assert invocation.combined_output.strip() != "", invocation.report()
+    assert runner.calls == [], "an invalid configuration must never reach serving"
+    if spy is not None:
+        assert spy.calls == [], "an invalid configuration must never compose a runtime"
+    assert not database.exists()
+    assert audit.issues == []
 
 
 @pytest.mark.parametrize("command", ["run", "simulate"])
@@ -591,9 +705,5 @@ def test_serving_failure_exits_cleanly_with_a_nonzero_code(
     _write_valid_config(path, tmp_path / "controller.sqlite3")
     runner = ServerRunner(failure=RuntimeError("supervisor failure: kernel task died"))
     invocation = _engaged_invocation(main_module, command, path, capsys, runner, serving=True)
-    assert not invocation.system_exit_raised, invocation.report()
-    assert isinstance(invocation.exit_code, int) and invocation.exit_code != 0, (
-        "a supervisor/serving failure must fence and exit with a clean nonzero code: "
-        + invocation.report()
-    )
+    assert_failed_cleanly(invocation)
     assert len(runner.calls) == 1

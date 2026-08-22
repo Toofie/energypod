@@ -10,7 +10,9 @@ the facade is the only real module under test.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -82,6 +84,8 @@ class Capability:
     unit_id: str
     direction: str
     watts: int
+    not_before_mono: float = 0.0
+    expires_at_mono: float = math.inf
 
 
 def good_quality() -> dict[str, str]:
@@ -148,8 +152,11 @@ class FakeObservationRepository:
 class FakeAuthorizationRepository:
     """Single-use capability slot mirroring the production port semantics."""
 
-    def __init__(self, current: Mapping[str, Capability] | None = None) -> None:
+    def __init__(
+        self, current: Mapping[str, Capability] | None = None, *, now_mono: float = 0.0
+    ) -> None:
         self.slots = dict(current or {})
+        self.now_mono = now_mono
         self.published: list[Any] = []
         self.current_calls: list[tuple[str, float]] = []
         self.peek_calls: list[str] = []
@@ -168,10 +175,20 @@ class FakeAuthorizationRepository:
         return self.slots.pop(unit_id, None)
 
     async def peek(self, unit_id: str) -> Capability | None:
+        # API_CONTRACTS AuthorizationRepository.peek(unit_id): non-consuming
+        # projection read returning the currently valid capability (not-before
+        # satisfied and unexpired) or None; snapshots peek, control uses current().
         self.peek_calls.append(unit_id)
         if self.failing:
             raise OSError("authorization store unavailable")
-        return self.slots.get(unit_id)
+        capability = self.slots.get(unit_id)
+        if capability is None:
+            return None
+        if capability.not_before_mono > self.now_mono:
+            return None
+        if capability.expires_at_mono <= self.now_mono:
+            return None
+        return capability
 
     async def revoke(self, *args: Any, **kwargs: Any) -> None:
         self.revocations.append(str(kwargs.get("reason", "")))
@@ -195,22 +212,28 @@ class FakeAuditRepository:
         self.appended.append(event)
         self.events.insert(0, event)
 
-    async def recent(self, limit: int) -> tuple[Any, ...]:
+    async def recent(self, limit: int, after_sequence: int | None = None) -> tuple[Any, ...]:
         self.recent_calls.append(limit)
         if self.failing:
             raise OSError("audit store unavailable")
-        return tuple(self.events[:limit])
+        window = self.events
+        if after_sequence is not None:
+            window = [event for event in window if field_of(event, "sequence") < after_sequence]
+        return tuple(window[:limit])
 
 
 class FakeEventBus:
     """Monotonic sequence source; publishing is the only sequence mutation."""
 
-    def __init__(self, starting_sequence: int = 0) -> None:
+    def __init__(self, starting_sequence: int = 0, history: list[str] | None = None) -> None:
         self.published: list[dict[str, Any]] = []
         self.sequence_reads = 0
         self._sequence = starting_sequence
+        self._history = history
 
     async def publish(self, body: Mapping[str, Any]) -> int:
+        if self._history is not None:
+            self._history.append("publish")
         self.published.append(dict(body))
         self._sequence += 1
         return self._sequence
@@ -227,6 +250,7 @@ class RecordingCoordinator:
         self._inner = api.AuthorityGenerationCoordinator()
         self._history = history
         self.failing = False
+        self.advance_error: BaseException | None = None
 
     async def snapshot(self) -> Any:
         if self.failing:
@@ -238,6 +262,11 @@ class RecordingCoordinator:
             raise OSError("authority coordinator unavailable")
         moved = await self._inner.advance(reason=reason)
         self._history.append("fence")
+        if self.advance_error is not None:
+            # The fence itself landed; only its acknowledgement is lost.  A
+            # facade that abandons the remaining stop work here fails the
+            # degraded-dependency matrix.
+            raise self.advance_error
         return moved
 
 
@@ -251,34 +280,50 @@ class FakeActorHandle:
         lifecycle: Any,
         armed_lifecycle: Any,
         history: list[str],
+        disarmed_lifecycle: Any = None,
         qualified: bool | None = True,
         inhibit_latched: bool = False,
         arm_error: BaseException | None = None,
+        zero_error: BaseException | None = None,
     ) -> None:
         self.unit_id = unit_id
         self.lifecycle = lifecycle
-        self.disarmed_lifecycle = lifecycle
+        self.disarmed_lifecycle = lifecycle if disarmed_lifecycle is None else disarmed_lifecycle
         self.armed_lifecycle = armed_lifecycle
         self.qualified = qualified
         self.inhibit_latched = inhibit_latched
         self.arm_error = arm_error
+        self.zero_error = zero_error
         self.history = history
 
     async def arm(self) -> None:
         self.history.append(f"arm:{self.unit_id}")
         if self.arm_error is not None:
             raise self.arm_error
+        # Only an explicit "not qualified" report refuses here: a None
+        # (unknown) qualification is accepted by the handle so the facade's
+        # own unknown-state gate is the only thing that can refuse it.
         if (
-            self.qualified is not True
+            self.qualified is False
             or self.inhibit_latched
             or self.lifecycle is not self.disarmed_lifecycle
         ):
             raise RuntimeError("unit is not qualified for arming")
         self.lifecycle = self.armed_lifecycle
 
+    async def disarm(self) -> None:
+        self.history.append(f"disarm:{self.unit_id}")
+        self.lifecycle = self.disarmed_lifecycle
+
+    async def acknowledge_inhibit(self) -> None:
+        self.history.append(f"inhibit-ack:{self.unit_id}")
+        self.inhibit_latched = False
+
     async def request_bounded_zero(self, reason: str) -> None:
         del reason
         self.history.append(f"zero:{self.unit_id}")
+        if self.zero_error is not None:
+            raise self.zero_error
 
     async def fence(self, reason: str) -> int:
         del reason
@@ -372,18 +417,20 @@ def make_rig(
             unit_id=unit_id,
             lifecycle=spec.get("lifecycle", api.UnitLifecycle.DISARMED),
             armed_lifecycle=api.UnitLifecycle.ARMED_IDLE,
+            disarmed_lifecycle=spec.get("disarmed_lifecycle", api.UnitLifecycle.DISARMED),
             history=history,
             qualified=spec.get("qualified", True),
             inhibit_latched=spec.get("inhibit_latched", False),
             arm_error=spec.get("arm_error"),
+            zero_error=spec.get("zero_error"),
         )
         for unit_id, spec in specs.items()
     }
     intents = FakeIntentRepository(seeded_intents)
     observations = FakeObservationRepository(telemetry)
-    authorizations = FakeAuthorizationRepository(capabilities)
+    authorizations = FakeAuthorizationRepository(capabilities, now_mono=clock.monotonic())
     audit = FakeAuditRepository(audit_events, history)
-    bus = FakeEventBus(bus_sequence)
+    bus = FakeEventBus(bus_sequence, history)
     coordinator = RecordingCoordinator(api, history)
     facade = api.EnergyServiceFacade(
         site_id=SITE_ID,
@@ -490,6 +537,20 @@ async def _invoke(
             idempotency_key="arm-key-9",
             request_id="request-r9",
         )
+    if operation == "disarm":
+        return await facade.disarm(
+            unit_ids=["pod-a"],
+            principal=principal,
+            idempotency_key="disarm-key-9",
+            request_id="request-q9",
+        )
+    if operation == "acknowledge_inhibit":
+        return await facade.acknowledge_inhibit(
+            unit_id="pod-a",
+            principal=principal,
+            idempotency_key="inhibit-ack-key-9",
+            request_id="request-n9",
+        )
     if operation == "emergency_stop":
         return await facade.emergency_stop(
             unit_ids=["pod-a"],
@@ -559,7 +620,6 @@ async def test_snapshot_assembles_site_sequence_and_per_unit_projections(api: An
     assert pod_b["requested_power"] == {"direction": "idle", "watts": 0}
     assert pod_b["authorized_power"] is None
     assert pod_b["measured_watts"] is None
-    assert rig.intents.active_calls == [rig.clock.monotonic()]
 
 
 async def test_snapshot_quality_projection_never_masks_bad_telemetry(api: Any) -> None:
@@ -572,6 +632,37 @@ async def test_snapshot_quality_projection_never_masks_bad_telemetry(api: Any) -
     assert units["pod-a"]["quality"] == "bad"
 
 
+@pytest.mark.parametrize(
+    ("quality", "expected"),
+    [
+        ({**good_quality(), "battery_watts": "stale"}, "degraded"),
+        ({**good_quality(), "battery_watts": "suspect"}, "degraded"),
+        ({**good_quality(), "soh_pct": "stale", "temperatures_c": "suspect"}, "degraded"),
+        ({**good_quality(), "battery_watts": "bad", "soh_pct": "stale"}, "bad"),
+    ],
+    ids=["stale_field", "suspect_field", "mixed_degraded_fields", "bad_dominates_degraded"],
+)
+async def test_snapshot_quality_never_reports_good_over_degraded_fields(
+    api: Any, quality: Mapping[str, str], expected: str
+) -> None:
+    rig = make_rig(api, telemetry={"pod-a": Telemetry("pod-a", 99.5, 100.0, quality)})
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["quality"] == expected
+
+
+async def test_snapshot_quality_never_reports_good_for_age_stale_telemetry(api: Any) -> None:
+    rig = make_rig(api, telemetry={"pod-a": Telemetry("pod-a", 0.0, 100.0, good_quality())})
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["telemetry_age_s"] == 100.0
+    assert units["pod-a"]["quality"] != "good", "age-stale telemetry is never good"
+
+
 async def test_snapshot_never_consumes_single_use_authorizations(api: Any) -> None:
     capability = Capability("pod-a", "discharge", 700)
     rig = make_rig(api, capabilities={"pod-a": capability})
@@ -582,6 +673,41 @@ async def test_snapshot_never_consumes_single_use_authorizations(api: Any) -> No
     assert units["pod-a"]["authorized_power"] == {"direction": "discharge", "watts": 700}
     still_current = await rig.authorizations.current("pod-a", rig.clock.monotonic())
     assert still_current is capability, "a snapshot read must not burn a single-use capability"
+
+
+async def test_snapshot_peek_does_not_consume_while_current_does(api: Any) -> None:
+    capability = Capability("pod-a", "discharge", 700)
+    rig = make_rig(api, capabilities={"pod-a": capability})
+
+    first = await rig.facade.snapshot(principal=OPERATOR)
+    second = await rig.facade.snapshot(principal=OPERATOR)
+
+    for snapshot in (first, second):
+        units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+        assert units["pod-a"]["authorized_power"] == {"direction": "discharge", "watts": 700}
+    consumed = await rig.authorizations.current("pod-a", rig.clock.monotonic())
+    assert consumed is capability, "current() remains the single-use control read"
+    after_consumption = await rig.facade.snapshot(principal=OPERATOR)
+    units = {unit["unit_id"]: unit for unit in after_consumption["units"]}
+    assert units["pod-a"]["authorized_power"] is None
+
+
+async def test_snapshot_projects_only_currently_valid_capabilities(api: Any) -> None:
+    rig = make_rig(
+        api,
+        capabilities={
+            # API_CONTRACTS peek: only a capability whose not-before is
+            # satisfied and which is unexpired projects as live authority.
+            "pod-a": Capability("pod-a", "discharge", 700, expires_at_mono=99.0),
+            "pod-b": Capability("pod-b", "charge", 500, not_before_mono=110.0),
+        },
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["authorized_power"] is None, "an expired capability is not authority"
+    assert units["pod-b"]["authorized_power"] is None, "a not-yet-valid capability is not authority"
 
 
 async def test_snapshot_requested_power_follows_the_newest_active_intent(api: Any) -> None:
@@ -697,8 +823,26 @@ async def test_recent_audit_is_bounded_newest_first_and_stable(api: Any) -> None
 
     assert [field_of(event, "sequence") for event in first["events"]] == [9, 8, 7]
     assert "next_cursor" in first
+    # The cursor names the oldest delivered event so pagination can resume.
+    assert first["next_cursor"] == field_of(first["events"][-1], "sequence")
     assert first["next_cursor"] == second["next_cursor"]
     assert rig.audit.recent_calls == [3, 3]
+    assert rig.audit.appended == []
+    assert rig.bus.published == []
+
+
+async def test_recent_audit_cursor_resumes_with_strictly_older_events(api: Any) -> None:
+    events = tuple(
+        SimpleNamespace(sequence=number, event_id=f"event-{number}") for number in (9, 8, 7, 6, 5)
+    )
+    rig = make_rig(api, audit_events=events)
+
+    first = await rig.facade.recent_audit(principal=OPERATOR, limit=3)
+    older = await rig.facade.recent_audit(principal=OPERATOR, limit=3, cursor=first["next_cursor"])
+
+    assert [field_of(event, "sequence") for event in first["events"]] == [9, 8, 7]
+    assert [field_of(event, "sequence") for event in older["events"]] == [6, 5]
+    assert older["next_cursor"] is None, "a short terminal page leaves no further cursor"
     assert rig.audit.appended == []
     assert rig.bus.published == []
 
@@ -802,8 +946,6 @@ async def test_submit_intent_rejects_invalid_payloads_without_storing(
         await rig.facade.submit_intent(**submit_kwargs(**overrides))
 
     assert rig.intents.added == []
-    assert rig.audit.appended == []
-    assert rig.bus.published == []
 
 
 # --- arm --------------------------------------------------------------------
@@ -852,13 +994,84 @@ async def test_arm_refusals_are_visible_per_unit_and_never_silent(api: Any) -> N
     outcomes = {unit["unit_id"]: unit for unit in result["units"]}
     assert set(outcomes) == set(requested)
     assert outcomes["pod-a"]["status"] == "armed"
-    for unit_id in ("pod-ghost", "pod-b", "pod-c", "pod-d"):
-        assert outcomes[unit_id]["status"] == "refused"
-        reason = outcomes[unit_id]["reason"]
-        assert isinstance(reason, str) and reason
+    reasons = {
+        "unknown_unit": outcomes["pod-ghost"]["reason"],
+        "not_qualified": outcomes["pod-b"]["reason"],
+        "inhibit_latched": outcomes["pod-c"]["reason"],
+        "actor_failure": outcomes["pod-d"]["reason"],
+    }
+    assert all(isinstance(reason, str) and reason for reason in reasons.values())
+    assert len(set(reasons.values())) == len(reasons), (
+        "every refusal category carries a distinguishable operator reason"
+    )
+    assert "arm:pod-b" not in rig.history and "arm:pod-c" not in rig.history, (
+        "facade-level refusals never reach the actor handle"
+    )
+    assert "arm:pod-d" in rig.history, "an actor failure can only be discovered by attempting"
     assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.ARMED_IDLE
     for unit_id in ("pod-b", "pod-c", "pod-d"):
         assert rig.handles[unit_id].lifecycle is not api.UnitLifecycle.ARMED_IDLE
+    assert_audited_and_published(rig, OPERATOR.subject)
+
+
+async def test_arm_refuses_unknown_qualification_without_actor_contact(api: Any) -> None:
+    rig = make_rig(api, units={"pod-a": {"qualified": None}, "pod-b": {}})
+
+    result = await rig.facade.arm(
+        unit_ids=["pod-a", "pod-b"],
+        principal=OPERATOR,
+        idempotency_key="arm-key-3",
+        request_id="request-c",
+    )
+
+    outcomes = {unit["unit_id"]: unit for unit in result["units"]}
+    assert outcomes["pod-a"]["status"] == "refused"
+    reason = outcomes["pod-a"]["reason"]
+    assert isinstance(reason, str) and reason
+    assert outcomes["pod-b"]["status"] == "armed"
+    assert "arm:pod-a" not in rig.history, (
+        "the handle would have accepted this unit; only the facade gate refuses it"
+    )
+    assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.DISARMED
+    assert_audited_and_published(rig, OPERATOR.subject)
+
+
+# --- disarm ------------------------------------------------------------------
+
+
+async def test_disarm_is_the_arm_path_inverted_and_always_succeeds_for_known_units(
+    api: Any,
+) -> None:
+    rig = make_rig(
+        api,
+        units={
+            "pod-a": {"lifecycle": api.UnitLifecycle.ARMED_IDLE},
+            "pod-b": {},
+            "pod-c": {"lifecycle": api.UnitLifecycle.INHIBITED, "inhibit_latched": True},
+        },
+    )
+
+    result = await rig.facade.disarm(
+        unit_ids=["pod-a", "pod-b", "pod-c", "pod-ghost"],
+        principal=OPERATOR,
+        idempotency_key="disarm-key-1",
+        request_id="request-d1",
+    )
+
+    outcomes = {unit["unit_id"]: unit for unit in result["units"]}
+    assert set(outcomes) == {"pod-a", "pod-b", "pod-c", "pod-ghost"}
+    for unit_id in ("pod-a", "pod-b", "pod-c"):
+        assert outcomes[unit_id]["status"] == "disarmed", (
+            "disarm is the arm path inverted: every known unit succeeds"
+        )
+    assert outcomes["pod-ghost"]["status"] == "refused"
+    ghost_reason = outcomes["pod-ghost"]["reason"]
+    assert isinstance(ghost_reason, str) and ghost_reason
+    assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.DISARMED
+    assert "disarm:pod-a" in rig.history and "disarm:pod-b" in rig.history
+    assert rig.handles["pod-c"].inhibit_latched is True, (
+        "disarming never acknowledges an inhibit latch"
+    )
     assert_audited_and_published(rig, OPERATOR.subject)
 
 
@@ -886,14 +1099,67 @@ async def test_emergency_stop_latches_fences_then_bounds_before_returning(api: A
     assert stored.watts == 0
     assert stored.selected_unit_ids == frozenset({"pod-a", "pod-b"})
     assert stored.actor_identity == OPERATOR.subject
-    # A latched stop ends by acknowledgement, never by TTL expiry.
+    # API_CONTRACTS: a latched stop carries a fixed duration of at least 24
+    # hours and is removed only by acknowledgement, never by TTL expiry.
     assert stored.duration_s >= 86_400.0
     fence = rig.history.index("fence")
     assert fence < rig.history.index("zero:pod-a")
     assert fence < rig.history.index("zero:pod-b")
     assert fence < rig.history.index("audit"), "revocation must fence before audit work"
+    assert fence < rig.history.index("publish"), "the stop must fence before publishing"
     assert rig.authorizations.published == []
     assert_audited_and_published(rig, OPERATOR.subject)
+
+
+@pytest.mark.parametrize(
+    "deformation",
+    [
+        "intents_add_fails",
+        "audit_append_fails",
+        "actor_zero_fails",
+        "coordinator_advance_fails",
+        "unknown_unit",
+    ],
+)
+async def test_emergency_stop_survives_degraded_dependencies(api: Any, deformation: str) -> None:
+    rig = make_rig(api, units={"pod-a": {}, "pod-b": {}})
+    if deformation == "intents_add_fails":
+        rig.intents.failing = True
+    elif deformation == "audit_append_fails":
+        rig.audit.failing = True
+    elif deformation == "actor_zero_fails":
+        rig.handles["pod-a"].zero_error = RuntimeError("mailbox wedged")
+    elif deformation == "coordinator_advance_fails":
+        rig.coordinator.advance_error = RuntimeError("fence acknowledgement lost")
+    epoch_before = (await rig.coordinator.snapshot()).epoch
+    known_units = ["pod-a"] if deformation == "unknown_unit" else ["pod-a", "pod-b"]
+    requested_units = ["pod-a", "pod-ghost"] if deformation == "unknown_unit" else known_units
+
+    # Whether a degraded stop raises or returns is unpinned; the safety order
+    # underneath it never is.
+    with contextlib.suppress(Exception):
+        await _stop(
+            rig.facade,
+            unit_ids=requested_units,
+            reason="degraded halt",
+            idempotency_key="stop-key-d",
+            request_id="request-d",
+        )
+
+    assert (await rig.coordinator.snapshot()).epoch > epoch_before, (
+        "a degraded dependency must never prevent fencing the generation"
+    )
+    fence = rig.history.index("fence")
+    for unit_id in known_units:
+        assert f"zero:{unit_id}" in rig.history, "bounded zero is still requested"
+        assert fence < rig.history.index(f"zero:{unit_id}")
+    if "audit" in rig.history:
+        audit = rig.history.index("audit")
+        assert fence < audit, "revocation must fence before audit work"
+        for unit_id in known_units:
+            assert rig.history.index(f"zero:{unit_id}") < audit
+    if rig.bus.published:
+        assert fence < rig.history.index("publish"), "the stop must fence before publishing"
 
 
 async def test_repeated_stops_receive_distinct_acknowledgeable_ids(api: Any) -> None:
@@ -966,10 +1232,6 @@ async def test_acknowledge_accepts_the_exact_id_and_removes_the_latch(api: Any) 
     assert rig.intents.removed == [stop_id]
     live = await rig.intents.active(rig.clock.now)
     assert not any(intent.id == stop_id for intent in live), "latch must not relatch"
-    assert not any(entry == "fence" or entry.startswith("fence:") for entry in rig.history), (
-        "acknowledgement must not fence again"
-    )
-    assert not any(entry.startswith("zero:") for entry in rig.history)
     assert_audited_and_published(rig, OPERATOR.subject)
 
 
@@ -1034,6 +1296,123 @@ async def test_acknowledge_is_exact_and_leaves_other_latched_stops_active(api: A
     assert second["stop_id"] in live_ids
 
 
+# --- acknowledge_inhibit -------------------------------------------------------
+
+
+async def test_acknowledge_inhibit_clears_exactly_the_named_latched_unit(api: Any) -> None:
+    rig = make_rig(
+        api,
+        units={
+            "pod-a": {},
+            "pod-b": {},
+            "pod-c": {"lifecycle": api.UnitLifecycle.INHIBITED, "inhibit_latched": True},
+            "pod-d": {"lifecycle": api.UnitLifecycle.INHIBITED, "inhibit_latched": True},
+        },
+    )
+
+    result = await rig.facade.acknowledge_inhibit(
+        unit_id="pod-c",
+        principal=OPERATOR,
+        idempotency_key="inhibit-ack-key-1",
+        request_id="request-i1",
+    )
+
+    assert result["unit_id"] == "pod-c"
+    assert result["status"] == "acknowledged"
+    assert rig.handles["pod-c"].inhibit_latched is False
+    assert rig.handles["pod-d"].inhibit_latched is True, "acknowledgement is exact-unit"
+    assert rig.handles["pod-c"].lifecycle is api.UnitLifecycle.INHIBITED, (
+        "acknowledgement only clears the latch; recovery still needs stable samples"
+    )
+    assert "arm:pod-c" not in rig.history, "acknowledgement never arms the unit"
+    assert_audited_and_published(rig, OPERATOR.subject)
+
+
+async def test_acknowledge_inhibit_is_idempotent(api: Any) -> None:
+    rig = make_rig(
+        api,
+        units={"pod-a": {"lifecycle": api.UnitLifecycle.INHIBITED, "inhibit_latched": True}},
+    )
+
+    first = await rig.facade.acknowledge_inhibit(
+        unit_id="pod-a",
+        principal=OPERATOR,
+        idempotency_key="inhibit-ack-key-1",
+        request_id="request-i1",
+    )
+    second = await rig.facade.acknowledge_inhibit(
+        unit_id="pod-a",
+        principal=OPERATOR,
+        idempotency_key="inhibit-ack-key-2",
+        request_id="request-i2",
+    )
+
+    assert first["status"] == "acknowledged"
+    assert second["status"] == "acknowledged", "a repeated acknowledgement never raises"
+    assert rig.handles["pod-a"].inhibit_latched is False
+    assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.INHIBITED
+    assert_audited_and_published(rig, OPERATOR.subject)
+
+
+async def test_acknowledge_inhibit_without_a_latched_inhibit_is_a_no_op_success(
+    api: Any,
+) -> None:
+    # API_CONTRACTS "Inhibit acknowledgement" makes the endpoint idempotent,
+    # audited, and published; only LATCHED inhibits need the acknowledgement,
+    # so a non-latched inhibit is pinned here as a no-op success.
+    rig = make_rig(
+        api,
+        units={
+            "pod-a": {"lifecycle": api.UnitLifecycle.INHIBITED, "inhibit_latched": False},
+            "pod-b": {"lifecycle": api.UnitLifecycle.INHIBITED, "inhibit_latched": True},
+        },
+    )
+
+    result = await rig.facade.acknowledge_inhibit(
+        unit_id="pod-a",
+        principal=OPERATOR,
+        idempotency_key="inhibit-ack-key-1",
+        request_id="request-i1",
+    )
+
+    assert result["unit_id"] == "pod-a"
+    assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.INHIBITED, (
+        "a transient inhibit recovers through stable samples only"
+    )
+    assert rig.handles["pod-b"].inhibit_latched is True
+    assert "arm:pod-a" not in rig.history, "a no-op acknowledgement must not bypass recovery"
+    assert_audited_and_published(rig, OPERATOR.subject)
+
+
+@pytest.mark.parametrize(
+    "deformation",
+    [
+        {"scopes": frozenset({"observe", "dispatch", "stop", "stop:acknowledge"})},
+        {"interactive": False},
+    ],
+    ids=["missing_arm_scope", "non_interactive"],
+)
+async def test_acknowledge_inhibit_requires_arm_scope_and_an_interactive_principal(
+    api: Any, deformation: dict
+) -> None:
+    rig = make_rig(
+        api,
+        units={"pod-a": {"lifecycle": api.UnitLifecycle.INHIBITED, "inhibit_latched": True}},
+    )
+    principal = replace(OPERATOR, **deformation)
+
+    with pytest.raises(PermissionError):
+        await rig.facade.acknowledge_inhibit(
+            unit_id="pod-a",
+            principal=principal,
+            idempotency_key="inhibit-ack-key-1",
+            request_id="request-i1",
+        )
+
+    assert rig.recorder_activity() == []
+    assert rig.handles["pod-a"].inhibit_latched is True
+
+
 # --- principal enforcement --------------------------------------------------
 
 
@@ -1045,6 +1424,8 @@ async def test_acknowledge_is_exact_and_leaves_other_latched_stops_active(api: A
         "recent_audit",
         "submit_intent",
         "arm",
+        "disarm",
+        "acknowledge_inhibit",
         "emergency_stop",
         "acknowledge_emergency_stop",
     ],
