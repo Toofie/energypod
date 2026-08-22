@@ -439,8 +439,11 @@ With the feature enabled, the live decode strategy promotes the PCS live block `
 +17, load at +20) from the cold ring into the control-rate core, so `grid_power_w` refreshes
 every telemetry cycle. The plan stays inside the commissioned cadence budget: steady-state
 ≤ 8 windows plus the probe (~0.9 s at the 0.1 s inter-frame gap, inside the 1.5 s control
-period; bootstrap cycle ≤ 10 windows). With the feature absent or disabled the plan is exactly
-today's, PCS block included in the ~108 s cold ring.
+period; bootstrap cycle ≤ 10 windows). With the feature absent or disabled the plan matches
+today's in structure, budget, and ring period — PCS block included in the ~108 s cold ring —
+with one rotation-phase change: the default ring now visits the PCS block first (cycle 8)
+rather than at cycle 72, so advisory grid data appears within seconds of boot instead of
+~108 s.
 
 ### Beat-autonomy hysteresis
 
