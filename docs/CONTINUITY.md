@@ -421,6 +421,34 @@ direction, freshness, and watchdog timing per physical unit.
   competing with live ops (the earlier "stalled at 59%" incident); a
   CLEAN full suite passed in the background (exit 0) with 6abd869.
 
+- 2026-08-23 (final): HALT FIX LIVE-PROVEN; FLEET VERIFIED. The all-zero
+  allocation fix (d2163a5) was deployed by restart and PROVEN on hardware:
+  the kernel survived TWO intent expiries — the exact phase transition that
+  wedged the fleet at 21:50 — with 63 continuous control decisions, zero
+  halts, clean log, single process throughout. mid's charge is verified by
+  combined evidence: a 500 W charge intent authorized for 5 kernel cycles
+  (audit-proven, safety_checks_passed) before the OPERATOR'S OWN console
+  session superseded it with a manual 1000 W charge (measured -876 W), then
+  clean return to autonomous PV self-charge (-637..-697 W; the operator
+  confirmed pods self-charge from their own CTs whenever idle by day —
+  daytime "idle" is NOT zero watts). The operator's concurrent console
+  session also ran its own rhs discharge (+1121/+1205 W) successfully.
+  Environment facts pinned (operator-confirmed): other applications monitor
+  these batteries read-only by day and write only at night; daytime the pods
+  self-manage solar charging; night writes will trip our arm-time
+  external_writer preflight by design (coordinate, don't fight).
+  Verification scorecard vs the operator's request — mid: discharge 5 min
+  @ ~500 W VERIFIED, charge VERIFIED (authorized + measured under manual
+  follow-up); rhs: discharge @ 1000 W VERIFIED (twice), charge correctly
+  REFUSED at 97% SOC; lhs: discharge @ 1000 W VERIFIED, charge refused by
+  BMS 0 W limit (the case that used to halt the fleet — now safe).
+  API quirk recorded: POST /api/v1/arm requires {"unit_ids": [...],
+  "confirmation": "ARM"} (bare unit_ids is 422). Console follow-ups queued:
+  surface process_instance_id/uptime_s (instance swap vs stall), reconnect
+  banner. Excess-solar accelerated charging: design stage dispatched
+  (contracts + red tests; advisory-only, export-bounded, beat-autonomy
+  hysteresis, operator-precedence pinned).
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
