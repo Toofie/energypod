@@ -366,6 +366,26 @@ direction, freshness, and watchdog timing per physical unit.
 - 2026-08-21: Committed the baseline as `1552202` and dispatched five disjoint
   implementation streams: domain/allocation; config/schedule/persistence;
   arbiter/safety/kernel; protocol/transport; and sole-owner actor.
+- 2026-08-22: LIVE COMMISSIONING (observe-only) + telemetry surface. With the
+  operator's explicit direct-hookup authorization: first live reads ever
+  through the production transport verified the RTU-over-TCP framing,
+  probed all three units (MID 6 BIC / RHS 5 BIC / LHS 6 BIC), captured the
+  full IoT plan + follow-up blocks as the first E1 hardware vectors, and
+  produced the validated field mapping (docs/evidence/). Run-mode observe-only
+  then landed contract-first: wire decoder, FileCredentialStore, live
+  composition with structural observe-only (stable-sample threshold 2^63-1 —
+  no telemetry count can ever qualify a live unit), proven gateway timing
+  (3.0 s timeout, 0.1 s inter-frame gap — back-to-back reads made the
+  gateway answer out of order). The telemetry surface (69132b6) completes
+  the picture: snapshot units carry the nullable 16-field telemetry summary
+  and GET /api/v1/units/{id} serves the full observation projection; the
+  console renders SOC/pack/cells/temperatures live. State: 1203 Python +
+  184 web tests green; live controller verified serving real values
+  (SOC 9/68/47%, 60/50/60 cells, quality good). REMAINING for control:
+  power-direction sign validation, watchdog timing experiment, then a
+  SEPARATE explicit authorization for any write-enabled composition; MCP
+  get_unit_detail queued (facade method exists).
+
 - 2026-08-22: MILESTONES B AND C COMPLETE — the product ships. Milestone B
   (2ce9194, 392310e): the React operator console (shell with token gate,
   four-fact connection indicator, live stream with resync recovery; Home,
