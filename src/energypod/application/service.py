@@ -489,7 +489,15 @@ class EnergyServiceFacade:
         )
         control_reasons = self._control_readiness_reasons()
         return {
-            "liveness": {"ok": True},
+            "liveness": {
+                "ok": True,
+                # Identity of THIS process (2026-08-23 false-stall lesson): a
+                # console watching these can distinguish a deployment — the
+                # instance id changes — from a genuine stall, where the id is
+                # stable while data ages climb.
+                "process_instance_id": self._process_instance_id,
+                "uptime_s": round(now_mono - self._process_origin_mono, 3),
+            },
             "service_readiness": {"ready": not service_reasons, "reasons": service_reasons},
             "control_readiness": {"ready": not control_reasons, "reasons": control_reasons},
         }

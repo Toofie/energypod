@@ -1245,7 +1245,13 @@ async def test_snapshot_and_health_stay_honest_for_an_unqualified_replayed_fleet
                 assert view["telemetry_age_s"] is None
 
         health = await runtime.facade.health(principal=OPERATOR)
-        assert health["liveness"] == {"ok": True}
+        # Liveness carries this process's identity so a console can tell a
+        # DEPLOYMENT (new instance id) from a stall (same id, ages climbing).
+        assert health["liveness"]["ok"] is True
+        assert isinstance(health["liveness"]["process_instance_id"], str)
+        assert health["liveness"]["process_instance_id"]
+        assert isinstance(health["liveness"]["uptime_s"], float)
+        assert health["liveness"]["uptime_s"] >= 0.0
         assert health["service_readiness"] == {"ready": True, "reasons": []}
         control = health["control_readiness"]
         assert control["ready"] is False

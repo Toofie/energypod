@@ -1440,7 +1440,16 @@ class _Supervision:
             for actor in self._actors:
                 try:
                     with contextlib.suppress(Exception):
-                        await actor.heartbeat_once()
+                        # Structural bound (2026-08-23 silent-wedge hardening):
+                        # a transport write that never resolves must not wedge
+                        # the whole fleet loop with a clean log. An abandoned
+                        # renewal is fail-closed exactly like an unreadable
+                        # poll — authority lapses and the device watchdog
+                        # stops power. TimeoutError is an Exception, so the
+                        # suppress above already swallows it.
+                        await asyncio.wait_for(
+                            actor.heartbeat_once(), timeout=self._interval_s
+                        )
                 except asyncio.CancelledError:
                     # A facade fence (emergency stop) cancels in-flight
                     # authority work; that borrowed cancellation must not end
@@ -1459,7 +1468,13 @@ class _Supervision:
                 *(self._bounded_poll(actor) for actor in self._actors),
                 return_exceptions=True,
             )
-            await self._kernel.tick()
+            # A kernel tick that overruns the interval is a component failure,
+            # not a survivable per-unit fault. Cancelling it is safe — the
+            # kernel's BaseException path revokes authority first (shielded)
+            # and the durable audit write is transactional — and letting the
+            # TimeoutError end this task makes the watcher halt the fleet with
+            # evidence instead of the loop wedging silently forever.
+            await asyncio.wait_for(self._kernel.tick(), timeout=self._interval_s)
 
     async def _bounded_poll(self, actor: EnergyPodActor) -> None:
         with contextlib.suppress(Exception, asyncio.TimeoutError):
