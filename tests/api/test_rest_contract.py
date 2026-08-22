@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from .conftest import (
     FakeAuthenticator,
     FakeEventSource,
+    MutableMonotonicClock,
     RecordingEnergyService,
     load_contract_module,
 )
@@ -22,6 +23,7 @@ API = "/api/v1"
 def _client(
     service: RecordingEnergyService,
     authenticator: FakeAuthenticator,
+    **app_kwargs: Any,
 ) -> TestClient:
     module = load_contract_module("energypod.api.rest")
     assert hasattr(module, "create_api_app"), "energypod.api.rest.create_api_app is required"
@@ -30,6 +32,7 @@ def _client(
         authenticator=authenticator,
         event_source=FakeEventSource(),
         auth_required=True,
+        **app_kwargs,
     )
     return TestClient(app)
 
@@ -135,6 +138,84 @@ def test_audit_read_scope_alone_is_insufficient_without_observe(
         snapshot = client.get(f"{API}/snapshot", headers=_auth("audit-only-token"))
     _assert_error(audit, 403, "insufficient_scope")
     _assert_error(snapshot, 403, "insufficient_scope")
+    assert service.calls == []
+
+
+class _PagedAuditService(RecordingEnergyService):
+    """Two bounded pages; the second resumes strictly older than the first."""
+
+    async def recent_audit(
+        self, *, principal: object, limit: int, cursor: int | None = None
+    ) -> dict[str, Any]:
+        self.calls.append(
+            ("recent_audit", {"principal": principal, "limit": limit, "cursor": cursor})
+        )
+        if cursor is None:
+            return {
+                "events": [
+                    {"sequence": 50, "type": "intent.accepted", "request_id": "req-1"},
+                    {"sequence": 42, "type": "decision.evaluated", "request_id": "req-2"},
+                ],
+                "next_cursor": 42,
+            }
+        return {
+            "events": [{"sequence": 41, "type": "unit.armed", "request_id": "req-3"}],
+            "next_cursor": None,
+        }
+
+
+def test_audit_pagination_continues_through_the_returned_cursor(
+    authenticator: FakeAuthenticator,
+) -> None:
+    service = _PagedAuditService()
+    with _client(service, authenticator) as client:
+        first = client.get(f"{API}/audit?limit=2", headers=_auth("auditor-token"))
+        assert first.status_code == 200
+        page_one = first.json()
+        assert page_one["next_cursor"] == 42
+        second = client.get(
+            f"{API}/audit?limit=2&after_sequence={page_one['next_cursor']}",
+            headers=_auth("auditor-token"),
+        )
+        assert second.status_code == 200
+        page_two = second.json()
+
+    assert [event["sequence"] for event in page_two["events"]] == [41]
+    assert page_two["next_cursor"] is None
+    forwarded = [values for name, values in service.calls if name == "recent_audit"]
+    assert [item["cursor"] for item in forwarded] == [None, 42]
+    assert [item["limit"] for item in forwarded] == [2, 2]
+
+
+def test_audit_forwards_after_sequence_and_defaults_to_absent(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        plain = client.get(f"{API}/audit", headers=_auth("auditor-token"))
+        zero = client.get(f"{API}/audit?after_sequence=0", headers=_auth("auditor-token"))
+        paged = client.get(
+            f"{API}/audit?limit=1&after_sequence=118", headers=_auth("auditor-token")
+        )
+    assert plain.status_code == zero.status_code == paged.status_code == 200
+    forwarded = [values for name, values in service.calls if name == "recent_audit"]
+    assert forwarded[0]["cursor"] is None
+    assert forwarded[1]["cursor"] == 0
+    assert set(forwarded[2]) == {"principal", "limit", "cursor"}
+    assert forwarded[2]["limit"] == 1
+    assert forwarded[2]["cursor"] == 118
+
+
+@pytest.mark.parametrize("cursor", ["-1", "abc", "1.5", "1e2", "true", ""])
+def test_audit_rejects_an_invalid_cursor_before_the_service(
+    cursor: str,
+    service: RecordingEnergyService,
+    authenticator: FakeAuthenticator,
+) -> None:
+    with _client(service, authenticator) as client:
+        response = client.get(
+            f"{API}/audit?after_sequence={cursor}", headers=_auth("auditor-token")
+        )
+    _assert_error(response, 422, "validation_error")
     assert service.calls == []
 
 
@@ -396,6 +477,109 @@ def test_client_cannot_supply_identity_site_or_arming_lifecycle_metadata(
     assert all(name != "arm" for name, _ in service.calls)
 
 
+def test_disarm_requires_arm_scope_but_no_interactive_operator(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    payload = {"unit_ids": ["pod-a"]}
+    with _client(service, authenticator) as client:
+        denied = client.post(
+            f"{API}/disarm",
+            json=payload,
+            headers=_mutation_headers("viewer-token", key="disarm-viewer"),
+        )
+        automation = client.post(
+            f"{API}/disarm",
+            json=payload,
+            headers=_mutation_headers("noninteractive-operator-token", key="disarm-auto"),
+        )
+        human = client.post(
+            f"{API}/disarm",
+            json=payload,
+            headers=_mutation_headers("operator-token", key="disarm-human"),
+        )
+    _assert_error(denied, 403, "insufficient_scope")
+    # Disarming is safety-positive: the non-interactive automation credential
+    # with the arm scope is accepted where arming would refuse it.
+    assert automation.status_code == 200
+    assert human.status_code == 200
+    disarm_calls = [values for name, values in service.calls if name == "disarm"]
+    assert [values["principal"].subject for values in disarm_calls] == [
+        "service:operator-automation",
+        "person:operator",
+    ]
+    assert disarm_calls[0]["principal"].interactive is False
+
+
+def test_disarm_validates_units_like_arm_and_reports_per_unit_outcomes(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        accepted = client.post(
+            f"{API}/disarm",
+            json={"unit_ids": ["pod-a", "pod-b"]},
+            headers=_mutation_headers("operator-token", key="disarm-multi"),
+        )
+        for invalid in (
+            {"unit_ids": "pod-a"},
+            {"unit_ids": []},
+            {"unit_ids": ["pod-a", "pod-a"]},
+            {"unit_ids": [" pod-a"]},
+            {"unit_ids": ["-pod"]},
+            {"unit_ids": ["pod-a"], "confirmation": "DISARM"},
+            {"unit_ids": ["pod-a"], "unknown": "field"},
+            {"unit_ids": ["pod-a"], "principal": "person:admin"},
+        ):
+            response = client.post(
+                f"{API}/disarm",
+                json=invalid,
+                headers=_mutation_headers("operator-token", key=f"disarm-bad-{len(str(invalid))}"),
+            )
+            _assert_error(response, 422, "validation_error")
+
+    assert accepted.status_code == 200
+    assert accepted.json() == {
+        "units": [
+            {"unit_id": "pod-a", "status": "disarmed", "reason": "disarmed"},
+            {"unit_id": "pod-b", "status": "disarmed", "reason": "disarmed"},
+        ]
+    }
+    disarm_calls = [values for name, values in service.calls if name == "disarm"]
+    assert len(disarm_calls) == 1
+    assert disarm_calls[0]["unit_ids"] == ["pod-a", "pod-b"]
+    assert disarm_calls[0]["idempotency_key"] == "disarm-multi"
+    assert disarm_calls[0]["request_id"] == "req-123"
+
+
+def test_disarm_is_idempotent_like_other_mutations(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        missing_key = client.post(
+            f"{API}/disarm", json={"unit_ids": ["pod-a"]}, headers=_auth("operator-token")
+        )
+        first = client.post(
+            f"{API}/disarm",
+            json={"unit_ids": ["pod-a"]},
+            headers=_mutation_headers("operator-token", key="disarm-replay"),
+        )
+        replay = client.post(
+            f"{API}/disarm",
+            json={"unit_ids": ["pod-a"]},
+            headers=_mutation_headers("operator-token", key="disarm-replay"),
+        )
+        conflict = client.post(
+            f"{API}/disarm",
+            json={"unit_ids": ["pod-b"]},
+            headers=_mutation_headers("operator-token", key="disarm-replay"),
+        )
+
+    _assert_error(missing_key, 400, "idempotency_key_required")
+    assert first.status_code == replay.status_code == 200
+    assert first.json() == replay.json()
+    _assert_error(conflict, 409, "idempotency_conflict")
+    assert len([name for name, _ in service.calls if name == "disarm"]) == 1
+
+
 def test_emergency_stop_latches_and_acknowledges_exact_stop_id(
     service: RecordingEnergyService, authenticator: FakeAuthenticator
 ) -> None:
@@ -576,3 +760,95 @@ def test_public_route_and_openapi_surfaces_exclude_maintenance_and_debug(
     lowered = " ".join(paths).lower()
     assert all(word not in lowered for word in forbidden)
     assert all(path == "/openapi.json" or path.startswith(API) for path in paths)
+
+
+def test_events_session_requires_bearer_and_observe_scope(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        unauthenticated = client.post(f"{API}/events/session")
+        audit_only = client.post(f"{API}/events/session", headers=_auth("audit-only-token"))
+        viewer = client.post(f"{API}/events/session", headers=_auth("viewer-token"))
+    _assert_error(unauthenticated, 401, "authentication_required")
+    _assert_error(audit_only, 403, "insufficient_scope")
+    assert viewer.status_code == 200
+    assert service.calls == []
+
+
+def test_events_session_issues_opaque_short_lived_tickets(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    clock = MutableMonotonicClock(500.0)
+    with _client(
+        service, authenticator, event_ticket_ttl_s=5.0, event_ticket_clock=clock
+    ) as client:
+        first = client.post(f"{API}/events/session", headers=_auth("viewer-token")).json()
+        second = client.post(f"{API}/events/session", headers=_auth("operator-token")).json()
+
+    for body in (first, second):
+        assert set(body) == {"ticket", "expires_in_s"}
+        assert body["expires_in_s"] == 5.0
+        ticket = body["ticket"]
+        assert isinstance(ticket, str) and len(ticket) >= 32
+        assert ticket.strip() == ticket and " " not in ticket
+        # Opaque: the ticket never echoes the credential or the principal.
+        assert "viewer-token" not in ticket
+        assert "operator-token" not in ticket
+        assert "person:" not in ticket
+    assert first["ticket"] != second["ticket"]
+
+
+def test_events_session_default_ttl_is_bounded_and_the_knob_is_validated(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    module = load_contract_module("energypod.api.rest")
+    with _client(service, authenticator) as client:
+        body = client.post(f"{API}/events/session", headers=_auth("viewer-token")).json()
+    assert 0 < body["expires_in_s"] <= 30
+
+    # The contracted ceiling itself is accepted; anything beyond it, or a
+    # non-positive / non-finite / boolean value, is refused at construction.
+    module.create_api_app(
+        service=service,
+        authenticator=authenticator,
+        event_source=FakeEventSource(),
+        auth_required=True,
+        event_ticket_ttl_s=30.0,
+    )
+    for invalid in (30.5, 31.0, 0, -1, float("inf"), float("nan"), True):
+        with pytest.raises(ValueError, match="event_ticket_ttl_s"):
+            module.create_api_app(
+                service=service,
+                authenticator=authenticator,
+                event_source=FakeEventSource(),
+                auth_required=True,
+                event_ticket_ttl_s=invalid,
+            )
+
+
+def test_event_ticket_grants_nothing_but_the_event_stream(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    clock = MutableMonotonicClock()
+    with _client(
+        service, authenticator, event_ticket_ttl_s=15.0, event_ticket_clock=clock
+    ) as client:
+        ticket = client.post(f"{API}/events/session", headers=_auth("operator-token")).json()[
+            "ticket"
+        ]
+        bearer = {"Authorization": f"Bearer {ticket}"}
+        snapshot = client.get(f"{API}/snapshot", headers=bearer)
+        disarm = client.post(
+            f"{API}/disarm",
+            json={"unit_ids": ["pod-a"]},
+            headers={**bearer, "Idempotency-Key": "ticket-as-bearer"},
+        )
+        session = client.post(f"{API}/events/session", headers=bearer)
+
+    # The ticket is not a bearer credential: it authorizes only the WebSocket
+    # handshake, never a REST read, mutation, or further ticket issuance.
+    _assert_error(snapshot, 401, "authentication_required")
+    _assert_error(disarm, 401, "authentication_required")
+    _assert_error(session, 401, "authentication_required")
+    assert service.calls == []
+    assert authenticator.presented_tokens == ["operator-token", ticket, ticket, ticket]

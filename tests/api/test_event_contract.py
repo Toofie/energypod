@@ -14,6 +14,7 @@ from starlette.websockets import WebSocketDisconnect
 from .conftest import (
     FakeAuthenticator,
     FakeEventSource,
+    MutableMonotonicClock,
     RecordingEnergyService,
     load_contract_module,
 )
@@ -24,17 +25,32 @@ def _app(
     source: Any,
     *,
     trusted_websocket_origins: frozenset[str] | None = None,
+    event_ticket_ttl_s: float | None = None,
+    event_ticket_clock: Any = None,
 ) -> object:
     module = load_contract_module("energypod.api.rest")
     assert hasattr(module, "create_api_app")
-    return module.create_api_app(
-        service=service,
-        authenticator=FakeAuthenticator(),
-        event_source=source,
-        auth_required=True,
-        websocket_queue_capacity=2,
-        trusted_websocket_origins=trusted_websocket_origins,
+    app_kwargs: dict[str, Any] = {
+        "service": service,
+        "authenticator": FakeAuthenticator(),
+        "event_source": source,
+        "auth_required": True,
+        "websocket_queue_capacity": 2,
+        "trusted_websocket_origins": trusted_websocket_origins,
+    }
+    if event_ticket_ttl_s is not None:
+        app_kwargs["event_ticket_ttl_s"] = event_ticket_ttl_s
+    if event_ticket_clock is not None:
+        app_kwargs["event_ticket_clock"] = event_ticket_clock
+    return module.create_api_app(**app_kwargs)
+
+
+def _event_ticket(client: TestClient, credential: str = "viewer-token") -> str:
+    response = client.post(
+        "/api/v1/events/session", headers={"Authorization": f"Bearer {credential}"}
     )
+    assert response.status_code == 200, response.text
+    return str(response.json()["ticket"])
 
 
 def test_websocket_requires_viewer_authentication() -> None:
@@ -394,3 +410,155 @@ def test_bus_stale_cursor_marker_reaches_client_with_true_reason_and_snapshot() 
     assert terminal["reason"] == "retention_window_exceeded"
     assert terminal["snapshot_sequence"] == 30
     assert source.subscriptions == [0]
+
+
+def test_subprotocol_ticket_handshake_streams_without_authorization_header() -> None:
+    # Browsers cannot set an Authorization header on a WebSocket: the handshake
+    # offers Sec-WebSocket-Protocol: energypod-events, <ticket> instead, the
+    # server consumes the ticket, negotiates the subprotocol, and streams.
+    source = FakeEventSource(
+        [{"sequence": 21, "type": "observation.updated", "data": {"unit_id": "pod-a"}}]
+    )
+    clock = MutableMonotonicClock(2000.0)
+    with (
+        TestClient(
+            _app(
+                RecordingEnergyService(),
+                source,
+                event_ticket_ttl_s=15.0,
+                event_ticket_clock=clock,
+            )
+        ) as client,
+    ):
+        ticket = _event_ticket(client)
+        with client.websocket_connect(
+            "/api/v1/events", subprotocols=["energypod-events", ticket]
+        ) as websocket:
+            assert websocket.accepted_subprotocol == "energypod-events"
+            assert websocket.receive_json()["type"] == "snapshot"
+            assert websocket.receive_json()["sequence"] == 21
+    assert source.subscriptions == [20]
+
+
+def test_event_ticket_is_consumed_at_the_handshake() -> None:
+    source = FakeEventSource()
+    clock = MutableMonotonicClock()
+    with (
+        TestClient(
+            _app(
+                RecordingEnergyService(),
+                source,
+                event_ticket_ttl_s=15.0,
+                event_ticket_clock=clock,
+            )
+        ) as client,
+    ):
+        ticket = _event_ticket(client)
+        with client.websocket_connect(
+            "/api/v1/events", subprotocols=["energypod-events", ticket]
+        ) as websocket:
+            assert websocket.receive_json()["type"] == "snapshot"
+        with (
+            pytest.raises(WebSocketDisconnect) as refused,
+            client.websocket_connect("/api/v1/events", subprotocols=["energypod-events", ticket]),
+        ):
+            raise AssertionError("a consumed ticket unexpectedly re-authenticated")
+        assert refused.value.code == 4401
+
+
+def test_expired_event_ticket_refuses_the_handshake() -> None:
+    source = FakeEventSource()
+    clock = MutableMonotonicClock(100.0)
+    with (
+        TestClient(
+            _app(
+                RecordingEnergyService(),
+                source,
+                event_ticket_ttl_s=5.0,
+                event_ticket_clock=clock,
+            )
+        ) as client,
+    ):
+        ticket = _event_ticket(client)
+        clock.now = 105.0  # exactly the TTL later: no longer valid
+        with (
+            pytest.raises(WebSocketDisconnect) as refused,
+            client.websocket_connect("/api/v1/events", subprotocols=["energypod-events", ticket]),
+        ):
+            raise AssertionError("an expired ticket unexpectedly authenticated")
+        assert refused.value.code == 4401
+        assert ticket not in str(refused.value)
+    assert source.subscriptions == []
+
+
+def test_handshake_without_a_ticket_still_accepts_the_authorization_header() -> None:
+    source = FakeEventSource()
+    with TestClient(_app(RecordingEnergyService(), source)) as client:
+        with client.websocket_connect(
+            "/api/v1/events", headers={"Authorization": "Bearer viewer-token"}
+        ) as websocket:
+            assert websocket.accepted_subprotocol is None
+            assert websocket.receive_json()["type"] == "snapshot"
+        # A subprotocol offer without a ticket still rides the header path and
+        # negotiates the offered energypod-events subprotocol.
+        with client.websocket_connect(
+            "/api/v1/events",
+            headers={"Authorization": "Bearer viewer-token"},
+            subprotocols=["energypod-events"],
+        ) as websocket:
+            assert websocket.accepted_subprotocol == "energypod-events"
+            assert websocket.receive_json()["type"] == "snapshot"
+    assert source.subscriptions == [20, 20]
+
+
+@pytest.mark.parametrize(
+    "offered",
+    [
+        ["energypod-events", "not-a-real-ticket"],
+        ["energypod-events", "candidate-one", "candidate-two"],
+    ],
+)
+def test_unknown_or_malformed_tickets_refuse_cleanly(offered: list[str]) -> None:
+    source = FakeEventSource()
+    with TestClient(_app(RecordingEnergyService(), source)) as client:
+        with (
+            pytest.raises(WebSocketDisconnect) as refused,
+            client.websocket_connect("/api/v1/events", subprotocols=offered),
+        ):
+            raise AssertionError("an invalid ticket offer unexpectedly authenticated")
+        assert refused.value.code in {1008, 4401}
+        assert not str(refused.value)
+    assert source.subscriptions == []
+
+
+def test_ticket_channel_still_prohibits_query_string_credentials() -> None:
+    source = FakeEventSource()
+    clock = MutableMonotonicClock()
+    with (
+        TestClient(
+            _app(
+                RecordingEnergyService(),
+                source,
+                event_ticket_ttl_s=15.0,
+                event_ticket_clock=clock,
+            )
+        ) as client,
+    ):
+        ticket = _event_ticket(client)
+        with (
+            pytest.raises((WebSocketDisconnect, WebSocketDenialResponse)) as refused,
+            client.websocket_connect(
+                f"/api/v1/events?access_token={ticket}",
+                subprotocols=["energypod-events", ticket],
+            ),
+        ):
+            raise AssertionError("a query-string credential unexpectedly authenticated")
+        assert getattr(refused.value, "code", None) in {1008, 4401}
+        assert ticket not in str(refused.value)
+        # The refused handshake never consumed the ticket nor leaked it: the
+        # same ticket still authenticates a clean subprotocol-only handshake.
+        with client.websocket_connect(
+            "/api/v1/events", subprotocols=["energypod-events", ticket]
+        ) as websocket:
+            assert websocket.receive_json()["type"] == "snapshot"
+    assert source.subscriptions == [20]

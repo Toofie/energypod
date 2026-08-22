@@ -88,8 +88,12 @@ class RecordingEnergyService:
             "control_readiness": {"ready": False, "reasons": ["units_disarmed"]},
         }
 
-    async def recent_audit(self, *, principal: Principal, limit: int) -> dict[str, Any]:
-        self.calls.append(("recent_audit", {"principal": principal, "limit": limit}))
+    async def recent_audit(
+        self, *, principal: Principal, limit: int, cursor: int | None = None
+    ) -> dict[str, Any]:
+        self.calls.append(
+            ("recent_audit", {"principal": principal, "limit": limit, "cursor": cursor})
+        )
         return {
             "events": [{"sequence": 7, "type": "intent.accepted", "request_id": "req-old"}],
             "next_cursor": None,
@@ -116,6 +120,15 @@ class RecordingEnergyService:
         self.calls.append(("arm", kwargs))
         return {"unit_ids": kwargs["unit_ids"], "status": "armed_idle"}
 
+    async def disarm(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("disarm", kwargs))
+        return {
+            "units": [
+                {"unit_id": unit_id, "status": "disarmed", "reason": "disarmed"}
+                for unit_id in kwargs["unit_ids"]
+            ]
+        }
+
     async def emergency_stop(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("emergency_stop", kwargs))
         return {"stop_id": "stop-server-1", "status": "latched"}
@@ -133,6 +146,16 @@ class RecordingEnergyService:
             "status": "acknowledged",
             "latch_cleared": True,
         }
+
+
+class MutableMonotonicClock:
+    """Injectable ticket clock: tests advance time deterministically."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = float(start)
+
+    def __call__(self) -> float:
+        return self.now
 
 
 class FakeEventSource:

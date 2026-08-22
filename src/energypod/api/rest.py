@@ -5,11 +5,15 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+import secrets
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
-from typing import Any, Literal, Protocol, cast
+from dataclasses import dataclass
+from threading import Lock
+from typing import Any, Final, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Query, Request, WebSocket, WebSocketException
@@ -22,6 +26,12 @@ from .idempotency import IdempotencyConflictError, IdempotencyCoordinator, Store
 
 API_PREFIX = "/api/v1"
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+
+EVENTS_SUBPROTOCOL = "energypod-events"
+# API_CONTRACTS: the browser event-stream ticket is single-use with a short
+# TTL (at most 30 s) bound to one principal and to the events stream only.
+_MAX_EVENT_TICKET_TTL_S: Final[float] = 30.0
+_DEFAULT_EVENT_TICKET_TTL_S: Final[float] = 15.0
 
 
 class Principal(Protocol):
@@ -38,9 +48,12 @@ class Authenticator(Protocol):
 class EnergyService(Protocol):
     async def snapshot(self, *, principal: Principal) -> dict[str, Any]: ...
     async def health(self, *, principal: Principal) -> dict[str, Any]: ...
-    async def recent_audit(self, *, principal: Principal, limit: int) -> dict[str, Any]: ...
+    async def recent_audit(
+        self, *, principal: Principal, limit: int, cursor: int | None = None
+    ) -> dict[str, Any]: ...
     async def submit_intent(self, **kwargs: Any) -> dict[str, Any]: ...
     async def arm(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def disarm(self, **kwargs: Any) -> dict[str, Any]: ...
     async def emergency_stop(self, **kwargs: Any) -> dict[str, Any]: ...
     async def acknowledge_emergency_stop(self, **kwargs: Any) -> dict[str, Any]: ...
     async def acknowledge_inhibit(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -86,6 +99,17 @@ class IntentRequest(StrictRequest):
 class ArmRequest(StrictRequest):
     unit_ids: list[str] = Field(min_length=1)
     confirmation: Literal["ARM"]
+
+    @field_validator("unit_ids")
+    @classmethod
+    def validate_units(cls, value: list[str]) -> list[str]:
+        return IntentRequest.validate_units(value)
+
+
+class DisarmRequest(StrictRequest):
+    # Disarming is safety-positive: no confirmation literal is demanded, so
+    # automation may always drive selected units back to the safe state.
+    unit_ids: list[str] = Field(min_length=1)
 
     @field_validator("unit_ids")
     @classmethod
@@ -196,6 +220,92 @@ def _error_response(error: BoundaryError, request_id: str) -> JSONResponse:
     )
 
 
+@dataclass(frozen=True)
+class _EventTicket:
+    """One single-use handshake credential bound to a principal."""
+
+    principal: Principal
+    expires_at_mono: float
+
+
+def _issue_event_ticket(
+    tickets: OrderedDict[str, _EventTicket],
+    lock: Lock,
+    clock: Callable[[], float],
+    ttl_s: float,
+    principal: Principal,
+) -> str:
+    """Mint one opaque ticket; expired leftovers are purged so the store stays bounded."""
+    now = float(clock())
+    ticket = secrets.token_urlsafe(32)
+    with lock:
+        for stale in [key for key, record in tickets.items() if record.expires_at_mono <= now]:
+            del tickets[stale]
+        tickets[ticket] = _EventTicket(principal=principal, expires_at_mono=now + ttl_s)
+    return ticket
+
+
+def _consume_event_ticket(
+    ticket: str,
+    tickets: dict[str, _EventTicket],
+    lock: Lock,
+    clock: Callable[[], float],
+) -> Principal:
+    """Redeem a ticket exactly once; an unknown, consumed, or expired ticket is no credential."""
+    now = float(clock())
+    with lock:
+        record = tickets.pop(ticket, None)
+    if record is None or now >= record.expires_at_mono:
+        raise BoundaryError(
+            401, "authentication_required", "A valid event-stream ticket is required"
+        )
+    return _validated_principal(record.principal)
+
+
+def _offered_subprotocols(websocket: WebSocket) -> list[str]:
+    offered = websocket.scope.get("subprotocols") or ()
+    if not isinstance(offered, list | tuple):
+        return []
+    return [item for item in offered if isinstance(item, str)]
+
+
+def _event_ticket_candidate(offered: list[str]) -> str | None:
+    """Extract the ticket from the documented ``energypod-events, <ticket>`` offer.
+
+    Only the exact two-token convention is the ticket channel: stray protocols
+    from non-browser clients never masquerade as credentials, and an offer
+    carrying more than one candidate is malformed rather than ambiguous.
+    """
+    if EVENTS_SUBPROTOCOL not in offered:
+        return None
+    candidates = [item for item in offered if item != EVENTS_SUBPROTOCOL]
+    if len(candidates) > 1:
+        raise BoundaryError(400, "malformed_subprotocol", "The event-stream handshake is malformed")
+    return candidates[0] if candidates else None
+
+
+async def _authenticate_events_handshake(
+    websocket: WebSocket,
+    authenticator: Authenticator,
+    tickets: OrderedDict[str, _EventTicket],
+    ticket_lock: Lock,
+    ticket_clock: Callable[[], float],
+) -> tuple[Principal, bool]:
+    """Authenticate by single-use ticket or Authorization header.
+
+    Returns the principal plus whether the ``energypod-events`` subprotocol
+    was offered and must be negotiated at accept.
+    """
+    offered = _offered_subprotocols(websocket)
+    ticket = _event_ticket_candidate(offered)
+    if ticket is not None:
+        return _consume_event_ticket(ticket, tickets, ticket_lock, ticket_clock), True
+    identity = await _authenticate_header(
+        _single_header(websocket.scope, b"authorization"), authenticator
+    )
+    return identity, EVENTS_SUBPROTOCOL in offered
+
+
 def create_api_app(
     *,
     service: EnergyService,
@@ -205,6 +315,8 @@ def create_api_app(
     websocket_queue_capacity: int = 128,
     trusted_websocket_origins: frozenset[str] | None = None,
     idempotency_capacity: int = 4096,
+    event_ticket_ttl_s: float = _DEFAULT_EVENT_TICKET_TTL_S,
+    event_ticket_clock: Callable[[], float] | None = None,
 ) -> FastAPI:
     """Create an isolated API adapter with no global mutable state."""
     if not auth_required:
@@ -215,12 +327,24 @@ def create_api_app(
         raise ValueError("idempotency_capacity must be positive")
     if trusted_websocket_origins is not None:
         _validate_configured_origins(trusted_websocket_origins)
+    if (
+        isinstance(event_ticket_ttl_s, bool)
+        or not isinstance(event_ticket_ttl_s, int | float)
+        or not math.isfinite(float(event_ticket_ttl_s))
+        or not 0.0 < float(event_ticket_ttl_s) <= _MAX_EVENT_TICKET_TTL_S
+    ):
+        raise ValueError("event_ticket_ttl_s must be positive and at most 30 seconds")
 
     app = FastAPI(title="EnergyPod guarded API", version="1.0.0")
     idempotency = IdempotencyCoordinator(max_completed_entries=idempotency_capacity)
     known_stops: OrderedDict[str, None] = OrderedDict()
     claimed_stops: set[str] = set()
     stop_lock = asyncio.Lock()
+    ticket_clock: Callable[[], float] = (
+        event_ticket_clock if event_ticket_clock is not None else time.monotonic
+    )
+    event_tickets: OrderedDict[str, _EventTicket] = OrderedDict()
+    ticket_lock = Lock()
 
     @app.middleware("http")
     async def correlate(request: Request, call_next: Callable[[Request], Awaitable[Any]]) -> Any:
@@ -332,9 +456,12 @@ def create_api_app(
     @app.get(f"{API_PREFIX}/audit")
     async def get_audit(
         limit: int = Query(default=100, ge=1, le=500),
+        after_sequence: int | None = Query(default=None, ge=0),
         identity: Principal = audit_dependency,
     ) -> Any:
-        return await service.recent_audit(principal=identity, limit=limit)
+        # ``after_sequence`` is the previous page's oldest-delivered cursor; the
+        # facade derives the next cursor from what the store returned.
+        return await service.recent_audit(principal=identity, limit=limit, cursor=after_sequence)
 
     @app.post(f"{API_PREFIX}/intents", status_code=202)
     async def submit_intent(
@@ -378,6 +505,31 @@ def create_api_app(
             payload=payload,
             status_code=200,
             invoke=lambda: service.arm(
+                unit_ids=payload["unit_ids"],
+                principal=identity,
+                idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                request_id=request.state.request_id,
+            ),
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.post(f"{API_PREFIX}/disarm")
+    async def disarm(
+        body: DisarmRequest,
+        request: Request,
+        identity: Principal = arm_dependency,
+    ) -> JSONResponse:
+        # Disarming is safety-positive: the arm scope applies, but unlike
+        # arming no interactive human principal is required to reach the
+        # safe state, so automation may always disarm.
+        payload = body.model_dump(mode="json")
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="disarm",
+            payload=payload,
+            status_code=200,
+            invoke=lambda: service.disarm(
                 unit_ids=payload["unit_ids"],
                 principal=identity,
                 idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
@@ -522,12 +674,24 @@ def create_api_app(
         )
         return JSONResponse(status_code=result.status_code, content=dict(result.body))
 
+    @app.post(f"{API_PREFIX}/events/session")
+    async def create_events_session(
+        identity: Principal = observe_dependency,
+    ) -> dict[str, Any]:
+        # Browsers cannot set an Authorization header on a WebSocket, so this
+        # mints one single-use, short-lived ticket bound to this principal and
+        # to the events stream only; it is a credential for nothing else.
+        ticket = _issue_event_ticket(
+            event_tickets, ticket_lock, ticket_clock, event_ticket_ttl_s, identity
+        )
+        return {"ticket": ticket, "expires_in_s": event_ticket_ttl_s}
+
     @app.websocket(f"{API_PREFIX}/events")
     async def events(websocket: WebSocket, after: int | None = Query(default=None, ge=0)) -> None:
         try:
             _reject_websocket_query_credentials(websocket)
-            identity = await _authenticate_header(
-                _single_header(websocket.scope, b"authorization"), authenticator
+            identity, offered_events_subprotocol = await _authenticate_events_handshake(
+                websocket, authenticator, event_tickets, ticket_lock, ticket_clock
             )
             if "observe" not in identity.scopes:
                 raise BoundaryError(403, "insufficient_scope", "The credential lacks permission")
@@ -535,7 +699,9 @@ def create_api_app(
         except BoundaryError as exc:
             raise WebSocketException(code=4401 if exc.status == 401 else 1008) from exc
 
-        await websocket.accept()
+        await websocket.accept(
+            subprotocol=EVENTS_SUBPROTOCOL if offered_events_subprotocol else None
+        )
         request_id = _request_id(_single_header(websocket.scope, b"x-request-id"))
         try:
             snapshot = await service.snapshot(principal=identity)
