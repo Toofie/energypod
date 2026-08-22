@@ -89,6 +89,11 @@ from energypod.application.arbiter import STOP_ACKNOWLEDGE_SCOPE, IntentArbiter
 from energypod.application.audit import AuditEventFactory
 from energypod.application.control_kernel import ControlKernel
 from energypod.application.events import EventBus
+from energypod.application.excess_charge import (
+    ExcessChargeAdviser,
+    ExcessChargeSettings,
+    eligible_export_charge_w,
+)
 from energypod.application.generation import AuthorityGenerationCoordinator
 from energypod.application.safety import SafetyKernel
 from energypod.application.service import EnergyServiceFacade
@@ -96,6 +101,7 @@ from energypod.domain import (
     ControlPolicy,
     DataQuality,
     Direction,
+    IntentSource,
     Observation,
     UnitHeadroom,
     UnitLifecycle,
@@ -155,6 +161,7 @@ _RUN_MODE_STABLE_SAMPLES_REQUIRED = 2**63 - 1
 # section 5): the common system block, the IoT BMS block, the three IoT
 # fault/status blocks, and the cell blocks whose counts follow the BIC count.
 _SYSTEM_BLOCK_BASE = 0x0100
+_PCS_LIVE_BLOCK_BASE = 0x1000
 _BMS_BLOCK_BASE = 0x5000
 _PCS_FAULT_BLOCK_BASE = 0x1040
 _DCDC_FAULT_BLOCK_BASE = 0x2040
@@ -175,6 +182,16 @@ _DEV_PRINCIPAL_SUBJECT = "dev:simulator"
 _DEV_PRINCIPAL_SCOPES = frozenset(
     {"observe", "audit:read", "dispatch", "arm", "stop", "stop:acknowledge"}
 )
+
+# API_CONTRACTS "Excess-solar accelerated charging (advisory)": the composed
+# automation principal the excess-charge adviser submits under.  Audit
+# attribution relies on principal plus the ``optimizer`` source tag — local
+# console and agent traffic is ``operator:local`` + ``manual``/``agent``, so
+# the adviser is always distinguishable.  Non-interactive, site-bound, and
+# holding nothing beyond what an ordinary dispatch needs: the adviser has no
+# special authority anywhere.
+_EXCESS_ADVISER_PRINCIPAL_SUBJECT = "energypod:excess-adviser"
+_EXCESS_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 
 
 class Clock(Protocol):
@@ -657,19 +674,43 @@ class _FleetProposal:
     intent_expires_at_mono: float
     reactive_vars: int = 0
     generation: int = 0
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": only the
+    # allocator's optimizer-charge proposals carry the export-bounded flag,
+    # which is what arms the kernel's fleet-wide export-evidence denial.
+    export_bounded: bool = False
 
 
 class _FleetAllocatorAdapter:
     """Adapt the deterministic domain allocator to the kernel's allocator port."""
 
     def allocate(
-        self, intent: Any, observations: Mapping[str, Any], policy: ControlPolicy
+        self,
+        intent: Any,
+        observations: Mapping[str, Any],
+        policy: ControlPolicy,
+        now_mono: float,
     ) -> tuple[_FleetProposal, ...]:
+        export_cap_w: int | None = None
+        export_bounded = False
+        if (
+            getattr(intent, "source", None) is IntentSource.OPTIMIZER
+            and intent.direction is Direction.CHARGE
+        ):
+            # API_CONTRACTS "Excess-solar accelerated charging (advisory)":
+            # for an OPTIMIZER charge intent the measured-export bound is one
+            # additional min() term on the allocation demand — computed from
+            # the fleet observations and policy the allocator already
+            # receives, fail-closed to 0 (an all-zero allocation, which stays
+            # a legitimate representation) on any missing/bad/stale grid
+            # evidence or an unarmed policy triple.  No other source or
+            # direction is ever export-bounded.
+            export_cap_w = eligible_export_charge_w(observations, policy, now_mono)
+            export_bounded = True
         selected = sorted(intent.selected_unit_ids)
         headrooms = tuple(
             self._headroom(unit_id, observations.get(unit_id), policy) for unit_id in selected
         )
-        allocation = allocate_fleet_power(intent, headrooms)
+        allocation = allocate_fleet_power(intent, headrooms, export_cap_w=export_cap_w)
         return tuple(
             _FleetProposal(
                 unit_id=unit_id,
@@ -677,6 +718,7 @@ class _FleetAllocatorAdapter:
                 watts=int(allocation.allocations[unit_id]),
                 intent_id=intent.id,
                 intent_expires_at_mono=float(intent.expires_at_mono),
+                export_bounded=export_bounded,
             )
             for unit_id in selected
         )
@@ -973,6 +1015,7 @@ class _LiveDecodeTelemetry:
         expected_cell_count: int,
         probe_address: int,
         probe_count: int,
+        promote_pcs_live_block: bool = False,
     ) -> None:
         if expected_profile != register_layout.ProtocolLayout.IOT.value:
             # The evidenced live decode covers the deployed IoT register plan
@@ -991,6 +1034,14 @@ class _LiveDecodeTelemetry:
         self._expected_profile = expected_profile
         self._expected_cell_count = expected_cell_count
         self._probe_window = (probe_address, probe_count)
+        # API_CONTRACTS "Excess-solar accelerated charging (advisory)": with
+        # the feature enabled the PCS live block (grid at +17, load at +20,
+        # PROTOCOL_EVIDENCE 4c) is promoted from the cold ring into the
+        # control-rate core so grid_power_w refreshes every telemetry cycle
+        # inside export_telemetry_max_age_s.  The plan stays inside the
+        # commissioned cadence budget (steady state <= 8 windows plus the
+        # probe, bootstrap <= 10).
+        self._promote_pcs_live_block = bool(promote_pcs_live_block)
         self._catalog = register_layout.RegisterCatalog()
         self._sequence = itertools.count(1)
         self._probe: register_layout.LayoutProbe | None = None
@@ -1029,14 +1080,15 @@ class _LiveDecodeTelemetry:
         """This cycle's windows under the commissioned tiered refresh.
 
         Every cycle: the BMS block and the three IoT fault blocks (everything
-        the safety kernel consumes at the control rate) plus temperatures.
-        Every third cycle: the cell-voltage window (the domain already models
-        cells on their own slower capture clock; the policy's cell-age bound
-        covers the tier).  First cycle: the stable identity pair, cached for
-        the process lifetime.  Every eighth cycle: one cold-ring window
-        (PCS/DCDC detail, system overview, parameters, balance, energy) so
-        the unit-detail surface stays populated without threatening the
-        renewal cadence.
+        the safety kernel consumes at the control rate) plus temperatures —
+        and, with the excess-solar feature enabled, the PCS live block so the
+        advisory grid word rides the control rate.  Every third cycle: the
+        cell-voltage window (the domain already models cells on their own
+        slower capture clock; the policy's cell-age bound covers the tier).
+        First cycle: the stable identity pair, cached for the process
+        lifetime.  Every eighth cycle: one cold-ring window (PCS/DCDC detail,
+        system overview, parameters, balance, energy) so the unit-detail
+        surface stays populated without threatening the renewal cadence.
         """
         probe = self._probe_require()
         full = [
@@ -1058,6 +1110,8 @@ class _LiveDecodeTelemetry:
             # slow ring refresh.
             _IDENTITY_BLOCK_BASE,
         }
+        if self._promote_pcs_live_block:
+            core_bases.add(_PCS_LIVE_BLOCK_BASE)
         plan = [(base, by_base[base]) for base in sorted(core_bases) if base in by_base]
         if _CELL_VOLTAGE_BASE in by_base and self._cycle % 3 == 1:
             plan.append((_CELL_VOLTAGE_BASE, by_base[_CELL_VOLTAGE_BASE]))
@@ -1069,7 +1123,11 @@ class _LiveDecodeTelemetry:
             if base not in core_bases | {_CELL_VOLTAGE_BASE, _SYSTEM_BLOCK_BASE}
         )
         if cold and self._cycle % 8 == 0:
-            chosen = cold[(self._cycle // 8) % len(cold)]
+            # The rotation starts at the PCS live block: with the feature
+            # disabled that keeps the advisory grid word inside the FIRST
+            # cold-ring refresh of any observation window (and the ring's
+            # ~108 s period unchanged), instead of its old last-place slot.
+            chosen = cold[((self._cycle // 8) - 1) % len(cold)]
             plan.append((chosen, by_base[chosen]))
         return tuple(plan)
 
@@ -1206,6 +1264,23 @@ class _DevelopmentPrincipal:
     site_id: str
 
 
+@dataclass(slots=True)
+class _AdvisoryPrincipal:
+    """The composed excess-charge automation principal (API_CONTRACTS).
+
+    ``energypod:excess-adviser``: observe + dispatch only, non-interactive,
+    site-bound.  It exists so the adviser's intents are attributable in the
+    audit trail distinct from every human console and agent writer; it holds
+    no scope the advisory path does not need and no interactive capability
+    at all.
+    """
+
+    subject: str
+    scopes: frozenset[str]
+    interactive: bool
+    site_id: str
+
+
 def _announce_dev_credential_to_stdout(token: str) -> None:
     """The default startup sink: print the token once (API_CONTRACTS)."""
     print(f"energypod simulate: development principal bearer token: {token}")
@@ -1316,6 +1391,7 @@ class _Supervision:
         actors: tuple[EnergyPodActor, ...],
         authorizations: _AsyncAuthorizationRepository,
         coordinator: AuthorityGenerationCoordinator,
+        adviser: ExcessChargeAdviser | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -1325,6 +1401,7 @@ class _Supervision:
         self._actors = actors
         self._authorizations = authorizations
         self._coordinator = coordinator
+        self._adviser = adviser
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
@@ -1447,9 +1524,7 @@ class _Supervision:
                         # poll — authority lapses and the device watchdog
                         # stops power. TimeoutError is an Exception, so the
                         # suppress above already swallows it.
-                        await asyncio.wait_for(
-                            actor.heartbeat_once(), timeout=self._interval_s
-                        )
+                        await asyncio.wait_for(actor.heartbeat_once(), timeout=self._interval_s)
                 except asyncio.CancelledError:
                     # A facade fence (emergency stop) cancels in-flight
                     # authority work; that borrowed cancellation must not end
@@ -1468,6 +1543,17 @@ class _Supervision:
                 *(self._bounded_poll(actor) for actor in self._actors),
                 return_exceptions=True,
             )
+            if self._adviser is not None:
+                # API_CONTRACTS "Excess-solar accelerated charging
+                # (advisory)": one bounded advisory renewal per fleet cycle,
+                # after the polls (so it reasons over fresh evidence) and
+                # before the kernel tick (so a renewed intent is arbitrated
+                # this same cycle).  An advisory failure is survivable per
+                # cycle — the intent TTL lapse plus the firmware watchdog
+                # are the designed hand-back — and never halts the fleet.
+                # CancelledError is a BaseException and is never swallowed.
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self._adviser.tick(), timeout=self._interval_s)
             # A kernel tick that overruns the interval is a component failure,
             # not a survivable per-unit fault. Cancelling it is safe — the
             # kernel's BaseException path revokes authority first (shielded)
@@ -1596,6 +1682,18 @@ def _control_policy(config: ControllerConfig) -> ControlPolicy:
     """
     heartbeat_interval_s = float(config.timing.control_period_s)
     cell_counts = {unit.unit_id: unit.expected_cell_count for unit in config.units}
+    excess = config.excess_charging
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": an
+    # enabled block arms the all-or-none export triple so the allocator's
+    # optimizer-charge bound has a cap, margin, and freshness bound to work
+    # with; a disabled or absent block arms nothing and the bound is 0.
+    export_limit_w: int | None = None
+    export_margin_w: int | None = None
+    export_age_s: float | None = None
+    if excess is not None and excess.enabled:
+        export_limit_w = excess.max_charge_from_export_w
+        export_margin_w = excess.export_headroom_margin_w
+        export_age_s = excess.export_telemetry_max_age_s
     configured = config.policy
     if configured is None:
         # Observe-only deployments configure no control policy.  The kernel
@@ -1677,6 +1775,9 @@ def _control_policy(config: ControllerConfig) -> ControlPolicy:
         stable_samples_needed_to_rearm=configured.stable_samples_to_rearm,
         blocking_fault_codes=frozenset(configured.blocking_fault_codes),
         blocking_warning_codes=frozenset(),
+        export_charge_limit_w=export_limit_w,
+        export_headroom_margin_w=export_margin_w,
+        export_telemetry_max_age_s=export_age_s,
     )
 
 
@@ -1713,6 +1814,9 @@ class ComposedRuntime:
     app: FastAPI
     mcp_server_factory: Callable[..., FastMCP]
     simulators: Mapping[str, SimulatedEnergyPod] | None
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": composed
+    # only when the configuration enables the feature; None otherwise.
+    excess_adviser: ExcessChargeAdviser | None = None
 
 
 def _simulator_pod(
@@ -1900,6 +2004,12 @@ def _build_runtime(
 
     # --- control authority -------------------------------------------------
     policy = _control_policy(config)
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": an
+    # enabled block arms the policy's export triple, promotes the PCS live
+    # block into the control-rate read plan, and composes the adviser below;
+    # a disabled or absent block changes nothing anywhere (the default).
+    excess_config = config.excess_charging
+    excess_enabled = excess_config is not None and excess_config.enabled
     audit_event_factory = AuditEventFactory(
         process_instance_id=process_instance_id,
         process_origin_mono=process_origin_mono,
@@ -1982,6 +2092,7 @@ def _build_runtime(
                 expected_cell_count=unit.expected_cell_count,
                 probe_address=probe.address,
                 probe_count=probe.count,
+                promote_pcs_live_block=excess_enabled,
             )
         actors[unit.unit_id] = EnergyPodActor(
             unit_id=unit.unit_id,
@@ -2038,6 +2149,46 @@ def _build_runtime(
         actors={unit_id: _ActorCommandHandle(actor) for unit_id, actor in actors.items()},
     )
 
+    # --- excess-solar advisory composition ---------------------------------
+    excess_adviser: ExcessChargeAdviser | None = None
+    if excess_enabled and excess_config is not None:
+        # The adviser is composed exactly when the feature is enabled, under
+        # the composed automation principal, driving the facade's internal
+        # advisory submission (never REST/MCP).  Everything downstream is the
+        # existing arbiter -> allocator -> SafetyKernel -> per-unit authority
+        # path; the adviser holds no special authority anywhere.
+        adviser_principal = _AdvisoryPrincipal(
+            subject=_EXCESS_ADVISER_PRINCIPAL_SUBJECT,
+            scopes=_EXCESS_ADVISER_PRINCIPAL_SCOPES,
+            interactive=False,
+            site_id=config.site.site_id,
+        )
+
+        async def _submit_advisory_intent(
+            *, unit_ids: Any, direction: Any, watts: Any, ttl_s: Any
+        ) -> Any:
+            return await facade.submit_advisory_intent(
+                unit_ids=unit_ids,
+                direction=direction,
+                watts=watts,
+                ttl_s=ttl_s,
+                principal=adviser_principal,
+            )
+
+        excess_adviser = ExcessChargeAdviser(
+            settings=ExcessChargeSettings(
+                assumed_autonomous_charge_w=excess_config.assumed_autonomous_charge_w,
+                min_acceleration_w=excess_config.min_acceleration_w,
+                exit_hysteresis_w=excess_config.exit_hysteresis_w,
+                intent_ttl_s=excess_config.intent_ttl_s,
+            ),
+            policy=policy,
+            clock=resolved_clock,
+            observations=observation_port,
+            intents=intent_port,
+            submit=_submit_advisory_intent,
+        )
+
     def mcp_server_factory(*, principal: Any) -> FastMCP:
         # MCP is read-only by default: dispatch needs explicit configuration
         # plus a separately issued automation credential (API_CONTRACTS).
@@ -2091,6 +2242,7 @@ def _build_runtime(
         actors=tuple(actors.values()),
         authorizations=authorization_port,
         coordinator=coordinator,
+        adviser=excess_adviser,
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision
@@ -2114,6 +2266,7 @@ def _build_runtime(
         app=app,
         mcp_server_factory=mcp_server_factory,
         simulators=simulators,
+        excess_adviser=excess_adviser,
     )
 
 

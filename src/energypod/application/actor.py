@@ -15,9 +15,18 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Final
 
-from energypod.domain import UnitLifecycle
+from energypod.domain import Observation, UnitLifecycle
 
 from .generation import AuthorityGenerationCoordinator
+
+# API_CONTRACTS "Excess-solar accelerated charging (advisory)": the advisory
+# CT power words (grid/load at PCS 0x1000+17/+20) ride the observation's
+# quality map but stay OUTSIDE every ordinary quality judgment.  Qualifying
+# a unit is exactly such an ordinary decision: a read plan that does not
+# serve the PCS block (advisory MISSING) must never keep a unit from
+# qualifying, and the advisory words gate their own fail-closed export
+# bound instead.
+_SAFETY_QUALITY_FIELDS: Final[frozenset[str]] = Observation.QUALITY_FIELDS
 
 _HEARTBEAT_PRIORITY: Final = 0
 _CONTROL_PRIORITY: Final = 10
@@ -521,11 +530,15 @@ class EnergyPodActor:
             # instead of a bare flag; incomplete safety data never qualifies.
             complete = getattr(observation, "safety_data_complete", False)
         quality = getattr(observation, "quality", None)
-        quality_values = getattr(quality, "values", None)
-        if callable(quality_values):
-            # A quality map (domain Observation): every telemetry field must
-            # be good, and an empty map is the absence of evidence, not proof.
-            values = tuple(quality_values())
+        quality_items = getattr(quality, "items", None)
+        if callable(quality_items):
+            # A quality map (domain Observation): every SAFETY-CRITICAL
+            # telemetry field must be good — the advisory CT fields stay
+            # outside this judgment (see _SAFETY_QUALITY_FIELDS) — and an
+            # empty judgment is the absence of evidence, not proof.
+            values = tuple(
+                value for field, value in quality_items() if field in _SAFETY_QUALITY_FIELDS
+            )
             quality_ok = bool(values) and all(
                 getattr(value, "value", value) == "good" for value in values
             )

@@ -153,9 +153,14 @@ class Allocator:
     def __init__(self, output: tuple[Proposal, ...], history: list[str]):
         self.output, self.history, self.calls = output, history, []
 
-    def allocate(self, intent: Any, observations: Any, policy: Any) -> Any:
+    def allocate(
+        self, intent: Any, observations: Any, policy: Any, now_mono: Any = None
+    ) -> Any:
+        # The allocator port carries the tick's monotonic time (the
+        # export bound's freshness input); the fake records it without
+        # asserting on it.
         self.history.append("allocate")
-        self.calls.append((intent, observations, policy))
+        self.calls.append((intent, observations, policy, now_mono))
         return self.output
 
 

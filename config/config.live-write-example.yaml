@@ -140,3 +140,35 @@ authentication:
 storage:
   database_path: var/live-write.sqlite3
   busy_timeout_ms: 250
+
+# Excess-solar accelerated charging (advisory) — DEFAULT OFF.  An absent
+# block is identical to `enabled: false`: no adviser is composed, the policy
+# gains no export triple, no register tier is promoted, nothing changes.
+#
+# The feature is an ADVISER: it submits ordinary short-TTL `optimizer`
+# charge intents under the composed automation principal
+# `energypod:excess-adviser` (audit-attributable, never on REST/MCP), the
+# deterministic bound is one additional min() term in the allocator
+# (min(max_charge_from_export_w, max(0, fleet grid export - margin)),
+# collapsing to 0 on any missing/bad/stale per-pod grid word at PCS
+# 0x1000+17), and hand-back to each pod's own CT-following autonomy is by
+# non-renewal only — the TTL lapse plus the ~3.5-4.0 s firmware watchdog.
+# A manual or agent intent always displaces it (arbiter priority).
+#
+# Commissioning gates (refused at validation time otherwise): write_enabled
+# mode with a policy; max_charge_from_export_w <= policy.max_unit_charge_w;
+# export_telemetry_max_age_s > control_period_s + essential_read_timeout_s;
+# exit_hysteresis_w < min_acceleration_w; 0 < intent_ttl_s <= 300 and
+# > control_period_s.  The values below are the commissioned defaults; the
+# NET-BILLING assumption (site billing netted across phases) must be
+# operator-confirmed before production enablement.
+#
+# excess_charging:
+#   enabled: false
+#   export_headroom_margin_w: 200
+#   max_charge_from_export_w: 2500
+#   export_telemetry_max_age_s: 3.0
+#   assumed_autonomous_charge_w: 520
+#   min_acceleration_w: 100
+#   exit_hysteresis_w: 50
+#   intent_ttl_s: 10.0

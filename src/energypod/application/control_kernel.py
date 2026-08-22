@@ -139,7 +139,11 @@ class ControlKernel:
                 await self._revoke("no_active_intent")
                 return None
 
-            proposals = tuple(self._allocator.allocate(winner, current, self._policy))
+            # API_CONTRACTS "Excess-solar accelerated charging (advisory)":
+            # the allocator receives the tick's own monotonic time so the
+            # export bound judges grid-evidence freshness at the moment of
+            # allocation, exactly as the kernel's staleness checks do.
+            proposals = tuple(self._allocator.allocate(winner, current, self._policy, issued_at))
             if not self._proposals_match_intent(winner, proposals):
                 raise ValueError("allocator output does not match the selected intent")
             decision = self._safety.evaluate(proposals, current, previous, self._policy, issued_at)
