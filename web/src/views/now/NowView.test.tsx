@@ -1424,3 +1424,92 @@ describe("NowView — snapshot adoption is guarded by sequence", () => {
     expect(still.textContent ?? "").not.toMatch(/900/);
   });
 });
+
+// --- live-update regression pins (2026-08-23 incident) -----------------------
+//
+// The snapshot frame arrives exactly once per connection (rest.py); the
+// per-cycle observation.published frames are the live freshness signal
+// (composition.py). Now once computed "…s ago" from the mount-time snapshot,
+// so the figure climbed past minutes while the pod was publishing fine. These
+// pin the corrected binding and the controller-restart adoption.
+
+describe("NowView — live observations keep the actual age current", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("resets the actual-age when an observation arrives and keeps ticking from it", async () => {
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+    });
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([{ ...ACTIVE_MID, telemetry_age_s: 10 }]),
+    );
+    const channel = liveChannel([
+      { type: "snapshot", sequence: 41, data: snapshotEnvelope([{ ...ACTIVE_MID, telemetry_age_s: 10 }]) },
+    ]);
+    api.client.openEvents.mockImplementation(() => channel.openEvents());
+
+    renderNow();
+    const actual = await screen.findByRole("group", { name: "Actual" });
+    expect(actual.textContent ?? "").toMatch(/10 s ago/);
+
+    // The pod just published: the measurement is fresh NOW, so the age
+    // restarts from zero instead of climbing to 11, 12…
+    channel.push({
+      type: "observation.published",
+      sequence: 42,
+      occurred_at: "2026-08-22T12:00:10+10:00",
+      payload: { unit_id: "MID", connection_epoch: 3, sequence: 420 },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("group", { name: "Actual" }).textContent ?? "").toMatch(/[0-2] s ago/);
+    });
+
+    // And it keeps ticking from the observation — the healthy sawtooth.
+    act(() => {
+      vi.advanceTimersByTime(4000);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("group", { name: "Actual" }).textContent ?? "").toMatch(/[3-6] s ago/);
+    });
+  });
+
+  it("adopts the renumbered snapshot after a controller restart instead of freezing the pre-restart picture", async () => {
+    const before = snapshotEnvelope([ACTIVE_MID], 42);
+    const after = snapshotEnvelope(
+      [
+        {
+          ...ACTIVE_MID,
+          requested_power: { direction: "charge", watts: 700 },
+        },
+      ],
+      5,
+    );
+    let connections = 0;
+    api.client.getSnapshot.mockResolvedValue(before);
+    api.client.openEvents.mockImplementation(() => {
+      connections += 1;
+      if (connections === 1) {
+        // Healthy, then the controller process is swapped: the socket dies.
+        return endingStream([{ type: "snapshot", sequence: 42, data: before }]);
+      }
+      // The resume carries the pre-restart cursor; the restarted service
+      // answers with its renumbered world (sequence 5 < 42).
+      return liveStream([{ type: "snapshot", sequence: 5, data: after }]);
+    });
+
+    renderNow();
+    const requested = await screen.findByRole("group", { name: "Requested" });
+    expect(requested.textContent ?? "").toMatch(/1,?500\s*W/);
+
+    // The reconnect lands the new world: never a frozen pre-restart picture.
+    await waitFor(
+      () => {
+        expect(screen.getByRole("group", { name: "Requested" }).textContent ?? "").toMatch(/700 W/);
+      },
+      { timeout: 5000 },
+    );
+  });
+});

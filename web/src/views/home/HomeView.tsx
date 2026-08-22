@@ -41,6 +41,17 @@
  *   both latch frames.
  * - Displayed ages are the captured `telemetry_age_s` plus elapsed monotonic
  *   time: an age that never grows is a frozen reading, not a current one.
+ *   The service sends its snapshot frame exactly once per connection
+ *   (rest.py), so the per-cycle liveness the operator should see comes from
+ *   `observation.published` frames (composition.py publishes one per telemetry
+ *   append): each observation for a unit resets that unit's displayed age to
+ *   the moment the reading landed (the healthy sawtooth), and the captured
+ *   `telemetry_age_s` plus elapsed time is only the fallback used until the
+ *   first observation for that unit arrives in this session. A resumed
+ *   connection's first snapshot whose sequence is LOWER than the picture on
+ *   screen is a controller restart that renumbered the sequence space from
+ *   zero — it is adopted, never refused, so a restart cannot leave the
+ *   pre-restart picture frozen on screen.
  */
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
@@ -59,6 +70,12 @@ const FRESHNESS_BOUND_S = 60;
 const RECONNECT_BASE_DELAY_MS = 400;
 const RECONNECT_MAX_DELAY_MS = 5000;
 const AGE_TICK_MS = 1000;
+/**
+ * Past this long without any fresh reading (no observation, no new snapshot)
+ * while the connection claims to be live, the picture is flagged stale: a
+ * climbing age must be unmistakable from the healthy sawtooth.
+ */
+const FRESH_DATA_BOUND_S = 10;
 
 /** A monotonic reading: displayed ages must never run backwards. */
 function monotonicNowMs(): number {
@@ -67,7 +84,13 @@ function monotonicNowMs(): number {
     : Date.now();
 }
 
-/** A ticking "now", mounted only while an on-screen value depends on elapsed time. */
+/**
+ * A ticking "now", mounted only while an on-screen value depends on elapsed
+ * time. A backgrounded tab gets its timers throttled by the browser, so the
+ * tick also re-reads the clock the moment the tab becomes visible or focused
+ * again: the first render the operator sees after coming back carries the true
+ * age, never the frozen number the throttled interval last painted.
+ */
 function useTickingNow(enabled: boolean): number {
   const [nowMs, setNowMs] = useState(monotonicNowMs);
   useEffect(() => {
@@ -77,8 +100,17 @@ function useTickingNow(enabled: boolean): number {
     const timer = window.setInterval(() => {
       setNowMs(monotonicNowMs());
     }, AGE_TICK_MS);
+    const refreshNow = (): void => {
+      if (document.visibilityState === "visible") {
+        setNowMs(monotonicNowMs());
+      }
+    };
+    document.addEventListener("visibilitychange", refreshNow);
+    window.addEventListener("focus", refreshNow);
     return () => {
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshNow);
+      window.removeEventListener("focus", refreshNow);
     };
   }, [enabled]);
   return nowMs;
@@ -268,12 +300,15 @@ function isStale(ageSeconds: number | null): boolean {
   return ageSeconds !== null && ageSeconds > FRESHNESS_BOUND_S;
 }
 
-function dataAgeText(ageSeconds: number | null): string {
+function dataAgeText(ageSeconds: number | null, updatesPaused: boolean): string {
   if (ageSeconds === null) {
     return "Data age: not available (telemetry missing)";
   }
   if (ageSeconds > FRESHNESS_BOUND_S) {
     return `Data age: ${ageSeconds} s old — this reading is stale`;
+  }
+  if (updatesPaused) {
+    return `Data age: ${ageSeconds} s old — updates have paused; this reading may be stale`;
   }
   return `Data age: ${ageSeconds} s`;
 }
@@ -419,6 +454,13 @@ export function HomeView({ client }: HomeViewProps) {
   const [urgentNotice, setUrgentNotice] = useState("");
   const [expandedFactors, setExpandedFactors] = useState<Record<string, boolean>>({});
   const [reloadNonce, setReloadNonce] = useState(0);
+  /**
+   * The monotonic moment each unit's latest `observation.published` landed.
+   * The service snapshots once per connection, so these per-cycle frames are
+   * the live freshness signal: a unit's displayed age sawtooths from its own
+   * last observation instead of climbing from the connect-time snapshot.
+   */
+  const [observations, setObservations] = useState<Record<string, number>>({});
   const lastSequenceRef = useRef<number | undefined>(undefined);
   // The sequence of the picture on screen (adoption guard) and the monotonic
   // marker the displayed ages tick from.
@@ -439,21 +481,33 @@ export function HomeView({ client }: HomeViewProps) {
     let cancelled = false;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let reconnectAttempt = 0;
+    setObservations({});
 
     /**
      * The single adoption path, guarded by sequence: a snapshot that does not
      * advance the picture on screen (the shell republishes its latest snapshot
      * frame to every newly mounted view; a REST read can resolve after a newer
-     * stream frame) never replaces a newer world.
+     * stream frame) never replaces a newer world. The one sanctioned regression
+     * is a controller restart, which renumbers the sequence space from zero: a
+     * resumed connection's first snapshot whose sequence is lower than the
+     * picture on screen is the new world, not an old one.
      */
-    const applySnapshot = (value: unknown, sequence: number | null): boolean => {
+    const applySnapshot = (
+      value: unknown,
+      sequence: number | null,
+      allowRenumber = false,
+    ): boolean => {
       const parsed = readSnapshot(value);
       if (parsed === null) {
         return false;
       }
       const incoming = sequence ?? parsed.snapshot_sequence;
       const current = adoptedSequenceRef.current;
-      if (current !== null && incoming <= current) {
+      if (
+        current !== null &&
+        incoming <= current &&
+        !(allowRenumber && incoming < current)
+      ) {
         return false;
       }
       adoptedSequenceRef.current = incoming;
@@ -631,6 +685,12 @@ export function HomeView({ client }: HomeViewProps) {
       if (cancelled) {
         return;
       }
+      // A connection opened with a cursor is a resume: its first snapshot may
+      // carry a renumbered (lower) sequence after a controller restart. A
+      // later frame on the SAME connection with a lower sequence is a stale
+      // republish, never a restart — it stays refused.
+      const resumed = cursor !== undefined;
+      let firstSnapshot = true;
       try {
         const stream = client.openEvents(cursor);
         for await (const frame of stream) {
@@ -656,11 +716,43 @@ export function HomeView({ client }: HomeViewProps) {
             }
             return;
           }
+          if (frame.type === "observation.published") {
+            // The per-cycle liveness frame (composition.py publishes one per
+            // telemetry append): it carries no readings, but it proves this
+            // unit's data just landed, so the unit's displayed age restarts
+            // from now instead of climbing from the connect-time snapshot.
+            const payload: unknown = frame.payload;
+            const unitId =
+              payload !== null &&
+              typeof payload === "object" &&
+              typeof (payload as Record<string, unknown>).unit_id === "string"
+                ? ((payload as Record<string, unknown>).unit_id as string)
+                : null;
+            if (unitId !== null) {
+              const at = monotonicNowMs();
+              setObservations((previous) =>
+                previous[unitId] === at ? previous : { ...previous, [unitId]: at },
+              );
+            }
+            setConnection("live");
+            if (typeof frame.sequence === "number") {
+              lastSequenceRef.current = Math.max(
+                lastSequenceRef.current ?? frame.sequence,
+                frame.sequence,
+              );
+            }
+            continue;
+          }
           if (frame.type === "snapshot") {
             if (typeof frame.sequence === "number") {
               lastSequenceRef.current = frame.sequence;
             }
-            applySnapshot(frame.data, typeof frame.sequence === "number" ? frame.sequence : null);
+            applySnapshot(
+              frame.data,
+              typeof frame.sequence === "number" ? frame.sequence : null,
+              resumed && firstSnapshot,
+            );
+            firstSnapshot = false;
             setConnection("live");
             continue;
           }
@@ -745,10 +837,34 @@ export function HomeView({ client }: HomeViewProps) {
 
   // Data ages are captured values plus elapsed monotonic time: without the
   // tick, every "Data age: N s" line would freeze at the value the snapshot
-  // arrived with and read as current forever.
-  const needsAgeTick = snapshot?.units.some((unit) => unit.telemetry_age_s !== null) ?? false;
+  // arrived with and read as current forever. Once a unit's own
+  // observation.published frames have been seen, that unit's age ticks from
+  // its latest observation instead (the healthy sawtooth).
+  const needsAgeTick =
+    (snapshot?.units.some((unit) => unit.telemetry_age_s !== null) ?? false) ||
+    Object.keys(observations).length > 0;
   const nowMs = useTickingNow(needsAgeTick);
   const ageTickS = Math.max(0, (nowMs - capturedAtRef.current) / 1000);
+  /** A unit's displayed data age: from its own last observation once seen. */
+  const unitAgeSeconds = (unit: UnitView): number | null => {
+    if (unit.telemetry_age_s === null) {
+      return null;
+    }
+    const observedAt = observations[unit.unit_id];
+    if (observedAt !== undefined) {
+      return Math.max(0, Math.floor((nowMs - observedAt) / 1000));
+    }
+    return Math.floor(unit.telemetry_age_s + ageTickS);
+  };
+  // Staleness of the picture itself: while the connection claims to be live,
+  // no fresh reading (no observation, no new snapshot) for the bound means the
+  // numbers on screen may no longer be current — a climbing age must never
+  // read as a healthy live view.
+  const freshestObservationMs =
+    Object.keys(observations).length > 0 ? Math.max(...Object.values(observations)) : null;
+  const lastFreshDataMs = freshestObservationMs ?? capturedAtRef.current;
+  const secondsSinceFreshData = (nowMs - lastFreshDataMs) / 1000;
+  const dataStale = connection === "live" && secondsSinceFreshData > FRESH_DATA_BOUND_S;
 
   const liveRegion = (
     <p role="status" aria-live="polite" className="home-live-region">
@@ -842,6 +958,12 @@ export function HomeView({ client }: HomeViewProps) {
         <p role="status" className={`home-connection home-connection--${connection}`}>
           {connectionText(connection)}
         </p>
+        {dataStale && (
+          <p role="status" className="home-connection home-connection--stale">
+            No fresh readings for {Math.floor(secondsSinceFreshData)} s — the numbers below may be
+            out of date until updates return.
+          </p>
+        )}
         <p className="home-service-line">{serviceText(health)}</p>
       </section>
 
@@ -854,7 +976,12 @@ export function HomeView({ client }: HomeViewProps) {
         ) : (
           <ul className="home-units">
             {units.map((unit) => (
-              <UnitPowerEntry key={unit.unit_id} unit={unit} ageTickS={ageTickS} />
+              <UnitPowerEntry
+                key={unit.unit_id}
+                unit={unit}
+                ageSeconds={unitAgeSeconds(unit)}
+                updatesPaused={dataStale}
+              />
             ))}
           </ul>
         )}
@@ -935,16 +1062,24 @@ export function HomeView({ client }: HomeViewProps) {
 /**
  * One unit's three separately labeled figures. Each magnitude lives inside its
  * own named figure, so the allowed amount can never be presented under the
- * requested label.
+ * requested label. The age line is the unit's own displayed data age, and it
+ * renders in the stale style whenever the reading itself is past its freshness
+ * bound OR no fresh reading has landed for the paused-updates bound.
  */
-function UnitPowerEntry({ unit, ageTickS }: { unit: UnitView; ageTickS: number }) {
+function UnitPowerEntry({
+  unit,
+  ageSeconds,
+  updatesPaused,
+}: {
+  unit: UnitView;
+  ageSeconds: number | null;
+  updatesPaused: boolean;
+}) {
   const limited = isLimited(unit);
   const badge = unitBadgeLabel(unit);
   const requested = unit.requested_power;
   const authorized = unit.authorized_power;
-  const ageSeconds =
-    unit.telemetry_age_s === null ? null : Math.floor(unit.telemetry_age_s + ageTickS);
-  const stale = isStale(ageSeconds);
+  const stale = isStale(ageSeconds) || updatesPaused;
   return (
     <li className="home-unit" aria-label={`${unit.unit_id} power`}>
       <div className="home-unit-head">
@@ -975,7 +1110,9 @@ function UnitPowerEntry({ unit, ageTickS }: { unit: UnitView; ageTickS: number }
           the request.
         </p>
       ) : null}
-      <p className={stale ? "home-age home-age--stale" : "home-age"}>{dataAgeText(ageSeconds)}</p>
+      <p className={stale ? "home-age home-age--stale" : "home-age"}>
+        {dataAgeText(ageSeconds, updatesPaused)}
+      </p>
     </li>
   );
 }

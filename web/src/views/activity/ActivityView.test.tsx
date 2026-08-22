@@ -64,7 +64,14 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
 import type { ApiClient } from "../../api/client";
-import { auditEvent, auditPage, type WireAuditEvent } from "../../test/wire";
+import {
+  auditAppended,
+  auditEvent,
+  auditPage,
+  observationPublished,
+  resyncRequired,
+  type WireAuditEvent,
+} from "../../test/wire";
 import { ActivityView } from "./ActivityView";
 
 // Only createApiClient is replaced; the rest of the client module (notably
@@ -634,5 +641,159 @@ describe("Activity view", () => {
 
     // The already-loaded entries are not dropped by the refusal.
     expect(screen.getAllByRole("listitem")).toHaveLength(1);
+  });
+});
+
+// --- live-update regression pins (2026-08-23 incident) -----------------------
+//
+// The operator opened Activity and saw nothing while the fleet was visibly
+// publishing: the view was a point-in-time REST read of the audit trail, and
+// the audit trail holds no observation entries at all (observations are
+// published on the event bus, never audited — wire.ts header). These pin the
+// corrected behavior: the view subscribes to the session's shared stream and
+// appends what the backend actually emits — audit.appended entries and live
+// observation entries — without a second REST read, deduped against a later
+// refresh by the audit event's own event_id.
+
+describe("Activity view — live updates from the event stream", () => {
+  /** A controllable shared stream: stays open until the test pushes frames. */
+  function streamChannel(): {
+    openEvents: () => AsyncGenerator<Record<string, unknown>, void, unknown>;
+    push(frame: Record<string, unknown>): void;
+  } {
+    const queue: Record<string, unknown>[] = [];
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    return {
+      openEvents: () =>
+        (async function* channel(): AsyncGenerator<Record<string, unknown>, void, unknown> {
+          while (true) {
+            while (queue.length > 0) {
+              const next = queue.shift();
+              if (next !== undefined) {
+                yield next;
+                if (next.type === "resync_required") {
+                  return;
+                }
+              }
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        })(),
+      push: (frame) => {
+        queue.push(frame);
+        notify();
+      },
+    };
+  }
+
+  it("appends an audit.appended frame to the timeline without another REST read", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+
+    // The loaded history is empty, and the bus delivers a real audited fact.
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+    channel.push(
+      auditAppended(91, {
+        event_id: "facade-91",
+        event_type: "unit_armed",
+        unit_id: "MID",
+        result: "armed",
+        reason_codes: ["armed"],
+      }) as unknown as Record<string, unknown>,
+    );
+
+    // The entry appears immediately, newest first — no second getAudit call.
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("Arm request");
+    expect(items[0]!.textContent).toContain("MID");
+    expect(client.getAudit).toHaveBeenCalledTimes(1);
+  });
+
+  it("lists live observations from the bus, and the Observations chip selects them", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    // The only observation signal the backend emits: the bus frame, not the
+    // audit trail. It becomes a timeline entry naming the telemetry sequence.
+    channel.push(
+      observationPublished(92, "MID", { telemetrySequence: 41050 }) as unknown as Record<
+        string,
+        unknown
+      >,
+    );
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("Observation");
+    expect(items[0]!.textContent).toContain("MID");
+    expect(items[0]!.textContent).toContain("telemetry sequence 41050");
+
+    // The contracted Observations chip finally selects a non-empty set...
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Observations" }));
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    // ...and the other kinds honestly exclude it.
+    await user.click(screen.getByRole("button", { name: "Decisions" }));
+    expect(await screen.findByText("No activity matches these filters")).toBeVisible();
+  });
+
+  it("dedupes a live-appended entry against the same fact arriving later over REST", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    const frame = auditAppended(93, {
+      event_id: "facade-5d",
+      event_type: "unit_disarmed",
+      unit_id: "LHS",
+      result: "disarmed",
+      reason_codes: ["disarmed"],
+    });
+    channel.push(frame as unknown as Record<string, unknown>);
+    expect(await screen.findAllByRole("listitem")).toHaveLength(1);
+
+    // The same durable fact, later readable over REST (its store sequence
+    // differs from the bus sequence — only the event_id is shared): the
+    // resync-triggered refresh must not render it twice.
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage(
+        [
+          auditEvent({
+            event_id: "facade-5d",
+            sequence: 12,
+            event_type: "unit_disarmed",
+            unit_id: "LHS",
+            result: "disarmed",
+            reason_codes: ["disarmed"],
+          }),
+        ],
+        null,
+      ),
+    );
+    channel.push(resyncRequired("retention_window_exceeded") as unknown as Record<string, unknown>);
+
+    // The discontinuity triggers exactly one quiet refresh on the new mock
+    // (the mount read went to the previous one)...
+    await waitFor(() => {
+      expect(client.getAudit).toHaveBeenCalledTimes(1);
+    });
+    // ...and the same durable fact still renders exactly once.
+    await waitFor(() => {
+      expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    });
   });
 });

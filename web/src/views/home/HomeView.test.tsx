@@ -1063,3 +1063,134 @@ describe("HomeView — live outcomes and ages in the composed app", () => {
     });
   });
 });
+
+// --- live-update regression pins (2026-08-23 incident) -----------------------
+//
+// The service sends its snapshot frame exactly once per connection (rest.py)
+// and one observation.published frame per telemetry append (composition.py).
+// Home once bound every displayed age to the connect-time snapshot, so the
+// number climbed past minutes while the fleet was publishing fine. These pin
+// the corrected binding: ages sawtooth from each unit's own observations, a
+// quiet connection is named stale instead of masquerading as current, and a
+// resumed connection after a controller restart adopts the renumbered world.
+
+/** A stream that yields its frames and then ends cleanly: the connection is
+ * lost without an error, exactly like a controller process being swapped. */
+function endingStream(frames: StreamFrame[]): AsyncIterable<StreamFrame> {
+  return (async function* ending(): AsyncGenerator<StreamFrame, void, unknown> {
+    for (const frame of frames) {
+      yield frame;
+    }
+  })();
+}
+
+describe("HomeView — live observations and staleness", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("resets a unit's data age when its observation arrives over the stream", async () => {
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+    });
+    const snapshot = fleet([unit({ unit_id: "pod-mid", telemetry_age_s: 20 })]);
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    installClient({ snapshot, openEvents: vi.fn(channel.openEvents) });
+    renderHome();
+
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    expectVisibleText(entry, /20 s/);
+
+    // The per-cycle liveness frame: the pod just published, so its reading is
+    // fresh NOW — the age restarts from zero instead of climbing to 21, 22…
+    channel.push({
+      type: "observation.published",
+      sequence: 44,
+      occurred_at: "2026-08-22T10:00:02Z",
+      payload: { unit_id: "pod-mid", connection_epoch: 3, sequence: 440 },
+    });
+    await waitFor(() => {
+      expectVisibleText(entry, /Data age: [0-2] s/);
+    });
+
+    // And it keeps ticking from the observation — the healthy sawtooth.
+    act(() => {
+      vi.advanceTimersByTime(4000);
+    });
+    await waitFor(() => {
+      expectVisibleText(entry, /Data age: [3-6] s/);
+    });
+  });
+
+  it("names the readings stale when no fresh data has arrived while the connection claims live", async () => {
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+    });
+    const snapshot = fleet([unit({ unit_id: "pod-mid", telemetry_age_s: 2 })]);
+    // A live channel that then goes quiet: the connection stays up, but no
+    // observation and no new snapshot ever arrive again.
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    installClient({ snapshot, openEvents: vi.fn(channel.openEvents) });
+    renderHome();
+    await dataLanded();
+
+    act(() => {
+      vi.advanceTimersByTime(12000);
+    });
+
+    // The climbing age is unmistakable from a healthy sawtooth: the safe region
+    // carries the paused-updates line and the age line is marked stale.
+    const safeRegion = await screen.findByRole("region", { name: SAFE_REGION });
+    await waitFor(() => {
+      expectVisibleText(safeRegion, /No fresh readings for 1[0-9] s/);
+    });
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    expectVisibleText(entry, /updates have paused/);
+  });
+
+  it("adopts the renumbered snapshot after a controller restart instead of freezing the pre-restart picture", async () => {
+    const before = fleet([unit({ unit_id: "pod-mid", lifecycle: "disarmed" })], 42);
+    // The restarted controller renumbers the sequence space from zero and the
+    // pod came back active.
+    const after = fleet(
+      [
+        unit({
+          unit_id: "pod-mid",
+          lifecycle: "active",
+          requested_power: { direction: "discharge", watts: 1500 },
+          authorized_power: { direction: "discharge", watts: 1500 },
+          measured_watts: 1480,
+        }),
+      ],
+      5,
+    );
+    let connections = 0;
+    const openEvents = vi.fn((afterSequence?: number) => {
+      connections += 1;
+      if (connections === 1) {
+        // Healthy, then the controller process is swapped: the socket dies.
+        return endingStream([snapshotFrame(before)]);
+      }
+      // The resume carries the pre-restart cursor; the restarted service
+      // answers with its renumbered world (sequence 5 < 42).
+      expect(afterSequence).toBe(42);
+      return liveChannel([snapshotFrame(after)]).openEvents();
+    });
+    installClient({ snapshot: before, openEvents });
+    renderHome();
+    await dataLanded();
+    expectVisibleText(await screen.findByRole("region", { name: SAFE_REGION }), "Disarmed");
+
+    // The reconnect lands the new world: never a frozen pre-restart picture.
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    await waitFor(
+      () => {
+        expectVisibleText(entry, /1,?480/);
+      },
+      { timeout: 5000 },
+    );
+    expectVisibleText(entry, "Active");
+  });
+});

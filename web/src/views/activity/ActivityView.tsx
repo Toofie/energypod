@@ -17,11 +17,24 @@
 // unit_disarmed, emergency_stop, stop_acknowledged, inhibit_acknowledged and
 // authorization_revoked; anything else is rendered defensively, never
 // crashed on, and never invented.
+//
+// LIVE TRUTH (runtime/composition.py): the audit trail holds NO observation
+// entries — observations are published on the event bus (`observation.published`,
+// one per telemetry append), never audited — and the REST read is a point-in-time
+// page, so a view that only reads once shows nothing new for the whole session.
+// This view therefore also subscribes to the session's shared event stream and
+// appends what the backend actually emits as it happens: `audit.appended`
+// frames become timeline entries immediately (their `event_id` is the same
+// identity a later REST page carries, so a refresh never duplicates them),
+// and `observation.published` frames become the live observation entries the
+// Observations chip has always promised. Session-live entries render above
+// the loaded history; they are capped so a long session cannot grow without
+// bound.
 
 import { Fragment } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
-import type { ApiClient, AuditEvent } from "../../api/client";
+import type { ApiClient, AuditEvent, StreamEvent } from "../../api/client";
 import "./activity.css";
 
 export type ActivityConnection = "connected" | "disconnected";
@@ -44,6 +57,18 @@ const FLEET_UNIT_IDS: readonly string[] = ["MID", "RHS", "LHS"];
 
 /** Entries older than this are stale: dimmed, never hidden, age kept. */
 const STALE_AFTER_MS = 60 * 60_000;
+
+/** Reconnect pause for the shared event stream: short enough that a dropped
+ * line is seen retrying within a glance, never a tight spin. */
+const RECONNECT_DELAY_MS = 300;
+
+/**
+ * How many session-live entries (bus frames) the timeline keeps. Observations
+ * land every telemetry cycle (~2 s), so the live list is bounded: the newest
+ * are kept and older ones age out of the session list (the audit REST history
+ * remains the durable record for everything audited).
+ */
+const MAX_LIVE_ENTRIES = 100;
 
 /** Placeholder rows inside the loading status; bounded by the page size. */
 const SKELETON_ROWS = 6;
@@ -122,6 +147,65 @@ function eventTypeOf(event: AuditEvent): string {
 
 function sequenceOf(event: AuditEvent, fallback: number): number {
   return numberField(event, "sequence") ?? fallback;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * One entry's stable identity. The bus summary and the REST read model carry
+ * the same `event_id`, so a live-appended audit entry and the REST copy of the
+ * same fact dedupe; entries without an event_id (observations) fall back to
+ * their type plus sequence, which never collides with the audit store's own
+ * sequence space.
+ */
+function identityOf(event: AuditEvent): string {
+  const id = stringField(event, "event_id");
+  if (id !== undefined) {
+    return `id:${id}`;
+  }
+  return `seq:${eventTypeOf(event)}:${sequenceOf(event, 0)}`;
+}
+
+/**
+ * An `audit.appended` frame as a timeline entry: the payload IS the audit
+ * summary (event_id, event_type, unit_id, result, reason_codes), and the bus
+ * envelope contributes the ordering `sequence` and the `occurred_at` stamp.
+ */
+function auditEntryFromFrame(frame: StreamEvent): AuditEvent | null {
+  const payload = frame.payload;
+  if (!isRecord(payload)) {
+    return null;
+  }
+  const entry: Record<string, unknown> = { ...payload };
+  if (typeof frame.sequence === "number") {
+    entry.sequence = frame.sequence;
+  }
+  if (typeof frame.occurred_at === "string") {
+    entry.occurred_at = frame.occurred_at;
+  }
+  return entry as unknown as AuditEvent;
+}
+
+/**
+ * An `observation.published` frame as a timeline entry. The frame is minimal
+ * by design (unit identity and the telemetry sequence, no readings), so the
+ * entry says exactly that — a reading landed for this unit — and invents
+ * nothing.
+ */
+function observationEntryFromFrame(frame: StreamEvent): AuditEvent | null {
+  const payload = frame.payload;
+  if (!isRecord(payload) || typeof payload.unit_id !== "string") {
+    return null;
+  }
+  return {
+    event_type: "observation",
+    unit_id: payload.unit_id,
+    occurred_at: typeof frame.occurred_at === "string" ? frame.occurred_at : "",
+    sequence: typeof frame.sequence === "number" ? frame.sequence : 0,
+    telemetry_sequence: typeof payload.sequence === "number" ? payload.sequence : null,
+  } as unknown as AuditEvent;
 }
 
 /** A raw wire code as calm words: telemetry_stale -> "Telemetry stale". */
@@ -267,9 +351,17 @@ function decidedLine(event: AuditEvent): string | null {
 }
 
 /** What happened. The audit record's own `result`, in words — a missing
- * result is named as missing, never a fabricated measurement. */
+ * result is named as missing, never a fabricated measurement. A live
+ * observation entry has no result at all: what happened is that a reading
+ * landed, named with the telemetry sequence the frame carries. */
 function happenedLine(event: AuditEvent): string | null {
   const eventType = eventTypeOf(event);
+  if (kindOf(eventType) === "observations") {
+    const telemetrySequence = numberField(event, "telemetry_sequence");
+    return telemetrySequence !== undefined
+      ? `Latest reading received (telemetry sequence ${telemetrySequence})`
+      : "Latest reading received";
+  }
   const result = stringField(event, "result");
   if (result === undefined) {
     return "Result not recorded yet";
@@ -345,11 +437,29 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
   const [moreError, setMoreError] = useState<ErrorView | null>(null);
   const [kindFilter, setKindFilter] = useState<KindKey | null>(null);
   const [unitFilter, setUnitFilter] = useState<string | null>(null);
+  /**
+   * Session-live entries appended from the shared event stream, newest first.
+   * The REST page is the durable history; these are the facts the backend
+   * emits while the operator watches (audit.appended and, the thing the audit
+   * trail never holds, observation.published).
+   */
+  const [liveEntries, setLiveEntries] = useState<AuditEvent[]>([]);
 
   const applyFirstPage = (page: { events: AuditEvent[]; next_cursor: number | null }) => {
     setEvents(newestFirst(page.events));
     setNextCursor(page.next_cursor);
   };
+
+  /** Append one live entry, deduped by identity and capped to the bound. */
+  const appendLiveEntry = useCallback((entry: AuditEvent) => {
+    setLiveEntries((previous) => {
+      const key = identityOf(entry);
+      if (previous.some((existing) => identityOf(existing) === key)) {
+        return previous;
+      }
+      return [entry, ...previous].slice(0, MAX_LIVE_ENTRIES);
+    });
+  }, []);
 
   // First load: REST is the view's own source of truth, whatever the socket
   // is doing (the disconnected notice is additive, never a substitute).
@@ -391,6 +501,66 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client]);
+
+  // The live bus: new facts appear on the timeline as they happen. Without
+  // this subscription the view is a point-in-time REST page — an operator who
+  // opens Activity and then acts sees nothing change for the whole session.
+  useEffect(() => {
+    let cancelled = false;
+    const run = async (): Promise<void> => {
+      while (!cancelled) {
+        let resync = false;
+        try {
+          for await (const frame of client.openEvents()) {
+            if (cancelled) {
+              return;
+            }
+            if (frame.type === "resync_required") {
+              resync = true;
+              break;
+            }
+            if (frame.type === "audit.appended") {
+              const entry = auditEntryFromFrame(frame);
+              if (entry !== null) {
+                appendLiveEntry(entry);
+              }
+            } else if (frame.type === "observation.published") {
+              const entry = observationEntryFromFrame(frame);
+              if (entry !== null) {
+                appendLiveEntry(entry);
+              }
+            }
+          }
+        } catch {
+          // A failed stream is treated exactly like a dropped one: retry.
+        }
+        if (cancelled) {
+          return;
+        }
+        if (resync) {
+          // A discontinuity means the loaded history may be out of step; one
+          // quiet refresh re-reads it (merged, so loaded history is kept).
+          try {
+            const page = await client.getAudit(AUDIT_PAGE_SIZE);
+            if (cancelled) {
+              return;
+            }
+            setEvents((previous) => mergeBySequence(previous, page.events));
+            setNextCursor(page.next_cursor);
+          } catch {
+            // The manual refresh remains available; live entries keep flowing.
+          }
+        }
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, RECONNECT_DELAY_MS);
+        });
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, appendLiveEntry]);
 
   // Retry with nothing loaded: the error stays on screen (no skeleton flash,
   // no fake entries) until the new page actually lands.
@@ -463,14 +633,23 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [client, nextCursor, loadingMore]);
 
+  /** REST entries whose identity a live frame already delivered: a later
+   * refresh must not duplicate what the bus already appended. */
+  const liveIdentities = useMemo(() => new Set(liveEntries.map(identityOf)), [liveEntries]);
+  /** The rendered timeline: session-live entries first (they happened after
+   * everything the REST page loaded), then the loaded history beneath. */
+  const timeline = useMemo(() => {
+    const rest = events.filter((event) => !liveIdentities.has(identityOf(event)));
+    return [...liveEntries, ...rest];
+  }, [events, liveEntries, liveIdentities]);
   const visibleEvents = useMemo(
     () =>
-      events.filter(
+      timeline.filter(
         (event) =>
           (kindFilter === null || kindOf(eventTypeOf(event)) === kindFilter) &&
           (unitFilter === null || stringField(event, "unit_id") === unitFilter),
       ),
-    [events, kindFilter, unitFilter],
+    [timeline, kindFilter, unitFilter],
   );
 
   const toggleKind = useCallback((id: KindKey) => {
@@ -545,7 +724,7 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
             />
           )}
 
-          {events.length === 0 ? (
+          {timeline.length === 0 ? (
             <EmptyActivity />
           ) : visibleEvents.length === 0 ? (
             <p className="activity-filtered-empty">No activity matches these filters</p>
@@ -559,7 +738,7 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
             >
               {visibleEvents.map((event) => (
                 <ActivityEntry
-                  key={sequenceOf(event, 0)}
+                  key={identityOf(event)}
                   event={event}
                   now={now}
                 />

@@ -35,6 +35,16 @@
  * stable samples). Both latch frames also trigger a snapshot refetch: the
  * event updates the picture immediately, and the refreshed snapshot — adopted
  * only when its sequence advances — is the world that wins.
+ *
+ * Freshness truth (src/energypod/api/rest.py + runtime/composition.py): the
+ * service sends its snapshot frame exactly once per connection and then one
+ * `observation.published` frame per telemetry append. The "…s ago" figure on
+ * the Actual fact therefore ticks from each unit's latest observation once one
+ * has been seen in this session (the healthy sawtooth); the captured
+ * `telemetry_age_s` plus elapsed time is only the pre-observation fallback. A
+ * resumed connection's first snapshot carrying a LOWER sequence than the
+ * picture on screen is a controller restart that renumbered the sequence
+ * space — adopted, never refused, so a restart cannot freeze this view.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -148,7 +158,9 @@ const TICK_MS = 1000;
  * A ticking "now" so displayed ages advance after render. The interval runs
  * only while something on screen is derived from elapsed time and is always
  * cleared on unmount; without it a 300 s countdown would sit frozen at the
- * value captured when the frame arrived.
+ * value captured when the frame arrived. A backgrounded tab gets its timers
+ * throttled, so the clock is also re-read the moment the tab becomes visible
+ * or focused again — the first render after coming back carries the true age.
  */
 function useTickingNow(enabled: boolean): number {
   const [nowMs, setNowMs] = useState(monotonicNowMs);
@@ -159,8 +171,17 @@ function useTickingNow(enabled: boolean): number {
     const timer = window.setInterval(() => {
       setNowMs(monotonicNowMs());
     }, TICK_MS);
+    const refreshNow = (): void => {
+      if (document.visibilityState === "visible") {
+        setNowMs(monotonicNowMs());
+      }
+    };
+    document.addEventListener("visibilitychange", refreshNow);
+    window.addEventListener("focus", refreshNow);
     return () => {
       window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshNow);
+      window.removeEventListener("focus", refreshNow);
     };
   }, [enabled]);
   return nowMs;
@@ -481,6 +502,13 @@ export function NowView({ client }: NowViewProps) {
   // these.
   const pictureSequenceRef = useRef<number | null>(null);
   const capturedAtRef = useRef<number>(monotonicNowMs());
+  /**
+   * The monotonic moment each unit's latest `observation.published` landed.
+   * The snapshot frame arrives once per connection, so these per-cycle frames
+   * are what keeps the "…s ago" figure honest while the connection stays up:
+   * each unit's age ticks from its own last observation, never from mount.
+   */
+  const [observations, setObservations] = useState<Record<string, number>>({});
 
   // --- control state ----------------------------------------------------------
   const [dialog, setDialog] = useState<DialogState | null>(null);
@@ -506,20 +534,26 @@ export function NowView({ client }: NowViewProps) {
    * The single adoption path. A snapshot whose sequence does not advance the
    * picture on screen is never adopted: the shell's shared stream republishes
    * its latest snapshot frame to every newly mounted view, and a REST read can
-   * resolve after a newer stream frame — neither may rewind a newer world.
+   * resolve after a newer stream frame — neither may rewind a newer world. The
+   * one sanctioned regression is a controller restart, which renumbers the
+   * sequence space from zero: a resumed connection's first snapshot carrying a
+   * lower sequence is the new world, not an old one.
    */
-  const adoptSnapshot = useCallback((wire: WireSnapshot, sequence: number | null): boolean => {
-    const incoming = sequence ?? wire.snapshot_sequence;
-    const current = pictureSequenceRef.current;
-    if (current !== null && incoming <= current) {
-      return false;
-    }
-    pictureSequenceRef.current = incoming;
-    capturedAtRef.current = monotonicNowMs();
-    setSnapshot(wire);
-    setLoadFailed(null);
-    return true;
-  }, []);
+  const adoptSnapshot = useCallback(
+    (wire: WireSnapshot, sequence: number | null, allowRenumber = false): boolean => {
+      const incoming = sequence ?? wire.snapshot_sequence;
+      const current = pictureSequenceRef.current;
+      if (current !== null && incoming <= current && !(allowRenumber && incoming < current)) {
+        return false;
+      }
+      pictureSequenceRef.current = incoming;
+      capturedAtRef.current = monotonicNowMs();
+      setSnapshot(wire);
+      setLoadFailed(null);
+      return true;
+    },
+    [],
+  );
 
   // --- REST snapshot (initial load + manual retry) ----------------------------
 
@@ -736,6 +770,12 @@ export function NowView({ client }: NowViewProps) {
 
     const connect = (): void => {
       if (cancelled) return;
+      // A connection opened with a cursor is a resume: its first snapshot may
+      // carry a renumbered (lower) sequence after a controller restart. A
+      // later frame on the SAME connection with a lower sequence is a stale
+      // republish, never a restart — it stays refused.
+      const resumed = lastSequence !== undefined;
+      let firstSnapshot = true;
       const iterator = client.openEvents(lastSequence);
       void (async () => {
         try {
@@ -746,7 +786,24 @@ export function NowView({ client }: NowViewProps) {
             }
             if (frame.type === "snapshot") {
               const wire = asSnapshot(frame.data);
-              if (wire !== null) adoptSnapshot(wire, wire.snapshot_sequence);
+              if (wire !== null) {
+                adoptSnapshot(wire, wire.snapshot_sequence, resumed && firstSnapshot);
+              }
+              firstSnapshot = false;
+              setConnection("live");
+            } else if (frame.type === "observation.published") {
+              // The per-cycle liveness frame: it carries no readings, but it
+              // proves this unit just published, resetting that unit's
+              // "…s ago" figure to now instead of climbing from mount time.
+              const payload = isRecord(frame.payload) ? frame.payload : null;
+              const unitId =
+                payload !== null && typeof payload.unit_id === "string" ? payload.unit_id : null;
+              if (unitId !== null) {
+                const at = monotonicNowMs();
+                setObservations((previous) =>
+                  previous[unitId] === at ? previous : { ...previous, [unitId]: at },
+                );
+              }
               setConnection("live");
             } else if (frame.type === "resync_required") {
               // The pinned client ends iteration right after this marker; the
@@ -806,13 +863,26 @@ export function NowView({ client }: NowViewProps) {
 
   // Ages are captured values plus elapsed monotonic time: `telemetry_age_s` is
   // the age at capture, so it must keep growing after render or a 300 s
-  // countdown (and every "x s ago") would sit frozen forever.
+  // countdown (and every "x s ago") would sit frozen forever. Once a unit's
+  // own observation.published frames have been seen, that unit's age ticks
+  // from its latest observation instead — the healthy sawtooth, never a
+  // number that climbs past minutes while the pod is publishing fine.
   const needsTick =
-    (snapshot?.units.some((unit) => unit.telemetry_age_s !== null) ?? false) || expiry !== null;
+    (snapshot?.units.some((unit) => unit.telemetry_age_s !== null) ?? false) ||
+    expiry !== null ||
+    Object.keys(observations).length > 0;
   const nowMs = useTickingNow(needsTick);
   const elapsedSeconds = Math.max(0, (nowMs - capturedAtRef.current) / 1000);
-  const displayedAge = (unit: WireUnit): number | null =>
-    unit.telemetry_age_s === null ? null : Math.floor(unit.telemetry_age_s + elapsedSeconds);
+  const displayedAge = (unit: WireUnit): number | null => {
+    if (unit.telemetry_age_s === null) {
+      return null;
+    }
+    const observedAt = observations[unit.unit_id];
+    if (observedAt !== undefined) {
+      return Math.max(0, Math.floor((nowMs - observedAt) / 1000));
+    }
+    return Math.floor(unit.telemetry_age_s + elapsedSeconds);
+  };
 
   const units = snapshot?.units ?? [];
   const armableUnits = units.filter((unit) => unit.lifecycle === "disarmed");
