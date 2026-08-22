@@ -1,7 +1,8 @@
 # Field mapping validation against live hardware — 2026-08-22
 
 Status: validated per-field decode of the 2026-08-22 observe-only capture. Offline analysis only; no hardware was contacted.
-Capture: `docs/evidence/live-capture-2026-08-22.json` (13 FC03 blocks per unit, MID/RHS/LHS; all declared counts match actual register-array lengths — verified programmatically).
+Capture 1: `docs/evidence/live-capture-2026-08-22.json` (13 FC03 blocks per unit, MID/RHS/LHS; all declared counts match actual register-array lengths — verified programmatically).
+Capture 2 (follow-up, same authorized read-only session): `docs/evidence/live-capture-followup-2026-08-22.json` (system overview `0x0100`×61, debug-mode readback `0x8100`×1, network status `0x8139`×1, device parameters `0x8102`×56 per unit; lengths verified). Captured ~15-20 minutes after capture 1 while RHS/LHS were still discharging (evident from the battery path and the discharge counters).
 Vendor decode authority: `C:\Users\vagrant\Downloads\EnergyPod_RE\src\MiniESapp\` (`SysControl.cs`, `MiniESapp.cs`, `GlobalFun.cs`, `BmsInfo.cs`), cited per expression.
 Evidence matrix: `docs/PROTOCOL_EVIDENCE.md` sections 4-7.
 
@@ -24,7 +25,7 @@ Identity read: FC03 `0x8106` (33030), 2 registers; decode `rtuId = u32lo(array2[
 | RHS | 192.168.1.12 | `[20598, 11298]` | `0x2C225076` (740446326) | `0x2C225076` | exact |
 | LHS | 192.168.1.13 | `[20629, 11298]` | `0x2C225095` (740446357) | `0x2C225095` | exact |
 
-Pinned per unit as above. The high word `0x2C22` is identical across the fleet (one product family/batch); the low words are distinct per unit, so the ID is usable as the per-string identity on the wire (still only a CRC32-grade identifier — string-identity binding strategy remains open per §4a).
+Pinned per unit as above. The high word `0x2C22` is identical across the fleet (one product family/batch); the low words are distinct per unit, so the ID is usable as the per-string identity on the wire (still only a CRC32-grade identifier — string-identity binding strategy remains open per §4a). The follow-up capture re-confirms all three IDs a second time at `0x8102+4/+5` and adds a stronger identity layer — ASCII serial number and MAC address (§2.15), giving serial↔RTU-ID↔MAC↔host bindings per unit.
 
 Layout and topology from the same capture (`0x5000` words 0/4/5; discriminator `array[0] > 10` → IoT, enable mask at offset 4, BIC count at offset 5 — `MiniESapp.cs:1287-1295`):
 
@@ -212,6 +213,66 @@ All 22 words are 0 on all three units. Verdict OK — no BMS/BECU warnings or fa
 
 Mapping and analysis in §4. Decode cites: cell count `min(BIC×10, 100)` and read at `0x5200` — `SysControl.cs:838-844`, stored raw mV at `SysControl.cs:852`; temperatures read `BIC×3` at `0x523C` with the per-triple assignment (offset 0 → pole+, 1 → all 10 cell temps of that BIC, 2 → pole−, all `raw - 40`) — `SysControl.cs:869-890`; balance words `BIC` at `0x524E`, stored raw with no bit decode — `SysControl.cs:906-915` (encoding Unknown, evidence §10).
 
+### 2.13 System overview — `0x0100` (256), 61 registers (capture 2); read `SysControl.cs:403`, decodes `SysControl.cs:409-433`
+
+Offsets not listed below (8-15, 23-47, 56) are **not decoded by the vendor application** and are recorded raw in §5 A-19.
+
+| Off | Field | Decode (vendor cite) | MID | RHS | LHS | Verdict |
+|---:|---|---|---|---|---|---|
+| 0 | status | low byte; **system** status enum 0 Standby / 1 Off-grid / 2 On-grid / 3 Fail / 4 Off-grid PV / 5 Shutdown — `GlobalFun.cs:28-40` via `SysControl.cs:409` | 0 → Standby | 2 → On-grid | 2 → On-grid | OK — coherent: MID idle/inhibited, RHS/LHS exporting. Note this enum is distinct from the PCS-status enum |
+| 1 | ctrlMode | enum 1 Remote / 2 Local — `GlobalFun.cs:204-211` via `SysControl.cs:410` | 1 → Remote | 1 → Remote | 1 → Remote | OK — fleet-consistent |
+| 2 | workMode | enum 2 Economy / 6 Remote dispatch / 8 Timing — `GlobalFun.cs:167-175` via `SysControl.cs:411` | 7 → outside enum | 2 → Economy | 2 → Economy | AMBIG (MID) — value 7 is not in the vendor's three-value enum; RHS/LHS Economy coheres with PCS "Matching Load" (§5, A-17) |
+| 3-4 | chargeEnergyHis | `u32(array[3]=high, array[4]=low)` — high-word-first, no scale — `SysControl.cs:412` | 54,28256 → 3,567,200 | 32,6548 → 2,103,700 | 71,1744 → 4,654,800 | OK — Wh unit established; equals the BMS ×0.1-kWh counter × 1000 exactly (§3.4) |
+| 5-6 | dischargeEnergyHis | `u32(array[5]=high, array[6]=low)` — `SysControl.cs:413` | 86,42804 → 5,678,900 | 96,60744 → 6,352,200 | 93,62652 → 6,157,500 | OK — RHS/LHS incremented +0.3/+0.6 kWh vs capture 1 while discharging; MID unchanged |
+| 7 | forceChargeMode | low byte, no enum in source — `SysControl.cs:414` | 0 | 0 | 0 | OK\* — 0 presumably "none" |
+| 16 | battStatus | BMS status enum — `GlobalFun.cs:239-250` via `SysControl.cs:415` | 3 → Running | 3 → Running | 3 → Running | OK — matches `0x5000+1` |
+| 17 | soc | low byte % — `SysControl.cs:416` | 10 % | 71 % | 53 % | OK — trajectory from capture 1 (10/73/57) matches continued discharge; MID static |
+| 18 | battVolt | `× 0.1 V` — `SysControl.cs:417` | 1923 → 192.3 V | 1631 → 163.1 V | 1951 → 195.1 V | OK — matches `0x5000+6` family |
+| 19 | battCurrent | `× 0.1 A` — `SysControl.cs:418` | 0 → 0.0 A | 81 → 8.1 A | 105 → 10.5 A | OK — V×I=P exact (§3.4) |
+| 20 | battPower | `s16` W — `SysControl.cs:419` | 0 W | 1321 W | 2048 W | OK |
+| 21 | battWarnInfo | word — `SysControl.cs:420` | 0 | 0 | 0 | OK — matches all-zero `0x5040` |
+| 22 | soh | low byte % — `SysControl.cs:421` | 100 % | 100 % | 100 % | OK\* — same as capture 1 |
+| 48 | pcsStatus | low byte — `SysControl.cs:422` | 8 | 4 | 4 | AMBIG — decoded but **never rendered** by the vendor UI (no enum exists for this field) and the values fit no known enum (§5, A-18) |
+| 49 | pcsCurrent | `× 0.1 A` — `SysControl.cs:423` | 0 → 0.0 A | 50 → 5.0 A | 77 → 7.7 A | OK — gridV×I = √(P²+Q²) on RHS/LHS (1220.5 vs 1220.3; 1895.0 vs 1887.9) |
+| 50 | gridVolt | `× 0.1 V` — `SysControl.cs:424` | 2435 → 243.5 V | 2441 → 244.1 V | 2461 → 246.1 V | OK — consistent with capture 1 and UK G98 supply (§2.15) |
+| 51 | pcsActivePower | `s16` W — `SysControl.cs:425` | 0 W | 1191 W | 1865 W | OK — battery 1321/2048 W → PCS 1191/1865 W, same ~9-10% chain loss as capture 1 |
+| 52 | pcsReactivePower | `s16` var — `SysControl.cs:426` | 0 | 65270 → -266 var | 65243 → -293 var | OK |
+| 53 | gridFreq | `× 0.01 Hz` — `SysControl.cs:427` | 5000 → 50.00 Hz | 4999 → 49.99 Hz | 4997 → 49.97 Hz | OK |
+| 54 | pcsApparentPowerLimit | `s16` VA — `SysControl.cs:428` | 5000 | 5000 | 5000 | OK — matches `0x1060+24` |
+| 55 | gridPower | `s16` W — `SysControl.cs:429` | 63711 → -1825 W | 65495 → -41 W | 65488 → -48 W | OK\* — MID import feeds its 1.7-1.8 kW load; RHS/LHS near-zero net (capture-1 externalGridPower -37/-48); sign convention still unlabeled |
+| 57 | sysChargePowerLimit | `s16` W — `SysControl.cs:430` | 5000 | 5000 | 5000 | OK — PCS rating clamp |
+| 58 | sysDischargePowerLimit | `s16` W — `SysControl.cs:431` | 0 | 5000 | 5000 | OK — MID inhibited, matching BMS/PCS discharge limits at SOC 10% |
+| 59 | pvPower | `s16` W — `SysControl.cs:432` | 65535 → -1 W | 0 | 0 | OK\* — noise-level, no PV |
+| 60 | radiatorTemp | `s16` raw °C — `SysControl.cs:433` | 30 °C | 31 °C | 33 °C | OK — matches PCS radiator temps (31/32/33 at capture 1, ≤1 °C drift) |
+
+**BMS runMode / chargeDischargeStatus resolution (coordinator ask):** the system-overview block does **not** contain either field — it carries `battStatus` (offset 16, enum known) but no BMS run-mode word, so these two enums remain unpinned. Capture 2 again sampled only the discharge state (positive battery current 8.1/10.5 A, positive power, discharging counters incrementing), adding no new enum values. The disambiguating read is unchanged: `0x5000`×31 during a known charge window (§6).
+
+### 2.14 Debug-mode readback `0x8100` (33024) ×1 and network status `0x8139` (33081) ×1 (capture 2)
+
+| Field | Decode (vendor cite) | MID | RHS | LHS | Verdict |
+|---|---|---|---|---|---|
+| debugMode | `(byte)array[0]`; names 0 Normal Mode / 1 Standby / 2 Charge / 3 Discharge / 4 Circulation / 5 Fixing SOC / 6 Verify Capacity — `SysControl.cs:383`; `GlobalFun.cs:152-165` | 0 → Normal Mode | 0 | 0 | OK — all three units are in Normal Mode, i.e. the vendor UI's precondition for PQ dispatch (`MiniESapp.cs:2180-2184`, refuses when nonzero) is currently satisfied |
+| systemNetworkStatus | word; 0 Disconnected / 1 Connected — `SysControl.cs:445`; `GlobalFun.cs:214-221` | 0 → Disconnected | 0 | 0 | OK\* — matches `0x8102+55`; interpretation: the device's upstream link to its configured servers (§2.15) is down, expected on the isolated commissioning LAN; our Modbus session is a direct read and unaffected (§5, A-20) |
+
+### 2.15 Device parameters — `0x8102` (33026), 56 registers (capture 2); read `SysControl.cs:1534`, decodes `SysControl.cs:1540-1569`
+
+| Off | Field | Decode (vendor cite) | MID | RHS | LHS | Verdict |
+|---:|---|---|---|---|---|---|
+| 0-1 | rs485Param1 | raw pair — `SysControl.cs:1540-1541` | 19200, 4 | 19200, 4 | 19200, 4 | OK — baud 19200, station address 4; matches the vendor serial default (evidence §3) |
+| 2-3 | rs485Param2 | raw pair — `SysControl.cs:1542-1543` | 19200, 5 | 19200, 5 | 19200, 5 | OK — second RS485 port at 19200, station 5 |
+| 4-5 | rtuId | `u32lo(array[5], array[4])` — `SysControl.cs:1544` | 20631,11298 → `0x2C225097` | 20598,11298 → `0x2C225076` | 20629,11298 → `0x2C225095` | OK — third independent read of the pinned identity; exact match to `0x8106` |
+| 6-11 | macAddrParam[0..5] | raw words stored as bytes — `SysControl.cs:1545-1550` | 78:D4:F1:40:00:B7 | 78:D4:F1:40:00:96 | 78:D4:F1:40:00:B5 | OK — shared OUI+prefix (fleet-homogeneous hardware), distinct per unit; pinned |
+| 12-16 | server1Param[0..4] | raw, no vendor decode — `SysControl.cs:1551-1555` | 52.187.245.123 : 507 | same | same | AMBIG (inferred) — byte values are consistent with IPv4 + TCP port 507 (the vendor's own port, evidence §3); vendor stores opaque |
+| 17-21 | server2Param[0..4] | raw, no vendor decode — `SysControl.cs:1556-1560` | 20.191.198.60 : 507 | same | same | AMBIG (inferred) — same reading |
+| 22-42 | serialNum[0..20] | 21 bytes, ASCII — `SysControl.cs:1561-1564` | `BEP0005KXX11B10500151` | `BEP0005KXX11B10500118` | `BEP0005KXX11B10500149` | OK — 21-char format identical to the vendor log serials (`SerialNo_BEP0005KXX11B10500029.log` etc.); pinned per unit |
+| 43-49 | (not decoded) | vendor skips offsets 43-49 | 0,3,0,0,0,0,0 | 0,3,0,0,0,0,0 | 0,3,0,0,0,0,0 | Unknown — offset 43 is the serial NUL terminator; offset 44 = 3 on all units, meaning not in the decompiled source (§5, A-21) |
+| 50 | gridStandard | word; 1 → "G98" (UK) — `SysControl.cs:1565`; `GlobalFun.cs:42-73` | 1 → G98 | 1 → G98 | 1 → G98 | OK — resolves the PCS `0x1060+5` value 1; consistent with 243-247 V / 50.00-50.04 Hz and UK region (`GlobalFun.cs:81-84`) |
+| 51 | dredEnable | word — `SysControl.cs:1566` | 0 | 0 | 0 | OK — no DRED, coherent with BMS Warning0 bit 14 clear |
+| 52 | paraSetEnable | word — `SysControl.cs:1567` | 0 | 0 | 0 | OK — parameter setting disabled (matches the `0x8036` gate being off) |
+| 53 | lowVoltageProtectionFlag | word — `SysControl.cs:1568` | 0 | 0 | 0 | OK — no latched low-voltage protection, including MID at SOC 10% |
+| 54 | (not decoded) | vendor skips offset 54 | 4 | 81 | 105 | Unknown — per-unit values with no decode in the vendor source (§5, A-21) |
+| 55 | systemNetworkStatus | word — `SysControl.cs:1569` | 0 → Disconnected | 0 | 0 | OK\* — agrees with the live `0x8139` read |
+
 ## 3. Battery-power / dynamic-limit scaling check (deliverable 3)
 
 ### 3.1 The V×I=P identity at three independent measurement points
@@ -252,6 +313,22 @@ The DC bus voltage closes the chain: PCS dcVolt = DCDC dcOutputVolt (409.8/409.9
 
 **Verdict: the evidence-matrix scaling families (PCS/DCDC 0.01 A; system/BMS/BECU 0.1 A; unscaled W power; 0.1 V pack voltages; low-word-first 0.1-kWh energy counters) are consistent with — and positively confirmed by — the observed magnitudes.** No field in the captured set requires a rescale.
 
+### 3.4 Follow-up (capture 2) cross-validations
+
+**System battery path repeats the identity.** `0x0100+18/19/20`: RHS 163.1 V × 8.1 A = 1321.1 W vs 1321 W; LHS 195.1 V × 10.5 A = 2048.6 W vs 2048 W; MID 192.3 V × 0.0 A = 0 W. The system current is therefore 0.1 A/count like the BMS (a 0.01 A reading of 0.81/1.05 A would give 132/205 W, contradicting the measured 1321/2048 W). The system PCS path also coheres: gridV × pcsCurrent = √(P² + Q²) on RHS/LHS (1220.5 vs 1220.3 VA; 1895.0 vs 1887.9 VA).
+
+**The system history counters pin the last open word order and unit.** `0x0100+3..+6` (high-word-first, vendor applies no scale — `SysControl.cs:412-413`) equals the BMS `0x5000+15..+18` counters (low-word-first × 0.1 kWh) to the digit × 1000:
+
+| Unit | System charge (Wh) | System discharge (Wh) | Capture-1 BMS charge (kWh) | Capture-1 BMS discharge (kWh) | Δ vs capture 1 |
+|---|---:|---:|---:|---:|---|
+| MID | 3,567,200 | 5,678,900 | 3567.2 | 5678.9 | 0 / 0 (idle) |
+| RHS | 2,103,700 | 6,352,200 | 2103.7 | 6351.9 | 0 / **+0.3 kWh** |
+| LHS | 4,654,800 | 6,157,500 | 4654.8 | 6156.9 | 0 / **+0.6 kWh** |
+
+Consequences: (1) the engineering unit of the system-history counters is **Wh raw** — this resolves evidence §13.12; (2) the high-word-first order at `0x0103..0x0106` is confirmed by an exact numeric identity, not just by code reading; (3) **the charge/discharge role labels are confirmed** — during the 15-20 minutes of confirmed discharge between the captures (positive battery current and power in both captures), only the discharge-labeled counters moved (+0.3/+0.6 kWh ≈ 1.2/2.0 kW × 15/18 min) while the charge-labeled counters stayed identical to the digit. The "swapped labels" alternative of anomaly A-1 is eliminated; the buy/sell half of A-1 (different registers, not re-read) remains open.
+
+**Energy-vs-SOC coherence.** RHS discharged 0.3 kWh for 2 SOC points and LHS 0.6 kWh for 4 points — both 0.150 kWh per SOC point, implying ~15 kWh usable per pod. Consistent across two independent units; treat as indicative only (integer SOC quantization).
+
 ## 4. Cell blocks (deliverable 4)
 
 Cell count formula `min(BIC×10, 100)` (`SysControl.cs:839-844`); cells are raw mV (`SysControl.cs:852`), temperatures `raw - 40` (`SysControl.cs:881-890`).
@@ -290,7 +367,7 @@ Pattern flagged, not interpreted: if bits meant "balancing active" you would exp
 
 | # | Field (where) | Observation | Best alternative readings | Disposition |
 |---|---|---|---|---|
-| A-1 | Energy counter role labels (`0x4101`, `0x5000+15..18`) | Discharge > charge on ALL units despite PV = 0 (MID 3567 vs 5679; RHS 2104 vs 6352; LHS 4655 vs 6157 kWh); RHS sell (5175) > buy (2346) | (a) counters cleared independently at different times (a clear op `0x8001` exists); (b) charge/discharge pair roles swapped in the vendor label; (c) buy/sell swapped | Magnitudes and word order are solid; only the role labels are doubtful. Disambiguate with follow-up B (§6) |
+| A-1 | Energy counter role labels (`0x4101`, `0x5000+15..18`) | Discharge > charge on ALL units despite PV = 0 (MID 3567 vs 5679; RHS 2104 vs 6352; LHS 4655 vs 6157 kWh); RHS sell (5175) > buy (2346) | ~~(b) charge/discharge roles swapped~~ — **eliminated by capture 2** (§3.4: only the discharge-labeled counters moved during confirmed discharge; charge counters static to the digit). Remaining: (a) counters cleared independently at different times (a clear op `0x8001` exists), or charge counts only a subset of charge paths; (c) buy/sell swapped — still untested | Charge/discharge labels now **confirmed**; buy/sell role and the conservation oddity remain open (re-read `0x4101`×12 across a known import/export interval) |
 | A-2 | externalGridCurrent (`0x1000+16`) | MID reconciles with extGridP at PF 0.89, but RHS/LHS read 3.30/3.60 A against net powers of -37/-48 W (≈0.15/0.19 A) | (a) different measurement point (pod feeder vs combined); (b) RMS magnitude of non-cancelling components; (c) field means something else | Do not use for control or power accounting; keep raw |
 | A-3 | LHS gridApparentPower 1719 VA < gridActivePower 1747 W (`0x1000+9`) | Physically impossible pair (S ≥ \|P\|); V×I = 1713.8 supports the S value, √(P²+Q²) = 1748.1 supports P | Differently-filtered averaging windows between P and I channels | Metering-integration inconsistency, ~1.7%; inverter-side triple on the same unit is coherent. Follow-up D quantifies it |
 | A-4 | LHS cellNoMaxVolt = 3 (`0x5000+19`) | First 3260 mV cell in the array is index 1; MID (25) and RHS (2) match first-occurrence exactly | (a) firmware tie-break rule differs (e.g. last-in-BIC, round-robin); (b) 1-based-with-offset numbering — inconsistent with the other units | Treat cell numbers as approximate references; always recompute extrema from `0x5200` |
@@ -298,16 +375,22 @@ Pattern flagged, not interpreted: if bits meant "balancing active" you would exp
 | A-6 | MID inverter frequency 49.97 Hz with inverter voltage 0.5 V (`0x1000+12`) | Frequency reported while the inverter is open | Frequency tracked from grid sync, not the inverter output | Curiosity only |
 | A-7 | pcsFanSpeed = 0 with fanStatus = 1 (`0x1060+11`) | Always 0, including delivering units | Register unpopulated, or PWM/duty encoded | DEAD for telemetry |
 | A-8 | DCDC gridFrequency = 0.00 Hz (`0x2060+6`) | 0 on all units, including active ones, while PCS reads 50.00-50.04 Hz | Unpopulated firmware field, or a non-grid-frequency meaning | DEAD; exclude from the run-mode decoder |
-| A-9 | rateGridVoltFrequency = 0, functionSelected = 0 (`0x1060+3/+4`) | 0 on all units; no enum table in the decompiled source | Enum value 0 = "unset/default" most likely | Read `0x8102` (follow-up A) to pin the rated V/F and grid-standard enums |
+| A-9 | rateGridVoltFrequency = 0, functionSelected = 0 (`0x1060+3/+4`); gridStandard (`0x1060+5`) | 0/0/1 on all units | **gridStandard RESOLVED by capture 2**: `0x8102+50 = 1` → "G98" (UK) per `GlobalFun.cs:42-73`, consistent with 243-247 V / 50 Hz and with the PCS-block value 1. rateGridVoltFrequency and functionSelected still read 0 with no enum in the source | rateGridVoltFrequency/functionSelected stay AMBIG (likely "unset/default"); gridStandard is now high-confidence |
 | A-10 | DCDC fanStatus = 0 while running 1.1-1.8 kW (`0x2060+11`) | Fans off at meaningful power | Thermostatic threshold not reached (coolant 23-28 °C) — plausible | OK\*, watch in run-mode |
 | A-11 | DCDC status naming (`0x2000+1`) | Value 3 decoded with PCS status names ("On grid") but the DCDC is not grid-tied | For DCDC, 3 evidently means "running" (MID idle reads 1=Idle) | Naming ambiguity only; value mapping is consistent |
 | A-12 | LHS pvEnergyHis = 6.2 kWh (`0x4101+6/7`) | Tiny PV energy on one unit only, with PV current ≈ 0 | Bench-supply exposure or counter noise | Ignore; keep raw |
 | A-13 | BMS runMode (MID 3, RHS/LHS 1) and chargeDischargeStatus (0/2/2) (`0x5000+2/+3`) | No vendor enum exists for either field; values split cleanly idle vs discharge | runMode: 1 = discharge-mode, 3 = standby/idle; chargeDischargeStatus: 0 idle, 1 charge, 2 discharge | Consistent but unconfirmed; follow-up C pins the charge-state values |
-| A-14 | MID BMS power +38 W at idle (`0x5000+8`) | Positive discharge-signed power while discharge is inhibited (limits 0) | 0.2 A current-sensor bias at zero, or pack housekeeping draw measured at the string | Non-blocking; quantify with follow-up D |
+| A-14 | MID BMS power +38 W at idle (`0x5000+8`) | Positive discharge-signed power while discharge is inhibited (limits 0) | 0.2 A current-sensor bias at zero, or pack housekeeping draw measured at the string. Capture 2's independent system path (`0x0100+19/+20`) reads exactly 0.0 A / 0 W on MID, so the offset lives in the BMS-side reading or its filter | Non-blocking; quantify with follow-up D |
 | A-15 | Balance words (§4) | Nonzero words sit on the LOWEST-voltage BICs | Bits are not "balancing active"; likely per-cell flags or an inhibit state | Keep raw; encoding Unknown |
 | A-16 | ledStatus (PCS 24/18/18; DCDC 1/20/20), matchGoalState (0/3/3) | Values split cleanly by idle/active but have no enum | State-machine codes, meaning unknown | Record raw; do not name them |
+| A-17 | MID system workMode = 7 (`0x0100+2`) | Outside the vendor's three-value enum (2 Economy / 6 Remote dispatch / 8 Timing); RHS/LHS read 2 = Economy, coherent with PCS "Matching Load" | (a) firmware has more modes than the vendor UI enumerates (UI would show "Unknown"); (b) MID's low-SOC/inhibited state is encoded here | Keep raw; do not map 7 to any name |
+| A-18 | System pcsStatus 8 / 4 / 4 (`0x0100+48`) | Decoded by the vendor (`SysControl.cs:422`) but never rendered anywhere in the UI (verified: only `PcsInfo.status`/`DcdcInfo.status` are displayed, `MiniESapp.cs:1379/1384/1411/1416`); values fit neither the PCS-status nor the system-status enum, and MID (8) differs from its capture-1 PCS-block status (1 Idle) | (a) different per-firmware coding for this field; (b) bitmask, not an enum; (c) state changed between captures | Keep raw; use `0x1000+1` (PCS status) and `0x0100+0` (system status) for named states instead |
+| A-19 | `0x0100` offsets 32-40 (vendor-undecoded) | MID [22, 3208, 2, 3204, 0, 28, 50, 23, 0], RHS [2, 3266, 20, 3261, 0, 28, 40, 22, 0], LHS [3, 3257, 38, 3248, 0, 27, 50, 22, 0] — magnitudes and time-evolution match the cell-extrema families (maxV/minV mV equal to the arrays' extremes, ~27-28 °C / ~22-23 °C temps, plausible cell indices; e.g. LHS 3257/3248 vs capture-1 3260/3253 after further discharge) | Mirrored cell-extrema summary (most likely), or another subsystem's summary block | The vendor decodes nothing here — **Unknown, do not promote**; take extrema from the vendor-decoded `0x5000+19..30` |
+| A-20 | `0x8139` = 0 and `0x8102+55` = 0 ("Disconnected") on all units | Read as Disconnected while our Modbus session works fine | Refers to the device's upstream link to its configured servers (52.187.245.123:507 / 20.191.198.60:507, inferred), expected down on the isolated commissioning LAN; alternatively the enum means something else on this firmware | Non-blocking; if cloud reporting is ever required, this is the flag to watch |
+| A-21 | `0x8102` offset 44 (= 3 all units) and offset 54 (4 / 81 / 105 per unit) | Vendor decodes neither offset | Offset 43 is the serial NUL terminator; 44 and 54 are undocumented per-unit values (config? calibration? region?) | Keep raw; unknown |
+| A-22 | `0x0100` offsets 45 and 47 read 65496 (s16 -40) on all units, offsets 8-15, 23-31, 41-44, 46, 56 all 0 | Vendor decodes none of these | -40 is suspicious given the °C `raw-40` convention (could encode 0 in an offset field, or be a genuine -40 sentinel) | Keep raw; unknown |
 
-Everything else in §2 decoded plausibly: SOC in range (10/73/57), SOH 100 on all (top of band, new packs), pack voltages = cells × 3.2-3.27 V, all cells 3253-3271 mV, temperatures 22-43 °C across all sensors, dynamic limits positive and internally exact, status/warning/fault words coherent (two known calibration warnings, zero faults, states matching the measured power flow on every unit).
+Everything else in §2 decoded plausibly: SOC in range (10/73/57 at capture 1; 10/71/53 at capture 2), SOH 100 on all (top of band, new packs), pack voltages = cells × 3.2-3.27 V, all cells 3253-3271 mV, temperatures 22-43 °C across all sensors, dynamic limits positive and internally exact, status/warning/fault words coherent (two known calibration warnings, zero faults, states matching the measured power flow on every unit).
 
 ## 6. Confidence-graded disposition (deliverable 5)
 
@@ -323,28 +406,35 @@ Everything else in §2 decoded plausibly: SOC in range (10/73/57), SOH 100 on al
 8. DCDC live `0x2000`, all 13 offsets — V×I=P exact, branches sum to total.
 9. DCDC detail `0x2060+3,+4,+7,+15` (temps, voltage objective, power limit).
 10. Warning/fault word placement in `0x1040` / `0x2040` / `0x5040` — the captured bits decode to the two documented calibration warnings; everything else zero.
+11. System overview battery and PCS paths `0x0100+0/+1, +16..+22, +49..+55, +57..+60` (capture 2) — V×I=P exact on the battery path, system-status/ctrl-mode enums coherent, limits matching the BMS/PCS chain; workMode valid on RHS/LHS only (A-17).
+12. System history counters `0x0100+3..+6` — **high-word-first, raw Wh** (unit and order newly pinned by the exact identity with the BMS counters, §3.4); charge/discharge role labels confirmed.
+13. Device identity layer `0x8102` — RTU ID (third read, exact), ASCII serial numbers, MAC addresses, RS485 params (19200/4 and 19200/5), gridStandard = 1 → G98 (UK) pinned per unit.
+14. Debug-mode readback `0x8100` = 0 (Normal Mode) on all units — the vendor's PQ-dispatch precondition (`MiniESapp.cs:2180-2184`) is observably satisfied; network status `0x8139` = 0 with the upstream-server interpretation noted (A-20).
 
 ### Needs a follow-up capture — with the exact read that disambiguates
 
 | Open item | Exact follow-up read |
 |---|---|
-| A-1 energy counter role labels | FC03 `0x4101`×12 and `0x5000`×31 now and again at T+30 min with direction known (RHS/LHS discharge ~1.2/2.0 kW at capture time; ~0.6/1.0 kWh per 30 min = 6/10 counts). Whichever pair increments is the discharge counter; likewise buy vs sell on the external meter |
-| A-13 BMS runMode / chargeDischargeStatus values for charge | FC03 `0x5000`×31 during a known charge window (MID at SOC 10% with chargePowerLimit 7692 W will accept charge) — records the charge-state enum values and the current sign under charge |
-| A-9 rateGridVoltFrequency / gridStandard / serial parameters | FC03 `0x8102`×56 (device/network/serial parameter block, V-WRITE inventory) plus `0x0100`×61, `0x8100`×1, `0x8139`×1 — also completes the system-overview decode (control mode, work mode, system battery path), none of which are in this capture |
+| A-1 (remaining) buy/sell role labels | FC03 `0x4101`×12 at two times spanning a known import or export interval on one unit — whichever grid pair increments identifies buy vs sell (the charge/discharge half is now resolved by capture 2) |
+| A-13 BMS runMode / chargeDischargeStatus values for charge — **still open: capture 2's system block does not contain these fields** | FC03 `0x5000`×31 during a known charge window (MID at SOC 10% with chargePowerLimit 7692 W will accept charge) — records the charge-state enum values and the current sign under charge |
 | A-3 / A-14 metering integration and idle bias | Burst capture: FC03 `0x1000`×21 + `0x2000`×13 at 1 Hz for 60 s on one discharging unit and on idle MID |
 | A-4 cell-number tie-break | Any later cell capture where the maximum is unique (no tie) — the reported index then identifies the rule |
+| A-17 MID workMode = 7 | FC03 `0x0100`×61 after MID has recharged above its discharge-inhibit threshold — if workMode changes to 2 with operating state, 7 encodes the inhibited/low-SOC condition; if it persists, it is a firmware mode outside the vendor enum |
+| A-19 `0x0100+32..40` suspected extrema mirror | Compare a simultaneous `0x5000`×31 and `0x0100`×61 pair — if the mV words always equal the live cell extrema, the mirror reading is promoted |
 
 ### Stays unknown — not decodable from statics
 
 - Watchdog / PQ lease expiry timing, renewal jitter, and fallback state after missed renewals (requires the timed renewal-stop experiment of evidence §14; nothing in a static read can measure it).
-- Active/reactive power sign convention for control (negative-P charging is only operationally corroborated; the capture shows telemetry signs, not command signs).
+- Active/reactive power sign convention for control (negative-P charging is only operationally corroborated; the captures show telemetry signs, not command signs).
 - Balance-word bit encoding (A-15) and any cell-imbalance threshold semantics.
-- Meanings of ledStatus, matchGoalState, rateGridVoltFrequency, functionSelected, gridStandard, and DCDC debug enums (A-9, A-16).
+- Meanings of ledStatus, matchGoalState, rateGridVoltFrequency, functionSelected, and DCDC debug enums (A-9, A-16); gridStandard is now resolved (G98).
+- System pcsStatus semantics (`0x0100+48`, A-18) and MID workMode = 7 (A-17).
+- The vendor-undecoded areas of `0x0100` (offsets 8-15, 23-47, 56 — A-19/A-22) and of `0x8102` (offsets 44, 54 — A-21); the server-parameter octet/port reading is inferred, not vendor-decoded.
 - DCDC gridFrequency (A-8) and fan speeds (A-7) — dead registers in this firmware.
 - Whether another controller writes the objective registers (competing-writer detection, evidence §13.18).
 
 ## 7. Blockers
 
-- **Decoding: none.** Every captured field now has a validated mapping or an explicitly flagged ambiguity; nothing blocks building the run-mode (telemetry) decoder from the high-confidence list in §6.
-- **Control: unchanged from PROTOCOL_EVIDENCE §13** — watchdog timing, fallback behavior, `[1,P,Q]` vs active-only equivalence, verified sign conventions, and competing-writer detection remain open and gate any actuation. The string-identity binding strategy (only the CRC32-grade RTU ID is on the wire) also remains open.
-- Two fleet observations worth carrying into commissioning: all three units persistently report the PCS/DCDC calibration-parameter warnings (benign-looking, but root cause unknown — evidence §13.16), and MID sat at SOC 10% with discharge inhibited, which is why its DC link was sagged to battery voltage at capture time.
+- **Decoding: none.** Every captured field across both captures now has a validated mapping or an explicitly flagged ambiguity; nothing blocks building the run-mode (telemetry) decoder from the high-confidence list in §6.
+- **Control: unchanged from PROTOCOL_EVIDENCE §13** — watchdog timing, fallback behavior, `[1,P,Q]` vs active-only equivalence, verified sign conventions, and competing-writer detection remain open and gate any actuation. The `0x8100` readback of 0 (Normal Mode) shows the vendor UI's dispatch precondition is satisfied, but that is an observation, not an authorization to write. The string-identity binding question is now largely answered in practice (serial ↔ RTU ID ↔ MAC ↔ host pinned per unit, §1 and §2.15), though the wire still carries only the CRC32-grade RTU ID.
+- Two fleet observations worth carrying into commissioning: all three units persistently report the PCS/DCDC calibration-parameter warnings (benign-looking, but root cause unknown — evidence §13.16), and MID sat at SOC 10% with discharge inhibited across both captures, which is why its DC link was sagged to battery voltage and its system status read Standby.
