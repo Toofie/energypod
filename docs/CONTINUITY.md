@@ -366,6 +366,28 @@ direction, freshness, and watchdog timing per physical unit.
 - 2026-08-21: Committed the baseline as `1552202` and dispatched five disjoint
   implementation streams: domain/allocation; config/schedule/persistence;
   arbiter/safety/kernel; protocol/transport; and sole-owner actor.
+- 2026-08-22: LIVE CONTROL COMMISSIONED. Write-enabled run mode landed
+  contract-first (ea62398: policy qualification threshold, config gates for
+  live-trial expiry evidence and the 1.5 s renewal envelope, arm-time
+  external-writer preflight reading the served PQ objective — a foreign
+  nonzero objective latches INHIBITED instead of fighting) and was then made
+  live-capable by the tiered telemetry plan (fafc47c: the full 17-window
+  read takes ~3.4 s over the 0.1 s gateway gap, longer than the renewal
+  envelope, so refresh is tiered — control-rate core every cycle, cells on
+  their own capture clock, cold ring with cache merging). Two controlled
+  charges on MID verified end to end: dispatch -> kernel authority -> PQ
+  writes at the commissioned cadence -> measured -423 W charging -> TTL
+  expiry -> clean return to resting state. OPEN INCIDENT (und diagnose):
+  the FIRST live charge attempt (120 s TTL) ended in a fleet-wide halt
+  ~16 s in — all actors STOPPING, polls stopped, serving stayed up, no
+  traceback in the log; the battery was verified SAFE by direct probe
+  (objective P=0, watchdog had cleared it). Did not reproduce on the
+  second trial (45 s TTL, clean). Follow-up: surface the halt reason
+  through /api/v1/health or a diagnostics field, and watch the durable
+  SQLite audit path under write load. The console (localhost:5173) shows
+  live control: requested/authorized/measured separately, arm/disarm,
+  dispatch with preview, emergency stop with acknowledgement.
+
 - 2026-08-22: LIVE COMMISSIONING (observe-only) + telemetry surface. With the
   operator's explicit direct-hookup authorization: first live reads ever
   through the production transport verified the RTU-over-TCP framing,
