@@ -617,6 +617,43 @@ direction, freshness, and watchdog timing per physical unit.
   2000 W intent drove authorized 2000 W / measured 2197-2239 W before
   their own 22:58:50 disarm.
 
+- 2026-08-23 (stop): EMERGENCY-STOP INCIDENT CLOSED — and a deeper bug
+  found. The "unable to charge mid / stopped authorized" episode was a
+  LATCHED EMERGENCY STOP pressed MANUALLY by the operator at 23:14:24Z
+  (stop-5-3753.297000, 1.4 s after their own -2000 W charge intent went
+  active — an accidental/experimental press), holding every cycle at
+  stop_authorized until acknowledged. Released 23:20:37Z via the
+  documented acknowledge (needs an Idempotency-Key header). CHARGING
+  VERIFIED on release: the operator's still-live 2000 W intent immediately
+  won arbitration — authorized -2000 W, measured -1824 W vs the ~-900 W
+  self-charge baseline (~900 W deeper, tracking), clean TTL expiry back
+  to armed_idle. First-ever stop_acknowledged audit event (Activity
+  Acknowledgements section now has its first real entry). UX DEFECTS
+  confirmed (release affordance renders ONLY in the browser session that
+  pressed the stop — stopOutcome is session state; the latch banner is
+  event-driven only, so a console loaded after the latch shows NO banner;
+  Activity renders stop cycles as "Power allowed" instead of naming the
+  stop): fix = expose latch state in snapshot/health (queue item already
+  present), show banner + inline type-it-back acknowledge wherever the
+  latch is announced, disable arm/disarm with the stop id named.
+  PRIORITY BUG REOPENED — publish-fence generation desync: after the
+  acknowledgment, a NEW intent (300 W probe) arbitrated authorized EVERY
+  cycle while its watts NEVER dispatched: each cycle minted authority
+  then publish was fenced 2-5 ms later (StaleGenerationError-at-publish
+  path; memory.py fence rejects generation <= revoked_through), leaving
+  two audit rows per cycle (granted + zero-authorized fenced record) and
+  snapshot authorized_power null. Counterexample: intent-1->intent-2 at
+  23:00Z published cleanly at generation 0 — failure is specific to the
+  post-ack generation state (gen 4). This is the SAME authorized-but-
+  nothing-happens signature as the 22:11Z "silent actuation loss" (which
+  the restart "fixed" — a restart also resets generation state), so the
+  mode-word theory is demoted to co-suspect: REPRO — new intent after a
+  prior intent's expiry in the post-ack generation state; inspect the
+  generation coordinator vs repository revoked_through reconciliation
+  (why does the coordinator keep minting at a fenced generation instead
+  of advancing?). Fix owner: src/ (queued at the head of the fix queue,
+  behind the in-flight excess-charging implementation).
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
