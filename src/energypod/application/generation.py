@@ -44,6 +44,32 @@ class AuthorityGenerationCoordinator:
             self._epoch += 1
             return AuthorityGenerationSnapshot(self._epoch)
 
+    async def advance_past(self, epoch: int, *, reason: str) -> AuthorityGenerationSnapshot:
+        """Reconcile strictly beyond a fence another component already applied.
+
+        2026-08-23 live desync: a revocation that fences the authorization
+        repository without advancing this coordinator leaves every later mint
+        at a permanently fenced epoch.  This operation repairs exactly that
+        gap: it moves the epoch to ``epoch + 1`` when the coordinator sits at
+        or below ``epoch``, and is an idempotent no-op when already beyond.
+        The epoch never regresses and is never reused; nothing at or below
+        the reconciled fence may publish again, so the permanent generation
+        fence keeps its full strength.
+        """
+        if type(epoch) is not int or not 0 <= epoch <= _MAX_EPOCH:
+            raise ValueError("epoch must fit a non-negative signed 64-bit integer")
+        self._validate_reason(reason)
+        async with self._lock:
+            target = epoch + 1
+            if self._epoch >= target:
+                return AuthorityGenerationSnapshot(self._epoch)
+            if target > _MAX_EPOCH:
+                raise OverflowError("authority generation is exhausted")
+            # Same atomicity contract as ``advance``: no cancellation point
+            # exists between the mutation and the returned snapshot.
+            self._epoch = target
+            return AuthorityGenerationSnapshot(self._epoch)
+
     @staticmethod
     def _validate_reason(reason: str) -> None:
         if type(reason) is not str:
