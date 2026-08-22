@@ -13,7 +13,7 @@ Boot is observe-only and disarmed regardless of persisted history: authority,
 arming, and active commands are never restored from persistence, and the
 volatile stores start empty on every build.
 
-Two bridging decisions live in this module and nowhere else:
+Three bridging decisions live in this module and nowhere else:
 
 - The shipped repositories are synchronous; every application component
   (kernel, actor, facade) awaits its ports.  The async adapters below wrap the
@@ -25,6 +25,16 @@ Two bridging decisions live in this module and nowhere else:
   event can never be lost to task scheduling and a slow subscriber can never
   delay the safety path.  Supervision therefore runs the kernel tick loop and
   the per-unit actor loops; there is no separate publisher task to lose.
+- Run mode (``simulate=False``) wires each actor a decode-driven telemetry
+  strategy over the production transport: the served layout probe decides the
+  register plan, and the production wire decoder turns the served blocks into
+  the domain observation.  Run-mode observe-only is structural, not a mode
+  flag the composition checks: the actor's stable-sample qualification
+  threshold is wired beyond any reachable count because the per-unit
+  commissioning evidence that would justify qualification (verified sign
+  conventions, watchdog timing, string-identity binding — field-mapping
+  2026-08-22 section 7) is not composed, so no amount of coherent telemetry
+  can ever carry a live unit into DISARMED or mint authority for it.
 """
 
 from __future__ import annotations
@@ -57,6 +67,7 @@ from energypod.adapters.modbus import (
     protocol_codec,
     register_layout,
 )
+from energypod.adapters.modbus import decode as wire_decode
 from energypod.adapters.persistence.memory import (
     InMemoryAuthorizationRepository,
     InMemoryIntentRepository,
@@ -90,6 +101,7 @@ from energypod.domain import (
 from energypod.domain.audit import AuditEvent, DuplicateAuditEventError
 from energypod.domain.schedule import SchedulePlan, ScheduleVersionConflict
 from energypod.runtime.config import ControllerConfig
+from energypod.runtime.credentials import FileCredentialStore
 from energypod.simulator import SimulatedEnergyPod, SimulatorTransport
 
 # Bounded retention for the composed event bus; publishers are never blocked
@@ -111,6 +123,19 @@ _MAX_SIMULATOR_BICS = 6
 
 # The only evidenced writable objective is FC16 at 0x0200 with [1, P, Q].
 _PQ_OBJECTIVE_ADDRESS = 0x0200
+
+# Run mode composes no interactive qualification path (PROTOCOL_EVIDENCE
+# section 4a; field-mapping 2026-08-22 section 7): actuation stays gated on
+# per-unit commissioning evidence — verified power-direction signs, watchdog
+# renewal timing, and the string-identity binding strategy — that no run-mode
+# composition holds.  The actor's stable-sample threshold is therefore wired
+# beyond any count a process could ever reach (one sample per telemetry cycle
+# at the 0.40 s commissioned cadence would need ~10^12 years to reach 2^63-1),
+# so a live unit can never cross into DISARMED through telemetry alone, the
+# facade always sees an unqualified unit, and the only register write run mode
+# can ever issue is the bounded stop triple.  Observe-only is structural, not
+# a mode flag the composition re-checks anywhere else.
+_RUN_MODE_STABLE_SAMPLES_REQUIRED = 2**63 - 1
 
 # Register windows the simulator telemetry decode consumes (PROTOCOL_EVIDENCE
 # section 5): the common system block, the IoT BMS block, the three IoT
@@ -710,14 +735,16 @@ def _production_transport_factory(unit: Any, timeout_s: float) -> Callable[[], W
     return lambda: WaveshareTransport(config=config)
 
 
-class _SimulatorBankMismatchError(RuntimeError):
+class _ServedBankMismatchError(RuntimeError):
     """The served register bank contradicts what the unit is configured for.
 
     A decode that cannot reconcile the bank it actually read with the unit's
     configured profile or topology fails the poll: no observation is
     delivered, qualification can never pass, and control fails closed through
     telemetry staleness.  Copying the configured expectation into the
-    observation instead would fabricate self-consistent evidence.
+    observation instead would fabricate self-consistent evidence.  Both
+    composed telemetry strategies — the simulator device model and the live
+    wire decode — share this one fail-closed doctrine.
     """
 
 
@@ -837,30 +864,30 @@ class _SimulatorTelemetry:
         """
         probe = register_layout.detect_layout(bms[:7])
         if probe.layout.value != self._expected_profile:
-            raise _SimulatorBankMismatchError(
+            raise _ServedBankMismatchError(
                 f"unit {self._unit_id!r} is configured for protocol profile "
                 f"{self._expected_profile!r} but the served register bank reports "
                 f"{probe.layout.value!r}"
             )
         if not probe.topology_valid:
-            raise _SimulatorBankMismatchError(
+            raise _ServedBankMismatchError(
                 f"unit {self._unit_id!r} is served an invalid {probe.layout.value} topology: "
                 f"{probe.bic_count} BICs"
             )
         served_cells = probe.bic_count * _CELLS_PER_BIC
         served_temperatures = probe.bic_count * _TEMPERATURES_PER_BIC
         if len(cells) != served_cells:
-            raise _SimulatorBankMismatchError(
+            raise _ServedBankMismatchError(
                 f"unit {self._unit_id!r} served {len(cells)} cell words where its own "
                 f"topology reports {served_cells}"
             )
         if len(temperatures) != served_temperatures:
-            raise _SimulatorBankMismatchError(
+            raise _ServedBankMismatchError(
                 f"unit {self._unit_id!r} served {len(temperatures)} temperature words where "
                 f"its own topology reports {served_temperatures}"
             )
         if served_cells < self._expected_cell_count:
-            raise _SimulatorBankMismatchError(
+            raise _ServedBankMismatchError(
                 f"unit {self._unit_id!r} expects {self._expected_cell_count} cells but the "
                 f"served IoT packing holds {served_cells}"
             )
@@ -883,6 +910,134 @@ class _SimulatorTelemetry:
                     signal.code for signal in faults.decode_fault_word(prefix, words[prefix])
                 )
         return frozenset(fault_codes), frozenset(warning_codes)
+
+
+class _LiveDecodeTelemetry:
+    """Composition-owned probe -> plan -> decode strategy over one live gateway.
+
+    Run mode (``simulate=False``) wires exactly one of these per unit, over the
+    same lazy production transport the owning actor dispatches through (so sole
+    socket ownership is unchanged — every read below still runs inside the
+    actor's serialized mailbox dispatch).  One telemetry cycle is:
+
+    1. ``advance()`` reads the seven-word layout probe from the BMS block and
+       decodes it with the production ``detect_layout``.  The served probe —
+       not the configuration — is the evidence: the wire's own BIC count sizes
+       this cycle's cell, temperature, and balance windows, exactly as the
+       2026-08-22 captures show a mixed 6/5/6-BIC fleet behind one read plan.
+       A probe that contradicts the configured profile, or reports a topology
+       the evidenced IoT packing cannot serve, fails the poll: no observation,
+       no qualification, control fails closed through telemetry staleness.
+    2. ``read_plan()`` is the shipped catalog's IoT read plan for the probed
+       topology plus the common blocks (system overview, debug-mode readback,
+       network status, the identity pair, and the device parameters whose
+       RTU-ID mirror cross-checks identity).
+    3. ``decode()`` hands the served blocks — re-keyed from the actor's
+       ``(address, count)`` windows to the base-address mapping the wire
+       decoder speaks — to the production decoder, together with the probe and
+       this unit's commissioned expectations.  Identity comes from the wire
+       (``0x8106``, low word first, rendered ``byd-{rtu_id:08x}``), never from
+       configuration; the deployed plan carries no poll-sequence or
+       capture-time registers, so the strategy mints the per-unit capture
+       sequence and stamps the injected clock's capture times; the lifecycle
+       comes from the owning actor so the control path sees controllability
+       exactly as the actor holds it.
+    """
+
+    def __init__(
+        self,
+        *,
+        transport: _LazyWaveshareTransport,
+        clock: Clock,
+        unit_id: str,
+        expected_identity: str,
+        expected_profile: str,
+        expected_cell_count: int,
+        probe_address: int,
+        probe_count: int,
+    ) -> None:
+        if expected_profile != register_layout.ProtocolLayout.IOT.value:
+            # The evidenced live decode covers the deployed IoT register plan
+            # only.  Composing a legacy-profile live unit would boot a pod that
+            # can never be served a decodable bank: a wiring error, not a
+            # runtime discovery.
+            raise ValueError(
+                f"unit {unit_id!r} is configured for protocol profile "
+                f"{expected_profile!r}; the evidenced live decode covers the "
+                f"deployed {register_layout.ProtocolLayout.IOT.value} register plan only"
+            )
+        self._transport = transport
+        self._clock = clock
+        self._unit_id = unit_id
+        self._expected_identity = expected_identity
+        self._expected_profile = expected_profile
+        self._expected_cell_count = expected_cell_count
+        self._probe_window = (probe_address, probe_count)
+        self._catalog = register_layout.RegisterCatalog()
+        self._sequence = itertools.count(1)
+        self._probe: register_layout.LayoutProbe | None = None
+
+    async def advance(self) -> None:
+        """Probe the served layout so this cycle's plan follows the wire."""
+        words = await self._transport.read_holding(*self._probe_window)
+        probe = register_layout.detect_layout(words)
+        if probe.layout.value != self._expected_profile:
+            raise _ServedBankMismatchError(
+                f"unit {self._unit_id!r} is configured for protocol profile "
+                f"{self._expected_profile!r} but the served register bank reports "
+                f"{probe.layout.value!r}"
+            )
+        if not probe.topology_valid:
+            raise _ServedBankMismatchError(
+                f"unit {self._unit_id!r} is served an invalid {probe.layout.value} topology: "
+                f"{probe.bic_count} BICs"
+            )
+        self._probe = probe
+
+    def read_plan(self) -> tuple[tuple[int, int], ...]:
+        """The evidenced IoT register windows one live telemetry cycle reads."""
+        probe = self._probe_require()
+        return tuple(
+            (block.address, block.count)
+            for block in (
+                *self._catalog.iot_reads(bic_count=probe.bic_count),
+                *self._catalog.common_reads,
+            )
+        )
+
+    def decode(
+        self, blocks: Mapping[tuple[int, int], tuple[int, ...]], lifecycle: UnitLifecycle
+    ) -> Observation:
+        probe = self._probe_require()
+        # The actor keys blocks by read window; the wire decoder keys them by
+        # base address.  Where two windows share a base (the seven-word
+        # essential probe inside the 31-word BMS block), the fuller block is
+        # the one the decoder consumes.
+        served: dict[int, tuple[int, ...]] = {}
+        for (address, _count), words in blocks.items():
+            current = served.get(address)
+            if current is None or len(words) > len(current):
+                served[address] = words
+        return wire_decode.decode_observation(
+            probe,
+            served,
+            unit_id=self._unit_id,
+            expected_identity=self._expected_identity,
+            expected_profile=self._expected_profile,
+            expected_cell_count=self._expected_cell_count,
+            wall_timestamp=self._clock.wall_now().astimezone(UTC),
+            captured_at_mono=float(self._clock.monotonic()),
+            sequence=next(self._sequence),
+            lifecycle=lifecycle,
+        )
+
+    def _probe_require(self) -> register_layout.LayoutProbe:
+        """The probe ``advance()`` read this cycle; the actor always awaits it first."""
+        if self._probe is None:
+            raise _ServedBankMismatchError(
+                f"unit {self._unit_id!r} has no served layout probe for this telemetry cycle"
+            )
+        return self._probe
 
 
 class _ActorCommandHandle:
@@ -929,12 +1084,14 @@ class _ActorCommandHandle:
 class _UnresolvedCredentialAuthenticator:
     """Fail-closed bearer authentication until a credential store is composed.
 
-    The configuration carries a secret *reference*, never a secret, and no
-    credential store exists in this milestone.  Every bearer token is refused
-    so no principal is ever fabricated; the REST boundary answers with its
-    structured 401 envelope.  This stays the composed authenticator for every
-    run-mode deployment and for any configuration that names a credential
-    store; only the simulator grant below ever replaces it.
+    The configuration carries a secret *reference*, never a secret, so a
+    reference alone never fabricates a principal: every bearer token is
+    refused and the REST boundary answers with its structured 401 envelope.
+    This stays the composed authenticator whenever no credential store is
+    injected — every run-mode deployment without a store, and any
+    configuration that references credentials without one.  Only the
+    simulator grant below and an injected, configuration-referenced
+    ``FileCredentialStore`` ever replace it.
     """
 
     async def authenticate(self, bearer_token: str) -> None:
@@ -1480,6 +1637,7 @@ def build_runtime(
     simulate: bool = False,
     clock: Clock | None = None,
     dev_credential_announce: Callable[[str], None] | None = None,
+    credential_store: FileCredentialStore | None = None,
 ) -> ComposedRuntime:
     """Construct the whole controller graph; the only composition point.
 
@@ -1492,6 +1650,11 @@ def build_runtime(
     persistence.  Wiring is validated before that store opens, and a
     composition that cannot complete closes it again, so a rejected
     configuration leaves nothing on disk.
+
+    ``credential_store`` injects the run-mode credential store; it is used
+    only when ``config.authentication`` references credentials (present and
+    enabled), and is otherwise left unused — the configuration, not the
+    injection, is the authority.
     """
     _validate_actor_timing_wiring(config)
     resolved_clock = clock if clock is not None else _SystemClock()
@@ -1503,6 +1666,7 @@ def build_runtime(
             resolved_clock=resolved_clock,
             database=None,
             dev_credential_announce=dev_credential_announce,
+            credential_store=credential_store,
         )
     database = SQLiteDatabase(
         storage.database_path,
@@ -1521,6 +1685,7 @@ def build_runtime(
             resolved_clock=resolved_clock,
             database=database,
             dev_credential_announce=dev_credential_announce,
+            credential_store=credential_store,
         )
     except BaseException:
         # A composition that cannot complete must not leave an open durable
@@ -1530,6 +1695,17 @@ def build_runtime(
         raise
 
 
+def _credential_store_referenced(config: ControllerConfig) -> bool:
+    """True when the configuration's authentication block references credentials.
+
+    The configuration, not the injection, is the authority: an injected
+    ``FileCredentialStore`` composes only for a deployment whose
+    authentication block is present and enabled, and is otherwise ignored.
+    """
+    authentication = config.authentication
+    return authentication is not None and authentication.enabled
+
+
 def _build_runtime(
     config: ControllerConfig,
     *,
@@ -1537,6 +1713,7 @@ def _build_runtime(
     resolved_clock: Clock,
     database: SQLiteDatabase | None,
     dev_credential_announce: Callable[[str], None] | None = None,
+    credential_store: FileCredentialStore | None = None,
 ) -> ComposedRuntime:
     unit_ids = frozenset(unit.unit_id for unit in config.units)
     process_instance_id = f"energypod-{uuid.uuid4().hex}"
@@ -1619,7 +1796,7 @@ def _build_runtime(
     actors: dict[str, EnergyPodActor] = {}
     simulators: dict[str, SimulatedEnergyPod] | None = {} if simulate else None
     for index, unit in enumerate(config.units):
-        telemetry: _SimulatorTelemetry | None = None
+        telemetry: _SimulatorTelemetry | _LiveDecodeTelemetry | None = None
         if simulate:
             pod = _simulator_pod(
                 unit,
@@ -1645,6 +1822,21 @@ def _build_runtime(
             transport = _LazyWaveshareTransport(
                 _production_transport_factory(unit, config.timing.essential_read_timeout_s)
             )
+            # Run mode decodes the served register bank with the production
+            # wire decoder over the same lazy transport the actor owns, so one
+            # telemetry cycle probes the served layout, reads the plan the
+            # probe justifies, and delivers the decoded observation through
+            # the actor's accept-observation path.
+            telemetry = _LiveDecodeTelemetry(
+                transport=transport,
+                clock=resolved_clock,
+                unit_id=unit.unit_id,
+                expected_identity=unit.expected_identity,
+                expected_profile=unit.protocol_profile.value,
+                expected_cell_count=unit.expected_cell_count,
+                probe_address=probe.address,
+                probe_count=probe.count,
+            )
         actors[unit.unit_id] = EnergyPodActor(
             unit_id=unit.unit_id,
             transport=transport,
@@ -1657,7 +1849,15 @@ def _build_runtime(
             expected_identity=unit.expected_identity,
             expected_profile=unit.protocol_profile.value,
             expected_cell_count=unit.expected_cell_count,
-            stable_observations_required=policy.stable_samples_needed_to_rearm,
+            # Structural observe-only for run mode: the qualification threshold
+            # is wired beyond any reachable count because the per-unit
+            # commissioning evidence that would justify qualification is not
+            # composed.  Simulate mode keeps the policy's commissioning path.
+            stable_observations_required=(
+                policy.stable_samples_needed_to_rearm
+                if simulate
+                else _RUN_MODE_STABLE_SAMPLES_REQUIRED
+            ),
             essential_read_address=probe.address,
             essential_read_count=probe.count,
             heartbeat_interval_s=policy.heartbeat_interval_s,
@@ -1696,12 +1896,21 @@ def _build_runtime(
     # API_CONTRACTS "Operations surface": simulate mode with no configured
     # credential store mints exactly one deterministic development principal
     # (full scopes, interactive) and announces its per-process token once —
-    # composition is the controller's startup.  Run mode, and any
-    # configuration that names a credential store (enabled or not), stays
-    # fail-closed: every bearer is refused until a real credential store is
-    # composed, so no principal is fabricated outside the simulator grant.
-    authenticator: _DevelopmentPrincipalAuthenticator | _UnresolvedCredentialAuthenticator
-    if simulate and config.authentication is None:
+    # composition is the controller's startup.  A credential store injected
+    # for a configuration whose authentication block references credentials is
+    # the composed authenticator instead (and the simulator grant is then
+    # never minted).  Everything else — run mode without a store, a
+    # configuration that references credentials without one, a store injected
+    # without a reference — stays fail-closed: every bearer is refused, so no
+    # principal is fabricated outside the simulator grant and the store.
+    authenticator: (
+        _DevelopmentPrincipalAuthenticator
+        | _UnresolvedCredentialAuthenticator
+        | FileCredentialStore
+    )
+    if credential_store is not None and _credential_store_referenced(config):
+        authenticator = credential_store
+    elif simulate and config.authentication is None:
         dev_authenticator = _DevelopmentPrincipalAuthenticator(
             site_id=config.site.site_id,
             announce=(

@@ -537,9 +537,26 @@ def _compose_runtime(config: ControllerConfig, *, simulate: bool) -> Any:
     any I/O. Construction validates wiring eagerly, so a misconfiguration
     fails before any task starts.
     """
-    from energypod.runtime import composition
+    from pathlib import Path
 
-    return composition.build_runtime(config, simulate=simulate)
+    from energypod.runtime import composition
+    from energypod.runtime.credentials import FileCredentialStore
+
+    credential_store = None
+    authentication = getattr(config, "authentication", None)
+    if authentication is not None and authentication.enabled:
+        # API_CONTRACTS "Operations surface": the config carries a secret
+        # REFERENCE, never a secret; the deployment resolves it to the
+        # credential file. A secret:// path reference resolves relative to the
+        # deployment; a missing or unusable file stays fail-closed inside the
+        # store (every bearer refused) rather than blocking startup.
+        reference = authentication.operator_credential_ref
+        credential_path = Path(reference.removeprefix("secret://"))
+        if not credential_path.is_absolute():
+            credential_path = Path.cwd() / credential_path
+        credential_store = FileCredentialStore(credential_path)
+
+    return composition.build_runtime(config, simulate=simulate, credential_store=credential_store)
 
 
 async def _await_outcome(outcome: Awaitable[Any]) -> None:
