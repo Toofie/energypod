@@ -18,12 +18,47 @@ safety invariant is NEVER deferred — it is fixed before the milestone closes.
 
 ## Queue: mutation-analysis findings (2026-08-22, isolated worktree run)
 
-Pending: the isolated mutmut run over events.py, service.py, and
-simulator/pod.py reports its per-module survivor classification here when it
-completes. Historical safety-module analysis (2026-08-21) already reduced
-safety.py survivors 60 -> 23 with the remaining classified as non-vocabulary
-equivalents (and/or operator swaps, getattr defaults, limit arithmetic
-boundary mutants, dataclass slots).
+Run by a background agent in a dedicated git worktree against the Milestone A
+state; worktree removed afterwards; main tree never mutated. Kill rates:
+events.py 66.3% (101 mutants), service.py 57.8% (578), simulator/pod.py 57.8%
+(559). Equivalent-mutant counts accepted as noise: ~22 (events), ~75
+(service), ~60 (pod) — dominated by error-message text, StrEnum fallbacks,
+annotation-only edits, and contract-declined literal pins. Genuine test gaps,
+queued by value:
+
+1. **Facade audit/publish content assertions (~86 survivors, highest value):**
+   the facade suite never asserts audit-event content (event_type, result,
+   reason_codes, payload, correlation_id, policy_version, fingerprints,
+   requested/authorized watts) nor published-body payloads beyond type
+   presence. One compact exact-dict test per happy-path operation kills the
+   cluster.
+2. **Simulator literal register image (~90 survivors):** served words are
+   pinned by range/coherence, never literal word values (status/SOC/SOH
+   placement, limit words, energy word pairing, extrema triples + index
+   words, +40 temperature offsets, RTU-ID value at 0x8106, reserved words
+   zero, one-past-block reads raising). One golden full-plan snapshot per
+   scenario step computed with literal word arithmetic.
+3. **Golden energy/SOC scenario (~28):** a load long enough to cross the
+   0.1 kWh integration resolution, asserting exact energy deltas and SOC
+   movement; watchdog expiry exactly at the deadline; a second poll after
+   expiry (latent empty-lease crash); post-expiry split-interval accounting;
+   energy-count ceiling path.
+4. **Validation matrices (~30):** SimulatedEnergyPod constructor validation
+   (19: identity/bic/seed/watchdog/interval shapes + inject hook boundaries);
+   facade input shapes (string unit_ids, non-int watts/ttl, limit/cursor
+   boundaries, reason length 500/501, Direction enum dispatch); event-bus
+   bound=1, bool bound, missing type, missing payload, NaN fail-closed,
+   broken clock.
+5. **Behavioral pins (~40):** unknown-unit-FIRST emergency stop ordering;
+   partial-stop acknowledgement liveness (the fleet-wide short-circuit leaves
+   one branch untested); exact degraded-list reason codes; health
+   per-dependency reason strings and control-readiness reason content; arm
+   interactivity requirement; fenced_generation/stop_id response fields;
+   post-aclose bus terminality (two terminal reads); cursor-ahead-of-live
+   duplicate suppression; connection-epoch assertions; cell cadence across
+   multiple refreshes; extrema tie-breaking; constructor defaults.
+6. **Equivalent-mutant hygiene:** accept the message-text/StrEnum clusters;
+   consider mutant exclusions if a mutation-score gate is ever added.
 
 ## Queue: implementation-review P2 notes (2026-08-22, 30 items)
 
