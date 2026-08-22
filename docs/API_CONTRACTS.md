@@ -199,7 +199,19 @@ coordinator, the event bus, and per-unit actor handles.
   (from the event bus), `captured_at` wall time, and per-unit `lifecycle`, `telemetry_age_s`,
   `quality`, `requested_power` (from the newest active intent for that unit), `authorized_power`
   (from the current authorization, if any), and `measured_watts` (from the latest observation).
-  It performs no I/O beyond repository reads and never triggers control.
+  Each unit additionally carries a nullable `telemetry` summary projection from the latest
+  observation — `soc_pct`, `bms_soc_pct`, `soh_pct`, `pack_voltage_v`, `pack_current_a`,
+  `battery_watts`, `dynamic_charge_limit_w`, `dynamic_discharge_limit_w`, `cell_count`,
+  `cell_min_v`, `cell_max_v`, `cell_spread_mv`, `temperature_min_c`, `temperature_max_c`,
+  `active_faults`, `active_warnings` — every field null when that datum is absent from the
+  observation, never zero-filled or fabricated. It performs no I/O beyond repository reads and
+  never triggers control.
+- `unit_detail(principal, unit_id)` (REST `GET /api/v1/units/{unit_id}`, `observe` scope)
+  returns the full latest observation projection for one unit: identity (`device_identity`),
+  `protocol_profile`, `connection_epoch`, telemetry and cell sequences and capture times, all
+  scalar measurements above, the complete `cell_voltages_v` and `temperatures_c` arrays, the
+  per-field `quality` map, faults and warnings. Unknown unit ids are refused with the
+  structured envelope. It is a read-only view of repository state.
 - `health(principal)` separates `liveness` (process-up), `service_readiness` (repositories and
   coordinator responsive), and `control_readiness` (every unit qualified and at least one
   armed, with blocking reasons listed per unit). Readiness never fabricates optimism: an
