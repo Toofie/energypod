@@ -377,13 +377,15 @@ async def test_explicit_selected_subset_is_complete(api: Any):
     assert_batch(api, auth.published[0], value)
 
 
-async def test_partially_eligible_fleet_allocates_zero_watt_proposals_without_crashing(
+async def test_partially_eligible_fleet_mints_authority_only_for_participating_units(
     api: Any,
 ) -> None:
-    """2026-08-23 live halt: a multi-unit charge with units above the SOC
-    ceiling produces zero-watt proposals for those units; the kernel must
-    accept them, mint authority only for the eligible unit, and never raise
-    "allocator output does not match the selected intent"."""
+    """2026-08-23 live halt and rejection: a multi-unit intent with units at
+    their headroom limits produces zero-watt proposals for those units. The
+    kernel must accept them, mint authority ONLY for the participating unit —
+    a zero-watt setpoint is explicit non-participation and never carries
+    authority — and never raise "allocator output does not match the selected
+    intent" nor blanket-reject the deliverable units."""
     from dataclasses import replace as _replace
 
     value = intent(api, units=UNITS)
@@ -406,9 +408,6 @@ async def test_partially_eligible_fleet_allocates_zero_watt_proposals_without_cr
     kernel, history, auth, audit, allocator, safety = make_kernel(api, value, outcome)
     allocator.output = eligible_only
     decision = await kernel.tick()
-    # The kernel accepts the partially-eligible allocation (no ValueError),
-    # audits the decision durably, and — because a zero-watt setpoint can
-    # never carry authority — grants nothing: fail-closed, not a fleet halt.
     assert history == [
         "intents",
         "current",
@@ -417,11 +416,18 @@ async def test_partially_eligible_fleet_allocates_zero_watt_proposals_without_cr
         "allocate",
         "safety",
         "audit",
-        "revoke",
+        "publish",
     ]
     assert decision is outcome
-    assert auth.published == []
     assert audit.events
+    # Authority is minted for the participating unit ONLY: the zero-watt
+    # setpoints stay in the audited decision but carry no capability.
+    (batch,) = auth.published
+    participants = {cap.unit_id for cap in batch.authorizations}
+    assert participants == {"rhs"}
+    authorized = next(cap for cap in batch.authorizations if cap.unit_id == "rhs")
+    assert authorized.watts == outcome.setpoints[2].watts
+    assert authorized.direction is value.direction
 
 
 @pytest.mark.parametrize("shape", ["missing", "duplicate", "extra"])

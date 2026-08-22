@@ -272,7 +272,10 @@ class ControlKernel:
                 configuration_version=self._configuration_version,
                 decision_id=decision_id,
             )
+            # Zero-watt setpoints are non-participants: they stay in the
+            # audited decision but never carry authority.
             for setpoint in sorted(setpoints, key=lambda item: item.unit_id)
+            if setpoint.watts > 0
         )
         return AuthorizationBatch(
             cycle_id=cycle_id,
@@ -386,6 +389,7 @@ class ControlKernel:
 
         seen: set[str] = set()
         total_watts = 0
+        participating = 0
         for setpoint in setpoints:
             unit_id = getattr(setpoint, "unit_id", None)
             expiry = getattr(setpoint, "authorization_expires_at_mono", None)
@@ -403,15 +407,31 @@ class ControlKernel:
                 or getattr(setpoint, "direction", None) is not intent.direction
                 or intent.direction is Direction.IDLE
                 or type(watts) is not int
-                or watts <= 0
+                or watts < 0
                 or type(reactive_vars) is not int
-                or not self._finite(expiry)
+            ):
+                return False
+            if watts == 0:
+                # Zero watts with an active direction is explicit
+                # NON-participation (a selected unit with no usable headroom —
+                # 2026-08-23 live rejections). No authority is minted for it,
+                # so the authority-granting checks below do not apply; the
+                # unit's observations still join the evidence-coherence gate.
+                seen.add(unit_id)
+                continue
+            if (
+                not self._finite(expiry)
                 or expiry_value <= issued_at
                 or expiry_value > intent.expires_at_mono
             ):
                 return False
             seen.add(unit_id)
+            participating += 1
             total_watts += watts
+        # An active intent that participates nowhere mints no authority at
+        # all: fail-closed, never an empty capability batch.
+        if participating == 0:
+            return False
         return total_watts <= intent.watts and self._evidence_is_coherent(
             selected, current, previous
         )

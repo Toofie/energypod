@@ -99,8 +99,15 @@ class UnitSetpoint(BaseModel):
 
     @model_validator(mode="after")
     def _direction_matches_magnitude(self) -> UnitSetpoint:
-        if (self.direction is Direction.IDLE) != (self.watts == 0):
-            raise ValueError("idle requires zero watts; active directions require positive watts")
+        # IDLE must carry zero watts. The reverse coupling (active directions
+        # must be positive) is deliberately absent: zero watts with an active
+        # direction is explicit NON-participation — a selected unit with no
+        # usable headroom inside an otherwise deliverable fleet intent
+        # (2026-08-23 live rejection: fleet dispatches with units at the SOC
+        # floor/ceiling). No authority is ever minted for a zero-watt
+        # setpoint, so representing it is safe.
+        if self.direction is Direction.IDLE and self.watts != 0:
+            raise ValueError("idle requires zero watts; active directions may carry zero")
         return self
 
 

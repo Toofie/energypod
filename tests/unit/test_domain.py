@@ -280,9 +280,15 @@ def test_setpoint_generation_can_start_at_zero_and_power_is_protocol_agnostic() 
 def test_setpoint_idle_and_non_idle_magnitude_rules() -> None:
     models = _models()
     assert _setpoint(models, direction=models.Direction.IDLE, watts=0).watts == 0
-    for direction, watts in ((models.Direction.IDLE, 1), (models.Direction.CHARGE, 0)):
-        with pytest.raises((TypeError, ValueError)):
-            _setpoint(models, direction=direction, watts=watts)
+    # Zero watts with an ACTIVE direction is explicit non-participation: a
+    # selected unit with no usable headroom (2026-08-23 live rejection — units
+    # at the SOC floor/ceiling inside an otherwise deliverable fleet intent).
+    # No authority is ever minted for such a setpoint, so representing it is
+    # safe; IDLE with nonzero watts remains the one forbidden combination.
+    for direction in (models.Direction.CHARGE, models.Direction.DISCHARGE):
+        assert _setpoint(models, direction=direction, watts=0).watts == 0
+    with pytest.raises((TypeError, ValueError)):
+        _setpoint(models, direction=models.Direction.IDLE, watts=1)
 
 
 @pytest.mark.parametrize(

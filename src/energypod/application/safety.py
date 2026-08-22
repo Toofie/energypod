@@ -63,6 +63,18 @@ class SafetyKernel:
         for proposal in proposals:
             observation = current_observations.get(proposal.unit_id)
             previous = previous_observations.get(proposal.unit_id)
+            if getattr(proposal, "watts", None) == 0:
+                # A zero-watt proposal is explicit NON-participation: the
+                # allocator had no usable headroom for this unit (2026-08-23
+                # live rejection: a fleet discharge with MID at the SOC floor,
+                # a fleet charge with units above the ceiling). No authority is
+                # ever minted for it, so its telemetry cannot endanger
+                # actuation and it must not veto the participating units.
+                # The control kernel still refuses to mint ANY authority
+                # without coherent observations for every selected unit.
+                limits[proposal.unit_id] = 0
+                expiries[proposal.unit_id] = now_mono
+                continue
             unit_reasons = self._deny_reasons(proposal, observation, previous, policy, now_mono)
             reasons.update(unit_reasons)
             if observation is not None and not unit_reasons:
@@ -81,7 +93,11 @@ class SafetyKernel:
             )
 
         bounded = {p.unit_id: min(p.watts, limits[p.unit_id]) for p in proposals}
-        if any(value <= 0 for value in bounded.values()):
+        # Only units ASKED to deliver power can fail the dynamic-capability
+        # check. A zero-watt proposal (no usable headroom — a partially
+        # eligible fleet) is satisfied by definition and must not veto the
+        # units that can deliver.
+        if any(proposal.watts > 0 and bounded[proposal.unit_id] <= 0 for proposal in proposals):
             return ControlDecision(
                 DecisionStatus.REJECTED,
                 tuple(self._zero_setpoint(p, now_mono) for p in proposals),
@@ -128,7 +144,14 @@ class SafetyKernel:
                 reasons.add("invalid_direction")
             if type(watts) is not int or watts < 0:
                 reasons.add("invalid_power")
-            elif (direction is Direction.IDLE) != (watts == 0):
+            elif direction is Direction.IDLE and watts != 0:
+                # IDLE must carry zero watts. The reverse coupling (active
+                # direction must be positive) is deliberately absent: a
+                # partially eligible fleet legitimately proposes ZERO watts
+                # for selected units with no usable headroom (2026-08-23
+                # live halt/rejection: units above the SOC ceiling). Zero is
+                # always permitted; a zero-watt proposal can never carry
+                # authority (the kernel's eligibility check refuses it).
                 reasons.add("direction_power_mismatch")
             expiry = getattr(proposal, "intent_expires_at_mono", None)
             expiry_value = (

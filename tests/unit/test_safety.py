@@ -709,6 +709,81 @@ def test_zero_dynamic_capability_rejects_nonzero_power(
     assert_rejected(decision, api)
 
 
+def test_partially_eligible_fleet_authorizes_the_participating_units(
+    api: SimpleNamespace,
+) -> None:
+    """2026-08-23 live rejection: MID sits at the 10% discharge floor, so the
+    allocator proposes zero watts for it. A zero-watt proposal is explicit
+    non-participation — no authority is ever minted for it — so the floor that
+    (correctly) disqualifies MID must not veto the units that can deliver."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(
+            api,
+            direction=api.Direction.DISCHARGE,
+            watts_by_unit={"lhs": 250, "mid": 0, "rhs": 250},
+        ),
+        current_observations={
+            "lhs": make_observation(api, unit_id="lhs"),
+            "mid": make_observation(api, unit_id="mid", system_soc_pct=9.5, bms_soc_pct=9.5),
+            "rhs": make_observation(api, unit_id="rhs"),
+        },
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert reasons(decision) == ("safety_checks_passed",)
+    setpoints = setpoints_by_unit(decision)
+    assert setpoints["lhs"].watts == 250
+    assert setpoints["mid"].watts == 0
+    assert setpoints["mid"].direction is api.Direction.DISCHARGE
+    assert setpoints["rhs"].watts == 250
+
+
+def test_partially_eligible_charge_fleet_authorizes_the_participating_units(
+    api: SimpleNamespace,
+) -> None:
+    """The charge twin of the discharge case: units above the SOC ceiling are
+    proposed at zero watts and must not veto the units with charge headroom."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(
+            api,
+            direction=api.Direction.CHARGE,
+            watts_by_unit={"lhs": 0, "mid": 500, "rhs": 0},
+        ),
+        current_observations={
+            "lhs": make_observation(api, unit_id="lhs", system_soc_pct=95.0, bms_soc_pct=95.0),
+            "mid": make_observation(api, unit_id="mid"),
+            "rhs": make_observation(api, unit_id="rhs", system_soc_pct=96.0, bms_soc_pct=96.0),
+        },
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert reasons(decision) == ("safety_checks_passed",)
+    setpoints = setpoints_by_unit(decision)
+    assert setpoints["lhs"].watts == 0
+    assert setpoints["mid"].watts == 500
+    assert setpoints["rhs"].watts == 0
+
+
+def test_zero_watt_non_participant_cannot_veto_the_fleet(api: SimpleNamespace) -> None:
+    """An unobservable unit is proposed at zero watts precisely BECAUSE its
+    headroom is unknowable; its stale telemetry must not halt the units that
+    are commanded (the kernel still refuses to mint anything without coherent
+    observations for every selected unit)."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, watts_by_unit={"lhs": 1_000, "mid": 0}),
+        current_observations={
+            "lhs": make_observation(api, unit_id="lhs"),
+            "mid": make_observation(api, unit_id="mid", captured_at_mono=NOW - 999.0),
+        },
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert setpoints_by_unit(decision)["mid"].watts == 0
+
+
 def test_ramp_limit_uses_current_signed_battery_power_and_control_interval(
     api: SimpleNamespace,
 ) -> None:
