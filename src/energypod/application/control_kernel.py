@@ -17,6 +17,7 @@ from energypod.domain import (
     UnitLifecycle,
 )
 from energypod.domain.audit import AuditEvent
+from energypod.domain.authorization import StaleGenerationError
 
 from .generation import AuthorityGenerationCoordinator
 
@@ -207,7 +208,29 @@ class ControlKernel:
             if generation_before_publish != generation_before_mint:
                 await self._revoke("authority_generation_changed")
                 return decision
-            await self._authorizations.publish(batch)
+            try:
+                await self._authorizations.publish(batch)
+            except StaleGenerationError:
+                # The repository's generation CAS fenced this cycle between the
+                # last snapshot and publication — the same outcome as the
+                # mint-to-audit snapshot checks, arrived one await later. A
+                # legitimate fence is not a component failure: revoke, append
+                # the durable zero-authorized audit record, and let the next
+                # tick run in the new generation instead of halting
+                # supervision.
+                await self._revoke("authority_generation_changed")
+                fenced_event = self._create_audit_event(
+                    intent=winner,
+                    decision=decision,
+                    batch=None,
+                    observations=current,
+                    generation=generation_before_mint,
+                    cycle_id=cycle_id,
+                    decision_id=decision_id,
+                    decided_at_mono=issued_at,
+                )
+                await self._audit.append(fenced_event)
+                return decision
             return decision
         except BaseException:
             await self._revoke_after_failure("control_cycle_failed")

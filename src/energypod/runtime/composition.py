@@ -1458,7 +1458,15 @@ class _Supervision:
         if not self._tasks:
             return
         await asyncio.wait(self._tasks, return_when=asyncio.FIRST_EXCEPTION)
-        if self._failure() is not None and not self._stopped:
+        failure = self._failure()
+        if failure is not None and not self._stopped:
+            # Record the triggering exception for diagnostics before the
+            # tasks are cancelled and the evidence disappears.
+            import traceback
+
+            self.halt_evidence = "".join(
+                traceback.format_exception(type(failure), failure, failure.__traceback__)
+            )
             await self._halt("supervisor_failure")
 
     def _failure(self) -> BaseException | None:
@@ -1526,6 +1534,9 @@ async def _poll_once(actor: EnergyPodActor) -> None:
     """One supervised telemetry cycle; a poll failure is survived, not fatal."""
     with contextlib.suppress(Exception):
         await actor.poll_once()
+
+
+_LAST_SUPERVISION: _Supervision | None = None
 
 
 def _attach_lifespan(app: FastAPI, supervision: _Supervision) -> None:
@@ -2052,6 +2063,8 @@ def _build_runtime(
         authorizations=authorization_port,
         coordinator=coordinator,
     )
+    global _LAST_SUPERVISION
+    _LAST_SUPERVISION = supervision
     _attach_lifespan(app, supervision)
 
     return ComposedRuntime(
