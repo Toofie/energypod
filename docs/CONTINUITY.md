@@ -399,6 +399,28 @@ direction, freshness, and watchdog timing per physical unit.
   Process note from the operator: long test harness runs must never block
   the live development loop — full suites go to background/subagents.
 
+- 2026-08-23 (later): FALSE STALL + SILENT-WEDGE HARDENING (f20602c). The
+  operator reported data age ~160 s and climbing; an agent investigation
+  (audit trail + py-spy + socket census) proved the running controller never
+  stalled: the age spike was the 6abd869 deploy — the previous process was
+  terminated at 21:33:51Z, the new one booted 56 s later, and the console
+  kept counting age across the dark window. Telemetry has been continuous
+  since boot (per-unit sequences in lockstep, ages 0.05-2.45 s), and the
+  audit trail showed the per-unit authority path working live: mid holding
+  an authorized 500 W discharge while rhs/lhs (97-98% SOC, above the charge
+  ceiling) sat as zero-watt non-participants with safety_checks_passed.
+  NOTE: rhs/lhs near-full means their CHARGE phases in verification sweeps
+  will be correctly REFUSED (soc_above_charge_ceiling) — expected, not a
+  defect. Real gap found and fixed: _run_fleet bounded polls but NOT
+  actor.heartbeat_once() or kernel.tick() — a never-resolving write would
+  wedge the fleet loop silently (no exception, watcher never fires, clean
+  log, ages climb forever). Both now bounded by the control interval;
+  /api/v1/health liveness carries process_instance_id + uptime_s so a
+  console can distinguish deployment from stall (console-side use queued).
+  Also killed a full-suite run wedged since 2026-08-22 13:44 that was
+  competing with live ops (the earlier "stalled at 59%" incident); a
+  CLEAN full suite passed in the background (exit 0) with 6abd869.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
