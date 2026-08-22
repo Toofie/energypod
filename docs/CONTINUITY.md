@@ -449,6 +449,32 @@ direction, freshness, and watchdog timing per physical unit.
   (contracts + red tests; advisory-only, export-bounded, beat-autonomy
   hysteresis, operator-precedence pinned).
 
+- 2026-08-23 (census): FOREIGN-WRITER INVESTIGATION CLOSED — day shift is
+  clean. Zero external_writer inhibits across the entire durable audit
+  (1,722 events, 6 process instances); exactly one socket per gateway, all
+  owned by the controller; Docker is NOT INSTALLED on this host (the
+  historic "−2500 W container" was a misattribution — it traces to
+  repro_es_fence.py, an offline harness with fake transports that never
+  touches hardware); the vendor app last ran 2024. Every anomaly
+  reconciled: daytime charging-with-no-command = the pods' own CT/PV
+  self-consumption (confirmed live: rhs flipped +1172 W discharging to
+  −672 W charging the instant our objective cleared); discharge overshoot
+  (+172 W on a +1000 W command) = pod firmware serving local load on top
+  of our battery-power objective; the 2026-08-22 "undiagnosed" first-charge
+  halt is now PINNED — two latched e-stops reason bounded_zero_failed:mid
+  during shutdown; and the "no impact" evening was three stacked internal
+  causes, all since fixed (245x direction_power_mismatch 0 W authorizations,
+  stale single-use authorizations c75ec13, legitimate SOC refusals).
+  OPEN BLIND SPOTS, honestly bounded: (1) this host is NAT'd — foreign
+  LAN-host connections to the gateways are invisible locally; (2) the audit
+  has a 7.3 h overnight gap (23:30→06:48 local) — night writing is
+  UNVERIFIED either way. QUEUED: between-cycles foreign-objective detector
+  (fold a 0x1060+17/+18 readback into the existing poll tiers, zero extra
+  frames; alert foreign_objective_observed when disarmed/idle, escalate per
+  policy); one deliberate overnight observe run to characterize the night
+  window; day/night control partition agreement with the night-writing
+  systems; dedicated VLAN for 192.168.1.11-13:4196 as the structural fix.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
