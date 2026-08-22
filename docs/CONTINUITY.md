@@ -366,6 +366,33 @@ direction, freshness, and watchdog timing per physical unit.
 - 2026-08-21: Committed the baseline as `1552202` and dispatched five disjoint
   implementation streams: domain/allocation; config/schedule/persistence;
   arbiter/safety/kernel; protocol/transport; and sole-owner actor.
+- 2026-08-22: MILESTONES B AND C COMPLETE — the product ships. Milestone B
+  (2ce9194, 392310e): the React operator console (shell with token gate,
+  four-fact connection indicator, live stream with resync recovery; Home,
+  Batteries, Now control surface, Activity timeline) built against twice-
+  reviewed behavior suites, hardened by a 25-agent composed-app review that
+  caught the isolated suites' blind seams (dead control surface from prop
+  drift, phantom wire events, frozen fleet badge) and repaired with a
+  composed-app integration test layer; 172/172 web tests, tsc strict clean,
+  production build verified. Server-side additions: audit cursor route,
+  disarm route, single-use browser event-stream ticket via subprotocol, and
+  the frozen-mapping serialization fix (real AuditEvents 500'd through the
+  audit boundary). Milestone C (f99bda1): energypod db migrate/backup/
+  restore with day-one schema versioning and backup-API snapshots; /healthz
+  liveness-only endpoint; simulate-mode development principal (fail-closed
+  preserved everywhere else); multi-stage Dockerfile + compose + nginx SPA
+  config + sample configs + docs/OPERATIONS.md; end-to-end simulate test
+  driving a dispatch through the public REST surface to the simulated pod.
+  Final state: 1088 Python tests + 172 web tests green; ruff, mypy strict,
+  tsc, vite build all clean. REMAINING before live use: build the container
+  image in a Docker-capable environment (step 12 — Docker absent here);
+  human visual inspection of every console state (corepack pnpm dev against
+  energypod simulate); the deferred-findings queue (docs/DEFERRED_FINDINGS.md)
+  including mutation-test gaps and the queued P2 inventory; and the
+  separately authorized observe-only commissioning that validates per-unit
+  topology, scaling, direction, freshness, and watchdog timing before any
+  hardware write path is enabled. The dev token is simulator-only; run mode
+  without a credential store refuses every bearer by design.
 - 2026-08-22: MILESTONE A COMPLETE — the application runs. Implementation
   (7 agents, commits 8a57706/e2ca540), adversarial implementation review
   (32 agents, two-lens verification: 24 confirmed findings incl. 3 P0,
