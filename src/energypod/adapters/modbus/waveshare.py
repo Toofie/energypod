@@ -7,6 +7,7 @@ belongs to the generation-fenced unit actor, never to this transport.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import math
 import time
@@ -125,6 +126,22 @@ class WaveshareTransport:
                 await asyncio.sleep(remaining)
         self._last_request_mono = time.monotonic()
 
+    async def _resync_after_failure(self) -> None:
+        """Reopen the TCP stream after any operation failure.
+
+        RTU framing carried over TCP carries no transaction identifier, so a
+        single late response (the gateway occasionally answers after the
+        caller's timeout under load) permanently offsets the response stream:
+        every later response answers the PREVIOUS request and all operations
+        time out forever. The gateway is stateless per connection, so closing
+        and reconnecting clears the offset. Failures still propagate to the
+        caller (fail-closed semantics are unchanged); only the next operation
+        runs on a fresh stream.
+        """
+        self._connected = False
+        with contextlib.suppress(Exception):
+            await self._client.close()
+
     async def read_holding(self, address: int, count: int) -> tuple[int, ...]:
         self._validate_address_count(address, count)
         async with self._lock:
@@ -137,8 +154,10 @@ class WaveshareTransport:
                     device_id=self._config.device_id,
                 )
             except ModbusException as error:
+                await self._resync_after_failure()
                 raise ModbusResponseError("Modbus read did not produce a valid response") from error
             except OSError as error:
+                await self._resync_after_failure()
                 raise TransportConnectionError("connection lost during Modbus read") from error
             self._ensure_connected()
             return self._validate_read_response(response, count)
@@ -163,10 +182,12 @@ class WaveshareTransport:
                     device_id=self._config.device_id,
                 )
             except ModbusException as error:
+                await self._resync_after_failure()
                 raise ModbusResponseError(
                     "Modbus write did not produce a valid acknowledgement"
                 ) from error
             except OSError as error:
+                await self._resync_after_failure()
                 raise TransportConnectionError("connection lost during Modbus write") from error
             self._ensure_connected()
             self._validate_write_response(response, address, len(registers))
