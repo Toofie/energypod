@@ -1,0 +1,379 @@
+/* Activity view styles — calm household console, never an engineering panel.
+ * Color is always accompanied by text; stale values are dimmed, not hidden;
+ * motion is gentle and disabled under prefers-reduced-motion. */
+
+.activity-view {
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1.25rem 1rem 3rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.activity-view__header h2 {
+  margin: 0;
+  font-size: 1.5rem;
+  letter-spacing: 0.01em;
+}
+
+.activity-view__intro {
+  margin: 0.25rem 0 0;
+  color: #5c6470;
+  font-size: 0.95rem;
+}
+
+/* Notices (disconnected) -------------------------------------------------- */
+
+.activity-notice {
+  border: 1px solid #e3c98f;
+  background: #fdf6e7;
+  border-radius: 0.75rem;
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  align-items: flex-start;
+}
+
+.activity-notice__title {
+  margin: 0;
+  font-weight: 600;
+  color: #6d5518;
+}
+
+.activity-notice__body {
+  margin: 0;
+  color: #5c6470;
+  font-size: 0.9rem;
+}
+
+.activity-notice__retry,
+.activity-error__retry,
+.activity-load-more {
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 0.4rem 0.9rem;
+  border-radius: 999px;
+  border: 1px solid #9db2c8;
+  background: #ffffff;
+  color: #243447;
+  cursor: pointer;
+}
+
+.activity-notice__retry:hover:not(:disabled),
+.activity-error__retry:hover:not(:disabled),
+.activity-load-more:hover:not(:disabled) {
+  background: #f2f7fb;
+}
+
+.activity-notice__retry:disabled,
+.activity-error__retry:disabled,
+.activity-load-more:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Filters ------------------------------------------------------------------- */
+
+.activity-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.25rem;
+}
+
+.activity-filters__group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.activity-chip {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.3rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid #c8d0da;
+  background: #ffffff;
+  color: #37414e;
+  cursor: pointer;
+}
+
+.activity-chip:hover {
+  background: #f2f7fb;
+}
+
+.activity-chip[aria-pressed="true"] {
+  background: #243447;
+  border-color: #243447;
+  color: #ffffff;
+}
+
+.activity-chip:focus-visible,
+.activity-notice__retry:focus-visible,
+.activity-error__retry:focus-visible,
+.activity-load-more:focus-visible,
+.activity-entry__toggle:focus-visible {
+  outline: 2px solid #2f6fb2;
+  outline-offset: 2px;
+}
+
+/* Loading skeleton ---------------------------------------------------------- */
+
+.activity-loading {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.activity-loading__text {
+  margin: 0;
+  color: #5c6470;
+  font-size: 0.9rem;
+}
+
+.activity-loading__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.activity-loading__row {
+  height: 4.25rem;
+  border-radius: 0.75rem;
+  border: 1px solid #e2e7ee;
+  background: linear-gradient(100deg, #f4f6f9 40%, #e9edf3 50%, #f4f6f9 60%);
+  background-size: 200% 100%;
+  animation: activity-shimmer 1.6s ease-in-out infinite;
+}
+
+@keyframes activity-shimmer {
+  from {
+    background-position: 120% 0;
+  }
+  to {
+    background-position: -80% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .activity-loading__row {
+    animation: none;
+  }
+}
+
+/* Timeline ------------------------------------------------------------------- */
+
+.activity-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.activity-timeline--dimmed .activity-entry {
+  opacity: 0.75;
+}
+
+.activity-entry {
+  border: 1px solid #e2e7ee;
+  border-radius: 0.75rem;
+  background: #ffffff;
+  padding: 0.75rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.activity-entry--stale {
+  border-color: #dcd3c0;
+  background: #fdfbf6;
+}
+
+.activity-entry__head {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.activity-entry__kind {
+  font-weight: 600;
+  color: #243447;
+}
+
+.activity-entry__unit {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #33587a;
+  border: 1px solid #c9d8e6;
+  border-radius: 0.4rem;
+  padding: 0.05rem 0.4rem;
+}
+
+.activity-entry__age {
+  margin-left: auto;
+  color: #6b7480;
+  font-size: 0.85rem;
+}
+
+.activity-entry--stale .activity-entry__age {
+  color: #8a6d2f;
+  font-weight: 600;
+}
+
+.activity-entry__who {
+  margin: 0;
+  color: #5c6470;
+  font-size: 0.9rem;
+}
+
+.activity-entry__principal {
+  color: #243447;
+  font-weight: 600;
+}
+
+.activity-entry__facts {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.activity-entry__fact {
+  display: grid;
+  grid-template-columns: 9rem 1fr;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+.activity-entry__fact dt {
+  color: #6b7480;
+  font-size: 0.82rem;
+}
+
+.activity-entry__fact dd {
+  margin: 0;
+  color: #243447;
+}
+
+.activity-entry__technical {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  align-items: flex-start;
+}
+
+.activity-entry__toggle {
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 0.25rem 0.7rem;
+  border-radius: 999px;
+  border: 1px solid #c8d0da;
+  background: #f7f9fb;
+  color: #37414e;
+  cursor: pointer;
+}
+
+.activity-entry__toggle:hover {
+  background: #eef3f8;
+}
+
+.activity-entry__detail {
+  font-size: 0.82rem;
+  color: #5c6470;
+}
+
+.activity-entry__codes code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  background: #f0f2f5;
+  border-radius: 0.3rem;
+  padding: 0.05rem 0.3rem;
+  color: #37414e;
+}
+
+/* Empty / filtered empty -------------------------------------------------------- */
+
+.activity-empty {
+  border: 1px dashed #d4dae2;
+  border-radius: 0.75rem;
+  padding: 1.5rem 1.25rem;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.activity-empty__title {
+  margin: 0;
+  font-size: 1.05rem;
+  color: #243447;
+}
+
+.activity-empty__body,
+.activity-empty__first {
+  margin: 0;
+  color: #5c6470;
+  font-size: 0.9rem;
+}
+
+.activity-filtered-empty {
+  margin: 0;
+  border: 1px dashed #d4dae2;
+  border-radius: 0.75rem;
+  padding: 1.25rem;
+  text-align: center;
+  color: #5c6470;
+}
+
+/* Errors ------------------------------------------------------------------------ */
+
+.activity-error {
+  border: 1px solid #ddb6b6;
+  background: #fdf3f3;
+  border-radius: 0.75rem;
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  align-items: flex-start;
+}
+
+.activity-error__title {
+  margin: 0;
+  font-weight: 600;
+  color: #6d3030;
+}
+
+.activity-error__code,
+.activity-error__message,
+.activity-error__request {
+  margin: 0;
+  color: #5c6470;
+  font-size: 0.9rem;
+}
+
+.activity-error__code code,
+.activity-error__request code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  background: #f5eaea;
+  border-radius: 0.3rem;
+  padding: 0.05rem 0.3rem;
+  color: #4a2d2d;
+}
+
+/* Pagination --------------------------------------------------------------------- */
+
+.activity-load-more-row {
+  display: flex;
+  justify-content: center;
+  padding-top: 0.25rem;
+}

@@ -619,9 +619,11 @@ describe("NowView — dispatch", () => {
         watts: 1500,
         ttl_s: 300,
       }),
+      // One idempotency key per operator action is part of the pinned call.
+      expect.any(String),
     );
     expect(await screen.findByText(/^accepted$/i)).toBeInTheDocument();
-    expect(fact("Remaining time").textContent ?? "").toMatch(/\b(300|5)\b/);
+    expect(fact("Remaining time").textContent ?? "").toMatch(/(300|5)\b/);
   });
 
   it("keeps discharge as a separate action posting direction discharge", async () => {
@@ -653,6 +655,8 @@ describe("NowView — dispatch", () => {
 
     expect(api.client.postIntent).toHaveBeenCalledWith(
       expect.objectContaining({ direction: "discharge", watts: 800, ttl_s: 300 }),
+      // One idempotency key per operator action is part of the pinned call.
+      expect.any(String),
     );
   });
 

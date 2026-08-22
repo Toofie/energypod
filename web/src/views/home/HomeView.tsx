@@ -1,10 +1,780 @@
-import type { ApiClient } from "../../api/client";
+/**
+ * Home view: answers the five household questions, in order
+ * (UI_CONTRACTS.md, "Home").
+ *
+ * 1. Are we safe and connected?  — fleet badge + connection/service facts.
+ * 2. What is powering the home?  — per-unit requested / allowed / actual.
+ * 3. How full are the batteries? — fleet reserve + per-unit breakdown.
+ * 4. What happens next?          — the active intent's direction and watts.
+ * 5. Is anything limiting?       — health reasons + snapshot quality.
+ *
+ * Honesty pins the shapes below:
+ *
+ * - Wire enums arrive lowercase (`"disarmed"`, `"charge"`, `"good"` ...);
+ *   labels shown to humans are capitalized.
+ * - Requested, allowed, and actual are three separately labeled figures, each
+ *   binding its own magnitude, so a limited action is never presented as
+ *   delivered.
+ * - The snapshot carries no charge level, so reserve says "not available"
+ *   rather than inventing a percentage.
+ * - No pinned wire source carries intent expiry, so the next-action region
+ *   shows direction and watts only.
+ * - Missing telemetry is named ("not available"), never zero-filled.
+ * - Stale = `telemetry_age_s` past the freshness bound (the service never
+ *   emits a "stale" quality); the age is shown next to the value and the value
+ *   stays visible.
+ * - The event stream reconnects with the last seen sequence as cursor, and a
+ *   `resync_required` frame triggers exactly one snapshot refetch plus a
+ *   reconnect from the frame's recovery cursor.
+ */
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { ApiClientError } from "../../api/client";
+import type { ApiClient, Health, StreamEvent } from "../../api/client";
+import "./home.css";
 
 export interface HomeViewProps {
   client: ApiClient;
 }
 
-/** Red-phase stub: replaced by the Home implementation in the green phase. */
-export function HomeView(_props: HomeViewProps) {
-  return <div>HomeView</div>;
+type ConnectionState = "connecting" | "live" | "disconnected";
+type Phase = "loading" | "ready" | "error";
+
+/** Past this age a reading is shown as stale (age next to the value). */
+const FRESHNESS_BOUND_S = 60;
+const RECONNECT_BASE_DELAY_MS = 400;
+const RECONNECT_MAX_DELAY_MS = 5000;
+
+// --- honest view-model over the wire ---------------------------------------
+
+interface PowerFigureView {
+  direction: "charge" | "discharge" | "idle";
+  watts: number;
+}
+
+interface UnitView {
+  unit_id: string;
+  lifecycle: string;
+  telemetry_age_s: number | null;
+  quality: string;
+  requested_power: PowerFigureView;
+  authorized_power: PowerFigureView | null;
+  measured_watts: number | null;
+}
+
+interface SnapshotView {
+  snapshot_sequence: number;
+  units: UnitView[];
+}
+
+function readPowerFigure(value: unknown): PowerFigureView | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const direction = String(record.direction ?? "idle").toLowerCase();
+  const watts =
+    typeof record.watts === "number" && Number.isFinite(record.watts) ? record.watts : 0;
+  return {
+    direction: direction === "charge" || direction === "discharge" ? direction : "idle",
+    watts,
+  };
+}
+
+function readUnit(value: unknown): UnitView | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.unit_id !== "string" || record.unit_id === "") {
+    return null;
+  }
+  return {
+    unit_id: record.unit_id,
+    lifecycle: String(record.lifecycle ?? "").toLowerCase(),
+    telemetry_age_s: typeof record.telemetry_age_s === "number" ? record.telemetry_age_s : null,
+    quality: String(record.quality ?? "").toLowerCase(),
+    requested_power: readPowerFigure(record.requested_power) ?? { direction: "idle", watts: 0 },
+    authorized_power: readPowerFigure(record.authorized_power),
+    measured_watts: typeof record.measured_watts === "number" ? record.measured_watts : null,
+  };
+}
+
+function readSnapshot(value: unknown): SnapshotView | null {
+  if (value === null || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record.units)) {
+    return null;
+  }
+  const units: UnitView[] = [];
+  for (const entry of record.units) {
+    const unit = readUnit(entry);
+    if (unit !== null) {
+      units.push(unit);
+    }
+  }
+  return {
+    snapshot_sequence: typeof record.snapshot_sequence === "number" ? record.snapshot_sequence : 0,
+    units,
+  };
+}
+
+// --- labels ----------------------------------------------------------------
+
+const BADGE_LABELS: Record<string, string> = {
+  observe_only: "Observe only",
+  disarmed: "Disarmed",
+  armed_idle: "Armed",
+  active: "Active",
+  inhibited: "Inhibited",
+  boot: "Starting",
+  stopping: "Stopping",
+  disconnected: "Offline",
+};
+
+function isLimited(unit: UnitView): boolean {
+  if (unit.lifecycle !== "active" || unit.authorized_power === null) {
+    return false;
+  }
+  return unit.authorized_power.watts < unit.requested_power.watts;
+}
+
+function unitBadgeLabel(unit: UnitView): string {
+  if (isLimited(unit)) {
+    return "Limited";
+  }
+  return BADGE_LABELS[unit.lifecycle] ?? "Unknown";
+}
+
+/**
+ * The most conservative state wins: observe-only (no control possible at all),
+ * then a latched inhibit, then a limited action, then the rest.
+ */
+function fleetBadgeLabel(units: UnitView[]): string {
+  if (units.length === 0) {
+    return "No pods yet";
+  }
+  const lifecycles = new Set(units.map((unit) => unit.lifecycle));
+  if (lifecycles.has("observe_only")) {
+    return "Observe only";
+  }
+  if (lifecycles.has("inhibited")) {
+    return "Inhibited";
+  }
+  if (units.some(isLimited)) {
+    return "Limited";
+  }
+  if (lifecycles.has("active")) {
+    return "Active";
+  }
+  if (lifecycles.has("armed_idle")) {
+    return "Armed";
+  }
+  if (lifecycles.has("disarmed")) {
+    return "Disarmed";
+  }
+  return "Starting";
+}
+
+function badgeKey(label: string): string {
+  const keys: Record<string, string> = {
+    "Observe only": "observe-only",
+    Disarmed: "disarmed",
+    Armed: "armed",
+    Active: "active",
+    Limited: "limited",
+    Inhibited: "inhibited",
+  };
+  return keys[label] ?? "none";
+}
+
+function formatWatts(watts: number): string {
+  return `${watts.toLocaleString("en-US")} W`;
+}
+
+function directionWord(direction: PowerFigureView["direction"]): string {
+  if (direction === "charge") {
+    return "Charging";
+  }
+  if (direction === "discharge") {
+    return "Discharging";
+  }
+  return "Idle";
+}
+
+function isStale(unit: UnitView): boolean {
+  return unit.telemetry_age_s !== null && unit.telemetry_age_s > FRESHNESS_BOUND_S;
+}
+
+function dataAgeText(unit: UnitView): string {
+  if (unit.telemetry_age_s === null) {
+    return "Data age: not available (telemetry missing)";
+  }
+  const age = unit.telemetry_age_s;
+  if (age > FRESHNESS_BOUND_S) {
+    return `Data age: ${age} s old — this reading is stale`;
+  }
+  return `Data age: ${age} s`;
+}
+
+function allowedText(unit: UnitView): string {
+  if (unit.authorized_power !== null) {
+    const authorized = unit.authorized_power;
+    return `${directionWord(authorized.direction)} ${formatWatts(authorized.watts)}`;
+  }
+  if (unit.requested_power.direction === "idle" && unit.requested_power.watts === 0) {
+    return "Not needed while idle";
+  }
+  return "Not available";
+}
+
+function connectionText(connection: ConnectionState): string {
+  if (connection === "live") {
+    return "Live updates connected — this picture is current.";
+  }
+  if (connection === "disconnected") {
+    return "Connection lost — showing the last known readings with their age; reconnecting automatically.";
+  }
+  return "Connecting to live updates…";
+}
+
+function serviceText(health: Health | null): string {
+  if (health === null) {
+    return "Service health: not available yet.";
+  }
+  return health.liveness.ok ? "Service health: healthy." : "Service health: not reporting healthy.";
+}
+
+// --- limiting factors --------------------------------------------------------
+
+interface LimitingFactor {
+  key: string;
+  raw: string;
+  plain: string;
+}
+
+/** Plain language first; the raw reason code is revealed only on demand. */
+function plainLanguage(raw: string): string {
+  const separator = raw.indexOf(":");
+  const unit = separator > 0 ? raw.slice(0, separator) : "";
+  const code = separator > 0 ? raw.slice(separator + 1) : raw;
+  let text: string;
+  if (code.includes("inhibit")) {
+    text = "is held by a safety latch and needs an acknowledgement before it can take part again.";
+  } else if (code.includes("not_qualified")) {
+    text = "is not qualified yet — its readiness checks have not passed, so it cannot be armed.";
+  } else if (code === "no_unit_armed") {
+    text = "No pod is armed yet, so none can act when the home needs power.";
+  } else {
+    text = "is being held back by the safety system.";
+  }
+  return unit === "" ? text : `${unit} ${text}`;
+}
+
+function collectFactors(units: UnitView[], health: Health | null): LimitingFactor[] {
+  const factors: LimitingFactor[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string, plain: string): void => {
+    if (seen.has(raw)) {
+      return;
+    }
+    seen.add(raw);
+    factors.push({ key: raw, raw, plain });
+  };
+  if (health !== null) {
+    const reasons = [...health.service_readiness.reasons, ...health.control_readiness.reasons];
+    for (const reason of reasons) {
+      if (typeof reason === "string" && reason !== "") {
+        add(reason, plainLanguage(reason));
+      }
+    }
+  }
+  for (const unit of units) {
+    if (unit.quality === "bad") {
+      add(
+        `${unit.unit_id}:telemetry_bad`,
+        `${unit.unit_id} is sending poor-quality data, so its readings cannot be trusted right now.`,
+      );
+    } else if (unit.quality === "missing") {
+      add(
+        `${unit.unit_id}:telemetry_missing`,
+        `${unit.unit_id} is not sending telemetry, so its state cannot be confirmed right now.`,
+      );
+    }
+  }
+  return factors;
+}
+
+// --- error rendering ---------------------------------------------------------
+
+function describeError(failure: unknown): { code: string; message: string } {
+  if (failure instanceof ApiClientError) {
+    return { code: failure.code, message: failure.message };
+  }
+  if (failure instanceof Error) {
+    return { code: "unexpected_error", message: failure.message };
+  }
+  return { code: "unexpected_error", message: "An unexpected failure occurred." };
+}
+
+// --- component ---------------------------------------------------------------
+
+export function HomeView({ client }: HomeViewProps) {
+  const [phase, setPhase] = useState<Phase>("loading");
+  const [failure, setFailure] = useState<unknown>(null);
+  const [snapshot, setSnapshot] = useState<SnapshotView | null>(null);
+  const [health, setHealth] = useState<Health | null>(null);
+  const [connection, setConnection] = useState<ConnectionState>("connecting");
+  const [announcement, setAnnouncement] = useState("");
+  const [expandedFactors, setExpandedFactors] = useState<Record<string, boolean>>({});
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const lastSequenceRef = useRef<number | undefined>(undefined);
+
+  // Heading ids are created up front so hook order is stable across the
+  // loading / error / ready branches below.
+  const liveHeadingId = useId();
+  const errorHeadingId = useId();
+  const safetyHeadingId = useId();
+  const powerHeadingId = useId();
+  const reserveHeadingId = useId();
+  const nextHeadingId = useId();
+  const limitingHeadingId = useId();
+
+  useEffect(() => {
+    let cancelled = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectAttempt = 0;
+
+    const applySnapshot = (value: unknown): void => {
+      const parsed = readSnapshot(value);
+      if (parsed === null) {
+        return;
+      }
+      setSnapshot(parsed);
+      lastSequenceRef.current = parsed.snapshot_sequence;
+    };
+
+    /** Status changes arriving over the socket reach non-visual operators. */
+    const applyEventFrame = (frame: StreamEvent): void => {
+      if (frame.type !== "unit.armed" && frame.type !== "unit.disarmed") {
+        return;
+      }
+      const armed = frame.type === "unit.armed";
+      const payload: unknown = frame.payload;
+      const listed =
+        payload !== null &&
+        typeof payload === "object" &&
+        Array.isArray((payload as Record<string, unknown>).units)
+          ? ((payload as Record<string, unknown>).units as unknown[])
+          : [];
+      const unitIds: string[] = [];
+      for (const entry of listed) {
+        if (
+          entry !== null &&
+          typeof entry === "object" &&
+          typeof (entry as Record<string, unknown>).unit_id === "string"
+        ) {
+          unitIds.push((entry as Record<string, unknown>).unit_id as string);
+        }
+      }
+      if (unitIds.length === 0) {
+        return;
+      }
+      const lifecycle = armed ? "armed_idle" : "disarmed";
+      setSnapshot((previous) => {
+        if (previous === null) {
+          return previous;
+        }
+        return {
+          ...previous,
+          units: previous.units.map((unit) =>
+            unitIds.includes(unit.unit_id) ? { ...unit, lifecycle } : unit,
+          ),
+        };
+      });
+      setAnnouncement(
+        unitIds.map((unitId) => `${unitId} is now ${armed ? "armed" : "disarmed"}.`).join(" "),
+      );
+    };
+
+    const onStreamLost = (): void => {
+      if (cancelled) {
+        return;
+      }
+      reconnectAttempt += 1;
+      setConnection("disconnected");
+      const delay = Math.min(
+        RECONNECT_BASE_DELAY_MS * 2 ** (reconnectAttempt - 1),
+        RECONNECT_MAX_DELAY_MS,
+      );
+      const cursor = lastSequenceRef.current;
+      reconnectTimer = setTimeout(() => {
+        void connect(cursor);
+      }, delay);
+    };
+
+    async function connect(cursor: number | undefined): Promise<void> {
+      if (cancelled) {
+        return;
+      }
+      try {
+        const stream = client.openEvents(cursor);
+        for await (const frame of stream) {
+          if (cancelled) {
+            return;
+          }
+          if (frame.type === "resync_required") {
+            // The discontinuity is data: refetch one snapshot, then reconnect
+            // from the recovery cursor — never a replay from zero.
+            const recovery =
+              typeof frame.snapshot_sequence === "number"
+                ? frame.snapshot_sequence
+                : lastSequenceRef.current;
+            try {
+              const fresh = await client.getSnapshot();
+              if (cancelled) {
+                return;
+              }
+              applySnapshot(fresh);
+              void connect(recovery);
+            } catch {
+              onStreamLost();
+            }
+            return;
+          }
+          if (frame.type === "snapshot") {
+            const data: unknown = frame.data;
+            const parsed = readSnapshot(data);
+            if (parsed !== null) {
+              setSnapshot(parsed);
+              lastSequenceRef.current =
+                typeof frame.sequence === "number" ? frame.sequence : parsed.snapshot_sequence;
+            }
+            setConnection("live");
+            continue;
+          }
+          setConnection("live");
+          if (typeof frame.sequence === "number") {
+            lastSequenceRef.current = frame.sequence;
+          }
+          applyEventFrame(frame);
+        }
+        // The iterator ended without an error: the stream went away.
+        onStreamLost();
+      } catch {
+        // A transport failure: never leak its message; show the designed
+        // disconnected notice and retry with the last seen sequence as cursor.
+        onStreamLost();
+      }
+    }
+
+    async function load(): Promise<void> {
+      setPhase("loading");
+      setConnection("connecting");
+      const [snapshotResult, healthResult] = await Promise.allSettled([
+        client.getSnapshot(),
+        client.getHealth(),
+      ]);
+      if (cancelled) {
+        return;
+      }
+      if (snapshotResult.status === "rejected") {
+        setFailure(snapshotResult.reason);
+        setPhase("error");
+        return;
+      }
+      const parsed = readSnapshot(snapshotResult.value);
+      if (parsed === null) {
+        setFailure(new Error("The snapshot response was not readable."));
+        setPhase("error");
+        return;
+      }
+      setSnapshot(parsed);
+      lastSequenceRef.current = parsed.snapshot_sequence;
+      setHealth(healthResult.status === "fulfilled" ? healthResult.value : null);
+      setPhase("ready");
+      void connect(parsed.snapshot_sequence);
+    }
+
+    void load();
+
+    return () => {
+      cancelled = true;
+      if (reconnectTimer !== null) {
+        clearTimeout(reconnectTimer);
+      }
+    };
+  }, [client, reloadNonce]);
+
+  const retry = useCallback(() => {
+    setFailure(null);
+    setSnapshot(null);
+    setHealth(null);
+    setConnection("connecting");
+    setReloadNonce((nonce) => nonce + 1);
+  }, []);
+
+  const toggleFactor = useCallback((key: string) => {
+    setExpandedFactors((previous) => ({ ...previous, [key]: !(previous[key] ?? false) }));
+  }, []);
+
+  const liveRegion = (
+    <p role="status" aria-live="polite" className="home-live-region">
+      {announcement}
+    </p>
+  );
+
+  // A lost connection while a pod is actively powering the home is the one
+  // home-side fact announced assertively; the region always exists so screen
+  // readers (and the role query) see a stable target.
+  const urgent =
+    snapshot !== null &&
+    connection === "disconnected" &&
+    snapshot.units.some((unit) => unit.lifecycle === "active");
+  const urgentRegion = (
+    <p role="alert" aria-live="assertive" className="home-alert-region">
+      {urgent
+        ? "Connection lost while a pod is actively powering the home — the last known readings are shown with their age and the live feed reconnects automatically."
+        : ""}
+    </p>
+  );
+
+  if (phase === "error") {
+    const described = describeError(failure);
+    return (
+      <div className="home-view">
+        {liveRegion}
+        {urgentRegion}
+        <section className="home-card home-card--error" aria-labelledby={errorHeadingId}>
+          <h2 id={errorHeadingId}>The home view could not load</h2>
+          <p className="home-error-detail">
+            <code className="home-error-code">{described.code}</code>
+            <span className="home-error-message">{described.message}</span>
+          </p>
+          <p className="home-error-note">
+            Nothing about your pods is shown, because this request did not succeed. You can retry
+            now.
+          </p>
+          <button type="button" className="home-retry" onClick={retry}>
+            Retry
+          </button>
+        </section>
+      </div>
+    );
+  }
+
+  if (snapshot === null) {
+    return (
+      <div className="home-view">
+        {liveRegion}
+        {urgentRegion}
+        <section className="home-card home-card--loading" aria-labelledby={liveHeadingId}>
+          <h2 id={liveHeadingId}>Your EnergyPod at a glance</h2>
+          <p role="status" className="home-loading-line">
+            Loading your pods…
+          </p>
+          <p className="home-loading-hint">
+            The five answers about your home will appear here as soon as the first snapshot
+            arrives.
+          </p>
+        </section>
+      </div>
+    );
+  }
+
+  const units = snapshot.units;
+  const badge = fleetBadgeLabel(units);
+  const activeUnits = units.filter(
+    (unit) => unit.lifecycle === "active" && unit.requested_power.direction !== "idle",
+  );
+  const nextAction = activeUnits[0] ?? null;
+  const factors = collectFactors(units, health);
+  const systemHealthy =
+    health !== null &&
+    health.liveness.ok &&
+    health.service_readiness.ready &&
+    health.control_readiness.ready;
+
+  return (
+    <div className="home-view" data-connection={connection}>
+      {liveRegion}
+      {urgentRegion}
+
+      <section className="home-card" aria-labelledby={safetyHeadingId}>
+        <h2 id={safetyHeadingId}>Are we safe and connected?</h2>
+        <p className="home-fleet-line">
+          Fleet status:{" "}
+          <strong className={`home-badge home-badge--${badgeKey(badge)}`}>{badge}</strong>
+        </p>
+        <p role="status" className={`home-connection home-connection--${connection}`}>
+          {connectionText(connection)}
+        </p>
+        <p className="home-service-line">{serviceText(health)}</p>
+      </section>
+
+      <section className="home-card" aria-labelledby={powerHeadingId}>
+        <h2 id={powerHeadingId}>What is powering the home?</h2>
+        {units.length === 0 ? (
+          <p className="home-empty">
+            No batteries yet — what is powering the home will appear here once a pod connects.
+          </p>
+        ) : (
+          <ul className="home-units">
+            {units.map((unit) => (
+              <UnitPowerEntry key={unit.unit_id} unit={unit} />
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="home-card" aria-labelledby={reserveHeadingId}>
+        <h2 id={reserveHeadingId}>How full are the batteries?</h2>
+        {units.length === 0 ? (
+          <p className="home-empty">
+            No batteries yet. Each pod&apos;s charge level will appear here as soon as one
+            connects — the first step is to connect or enrol a pod, or simply wait for it to check
+            in.
+          </p>
+        ) : (
+          <>
+            <p className="home-reserve-total">
+              Fleet charge level: not available — the snapshot does not carry a charge reading
+              yet.
+            </p>
+            <ul className="home-reserve-list" aria-label="Per-unit battery breakdown">
+              {units.map((unit) => (
+                <li
+                  key={unit.unit_id}
+                  className="home-reserve-item"
+                  aria-label={`${unit.unit_id} charge level`}
+                >
+                  {unit.unit_id}: charge level not available
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+      </section>
+
+      <section className="home-card" aria-labelledby={nextHeadingId}>
+        <h2 id={nextHeadingId}>What happens next?</h2>
+        {nextAction === null ? (
+          <p className="home-next-none">
+            No planned action — nothing is scheduled for the pods right now.
+          </p>
+        ) : (
+          <p className="home-next-action">
+            {directionWord(nextAction.requested_power.direction)} at{" "}
+            {formatWatts(nextAction.requested_power.watts)} per pod (
+            {activeUnits.map((unit) => unit.unit_id).join(", ")}).
+          </p>
+        )}
+      </section>
+
+      <section className="home-card" aria-labelledby={limitingHeadingId}>
+        <h2 id={limitingHeadingId}>Is anything limiting operation?</h2>
+        {factors.length === 0 ? (
+          systemHealthy ? (
+            <p className="home-limits-none">
+              Nothing is limiting operation — the pods are operating normally.
+            </p>
+          ) : (
+            <p className="home-limits-unknown">
+              Operation limits are not available yet — the health of the system could not be read.
+            </p>
+          )
+        ) : (
+          <ul className="home-factors">
+            {factors.map((factor) => (
+              <LimitingFactorItem
+                key={factor.key}
+                factor={factor}
+                expanded={expandedFactors[factor.key] ?? false}
+                onToggle={toggleFactor}
+              />
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+/**
+ * One unit's three separately labeled figures. Each magnitude lives inside its
+ * own named figure, so the allowed amount can never be presented under the
+ * requested label.
+ */
+function UnitPowerEntry({ unit }: { unit: UnitView }) {
+  const limited = isLimited(unit);
+  const badge = unitBadgeLabel(unit);
+  const requested = unit.requested_power;
+  const authorized = unit.authorized_power;
+  const stale = isStale(unit);
+  return (
+    <li className="home-unit" aria-label={`${unit.unit_id} power`}>
+      <div className="home-unit-head">
+        <h3 className="home-unit-name">{unit.unit_id}</h3>
+        <span className={`home-badge home-badge--${badgeKey(badge)}`}>{badge}</span>
+      </div>
+      <div className="home-figures">
+        <div className="home-figure" role="figure" aria-label="Requested">
+          <span className="home-figure-label">Requested</span>
+          <span className="home-figure-value">
+            {directionWord(requested.direction)} {formatWatts(requested.watts)}
+          </span>
+        </div>
+        <div className="home-figure" role="figure" aria-label="Allowed">
+          <span className="home-figure-label">Allowed</span>
+          <span className="home-figure-value">{allowedText(unit)}</span>
+        </div>
+        <div className="home-figure" role="figure" aria-label="Actual">
+          <span className="home-figure-label">Actual</span>
+          <span className="home-figure-value" data-stale={stale ? "true" : undefined}>
+            {unit.measured_watts === null ? "Not available" : formatWatts(unit.measured_watts)}
+          </span>
+        </div>
+      </div>
+      {limited && authorized !== null ? (
+        <p className="home-limit-note">
+          Limited to {formatWatts(authorized.watts)} — the safety system is holding back part of
+          the request.
+        </p>
+      ) : null}
+      <p className={stale ? "home-age home-age--stale" : "home-age"}>{dataAgeText(unit)}</p>
+    </li>
+  );
+}
+
+/** Plain language first; the raw reason code appears only after expanding. */
+function LimitingFactorItem({
+  factor,
+  expanded,
+  onToggle,
+}: {
+  factor: LimitingFactor;
+  expanded: boolean;
+  onToggle: (key: string) => void;
+}) {
+  const detailId = useId();
+  return (
+    <li className="home-factor">
+      <p className="home-factor-plain">{factor.plain}</p>
+      <button
+        type="button"
+        className="home-factor-reveal"
+        aria-expanded={expanded ? "true" : "false"}
+        aria-controls={detailId}
+        onClick={() => onToggle(factor.key)}
+      >
+        {expanded ? "Hide detail" : "Show detail"}
+      </button>
+      {expanded ? (
+        <p className="home-factor-detail" id={detailId}>
+          Raw code: <code className="home-factor-code">{factor.raw}</code>
+        </p>
+      ) : null}
+    </li>
+  );
 }

@@ -785,8 +785,12 @@ describe("HomeView", () => {
     });
     renderHome();
 
-    expectVisibleText(document.body, /internal_error/);
-    expectVisibleText(document.body, /The request could not be completed/);
+    // The envelope arrives with the rejected promise — one microtask after
+    // render, beyond React's synchronous act flush — so the first assertion
+    // yields to it (the pre-repair form awaited findAllByText here; the
+    // silentStream fixture keeps "no unit data" true while it waits).
+    expect(await screen.findByText(/internal_error/)).toBeVisible();
+    expect(screen.getByText(/The request could not be completed/)).toBeVisible();
     expect(screen.queryByText(/pod-mid/i)).toBeNull();
 
     const user = userEvent.setup();
@@ -811,8 +815,10 @@ describe("HomeView", () => {
     });
     renderHome();
 
-    expectVisibleText(document.body, /insufficient_scope/);
-    expectVisibleText(document.body, /The credential lacks permission/);
+    // Same timing reconciliation as the internal_error case above: the
+    // refusal is only observable after the rejected promise's microtask.
+    expect(await screen.findByText(/insufficient_scope/)).toBeVisible();
+    expect(screen.getByText(/The credential lacks permission/)).toBeVisible();
     // No partial data renders alongside a refusal.
     expect(screen.queryByText(/pod-mid/i)).toBeNull();
     expect(screen.getByRole("button", { name: /retry|try again/i })).toBeVisible();

@@ -1,0 +1,388 @@
+/*
+ * Home view styling — calm household product, never an engineering console.
+ * Color is always accompanied by a text label (never color alone); motion is
+ * honored behind prefers-reduced-motion; every state stays legible.
+ */
+
+.home-view {
+  display: grid;
+  gap: 1rem;
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+/* The polite live region is visually quiet but never display:none, so screen
+ * readers keep announcing through it. */
+.home-live-region {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.home-card {
+  padding: 1rem 1.25rem;
+  border: 1px solid #e2e0da;
+  border-radius: 0.9rem;
+  background: #fffdf9;
+  box-shadow: 0 1px 2px rgb(60 50 30 / 6%);
+}
+
+.home-card h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.05rem;
+  line-height: 1.3;
+  color: #3f3a30;
+}
+
+/* --- Question 1: safety + connection ------------------------------------ */
+
+.home-fleet-line {
+  margin: 0 0 0.5rem;
+  color: #3f3a30;
+}
+
+.home-badge {
+  display: inline-block;
+  padding: 0.1rem 0.65rem;
+  border: 1px solid;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 0.9em;
+  line-height: 1.5;
+}
+
+.home-badge--observe-only {
+  color: #4a5568;
+  border-color: #a0aec0;
+  background: #eef1f5;
+}
+
+.home-badge--disarmed {
+  color: #57534e;
+  border-color: #d6d3d1;
+  background: #fafaf9;
+}
+
+.home-badge--armed {
+  color: #276749;
+  border-color: #9ae6b4;
+  background: #f0fff4;
+}
+
+.home-badge--active {
+  color: #2c5282;
+  border-color: #90cdf4;
+  background: #ebf8ff;
+}
+
+.home-badge--limited {
+  color: #975a16;
+  border-color: #f6e05e;
+  background: #fffbeb;
+}
+
+.home-badge--inhibited {
+  color: #9b2c2c;
+  border-color: #fc8181;
+  background: #fff5f5;
+}
+
+.home-badge--none {
+  color: #57534e;
+  border-color: #d6d3d1;
+  background: #fafaf9;
+}
+
+.home-connection {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+}
+
+.home-connection--live {
+  color: #276749;
+}
+
+.home-connection--connecting {
+  color: #4a5568;
+}
+
+.home-connection--disconnected {
+  color: #9b2c2c;
+}
+
+/* Assertive announcements (connection lost during active control) render as a
+ * quiet but visible line; the region always exists, empty when not urgent. */
+.home-alert-region {
+  margin: 0;
+  padding: 0.5rem 0.9rem;
+  border-radius: 0.6rem;
+  background: #fff5f5;
+  border: 1px solid #fc8181;
+  color: #9b2c2c;
+  font-size: 0.95rem;
+}
+
+/* Empty (not urgent) stays in the accessibility tree — never display:none —
+ * but sheds its visual box. */
+.home-alert-region:empty {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.home-service-line {
+  margin: 0;
+  font-size: 0.95rem;
+  color: #57534e;
+}
+
+/* --- Question 2: power, per unit ---------------------------------------- */
+
+.home-units {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 1rem;
+}
+
+.home-unit {
+  padding: 0.85rem 1rem;
+  border: 1px solid #e7e4dc;
+  border-radius: 0.75rem;
+  background: #fffefb;
+}
+
+.home-unit-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.6rem;
+}
+
+.home-unit-name {
+  margin: 0;
+  font-size: 1rem;
+  color: #3f3a30;
+}
+
+.home-figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.6rem;
+}
+
+.home-figure {
+  padding: 0.5rem 0.65rem;
+  border: 1px solid #eceae3;
+  border-radius: 0.6rem;
+  background: #fbfaf6;
+}
+
+.home-figure-label {
+  display: block;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #78716c;
+}
+
+.home-figure-value {
+  display: block;
+  margin-top: 0.15rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: #33302a;
+}
+
+.home-limit-note {
+  margin: 0.6rem 0 0;
+  font-size: 0.92rem;
+  color: #975a16;
+}
+
+.home-age {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  color: #78716c;
+}
+
+.home-age--stale {
+  color: #975a16;
+}
+
+.home-age--stale + .home-figure-value,
+.home-figure-value[data-stale="true"] {
+  opacity: 0.75;
+}
+
+/* While the stream is down, the last values dim but never disappear. */
+.home-view[data-connection="disconnected"] .home-figure-value,
+.home-view[data-connection="disconnected"] .home-reserve-total,
+.home-view[data-connection="disconnected"] .home-reserve-item {
+  opacity: 0.75;
+}
+
+/* --- Question 3: reserve ------------------------------------------------ */
+
+.home-reserve-total {
+  margin: 0 0 0.6rem;
+  color: #3f3a30;
+}
+
+.home-reserve-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.home-reserve-item {
+  padding: 0.35rem 0.6rem;
+  border-left: 3px solid #d6d3d1;
+  background: #faf9f5;
+  border-radius: 0 0.4rem 0.4rem 0;
+  color: #57534e;
+}
+
+/* --- Question 4: next --------------------------------------------------- */
+
+.home-next-none,
+.home-next-action {
+  margin: 0;
+  color: #3f3a30;
+}
+
+/* --- Question 5: limiting factors --------------------------------------- */
+
+.home-limits-none,
+.home-limits-unknown {
+  margin: 0;
+  color: #3f3a30;
+}
+
+.home-factors {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.6rem;
+}
+
+.home-factor {
+  padding: 0.6rem 0.75rem;
+  border: 1px solid #eceae3;
+  border-radius: 0.6rem;
+  background: #fbfaf6;
+}
+
+.home-factor-plain {
+  margin: 0 0 0.35rem;
+  color: #3f3a30;
+}
+
+.home-factor-reveal {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.15rem 0.6rem;
+  border: 1px solid #d6d3d1;
+  border-radius: 999px;
+  background: #fff;
+  color: #57534e;
+  cursor: pointer;
+}
+
+.home-factor-detail {
+  margin: 0.5rem 0 0;
+  font-size: 0.85rem;
+  color: #78716c;
+  overflow-wrap: anywhere;
+}
+
+.home-factor-code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.3rem;
+  background: #f0efea;
+}
+
+/* --- Loading / empty / error -------------------------------------------- */
+
+.home-loading-line {
+  margin: 0 0 0.4rem;
+  color: #4a5568;
+}
+
+.home-loading-hint {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #78716c;
+}
+
+.home-empty {
+  margin: 0;
+  color: #57534e;
+}
+
+.home-error-detail {
+  margin: 0 0 0.6rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+.home-error-code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.85rem;
+  padding: 0.1rem 0.4rem;
+  border-radius: 0.3rem;
+  background: #fdf0ef;
+  color: #9b2c2c;
+  overflow-wrap: anywhere;
+}
+
+.home-error-message {
+  color: #3f3a30;
+}
+
+.home-error-note {
+  margin: 0 0 0.9rem;
+  font-size: 0.92rem;
+  color: #78716c;
+}
+
+.home-retry {
+  font: inherit;
+  padding: 0.35rem 1.1rem;
+  border: 1px solid #b8b2a7;
+  border-radius: 0.6rem;
+  background: #fffefb;
+  color: #3f3a30;
+  cursor: pointer;
+}
+
+/* Keyboard visibility for every control. */
+.home-factor-reveal:focus-visible,
+.home-retry:focus-visible {
+  outline: 3px solid #2c5282;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .home-card {
+    transition:
+      border-color 200ms ease,
+      box-shadow 200ms ease;
+  }
+}

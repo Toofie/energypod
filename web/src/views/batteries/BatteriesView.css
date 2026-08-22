@@ -1,0 +1,166 @@
+/* Batteries view styling: calm household language, states carried by text
+   first; dimming and color are secondary cues only. */
+
+.batteries-view {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.fleet {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: 1rem;
+}
+
+.battery-card {
+  border: 1px solid #d8d4cc;
+  border-radius: 0.75rem;
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  background: #fffdf9;
+}
+
+.battery-card.dimmed {
+  opacity: 0.75;
+}
+
+.card-title button {
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+.battery-card p {
+  margin: 0;
+}
+
+.latch {
+  font-weight: 600;
+}
+
+button:focus-visible {
+  outline: 2px solid #4a5d3a;
+  outline-offset: 2px;
+}
+
+.skeleton .skeleton-row {
+  height: 5rem;
+  border-radius: 0.75rem;
+  background: linear-gradient(90deg, #eeeae2 25%, #f7f4ee 50%, #eeeae2 75%);
+  background-size: 200% 100%;
+  animation: skeleton-sweep 1.4s ease infinite;
+  margin-top: 0.75rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton .skeleton-row {
+    animation: none;
+  }
+}
+
+@keyframes skeleton-sweep {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+.error-panel,
+.dialog-error,
+.refresh-error {
+  border: 1px solid #b3542f;
+  border-radius: 0.75rem;
+  padding: 0.75rem 1rem;
+  background: #fdf3ee;
+}
+
+.disconnected {
+  border: 1px solid #b3892f;
+  border-radius: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  background: #fdf8ee;
+}
+
+.latch-alert {
+  border: 1px solid #a03a3a;
+  border-radius: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  background: #fdeeee;
+  font-weight: 600;
+}
+
+.unit-detail {
+  border: 1px solid #d8d4cc;
+  border-radius: 0.75rem;
+  padding: 0.75rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.unit-detail h2 {
+  margin: 0;
+}
+
+.unit-detail [role="tablist"] {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.unit-detail [role="tabpanel"] {
+  border-top: 1px solid #e4e0d8;
+  padding-top: 0.5rem;
+}
+
+.unit-detail p {
+  margin: 0.25rem 0;
+}
+
+.event-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.event-list li {
+  border: 1px solid #e4e0d8;
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.raw-code {
+  font-family: ui-monospace, monospace;
+  font-size: 0.9em;
+}
+
+.dialog {
+  position: fixed;
+  inset: 25% auto auto 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  border: 2px solid #4a5d3a;
+  border-radius: 0.75rem;
+  padding: 1rem 1.25rem;
+  background: #fffdf9;
+  max-width: 28rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.dialog h2 {
+  margin: 0;
+}
+
+.dialog-actions {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}

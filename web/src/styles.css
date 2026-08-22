@@ -1,0 +1,330 @@
+/*
+ * Shared base styles for the EnergyPod operator console. Calm household energy
+ * product: quiet surfaces, clear focus, honest states. Per-view styling lives
+ * with the views; this sheet covers the shell, the token gate, focus-visible
+ * outlines, dimmed (stale/disconnected) data, and reduced motion.
+ */
+
+:root {
+  color-scheme: light;
+  --ink: #1f2733;
+  --ink-soft: #56637a;
+  --surface: #f7f8fa;
+  --card: #ffffff;
+  --line: #d9dee7;
+  --focus: #2b5bd7;
+  --yes: #1d7a3e;
+  --no: #a33327;
+  --armed: #8a6d1a;
+  --active: #1d5fa0;
+  --inhibited: #7a2d5e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  color: var(--ink);
+  background: var(--surface);
+  line-height: 1.5;
+}
+
+/* Keyboard users always see where they are. */
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+button {
+  font: inherit;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+  border-color: var(--focus);
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* --- token gate ---------------------------------------------------------- */
+
+.token-entry {
+  max-width: 26rem;
+  margin: 12vh auto 0;
+  padding: 1.5rem;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.token-entry h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.6rem;
+}
+
+.token-entry label {
+  display: block;
+  font-weight: 600;
+  margin: 1rem 0 0.35rem;
+}
+
+.token-entry input {
+  width: 100%;
+  font: inherit;
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.token-entry input::placeholder {
+  color: var(--ink-soft);
+}
+
+.token-entry button[type="submit"] {
+  margin-top: 1rem;
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #fff;
+}
+
+#token-help {
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+  margin: 0.5rem 0 0;
+}
+
+.refusal {
+  border-left: 4px solid var(--no);
+  background: #fdf3f2;
+  padding: 0.6rem 0.75rem;
+  border-radius: 0 8px 8px 0;
+}
+
+/* --- shell layout -------------------------------------------------------- */
+
+.shell {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 1rem 1.25rem 3rem;
+}
+
+.shell-header {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: 1fr;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  margin: 0;
+  text-transform: uppercase;
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+}
+
+.banner {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 0.75rem 1rem;
+}
+
+.banner-badge {
+  margin: 0 0 0.35rem;
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.badge-icon {
+  font-size: 1rem;
+}
+
+.banner-contact {
+  margin: 0 0 0.35rem;
+  color: var(--no);
+  font-weight: 600;
+}
+
+.banner-units {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.25rem;
+}
+
+.connection ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.25rem;
+  font-size: 0.85rem;
+}
+
+.connection .fact.yes strong {
+  color: var(--yes);
+}
+
+.connection .fact.no strong {
+  color: var(--no);
+}
+
+.header-actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.stop-button {
+  background: var(--no);
+  border-color: var(--no);
+  color: #fff;
+  font-weight: 700;
+}
+
+.stop-dialog {
+  position: relative;
+  margin-top: 0.75rem;
+  background: var(--card);
+  border: 2px solid var(--no);
+  border-radius: 12px;
+  padding: 1rem 1.25rem;
+}
+
+.stop-dialog h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+}
+
+.dialog-actions {
+  display: flex;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.dialog-actions button:last-child {
+  background: var(--no);
+  border-color: var(--no);
+  color: #fff;
+  font-weight: 700;
+}
+
+.shell-nav ul {
+  margin: 0.75rem 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1.5rem;
+}
+
+.shell-nav a {
+  color: var(--ink);
+  text-decoration: none;
+  padding: 0.2rem 0.1rem;
+  border-radius: 6px;
+}
+
+.shell-nav a[aria-current="page"] {
+  font-weight: 700;
+  border-bottom: 2px solid var(--focus);
+}
+
+.planned-view {
+  color: var(--ink-soft);
+}
+
+.planned-view em {
+  font-style: normal;
+  font-size: 0.8rem;
+  border: 1px dashed var(--line);
+  border-radius: 999px;
+  padding: 0.05rem 0.5rem;
+}
+
+.announcements {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.urgent-announcements {
+  border-left: 4px solid var(--no);
+  background: #fdf3f2;
+  padding: 0.6rem 0.75rem;
+  border-radius: 0 8px 8px 0;
+  font-weight: 600;
+}
+
+.disconnected-notice {
+  margin: 0.75rem 0;
+  border: 1px solid var(--no);
+  border-radius: 10px;
+  background: #fdf3f2;
+  padding: 0.6rem 0.9rem;
+}
+
+.disconnected-notice p {
+  margin: 0;
+}
+
+main h1 {
+  font-size: 1.35rem;
+  margin: 0.5rem 0 1rem;
+}
+
+/* The last known picture stays visible while disconnected — dimmed, not gone. */
+main.dimmed .banner,
+main.dimmed {
+  opacity: 0.75;
+}
+
+.snapshot-error {
+  border: 1px solid var(--no);
+  border-radius: 10px;
+  background: #fdf3f2;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+}
+
+.snapshot-error p {
+  margin: 0 0 0.5rem;
+}
+
+.loading p {
+  color: var(--ink-soft);
+}
+
+/* --- reduced motion ------------------------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

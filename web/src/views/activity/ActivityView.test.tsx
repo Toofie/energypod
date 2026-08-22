@@ -417,7 +417,7 @@ describe("Activity view", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows a skeleton of placeholder entries inside the loading status, never a spinner alone", () => {
+  it("shows a skeleton of placeholder entries inside the loading status, never a spinner alone", async () => {
     client.getAudit = vi.fn().mockReturnValue(new Promise(() => {}));
 
     renderView();
@@ -426,8 +426,10 @@ describe("Activity view", () => {
     expect(status).toBeVisible();
 
     // The skeleton is structural: placeholder rows stand in for timeline
-    // entries inside the status region, bounded by the page size.
-    const placeholders = within(status).getAllByRole("listitem");
+    // entries inside the status region, bounded by the page size. The
+    // placeholders appear once the outstanding fetch outlives the current
+    // tick (the standard anti-flash pattern), so the query waits for them.
+    const placeholders = await within(status).findAllByRole("listitem");
     expect(placeholders.length).toBeGreaterThanOrEqual(1);
     expect(placeholders.length).toBeLessThanOrEqual(PAGE_SIZE);
 
