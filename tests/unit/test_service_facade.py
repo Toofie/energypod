@@ -128,6 +128,8 @@ TELEMETRY_SUMMARY_FIELDS = (
     "temperature_max_c",
     "active_faults",
     "active_warnings",
+    "grid_power_w",
+    "load_power_w",
 )
 
 # Live-decoded reference values from the first hardware capture
@@ -159,6 +161,8 @@ def decoded_observation(
     cell_sequence: int = 12,
     cell_captured_at_mono: float = 98.0,
     connection_epoch: int = 3,
+    grid_power_w: float | None = None,
+    load_power_w: float | None = None,
 ) -> Any:
     """Build one real domain Observation carrying the captured fleet values."""
     steps = max(1, round((cell_high_v - cell_low_v) / 0.001))
@@ -190,6 +194,8 @@ def decoded_observation(
         temperatures_c=temperatures_c,
         active_faults=frozenset(),
         active_warnings=frozenset(FLEET_WARNINGS),
+        grid_power_w=grid_power_w,
+        load_power_w=load_power_w,
         quality={field: api.DataQuality.GOOD for field in QUALITY_FIELDS},
     )
 
@@ -209,6 +215,10 @@ def mid_observation(api: Any) -> Any:
         soh_pct=99.0,
         dynamic_charge_limit_w=2500.0,
         dynamic_discharge_limit_w=3000.0,
+        # Per-pod CT words from the same first hardware capture
+        # (PROTOCOL_EVIDENCE 4c: PCS 0x1000+17/+20; importing, so negative).
+        grid_power_w=-1736.0,
+        load_power_w=1701.0,
     )
 
 
@@ -229,6 +239,8 @@ def rhs_observation(api: Any) -> Any:
         dynamic_discharge_limit_w=2500.0,
         sequence=12,
         cell_sequence=3,
+        grid_power_w=-37.0,
+        load_power_w=1063.0,
     )
 
 
@@ -988,6 +1000,8 @@ async def test_snapshot_telemetry_summary_projects_the_decoded_fleet(api: Any) -
         "temperature_max_c": 28.0,
         "active_faults": [],
         "active_warnings": ["DCDC_Warning0_1", "PCS_Warning0_1"],
+        "grid_power_w": -1736.0,
+        "load_power_w": 1701.0,
     }
     assert units["RHS"]["telemetry"] == {
         "soc_pct": 68.0,
@@ -1006,6 +1020,8 @@ async def test_snapshot_telemetry_summary_projects_the_decoded_fleet(api: Any) -
         "temperature_max_c": 26.5,
         "active_faults": [],
         "active_warnings": ["DCDC_Warning0_1", "PCS_Warning0_1"],
+        "grid_power_w": -37.0,
+        "load_power_w": 1063.0,
     }
     assert units["LHS"]["telemetry"] == {
         "soc_pct": 48.0,
@@ -1024,6 +1040,10 @@ async def test_snapshot_telemetry_summary_projects_the_decoded_fleet(api: Any) -
         "temperature_max_c": 23.5,
         "active_faults": [],
         "active_warnings": ["DCDC_Warning0_1", "PCS_Warning0_1"],
+        # LHS carries no advisory CT words in this fixture: an unserved PCS
+        # block projects null readthrough, never a fabricated zero.
+        "grid_power_w": None,
+        "load_power_w": None,
     }
     # A genuinely measured zero stays zero; it is never promoted to a value.
     assert units["LHS"]["measured_watts"] == 0.0

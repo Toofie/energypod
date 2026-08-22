@@ -25,6 +25,10 @@ Fail-closed contract (pinned by ``tests/unit/test_wire_decode.py``):
   that decodes outside its domain (percentages outside 0-100, a negative
   dynamic power limit) is BAD with the value absent — never clamped, never
   fabricated.
+- The two advisory CT power words (PCS live block +17/+20, PROTOCOL_EVIDENCE
+  4c) decode as signed unscaled watts and ALWAYS appear in the quality map,
+  MISSING when the block was not served; they stay outside the
+  safety-critical completeness set.
 - The ambiguous families (energy-counter role labels S5 A-1, balance words
   S5 A-15) have no channel in the observation and are never read here.
 """
@@ -39,6 +43,7 @@ from energypod.domain.observations import DataQuality, Observation, UnitLifecycl
 
 # Block base addresses of the deployed IoT plan (field-mapping S2 per block).
 _SYSTEM_BLOCK_BASE = 0x0100
+_PCS_LIVE_BLOCK_BASE = 0x1000
 _PCS_FAULT_BLOCK_BASE = 0x1040
 _DCDC_FAULT_BLOCK_BASE = 0x2040
 _BMS_BLOCK_BASE = 0x5000
@@ -47,6 +52,15 @@ _CELL_VOLTAGE_BASE = 0x5200
 _CELL_TEMPERATURE_BASE = 0x523C
 _RTU_ID_BASE = 0x8106
 _DEVICE_PARAMETERS_BASE = 0x8102
+
+# PCS live block advisory offsets, PROTOCOL_EVIDENCE 4c (SysControl.cs:500
+# and :503): the per-pod CT external-grid power at +17 and the load power at
+# +20, both int16 unscaled watts.  Sign live-proven: negative = import,
+# positive = export.  The system-overview grid word at 0x0100+55 is a
+# separately-filtered cross-check and is deliberately NOT merged into this
+# value.
+_PCS_GRID_POWER_OFFSET = 17
+_PCS_LOAD_POWER_OFFSET = 20
 
 # BMS live block offsets, field-mapping S2.8 (SysControl.cs:731-739).
 _BMS_VOLTAGE_OFFSET = 6
@@ -273,6 +287,16 @@ def decode_observation(
         blocks.get(_CELL_TEMPERATURE_BASE), expected_temperature_count
     )
 
+    # Advisory per-pod CT power, PROTOCOL_EVIDENCE 4c: the PCS live block is
+    # the control-grade source (tier-promotable to the control-rate core).
+    # Both keys are ALWAYS emitted — MISSING when the poll did not serve the
+    # block — because the observation's quality map is the honest inventory
+    # of what this poll saw, and the export bound fails closed on MISSING
+    # without touching the safety-critical completeness set.
+    pcs_live = blocks.get(_PCS_LIVE_BLOCK_BASE)
+    grid_power_w, grid_power_quality = _measurement(pcs_live, _PCS_GRID_POWER_OFFSET, _WATT_SCALE)
+    load_power_w, load_power_quality = _measurement(pcs_live, _PCS_LOAD_POWER_OFFSET, _WATT_SCALE)
+
     quality: dict[str, DataQuality] = {
         "system_soc_pct": system_soc_quality,
         "bms_soc_pct": bms_soc_quality,
@@ -284,6 +308,8 @@ def decode_observation(
         "dynamic_discharge_limit_w": discharge_limit_quality,
         "cell_voltages_v": cell_quality,
         "temperatures_c": temperature_quality,
+        "grid_power_w": grid_power_quality,
+        "load_power_w": load_power_quality,
     }
 
     # Fail-closed downgrade: with identity, profile, topology or fault-block
@@ -323,6 +349,8 @@ def decode_observation(
         cell_sequence=cell_sequence,
         expected_temperature_count=expected_temperature_count,
         temperatures_c=temperatures_c,
+        grid_power_w=grid_power_w,
+        load_power_w=load_power_w,
         active_faults=fault_codes,
         active_warnings=warning_codes,
         quality=quality,

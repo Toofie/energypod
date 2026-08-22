@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Final, Protocol
 
-from energypod.domain import Direction, IntentSource, PowerIntent, UnitLifecycle
+from energypod.domain import Direction, IntentSource, Observation, PowerIntent, UnitLifecycle
 from energypod.domain.audit import AuditEvent
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -67,7 +67,17 @@ _TELEMETRY_SUMMARY_FIELDS: Final[tuple[str, ...]] = (
     "temperature_max_c",
     "active_faults",
     "active_warnings",
+    "grid_power_w",
+    "load_power_w",
 )
+
+# API_CONTRACTS "Excess-solar accelerated charging (advisory)": the advisory
+# CT power words stay OUTSIDE every ordinary quality judgment.  The fleet
+# view's aggregate quality therefore judges only the safety-critical fields;
+# a read plan that does not serve the PCS block (advisory MISSING) must not
+# degrade the fleet view, and the advisory words gate their own fail-closed
+# export bound instead.
+_SAFETY_QUALITY_FIELDS: Final[frozenset[str]] = Observation.QUALITY_FIELDS
 
 
 class Principal(Protocol):
@@ -347,6 +357,10 @@ def _telemetry_summary(observation: Any) -> dict[str, Any] | None:
         ),
         "active_faults": _optional_codes(getattr(observation, "active_faults", None)),
         "active_warnings": _optional_codes(getattr(observation, "active_warnings", None)),
+        # Advisory per-pod CT power, readthrough-style: null when the poll did
+        # not serve the PCS live block, never zero-filled or fabricated.
+        "grid_power_w": _optional_float(getattr(observation, "grid_power_w", None)),
+        "load_power_w": _optional_float(getattr(observation, "load_power_w", None)),
     }
 
 
@@ -1030,7 +1044,12 @@ class EnergyServiceFacade:
         quality = getattr(telemetry, "quality", None)
         if not isinstance(quality, Mapping):
             return "degraded"
-        values = [_enum_value(item) for item in quality.values()]
+        # Only the safety-critical fields decide the aggregate (see
+        # _SAFETY_QUALITY_FIELDS): advisory fields are readthrough data whose
+        # absence or badness never degrades an ordinary fleet view.
+        values = [
+            _enum_value(item) for field, item in quality.items() if field in _SAFETY_QUALITY_FIELDS
+        ]
         if "bad" in values:
             return "bad"
         fresh = age_s is not None and age_s <= _SNAPSHOT_GOOD_TELEMETRY_MAX_AGE_S
