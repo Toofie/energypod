@@ -566,6 +566,29 @@ direction, freshness, and watchdog timing per physical unit.
   measured movement => alarm); (vii) distinct arm-refusal reason for
   already-armed vs actor_failure.
 
+- 2026-08-23 (UX): REQUEST-CARD STALENESS + MISSING CANCEL. Operator
+  reports a "requested discharge 2000 W" card that never clears; server
+  truth at snapshot 2631: all units armed_idle, EMPTY request state — the
+  intent had EXPIRED and the UI never applied the transition. Root
+  suspicion (being traced field-by-field): the backend publishes NOTHING
+  explicit at intent expiry (kernel decisions simply stop when the arbiter
+  has no winner — silence, not an event), and the request panels neither
+  poll nor bind, so the card can only ever be replaced by the NEXT
+  request. Related known gap: raw telemetry ticks on Batteries but
+  request/authorization info (requested/allowed/actual) is stale on ALL
+  views during live intents — one defect family. QUEUED FEATURES (next
+  contract cycle, after the excess-charging implementation lands):
+  (1) POST /api/v1/intents/cancel (cancel the active intent by id or
+  current: repository remove -> kernel no-winner -> revoke -> non-renewal
+  stops power via device watchdog ~3.5-4 s; audit event required; per
+  repo rules stopping is safety-positive so scope = dispatch, no
+  interactive requirement) + a Stop/✕ button on the UI request card;
+  (2) explicit intent lifecycle events (accepted/expired/cancelled) on
+  the event bus so UIs never infer state from silence; (3) the
+  request-panel live binding (console agent, in flight). Until cancel
+  exists, the honest stop paths remain: TTL expiry (≤300 s), emergency
+  stop (immediate, fleet-wide, latched + acknowledge), or disarm.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
