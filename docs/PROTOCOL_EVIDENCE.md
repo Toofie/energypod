@@ -95,6 +95,58 @@ Any implementation must select framing explicitly. A default `ModbusTcpClient` u
 | BECU count | **Confirmed by vendor code** | It is the population count of the byte-truncated enable mask, forced to at least 1 (`GlobalFun.NumberOf1`, `SysControl.cs:90-99`). Because the mask is truncated to 8 bits, the legacy BECU count cannot exceed 8. |
 | Deployed units use the IoT layout. | **Verified by live capture (2026-08-22)** | All three layout probes return register 0 = 536 (> 10 selects IoT). Per-unit commissioned topology: MID (192.168.1.11) 6 BIC, RHS (192.168.1.12) 5 BIC — differing topology across the fleet, validating the per-unit commissioning requirement — LHS (192.168.1.13) 6 BIC; enable mask 1 on all. Pinned device identities (RTU ID at 0x8106, low-word-first uint32): MID `0x2C225097`, RHS `0x2C225076`, LHS `0x2C225095`. Control remains observe-only until scaling, direction, freshness, and watchdog timing are validated per unit. |
 
+## 4b. Power-direction sign conventions (2026-08-22, three-source reconciliation)
+
+Reconciled across the decompiled vendor app, the operator's three prior
+implementations, and live telemetry. The vendor app is a sign-TRANSPARENT
+pipe — it contains no charging/discharging conditional anywhere and never
+displays the decoded `chargeDischargeStatus` byte (SysControl.cs:1149/728),
+so the sign contract is carried by the prior implementations and live
+observation, not the vendor UI.
+
+**Battery power registers (BMS 0x5008 IoT / 0x5009 proto-0, DCDC 0x2009 IoT,
+system 0x0114): POSITIVE = DISCHARGE, NEGATIVE = CHARGE.**
+- Prior implementations: `byd/dashboard.py:742` "(-) Charging | (+)
+  Discharging"; `byd/battery.py:322` Charging requires `batt < -30`;
+  nextgen and root write paths agree. No read-path negation exists in any
+  of the three.
+- Live: during confirmed discharge (SOC 73→71, 57→53) the registers read
+  POSITIVE (+1192/+1972 W) — field-mapping §A-1.
+
+**PQ command (FC16 at 0x0200, `[1, P, Q]`): NEGATIVE P = CHARGE,
+POSITIVE P = DISCHARGE.** The enable word at 0x0200 (decimal 512) doubles
+as the prior implementations' "force state" register (1 = NORMAL_MODE;
+5 = STANDBY_TRICKLE_CHARGE used as their stop). All three prior
+implementations negate inside `charge()` (`byd/battery.py:297`,
+root `battery.py:530`, nextgen `battery_interface.py:108`) and write
+positive for discharge; the vendor transmits the operator's signed value
+verbatim (SysControl.cs:1442-1453, bit-preserving `(ushort)` cast).
+
+**Grid power (0x1018 IoT PCS external, 0x0137 system): NEGATIVE = IMPORT,
+POSITIVE = EXPORT.** Prior `Charging` status also required `grid < 0`
+(byd/battery.py:322); live captures read −1736/−37/−48 W while importing.
+
+**The operator-remembered "reversal" is real but display-only** — it exists
+in two labels/docstrings of the prior code, never in a control path:
+- `nextgen_battery_manager/dashboard.py:109`: help text
+  "positive=charging, negative=discharging" — inverted relative to every
+  other label AND its own write path; additionally mislabels load power
+  (register 4116) as battery power.
+- root `battery.py:210` docstring: "negative exports, positive imports" —
+  contradicts its own discharge docstring at :541.
+
+**Latent vendor decode hazard:** the system block decodes battery/PCS
+current and voltage with UNSIGNED casts (SysControl.cs:417-418, 423-424)
+where the BMS/PCS blocks use signed `(short)` — same quantities, opposite
+signedness; never displayed, but any reimplementation must not copy the
+system-block casts for signed quantities.
+
+**Remaining gate (unchanged):** the WRITE-side convention is corroborated by
+three prior implementations but not yet proven against live firmware — the
+low-power command-direction confirmation (command small negative P, observe
+charging: SOC rising, battery power negative, charge-energy counter
+incrementing) still requires the separate actuation authorization.
+
 ## 4a. Live commissioning evidence (2026-08-22, authorized observe-only)
 
 Authorized by the operator as a direct hookup; every operation below was a
