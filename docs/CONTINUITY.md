@@ -519,6 +519,53 @@ direction, freshness, and watchdog timing per physical unit.
   window; day/night control partition agreement with the night-writing
   systems; dedicated VLAN for 192.168.1.11-13:4196 as the structural fix.
 
+- 2026-08-23 (actuation): SILENT ACTUATION LOSS DIAGNOSED — vendor mode
+  registers implicated. The operator's rhs+lhs discharge "stall" (22:11:28Z
+  onward) was NOT a kernel halt, refusal, arbitration, or proxy fault: the
+  kernel decided every ~2.3 s and AUTHORIZED the requested power for 6+
+  minutes across three intents, but the authorized watts never physically
+  happened — measured battery power never moved, with zero errors, zero
+  transport faults, zero epoch changes. Two compounding defects:
+  (1) GREEDY ALLOCATOR STARVATION (by design, needs fixing): a fleet intent
+  over [lhs, rhs] fills lhs first (sorted order, lhs headroom >= request),
+  so lhs takes everything and rhs receives a 0 W proposal — the operator's
+  "both batteries" discharge silently halved. (2) SILENT WRITE/ APPLY
+  FAILURE: every actor write is wrapped in suppress(Exception) + bounded
+  wait_for (the f20602c hardening) — fail-closed but INVISIBLE BY
+  CONSTRUCTION; a total actuation loss leaves no log, audit, or error.
+  VENDOR RE CROSS-CHECK (the operator's directive paid off immediately):
+  SysControl.cs:1442-1458 SendPQPower is byte-identical to our encoder,
+  BUT the vendor refuses to send unless device debugMode == 0 "Nomal Mode"
+  (status 0x8100, command 0x8000; MiniESapp.cs:2178) and SysControlMode is
+  Remote (ctrlMode, GlobalFun.cs:204-212). Our controller NEVER writes
+  0x8000 — a pod latched into debug/local mode silently ignores 0x0200
+  objectives: the exact observed signature. Vendor renewal = re-send every
+  1000 ms, NO vendor ramp (our first-cycle ~800/1580 W clamp is OUR ramp
+  limiter from the pod's self-charge/float baseline — working correctly),
+  no PQ readback. Post-restart anomaly: mid oscillates ±1.2 kW completely
+  uncommanded (not the steady −520..−700 W self-charge) — consistent with
+  device-local control active on mid; EXCLUDE mid from fleet intents until
+  explained. Controller restarted cleanly (facade-1bfbb2c8, writemode13,
+  src/ verified clean first; py-spy had shown no OS-level hang — per-cycle
+  suppressed I/O failure, not a wedged thread). OPERATOR DISCRIMINATOR on
+  re-dispatch: first cycle clamps (~750 rhs / ~1580 lhs), then either
+  CLIMBS to setpoint within 2-4 cycles (controller-side, fixed by restart)
+  or PINS (pods ignoring remote objectives — check each pod in the vendor
+  MiniES app: Debug Mode "Nomal Mode", SysControlMode "Remote"; also check
+  mid). Per-unit intents get full power to each unit; fleet intents
+  starve the alphabetically-later unit until the allocator is fixed.
+  FIX QUEUE (sequenced after the excess-charging implementation lands, to
+  avoid two agents in src/): (i) audit+log every suppressed write failure
+  (composition.py ~1440); (ii) per-unit attribution on control_decision
+  rows; (iii) objective echo readback after 0x0200 writes (vendor
+  precedent: DebugModeRead after SendSysCtrl); (iv) poll debugMode
+  0x8100/ctrlMode in telemetry, expose in /units, refuse intents with an
+  explicit reason when mode != Normal/Remote; (v) allocator starvation fix
+  (capacity-aware split or per-unit targets + allocated_zero reason code);
+  (vi) actuation-coherence watchdog (N cycles authorized>0 with no
+  measured movement => alarm); (vii) distinct arm-refusal reason for
+  already-armed vs actor_failure.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
