@@ -87,7 +87,8 @@ async def main() -> None:
                         continue
                     stack = task.get_stack(limit=4)
                     frames = "".join(
-                        f"\n      at {frame.f_code.co_filename}:{frame.f_lineno} in {frame.f_code.co_name}"
+                        f"\n      at {frame.f_code.co_filename}:{frame.f_lineno}"
+                        f" in {frame.f_code.co_name}"
                         for frame in reversed(list(stack))
                     )
                     log(
