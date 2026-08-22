@@ -97,9 +97,23 @@ Any implementation must select framing explicitly. A default `ModbusTcpClient` u
 
 ## 4a. Live commissioning evidence (2026-08-22, authorized observe-only)
 
+Authorized by the operator as a direct hookup; every operation below was a
+read-only FC03 holding-register read through the production
+`WaveshareTransport`; no write of any kind was issued.
+
+- First live read: MID layout probe (0x5000, 7 registers) — succeeded first
+  attempt, validating the previously unverified RTU-over-TCP framing end to
+  end through our own adapter.
+- Full 13-block IoT read plan captured once per unit (including the 0x8106
+  identity pair): `docs/evidence/live-capture-2026-08-22.json` — the first
+  E1 reference vectors taken from deployed hardware rather than handcrafted.
+- Fleet topology: MID 6 BIC / RHS 5 BIC / LHS 6 BIC (enable mask 1 each).
+- Still unknown and required before any actuation: telemetry scaling and
+  field placement validation against the evidence matrix, power-direction
+  sign on the real installation, watchdog expiry timing, and the
+  string-identity binding strategy (the wire carries only the CRC32 RTU ID).
 
 ## 4b. Power-direction sign conventions (2026-08-22, three-source reconciliation)
-
 
 Reconciled across the decompiled vendor app, the operator's three prior
 implementations, and live telemetry. The vendor app is a sign-TRANSPARENT
