@@ -159,11 +159,28 @@ where the BMS/PCS blocks use signed `(short)` — same quantities, opposite
 signedness; never displayed, but any reimplementation must not copy the
 system-block casts for signed quantities.
 
-**Remaining gate (unchanged):** the WRITE-side convention is corroborated by
-three prior implementations but not yet proven against live firmware — the
-low-power command-direction confirmation (command small negative P, observe
-charging: SOC rising, battery power negative, charge-energy counter
-incrementing) still requires the separate actuation authorization.
+**WRITE-side convention CONFIRMED by live trial (2026-08-22,
+`docs/evidence/live-direction-trial-2026-08-22.json`):** the operator
+authorized a single bounded commissioning write — MID, −200 W (≈2.6% of its
+7696 W charge limit), one shot, abort-checked (debug mode 0, no competing
+objective), explicit stop. Result: objective readback (0x1060+17) showed
+−200 immediately; battery power went NEGATIVE (−288 W, pack current
+−1.5 A), charge-current limits engaged, SOC ticked 9→10; power returned to
+0 after the unrenewed objective expired; explicit stop `[1,0,0]` confirmed
+idle (post-stop +19 W, matching baseline). **Negative P = CHARGE,
+positive P = DISCHARGE — proven on live firmware.**
+
+**Watchdog expiry MEASURED by the same trial:** single write at t≈0.56 s,
+charge still flowing at t≈4.0 s (−288 W), zero by t≈4.6–5.3 s — with no
+renewal, the objective expires ≈3.5–4.0 s after the last write. The
+vendor's 1 s renewal cadence and the prior integration's 1.5 s cadence
+both sit safely inside it. A write-enabled composition must set its
+renewal period and `device_command_expiry_s` budget strictly inside this
+measured window with margin (the observe-only live config's 9.0 s expiry
+placeholder is only tolerable because run mode never writes).
+
+**Stop path CONFIRMED:** `[1,0,0]` returned the unit to its pre-trial
+state within 1.5 s; no force-state write needed.
 
 Authorized by the operator as a direct hookup; every operation below was a
 read-only FC03 holding-register read through the production
