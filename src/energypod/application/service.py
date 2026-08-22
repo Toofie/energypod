@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -433,6 +434,7 @@ class EnergyServiceFacade:
         self._coordinator = coordinator
         self._actors = handles
         self._revision = 0
+        self._advisory_correlations = itertools.count(1)
         self._latched_stops: dict[str, _LatchedStop] = {}
         self._acknowledged_stops: set[str] = set()
         self._process_instance_id = f"facade-{uuid.uuid4().hex}"
@@ -623,6 +625,110 @@ class EnergyServiceFacade:
             # arbitrate on the next tick.  A rollback failure cannot be
             # allowed to mask the original error; the stored intent is then
             # the residual risk the operator still has to see reported.
+            with contextlib.suppress(Exception):
+                await self._intents.remove(intent_id)
+            raise
+        return {
+            "intent_id": intent_id,
+            "acceptance_revision": revision,
+            "accepted_at_monotonic": now_mono,
+            "status": "accepted",
+            "requested": {
+                "direction": resolved_direction.value,
+                "watts": resolved_watts,
+            },
+            "authorized": None,
+            "measured": None,
+            "expires_in_s": duration_s,
+        }
+
+    async def submit_advisory_intent(
+        self,
+        *,
+        unit_ids: Any,
+        direction: Any,
+        watts: Any,
+        ttl_s: Any,
+        reason: Any = None,
+        principal: Principal,
+        idempotency_key: Any = None,
+        request_id: Any = None,
+    ) -> dict[str, Any]:
+        """Accept one internal OPTIMIZER intent; the advisory twin of submit_intent.
+
+        API_CONTRACTS "Excess-solar accelerated charging (advisory)": same
+        validation, audit event type, idempotency/correlation contract, and
+        publication as ``submit_intent``, with the mintage source pinned to
+        ``OPTIMIZER`` and its own intent-id prefix — so audit attribution
+        separates the automation principal plus ``optimizer`` tag from every
+        console (``manual``) or agent traffic.  This method is composition-
+        only wiring: it is never routed on REST or MCP, and only the composed
+        ``energypod:excess-adviser`` principal ever reaches it.  Absent
+        caller identifiers get deterministic facade-owned ones so a direct
+        internal drive still travels the correlated, audited path.
+        """
+        self._admit(principal, "dispatch")
+        units = _validated_units(unit_ids)
+        unknown = [unit_id for unit_id in units if unit_id not in self._actors]
+        if unknown:
+            raise ValueError(f"unknown units requested: {unknown}")
+        resolved_direction = _dispatch_direction(direction)
+        resolved_watts = _positive_watts(watts)
+        duration_s = _positive_duration(ttl_s)
+        _reason_text(reason, required=False)
+        resolved_idempotency = (
+            self._advisory_key("idempotency") if idempotency_key is None else idempotency_key
+        )
+        _correlation_key(resolved_idempotency, "idempotency_key")
+        request_source = self._advisory_key("request") if request_id is None else request_id
+        request = _correlation_key(request_source, "request_id")
+
+        now_mono = float(self._clock.monotonic())
+        revision = self._next_revision()
+        intent_id = f"excess-{revision}-{now_mono:.6f}"
+        intent = PowerIntent(
+            id=intent_id,
+            source=IntentSource.OPTIMIZER,
+            selected_unit_ids=frozenset(units),
+            direction=resolved_direction,
+            watts=resolved_watts,
+            duration_s=duration_s,
+            accepted_at_mono=now_mono,
+            acceptance_revision=revision,
+            actor_identity=principal.subject,
+        )
+        await self._intents.add(intent)
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="intent_accepted",
+                    subject=principal.subject,
+                    result="accepted",
+                    request_id=request,
+                    source=IntentSource.OPTIMIZER,
+                    intent_id=intent_id,
+                    reason_codes=("accepted",),
+                    lifecycle=UnitLifecycle.DISARMED,
+                    payload={
+                        "direction": resolved_direction.value,
+                        "unit_ids": sorted(units),
+                        "watts": resolved_watts,
+                    },
+                )
+            )
+            await self._publish(
+                "intent.accepted",
+                {
+                    "principal": principal.subject,
+                    "intent_id": intent_id,
+                    "direction": resolved_direction.value,
+                    "watts": resolved_watts,
+                    "unit_ids": sorted(units),
+                },
+            )
+        except Exception:
+            # Atomic with its audit and publication exactly like submit_intent:
+            # an advisory drive that failed here must leave nothing stored.
             with contextlib.suppress(Exception):
                 await self._intents.remove(intent_id)
             raise
@@ -1006,6 +1112,10 @@ class EnergyServiceFacade:
         revision = self._revision
         self._revision += 1
         return revision
+
+    def _advisory_key(self, prefix: str) -> str:
+        """Deterministic facade-owned correlation for an internal advisory drive."""
+        return f"excess-{prefix}-{next(self._advisory_correlations):08d}"
 
     async def _unit_view(
         self,
