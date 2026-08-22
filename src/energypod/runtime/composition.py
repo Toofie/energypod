@@ -724,13 +724,16 @@ class _LazyWaveshareTransport:
             await self._transport.close()
 
 
-def _production_transport_factory(unit: Any, timeout_s: float) -> Callable[[], WaveshareTransport]:
+def _production_transport_factory(
+    unit: Any, timeout_s: float, inter_request_delay_s: float = 0.1
+) -> Callable[[], WaveshareTransport]:
     """Build the per-unit production transport factory (eagerly validated)."""
     config = WaveshareTransportConfig(
         host=unit.endpoint.host,
         port=unit.endpoint.port,
         device_id=unit.device_id,
         timeout_s=timeout_s,
+        inter_request_delay_s=inter_request_delay_s,
     )
     return lambda: WaveshareTransport(config=config)
 
@@ -1820,7 +1823,11 @@ def _build_runtime(
             # the running loop at construction, and composition itself runs
             # with no loop and must open no sockets.
             transport = _LazyWaveshareTransport(
-                _production_transport_factory(unit, config.timing.essential_read_timeout_s)
+                _production_transport_factory(
+                    unit,
+                    config.timing.essential_read_timeout_s,
+                    config.timing.inter_request_delay_s,
+                )
             )
             # Run mode decodes the served register bank with the production
             # wire decoder over the same lazy transport the actor owns, so one

@@ -73,23 +73,29 @@ units:
     expected_cell_count: 60
 
 timing:
-  device_command_expiry_s: 2.35
-  device_command_expiry_evidence: commissioning://watchdog-trial-2026-08/rev-1
-  control_period_s: 0.40
-  essential_read_timeout_s: 0.10
-  kernel_timeout_s: 0.05
-  audit_timeout_s: 0.05
-  write_timeout_s: 0.10
-  acknowledgement_timeout_s: 0.10
-  maximum_jitter_s: 0.10
+  # Timing mirrors the prior PROVEN integration (modbus/byd/config.py):
+  # timeout 3.0 s per request, 0.1 s inter-frame gap, ~1.5 s update cadence.
+  # The full-plan telemetry poll (17 windows x (gap + response)) must fit the
+  # control period, so observe-only polls run at the slower cadence the
+  # gateway demonstrably sustains.
+  device_command_expiry_s: 9.00
+  device_command_expiry_evidence: commissioning://watchdog-trial-2026-08/rev-2
+  control_period_s: 5.00
+  essential_read_timeout_s: 3.00
+  kernel_timeout_s: 0.50
+  audit_timeout_s: 0.50
+  write_timeout_s: 1.00
+  acknowledgement_timeout_s: 1.00
+  maximum_jitter_s: 0.50
   renewal_margin_s: 0.50
+  inter_request_delay_s: 0.10
 
 authentication:
   enabled: true
-  operator_credential_ref: secret://energypod/live-operator-credential
+  operator_credential_ref: secret://var/live-credentials.json
   trusted_proxy_cidrs:
     - 192.168.1.0/24
 
 storage:
-  database_path: /var/lib/energypod/controller.sqlite3
+  database_path: var/controller.sqlite3
   busy_timeout_ms: 250

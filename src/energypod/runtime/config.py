@@ -49,6 +49,7 @@ class ProtocolProfile(StrEnum):
 
 NonEmpty = Annotated[StrictStr, Field(min_length=1)]
 PositiveFiniteFloat = Annotated[StrictFloat, Field(gt=0, allow_inf_nan=False)]
+NonNegativeFiniteFloat = Annotated[StrictFloat, Field(ge=0, allow_inf_nan=False)]
 PositiveStrictInt = Annotated[StrictInt, Field(gt=0)]
 NonNegativeStrictInt = Annotated[StrictInt, Field(ge=0)]
 
@@ -118,6 +119,10 @@ class TimingConfig(_FrozenModel):
     acknowledgement_timeout_s: PositiveFiniteFloat
     maximum_jitter_s: PositiveFiniteFloat
     renewal_margin_s: PositiveFiniteFloat
+    # Inter-frame gap the RTU-over-TCP gateway needs between bus requests
+    # (the prior integration's proven 0.1 s; see waveshare.py). Default keeps
+    # the commissioned value so a config omitting it still behaves safely.
+    inter_request_delay_s: NonNegativeFiniteFloat = 0.1
 
     @field_validator("device_command_expiry_evidence")
     @classmethod

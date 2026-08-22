@@ -12,3 +12,4 @@ web/dist/
 .env
 .mutmut-cache
 html/
+var/

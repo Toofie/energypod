@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import math
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -34,6 +35,7 @@ class WaveshareTransportConfig:
     timeout_s: float = 1.0
     retries: int = 0
     reconnect_delay_s: float = 0.0
+    inter_request_delay_s: float = 0.0
 
     def __post_init__(self) -> None:
         if type(self.host) is not str or not self.host.strip():
@@ -56,6 +58,12 @@ class WaveshareTransportConfig:
             or self.reconnect_delay_s < 0
         ):
             raise ValueError("reconnect_delay_s must be a non-negative finite number")
+        if (
+            type(self.inter_request_delay_s) not in (int, float)
+            or not math.isfinite(self.inter_request_delay_s)
+            or self.inter_request_delay_s < 0
+        ):
+            raise ValueError("inter_request_delay_s must be a non-negative finite number")
 
 
 ClientFactory = Callable[..., Any]
@@ -75,6 +83,12 @@ class WaveshareTransport:
         self._close_lock = asyncio.Lock()
         self._connected = False
         self._closed = False
+        # RTU-over-TCP gateways bridge to a half-duplex RS-485 bus: requests
+        # fired back-to-back can make the gateway answer out of order (the
+        # live commissioning capture observed stale/mismatched PDUs until the
+        # prior integration's proven 0.1 s inter-frame gap was restored). The
+        # gap is enforced under the request lock so every request pays it.
+        self._last_request_mono: float | None = None
         self._client = client_factory(
             config.host,
             port=config.port,
@@ -98,10 +112,24 @@ class WaveshareTransport:
             self._ensure_not_closed()
             self._connected = True
 
+    async def _respect_inter_request_gap(self) -> None:
+        """Hold the commissioned inter-frame gap between bus requests."""
+        gap = self._config.inter_request_delay_s
+        if gap <= 0:
+            self._last_request_mono = time.monotonic()
+            return
+        now = time.monotonic()
+        if self._last_request_mono is not None:
+            remaining = gap - (now - self._last_request_mono)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+        self._last_request_mono = time.monotonic()
+
     async def read_holding(self, address: int, count: int) -> tuple[int, ...]:
         self._validate_address_count(address, count)
         async with self._lock:
             self._ensure_connected()
+            await self._respect_inter_request_gap()
             try:
                 response = await self._client.read_holding_registers(
                     address,
@@ -127,6 +155,7 @@ class WaveshareTransport:
             raise ValueError("only the evidenced three-register PQ objective is writable")
         async with self._lock:
             self._ensure_connected()
+            await self._respect_inter_request_gap()
             try:
                 response = await self._client.write_registers(
                     address,
