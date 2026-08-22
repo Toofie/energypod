@@ -1,0 +1,65 @@
+# Findings for main (C:\Users\vagrant\Downloads\EnergyPod\pod-manager\tests\unit\test_main_entry.py)
+
+## Author notes
+Contract ambiguities and decisions made: (1) API_CONTRACTS/ADR-0003 do not spell the config-path argument; the suite probes both `<cmd> --config PATH` and `<cmd> PATH` on a valid config and uses whichever engages, so failure-path tests (invalid/missing file) run under the discovered spelling and cannot pass vacuously. (2) main must RETURN an int exit code and never raise SystemExit/sys.exit (pinned on every path including supervisor failure), per "callable from tests without process teardown tricks"; an argparse-escaping implementation will fail these. (3) Runner injection pinned as main(argv, server_runner=...) with the default doing real serving; tests also monkeypatch uvicorn.run/Server.serve/Server.run to raise so an unimplemented injection fails loudly instead of hanging on a bound port. (4) Strong design pin: with an injected runner, run/simulate must perform zero network activity (no bind and no outbound connect) — actor supervision must be tied to the serving lifecycle the runner drives, not started before it; primary must confirm this reading. (5) simulate pinned to call build_runtime(config, simulate=True), matching accepted tests/unit/test_composition.py; run pinned to not set simulate, to pass the loaded config through with its database path intact, and to create the configured sqlite file; simulate pinned to create no database file and open no sqlite connection (an sqlite ":memory:" implementation of "in-memory persistence" would fail this pin). (6) energypod.runtime.config has no YAML loading API (models only), so fixtures validate through the real ControllerConfig model, dump via yaml.safe_dump(model_dump(mode="json")), and the CLI is expected to accept and load a config path itself; invalid fixtures are pre-checked against the model with pytest.raises(ValidationError). (7) Side-effect verification uses a process audit hook (socket.bind/connect/getaddrinfo/sendto, subprocess/os.system, sqlite3.*, write-intent opens outside __pycache__, config-suffix reads during import/usage); empirically validated against realistic import/check-config/run/simulate flows on this interpreter (Windows, py3.12.10) — no false positives (fd-based "open" audit events are skipped as non-attributable; zoneinfo/pydantic/yaml reads pass filters). (8) check-config valid is pinned to print effective-config markers (site id, timezone, unit ids, mode, database filename); usage paths pinned to print "usage" and never reach the runner. (9) All main() invocations are from sync tests because main is a sync console-script entry likely using asyncio.run internally, which cannot run inside pytest-asyncio's loop. Primary should resolve: config-flag spelling (ideally document it), the serving-lifecycle pin in (4), and whether the strict no-SystemExit pin in (2) is the intended reading.
+
+## Reviewer summary
+Reviewed tests/unit/test_main_entry.py against ADR-0003 (D1/D4/D6), the API_CONTRACTS 'Runtime composition and entry point' section, ARCHITECTURE.md section 19, and CONTINUITY.md invariants. Red phase is clean: 13 tests collect with no import errors; execution yields 1 FAILED + 12 fixture-level pytest.fail errors (intended messages, no collection errors); ruff lint and format pass. The audit hook is genuinely sensitive (verified socket.getaddrinfo/connect, sqlite3.connect, and write-intent open events fire and are classified), so the side-effect bans are not vacuous. The suite's strongest pins, however, are contract inventions: the `server_runner` injection seam and the zero-network-under-injection supervision pin are granted by no document (grep confirms they appear nowhere else), and the import-purity module-state check false-fails any implementation written in the repo's own universal style (`from __future__ import annotations`, module-level tuples/dicts) — verified empirically with the project interpreter. Missing fail-closed negative paths for run/simulate with bad config is the main coverage hole. On the three questions the author raised: (config spelling) document it in API_CONTRACTS — the probe alone silently defines CLI syntax; (serving-lifecycle pin, note 4) NOT granted as written — either drive the captured app's ASGI lifespan to prove supervision starts/stops or document the requirement first; (no-SystemExit pin, note 2) stricter than the documented 'returns an exit code / no process teardown tricks' wording — soften or document before acceptance.
+
+## Findings
+
+### [1] P1 - Import-purity module-state check false-fails any implementation using `from __future__ import annotations` or module-level data structures
+Category: test-gaming
+
+test_import_is_side_effect_free_and_constructs_nothing flags every module global not in _IMPORT_SAFE_ATTRIBUTES. Verified on the project interpreter: `from __future__ import annotations` binds `annotations: _Feature` in the module namespace, and plain `COMMANDS = ("check-config", ...)` / `LOOKUP = {...}` bind tuple/dict instances — none pass the whitelist. Every existing file in src/energypod uses the future import, so a behaviorally perfect energypod.main written in house style fails with the misleading message 'must not construct runtime state'. The pin forces the implementer to drop the future import and inline any module-level constants — a weird implementation shape with no contract basis (ADR-0003 D6 only requires 'importable with no side effects at import time').
+
+Suggested fix: Whitelist immutable data (tuple/frozenset/dataclass-free constants, `_Feature`, `typing` re-exports) or invert the check: assert no instance of runtime construction types (FastAPI app, repositories, actors, event loops, sockets, file handles) rather than 'anything not function/scalar'.
+
+### [2] P1 - Invented `server_runner` injection seam (name, signature, default) is pinned but granted by no contract
+Category: contract-conflict
+
+Every run/simulate test calls `module.main(argv, server_runner=effective)` where the runner receives `(app, *args, **kwargs)` uvicorn-style. ADR-0003 D6 and the API_CONTRACTS 'Runtime composition and entry point' section specify only that `main(argv)` returns an exit code and is 'callable from tests without process teardown tricks'; grep confirms no doc or accepted test names a seam. A correct implementation satisfying every documented requirement but exposing the no-port seam differently (`runner=`, a `Serving` protocol, an env var, or returning the app) fails all four run/simulate tests with a TypeError, not a contract failure. The `_forbid_real_serving` monkeypatch (uvicorn.run/Server.serve/Server.run explode) is good hardening but hard-codes the one blessed shape.
+
+Suggested fix: Either amend API_CONTRACTS.md first to pin `main(argv, server_runner=...)` (uvicorn.run-compatible default) as the test seam, or discover the seam the way the config flag is discovered; do not accept the file with an undocumented API pin.
+
+### [3] P1 - Zero-network pin on `run` under injected runner forces lifespan-driven supervision that no doc grants, and cannot detect missing supervision
+Category: contract-conflict
+
+The fixtures configure real endpoints (127.0.0.1:4196/4197) and the audit asserts zero socket events during the whole `run` invocation with an injected runner. ARCHITECTURE.md section 19 ('one top-level runtime supervisor ... unit-actor scope per unit, persistence, API, and provider scopes') and ADR-0003 D6 permit a main-level supervisor that starts actor scopes concurrently with serving; such an implementation would attempt the configured TCP connects inside main() and fail the audit even though nothing in the docs ties supervision to the serving lifecycle the runner drives. The pin is simultaneously under-verifying: an implementation that never wires supervision at all (stub runner that ignores the app lifespan -> zero activity) passes, so the suite cannot distinguish 'supervision tied to lifespan' from 'supervision absent'. Answering the author's question: this reading is NOT granted by the current docs.
+
+Suggested fix: Drive the captured app's ASGI lifespan (send startup/shutdown scope messages) and assert supervision starts and fences on shutdown, then keep the zero-network pin as the complement; or document the serving-lifecycle requirement in ADR-0003 D6 before pinning it. As written it should not be accepted on the author's inference alone.
+
+### [4] P1 - No fail-closed negative paths for run/simulate with invalid, malformed, or missing config
+Category: fail-closed-gap
+
+The suite proves check-config rejects three semantic flaws, malformed YAML, and a missing file, but nothing pins the same for `run`/`simulate`. ADR-0003 D1 ('construction validates wiring eagerly; a misconfiguration raises before any task starts') and ARCHITECTURE.md's BOOT state ('fatal configuration failure stops startup') make this a safety-relevant entry-point invariant: an implementation that composes and serves anyway on a bad config — or that binds a port / creates the database before validation fails — passes the entire suite. The negative-path machinery (_discovered_argv, _replace_path) already exists and is only ever exercised against check-config.
+
+Suggested fix: Parametrize the invalid/malformed/missing-config fixtures across all three commands, asserting: nonzero exit, no SystemExit, no build_runtime call, runner never invoked, and no database file created.
+
+### [5] P2 - allow_database=True suppresses all non-database file-write detection during `run`
+Category: vacuous-assertion
+
+In _side_effect_violations, `elif allow_database: continue` skips the entire `open` classification — not just sqlite — so test_run's `audit.issues == []` is vacuous for arbitrary file writes anywhere on disk. An implementation that writes a log file, pid/lock file, or the database at an unintended path outside __pycache__ during run is unflagged; only the configured-path `database.exists()` check and the network/subprocess bans remain.
+
+Suggested fix: When allow_database is set, still classify write-intent opens and allow-list only the configured database path and its sqlite journal/WAL siblings under tmp_path.
+
+### [6] P2 - No-SystemExit pinned on every path, including usage errors, exceeds the documented contract
+Category: contract-conflict
+
+The docs say `main(argv)` returns an exit code and is 'callable from tests without process teardown tricks' — a statement about the normal call, aimed at tests not needing process tricks. The suite additionally asserts `not system_exit_raised` on missing command, unknown command, and every failure path, which outlaws conventional argparse-based CLIs (`parser.error` -> SystemExit(2)) that a reasonable implementer would write and which pytest already catches without session teardown. This forces hand-rolled parsing or a SystemExit-catching wrapper purely to satisfy the tests.
+
+Suggested fix: Soften to: an int exit code must be RETURNED when valid args are supplied; on error paths accept either a returned nonzero int or SystemExit with an int code. Or first document the stricter rule in API_CONTRACTS (the author flagged this ambiguity — resolve it before acceptance).
+
+### [7] P2 - Kwarg-only spying makes the run 'no simulator mode' check blind and blocks positional build_runtime calls
+Category: brittle-coupling
+
+`assert not kwargs.get("simulate")` (run) and `assert kwargs.get("simulate") is True` (simulate) inspect only kwargs. A semantically correct `build_runtime(config, True)` positional call in simulate mode fails the simulate pin (kwargs empty), while in run mode the check passes vacuously for a positional `simulate=True` (only the incidental database.exists() assertion would catch it). Similarly ServerRunner records `(app, kwargs)` and drops positional args, so `runner(app, "0.0.0.0", 8000)` silently skips the host/port sanity checks at lines 534-539 (both guarded by `if ... is not None`).
+
+Suggested fix: Record positional args in both spies and assert on the union: simulate flag = args[1] if len(args) > 1 else kwargs.get("simulate"); same for runner host/port.
+
+### [8] P2 - Config-flag discovery pins `--config PATH` / positional `PATH` as the only permitted spellings
+Category: brittle-coupling
+
+The docs never spell the config argument. _engaged_invocation tries exactly `--config PATH` then positional `PATH`; a contract-compliant CLI using only `-c`, a subcommand flag like `run --config=PATH`, or an environment variable fails every config-dependent test with the generic 'check-config never accepted a valid configuration' message. The two-spelling probe is a reasonable harness, but the ambiguity it papers over should be closed in the contract, otherwise the suite silently defines CLI syntax that operators will rely on.
+
+Suggested fix: Accept the two spellings as the harness contract and add one sentence to API_CONTRACTS.md ('the configuration path is given as `--config PATH` or a positional PATH') so the pin is granted rather than invented; keep the discovery probe for red-phase diagnostics.

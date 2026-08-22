@@ -1,0 +1,1092 @@
+"""Contract tests for the EnergyServiceFacade application service.
+
+The production module ``energypod.application.service`` does not exist yet.  It is
+imported lazily through the ``api`` fixture so this red-phase suite collects
+cleanly and every missing contract surfaces as an ordinary test failure.  All
+collaborating ports (intent/observation/authorization/audit repositories, event
+bus, fleet coordinator wrapper, actor handles) are deterministic inline fakes;
+the facade is the only real module under test.
+"""
+
+from __future__ import annotations
+
+import importlib
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+SITE_ID = "home"
+_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+QUALITY_FIELDS = (
+    "system_soc_pct",
+    "bms_soc_pct",
+    "soh_pct",
+    "battery_watts",
+    "pack_voltage_v",
+    "pack_current_a",
+    "dynamic_charge_limit_w",
+    "dynamic_discharge_limit_w",
+    "cell_voltages_v",
+    "temperatures_c",
+)
+
+
+@dataclass(frozen=True)
+class Principal:
+    subject: str
+    scopes: frozenset[str]
+    interactive: bool = True
+    site_id: str = SITE_ID
+
+
+OPERATOR = Principal(
+    subject="person:operator",
+    scopes=frozenset({"observe", "dispatch", "arm", "stop", "stop:acknowledge"}),
+)
+STRANGER = Principal(
+    subject="person:outsider",
+    scopes=frozenset({"observe", "dispatch", "arm", "stop", "stop:acknowledge"}),
+    site_id="elsewhere",
+)
+
+
+class FakeClock:
+    """Deterministic injected clock: no wall time, no sleeping."""
+
+    def __init__(self, now: float = 100.0) -> None:
+        self.now = now
+        self.wall = datetime(2026, 8, 21, 1, 2, 3, tzinfo=UTC)
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def wall_now(self) -> datetime:
+        return self.wall
+
+
+@dataclass(frozen=True)
+class Telemetry:
+    unit_id: str
+    captured_at_mono: float
+    battery_watts: float
+    quality: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class Capability:
+    unit_id: str
+    direction: str
+    watts: int
+
+
+def good_quality() -> dict[str, str]:
+    return {field: "good" for field in QUALITY_FIELDS}
+
+
+class FakeIntentRepository:
+    """Async intent port; emergency-stop intents stay active until removed."""
+
+    def __init__(self, seeded: tuple[Any, ...] = ()) -> None:
+        self.seeded = list(seeded)
+        self.added: list[Any] = []
+        self.removed: list[str] = []
+        self.active_calls: list[float] = []
+        self.failing = False
+
+    async def add(self, intent: Any) -> None:
+        if self.failing:
+            raise OSError("intent store unavailable")
+        self.added.append(intent)
+
+    async def active(self, now_mono: float) -> tuple[Any, ...]:
+        self.active_calls.append(now_mono)
+        if self.failing:
+            raise OSError("intent store unavailable")
+        removed = set(self.removed)
+        live = []
+        for item in [*self.seeded, *self.added]:
+            expired = item.accepted_at_mono + item.duration_s <= now_mono
+            latched = item.source.value == "emergency_stop"
+            if (
+                item.id not in removed
+                and item.accepted_at_mono <= now_mono
+                and (latched or not expired)
+            ):
+                live.append(item)
+        return tuple(live)
+
+    async def remove(self, intent_id: str) -> None:
+        if self.failing:
+            raise OSError("intent store unavailable")
+        self.removed.append(intent_id)
+
+
+class FakeObservationRepository:
+    def __init__(self, latest: Mapping[str, Telemetry] | None = None) -> None:
+        self.latest_values = dict(latest or {})
+        self.calls: list[str] = []
+        self.failing = False
+
+    async def latest(self, unit_id: str) -> Telemetry | None:
+        self.calls.append(f"latest:{unit_id}")
+        if self.failing:
+            raise OSError("observation store unavailable")
+        return self.latest_values.get(unit_id)
+
+    async def all_latest(self) -> dict[str, Telemetry]:
+        self.calls.append("all_latest")
+        if self.failing:
+            raise OSError("observation store unavailable")
+        return dict(self.latest_values)
+
+
+class FakeAuthorizationRepository:
+    """Single-use capability slot mirroring the production port semantics."""
+
+    def __init__(self, current: Mapping[str, Capability] | None = None) -> None:
+        self.slots = dict(current or {})
+        self.published: list[Any] = []
+        self.current_calls: list[tuple[str, float]] = []
+        self.peek_calls: list[str] = []
+        self.revocations: list[str] = []
+        self.failing = False
+
+    async def publish(self, batch: Any) -> None:
+        if self.failing:
+            raise OSError("authorization store unavailable")
+        self.published.append(batch)
+
+    async def current(self, unit_id: str, now_mono: float) -> Capability | None:
+        self.current_calls.append((unit_id, now_mono))
+        if self.failing:
+            raise OSError("authorization store unavailable")
+        return self.slots.pop(unit_id, None)
+
+    async def peek(self, unit_id: str) -> Capability | None:
+        self.peek_calls.append(unit_id)
+        if self.failing:
+            raise OSError("authorization store unavailable")
+        return self.slots.get(unit_id)
+
+    async def revoke(self, *args: Any, **kwargs: Any) -> None:
+        self.revocations.append(str(kwargs.get("reason", "")))
+
+
+class FakeAuditRepository:
+    """Newest-first durable trail; appends are recorded in shared history."""
+
+    def __init__(self, events: tuple[Any, ...] = (), history: list[str] | None = None) -> None:
+        self.events: list[Any] = list(events)
+        self.appended: list[Any] = []
+        self.recent_calls: list[int] = []
+        self.history = history
+        self.failing = False
+
+    async def append(self, event: Any) -> None:
+        if self.history is not None:
+            self.history.append("audit")
+        if self.failing:
+            raise OSError("audit store unavailable")
+        self.appended.append(event)
+        self.events.insert(0, event)
+
+    async def recent(self, limit: int) -> tuple[Any, ...]:
+        self.recent_calls.append(limit)
+        if self.failing:
+            raise OSError("audit store unavailable")
+        return tuple(self.events[:limit])
+
+
+class FakeEventBus:
+    """Monotonic sequence source; publishing is the only sequence mutation."""
+
+    def __init__(self, starting_sequence: int = 0) -> None:
+        self.published: list[dict[str, Any]] = []
+        self.sequence_reads = 0
+        self._sequence = starting_sequence
+
+    async def publish(self, body: Mapping[str, Any]) -> int:
+        self.published.append(dict(body))
+        self._sequence += 1
+        return self._sequence
+
+    def snapshot_sequence(self) -> int:
+        self.sequence_reads += 1
+        return self._sequence
+
+
+class RecordingCoordinator:
+    """Delegating wrapper around the real fleet generation fence."""
+
+    def __init__(self, api: Any, history: list[str]) -> None:
+        self._inner = api.AuthorityGenerationCoordinator()
+        self._history = history
+        self.failing = False
+
+    async def snapshot(self) -> Any:
+        if self.failing:
+            raise OSError("authority coordinator unavailable")
+        return await self._inner.snapshot()
+
+    async def advance(self, *, reason: str) -> Any:
+        if self.failing:
+            raise OSError("authority coordinator unavailable")
+        moved = await self._inner.advance(reason=reason)
+        self._history.append("fence")
+        return moved
+
+
+class FakeActorHandle:
+    """Inline stand-in for the per-unit actor handle port the facade composes."""
+
+    def __init__(
+        self,
+        *,
+        unit_id: str,
+        lifecycle: Any,
+        armed_lifecycle: Any,
+        history: list[str],
+        qualified: bool | None = True,
+        inhibit_latched: bool = False,
+        arm_error: BaseException | None = None,
+    ) -> None:
+        self.unit_id = unit_id
+        self.lifecycle = lifecycle
+        self.disarmed_lifecycle = lifecycle
+        self.armed_lifecycle = armed_lifecycle
+        self.qualified = qualified
+        self.inhibit_latched = inhibit_latched
+        self.arm_error = arm_error
+        self.history = history
+
+    async def arm(self) -> None:
+        self.history.append(f"arm:{self.unit_id}")
+        if self.arm_error is not None:
+            raise self.arm_error
+        if (
+            self.qualified is not True
+            or self.inhibit_latched
+            or self.lifecycle is not self.disarmed_lifecycle
+        ):
+            raise RuntimeError("unit is not qualified for arming")
+        self.lifecycle = self.armed_lifecycle
+
+    async def request_bounded_zero(self, reason: str) -> None:
+        del reason
+        self.history.append(f"zero:{self.unit_id}")
+
+    async def fence(self, reason: str) -> int:
+        del reason
+        self.history.append(f"fence:{self.unit_id}")
+        return 0
+
+
+@dataclass
+class Rig:
+    api: Any
+    facade: Any
+    clock: FakeClock
+    intents: FakeIntentRepository
+    observations: FakeObservationRepository
+    authorizations: FakeAuthorizationRepository
+    audit: FakeAuditRepository
+    bus: FakeEventBus
+    coordinator: RecordingCoordinator
+    handles: dict[str, FakeActorHandle]
+    history: list[str]
+
+    def reset_recorders(self) -> None:
+        self.intents.added.clear()
+        self.intents.removed.clear()
+        self.intents.active_calls.clear()
+        self.observations.calls.clear()
+        self.authorizations.published.clear()
+        self.authorizations.current_calls.clear()
+        self.authorizations.peek_calls.clear()
+        self.authorizations.revocations.clear()
+        self.audit.appended.clear()
+        self.audit.recent_calls.clear()
+        self.bus.published.clear()
+        self.bus.sequence_reads = 0
+        self.history.clear()
+
+    def recorder_activity(self) -> list[str]:
+        probes = (
+            ("intents.add", self.intents.added),
+            ("intents.active", self.intents.active_calls),
+            ("intents.remove", self.intents.removed),
+            ("observations", self.observations.calls),
+            ("authorizations.publish", self.authorizations.published),
+            ("authorizations.current", self.authorizations.current_calls),
+            ("authorizations.peek", self.authorizations.peek_calls),
+            ("authorizations.revoke", self.authorizations.revocations),
+            ("audit.append", self.audit.appended),
+            ("audit.recent", self.audit.recent_calls),
+            ("bus.publish", self.bus.published),
+            ("bus.snapshot_sequence", ["read"] * self.bus.sequence_reads),
+            ("actor-operations", self.history),
+        )
+        return [name for name, values in probes if values]
+
+
+@pytest.fixture
+def api() -> SimpleNamespace:
+    try:
+        service = importlib.import_module("energypod.application.service")
+        domain = importlib.import_module("energypod.domain")
+        generation = importlib.import_module("energypod.application.generation")
+        return SimpleNamespace(
+            EnergyServiceFacade=service.EnergyServiceFacade,
+            AuthorityGenerationCoordinator=generation.AuthorityGenerationCoordinator,
+            Direction=domain.Direction,
+            IntentSource=domain.IntentSource,
+            PowerIntent=domain.PowerIntent,
+            UnitLifecycle=domain.UnitLifecycle,
+        )
+    except (ImportError, AttributeError) as error:
+        pytest.fail(
+            f"application service facade contract is not implemented: {error}", pytrace=False
+        )
+
+
+def make_rig(
+    api: Any,
+    *,
+    units: Mapping[str, Mapping[str, Any]] | None = None,
+    telemetry: Mapping[str, Telemetry] | None = None,
+    capabilities: Mapping[str, Capability] | None = None,
+    seeded_intents: tuple[Any, ...] = (),
+    audit_events: tuple[Any, ...] = (),
+    bus_sequence: int = 0,
+) -> Rig:
+    clock = FakeClock()
+    history: list[str] = []
+    specs = dict(units or {"pod-a": {}, "pod-b": {}})
+    handles = {
+        unit_id: FakeActorHandle(
+            unit_id=unit_id,
+            lifecycle=spec.get("lifecycle", api.UnitLifecycle.DISARMED),
+            armed_lifecycle=api.UnitLifecycle.ARMED_IDLE,
+            history=history,
+            qualified=spec.get("qualified", True),
+            inhibit_latched=spec.get("inhibit_latched", False),
+            arm_error=spec.get("arm_error"),
+        )
+        for unit_id, spec in specs.items()
+    }
+    intents = FakeIntentRepository(seeded_intents)
+    observations = FakeObservationRepository(telemetry)
+    authorizations = FakeAuthorizationRepository(capabilities)
+    audit = FakeAuditRepository(audit_events, history)
+    bus = FakeEventBus(bus_sequence)
+    coordinator = RecordingCoordinator(api, history)
+    facade = api.EnergyServiceFacade(
+        site_id=SITE_ID,
+        clock=clock,
+        intents=intents,
+        observations=observations,
+        authorizations=authorizations,
+        audit=audit,
+        events=bus,
+        coordinator=coordinator,
+        actors=handles,
+    )
+    return Rig(
+        api=api,
+        facade=facade,
+        clock=clock,
+        intents=intents,
+        observations=observations,
+        authorizations=authorizations,
+        audit=audit,
+        bus=bus,
+        coordinator=coordinator,
+        handles=handles,
+        history=history,
+    )
+
+
+def canonical(value: Any) -> bool:
+    return isinstance(value, str) and _ID_PATTERN.fullmatch(value) is not None
+
+
+def field_of(item: Any, name: str) -> Any:
+    if isinstance(item, dict):
+        return item.get(name)
+    return getattr(item, name, None)
+
+
+def manual_intent(
+    api: Any,
+    *,
+    revision: int,
+    watts: int,
+    direction: str = "discharge",
+    unit_ids: frozenset[str] = frozenset({"pod-a"}),
+    accepted_at_mono: float = 90.0,
+    duration_s: float = 60.0,
+) -> Any:
+    return api.PowerIntent(
+        id=f"intent-{revision}",
+        source=api.IntentSource.MANUAL,
+        selected_unit_ids=unit_ids,
+        direction=api.Direction(direction),
+        watts=watts,
+        duration_s=duration_s,
+        accepted_at_mono=accepted_at_mono,
+        acceptance_revision=revision,
+        actor_identity="person:operator",
+    )
+
+
+def submit_kwargs(**overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "unit_ids": ["pod-a"],
+        "direction": "discharge",
+        "watts": 900,
+        "ttl_s": 30.0,
+        "reason": "grid peak",
+        "principal": OPERATOR,
+        "idempotency_key": "intent-key-1",
+        "request_id": "request-1",
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def assert_audited_and_published(rig: Rig, subject: str) -> None:
+    assert rig.audit.appended, "every facade mutation must reach the audit repository"
+    for event in rig.audit.appended:
+        assert field_of(event, "principal") == subject
+    assert rig.bus.published, "every facade mutation must be published to the event bus"
+    for body in rig.bus.published:
+        kind = field_of(body, "type")
+        assert isinstance(kind, str) and kind, "published event bodies must carry a type"
+
+
+async def _invoke(
+    facade: Any,
+    operation: str,
+    principal: Principal,
+    stop_id: str = "stop-irrelevant",
+) -> Any:
+    if operation == "snapshot":
+        return await facade.snapshot(principal=principal)
+    if operation == "health":
+        return await facade.health(principal=principal)
+    if operation == "recent_audit":
+        return await facade.recent_audit(principal=principal, limit=5)
+    if operation == "submit_intent":
+        return await facade.submit_intent(**submit_kwargs(principal=principal))
+    if operation == "arm":
+        return await facade.arm(
+            unit_ids=["pod-a"],
+            principal=principal,
+            idempotency_key="arm-key-9",
+            request_id="request-r9",
+        )
+    if operation == "emergency_stop":
+        return await facade.emergency_stop(
+            unit_ids=["pod-a"],
+            reason="halt",
+            principal=principal,
+            idempotency_key="stop-key-9",
+            request_id="request-s9",
+        )
+    return await facade.acknowledge_emergency_stop(
+        stop_id=stop_id,
+        principal=principal,
+        idempotency_key="ack-key-9",
+        request_id="request-k9",
+    )
+
+
+async def _stop(
+    facade: Any,
+    *,
+    unit_ids: list[str],
+    reason: str,
+    idempotency_key: str,
+    request_id: str,
+) -> Any:
+    return await facade.emergency_stop(
+        unit_ids=unit_ids,
+        reason=reason,
+        principal=OPERATOR,
+        idempotency_key=idempotency_key,
+        request_id=request_id,
+    )
+
+
+# --- snapshot ---------------------------------------------------------------
+
+
+async def test_snapshot_assembles_site_sequence_and_per_unit_projections(api: Any) -> None:
+    rig = make_rig(
+        api,
+        telemetry={"pod-a": Telemetry("pod-a", 99.5, 1234.0, good_quality())},
+        capabilities={"pod-a": Capability("pod-a", "discharge", 700)},
+        seeded_intents=(manual_intent(api, revision=3, watts=900),),
+        bus_sequence=20,
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    assert snapshot["site_id"] == SITE_ID
+    assert snapshot["snapshot_sequence"] == 20
+    assert snapshot["captured_at"] in {
+        rig.clock.wall_now(),
+        rig.clock.wall_now().isoformat(),
+    }
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert set(units) == set(rig.handles)
+    pod_a = units["pod-a"]
+    assert pod_a["lifecycle"] == "disarmed"
+    assert pod_a["telemetry_age_s"] == 0.5
+    assert pod_a["quality"] == "good"
+    assert pod_a["requested_power"] == {"direction": "discharge", "watts": 900}
+    assert pod_a["authorized_power"] == {"direction": "discharge", "watts": 700}
+    assert pod_a["measured_watts"] == 1234.0
+    pod_b = units["pod-b"]
+    assert pod_b["lifecycle"] == "disarmed"
+    assert pod_b["telemetry_age_s"] is None
+    assert pod_b["quality"] == "missing"
+    assert pod_b["requested_power"] == {"direction": "idle", "watts": 0}
+    assert pod_b["authorized_power"] is None
+    assert pod_b["measured_watts"] is None
+    assert rig.intents.active_calls == [rig.clock.monotonic()]
+
+
+async def test_snapshot_quality_projection_never_masks_bad_telemetry(api: Any) -> None:
+    degraded = {**good_quality(), "battery_watts": "bad"}
+    rig = make_rig(api, telemetry={"pod-a": Telemetry("pod-a", 99.5, 0.0, degraded)})
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["quality"] == "bad"
+
+
+async def test_snapshot_never_consumes_single_use_authorizations(api: Any) -> None:
+    capability = Capability("pod-a", "discharge", 700)
+    rig = make_rig(api, capabilities={"pod-a": capability})
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["authorized_power"] == {"direction": "discharge", "watts": 700}
+    still_current = await rig.authorizations.current("pod-a", rig.clock.monotonic())
+    assert still_current is capability, "a snapshot read must not burn a single-use capability"
+
+
+async def test_snapshot_requested_power_follows_the_newest_active_intent(api: Any) -> None:
+    rig = make_rig(
+        api,
+        seeded_intents=(
+            manual_intent(api, revision=5, watts=800),
+            manual_intent(api, revision=7, watts=600, direction="charge"),
+            manual_intent(api, revision=9, watts=900, accepted_at_mono=10.0, duration_s=5.0),
+        ),
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["requested_power"] == {"direction": "charge", "watts": 600}
+    assert units["pod-b"]["requested_power"] == {"direction": "idle", "watts": 0}
+
+
+async def test_snapshot_is_read_only_and_never_triggers_control(api: Any) -> None:
+    rig = make_rig(api)
+
+    await rig.facade.snapshot(principal=OPERATOR)
+
+    assert rig.audit.appended == []
+    assert rig.bus.published == []
+    assert rig.intents.added == []
+    assert rig.authorizations.published == []
+    assert rig.history == []
+
+
+# --- health -----------------------------------------------------------------
+
+
+async def test_health_separates_liveness_service_and_control_readiness(api: Any) -> None:
+    disarmed = make_rig(api)
+
+    report = await disarmed.facade.health(principal=OPERATOR)
+
+    assert report["liveness"]["ok"] is True
+    assert report["service_readiness"]["ready"] is True
+    assert report["service_readiness"]["reasons"] == []
+    control = report["control_readiness"]
+    assert control["ready"] is False
+    assert control["reasons"]
+    assert all(isinstance(reason, str) and reason for reason in control["reasons"])
+
+    armed = make_rig(api, units={"pod-a": {"lifecycle": api.UnitLifecycle.ARMED_IDLE}, "pod-b": {}})
+    armed_report = await armed.facade.health(principal=OPERATOR)
+    assert armed_report["liveness"]["ok"] is True
+    assert armed_report["control_readiness"]["ready"] is True
+    assert armed_report["control_readiness"]["reasons"] == []
+    assert armed.audit.appended == []
+    assert armed.bus.published == []
+    assert armed.history == []
+
+
+@pytest.mark.parametrize(
+    "deformation",
+    [{"qualified": None}, {"qualified": False}],
+    ids=["state_unknown", "not_qualified"],
+)
+async def test_health_never_fabricates_control_readiness(api: Any, deformation: dict) -> None:
+    rig = make_rig(
+        api,
+        units={"pod-a": {"lifecycle": api.UnitLifecycle.ARMED_IDLE}, "pod-b": deformation},
+    )
+
+    report = await rig.facade.health(principal=OPERATOR)
+
+    control = report["control_readiness"]
+    assert control["ready"] is False
+    assert any("pod-b" in reason for reason in control["reasons"])
+
+
+async def test_health_reports_unready_repositories_without_crashing(api: Any) -> None:
+    rig = make_rig(api)
+    rig.intents.failing = True
+    rig.observations.failing = True
+    rig.authorizations.failing = True
+    rig.audit.failing = True
+
+    report = await rig.facade.health(principal=OPERATOR)
+
+    assert report["liveness"]["ok"] is True
+    assert report["service_readiness"]["ready"] is False
+    assert report["service_readiness"]["reasons"]
+    assert report["control_readiness"]["ready"] is False
+
+
+async def test_health_reports_an_unresponsive_generation_coordinator(api: Any) -> None:
+    rig = make_rig(api)
+    rig.coordinator.failing = True
+
+    report = await rig.facade.health(principal=OPERATOR)
+
+    assert report["liveness"]["ok"] is True
+    assert report["service_readiness"]["ready"] is False
+    assert report["service_readiness"]["reasons"]
+
+
+# --- recent_audit -----------------------------------------------------------
+
+
+async def test_recent_audit_is_bounded_newest_first_and_stable(api: Any) -> None:
+    events = tuple(
+        SimpleNamespace(sequence=number, event_id=f"event-{number}") for number in (9, 8, 7, 6, 5)
+    )
+    rig = make_rig(api, audit_events=events)
+
+    first = await rig.facade.recent_audit(principal=OPERATOR, limit=3)
+    second = await rig.facade.recent_audit(principal=OPERATOR, limit=3)
+
+    assert [field_of(event, "sequence") for event in first["events"]] == [9, 8, 7]
+    assert "next_cursor" in first
+    assert first["next_cursor"] == second["next_cursor"]
+    assert rig.audit.recent_calls == [3, 3]
+    assert rig.audit.appended == []
+    assert rig.bus.published == []
+
+
+async def test_recent_audit_over_an_empty_trail_is_terminal(api: Any) -> None:
+    rig = make_rig(api)
+
+    result = await rig.facade.recent_audit(principal=OPERATOR, limit=5)
+
+    assert result["events"] == []
+    assert result["next_cursor"] is None
+
+
+# --- submit_intent ----------------------------------------------------------
+
+
+async def test_submit_intent_assigns_monotonic_server_revisions_and_stores_intents(
+    api: Any,
+) -> None:
+    rig = make_rig(api)
+
+    first = await rig.facade.submit_intent(**submit_kwargs())
+    second = await rig.facade.submit_intent(
+        **submit_kwargs(idempotency_key="intent-key-2", request_id="request-2")
+    )
+    third = await rig.facade.submit_intent(
+        **submit_kwargs(idempotency_key="intent-key-3", request_id="request-3")
+    )
+    # Idempotency is the adapter's concern: the facade accepts domain input again.
+    replay = await rig.facade.submit_intent(**submit_kwargs())
+
+    revisions = [
+        first["acceptance_revision"],
+        second["acceptance_revision"],
+        third["acceptance_revision"],
+        replay["acceptance_revision"],
+    ]
+    assert revisions[0] < revisions[1] < revisions[2] < revisions[3]
+    assert len(rig.intents.added) == 4
+    for index, view in enumerate((first, second, third, replay)):
+        stored = rig.intents.added[index]
+        assert stored.id == view["intent_id"]
+        assert stored.acceptance_revision == view["acceptance_revision"]
+    stored = rig.intents.added[0]
+    assert stored.source is not api.IntentSource.EMERGENCY_STOP
+    assert stored.direction is api.Direction.DISCHARGE
+    assert stored.selected_unit_ids == frozenset({"pod-a"})
+    assert stored.watts == 900
+    assert stored.duration_s == 30.0
+    assert stored.accepted_at_mono == rig.clock.monotonic()
+    assert stored.actor_identity == OPERATOR.subject
+
+
+async def test_submit_intent_returns_the_acceptance_view_and_never_grants_authority(
+    api: Any,
+) -> None:
+    rig = make_rig(api)
+
+    view = await rig.facade.submit_intent(**submit_kwargs())
+
+    assert canonical(view["intent_id"])
+    assert type(view["acceptance_revision"]) is int
+    assert view["acceptance_revision"] >= 0
+    assert view["accepted_at_monotonic"] == rig.clock.monotonic()
+    assert view["status"] == "accepted"
+    assert view["requested"] == {"direction": "discharge", "watts": 900}
+    assert view["authorized"] is None
+    assert view["measured"] is None
+    assert view["expires_in_s"] == 30.0
+    assert rig.authorizations.published == [], "only the kernel tick may publish authorization"
+    assert rig.authorizations.current_calls == []
+    assert rig.authorizations.peek_calls == []
+    assert rig.history == []
+
+
+async def test_submit_intent_is_audited_and_published(api: Any) -> None:
+    rig = make_rig(api)
+
+    await rig.facade.submit_intent(**submit_kwargs())
+
+    assert_audited_and_published(rig, OPERATOR.subject)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"watts": 0},
+        {"direction": "sideways"},
+        {"unit_ids": []},
+        {"ttl_s": 0.0},
+        {"unit_ids": ["pod-ghost"]},
+    ],
+    ids=["zero_watts", "unknown_direction", "no_units", "zero_ttl", "unknown_unit"],
+)
+async def test_submit_intent_rejects_invalid_payloads_without_storing(
+    api: Any, overrides: dict
+) -> None:
+    rig = make_rig(api)
+
+    with pytest.raises(ValueError):
+        await rig.facade.submit_intent(**submit_kwargs(**overrides))
+
+    assert rig.intents.added == []
+    assert rig.audit.appended == []
+    assert rig.bus.published == []
+
+
+# --- arm --------------------------------------------------------------------
+
+
+async def test_arm_arms_exactly_the_requested_qualified_disarmed_units(api: Any) -> None:
+    rig = make_rig(api)
+
+    result = await rig.facade.arm(
+        unit_ids=["pod-a"],
+        principal=OPERATOR,
+        idempotency_key="arm-key-1",
+        request_id="request-a",
+    )
+
+    armed = {unit["unit_id"] for unit in result["units"] if unit["status"] == "armed"}
+    assert armed == {"pod-a"}
+    assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.ARMED_IDLE
+    assert rig.handles["pod-b"].lifecycle is api.UnitLifecycle.DISARMED
+    assert_audited_and_published(rig, OPERATOR.subject)
+
+
+async def test_arm_refusals_are_visible_per_unit_and_never_silent(api: Any) -> None:
+    rig = make_rig(
+        api,
+        units={
+            "pod-a": {},
+            "pod-b": {"qualified": False},
+            "pod-c": {
+                "lifecycle": api.UnitLifecycle.INHIBITED,
+                "qualified": False,
+                "inhibit_latched": True,
+            },
+            "pod-d": {"arm_error": RuntimeError("mailbox wedged")},
+        },
+    )
+    requested = ["pod-a", "pod-ghost", "pod-b", "pod-c", "pod-d"]
+
+    result = await rig.facade.arm(
+        unit_ids=requested,
+        principal=OPERATOR,
+        idempotency_key="arm-key-2",
+        request_id="request-b",
+    )
+
+    outcomes = {unit["unit_id"]: unit for unit in result["units"]}
+    assert set(outcomes) == set(requested)
+    assert outcomes["pod-a"]["status"] == "armed"
+    for unit_id in ("pod-ghost", "pod-b", "pod-c", "pod-d"):
+        assert outcomes[unit_id]["status"] == "refused"
+        reason = outcomes[unit_id]["reason"]
+        assert isinstance(reason, str) and reason
+    assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.ARMED_IDLE
+    for unit_id in ("pod-b", "pod-c", "pod-d"):
+        assert rig.handles[unit_id].lifecycle is not api.UnitLifecycle.ARMED_IDLE
+    assert_audited_and_published(rig, OPERATOR.subject)
+
+
+# --- emergency_stop ---------------------------------------------------------
+
+
+async def test_emergency_stop_latches_fences_then_bounds_before_returning(api: Any) -> None:
+    rig = make_rig(api)
+    epoch_before = (await rig.coordinator.snapshot()).epoch
+
+    result = await _stop(
+        rig.facade,
+        unit_ids=["pod-a", "pod-b"],
+        reason="operator initiated halt",
+        idempotency_key="stop-key-1",
+        request_id="request-s",
+    )
+
+    assert canonical(result["stop_id"])
+    assert result["status"] == "latched"
+    assert (await rig.coordinator.snapshot()).epoch > epoch_before
+    stored = rig.intents.added[-1]
+    assert stored.source is api.IntentSource.EMERGENCY_STOP
+    assert stored.direction is api.Direction.IDLE
+    assert stored.watts == 0
+    assert stored.selected_unit_ids == frozenset({"pod-a", "pod-b"})
+    assert stored.actor_identity == OPERATOR.subject
+    # A latched stop ends by acknowledgement, never by TTL expiry.
+    assert stored.duration_s >= 86_400.0
+    fence = rig.history.index("fence")
+    assert fence < rig.history.index("zero:pod-a")
+    assert fence < rig.history.index("zero:pod-b")
+    assert fence < rig.history.index("audit"), "revocation must fence before audit work"
+    assert rig.authorizations.published == []
+    assert_audited_and_published(rig, OPERATOR.subject)
+
+
+async def test_repeated_stops_receive_distinct_acknowledgeable_ids(api: Any) -> None:
+    rig = make_rig(api)
+
+    first = await _stop(
+        rig.facade,
+        unit_ids=["pod-a"],
+        reason="first",
+        idempotency_key="stop-key-1",
+        request_id="request-s1",
+    )
+    second = await _stop(
+        rig.facade,
+        unit_ids=["pod-b"],
+        reason="second",
+        idempotency_key="stop-key-2",
+        request_id="request-s2",
+    )
+
+    assert canonical(first["stop_id"])
+    assert canonical(second["stop_id"])
+    assert first["stop_id"] != second["stop_id"]
+
+
+async def test_stop_intents_share_the_monotonic_revision_sequence(api: Any) -> None:
+    rig = make_rig(api)
+
+    await rig.facade.submit_intent(**submit_kwargs())
+    await _stop(
+        rig.facade,
+        unit_ids=["pod-a"],
+        reason="halt",
+        idempotency_key="stop-key-1",
+        request_id="request-s",
+    )
+    await rig.facade.submit_intent(
+        **submit_kwargs(idempotency_key="intent-key-2", request_id="request-2")
+    )
+
+    revisions = [intent.acceptance_revision for intent in rig.intents.added]
+    assert revisions[0] < revisions[1] < revisions[2]
+
+
+# --- acknowledge_emergency_stop ---------------------------------------------
+
+
+async def test_acknowledge_accepts_the_exact_id_and_removes_the_latch(api: Any) -> None:
+    rig = make_rig(api)
+    stopped = await _stop(
+        rig.facade,
+        unit_ids=["pod-a", "pod-b"],
+        reason="halt",
+        idempotency_key="stop-key-1",
+        request_id="request-s",
+    )
+    stop_id = stopped["stop_id"]
+    assert any(intent.id == stop_id for intent in await rig.intents.active(rig.clock.now))
+    rig.reset_recorders()
+
+    acknowledged = await rig.facade.acknowledge_emergency_stop(
+        stop_id=stop_id,
+        principal=OPERATOR,
+        idempotency_key="ack-key-1",
+        request_id="request-k",
+    )
+
+    assert acknowledged["stop_id"] == stop_id
+    assert acknowledged["status"] == "acknowledged"
+    assert rig.intents.removed == [stop_id]
+    live = await rig.intents.active(rig.clock.now)
+    assert not any(intent.id == stop_id for intent in live), "latch must not relatch"
+    assert not any(entry == "fence" or entry.startswith("fence:") for entry in rig.history), (
+        "acknowledgement must not fence again"
+    )
+    assert not any(entry.startswith("zero:") for entry in rig.history)
+    assert_audited_and_published(rig, OPERATOR.subject)
+
+
+@pytest.mark.parametrize("mode", ["unknown_id", "already_acknowledged"])
+async def test_acknowledge_rejects_unknown_and_consumed_ids(api: Any, mode: str) -> None:
+    rig = make_rig(api)
+    stopped = await _stop(
+        rig.facade,
+        unit_ids=["pod-a"],
+        reason="halt",
+        idempotency_key="stop-key-1",
+        request_id="request-s",
+    )
+    target = stopped["stop_id"]
+    if mode == "already_acknowledged":
+        await rig.facade.acknowledge_emergency_stop(
+            stop_id=target,
+            principal=OPERATOR,
+            idempotency_key="ack-key-1",
+            request_id="request-k1",
+        )
+    rig.reset_recorders()
+
+    with pytest.raises(LookupError):
+        await rig.facade.acknowledge_emergency_stop(
+            stop_id=target,
+            principal=OPERATOR,
+            idempotency_key="ack-key-2",
+            request_id="request-k2",
+        )
+
+    assert rig.intents.removed == []
+
+
+async def test_acknowledge_is_exact_and_leaves_other_latched_stops_active(api: Any) -> None:
+    rig = make_rig(api)
+    first = await _stop(
+        rig.facade,
+        unit_ids=["pod-a"],
+        reason="first",
+        idempotency_key="stop-key-1",
+        request_id="request-s1",
+    )
+    second = await _stop(
+        rig.facade,
+        unit_ids=["pod-b"],
+        reason="second",
+        idempotency_key="stop-key-2",
+        request_id="request-s2",
+    )
+
+    await rig.facade.acknowledge_emergency_stop(
+        stop_id=first["stop_id"],
+        principal=OPERATOR,
+        idempotency_key="ack-key-1",
+        request_id="request-k",
+    )
+
+    assert rig.intents.removed == [first["stop_id"]]
+    live_ids = {intent.id for intent in await rig.intents.active(rig.clock.now)}
+    assert first["stop_id"] not in live_ids
+    assert second["stop_id"] in live_ids
+
+
+# --- principal enforcement --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "snapshot",
+        "health",
+        "recent_audit",
+        "submit_intent",
+        "arm",
+        "emergency_stop",
+        "acknowledge_emergency_stop",
+    ],
+)
+async def test_cross_site_principals_never_reach_the_ports(api: Any, operation: str) -> None:
+    rig = make_rig(api)
+    stop_id = "stop-irrelevant"
+    if operation == "acknowledge_emergency_stop":
+        stopped = await _stop(
+            rig.facade,
+            unit_ids=["pod-a"],
+            reason="halt",
+            idempotency_key="stop-key-0",
+            request_id="request-s0",
+        )
+        stop_id = stopped["stop_id"]
+    rig.reset_recorders()
+
+    with pytest.raises(PermissionError):
+        await _invoke(rig.facade, operation, STRANGER, stop_id)
+
+    assert rig.recorder_activity() == []
+
+
+@pytest.mark.parametrize(
+    "deformation",
+    [
+        {"subject": "subject with spaces"},
+        {"site_id": ""},
+        {"scopes": {"observe"}},
+        {"interactive": "yes"},
+    ],
+    ids=["non_canonical_subject", "empty_site", "scopes_not_frozen", "interactive_not_bool"],
+)
+@pytest.mark.parametrize("operation", ["snapshot", "submit_intent"])
+async def test_malformed_principals_are_rejected_before_any_port_work(
+    api: Any, deformation: dict, operation: str
+) -> None:
+    rig = make_rig(api)
+    broken = replace(OPERATOR, **deformation)
+
+    with pytest.raises((PermissionError, TypeError, ValueError)):
+        await _invoke(rig.facade, operation, broken)
+
+    assert rig.recorder_activity() == []

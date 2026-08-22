@@ -39,7 +39,10 @@ reactive limit (zero by default), blocking fault codes, and debug-mode enable (f
 - `Clock.wall_now() -> datetime`, `Clock.monotonic() -> float`, async `Clock.sleep(seconds)`.
 - `UnitIO.read_holding(address, count)`, `write_registers(address, values)`, `close()`.
 - `ObservationRepository.latest(unit_id)`, `all_latest()`, `append(observation)`, `history(...)`.
-- `AuthorizationRepository.publish(batch)`, `current(unit_id, now_mono)`, `revoke(...)`.
+- `AuthorizationRepository.publish(batch)`, `current(unit_id, now_mono)` (single-use),
+  `peek(unit_id)` (non-consuming projection read returning the currently valid capability —
+  not-before satisfied and unexpired — or `None`; used by snapshot views, never by control),
+  `revoke(...)`.
 - `IntentRepository.add(intent)`, `active(now_mono)` (expiry-filtered; emergency-stop
   intents stay active until acknowledged), `remove(stop_id)` for acknowledged stops.
 - `AuditRepository.append(event)`, `recent(limit)`.
@@ -95,6 +98,10 @@ One `EnergyPodActor` owns one transport. No other object receives that transport
   authority derived from older evidence.
 - Replacement/stop increments the generation fence. An older task can never write afterward.
 - Write failure revokes locally, attempts one bounded zero write, inhibits the unit, and stops renewal.
+- The actor exposes a public bounded-zero request that enqueues exactly one bounded zero write
+  through the mailbox; the service facade uses it for emergency stop. A unit fence (including
+  reconnect fences) revokes that unit's outstanding authorizations, and snapshot projections
+  reflect that revocation.
 - Inhibit is never cleared by bad telemetry: a non-qualifying observation resets the stable-sample
   count and preserves the inhibit. Non-latching recovery requires the configured count of stable
   qualifying observations and returns the unit to `DISARMED`, never directly to `ACTIVE`; nonzero
@@ -177,9 +184,11 @@ coordinator, the event bus, and per-unit actor handles.
   succeeds for known units.
 - `emergency_stop(principal, unit_ids, reason)` creates one latched stop intent through the
   intent repository, immediately advances the fleet generation (fencing all outstanding
-  authority before returning), requests the bounded zero through the affected actors, and
-  records a stop id that `acknowledge_emergency_stop(principal, stop_id)` accepts exactly;
-  acknowledgement removes the latched stop so it cannot relatch.
+  authority before returning), revokes outstanding fleet authorizations, requests the bounded
+  zero through the affected actors, and records a stop id that
+  `acknowledge_emergency_stop(principal, stop_id)` accepts exactly; acknowledgement removes
+  the latched stop so it cannot relatch. A latched stop intent carries a fixed long duration
+  (at least 24 hours) and is removed only by acknowledgement, never by TTL expiry.
 - Every facade mutation is audited and published to the event bus. The facade rejects
   cross-site principals and never trusts caller-supplied identity, revisions, or sequences.
 
@@ -196,27 +205,41 @@ coordinator, the event bus, and per-unit actor handles.
   snapshot instead of replaying stale history.
 - Retention is a bounded most-recent window. Publishers are never blocked by slow consumers:
   the bounded per-subscriber queue drops to a resync marker.
-- Event bodies are JSON-serializable, credential-free, and carry `type`, `sequence`,
-  `occurred_at`, and a minimal payload. Observation, decision/audit, lifecycle, arming, and
-  stop events are the initial vocabulary.
+- Event bodies are JSON-serializable, credential-free, and carry at least `type`, `sequence`,
+  `occurred_at`, and a minimal payload; additional non-secret metadata (for example a unique
+  event id) is permitted. Observation, decision/audit, lifecycle, arming, intent-acceptance,
+  and stop events are the initial vocabulary (`intent.accepted` for facade intent acceptance).
 
 ## Runtime composition and entry point
 
 - `energypod.runtime.composition.build_runtime(config)` constructs the whole graph
   (repositories, coordinator, audit factory, kernel, actors, event bus, facade, API app, MCP
   server) and is the only composition point. Construction validates wiring eagerly; a
-  misconfiguration raises before any task starts.
+  misconfiguration raises before any task starts. It accepts a `simulate` flag and an
+  injectable deterministic `clock`, derives `ControlPolicy.heartbeat_interval_s` from
+  `timing.control_period_s`, and exposes drivable handles (config, kernel, actors, facade,
+  event bus, clock, repositories, and — in simulate mode — per-unit simulator scenario
+  handles including link drop/restore and connection-epoch control).
+- When no database path is configured, or in simulate mode, persistence is entirely
+  in-memory; SQLite is used only for the durable audit and schedule stores.
 - Boot is observe-only: no arming, authorization, or active command is restored from
   persistence; the process starts disarmed regardless of prior state.
 - `energypod.main` exposes `check-config` (validate and print the effective configuration,
   zero side effects), `run` (serve the composed API), and `simulate` (compose with simulator
-  transports and in-memory persistence regardless of configured database). Importing
-  `energypod.main` has no side effects; `main(argv)` returns an exit code and is callable
-  from tests without process teardown tricks.
+  transports and in-memory persistence regardless of configured database). Both `--config PATH`
+  and a positional `PATH` are accepted spellings. Importing `energypod.main` has no side
+  effects (module-level constants and `from __future__` imports are fine; no configuration
+  loading, server start, or IO at import); `main(argv, server_runner=None)` returns an exit
+  code, accepts an injected async server runner (defaulting to uvicorn, receiving the built
+  app and serving parameters), and is callable from tests without process teardown tricks.
 - Supervision runs as structured asyncio tasks in one process: the kernel tick loop at the
-  heartbeat cadence, per-unit actor loops, and event publication. Supervisor or task failure
-  fences every generation and runs actor shutdown with the bounded-zero contract before the
-  process exits.
+  heartbeat cadence, per-unit actor loops, and event publication. Supervision starts and
+  stops through the application lifespan. Supervisor or task failure fences every generation
+  and runs actor shutdown with the bounded-zero contract before the process exits.
+- The simulator's scenario hooks include link drop/restore, connection-epoch control, and
+  malformed-register/fault injection; measured telemetry is a deterministic function of the
+  applied setpoint and scripted time (deterministic and directionally correct — the contract
+  does not demand bit-exact equality with the commanded P).
 
 ## Deterministic simulator
 
