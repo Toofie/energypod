@@ -852,6 +852,7 @@ class _SimulatorTelemetry:
         )
         windows = {address: (address, count) for address, count in self._plan}
         self._system_window = windows[_SYSTEM_BLOCK_BASE]
+        self._pcs_live_window = windows[_PCS_LIVE_BLOCK_BASE]
         self._bms_window = windows[_BMS_BLOCK_BASE]
         self._fault_windows = (
             (faults.FaultBlock.IOT_PCS, windows[_PCS_FAULT_BLOCK_BASE]),
@@ -873,6 +874,7 @@ class _SimulatorTelemetry:
         self, blocks: Mapping[tuple[int, int], tuple[int, ...]], lifecycle: UnitLifecycle
     ) -> Observation:
         system = blocks[self._system_window]
+        pcs_live = blocks[self._pcs_live_window]
         bms = blocks[self._bms_window]
         fault_codes, warning_codes = self._decode_fault_signals(blocks)
         cells = blocks[self._cell_voltage_window]
@@ -887,6 +889,12 @@ class _SimulatorTelemetry:
             sequence=self._pod.telemetry_sequence,
             lifecycle=lifecycle,
             protocol_profile=self._expected_profile,
+            # Advisory per-pod CT words, PROTOCOL_EVIDENCE 4c: the simulator
+            # serves the PCS live block every cycle (its plan is the full IoT
+            # set), so the scripted scenario words decode GOOD — negative
+            # grid = import, positive = export, exactly as the live wire.
+            grid_power_w=float(protocol_codec.decode_signed16(pcs_live[17])),
+            load_power_w=float(protocol_codec.decode_signed16(pcs_live[20])),
             # System block: SOC at +17, pack voltage x0.1 V at +18, pack
             # current x0.1 A at +19, signed battery watts at +20, SOH at +22.
             system_soc_pct=float(system[17]),
@@ -910,7 +918,10 @@ class _SimulatorTelemetry:
             temperatures_c=tuple(float(value - 40) for value in temperatures),
             active_faults=fault_codes,
             active_warnings=warning_codes,
-            quality={field: DataQuality.GOOD for field in Observation.QUALITY_FIELDS},
+            quality={
+                field: DataQuality.GOOD
+                for field in Observation.QUALITY_FIELDS | Observation.ADVISORY_QUALITY_FIELDS
+            },
         )
 
     def _verify_served_bank(

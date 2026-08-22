@@ -31,6 +31,13 @@ _PQ_HEADER_WORD = 1  # first word of the evidenced [1, P, Q] objective frame
 _SYSTEM_BASE = 0x0100
 _PCS_LIVE_BASE = 0x1000
 _PCS_DETAIL_BASE = 0x1060
+# Advisory per-pod CT words inside the PCS live block, PROTOCOL_EVIDENCE 4c
+# (SysControl.cs:500/:503): external grid power at +17 and load power at +20,
+# int16 unscaled watts, negative grid = import / positive = export.  The
+# simulator serves scripted scenario values (default 0 W = an idle CT) so the
+# excess-solar export bound is exercisable end to end without hardware.
+_PCS_GRID_POWER_OFFSET = 17
+_PCS_LOAD_POWER_OFFSET = 20
 _DCDC_LIVE_BASE = 0x2000
 _DCDC_DETAIL_BASE = 0x2060
 _TOTALS_BASE = 0x4101
@@ -158,6 +165,10 @@ class SimulatedEnergyPod:
         self._applied_active_w = 0
         self._applied_reactive_var = 0
         self._lease_deadline_mono: float | None = None
+        # Scripted per-pod CT scenario values (PROTOCOL_EVIDENCE 4c words):
+        # the deterministic export scenario the excess-solar bound reads.
+        self._scripted_grid_power_w = 0
+        self._scripted_load_power_w = 0
         self._fault_words: dict[str, int] = {}
         self._malformed_addresses: set[int] = set()
         self._link_up = True
@@ -281,6 +292,28 @@ class SimulatedEnergyPod:
         self._link_up = True
         self._connection_epoch += 1
 
+    def script_grid_power_w(self, watts: int) -> None:
+        """Scenario hook: script the per-pod CT external-grid power word.
+
+        The value is served verbatim at PCS ``0x1000+17`` (int16 unscaled
+        watts; negative = import, positive = export — the live-pinned sign,
+        PROTOCOL_EVIDENCE 4b/4c) so the excess-solar export bound can be
+        driven end to end against a deterministic fleet export scenario.
+        """
+        self._scripted_grid_power_w = self._ct_word(watts, "grid power")
+
+    def script_load_power_w(self, watts: int) -> None:
+        """Scenario hook: script the per-pod CT load power word (+20)."""
+        self._scripted_load_power_w = self._ct_word(watts, "load power")
+
+    @staticmethod
+    def _ct_word(watts: int, label: str) -> int:
+        if isinstance(watts, bool) or type(watts) is not int:
+            raise ValueError(f"scripted {label} must be an integer watt value")
+        if not -0x8000 <= watts <= 0x7FFF:
+            raise ValueError(f"scripted {label} must fit the int16 CT word")
+        return watts
+
     def _advance_device_state(self, now: float) -> None:
         previous = self._last_poll_mono
         deadline = self._lease_deadline_mono
@@ -365,6 +398,10 @@ class SimulatedEnergyPod:
         words[2] = 1 if self._lease_deadline_mono is not None else 0  # run mode: remote PQ
         words[3] = pack_voltage_counts  # DC voltage x0.1 V
         words[13] = measured_word  # PCS active power, int16 W
+        # Advisory per-pod CT words (PROTOCOL_EVIDENCE 4c), scripted scenario
+        # values served verbatim: grid export/import at +17, load at +20.
+        words[_PCS_GRID_POWER_OFFSET] = self._scripted_grid_power_w & 0xFFFF
+        words[_PCS_LOAD_POWER_OFFSET] = self._scripted_load_power_w & 0xFFFF
         self._blocks[_PCS_LIVE_BASE] = words
 
     def _rebuild_fault_blocks(self) -> None:
