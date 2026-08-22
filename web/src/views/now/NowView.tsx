@@ -739,6 +739,9 @@ export function NowView({ client }: NowViewProps) {
         // not only a latched inhibit. So the frame says "authority changed",
         // never "this unit latched": the view re-reads the snapshot and says
         // exactly that, without inventing a lifecycle the frame does not carry.
+        // The request itself is over: the countdown must not linger on screen
+        // as a ghost of an intent that no longer exists.
+        setExpiry(null);
         const unitIds = unitIdsFromPayload(payload);
         const reason =
           payload !== null && typeof payload.reason === "string" && payload.reason !== ""
@@ -749,6 +752,19 @@ export function NowView({ client }: NowViewProps) {
             `Authorization was held on ${unitIds.join(", ")} (${reason}) — re-reading the current pod state.`,
           );
         }
+        refetchSnapshot();
+      } else if (type === "intent.expired") {
+        // Feature-detected: the backend publishes the end of a request this
+        // way once its intent-lifecycle event lands. The request card must not
+        // linger as a ghost: the countdown goes and the world is re-read.
+        setExpiry(null);
+        setRevokedNotice("The power request ended.");
+        refetchSnapshot();
+      } else if (type === "authorization.granted") {
+        // Feature-detected: an authority grant publishes nothing today (the
+        // grant is only visible in the next snapshot); when the backend adds
+        // the grant event this re-reads so Allowed/Actual move at the moment
+        // of the grant.
         refetchSnapshot();
       } else if (type === "emergency_stop.acknowledged") {
         // Another operator (or the system) cleared the latch: the notice goes

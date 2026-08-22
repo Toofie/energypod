@@ -7,7 +7,10 @@
  *
  * The shell absorbs `resync_required` discontinuities itself (it refetches the
  * snapshot and reconnects with the recovery cursor) and simply republishes the
- * fresh authoritative snapshot to subscribers.
+ * fresh authoritative snapshot to subscribers — and every forced refresh
+ * (`refresh()`) republishes the same way while the connection is live, so a
+ * re-read anywhere in the session updates every mounted view, never just the
+ * cache.
  *
  * Honesty rules the plane enforces:
  * - A cached snapshot is never handed over as a fresh read. It is servable
@@ -133,6 +136,14 @@ export class SharedDataPlane {
       (value) => {
         this.snapshotCache = value;
         this.snapshotCachedAt = Date.now();
+        // A forced read is a fresh authoritative picture: while the one real
+        // connection is live it is republished to every subscriber exactly
+        // like a wire snapshot frame, so a refresh updates the views, not just
+        // the shell's own cache (silently updating the cache is what let every
+        // view's request panel freeze at its connect-time picture).
+        if (this.live) {
+          this.publishSnapshot(value.snapshot_sequence, value);
+        }
         if (this.snapshotInFlight === read) {
           this.snapshotInFlight = null;
         }
@@ -295,6 +306,9 @@ export class SharedDataPlane {
 export function sharedClient(plane: SharedDataPlane, real: ApiClient): ApiClient {
   return {
     getSnapshot: () => plane.snapshot(),
+    // Views may force a fresh wire read (bypassing the short cache) when a
+    // frame proves the world moved: a stale cached picture must never answer.
+    refreshSnapshot: () => plane.refresh(),
     getHealth: () => plane.health(),
     getUnitDetail: (unitId) => real.getUnitDetail(unitId),
     getAudit: (limit, afterSequence) => real.getAudit(limit, afterSequence),

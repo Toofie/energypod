@@ -1504,3 +1504,44 @@ describe("AppShell — live-data badge", () => {
     expect(badge().textContent).toBe("Live");
   });
 });
+
+// --- announcements are structural: the latch banner clears when it clears -----
+
+describe("AppShell " + "—" + " latch announcements clear", () => {
+  it("shows the assertive latch announcement and removes it when the stop is acknowledged", async () => {
+    const snapshot = fleet(allUnits("armed_idle"));
+    const channel = streamChannel([snapshotFrame(snapshot)]);
+    installClient({ snapshots: [snapshot], openEvents: () => channel.open() });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    channel.push({
+      type: "emergency_stop.latched",
+      sequence: 44,
+      occurred_at: "2026-08-22T10:00:15Z",
+      payload: {
+        principal: "operator-7",
+        stop_id: "stop-12",
+        unit_ids: ["MID", "RHS", "LHS"],
+        reason: "operator requested",
+      },
+    });
+
+    // The announcement appears...
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent ?? "").toMatch(/stop/i);
+
+    // ...and disappears when the latch is acknowledged: an acknowledged stop
+    // must not linger in the alert region as a ghost.
+    channel.push({
+      type: "emergency_stop.acknowledged",
+      sequence: 45,
+      occurred_at: "2026-08-22T10:01:15Z",
+      payload: { principal: "operator-7", stop_id: "stop-12" },
+    });
+    await waitFor(() => {
+      expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    });
+  });
+});

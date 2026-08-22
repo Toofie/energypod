@@ -167,6 +167,12 @@ export function isUnauthorizedError(error: unknown): error is ApiClientError {
 
 export interface ApiClient {
   getSnapshot(): Promise<Snapshot>;
+  /**
+   * Optional forced fresh read (the shell's shared client supplies it; plain
+   * clients need not). A view that just saw a frame proving the world moved
+   * uses it to bypass the shell's short-lived snapshot cache.
+   */
+  refreshSnapshot?(): Promise<Snapshot>;
   getHealth(): Promise<Health>;
   /** One unit's full latest-observation projection (observe scope). */
   getUnitDetail(unitId: string): Promise<UnitDetail>;

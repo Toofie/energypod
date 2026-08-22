@@ -13,7 +13,12 @@
  *   The shell therefore refetches the snapshot — coalesced, so a burst of
  *   frames costs one read — on every frame that changes authority:
  *   emergency_stop.latched, authorization.revoked, inhibit.acknowledged,
- *   emergency_stop.acknowledged, unit.armed, unit.disarmed.
+ *   emergency_stop.acknowledged, unit.armed, unit.disarmed, and the kernel's
+ *   per-tick authorizing control_decision audit summaries (the only per-cycle
+ *   signal that the requested/allowed figures moved). Every refresh that
+ *   lands is republished to the views through the plane as a snapshot frame,
+ *   so request panels live-update on every view instead of freezing at the
+ *   connect-time picture.
  * - A lost stream marks the event-stream fact down, keeps the last known data,
  *   announces assertively when control was active, and retries automatically
  *   carrying the last seen sequence as the cursor — never a replay from zero —
@@ -125,7 +130,8 @@ type Action =
   | { type: "restart-notice" }
   | { type: "clear-restart-notice" }
   | { type: "polite"; text: string }
-  | { type: "assertive"; text: string };
+  | { type: "assertive"; text: string }
+  | { type: "clear-assertive" };
 
 const INITIAL: State = {
   snapshot: null,
@@ -262,6 +268,10 @@ function reducer(state: State, action: Action): State {
       return { ...state, polite: [...state.polite, action.text].slice(-5) };
     case "assertive":
       return { ...state, assertive: [action.text] };
+    case "clear-assertive":
+      // An acknowledged latch must not linger in the assertive region as a
+      // ghost of a state that no longer exists.
+      return state.assertive.length === 0 ? state : { ...state, assertive: [] };
   }
 }
 
@@ -331,6 +341,14 @@ const LATCHED_INHIBIT_REASONS: readonly string[] = ["blocking_fault_active", "id
  * refetched: the bus has no lifecycle event for active/inhibited/stopping, so
  * without a refetch the banner, the stop control, and the connection facts
  * would freeze on the connect-time picture for the whole session.
+ *
+ * `audit.appended` frames of an authorizing kind also count: the kernel audits
+ * a control_decision on every tick it grants or clamps power (control_kernel),
+ * and those summaries are the only per-cycle bus signal that the
+ * requested/allowed figures moved — without them every view's request panel
+ * freezes at the connect-time snapshot for the whole session (the snapshot
+ * frame arrives exactly once per connection and no bus frame carries watt
+ * figures). Idle refusals (no_setpoints and friends) do not trigger a read.
  */
 function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void): boolean {
   switch (frame.type) {
@@ -421,6 +439,7 @@ function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void)
     case "inhibit.acknowledged": {
       const payload = payloadOf(frame);
       const unitId = typeof payload.unit_id === "string" ? payload.unit_id : "";
+      dispatch({ type: "clear-assertive" });
       dispatch({
         type: "polite",
         text: `Inhibit latch acknowledged on ${
@@ -432,20 +451,75 @@ function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void)
     case "emergency_stop.acknowledged": {
       const payload = payloadOf(frame);
       const stopId = typeof payload.stop_id === "string" ? payload.stop_id : "";
+      dispatch({ type: "clear-assertive" });
       dispatch({
         type: "polite",
         text: `Emergency stop acknowledged${stopId === "" ? "" : ` (${stopId})`}.`,
       });
       return true;
     }
+    case "audit.appended": {
+      // The kernel's per-tick decision summaries: an authorizing or clamping
+      // decision (or an accepted dispatch) means the requested/allowed figures
+      // just moved, so the world must be re-read — the snapshot frame arrives
+      // once per connection and no other bus frame carries the figures.
+      const payload = payloadOf(frame);
+      const eventType = typeof payload.event_type === "string" ? payload.event_type : "";
+      const result = typeof payload.result === "string" ? payload.result : "";
+      const authorizing =
+        eventType === "intent_accepted" ||
+        (eventType === "control_decision" && (result === "authorized" || result === "clamped"));
+      return authorizing;
+    }
+    case "intent.accepted": {
+      // The request landed: the kernel grants authority on its next tick, and
+      // the accepted payload already names the request (direction, watts,
+      // units). Announce it and re-read — the next world carries the figures.
+      const payload = payloadOf(frame);
+      const unitIds = Array.isArray(payload.unit_ids)
+        ? payload.unit_ids.filter((id): id is string => typeof id === "string")
+        : [];
+      const watts = typeof payload.watts === "number" ? payload.watts : null;
+      const direction = typeof payload.direction === "string" ? payload.direction : "";
+      dispatch({
+        type: "polite",
+        text: `Power request accepted${
+          watts === null ? "" : ` — ${direction} ${watts} W`
+        } for ${nameUnits(unitIds)}.`,
+      });
+      return true;
+    }
+    case "intent.expired":
+      // Feature-detected: the backend publishes the end of a request this way
+      // once its intent-lifecycle event lands; treat it as authority changed
+      // either way (today the expiry revocation arrives as
+      // authorization.revoked instead).
+      dispatch({ type: "polite", text: "The power request ended." });
+      return true;
+    case "authorization.granted":
+      // Feature-detected: an authority grant publishes nothing today (the
+      // grant is only visible in the next snapshot); when the backend adds
+      // the grant event this re-reads immediately so the figures move at the
+      // moment of the grant instead of the next refresh.
+      return true;
     default:
-      // observation.published, audit.appended, intent.accepted, ... are not
+      // observation.published, audit.appended refusals, ... are not
       // shell-level facts; subscribers that care read them through the feed.
       return false;
   }
 }
 
 const HEALTH_POLL_MS = 15000;
+/**
+ * Interim live cadence: while the stream is live and the tab visible, the
+ * shell re-reads and republishes the snapshot every few seconds. Authority
+ * GRANTS publish nothing on the bus today (the grant is only visible in the
+ * next snapshot) and intent expiry is silent, so without this cadence a
+ * console that misses an audit summary still freezes its request panels until
+ * the next reconnect. When the backend's queued intent/authority events land,
+ * this becomes a safety net rather than the primary source.
+ */
+export const LIVE_SNAPSHOT_POLL_MS = 2500;
 /** How often the staleness clock re-renders: the badge's "last update N s ago"
  * must move once a second while it is showing, and never at all while live. */
 const HEALTH_TICK_MS = 1000;
@@ -479,6 +553,8 @@ export interface ConsoleDataOptions {
   retryDelaysMs?: readonly number[];
   /** How long without a frame a "live" connection may go before it is stale. */
   staleAfterMs?: number;
+  /** The live-cadence snapshot poll; a huge value disables it for a test. */
+  livePollMs?: number;
 }
 
 export function useConsoleData(
@@ -488,6 +564,7 @@ export function useConsoleData(
 ): ConsoleData & { retrySnapshot: () => void; retryStream: () => void } {
   const retryDelays = options.retryDelaysMs ?? STREAM_RETRY_DELAYS_MS;
   const staleAfterMs = options.staleAfterMs ?? STALE_AFTER_MS;
+  const livePollMs = options.livePollMs ?? LIVE_SNAPSHOT_POLL_MS;
   const [state, dispatch] = useReducer(reducer, INITIAL);
   const [streamEpoch, setStreamEpoch] = useState(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -547,6 +624,51 @@ export function useConsoleData(
       clearInterval(timer);
     };
   }, []);
+
+  // --- the interim live cadence ------------------------------------------------
+  //
+  // While the stream is live and the tab visible, re-read the snapshot on a
+  // steady cadence and let the plane republish it: authority grants publish
+  // nothing on the bus today, so this is what keeps every element on screen
+  // moving between bus events. A hidden tab does not poll (its timers are
+  // throttled anyway and the visibility re-check resynchronizes on return).
+  useEffect(() => {
+    if (plane === null) {
+      return undefined;
+    }
+    let inFlight = false;
+    const timer = setInterval(() => {
+      if (inFlight || stateRef.current.streamStatus !== "live") {
+        return;
+      }
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      inFlight = true;
+      plane
+        .refresh()
+        .then(
+          (raw) => {
+            if (stateRef.current.snapshot === null || raw.snapshot_sequence >= stateRef.current.snapshot.sequence) {
+              dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
+            }
+          },
+          (error: unknown) => {
+            if (isUnauthorizedError(error)) {
+              dropSession(error);
+            }
+            // A failed poll is not reported on its own: the stream's own
+            // loss path owns the disconnected story.
+          },
+        )
+        .finally(() => {
+          inFlight = false;
+        });
+    }, livePollMs);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [plane, livePollMs, dropSession]);
 
   /**
    * Background-tab recovery: a browser throttles a hidden tab's timers to

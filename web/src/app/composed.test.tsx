@@ -1086,3 +1086,91 @@ describe("Composed console — stream loss and recovery", () => {
     expect(screen.queryByRole("region", { name: /live updates/i })).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 7. Live intent: request panels follow the kernel's per-tick decisions
+// ---------------------------------------------------------------------------
+
+describe("Composed console — request panels live-update during an intent", () => {
+  it("follows the kernel’s authorizing control_decision audits on every view, without a reconnect", async () => {
+    const user = userEvent.setup();
+    const harness = new ComposedHarness(worldActive());
+    harness.install();
+    render(<AppShell views={views} />);
+    await unlock(user);
+    await waitFor(() => {
+      expect(factText(/event stream/i)).toContain("Yes — live");
+    });
+    // Home answers the power question from the connect-time world: 1,200 W.
+    expect(await screen.findAllByText("Discharging 1,200 W")).toHaveLength(2);
+    const readsBefore = harness.requestsFor("GET", "/api/v1/snapshot").length;
+    expect(harness.sockets).toHaveLength(1);
+
+    // The kernel clamps MID on its next tick and audits the decision; the
+    // service’s snapshot reflects the clamp for every later read.
+    harness.world = wireSnapshot(
+      [
+        unitSnapshot({
+          unit_id: "MID",
+          lifecycle: "active",
+          telemetry_age_s: 2,
+          quality: "good",
+          requested_power: { direction: "discharge", watts: 1500 },
+          authorized_power: { direction: "discharge", watts: 900 },
+          measured_watts: 880,
+        }),
+        unitSnapshot({ unit_id: "RHS", lifecycle: "armed_idle", telemetry_age_s: 3, measured_watts: 0 }),
+        unitSnapshot({ unit_id: "LHS", lifecycle: "disarmed", telemetry_age_s: 5, measured_watts: null }),
+      ],
+      // Wire-realistic: the refreshed snapshot is built after the audited
+      // decision, so its sequence stands above the audit frame's own bus
+      // sequence (the adoption guards on views compare the two).
+      { snapshot_sequence: 4105, captured_at: OCCURRED_AT },
+    );
+    harness.publish(
+      auditAppended(4101, { event_type: "control_decision", unit_id: "MID", result: "clamped", reason_codes: ["power_clamped"] }),
+    );
+
+    // The audited decision triggers one coalesced snapshot read, the fresh
+    // world is republished through the plane, and Home’s requested/allowed/
+    // actual figures move MID-INTENT — no reconnect, same single socket.
+    await waitFor(() => {
+      // >= the decision-triggered read (the interim live-cadence poll may add
+      // one of its own); the point is that the decision forced a fresh read.
+      expect(harness.requestsFor("GET", "/api/v1/snapshot").length).toBeGreaterThanOrEqual(
+        readsBefore + 1,
+      );
+    });
+    expect(within(banner()).getByText("Limited")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getAllByText("Discharging 1,500 W").length).toBeGreaterThanOrEqual(1);
+    });
+    expect(screen.getAllByText("Discharging 900 W").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("880 W")).toBeInTheDocument();
+    expect(harness.sockets).toHaveLength(1);
+
+    // The same republished world drives the Batteries cards: the request
+    // figures there move too, not just the raw telemetry sequence.
+    await user.click(screen.getByRole("link", { name: "Batteries" }));
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    await waitFor(() => {
+      expect(midCard).toHaveTextContent(/discharging 880 W/i);
+    });
+    expect(harness.sockets).toHaveLength(1);
+
+    // An idle refusal (no setpoints) is not an authorizing decision: it must
+    // not schedule further reads.
+    const readsAfterClamp = harness.requestsFor("GET", "/api/v1/snapshot").length;
+    harness.publish(
+      auditAppended(4106, { event_type: "control_decision", unit_id: null, result: "rejected", reason_codes: ["no_setpoints"] }),
+    );
+    await new Promise((resolve) => {
+      setTimeout(resolve, 400);
+    });
+    // No decision-triggered burst: at most the interim live-cadence poll once.
+    expect(harness.requestsFor("GET", "/api/v1/snapshot").length).toBeLessThanOrEqual(
+      readsAfterClamp + 1,
+    );
+    expect(harness.sockets).toHaveLength(1);
+  });
+});

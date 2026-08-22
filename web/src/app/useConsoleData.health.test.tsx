@@ -112,11 +112,13 @@ function Probe({
   onUnauthorized,
   retryDelaysMs,
   staleAfterMs,
+  livePollMs,
 }: {
   client: ApiClient;
   onUnauthorized: () => void;
   retryDelaysMs: readonly number[];
   staleAfterMs?: number;
+  livePollMs?: number;
 }): React.ReactElement {
   // One plane per session, exactly as the shell builds it (a new plane per
   // render would be a new session per render).
@@ -124,7 +126,13 @@ function Probe({
   const data = useConsoleData(
     plane,
     onUnauthorized,
-    staleAfterMs === undefined ? { retryDelaysMs } : { retryDelaysMs, staleAfterMs },
+    staleAfterMs === undefined && livePollMs === undefined
+      ? { retryDelaysMs }
+      : {
+          retryDelaysMs,
+          ...(staleAfterMs === undefined ? {} : { staleAfterMs }),
+          ...(livePollMs === undefined ? {} : { livePollMs }),
+        },
   );
   return (
     <div>
@@ -402,6 +410,44 @@ describe("useConsoleData — the controller-restart notice", () => {
     await waitFor(
       () => {
         expect(screen.getByTestId("restart-notice").textContent).toBe("none");
+      },
+      { timeout: 4000 },
+    );
+  });
+});
+
+describe("useConsoleData — the interim live cadence", () => {
+  it("re-reads and republishes the snapshot on a steady cadence while live, and an idle audit refusal adds no read", async () => {
+    const worlds = [SNAPSHOT, { ...SNAPSHOT, snapshot_sequence: 42 }, { ...SNAPSHOT, snapshot_sequence: 43 }];
+    let reads = 0;
+    const client = mockClient({
+      getSnapshot: vi.fn(() => {
+        const world = worlds[Math.min(reads, worlds.length - 1)]!;
+        reads += 1;
+        return Promise.resolve(world);
+      }) as unknown as ApiClient["getSnapshot"],
+    });
+    render(
+      <Probe
+        client={client}
+        onUnauthorized={vi.fn()}
+        retryDelaysMs={[5]}
+        staleAfterMs={60_000}
+        livePollMs={120}
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("status").textContent).toBe("live");
+    });
+
+    // The cadence poll keeps re-reading while the connection is live: every
+    // element on screen moves even between bus events (authority grants
+    // publish nothing today). The idle-refusal filter (a rejected
+    // control_decision must not add a read of its own) is pinned end-to-end
+    // in the composed suite, which owns the channel plumbing for frames.
+    await waitFor(
+      () => {
+        expect(reads).toBeGreaterThanOrEqual(3);
       },
       { timeout: 4000 },
     );

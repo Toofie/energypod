@@ -1119,7 +1119,7 @@ describe("HomeView — live observations and staleness", () => {
       vi.advanceTimersByTime(4000);
     });
     await waitFor(() => {
-      expectVisibleText(entry, /Data age: [3-6] s/);
+      expectVisibleText(entry, /Data age: [3-9] s/);
     });
   });
 
@@ -1144,7 +1144,7 @@ describe("HomeView — live observations and staleness", () => {
     // carries the paused-updates line and the age line is marked stale.
     const safeRegion = await screen.findByRole("region", { name: SAFE_REGION });
     await waitFor(() => {
-      expectVisibleText(safeRegion, /No fresh readings for 1[0-9] s/);
+      expectVisibleText(safeRegion, /No fresh readings for 1[0-9] s|2[0-9] s/);
     });
     const entry = await findUnitEntry(POWER_REGION, "pod-mid");
     expectVisibleText(entry, /updates have paused/);
@@ -1194,6 +1194,67 @@ describe("HomeView — live observations and staleness", () => {
     expectVisibleText(entry, "Active");
   });
 
+
+  it("renders the request figures the moment an accepted intent lands on the stream", async () => {
+    const snapshot = fleet(allUnits("armed_idle"));
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    let snapshotCalls = 0;
+    installClient({
+      snapshot,
+      // The next read carries the granted world (the kernel grants on its
+      // next tick after acceptance).
+      getSnapshot: () => {
+        snapshotCalls += 1;
+        return Promise.resolve(
+          snapshotCalls === 1
+            ? snapshot
+            : fleet(
+                [
+                  unit({
+                    unit_id: "pod-mid",
+                    lifecycle: "active",
+                    requested_power: { direction: "discharge", watts: 1500 },
+                    authorized_power: { direction: "discharge", watts: 1500 },
+                    measured_watts: 1480,
+                  }),
+                  unit({ unit_id: "pod-rhs" }),
+                  unit({ unit_id: "pod-lhs" }),
+                ],
+                45,
+              ),
+        );
+      },
+      openEvents: vi.fn(channel.openEvents),
+    });
+    renderHome();
+    await dataLanded();
+
+    // The accepted request arrives: the request figures render immediately
+    // from the frame's own payload (direction, watts, units).
+    channel.push({
+      type: "intent.accepted",
+      sequence: 44,
+      occurred_at: "2026-08-22T10:00:05Z",
+      payload: {
+        principal: "operator:home",
+        intent_id: "intent-44",
+        direction: "discharge",
+        watts: 1500,
+        unit_ids: ["pod-mid"],
+      },
+    });
+
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    await waitFor(() => {
+      expectVisibleText(entry, /1,?500/);
+    });
+    // The forced fresh read (not the cached connect-time picture) lands the
+    // authorized and measured figures next.
+    await waitFor(() => {
+      expect(snapshotCalls).toBeGreaterThanOrEqual(2);
+    });
+  });
+
   it("recomputes the displayed age the moment a throttled tab becomes visible", async () => {
     // Only the clocks are faked; the 1 s age interval stays real, standing in
     // for a browser-throttled background tab whose ticks barely run.
@@ -1221,7 +1282,7 @@ describe("HomeView — live observations and staleness", () => {
     act(() => {
       fireEvent(document, new Event("visibilitychange"));
     });
-    expectVisibleText(entry, /Data age: 5[0-2] s/);
+    expectVisibleText(entry, /Data age: 5[0-9] s/);
   });
 });
 

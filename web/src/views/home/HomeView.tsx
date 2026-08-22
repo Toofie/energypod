@@ -517,10 +517,16 @@ export function HomeView({ client }: HomeViewProps) {
       return true;
     };
 
-    /** A fresher read after a latch frame: adopted only if it advances. */
+    /** A fresher read after a world-moving frame: adopted only if it advances.
+     * The read bypasses the shell's short-lived snapshot cache when the shared
+     * client allows it — a cached picture must never answer a frame that just
+     * proved the world moved. */
     const refetchSnapshot = (): void => {
-      client
-        .getSnapshot()
+      const read =
+        typeof client.refreshSnapshot === "function"
+          ? client.refreshSnapshot()
+          : client.getSnapshot();
+      read
         .then((value) => {
           if (!cancelled) {
             applySnapshot(value, null);
@@ -568,6 +574,27 @@ export function HomeView({ client }: HomeViewProps) {
           ...previous,
           units: previous.units.map((unit) =>
             unitIds.includes(unit.unit_id) ? { ...unit, lifecycle } : unit,
+          ),
+        };
+      });
+    };
+
+    /** Patch the requested figure for the units an intent names. */
+    const patchRequested = (
+      unitIds: string[],
+      direction: PowerFigureView["direction"],
+      watts: number,
+    ): void => {
+      setSnapshot((previous) => {
+        if (previous === null) {
+          return previous;
+        }
+        return {
+          ...previous,
+          units: previous.units.map((unit) =>
+            unitIds.includes(unit.unit_id)
+              ? { ...unit, requested_power: { direction, watts } }
+              : unit,
           ),
         };
       });
@@ -643,6 +670,38 @@ export function HomeView({ client }: HomeViewProps) {
         // and revocation is routine (intent expiry, disarm, generation fences)
         // — not only a latched inhibit. The frame says authority changed, so
         // the picture is re-read; no lifecycle is invented from it.
+        refetchSnapshot();
+        return;
+      }
+      if (frame.type === "intent.accepted") {
+        // The request landed: the payload names it (direction, watts, units),
+        // so the request figures render the moment the frame arrives — the
+        // authorized figures follow with the next refreshed snapshot.
+        const payload: unknown = frame.payload;
+        const record = payload !== null && typeof payload === "object" ? payload as Record<string, unknown> : {};
+        const unitIds = Array.isArray(record.unit_ids)
+          ? record.unit_ids.filter((id): id is string => typeof id === "string")
+          : [];
+        const watts = typeof record.watts === "number" ? record.watts : null;
+        const rawDirection = typeof record.direction === "string" ? record.direction : "";
+        const direction: PowerFigureView["direction"] | null =
+          rawDirection === "charge" || rawDirection === "discharge" || rawDirection === "idle"
+            ? rawDirection
+            : null;
+        if (unitIds.length > 0 && watts !== null && direction !== null) {
+          patchRequested(unitIds, direction, watts);
+          setAnnouncement(
+            `Power request accepted — ${direction} ${watts} W for ${unitIds.join(", ")}.`,
+          );
+        }
+        refetchSnapshot();
+        return;
+      }
+      if (frame.type === "intent.expired") {
+        // Feature-detected: the backend publishes the end of a request this
+        // way once its intent-lifecycle event lands. Today the same fact
+        // arrives as a routine authorization.revoked; both re-read the world.
+        setAnnouncement("The power request ended.");
         refetchSnapshot();
         return;
       }

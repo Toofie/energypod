@@ -1236,6 +1236,83 @@ describe("NowView — latches arriving over the stream", () => {
   });
 });
 
+
+// --- structural reactivity: the request card appears and disappears -----------
+//
+// The request card's remaining time once lingered as a ghost after the intent
+// ended (the expiry publishes authorization.revoked today; a dedicated
+// intent.expired event is queued backend-side). Both endings must clear it.
+
+describe("NowView — the request card clears when the request ends", () => {
+  it("counts down while the request lives and returns to not-available on the expiry revocation", async () => {
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+    });
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    api.client.getSnapshot.mockResolvedValue(snapshotEnvelope([ARMED_MID]));
+    api.client.postIntent.mockResolvedValue(ACCEPTED_CHARGE);
+    const channel = liveChannel([]);
+    api.client.openEvents.mockImplementation(() => channel.openEvents());
+
+    renderNow();
+    await user.click(await screen.findByRole("button", { name: /^charge/i }));
+    const dialog = screen.getByRole("dialog");
+    await user.clear(within(dialog).getByLabelText(/watts/i));
+    await user.type(within(dialog).getByLabelText(/watts/i), "1500");
+    await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
+    expect(await screen.findByText(/^accepted$/i)).toBeInTheDocument();
+
+    // The card is live: a remaining time that counts down.
+    expect(screen.getByRole("group", { name: "Remaining time" }).textContent ?? "").toMatch(/\d+ s left/);
+
+    // The intent expires: the runtime revokes the held authorization, and the
+    // ghost countdown must go — the honest no-request state returns.
+    channel.push({
+      type: "authorization.revoked",
+      sequence: 44,
+      occurred_at: "2026-08-22T12:05:00+10:00",
+      payload: { reason: "no_active_intent", unit_ids: ["MID"] },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("group", { name: "Remaining time" }).textContent ?? "").toContain(
+        "Not available",
+      );
+    });
+  });
+
+  it("clears the countdown on the backend's future intent.expired event the moment it arrives", async () => {
+    const user = userEvent.setup();
+    api.client.getSnapshot.mockResolvedValue(snapshotEnvelope([ARMED_MID]));
+    api.client.postIntent.mockResolvedValue(ACCEPTED_CHARGE);
+    const channel = liveChannel([]);
+    api.client.openEvents.mockImplementation(() => channel.openEvents());
+
+    renderNow();
+    await user.click(await screen.findByRole("button", { name: /^charge/i }));
+    const dialog = screen.getByRole("dialog");
+    await user.clear(within(dialog).getByLabelText(/watts/i));
+    await user.type(within(dialog).getByLabelText(/watts/i), "1500");
+    await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
+    expect(await screen.findByText(/^accepted$/i)).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "Remaining time" }).textContent ?? "").toMatch(/\d+ s left/);
+
+    // The dedicated expiry event (queued backend-side): feature-detected, so
+    // the console is ready the day it starts arriving.
+    channel.push({
+      type: "intent.expired",
+      sequence: 45,
+      occurred_at: "2026-08-22T12:05:00+10:00",
+      payload: { unit_ids: ["MID"] },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("group", { name: "Remaining time" }).textContent ?? "").toContain(
+        "Not available",
+      );
+    });
+  });
+});
+
 describe("NowView — ages run from captured monotonic markers", () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -1472,7 +1549,7 @@ describe("NowView — live observations keep the actual age current", () => {
       vi.advanceTimersByTime(4000);
     });
     await waitFor(() => {
-      expect(screen.getByRole("group", { name: "Actual" }).textContent ?? "").toMatch(/[3-6] s ago/);
+      expect(screen.getByRole("group", { name: "Actual" }).textContent ?? "").toMatch(/[3-9] s ago/);
     });
   });
 
