@@ -469,6 +469,69 @@ def test_latched_stops_stay_acknowledgeable_beyond_idempotency_capacity(
     assert ack_first.status_code == 200, ack_first.json()
 
 
+def test_inhibit_acknowledgement_requires_arm_scope_and_an_interactive_operator(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    path = f"{API}/units/pod-a/inhibit/acknowledge"
+    with _client(service, authenticator) as client:
+        acknowledged = client.post(
+            path,
+            json={"confirmation": "ACKNOWLEDGE"},
+            headers=_mutation_headers("operator-token", key="inhibit-1"),
+        )
+        viewer = client.post(
+            path,
+            json={"confirmation": "ACKNOWLEDGE"},
+            headers=_mutation_headers("viewer-token", key="inhibit-2"),
+        )
+        automation = client.post(
+            path,
+            json={"confirmation": "ACKNOWLEDGE"},
+            headers=_mutation_headers("noninteractive-operator-token", key="inhibit-3"),
+        )
+        unauthenticated = client.post(
+            path,
+            json={"confirmation": "ACKNOWLEDGE"},
+            headers={"Idempotency-Key": "inhibit-4"},
+        )
+    assert acknowledged.status_code == 200
+    assert acknowledged.json()["status"] == "acknowledged"
+    call = next(values for name, values in service.calls if name == "acknowledge_inhibit")
+    assert call["unit_id"] == "pod-a"
+    assert call["principal"].subject == "person:operator"
+    _assert_error(viewer, 403, "insufficient_scope")
+    _assert_error(automation, 403, "interactive_operator_required")
+    _assert_error(unauthenticated, 401, "authentication_required")
+    assert [name for name, _ in service.calls].count("acknowledge_inhibit") == 1
+
+
+def test_inhibit_acknowledgement_rejects_malformed_or_unknown_units(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        wrong_confirmation = client.post(
+            f"{API}/units/pod-a/inhibit/acknowledge",
+            json={"confirmation": "STOP"},
+            headers=_mutation_headers("operator-token", key="inhibit-5"),
+        )
+        malformed_id = client.post(
+            f"{API}/units/-pod/inhibit/acknowledge",
+            json={"confirmation": "ACKNOWLEDGE"},
+            headers=_mutation_headers("operator-token", key="inhibit-6"),
+        )
+        unknown_unit = client.post(
+            f"{API}/units/pod-ghost/inhibit/acknowledge",
+            json={"confirmation": "ACKNOWLEDGE"},
+            headers=_mutation_headers("operator-token", key="inhibit-7"),
+        )
+    _assert_error(wrong_confirmation, 422, "validation_error")
+    _assert_error(malformed_id, 422, "validation_error")
+    _assert_error(unknown_unit, 404, "unit_not_found")
+    # Only the unknown-unit probe reaches the service (and is refused there);
+    # validation failures never reach it.
+    assert [name for name, _ in service.calls].count("acknowledge_inhibit") == 1
+
+
 def test_emergency_stop_requires_auth_but_not_an_arming_confirmation(
     service: RecordingEnergyService, authenticator: FakeAuthenticator
 ) -> None:

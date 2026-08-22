@@ -124,6 +124,16 @@ class RecordingEnergyService:
         self.calls.append(("acknowledge_emergency_stop", kwargs))
         return {"stop_id": kwargs["stop_id"], "status": "acknowledged"}
 
+    async def acknowledge_inhibit(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("acknowledge_inhibit", kwargs))
+        if kwargs["unit_id"] == "pod-ghost":
+            raise LookupError("no unit with id 'pod-ghost'")
+        return {
+            "unit_id": kwargs["unit_id"],
+            "status": "acknowledged",
+            "latch_cleared": True,
+        }
+
 
 class FakeEventSource:
     def __init__(self, events: list[dict[str, Any]] | None = None) -> None:

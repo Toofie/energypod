@@ -64,6 +64,7 @@ class EnergyPodActor:
         heartbeat_interval_s: float,
         heartbeat_safety_margin_s: float,
         blocking_fault_codes: frozenset[str] | None = None,
+        telemetry: Any | None = None,
     ) -> None:
         if stable_observations_required < 1:
             raise ValueError("stable_observations_required must be positive")
@@ -93,6 +94,12 @@ class EnergyPodActor:
         self._heartbeat_interval = heartbeat_interval_s
         self._heartbeat_margin = heartbeat_safety_margin_s
         self._blocking_fault_codes = frozenset(blocking_fault_codes or ())
+        # Optional telemetry strategy (structural port): the composition root
+        # may inject the poll->decode->deliver strategy so one telemetry cycle
+        # reads the selected register-layout plan through this actor's sole
+        # transport and delivers the decoded observation.  Without it the poll
+        # stays the bare essential read and nothing is published.
+        self._telemetry = telemetry
 
         self.lifecycle = UnitLifecycle.BOOT
         self.generation = 0
@@ -140,11 +147,35 @@ class EnergyPodActor:
                 raise
             self.lifecycle = UnitLifecycle.OBSERVE_ONLY
 
+    @property
+    def qualified(self) -> bool | None:
+        """Whether stable observations currently qualify the unit for arming.
+
+        ``None`` models the honest unknown — no observation has ever been
+        assessed — which callers must treat as a refusal, never as permission.
+        A unit holding the configured count of consecutive qualifying
+        observations reports ``True`` even while armed or inhibited; the
+        lifecycle and the latch remain the separate arming gates.
+        """
+        if self._latest_observation is None:
+            return None
+        return self._stable_observations >= self._stable_required
+
     async def accept_observation(self, observation: Any) -> None:
         await self._submit("observation", observation, _CONTROL_PRIORITY)
 
     async def arm(self) -> None:
         await self._submit("arm", None, _CONTROL_PRIORITY)
+
+    async def disarm(self) -> None:
+        """Disarm through the mailbox; the inhibit latch is never cleared.
+
+        Idempotent and fail-closed: disarming an unarmed, inhibited, or
+        stopping unit is a no-op, an armed unit loses its armed lifecycles and
+        its outstanding authorization, and re-arming always needs the full
+        qualification path again.
+        """
+        await self._submit("disarm", None, _CONTROL_PRIORITY)
 
     async def poll_once(self) -> Any:
         if self._stopping or not self._started:
@@ -328,10 +359,10 @@ class EnergyPodActor:
             return await self._accept_observation_owned(argument)
         if operation == "arm":
             return self._arm_owned()
+        if operation == "disarm":
+            return await self._disarm_owned()
         if operation == "poll":
-            return await self._transport.read_holding(
-                self._essential_address, self._essential_count
-            )
+            return await self._poll_owned()
         if operation == "heartbeat":
             return await self._heartbeat_owned()
         if operation == "zero":
@@ -381,6 +412,33 @@ class EnergyPodActor:
             }:
                 self.lifecycle = UnitLifecycle.OBSERVE_ONLY
 
+    async def _poll_owned(self) -> Any:
+        """One telemetry cycle: advance, read the plan, decode, and deliver.
+
+        With no injected telemetry strategy the poll stays the bare essential
+        read.  With one, the device advances exactly once per cycle, every
+        register window of the plan is read through this actor's transport
+        (still inside the one serialized mailbox dispatch, so sole socket
+        ownership is unchanged), the decoded observation is delivered through
+        the same accept-observation path the public mailbox operation uses,
+        and the essential registers are returned to the caller.
+        """
+        telemetry = self._telemetry
+        if telemetry is None:
+            return await self._transport.read_holding(
+                self._essential_address, self._essential_count
+            )
+        await telemetry.advance()
+        essential = (self._essential_address, self._essential_count)
+        blocks: dict[tuple[int, int], tuple[int, ...]] = {}
+        for window in (essential, *telemetry.read_plan()):
+            if window in blocks:
+                continue
+            blocks[window] = await self._transport.read_holding(*window)
+        observation = telemetry.decode(blocks, self.lifecycle)
+        await self._accept_observation_owned(observation)
+        return blocks[essential]
+
     def _latching_fault_present(self, observation: Any) -> bool:
         # Blocking-fault classification is the policy's: composition wires the
         # configured blocking fault codes, so an empty set disables the hook.
@@ -399,13 +457,27 @@ class EnergyPodActor:
         await self._inhibit_owned("blocking_fault_active", InhibitCause.LATCHED)
 
     def _qualifies(self, observation: Any) -> bool:
+        complete = getattr(observation, "complete", None)
+        if complete is None:
+            # Domain observations carry the derived safety-completeness view
+            # instead of a bare flag; incomplete safety data never qualifies.
+            complete = getattr(observation, "safety_data_complete", False)
         quality = getattr(observation, "quality", None)
-        quality_value = getattr(quality, "value", quality)
+        quality_values = getattr(quality, "values", None)
+        if callable(quality_values):
+            # A quality map (domain Observation): every telemetry field must
+            # be good, and an empty map is the absence of evidence, not proof.
+            values = tuple(quality_values())
+            quality_ok = bool(values) and all(
+                getattr(value, "value", value) == "good" for value in values
+            )
+        else:
+            quality_ok = getattr(quality, "value", quality) == "good"
         cells = getattr(observation, "cells", None)
         cell_count_ok = cells is None or len(cells) == self._expected_cell_count
         return bool(
-            getattr(observation, "complete", False)
-            and quality_value == "good"
+            complete
+            and quality_ok
             and getattr(observation, "unit_id", None) == self.unit_id
             and getattr(observation, "device_identity", None) == self._expected_identity
             and getattr(observation, "protocol_profile", None) == self._expected_profile
@@ -422,6 +494,20 @@ class EnergyPodActor:
         ):
             raise RuntimeError("unit is not qualified for arming")
         self.lifecycle = UnitLifecycle.ARMED_IDLE
+
+    async def _disarm_owned(self) -> None:
+        # An unarmed or inhibited unit has nothing to drop; an armed unit loses
+        # its armed lifecycle first, then its outstanding authority, so an
+        # observer that sees DISARMED can never still see live capability.
+        # The inhibit latch and its cause are deliberately untouched: only the
+        # privileged acknowledgement may clear them.
+        if self._stopping or self.lifecycle not in {
+            UnitLifecycle.ARMED_IDLE,
+            UnitLifecycle.ACTIVE,
+        }:
+            return
+        self.lifecycle = UnitLifecycle.DISARMED
+        await self._revoke("disarmed")
 
     def _acknowledge_inhibit_owned(self) -> None:
         # Acknowledgement clears only the latch; lifecycle and the stable-sample

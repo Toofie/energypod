@@ -43,6 +43,7 @@ class EnergyService(Protocol):
     async def arm(self, **kwargs: Any) -> dict[str, Any]: ...
     async def emergency_stop(self, **kwargs: Any) -> dict[str, Any]: ...
     async def acknowledge_emergency_stop(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def acknowledge_inhibit(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
 class EventSource(Protocol):
@@ -465,6 +466,46 @@ def create_api_app(
             request=request,
             identity=identity,
             operation_name="acknowledge_emergency_stop",
+            payload=payload,
+            status_code=200,
+            invoke=invoke,
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.post(f"{API_PREFIX}/units/{{unit_id}}/inhibit/acknowledge")
+    async def acknowledge_inhibit(
+        unit_id: str,
+        body: AcknowledgeRequest,
+        request: Request,
+        identity: Principal = arm_dependency,
+    ) -> JSONResponse:
+        if not identity.interactive:
+            raise BoundaryError(
+                403,
+                "interactive_operator_required",
+                "Interactive operator required",
+            )
+        if not _valid_id(unit_id):
+            raise BoundaryError(422, "validation_error", "Invalid unit identifier")
+        payload = {"unit_id": unit_id, **body.model_dump(mode="json")}
+
+        async def invoke() -> dict[str, Any]:
+            try:
+                return await service.acknowledge_inhibit(
+                    unit_id=unit_id,
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
+            except LookupError as exc:
+                raise BoundaryError(
+                    404, "unit_not_found", "The unit identifier is not known"
+                ) from exc
+
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="acknowledge_inhibit",
             payload=payload,
             status_code=200,
             invoke=invoke,

@@ -17,8 +17,9 @@ Two bridging decisions live in this module and nowhere else:
 
 - The shipped repositories are synchronous; every application component
   (kernel, actor, facade) awaits its ports.  The async adapters below wrap the
-  same underlying store instances the runtime exposes, so "the kernel drives
-  THE runtime repositories" is structural, not a convention.
+  underlying stores, and the runtime exposes those same adapters as its
+  repository handles, so "the kernel drives THE runtime repositories" is
+  structural, not a convention.
 - Event publication rides with the durable state change inside those adapters
   (audit append, observation append, authorization revocation), so a published
   event can never be lost to task scheduling and a slow subscriber can never
@@ -36,7 +37,7 @@ import json
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
@@ -50,6 +51,9 @@ from energypod.adapters.modbus import (
     WaveshareTransportConfig,
     encode_pq_registers,
     encode_stop_registers,
+    faults,
+    protocol_codec,
+    register_layout,
 )
 from energypod.adapters.persistence.memory import (
     InMemoryAuthorizationRepository,
@@ -64,7 +68,7 @@ from energypod.adapters.persistence.sqlite import (
 from energypod.api.mcp import create_mcp_server
 from energypod.api.rest import create_api_app
 from energypod.application.actor import EnergyPodActor
-from energypod.application.arbiter import IntentArbiter
+from energypod.application.arbiter import STOP_ACKNOWLEDGE_SCOPE, IntentArbiter
 from energypod.application.audit import AuditEventFactory
 from energypod.application.control_kernel import ControlKernel
 from energypod.application.events import EventBus
@@ -73,7 +77,9 @@ from energypod.application.safety import SafetyKernel
 from energypod.application.service import EnergyServiceFacade
 from energypod.domain import (
     ControlPolicy,
+    DataQuality,
     Direction,
+    Observation,
     UnitHeadroom,
     UnitLifecycle,
     allocate_fleet_power,
@@ -102,6 +108,17 @@ _MAX_SIMULATOR_BICS = 6
 # The only evidenced writable objective is FC16 at 0x0200 with [1, P, Q].
 _PQ_OBJECTIVE_ADDRESS = 0x0200
 
+# Register windows the simulator telemetry decode consumes (PROTOCOL_EVIDENCE
+# section 5): the common system block, the IoT BMS block, the three IoT
+# fault/status blocks, and the cell blocks whose counts follow the BIC count.
+_SYSTEM_BLOCK_BASE = 0x0100
+_BMS_BLOCK_BASE = 0x5000
+_PCS_FAULT_BLOCK_BASE = 0x1040
+_DCDC_FAULT_BLOCK_BASE = 0x2040
+_BMS_FAULT_BLOCK_BASE = 0x5040
+_CELL_VOLTAGE_BASE = 0x5200
+_CELL_TEMPERATURE_BASE = 0x523C
+
 _RUNTIME_PRINCIPAL = "energypod:runtime"
 _COMPOSITION_POLICY_VERSION = "composition"
 
@@ -117,13 +134,27 @@ class Clock(Protocol):
 
 
 class _SystemClock:
-    """Ambient production clock; tests inject a scripted clock instead."""
+    """Ambient production clock; tests inject a scripted clock instead.
+
+    The monotonic timeline is process-relative with a fixed origin: every
+    window the controller reasons about (authorization lifetime, telemetry age,
+    watchdog leases) is a duration between two reads of one clock, so the
+    epoch is arbitrary — but it must be process-local.  Raw host monotonic
+    time would leak the machine's boot uptime into every controller
+    timestamp, coupling process-internal validity windows to an accident of
+    the host.  The origin matches the deterministic test clocks' convention
+    (the golden scenarios' manual clock starts at 1000.0), so ambient and
+    injected timelines live on one familiar scale.
+    """
+
+    _origin = 1000.0
+    _anchor = time.monotonic()
 
     def wall_now(self) -> datetime:
         return datetime.now(UTC)
 
     def monotonic(self) -> float:
-        return time.monotonic()
+        return self._origin + (time.monotonic() - self._anchor)
 
     async def sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
@@ -217,10 +248,19 @@ class _InMemoryScheduleRepository:
 
 
 class _AsyncIntentRepository:
-    """Awaitable intent port over the process-local intent store."""
+    """Awaitable intent port over the process-local intent store.
 
-    def __init__(self, store: InMemoryIntentRepository) -> None:
+    Removing a latched emergency stop also completes the arbiter's own
+    acknowledgement protocol: the arbiter latches a selected stop internally,
+    and a latch that outlived its intent would keep fencing every future cycle
+    exactly as if the stop were still live.  The runtime principal carries the
+    stop-acknowledge scope here only after the facade has already admitted the
+    human operator with that scope; this bridge is wiring, not authority.
+    """
+
+    def __init__(self, store: InMemoryIntentRepository, *, arbiter: IntentArbiter) -> None:
         self._store = store
+        self._arbiter = arbiter
 
     async def add(self, intent: Any) -> None:
         self._store.add(intent)
@@ -229,7 +269,19 @@ class _AsyncIntentRepository:
         return self._store.active(now_mono)
 
     async def remove(self, intent_id: str) -> None:
-        self._store.remove(intent_id)
+        try:
+            self._arbiter.acknowledge_emergency_stop(
+                intent_id=intent_id,
+                actor_identity=_RUNTIME_PRINCIPAL,
+                operator_scopes=frozenset({STOP_ACKNOWLEDGE_SCOPE}),
+            )
+        except KeyError:
+            # Not the arbiter's latched stop: an ordinary intent removal.
+            self._store.remove(intent_id)
+            return
+        # The arbiter removed the acknowledged stop from the shared store and
+        # released its latch; removing again would raise a spurious LookupError.
+        return
 
 
 class _AsyncObservationRepository:
@@ -490,13 +542,170 @@ class _FleetAllocatorAdapter:
         )
 
 
-class _ActorCommandHandle:
-    """Facade-facing per-unit handle; the actor keeps sole ownership of I/O.
+class _LazyWaveshareTransport:
+    """Loop-deferred production transport: construct on first use, never here.
 
-    ``qualified`` is deliberately not exposed: the composed actor surface
-    cannot yet report qualification, and the facade is required to treat an
-    unknown state as a refusal, never as permission.
+    pymodbus 3.15's ``AsyncModbusTcpClient`` captures the running event loop at
+    construction, while the entry-point contract composes synchronously with no
+    loop and no socket events at all.  The proxy therefore defers building the
+    real ``WaveshareTransport`` until the first await — always inside the
+    owning actor's serialized mailbox dispatch on the serving loop — so the
+    client is always bound to the loop that actually drives it.  The transport
+    configuration itself is still validated eagerly at composition time.
     """
+
+    __slots__ = ("_factory", "_transport")
+
+    def __init__(self, factory: Callable[[], WaveshareTransport]) -> None:
+        self._factory = factory
+        self._transport: WaveshareTransport | None = None
+
+    def _resolve(self) -> WaveshareTransport:
+        if self._transport is None:
+            self._transport = self._factory()
+        return self._transport
+
+    async def connect(self) -> None:
+        await self._resolve().connect()
+
+    async def read_holding(self, address: int, count: int) -> tuple[int, ...]:
+        return await self._resolve().read_holding(address, count)
+
+    async def write_registers(self, address: int, values: Sequence[int]) -> None:
+        await self._resolve().write_registers(address, values)
+
+    async def close(self) -> None:
+        # A transport that was never constructed never opened anything, and
+        # building a client merely to close it would bind a loop for nothing.
+        if self._transport is not None:
+            await self._transport.close()
+
+
+def _production_transport_factory(unit: Any, timeout_s: float) -> Callable[[], WaveshareTransport]:
+    """Build the per-unit production transport factory (eagerly validated)."""
+    config = WaveshareTransportConfig(
+        host=unit.endpoint.host,
+        port=unit.endpoint.port,
+        device_id=unit.device_id,
+        timeout_s=timeout_s,
+    )
+    return lambda: WaveshareTransport(config=config)
+
+
+class _SimulatorTelemetry:
+    """Composition-owned poll -> decode -> deliver strategy over one pod.
+
+    Every register window is decoded with the production stack — the shipped
+    register catalog (which also supplies the read plan), the evidenced codec
+    scaling, and the fault catalog — into one domain ``Observation``.  Identity,
+    connection epoch, and the telemetry/cell sequences come from the pod's
+    device-model surface (the evidenced register bank carries no string
+    identity), and the lifecycle comes from the owning actor at decode time so
+    the control path sees controllability exactly as the actor holds it.  A
+    decode failure propagates: no observation is delivered and control fails
+    closed through telemetry staleness.
+    """
+
+    def __init__(
+        self,
+        *,
+        pod: SimulatedEnergyPod,
+        clock: Clock,
+        unit_id: str,
+        expected_profile: str,
+        expected_cell_count: int,
+    ) -> None:
+        self._pod = pod
+        self._clock = clock
+        self._unit_id = unit_id
+        self._expected_profile = expected_profile
+        self._expected_cell_count = expected_cell_count
+        catalog = register_layout.RegisterCatalog()
+        self._plan = tuple(
+            (block.address, block.count)
+            for block in (*catalog.iot_reads(bic_count=pod.bic_count), *catalog.common_reads)
+        )
+        windows = {address: (address, count) for address, count in self._plan}
+        self._system_window = windows[_SYSTEM_BLOCK_BASE]
+        self._bms_window = windows[_BMS_BLOCK_BASE]
+        self._fault_windows = (
+            (faults.FaultBlock.IOT_PCS, windows[_PCS_FAULT_BLOCK_BASE]),
+            (faults.FaultBlock.IOT_DCDC, windows[_DCDC_FAULT_BLOCK_BASE]),
+            (faults.FaultBlock.IOT_BMS, windows[_BMS_FAULT_BLOCK_BASE]),
+        )
+        self._cell_voltage_window = windows[_CELL_VOLTAGE_BASE]
+        self._cell_temperature_window = windows[_CELL_TEMPERATURE_BASE]
+
+    async def advance(self) -> None:
+        """Advance the device model exactly once per telemetry cycle."""
+        self._pod.poll()
+
+    def read_plan(self) -> tuple[tuple[int, int], ...]:
+        """The evidenced IoT register windows one telemetry cycle reads."""
+        return self._plan
+
+    def decode(
+        self, blocks: Mapping[tuple[int, int], tuple[int, ...]], lifecycle: UnitLifecycle
+    ) -> Observation:
+        system = blocks[self._system_window]
+        bms = blocks[self._bms_window]
+        fault_codes, warning_codes = self._decode_fault_signals(blocks)
+        cells = blocks[self._cell_voltage_window]
+        temperatures = blocks[self._cell_temperature_window]
+        return Observation(
+            unit_id=self._unit_id,
+            device_identity=self._pod.identity,
+            connection_epoch=self._pod.connection_epoch,
+            wall_timestamp=self._clock.wall_now(),
+            captured_at_mono=self._pod.telemetry_captured_at_mono,
+            sequence=self._pod.telemetry_sequence,
+            lifecycle=lifecycle,
+            protocol_profile=self._expected_profile,
+            # System block: SOC at +17, pack voltage x0.1 V at +18, pack
+            # current x0.1 A at +19, signed battery watts at +20, SOH at +22.
+            system_soc_pct=float(system[17]),
+            soh_pct=float(system[22]),
+            battery_watts=float(protocol_codec.decode_signed16(system[20])),
+            pack_voltage_v=system[18] * 0.1,
+            pack_current_a=protocol_codec.decode_signed16(system[19]) * 0.1,
+            # BMS block: SOC at +9, dynamic charge/discharge power limits at
+            # +13/+14 (raw watts, the device's own headroom report).
+            bms_soc_pct=float(bms[9]),
+            dynamic_charge_limit_w=float(bms[13]),
+            dynamic_discharge_limit_w=float(bms[14]),
+            expected_cell_count=self._expected_cell_count,
+            # Cell blocks: millivolt words and raw-40-offset temperature words.
+            cell_voltages_v=tuple(value / 1000.0 for value in cells),
+            cell_captured_at_mono=self._pod.cell_captured_at_mono,
+            cell_sequence=self._pod.cell_sequence,
+            expected_temperature_count=len(temperatures),
+            temperatures_c=tuple(float(value - 40) for value in temperatures),
+            active_faults=fault_codes,
+            active_warnings=warning_codes,
+            quality={field: DataQuality.GOOD for field in Observation.QUALITY_FIELDS},
+        )
+
+    def _decode_fault_signals(
+        self, blocks: Mapping[tuple[int, int], tuple[int, ...]]
+    ) -> tuple[frozenset[str], frozenset[str]]:
+        fault_codes: set[str] = set()
+        warning_codes: set[str] = set()
+        for block, window in self._fault_windows:
+            layout = faults.FAULT_BLOCK_LAYOUTS[block]
+            words = faults.extract_fault_block(block, blocks[window])
+            for prefix in layout.warning_offsets:
+                warning_codes.update(
+                    signal.code for signal in faults.decode_fault_word(prefix, words[prefix])
+                )
+            for prefix in layout.fault_offsets:
+                fault_codes.update(
+                    signal.code for signal in faults.decode_fault_word(prefix, words[prefix])
+                )
+        return frozenset(fault_codes), frozenset(warning_codes)
+
+
+class _ActorCommandHandle:
+    """Facade-facing per-unit handle; the actor keeps sole ownership of I/O."""
 
     def __init__(self, actor: EnergyPodActor) -> None:
         self._actor = actor
@@ -510,6 +719,11 @@ class _ActorCommandHandle:
         return self._actor.lifecycle
 
     @property
+    def qualified(self) -> bool | None:
+        """The actor's own qualification report; ``None`` stays unknown."""
+        return self._actor.qualified
+
+    @property
     def inhibit_latched(self) -> bool:
         return bool(self._actor.inhibit_latched)
 
@@ -517,10 +731,7 @@ class _ActorCommandHandle:
         await self._actor.arm()
 
     async def disarm(self) -> None:
-        # The actor has no disarm mailbox operation; fencing is the safe
-        # equivalent available today: it revokes the unit's outstanding
-        # authority and cancels any in-flight heartbeat write.
-        await self._actor.fence("facade_disarm")
+        await self._actor.disarm()
 
     async def acknowledge_inhibit(self) -> None:
         await self._actor.acknowledge_inhibit()
@@ -860,9 +1071,11 @@ def _control_policy(config: ControllerConfig) -> ControlPolicy:
 class ComposedRuntime:
     """Drivable handles over one composed controller process.
 
-    The repository handles are the shipped synchronous stores the async port
-    adapters wrap, so driving a handle and driving the kernel touch exactly the
-    same state.  ``simulators`` is populated only in simulate mode.
+    The intent, observation, and authorization handles are the same async port
+    adapters the kernel, actors, and facade drive — awaiting a handle and
+    driving the control loop touch exactly the same state.  The audit and
+    schedule handles stay the shipped durable stores those ports wrap.
+    ``simulators`` is populated only in simulate mode.
     """
 
     config: ControllerConfig
@@ -874,9 +1087,9 @@ class ComposedRuntime:
     actors: Mapping[str, EnergyPodActor]
     facade: EnergyServiceFacade
     event_bus: EventBus
-    intents: InMemoryIntentRepository
-    observations: InMemoryObservationRepository
-    authorizations: InMemoryAuthorizationRepository
+    intents: _AsyncIntentRepository
+    observations: _AsyncObservationRepository
+    authorizations: _AsyncAuthorizationRepository
     audit: SQLiteAuditRepository | _InMemoryAuditRepository
     schedule: SQLiteScheduleRepository | _InMemoryScheduleRepository
     app: FastAPI
@@ -884,15 +1097,20 @@ class ComposedRuntime:
     simulators: Mapping[str, SimulatedEnergyPod] | None
 
 
-def _simulator_pod(unit: Any, index: int, clock: Clock) -> SimulatedEnergyPod:
+def _simulator_pod(
+    unit: Any, index: int, clock: Clock, *, command_expiry_s: float
+) -> SimulatedEnergyPod:
     bic_count = min(_MAX_SIMULATOR_BICS, max(1, -(-unit.expected_cell_count // _CELLS_PER_BIC)))
     # The seed is the unit's configuration position, so identical
-    # configurations produce identical register banks across builds.
+    # configurations produce identical register banks across builds.  The
+    # device's command lease follows the commissioned expiry evidence, so the
+    # simulated watchdog fences exactly when the configured budget says so.
     return SimulatedEnergyPod(
         clock=clock,
         identity=unit.expected_identity,
         bic_count=bic_count,
         seed=index,
+        watchdog_timeout_s=command_expiry_s,
     )
 
 
@@ -946,11 +1164,14 @@ def build_runtime(
         queue_capacity=_EVENT_BUS_QUEUE_CAPACITY,
         clock=resolved_clock,
     )
+    # The arbiter owns the live intent store so its exact-id acknowledgement
+    # removes a latched stop durably, not just from its own latch.
+    arbiter = IntentArbiter(intent_repository=intent_store)
 
     # --- async ports over the exposed stores ------------------------------
     audit_port = _AsyncAuditRepository(audit_store, bus=bus)
     observation_port = _AsyncObservationRepository(store=observation_store, bus=bus)
-    intent_port = _AsyncIntentRepository(intent_store)
+    intent_port = _AsyncIntentRepository(intent_store, arbiter=arbiter)
     authorization_port = _AsyncAuthorizationRepository(
         authorization_store,
         fleet_unit_ids=unit_ids,
@@ -976,7 +1197,7 @@ def build_runtime(
         observations=observation_port,
         authorizations=authorization_port,
         audit=audit_port,
-        arbiter=IntentArbiter(),
+        arbiter=arbiter,
         allocator=_FleetAllocatorAdapter(),
         safety=SafetyKernel(),
         policy=policy,
@@ -990,22 +1211,31 @@ def build_runtime(
     actors: dict[str, EnergyPodActor] = {}
     simulators: dict[str, SimulatedEnergyPod] | None = {} if simulate else None
     for index, unit in enumerate(config.units):
+        telemetry: _SimulatorTelemetry | None = None
         if simulate:
-            pod = _simulator_pod(unit, index, resolved_clock)
-            transport: SimulatorTransport | WaveshareTransport = SimulatorTransport(pod=pod)
+            pod = _simulator_pod(
+                unit,
+                index,
+                resolved_clock,
+                command_expiry_s=config.timing.device_command_expiry_s,
+            )
+            transport: SimulatorTransport | _LazyWaveshareTransport = SimulatorTransport(pod=pod)
+            telemetry = _SimulatorTelemetry(
+                pod=pod,
+                clock=resolved_clock,
+                unit_id=unit.unit_id,
+                expected_profile=unit.protocol_profile.value,
+                expected_cell_count=unit.expected_cell_count,
+            )
             if simulators is not None:
                 simulators[unit.unit_id] = pod
         else:
-            # The production transport is constructed but never connected:
-            # connection belongs to the actor's serialized start, which only
-            # supervision or an explicit start() performs.
-            transport = WaveshareTransport(
-                config=WaveshareTransportConfig(
-                    host=unit.endpoint.host,
-                    port=unit.endpoint.port,
-                    device_id=unit.device_id,
-                    timeout_s=config.timing.essential_read_timeout_s,
-                )
+            # The production transport is configured (and validated) here but
+            # constructed lazily on the serving loop: pymodbus's client binds
+            # the running loop at construction, and composition itself runs
+            # with no loop and must open no sockets.
+            transport = _LazyWaveshareTransport(
+                _production_transport_factory(unit, config.timing.essential_read_timeout_s)
             )
         actors[unit.unit_id] = EnergyPodActor(
             unit_id=unit.unit_id,
@@ -1028,6 +1258,7 @@ def build_runtime(
             # bounded-zero attempt.
             heartbeat_safety_margin_s=config.timing.write_timeout_s,
             blocking_fault_codes=frozenset(policy.blocking_fault_codes),
+            telemetry=telemetry,
         )
 
     # --- application facade, guarded API, and MCP surface -------------------
@@ -1078,9 +1309,9 @@ def build_runtime(
         actors=actors,
         facade=facade,
         event_bus=bus,
-        intents=intent_store,
-        observations=observation_store,
-        authorizations=authorization_store,
+        intents=intent_port,
+        observations=observation_port,
+        authorizations=authorization_port,
         audit=audit_store,
         schedule=schedule_store,
         app=app,
