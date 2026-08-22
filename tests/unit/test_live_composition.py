@@ -1267,3 +1267,92 @@ async def test_snapshot_and_health_stay_honest_for_an_unqualified_replayed_fleet
         await _shutdown_actors(runtime)
 
     journal.assert_only_bounded_stops()
+
+
+# --- excess-solar tier promotion (API_CONTRACTS "Excess-solar accelerated
+# --- charging (advisory)") -----------------------------------------------------
+#
+# The PCS live block 0x1000 (grid at +17, load at +20, PROTOCOL_EVIDENCE 4c)
+# rides the cold ring today: one window every 8th cycle, ~108 s per refresh at
+# the 1.5 s commissioned cadence — useless as a control-rate export signal.
+# With the feature enabled it must join the control-rate core EVERY cycle while
+# the per-cycle plan stays inside the cadence budget (windows x 0.1 s gateway
+# inter-frame gap << control period).
+
+
+class _StaticCaptureTransport:
+    """Serves one captured register bank at the transport port; no socket."""
+
+    def __init__(self, bank: dict[int, int]) -> None:
+        self._bank = bank
+
+    async def read_holding(self, address: int, count: int) -> tuple[int, ...]:
+        return tuple(self._bank[address + offset] for offset in range(count))
+
+    async def write_registers(self, address: int, values: Sequence[int]) -> None:
+        raise AssertionError("the telemetry strategy never writes")
+
+    async def close(self) -> None:
+        return None
+
+
+def _live_decode_strategy(bank: dict[int, int], *, promote_pcs_live_block: bool) -> Any:
+    """Compose the live decode telemetry strategy directly over one bank."""
+    telemetry_class = getattr(_composition(), "_LiveDecodeTelemetry", None)
+    if telemetry_class is None:  # pragma: no cover - pinned by the suite import
+        pytest.fail("energypod.runtime.composition._LiveDecodeTelemetry is not implemented")
+    try:
+        return telemetry_class(
+            transport=_StaticCaptureTransport(bank),
+            clock=ScriptedClock(),
+            unit_id="mid",
+            expected_identity="byd-2c225097",
+            expected_profile="iot",
+            expected_cell_count=60,
+            probe_address=0x5000,
+            probe_count=7,
+            promote_pcs_live_block=promote_pcs_live_block,
+        )
+    except TypeError as error:
+        pytest.fail(
+            "the live decode strategy does not yet accept promote_pcs_live_block (the "
+            f"excess-solar tier-promotion contract): {error}",
+            pytrace=False,
+        )
+        raise  # pragma: no cover - pytest.fail never returns
+
+
+async def test_pcs_live_block_is_promoted_to_the_control_rate_core_for_excess_charging() -> None:
+    """With the feature enabled, grid evidence refreshes EVERY telemetry cycle.
+
+    Default (disabled): 0x1000 stays on the cold ring — present on its rotating
+    cycle only.  Enabled: it rides the core on every cycle, and the plan stays
+    within the cadence budget (<= 10 windows even on the bootstrap cycle).
+    """
+    bank = _register_banks_by_host()["192.168.1.11"]
+    window = (0x1000, 21)
+
+    default_plans: list[tuple[tuple[int, int], ...]] = []
+    strategy = _live_decode_strategy(bank, promote_pcs_live_block=False)
+    for _ in range(9):
+        await strategy.advance()
+        default_plans.append(strategy.read_plan())
+    coldring_cycles = [plan for plan in default_plans if window in plan]
+    assert 0 < len(coldring_cycles) < len(default_plans), (
+        "today's cold ring serves the PCS block on a rotating minority of cycles"
+    )
+
+    promoted_plans: list[tuple[tuple[int, int], ...]] = []
+    strategy = _live_decode_strategy(bank, promote_pcs_live_block=True)
+    for _ in range(9):
+        await strategy.advance()
+        promoted_plans.append(strategy.read_plan())
+
+    for cycle, plan in enumerate(promoted_plans, start=1):
+        assert window in plan, (
+            f"cycle {cycle} must read the PCS live block at the control rate: {sorted(plan)}"
+        )
+        assert len(plan) <= 10, (
+            f"cycle {cycle} reads {len(plan)} windows; the promoted plan must stay inside "
+            "the commissioned cadence budget"
+        )

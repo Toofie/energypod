@@ -349,6 +349,50 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-23 (excess-solar design): EXCESS-SOLAR ACCELERATED CHARGING DESIGNED,
+  ACCEPTED PENDING IMPLEMENTATION. Contracts + red-phase tests + implementation
+  plan landed for the operator's scenario (single-phase empty battery charging
+  faster from fleet-wide surplus PV; billing net across phases). Authority
+  posture: a new ADVISORY component only — `ExcessChargeAdviser`
+  (src/energypod/application/excess_charge.py, to be built) submits ordinary
+  short-TTL OPTIMIZER charge intents through an internal facade path; arbiter →
+  allocator → SafetyKernel → per-unit authority are unchanged in role.
+  Deterministic bound (allocator, one additional min() term on OPTIMIZER charge
+  intents only): eligible = min(max_charge_from_export_w, max(0, floor(Σ
+  grid_power_w) − export_headroom_margin_w)), collapsing to 0 unless EVERY
+  fleet unit's grid evidence is finite, GOOD, and fresh; the kernel adds
+  export_evidence_missing/bad/stale denials as defense in depth. BEAT-AUTONOMY
+  HYSTERESIS pinned: intervene only above autonomy+min_acceleration_w (520+100
+  W default), continue above autonomy+exit_hysteresis_w (570 W), otherwise
+  leave the pod's own CT self-consumption alone — commanding less would slow
+  charging. Hand-back is ALWAYS by non-renewal (TTL ≤ 300 s, default 10 s; the
+  measured ~3.5-4 s watchdog returns autonomy); the adviser never writes
+  registers, stop triples, or idle intents. OPERATOR PRECEDENCE PINNED from the
+  2026-08-23 live verification (a manual console intent superseded an in-flight
+  agent intent mid-window): the arbiter's manual > optimizer priority already
+  displaces the adviser, and the adviser additionally withdraws while any
+  higher-priority intent is live and re-posts only after expiry AND hysteresis
+  re-qualifies. Audit attribution note: the trail distinguishes writers only by
+  principal + source — the adviser is energypod:excess-adviser + optimizer vs
+  operator:local + manual. NET-BILLING assumption is OPERATOR-CONFIRMED
+  PENDING: a per-phase-billed site changes the economics, never the safety.
+  Deliverables: API_CONTRACTS.md advisory section; PROTOCOL_EVIDENCE.md §4c
+  (grid/load CT registers 0x1000+17, 0x1000+20, 0x0100+55 with vendor cites
+  SysControl.cs:500/503/429 and live-capture values; §7's external-grid-sign
+  "Unknown" row superseded by the live-proven negative=import); red tests in
+  test_wire_decode.py (T-UNIT-WIRE-025..028; 0x1000 moved out of the unconsumed
+  set), test_safety.py, test_composition.py, test_config.py
+  (T-UNIT-CONFIG-014..020), test_live_composition.py, and the new
+  test_excess_charge.py — 54 red cases, all failing for the intended missing
+  contract (Observation advisory fields, ControlPolicy export triple,
+  allocator now_mono port + export_bounded flag, config block, adviser module,
+  tier promotion), 292 pre-existing tests in those files still green; ruff
+  clean, scoped mypy clean on the added lines. docs/DESIGN_EXCESS_CHARGING.md
+  is the ordered implementation plan (9 steps, test mapping, live protocol).
+  Feature is config-gated OFF by default (`excess_charging` absent block).
+  NEXT: implement per the plan (simulator first), then the separately
+  authorized single-unit daytime trial — note POST /api/v1/arm requires
+  {"unit_ids": [...], "confirmation": "ARM"} (bare unit_ids is 422).
 - 2026-08-21: Created this durable ledger after architecture/protocol audits and
   the first contract-test/review cycles. Recorded the completed actor/kernel
   adversarial review and the virtual-environment discrepancy.

@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import importlib
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 NOW = 101.0
 UNIT_IDS = ("lhs", "mid", "rhs")
@@ -143,6 +144,9 @@ class ProposedSetpointRecord:
     intent_id: str
     intent_expires_at_mono: float
     reactive_vars: int = 0
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": only the
+    # allocator's optimizer-charge proposals carry the export-bounded flag.
+    export_bounded: bool = False
 
 
 def make_proposed_setpoints(
@@ -153,6 +157,7 @@ def make_proposed_setpoints(
     watts_by_unit: dict[str, int] | None = None,
     intent_expires_at_mono: float = 109.0,
     reactive_vars: int = 0,
+    export_bounded: bool = False,
 ) -> tuple[ProposedSetpointRecord, ...]:
     selected_direction = direction or api.Direction.DISCHARGE
     allocation = watts_by_unit if watts_by_unit is not None else {"mid": watts}
@@ -164,6 +169,7 @@ def make_proposed_setpoints(
             intent_id="intent-001",
             intent_expires_at_mono=intent_expires_at_mono,
             reactive_vars=reactive_vars,
+            export_bounded=export_bounded,
         )
         for unit_id, unit_watts in sorted(allocation.items())
     )
@@ -1519,3 +1525,170 @@ def test_evaluation_is_deterministic_and_does_not_mutate_inputs(api: SimpleNames
     assert proposed == before_proposed
     assert current == before_current
     assert previous == before_previous
+
+
+# --- excess-solar export evidence (API_CONTRACTS "Excess-solar accelerated
+# --- charging (advisory)") ----------------------------------------------------
+#
+# Defense in depth behind the allocator's export bound: the kernel itself
+# refuses a NON-ZERO export-bounded charge proposal whose fleet grid evidence
+# is missing, quality-bad, or stale, mirroring the telemetry_stale pattern.
+# The policy carries the all-or-none export triple; the observations carry the
+# advisory grid_power_w (raw namespaces so the KERNEL's logic is under test,
+# not the domain constructor).  Zero-watt proposals never accrue export
+# reasons: zero is always permitted and all-zero allocations stay legitimate.
+
+EXPORT_POLICY_KEYS: dict[str, Any] = {
+    "export_charge_limit_w": 2_000,
+    "export_headroom_margin_w": 200,
+    "export_telemetry_max_age_s": 3.0,
+}
+
+
+def make_export_policy(api: SimpleNamespace) -> Any:
+    try:
+        return make_policy(api, **EXPORT_POLICY_KEYS)
+    except ValidationError as error:
+        pytest.fail(f"the ControlPolicy export triple is not implemented: {error}", pytrace=False)
+        raise  # pragma: no cover - pytest.fail never returns
+
+
+def make_export_fleet(
+    api: SimpleNamespace,
+    grids: Mapping[str, float | None],
+    *,
+    grid_quality: Any = None,
+    captured_at_mono_by_unit: Mapping[str, float] | None = None,
+    drop_quality_key: bool = False,
+) -> dict[str, Any]:
+    """Fleet of raw observations carrying per-pod grid power (export evidence)."""
+    fleet: dict[str, Any] = {}
+    for unit_id, grid in grids.items():
+        quality: dict[str, Any] = {field: api.DataQuality.GOOD for field in REQUIRED_QUALITY_FIELDS}
+        if not drop_quality_key:
+            quality["grid_power_w"] = (
+                grid_quality if grid_quality is not None else api.DataQuality.GOOD
+            )
+        captured = (
+            100.0
+            if captured_at_mono_by_unit is None
+            else captured_at_mono_by_unit.get(unit_id, 100.0)
+        )
+        fleet[unit_id] = make_raw_observation(
+            api,
+            unit_id=unit_id,
+            grid_power_w=grid,
+            captured_at_mono=captured,
+            quality=quality,
+        )
+    return fleet
+
+
+_EXPORT_GRIDS = {"lhs": -300.0, "mid": 800.0, "rhs": 900.0}
+
+
+def test_export_bounded_charge_authorizes_on_fresh_good_fleet_grid_evidence(
+    api: SimpleNamespace,
+) -> None:
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(
+            api, direction=api.Direction.CHARGE, export_bounded=True
+        ),
+        current_observations=make_export_fleet(api, _EXPORT_GRIDS),
+        policy=make_export_policy(api),
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert reasons(decision) == ("safety_checks_passed",)
+    assert setpoints_by_unit(decision)["mid"].watts == 1_000
+
+
+@pytest.mark.parametrize(
+    ("grids", "grid_quality", "captured", "drop_key", "expected_reason"),
+    [
+        # A fleet unit with no observation at all: one unreadable phase is
+        # never treated as zero export.
+        (
+            {k: v for k, v in _EXPORT_GRIDS.items() if k != "rhs"},
+            None,
+            None,
+            False,
+            "export_evidence_missing",
+        ),
+        # A None (unsourced) grid value with otherwise GOOD quality.
+        ({**_EXPORT_GRIDS, "rhs": None}, None, None, False, "export_evidence_missing"),
+        # An old-shape observation whose quality map never carried the key.
+        (_EXPORT_GRIDS, None, None, True, "export_evidence_missing"),
+        # Quality-bad and quality-suspect grid words.
+        (_EXPORT_GRIDS, "BAD", None, False, "export_evidence_bad"),
+        (_EXPORT_GRIDS, "SUSPECT", None, False, "export_evidence_bad"),
+        # Stale export evidence: rhs captured 96.0 is exactly ON the regular
+        # telemetry-stale boundary (age 5.0 of 5.0) but 2 s past the export
+        # freshness bound, isolating the export reason.
+        (_EXPORT_GRIDS, None, {"rhs": 96.0}, False, "export_evidence_stale"),
+    ],
+)
+def test_export_bounded_charge_fails_closed_on_any_unusable_grid_evidence(
+    api: SimpleNamespace,
+    grids: dict[str, float | None],
+    grid_quality: Any,
+    captured: dict[str, float] | None,
+    drop_key: bool,
+    expected_reason: str,
+) -> None:
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(
+            api, direction=api.Direction.CHARGE, export_bounded=True
+        ),
+        current_observations=make_export_fleet(
+            api,
+            grids,
+            grid_quality=None if grid_quality is None else getattr(api.DataQuality, grid_quality),
+            captured_at_mono_by_unit=captured,
+            drop_quality_key=drop_key,
+        ),
+        policy=make_export_policy(api),
+    )
+
+    assert_rejected(decision, api)
+    assert expected_reason in reasons(decision)
+
+
+def test_zero_watt_export_bounded_proposal_never_accrues_export_reasons(
+    api: SimpleNamespace,
+) -> None:
+    """Zero is always permitted; an all-zero allocation stays a legitimate,
+    honestly-rejected representation and must not be blamed on export evidence."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(
+            api, direction=api.Direction.CHARGE, watts=0, export_bounded=True
+        ),
+        current_observations=make_export_fleet(
+            api, _EXPORT_GRIDS, captured_at_mono_by_unit={"rhs": 96.0}
+        ),
+        policy=make_export_policy(api),
+    )
+
+    assert_rejected(decision, api)
+    assert reasons(decision) == ("zero_dynamic_capability",)
+    assert not [reason for reason in reasons(decision) if reason.startswith("export_")]
+
+
+def test_ordinary_charge_is_untouched_by_export_evidence_rules(
+    api: SimpleNamespace,
+) -> None:
+    """Without the export-bounded flag the export evidence is irrelevant."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, direction=api.Direction.CHARGE),
+        current_observations={},
+        previous_observations={},
+        policy=make_export_policy(api),
+    )
+
+    assert_rejected(decision, api)
+    assert "observation_missing" in reasons(decision)
+    assert not [reason for reason in reasons(decision) if reason.startswith("export_")]

@@ -390,3 +390,133 @@ def test_valid_config_is_frozen_and_retains_explicit_profiles() -> None:
     assert parsed.units[0].protocol_profile.value == "iot"
     with pytest.raises((ValidationError, AttributeError, TypeError)):
         parsed.revision = 8
+
+
+# --- excess-solar accelerated charging gates (API_CONTRACTS "Excess-solar
+# --- accelerated charging (advisory)") ----------------------------------------
+#
+# The feature is OFF by default (an absent block is identical to disabled),
+# and an enabled block is commissioned only for a write-enabled deployment
+# with a policy, coherent hysteresis, a cap inside the static unit charge
+# limit, a satisfiable freshness bound, and a bounded intent TTL.
+
+
+def _excess_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"enabled": True}
+    payload.update(overrides)
+    return payload
+
+
+def _assert_excess_rule(payload: dict[str, Any], *, message_contains: str) -> ValidationError:
+    """Refuse the block by its OWN commissioning rule, not by key ignorance.
+
+    Today the block is unknown, so pydantic answers ``extra_forbidden`` while
+    echoing the (substring-bearing) input back — a spurious pass.  The rule is
+    only implemented when the refusal is a real value error whose location is
+    the excess_charging block itself.
+    """
+    with pytest.raises(ValidationError) as caught:
+        _validate(payload)
+    error = caught.value
+    excess_errors = [
+        item for item in error.errors() if item["loc"] and item["loc"][0] == "excess_charging"
+    ]
+    assert excess_errors, f"expected an excess_charging error, got {error.errors()!r}"
+    assert all(item["type"] != "extra_forbidden" for item in excess_errors), (
+        "the excess_charging block must be a known key refused by its commissioning rule, "
+        "not rejected as an unknown key"
+    )
+    assert message_contains in str(error).lower()
+    return error
+
+
+def test_excess_charging_is_disabled_by_default() -> None:
+    """T-UNIT-CONFIG-014 / advisory feature default-off / S0."""
+    parsed = _validate(_valid_config())
+
+    assert getattr(parsed, "excess_charging", "__missing__") is None, (
+        "no excess_charging block means the feature is entirely absent"
+    )
+
+    explicit_off = _valid_config()
+    explicit_off["excess_charging"] = {"enabled": False}
+    parsed_off = _validate(explicit_off)
+    assert parsed_off.excess_charging.enabled is False
+
+
+def test_excess_charging_enabled_validates_and_carries_pinned_defaults() -> None:
+    """T-UNIT-CONFIG-015 / advisory block defaults / S1."""
+    payload = _valid_config()
+    payload["excess_charging"] = _excess_payload()
+
+    parsed = _validate(payload)
+
+    block = parsed.excess_charging
+    assert block.enabled is True
+    assert block.export_headroom_margin_w == 200
+    assert block.max_charge_from_export_w == 2500
+    assert block.export_telemetry_max_age_s == 3.0
+    assert block.assumed_autonomous_charge_w == 520
+    assert block.min_acceleration_w == 100
+    assert block.exit_hysteresis_w == 50
+    assert block.intent_ttl_s == 10.0
+
+
+def test_excess_charging_requires_write_enabled_mode() -> None:
+    """T-UNIT-CONFIG-016 / advisory needs an actuating composition / S0."""
+    payload = _valid_config(mode="observe_only")
+    payload.pop("policy", None)
+    payload["excess_charging"] = _excess_payload()
+
+    _assert_excess_rule(payload, message_contains="write_enabled")
+
+
+def test_excess_charging_requires_a_policy_block() -> None:
+    """T-UNIT-CONFIG-016A / advisory bounds derive from the policy / S0.
+
+    The write-enabled-without-policy refusal already exists; this test pins
+    that the EXCESS block itself names the policy requirement when enabled.
+    """
+    payload = _valid_config(mode="write_enabled")
+    payload.pop("policy")
+    payload["excess_charging"] = _excess_payload()
+
+    _assert_excess_rule(payload, message_contains="policy")
+
+
+def test_excess_charging_hysteresis_must_be_coherent() -> None:
+    """T-UNIT-CONFIG-017 / entry margin strictly above exit margin / S0."""
+    payload = _valid_config()
+    payload["excess_charging"] = _excess_payload(exit_hysteresis_w=100)
+
+    _assert_excess_rule(payload, message_contains="hysteresis")
+
+
+def test_excess_charging_cap_must_not_exceed_the_static_unit_charge_limit() -> None:
+    """T-UNIT-CONFIG-018 / an additional min() term only / S0."""
+    payload = _valid_config()
+    payload["excess_charging"] = _excess_payload(max_charge_from_export_w=2501)
+
+    _assert_excess_rule(payload, message_contains="max_unit_charge_w")
+
+
+def test_excess_charging_freshness_must_be_satisfiable_by_the_polling_loop() -> None:
+    """T-UNIT-CONFIG-019 / a fresher demand than the plan serves collapses the
+    bound permanently: refuse it at configuration time / S0."""
+    payload = _valid_config()
+    # control 0.40 + essential read 0.10 = 0.50; a bound of exactly 0.50 can
+    # never be strictly satisfied cycle over cycle.
+    payload["excess_charging"] = _excess_payload(export_telemetry_max_age_s=0.50)
+
+    _assert_excess_rule(payload, message_contains="control_period_s")
+
+
+def test_excess_charging_intent_ttl_is_bounded() -> None:
+    """T-UNIT-CONFIG-020 / short-lived intents only / S1."""
+    too_long = _valid_config()
+    too_long["excess_charging"] = _excess_payload(intent_ttl_s=300.5)
+    _assert_excess_rule(too_long, message_contains="300")
+
+    not_renewable = _valid_config()
+    not_renewable["excess_charging"] = _excess_payload(intent_ttl_s=0.20)
+    _assert_excess_rule(not_renewable, message_contains="control_period_s")

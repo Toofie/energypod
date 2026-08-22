@@ -113,8 +113,10 @@ _REQUIRED_BLOCKS: tuple[int, ...] = (
     _RTU_ID_BASE,
 )
 
+# The PCS live block 0x1000 became advisory-CONSUMED with the excess-solar
+# contract (grid_power_w at +17, load_power_w at +20 — PROTOCOL_EVIDENCE 4c);
+# it no longer belongs in the unconsumed set below.
 _UNCONSUMED_BLOCKS: tuple[int, ...] = (
-    0x1000,
     0x1060,
     0x2000,
     0x2060,
@@ -781,3 +783,103 @@ def test_decode_leaves_the_served_blocks_untouched(wire_decode: Any, capture: An
     _decode_unit(wire_decode, capture, "MID", blocks=blocks)
 
     assert blocks == snapshot
+
+
+# --- excess-solar advisory fields (PCS grid/load power) ------------------------
+#
+# API_CONTRACTS "Excess-solar accelerated charging (advisory)" and
+# PROTOCOL_EVIDENCE section 4c: the per-pod CT power words live in the PCS
+# live block — grid at 0x1000+17 and load at 0x1000+20, both int16 unscaled
+# watts (SysControl.cs:500/503) — with the live-proven sign NEGATIVE = import,
+# POSITIVE = export.  The fields are ADVISORY: honest per-field quality, but
+# deliberately outside the safety-critical completeness set so an ordinary
+# control decision never fails because a poll did not serve the PCS block.
+
+_PCS_BLOCK_BASE = 0x1000
+_PCS_GRID_POWER_OFFSET = 17
+_PCS_LOAD_POWER_OFFSET = 20
+
+_GRID_LOAD_SPOT: dict[str, dict[str, float]] = {
+    "MID": {"grid_w": -1736.0, "load_w": 1701.0},
+    "RHS": {"grid_w": -37.0, "load_w": 1063.0},
+    "LHS": {"grid_w": -48.0, "load_w": 1781.0},
+}
+
+
+@pytest.mark.parametrize("unit_key", _UNIT_KEYS)
+def test_pcs_block_decodes_signed_grid_and_load_power(
+    wire_decode: Any, capture: Any, unit_key: str
+) -> None:
+    """T-UNIT-WIRE-025 / PROTOCOL_EVIDENCE 4c (0x1000+17/+20) / S1.
+
+    The deployed capture carries the PCS live block, so the observation must
+    carry its two power words with honest GOOD quality.
+    """
+    pcs = _blocks_of(capture, unit_key)[_PCS_BLOCK_BASE]
+    observation = _decode_unit(wire_decode, capture, unit_key)
+
+    signed = protocol_codec.decode_signed16
+    assert observation.grid_power_w == pytest.approx(float(signed(pcs[_PCS_GRID_POWER_OFFSET]))), (
+        "grid power must decode from the PCS block at 0x1000+17, signed, unscaled watts"
+    )
+    assert observation.load_power_w == pytest.approx(float(signed(pcs[_PCS_LOAD_POWER_OFFSET]))), (
+        "load power must decode from the PCS block at 0x1000+20, signed, unscaled watts"
+    )
+    assert observation.quality["grid_power_w"] is DataQuality.GOOD
+    assert observation.quality["load_power_w"] is DataQuality.GOOD
+
+
+@pytest.mark.parametrize("unit_key", _UNIT_KEYS)
+def test_grid_power_sign_follows_the_live_import_export_convention(
+    wire_decode: Any, capture: Any, unit_key: str
+) -> None:
+    """T-UNIT-WIRE-026 / live-proven sign convention (PROTOCOL_EVIDENCE 4b/4c) / S0.
+
+    Every captured unit was importing at capture time, so the decoded CT power
+    must be negative exactly as the wire read it — never sign-flipped.
+    """
+    observation = _decode_unit(wire_decode, capture, unit_key)
+
+    assert observation.grid_power_w == pytest.approx(_GRID_LOAD_SPOT[unit_key]["grid_w"])
+    assert observation.load_power_w == pytest.approx(_GRID_LOAD_SPOT[unit_key]["load_w"])
+    assert observation.grid_power_w < 0, "captured units were importing: negative = import"
+
+
+@pytest.mark.parametrize("unit_key", _UNIT_KEYS)
+def test_missing_pcs_block_leaves_grid_and_load_missing_but_qualifying(
+    wire_decode: Any, capture: Any, unit_key: str
+) -> None:
+    """T-UNIT-WIRE-027 / advisory fields outside the safety set / S0.
+
+    A poll without the PCS block must report grid and load honestly MISSING
+    while the observation STILL qualifies for ordinary control: export-bounded
+    charging is gated by its own fail-closed bound (which collapses to 0
+    without grid evidence), never by the general safety completeness set.
+    """
+    blocks = _blocks_of(capture, unit_key)
+    del blocks[_PCS_BLOCK_BASE]
+    observation = _decode_unit(wire_decode, capture, unit_key, blocks=blocks)
+
+    assert observation.grid_power_w is None
+    assert observation.load_power_w is None
+    assert observation.quality["grid_power_w"] is DataQuality.MISSING
+    assert observation.quality["load_power_w"] is DataQuality.MISSING
+    assert observation.safety_data_complete is True, (
+        "advisory fields must not enter the safety-critical completeness set"
+    )
+
+
+def test_quality_map_carries_the_advisory_field_set(wire_decode: Any, capture: Any) -> None:
+    """T-UNIT-WIRE-028 / ADVISORY_QUALITY_FIELDS shape / S1.
+
+    The decoder always emits the twelve-key quality shape (ten safety-critical
+    plus the two advisory fields); the domain accepts exactly the ten-field or
+    the twelve-field shape and nothing else.
+    """
+    observation = _decode_unit(wire_decode, capture, "MID")
+
+    assert set(observation.quality) == set(Observation.QUALITY_FIELDS) | {
+        "grid_power_w",
+        "load_power_w",
+    }
+    assert hasattr(Observation, "ADVISORY_QUALITY_FIELDS")

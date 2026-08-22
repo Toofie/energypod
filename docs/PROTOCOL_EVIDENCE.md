@@ -182,6 +182,44 @@ placeholder is only tolerable because run mode never writes).
 **Stop path CONFIRMED:** `[1,0,0]` returned the unit to its pre-trial
 state within 1.5 s; no force-state write needed.
 
+## 4c. Per-pod grid and load power (export-arbitrage telemetry)
+
+Added 2026-08-23 for the excess-solar accelerated-charging design. Three
+registers carry the per-pod CT measurements the feature reads; the sign
+convention is the one §4b proved live. Addresses below are the literal
+zero-based PDU `startAddress` values the vendor application passes to
+NModbus (section 3), pinning the shorthand prose in §4b to exact call sites.
+
+| Register | View / field | Decode | Vendor cite | Live capture 2026-08-22 (MID/RHS/LHS) | Classification |
+|---|---|---|---|---|---|
+| `0x1000+17` (`0x1011`) | PCS external grid power (per-pod CT) | `int16`, unscaled W | `SysControl.cs:500` | −1736 / −37 / −48 W | **Confirmed by vendor code; live-captured** |
+| `0x1000+20` (`0x1014`) | PCS load power | `int16`, unscaled W | `SysControl.cs:503` | 1701 / 1063 / 1781 W | **Confirmed by vendor code; live-captured** |
+| `0x0100+55` (`0x0137`) | system overview grid power (per-pod CT) | `int16`, unscaled W | `SysControl.cs:429` | −1825 / −41 / −48 W | **Confirmed by vendor code; live-captured** |
+
+- **Sign (control-grade): NEGATIVE = IMPORT, POSITIVE = EXPORT.** All six
+  live-captured grid words above are negative while the site was importing,
+  matching §4b's captures (−1736/−37/−48) and the prior implementations'
+  `Charging` gate requiring `grid < 0`. The §7 row "External-grid power
+  sign: Unknown" is superseded by this row and §4b.
+- The two grid views agree in sign and within metering tolerance on
+  RHS/LHS (−41/−48 system vs −37/−48 PCS); MID diverges by ~89 W
+  (−1825 vs −1736), consistent with the differently-filtered integration
+  windows already recorded for the PCS metering chain (field-mapping §5,
+  A-3/A-14). The **control-grade source is the PCS view `0x1000+17`**:
+  the tiered read plan can refresh it at the control rate, while the
+  61-word system block stays a cold-ring cross-check. The two views are
+  never merged into one value.
+- Load power at `0x1000+20` balances the capture independently (MID:
+  1736 ≈ 1701 load + 39 standby draw), corroborating both power words.
+  Note the prior `nextgen` dashboard mislabeled decimal register 4116 —
+  this same word — as battery power (§4b); the correct meaning is load
+  power per the vendor decoder.
+- The prior `byd` dashboard's `Charging`-while-idle behavior and the
+  operator's observed daytime self-charge (~−520..−560 W battery power
+  while pods autonomously follow their own CTs) are the environment facts
+  that make the export-sum bound the right control signal; they are
+  operational observations, not register facts.
+
 Authorized by the operator as a direct hookup; every operation below was a
 read-only FC03 holding-register read through the production
 `WaveshareTransport`; no write of any kind was issued.
@@ -406,7 +444,7 @@ All six fields are low-word-first `uint32 ×0.1`: grid buy, grid sell, load cons
 | The device has an approximately two-second lease/watchdog. | **Unknown** | Periodic renewal is confirmed, and the BMS warning dictionary includes `No Remote Dispatch`, but no vendor source defines an expiry interval. The user's and prior application's approximately two-second resend behavior is operational evidence, not a measured firmware contract. |
 | Prior active-only write | **Corroborated operationally** | Prior integrations repeatedly write signed active power to PDU address `0x0201` (513), commonly every 2.0 or 1.5 seconds (P-CONTROL, P-FLEET). This writes only P and does not reproduce the vendor's full `[1,P,Q]` transaction. It needs byte capture and a controlled acceptance test before becoming normative. |
 | Negative P means charging; positive P means discharging. | **Corroborated operationally** | Both prior implementations invoke charging with negative values and discharging with positive values. The vendor UI/source does not label either sign, and no raw measured trace was supplied. |
-| External-grid power sign | **Unknown** | Prior code infers signs, but the vendor decoder only casts the register to `short`. Buy-positive/sell-negative is not proved. |
+| External-grid power sign | **Corroborated operationally + live-captured** | NEGATIVE = import, POSITIVE = export: live captures read the external grid power word negative on all three units while importing (§4b), the prior `Charging` gate required `grid < 0`, and the follow-up capture repeats it on both grid views (§4c, `0x1000+17` / `0x0100+55`). The superseded "Unknown" applied only before those captures. |
 | Firmware fallback when renewals stop | **Unknown** | Prior use suggests autonomous grid-following resumes, but neither the device-side timeout nor fallback state is present in the inspected source. |
 | `SendPQPower()` success return | **Confirmed by vendor code** | The method initializes `result=false` and never sets it true, even after a successful write (`SysControl.cs:1442-1460`). Callers ignore the return. A rewrite must validate the actual Modbus acknowledgement instead of copying this defect. |
 

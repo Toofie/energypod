@@ -27,7 +27,8 @@ sequence, lifecycle, protocol profile, system SOC, BMS SOC, SOH, signed battery 
 and current, dynamic charge/discharge limits, cells, temperatures, active faults/warnings, and a
 quality map. Cell data carries its own monotonic capture time and sequence because it is polled less
 frequently. Derived properties expose age, cell age, cell min/max/imbalance, and safety-data
-completeness.
+completeness. Optional advisory fields (`grid_power_w`, `load_power_w`) carry per-field quality but
+stay outside the safety-critical completeness set ("Excess-solar accelerated charging (advisory)").
 
 `ControlPolicy` is immutable, strict, and versioned. It contains static per-unit/fleet limits,
 SOC/cell/temperature/imbalance limits, SOC consistency and jump thresholds, telemetry/cell maximum
@@ -352,3 +353,168 @@ coordinator, the event bus, and per-unit actor handles.
   present blocking fault re-latches on the next observation.
 - The actor exposes the inhibit cause class and its latched flag through the facade
   snapshot; the REST surface is exactly this one new endpoint and nothing else.
+
+## Excess-solar accelerated charging (advisory)
+
+Purpose: fleet-wide surplus PV (export measured on any phase) charges the neediest battery at a
+rate its own per-phase autonomy could never reach, under net-across-phases billing. The feature is
+advisory-only and config-gated OFF by default.
+
+### Advisory component, ordinary authority
+
+- `energypod.application.excess_charge.ExcessChargeAdviser` is composed only when
+  `excess_charging.enabled` is true. It owns no transport, no authorization path, no allocator or
+  kernel role, and cannot import control adapters.
+- It submits ordinary short-TTL `PowerIntent`s with `source: OPTIMIZER` through the facade's
+  internal `submit_advisory_intent` — the POST-equivalent internal submit with the same
+  validation, audit, and publication as `submit_intent`, mintage source pinned to `OPTIMIZER`,
+  and never exposed on REST or MCP. Everything downstream is the existing path:
+  arbiter → allocator → SafetyKernel → per-unit authority. The adviser has no special authority
+  anywhere in that chain.
+- The composed automation principal is `energypod:excess-adviser` (scopes `observe` + `dispatch`,
+  non-interactive, site-bound). Audit attribution relies on principal plus the `optimizer` source
+  tag: local console and agent traffic is `operator:local` + `manual`/`agent`, the adviser is
+  always distinguishable.
+
+### Operator precedence (pinned)
+
+`IntentArbiter` priority (emergency stop > manual > agent > optimizer > schedule > idle; equal
+priority by acceptance revision then stable id) already displaces the adviser whenever a manual or
+agent intent is live — live-verified 2026-08-23, when a console manual intent superseded an
+in-flight agent intent mid-window. The adviser also yields on its own: while any active intent
+with priority above `OPTIMIZER` exists fleet-wide, it withdraws its intent (repository removal,
+never a stop triple) and does not re-post until that intent has expired AND the entry hysteresis
+re-qualifies.
+
+### Deterministic export bound
+
+For a charge intent with `source == OPTIMIZER`, the allocator computes — from the fleet
+observations and policy it already receives — one additional min() term on the allocation demand:
+
+```text
+eligible_charge_w = min(max_charge_from_export_w,
+                        max(0, floor(Σ_{u ∈ fleet} grid_power_w[u]) - export_headroom_margin_w))
+```
+
+- `grid_power_w` is the per-pod CT power at PCS `0x1000+17` (int16, unscaled W; vendor cite
+  `SysControl.cs:500`); sign live-proven: negative = import, positive = export
+  (PROTOCOL_EVIDENCE sections 4b/4c).
+- The sum is over every unit in the policy's per-unit maps (the whole fleet): the arbitrage is
+  net-across-phases. One phase exporting 1500 W while the target's phase idles is exactly the
+  scenario the bound serves.
+- The term can only lower power below today's limits — static per-unit, fleet, BMS dynamic,
+  ramp, SOC ceiling/floor, apparent/reactive all still apply unchanged. It can never raise power
+  above what today's path would authorize.
+
+### Fail-closed freshness and quality
+
+- The bound is 0 unless EVERY fleet unit's observation carries a `grid_power_w` that is finite,
+  `quality == GOOD`, and no older than `export_telemetry_max_age_s` (mirroring the kernel's
+  `telemetry_stale` pattern). One unreadable phase is never treated as zero export: a missing
+  unit, a `None`/non-finite value, or a non-GOOD quality each collapse the bound to 0.
+- Defense in depth: the SafetyKernel additionally rejects a non-zero export-bounded charge
+  proposal with reason codes `export_evidence_missing`, `export_evidence_bad`, or
+  `export_evidence_stale`, computed over the fleet observations the kernel already holds.
+- Zero-watt proposals never accrue export deny reasons: zero is always permitted, and all-zero or
+  partially-eligible allocations remain legitimate representations (never couple active direction
+  to positive watts anywhere in this feature).
+
+### Observation fields and readthrough
+
+- `Observation` gains optional `grid_power_w` and `load_power_w` (signed; None when unsourced)
+  with quality keys in a new `ADVISORY_QUALITY_FIELDS` set. The quality map contains exactly
+  `QUALITY_FIELDS` (the ten safety-critical fields) or exactly `QUALITY_FIELDS ∪
+  ADVISORY_QUALITY_FIELDS`; the wire decoder always emits the twelve-key shape, with MISSING for
+  unserved sources.
+- Both fields stay OUTSIDE `safety_data_complete` and the kernel's required-quality set: an
+  ordinary (non-export) control decision must not start failing because a deployment's read plan
+  does not serve the PCS block. Export-bounded control is gated by its own fail-closed bound,
+  not by the general safety completeness set.
+- The facade snapshot telemetry summary and the unit-detail projection expose both fields
+  readthrough-style: nullable, never zero-filled, never fabricated.
+
+### Read-plan tier promotion
+
+With the feature enabled, the live decode strategy promotes the PCS live block `0x1000` (grid at
++17, load at +20) from the cold ring into the control-rate core, so `grid_power_w` refreshes
+every telemetry cycle. The plan stays inside the commissioned cadence budget: steady-state
+≤ 8 windows plus the probe (~0.9 s at the 0.1 s inter-frame gap, inside the 1.5 s control
+period; bootstrap cycle ≤ 10 windows). With the feature absent or disabled the plan is exactly
+today's, PCS block included in the ~108 s cold ring.
+
+### Beat-autonomy hysteresis
+
+While renewed, the adviser's objective REPLACES the pod's own self-consumption (its CT-following
+autonomy resumes only after our renewal lapses); commanding less than the pod's autonomous rate
+would slow charging — a regression the operator would feel. The adviser therefore:
+
+- enters only when `achievable_w ≥ assumed_autonomous_charge_w + min_acceleration_w`, where
+  `achievable_w = min(eligible_charge_w, target unit charge headroom, static unit charge cap)`;
+- once intervening, continues while `achievable_w > assumed_autonomous_charge_w +
+  exit_hysteresis_w` (`exit_hysteresis_w < min_acceleration_w`, validated at configuration
+  time), so a dip between the two thresholds never oscillates;
+- otherwise leaves autonomy alone entirely — no intent, no write, no stop triple.
+
+The commissioned ramp limit (1000 W/s at the 1.5 s cadence) exceeds the autonomous rate, so the
+first authorized tick already meets or exceeds autonomy once entry qualifies.
+
+### Target selection
+
+Exactly one unit at a time, never a fleet-wide dispatch: the neediest — lowest `system_soc_pct`
+among units whose latest observation is controllable (lifecycle `ARMED_IDLE`/`ACTIVE`), below the
+SOC charge ceiling, and with positive charge headroom; ties break by unit id. Non-controllable,
+inhibited, or ceiling-blocked units are skipped, and the kernel's existing deny reasons remain
+the backstop.
+
+### Night writers and external writers
+
+The feature is OFF by default and is enabled only for deliberate daytime operation (other apps
+monitor read-only by day and write at night). The existing arm-time external-writer preflight
+(served PQ objective readback at IoT `0x1060+17/+18`) is unchanged and dominates: a foreign
+nonzero objective latches `INHIBITED` with cause `external_writer`, the target selector skips the
+unit, and the kernel's `lifecycle_not_controllable` backstops. The adviser never writes registers
+and never fights a latched inhibit.
+
+### Renewal and the designed fail-safe
+
+The adviser renews (remove previous, submit fresh) once per fleet cycle — bounded by the control
+interval, after polls and before the kernel tick; a failing evaluation is survivable per cycle
+(advisory) and never halts the fleet. Intent TTL is `intent_ttl_s` (≤ 300 s, the REST dispatch
+cap; default 10 s). Any failure to renew — adviser stall, process death, bound collapse,
+staleness, yield, or hysteresis exit — ends the intent by TTL, the kernel stops minting, the
+actor stops writing, and the firmware watchdog (measured ~3.5-4.0 s) returns the pod to its own
+CT-following autonomy. Hand-back is by non-renewal: the adviser issues no stop triple and no IDLE
+intent on exit. Emergency stop, fences, and shutdown dominate renewal exactly as for any other
+intent.
+
+### Net-billing assumption (operator-confirmed PENDING)
+
+The feature is energy arbitrage on export and assumes site billing is netted across phases. A
+per-phase-billed site changes the ECONOMICS (import on the charging phase could be billed above
+the export credit elsewhere) but changes NOTHING about safety: the bound caps at measured
+physical export and every existing safety limit still applies. The operator must confirm net
+billing before the feature is enabled in production.
+
+### Policy and configuration keys
+
+`ControlPolicy` gains the all-or-none export triple — `export_charge_limit_w` (positive),
+`export_headroom_margin_w` (non-negative), `export_telemetry_max_age_s` (positive); absent (the
+default) means export bounding is not armed, and the bound for an optimizer charge intent is then
+0: an advisory charge may flow only from measured, armed export evidence.
+
+| Key (under `excess_charging`) | Type | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `false` | feature switch; an absent block is identical to disabled |
+| `export_headroom_margin_w` | int > 0 | `200` | export kept on the grid before any advisory charge |
+| `max_charge_from_export_w` | int > 0 | `2500` | hard cap on the bound; must not exceed `policy.max_unit_charge_w` (validated) |
+| `export_telemetry_max_age_s` | float > 0 | `3.0` | freshness bound on grid evidence; must exceed `timing.control_period_s + timing.essential_read_timeout_s` (validated) |
+| `assumed_autonomous_charge_w` | int > 0 | `520` | the evidenced daytime self-charge rate (~-520..-560 W observed) |
+| `min_acceleration_w` | int > 0 | `100` | entry margin over autonomy |
+| `exit_hysteresis_w` | int ≥ 0 | `50` | exit margin; strictly below `min_acceleration_w` (validated) |
+| `intent_ttl_s` | float > 0 | `10.0` | adviser intent TTL; ≤ 300 s and > `control_period_s` (validated) |
+
+Configuration gates: `excess_charging.enabled: true` is refused unless `mode: write_enabled` AND
+a `policy` block is present (an observe-only composition structurally never actuates; an adviser
+there is dead code refused at validation time), and every cross-validation above holds. The
+default — no block, or `enabled: false` — composes no adviser, adds no policy export triple,
+promotes no register tier, and changes nothing else.

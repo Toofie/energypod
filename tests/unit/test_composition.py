@@ -44,7 +44,13 @@ from energypod.application.actor import EnergyPodActor
 from energypod.application.audit import AuditEventFactory
 from energypod.application.control_kernel import ControlKernel
 from energypod.application.generation import AuthorityGenerationCoordinator
-from energypod.domain import Direction, IntentSource, PowerIntent, UnitLifecycle
+from energypod.domain import (
+    ControlPolicy,
+    Direction,
+    IntentSource,
+    PowerIntent,
+    UnitLifecycle,
+)
 from energypod.domain.audit import AuditEvent
 from energypod.domain.authorization import AuthorizationBatch, AuthorizedSetpoint
 from energypod.runtime.config import ControllerConfig
@@ -1526,3 +1532,215 @@ async def test_a_configured_credential_reference_stays_fail_closed_even_in_simul
     status, body = await _asgi_request(runtime.app, "GET", "/healthz")
     assert status == 200
     assert body == {"ok": True}
+
+
+# --- excess-solar export bound (API_CONTRACTS "Excess-solar accelerated
+# --- charging (advisory)") ----------------------------------------------------
+#
+# The deterministic bound is ONE additional min() term on the allocation
+# demand for an OPTIMIZER-sourced charge intent: margin-subtracted fleet grid
+# export, capped by max_charge_from_export_w, collapsing to 0 whenever any
+# fleet unit's grid evidence is missing, quality-bad, or stale.  It can never
+# raise power above today's limits, and it never applies to any other source
+# or direction.
+
+
+def _export_control_policy(
+    *, export_limit_w: int | None = 2_000, margin_w: int = 200, max_age_s: float = 3.0
+) -> Any:
+    """A real ControlPolicy with the export triple armed (all-or-none)."""
+    values: dict[str, Any] = {
+        "version": "export-1",
+        "static_charge_limit_w_by_unit": {"mid": 2_500, "rhs": 2_500},
+        "static_discharge_limit_w_by_unit": {"mid": 2_500, "rhs": 2_500},
+        "fleet_charge_limit_w": 6_000,
+        "fleet_discharge_limit_w": 6_000,
+        "min_soc_pct": 10.0,
+        "max_soc_pct": 95.0,
+        "max_soc_jump_pct": 10.0,
+        "max_soc_disagreement_pct": 5.0,
+        "min_cell_voltage_v": 2.80,
+        "max_cell_voltage_v": 3.65,
+        "max_cell_imbalance_v": 0.050,
+        "expected_cell_count_by_unit": {"mid": 59, "rhs": 59},
+        "min_temperature_c": 0.0,
+        "max_temperature_c": 45.0,
+        "max_temperature_spread_c": 45.0,
+        "max_telemetry_age_s": 5.0,
+        "max_cell_age_s": 15.0,
+        "authorization_lifetime_s": 2.0,
+        "heartbeat_interval_s": 1.5,
+        "ramp_limit_w_per_s_by_unit": {"mid": 10_000, "rhs": 10_000},
+        "apparent_power_limit_va_by_unit": {"mid": 5_000, "rhs": 5_000},
+        "reactive_limit_var": 0,
+        "stable_samples_needed_to_rearm": 3,
+        "blocking_fault_codes": frozenset(),
+        "blocking_warning_codes": frozenset(),
+    }
+    if export_limit_w is not None:
+        values.update(
+            export_charge_limit_w=export_limit_w,
+            export_headroom_margin_w=margin_w,
+            export_telemetry_max_age_s=max_age_s,
+        )
+    try:
+        return ControlPolicy(**values)
+    except ValidationError as error:
+        pytest.fail(f"the ControlPolicy export triple is not implemented: {error}", pytrace=False)
+        raise  # pragma: no cover - pytest.fail never returns
+
+
+def _export_observation(
+    *, grid_power_w: float | None, captured_at_mono: float = 100.0
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        dynamic_charge_limit_w=2_500.0,
+        dynamic_discharge_limit_w=2_500.0,
+        grid_power_w=grid_power_w,
+        captured_at_mono=captured_at_mono,
+    )
+
+
+def _optimizer_charge_intent(watts: int = 3_000, units: frozenset[str] = frozenset({"mid"})) -> Any:
+    return PowerIntent(
+        id="excess-1",
+        source=IntentSource.OPTIMIZER,
+        selected_unit_ids=frozenset(units),
+        direction=Direction.CHARGE,
+        watts=watts,
+        duration_s=10.0,
+        accepted_at_mono=100.0,
+        acceptance_revision=1,
+        actor_identity="energypod:excess-adviser",
+    )
+
+
+def _allocate_export(intent: Any, observations: dict[str, Any], policy: Any) -> tuple[Any, ...]:
+    adapter = _load_class("energypod.runtime.composition", "_FleetAllocatorAdapter")()
+    try:
+        return tuple(adapter.allocate(intent, observations, policy, 101.0))
+    except TypeError as error:
+        pytest.fail(
+            "the allocator port does not yet accept now_mono (the export bound's freshness "
+            f"input): {error}",
+            pytrace=False,
+        )
+        raise  # pragma: no cover - pytest.fail never returns
+
+
+@pytest.mark.parametrize(
+    ("grids", "captured", "export_limit_w", "expected_watts"),
+    [
+        # Sum 1700 W export - 200 W margin = 1500 W eligible, demand 3000 W.
+        ({"mid": 800.0, "rhs": 900.0}, {}, 2_000, 1_500),
+        # The margin dominates: only 200 W of export survives it.
+        ({"mid": 300.0, "rhs": 100.0}, {}, 2_000, 200),
+        # The cap dominates: 4800 W eligible, capped at 2000 W.
+        ({"mid": 2_500.0, "rhs": 2_500.0}, {}, 2_000, 2_000),
+        # Net import across the fleet: no eligible charge at all.
+        ({"mid": -400.0, "rhs": -100.0}, {}, 2_000, 0),
+        # One stale phase collapses the whole bound fail-closed.
+        ({"mid": 800.0, "rhs": 900.0}, {"rhs": 96.0}, 2_000, 0),
+        # Without grid evidence anywhere: no advisory charge.
+        ({"mid": None, "rhs": None}, {}, 2_000, 0),
+    ],
+)
+def test_allocator_bounds_optimizer_charge_by_measured_export(
+    grids: dict[str, float | None],
+    captured: dict[str, float],
+    export_limit_w: int | None,
+    expected_watts: int,
+) -> None:
+    observations = {
+        unit: _export_observation(grid_power_w=grid, captured_at_mono=captured.get(unit, 100.0))
+        for unit, grid in grids.items()
+    }
+    policy = _export_control_policy(export_limit_w=export_limit_w)
+
+    proposals = _allocate_export(_optimizer_charge_intent(), observations, policy)
+
+    assert [proposal.unit_id for proposal in proposals] == ["mid"]
+    assert proposals[0].watts == expected_watts
+    assert getattr(proposals[0], "export_bounded", False) is True, (
+        "the proposal must carry the export-bounded flag so the kernel's evidence "
+        "denial can apply to it"
+    )
+
+
+def test_export_bound_is_zero_when_the_policy_triple_is_not_armed() -> None:
+    """No armed export triple means no advisory charging: the fail-closed default."""
+    observations = {unit: _export_observation(grid_power_w=2_500.0) for unit in ("mid", "rhs")}
+    policy = _export_control_policy(export_limit_w=None)
+
+    proposals = _allocate_export(_optimizer_charge_intent(), observations, policy)
+
+    assert proposals[0].watts == 0
+
+
+def test_export_bound_never_touches_manual_or_discharge_intents() -> None:
+    """The bound scopes to OPTIMIZER charge intents only: a manual charge or an
+    optimizer discharge allocates exactly as today, importing fleet or not."""
+    observations = {unit: _export_observation(grid_power_w=-400.0) for unit in ("mid", "rhs")}
+    policy = _export_control_policy()
+
+    manual = PowerIntent(
+        id="manual-1",
+        source=IntentSource.MANUAL,
+        selected_unit_ids=frozenset({"mid"}),
+        direction=Direction.CHARGE,
+        watts=2_000,
+        duration_s=60.0,
+        accepted_at_mono=100.0,
+        acceptance_revision=2,
+        actor_identity="operator:local",
+    )
+    discharge = PowerIntent(
+        id="excess-2",
+        source=IntentSource.OPTIMIZER,
+        selected_unit_ids=frozenset({"mid"}),
+        direction=Direction.DISCHARGE,
+        watts=2_000,
+        duration_s=10.0,
+        accepted_at_mono=100.0,
+        acceptance_revision=3,
+        actor_identity="energypod:excess-adviser",
+    )
+
+    manual_proposals = _allocate_export(manual, observations, policy)
+    discharge_proposals = _allocate_export(discharge, observations, policy)
+
+    assert manual_proposals[0].watts == 2_000
+    assert getattr(manual_proposals[0], "export_bounded", True) is False
+    assert discharge_proposals[0].watts == 2_000
+    assert getattr(discharge_proposals[0], "export_bounded", True) is False
+
+
+def test_disabled_excess_charging_composes_no_adviser(tmp_path: Path) -> None:
+    """Default configuration: no adviser handle is composed at all."""
+    runtime = compose_write_enabled(tmp_path / "no-adviser.sqlite3")
+
+    assert getattr(runtime, "excess_adviser", "__missing__") is None, (
+        "an unconfigured deployment must compose no excess-charge adviser"
+    )
+    assert getattr(runtime.policy, "export_charge_limit_w", None) is None
+
+
+async def test_enabled_excess_charging_composes_the_adviser_and_armed_policy(
+    tmp_path: Path,
+) -> None:
+    payload = _write_enabled_payload(tmp_path / "adviser.sqlite3")
+    payload["excess_charging"] = {"enabled": True}
+    try:
+        config = _validate(payload)
+    except ValidationError as error:
+        pytest.fail(f"the excess_charging configuration block is not implemented: {error}")
+        raise  # pragma: no cover
+    runtime = _compose_with(config, simulate=True)
+
+    assert getattr(runtime, "excess_adviser", None) is not None, (
+        "an enabled deployment must compose the excess-charge adviser"
+    )
+    assert runtime.policy.export_charge_limit_w == 2_500
+    assert runtime.policy.export_headroom_margin_w == 200
+    assert runtime.policy.export_telemetry_max_age_s == 3.0
+    await _shutdown_actors(runtime)
