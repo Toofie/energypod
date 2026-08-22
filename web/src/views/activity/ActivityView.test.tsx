@@ -18,7 +18,9 @@
 //     telemetry_stale, latched, latch_cleared, ...);
 //   - only the per-unit mutations (unit_armed, unit_disarmed,
 //     inhibit_acknowledged) carry a `unit_id`; fleet-wide decisions and stops
-//     carry none and are never claimed for a unit.
+//     carry none and are never claimed for a unit; the wire's unit ids are
+//     lowercase (mid, rhs, lhs) while the chips are named MID, RHS, LHS, so
+//     the unit filter compares canonical ids, never display labels.
 //
 // Pinned surface strings an implementation must render (calm household tone,
 // plain language first, raw codes on demand):
@@ -44,6 +46,11 @@
 //     "All units", "MID", "RHS", "LHS" where "All units" resets the unit
 //     filter; every chip is a toggle button exposing aria-pressed across its
 //     whole lifecycle and keyboard operable
+//   - filtered empty: an empty Acknowledgements filter says what will appear
+//     there (a latched stop or latched inhibit being acknowledged) and stays
+//     honest about unloaded history, while an empty per-unit filter explains
+//     that fleet-wide decisions and stops carry no unit id; every other
+//     filtered-empty state is the plain "No activity matches these filters"
 //   - states: loading role "status" named "Loading activity" renders skeleton
 //     placeholder entries INSIDE the status region (never a spinner-only
 //     region) that carry no data; empty "Nothing here yet" + what appears
@@ -393,7 +400,13 @@ describe("Activity view", () => {
     rhsChip.focus();
     await user.keyboard("{Enter}");
     expect(screen.queryAllByRole("listitem")).toHaveLength(0);
-    expect(screen.getByText("No activity matches these filters")).toBeVisible();
+    // A per-unit view that matches nothing explains where the fleet-wide
+    // rows went instead of looking broken.
+    expect(
+      screen.getByText(
+        "No RHS activity matches these filters. Fleet-wide decisions and stops carry no unit id, so they appear only under All units.",
+      ),
+    ).toBeVisible();
 
     // "All units" resets the unit filter: every entry returns and the unit
     // toggles go back to unpressed.
@@ -402,6 +415,133 @@ describe("Activity view", () => {
     await user.keyboard("{Enter}");
     expect(screen.getAllByRole("listitem")).toHaveLength(6);
     expect(rhsChip).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("tells an empty Acknowledgements filter what will appear there", async () => {
+    // No *_acknowledged entry anywhere in the loaded history: the operator
+    // must see what the section is waiting for, not a bare "nothing matches".
+    client.getAudit = vi
+      .fn()
+      .mockResolvedValue(auditPage([emergencyStop, clampedDecision], null));
+
+    renderView();
+    await screen.findAllByRole("listitem");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Acknowledgements" }));
+
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+    expect(
+      screen.getByText(
+        "No acknowledgements yet. One appears here each time a latched emergency stop or a latched unit inhibit is acknowledged.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.queryByText("No activity matches these filters"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("stays honest about unloaded history when the loaded page holds no acknowledgement", async () => {
+    // With more history unloaded, an older acknowledgement may simply be
+    // beyond the loaded page: the empty message shrinks its claim and points
+    // at Load more instead of asserting "none yet".
+    client.getAudit = vi
+      .fn()
+      .mockResolvedValue(auditPage([emergencyStop, clampedDecision], 59));
+
+    renderView();
+    await screen.findAllByRole("listitem");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Acknowledgements" }));
+
+    expect(
+      screen.getByText(
+        "No acknowledgements in the activity loaded so far — Load more reaches older entries. One appears here each time a latched emergency stop or a latched unit inhibit is acknowledged.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("does not claim 'no acknowledgements yet' when the unit filter narrowed them away", async () => {
+    // Acknowledgements that exist but are excluded by the unit filter are a
+    // per-unit empty state, never "nothing yet".
+    client.getAudit = vi
+      .fn()
+      .mockResolvedValue(auditPage([inhibitAcknowledgementMID], null));
+
+    renderView();
+    await screen.findAllByRole("listitem");
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Acknowledgements" }));
+    await user.click(screen.getByRole("button", { name: "RHS" }));
+
+    expect(
+      screen.getByText("No RHS activity matches these filters."),
+    ).toBeVisible();
+    expect(
+      screen.queryByText(/No acknowledgements/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("filters units by the wire's canonical lowercase ids while the chips keep their display names", async () => {
+    // WIRE TRUTH: the live audit trail's `unit_id` values are lowercase
+    // (mid, rhs, lhs — the snapshot and bus frames carry them the same way),
+    // while the chips are named MID, RHS, LHS. The filter must bridge the
+    // two, not compare a display label against the data.
+    const armMidLower = auditEvent({
+      sequence: 81,
+      event_type: "unit_armed",
+      unit_id: "mid",
+      occurred_at: minutesAgo(3),
+      principal: PRINCIPAL,
+      result: "armed",
+      reason_codes: ["armed"],
+    });
+    const disarmLhsLower = auditEvent({
+      sequence: 80,
+      event_type: "unit_disarmed",
+      unit_id: "lhs",
+      occurred_at: minutesAgo(4),
+      principal: PRINCIPAL,
+      result: "disarmed",
+      reason_codes: ["disarmed"],
+    });
+    client.getAudit = vi
+      .fn()
+      .mockResolvedValue(auditPage([armMidLower, disarmLhsLower, clampedDecision], null));
+
+    renderView();
+    expect(await screen.findAllByRole("listitem")).toHaveLength(3);
+
+    const user = userEvent.setup();
+
+    // The display names stay uppercase on the chips and the pressed state
+    // tracks the canonical id underneath.
+    const lhsChip = screen.getByRole("button", { name: "LHS" });
+    await user.click(lhsChip);
+    expect(lhsChip).toHaveAttribute("aria-pressed", "true");
+    const lhsEntries = screen.getAllByRole("listitem");
+    expect(lhsEntries).toHaveLength(1);
+    expect((lhsEntries[0] as HTMLElement).textContent).toContain("lhs");
+
+    const midChip = screen.getByRole("button", { name: "MID" });
+    await user.click(midChip);
+    expect(midChip).toHaveAttribute("aria-pressed", "true");
+    expect(lhsChip).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getByText("mid")).toBeVisible();
+
+    // A unit with no rows of its own names the fleet-wide absence honestly.
+    await user.click(screen.getByRole("button", { name: "RHS" }));
+    expect(
+      screen.getByText(
+        "No RHS activity matches these filters. Fleet-wide decisions and stops carry no unit id, so they appear only under All units.",
+      ),
+    ).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "All units" }));
+    expect(screen.getAllByRole("listitem")).toHaveLength(3);
   });
 
   it("filters by kind and unit using the keyboard only", async () => {
@@ -434,7 +574,9 @@ describe("Activity view", () => {
 
     expect(midChip).toHaveAttribute("aria-pressed", "true");
     expect(
-      screen.getByText("No activity matches these filters"),
+      screen.getByText(
+        "No MID activity matches these filters. Fleet-wide decisions and stops carry no unit id, so they appear only under All units.",
+      ),
     ).toBeVisible();
     expect(screen.queryAllByRole("listitem")).toHaveLength(0);
 

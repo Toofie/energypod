@@ -4,7 +4,9 @@
 // the authoritative behavior pins live in ActivityView.test.tsx. The view is
 // a calm, newest-first timeline from GET /api/v1/audit with cursor
 // pagination, plain language first with raw reason codes on demand, and
-// honest empty/loading/disconnected/stale/partial/error states.
+// honest empty/loading/disconnected/stale/partial/error states. An empty
+// Acknowledgements filter says what will appear there (the two *_acknowledged
+// audit kinds), so "nothing yet" is never mistaken for "broken".
 //
 // WIRE TRUTH (service.py `recent_audit` over the audit read model — mirrored
 // in web/src/test/wire.ts `WireAuditEvent`): every entry carries the
@@ -52,8 +54,20 @@ export interface ActivityViewProps {
 /** The audit page size the view asks for; the cursor pagination honors it. */
 const AUDIT_PAGE_SIZE = 50;
 
-/** The fleet's named units (UI_CONTRACTS.md "Batteries": MID, RHS, LHS). */
-const FLEET_UNIT_IDS: readonly string[] = ["MID", "RHS", "LHS"];
+/**
+ * The fleet's named units (UI_CONTRACTS.md "Batteries": MID, RHS, LHS) as
+ * display labels. The wire's canonical ids are lowercase (`mid`, `rhs`,
+ * `lhs` — the audit `unit_id`, the snapshot, and the bus frames all carry
+ * them that way), so the chips show the display name but filter by the
+ * canonical id; the comparison itself normalizes both sides, because a wire
+ * that once carried uppercase ids must not silently empty the filter again.
+ */
+const FLEET_UNIT_LABELS: readonly string[] = ["MID", "RHS", "LHS"];
+
+/** The canonical form of a unit id: lowercase, trimmed. */
+function canonicalUnitId(value: string): string {
+  return value.trim().toLowerCase();
+}
 
 /** Entries older than this are stale: dimmed, never hidden, age kept. */
 const STALE_AFTER_MS = 60 * 60_000;
@@ -122,6 +136,42 @@ function kindOf(eventType: string): KindKey | "other" {
     return "acknowledgements";
   }
   return "other";
+}
+
+/**
+ * The filtered-empty message. The Acknowledgements chip can be empty because
+ * no acknowledgement has ever happened — a state the operator must be able to
+ * tell apart from a filter that merely narrowed entries away — so when the
+ * loaded timeline holds no acknowledgement at all, the message names what
+ * will appear there (the state contract's "empty explains what will appear
+ * here"). It stays honest about pagination: with more history unloaded, older
+ * acknowledgements may simply be beyond the loaded page. A per-unit view that
+ * matches nothing says why the fleet-wide rows are absent, because the audit
+ * trail attributes decisions and stops to no unit.
+ */
+function filteredEmptyText(
+  kindFilter: KindKey | null,
+  unitFilter: string | null,
+  acknowledgementsLoaded: boolean,
+  moreHistory: boolean,
+  unitlessLoaded: boolean,
+): string {
+  if (unitFilter !== null) {
+    const label = unitFilter.toUpperCase();
+    return `No ${label} activity matches these filters.${
+      unitlessLoaded
+        ? " Fleet-wide decisions and stops carry no unit id, so they appear only under All units."
+        : ""
+    }`;
+  }
+  if (kindFilter !== "acknowledgements" || acknowledgementsLoaded) {
+    return "No activity matches these filters";
+  }
+  const whatAppears =
+    "One appears here each time a latched emergency stop or a latched unit inhibit is acknowledged.";
+  return moreHistory
+    ? `No acknowledgements in the activity loaded so far — Load more reaches older entries. ${whatAppears}`
+    : `No acknowledgements yet. ${whatAppears}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -647,17 +697,35 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
       timeline.filter(
         (event) =>
           (kindFilter === null || kindOf(eventTypeOf(event)) === kindFilter) &&
-          (unitFilter === null || stringField(event, "unit_id") === unitFilter),
+          (unitFilter === null ||
+            canonicalUnitId(stringField(event, "unit_id") ?? "") ===
+              unitFilter),
       ),
     [timeline, kindFilter, unitFilter],
+  );
+  const acknowledgementsLoaded = useMemo(
+    () =>
+      timeline.some(
+        (event) => kindOf(eventTypeOf(event)) === "acknowledgements",
+      ),
+    [timeline],
+  );
+  /** Fleet-wide rows (decisions, stops) carry no unit id; a per-unit view
+   * that matches nothing names them so their absence is explained, not hid. */
+  const unitlessLoaded = useMemo(
+    () =>
+      timeline.some((event) => stringField(event, "unit_id") === undefined),
+    [timeline],
   );
 
   const toggleKind = useCallback((id: KindKey) => {
     setKindFilter((previous) => (previous === id ? null : id));
   }, []);
 
-  const toggleUnit = useCallback((id: string) => {
-    setUnitFilter((previous) => (previous === id ? null : id));
+  const toggleUnit = useCallback((label: string) => {
+    // The chip carries the display name; the filter holds the canonical id.
+    const canonical = canonicalUnitId(label);
+    setUnitFilter((previous) => (previous === canonical ? null : canonical));
   }, []);
 
   const clearUnit = useCallback(() => {
@@ -727,7 +795,15 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
           {timeline.length === 0 ? (
             <EmptyActivity />
           ) : visibleEvents.length === 0 ? (
-            <p className="activity-filtered-empty">No activity matches these filters</p>
+            <p className="activity-filtered-empty">
+              {filteredEmptyText(
+                kindFilter,
+                unitFilter,
+                acknowledgementsLoaded,
+                nextCursor !== null,
+                unitlessLoaded,
+              )}
+            </p>
           ) : (
             <ol
               className={
@@ -829,15 +905,15 @@ function ActivityFilters({
         >
           All units
         </button>
-        {FLEET_UNIT_IDS.map((unitId) => (
+        {FLEET_UNIT_LABELS.map((label) => (
           <button
-            key={unitId}
+            key={label}
             type="button"
             className="activity-chip"
-            aria-pressed={unitFilter === unitId}
-            onClick={() => onToggleUnit(unitId)}
+            aria-pressed={unitFilter === canonicalUnitId(label)}
+            onClick={() => onToggleUnit(label)}
           >
-            {unitId}
+            {label}
           </button>
         ))}
       </div>
