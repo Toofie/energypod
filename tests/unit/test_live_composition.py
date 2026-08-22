@@ -869,9 +869,16 @@ async def test_replayed_live_capture_decodes_real_telemetry_and_an_honest_snapsh
             assert observation.active_warnings == LIVE_CALIBRATION_WARNINGS, (
                 "the two calibration warnings every live unit reports must decode"
             )
-            assert set(observation.quality) == set(Observation.QUALITY_FIELDS)
-            assert all(quality is DataQuality.GOOD for quality in observation.quality.values()), (
-                "a fully served capture decodes good quality on every telemetry field"
+            assert set(observation.quality) == set(Observation.QUALITY_FIELDS) | set(
+                Observation.ADVISORY_QUALITY_FIELDS
+            ), "the decoder always emits the twelve-key quality shape"
+            assert all(
+                observation.quality[field] is DataQuality.GOOD
+                for field in Observation.QUALITY_FIELDS
+            ), (
+                "a fully served capture decodes good quality on every safety-critical field; "
+                "advisory CT fields may honestly read MISSING before the cold ring serves the "
+                "PCS block"
             )
             assert observation.cells_complete
             assert observation.temperatures_complete

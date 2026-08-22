@@ -654,6 +654,15 @@ direction, freshness, and watchdog timing per physical unit.
   of advancing?). Fix owner: src/ (queued at the head of the fix queue,
   behind the in-flight excess-charging implementation).
 
+- 2026-08-23 (queue): DISPLAY PRECISION PASS (operator request, queued for
+  the web agent slot — dispatch when the emergency-stop release-UX agent
+  lands to avoid two agents in web/): every numeric metric in the console
+  renders at most TWO decimal places — watts, SOC, voltages, temperatures,
+  currents, ages, percentages; integers render as integers (500 W, not
+  500.00 W); trailing zeros trimmed (46.5, not 46.50); display formatting
+  only, underlying data untouched; shared formatter helper + per-view sweep
+  + vitest pins.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time

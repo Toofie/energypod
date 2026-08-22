@@ -353,8 +353,9 @@ def test_export_bound_is_deterministic_and_fail_closed(
 ) -> None:
     """Margin-subtracted fleet export, capped, collapsing to 0 on any unusable
     evidence — one unreadable phase is never treated as zero export."""
-    if overrides.get("export_charge_limit_w") is None:
-        # The triple is all-or-none: disarming drops every export key.
+    if overrides.get("export_charge_limit_w", "armed") is None:
+        # The triple is all-or-none: an EXPLICIT None disarms it (empty
+        # overrides mean the commissioned defaults, not disarm).
         policy = make_policy(
             api,
             export_charge_limit_w=None,
@@ -555,6 +556,12 @@ async def test_adviser_yields_to_a_manual_intent_until_it_expires(excess: Any, a
     assert "yielding_to_higher_priority" in withheld.reason_codes
 
     clock.now = 131.0  # the manual intent has expired
+    # The re-entry tick still judges export freshness: refresh the fake
+    # fleet's capture clock (evidence 31 s old would collapse the bound
+    # fail-closed for the right reasons and mask the precedence pin).
+    observations.latest = make_fleet(
+        api, grids, **{f"{unit}__captured_at_mono": 131.0 for unit in grids}
+    )
     resumed = await adviser.tick()
     assert resumed.action == "propose"
     assert resumed.target_unit_id == "mid"

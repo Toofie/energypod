@@ -333,8 +333,17 @@ def test_all_high_confidence_fields_decode_on_every_captured_unit(
     assert observation.temperatures_complete is True
 
     # Coherent captures qualify across the whole declared quality surface.
-    assert set(observation.quality) == set(Observation.QUALITY_FIELDS)
-    assert all(quality is DataQuality.GOOD for quality in observation.quality.values())
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the wire
+    # decoder always emits the twelve-key quality shape — the ten safety
+    # fields plus the two advisory CT fields (MISSING when the PCS block is
+    # unserved by the read plan).
+    assert set(observation.quality) == set(Observation.QUALITY_FIELDS) | set(
+        Observation.ADVISORY_QUALITY_FIELDS
+    )
+    assert all(
+        observation.quality[field] is DataQuality.GOOD
+        for field in Observation.QUALITY_FIELDS
+    )
     assert observation.safety_data_complete is True
 
 
