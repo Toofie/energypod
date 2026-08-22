@@ -153,9 +153,7 @@ class Allocator:
     def __init__(self, output: tuple[Proposal, ...], history: list[str]):
         self.output, self.history, self.calls = output, history, []
 
-    def allocate(
-        self, intent: Any, observations: Any, policy: Any, now_mono: Any = None
-    ) -> Any:
+    def allocate(self, intent: Any, observations: Any, policy: Any, now_mono: Any = None) -> Any:
         # The allocator port carries the tick's monotonic time (the
         # export bound's freshness input); the fake records it without
         # asserting on it.
@@ -580,3 +578,221 @@ async def test_evaluation_failure_revokes_and_propagates(api: Any):
     with pytest.raises(RuntimeError, match="control died"):
         await kernel.tick()
     assert not audit.events and not auth.published and auth.revocations
+
+
+# --- the 2026-08-23 publish-fence generation desync (live incident) -------------
+#
+# Live evidence (~23:21Z, post-emergency-stop-acknowledgement): a fresh intent
+# after a prior intent's TTL expiry arbitrated `authorized` every cycle while
+# its watts never dispatched.  Each cycle emitted TWO audit rows sharing one
+# cycle_id -- the granted record, then a zero-authorized fenced record -- so
+# the kernel minted at a generation the repository had already fenced through.
+# Every kernel revocation bumps the repository's permanent fence to the last
+# published generation; nothing reconciled the coordinator, so minting at the
+# current epoch was fenced forever (only a restart, which resets generation
+# state, escaped it).  These contracts pin the reconciliation.
+
+
+class SwappableIntents:
+    """The intent port with a mutable active set, for multi-phase sequences."""
+
+    def __init__(self) -> None:
+        self.active_intents: tuple[Any, ...] = ()
+
+    async def active(self, now: float) -> tuple[Any, ...]:
+        del now
+        return self.active_intents
+
+
+class SelectingArbiter:
+    """The arbiter port that maps an empty active set to no winner."""
+
+    def __init__(self, intent: Intent, history: list[str]) -> None:
+        self.intent, self.history = intent, history
+
+    def select(self, intents: tuple[Intent, ...], now: float) -> Intent | None:
+        del now
+        self.history.append("select")
+        if not intents:
+            return None
+        return self.intent
+
+
+class StoreBackedAuthorizations:
+    """The real repository's permanent publish fence behind the awaitable port."""
+
+    def __init__(self) -> None:
+        memory = importlib.import_module("energypod.adapters.persistence.memory")
+        authorization = importlib.import_module("energypod.domain.authorization")
+        self._stale_error = authorization.StaleGenerationError
+        self.store = memory.InMemoryAuthorizationRepository()
+        self.published: list[Any] = []
+        self.fenced: list[Any] = []
+
+    async def publish(self, batch: Any) -> None:
+        try:
+            self.store.publish(batch)
+        except self._stale_error:
+            self.fenced.append(batch)
+            raise
+        self.published.append(batch)
+
+    async def revoke(self, unit_ids=None, *, reason: str, **_: Any) -> None:
+        self.store.revoke(unit_ids=unit_ids, reason=reason)
+
+    async def revoked_through(self, unit_ids: Any) -> int:
+        return self.store.revoked_through(unit_ids)
+
+
+def make_fenced_kernel(
+    api: Any,
+    value: Intent,
+    output: Decision | BaseException,
+    *,
+    clock: Clock | None = None,
+    after_audit: Any = None,
+    authorizations: StoreBackedAuthorizations | None = None,
+    coordinator: Any = None,
+):
+    """One kernel over the real repository fence and a real coordinator.
+
+    ``authorizations`` and ``coordinator`` may be injected so a multi-phase
+    sequence (or several kernels) can share exactly the live pair of
+    generation state and permanent fence.
+    """
+    history: list[str] = []
+    clock = clock or Clock()
+    current, previous = observation_pairs(value.unit_ids)
+    authorizations = authorizations or StoreBackedAuthorizations()
+    coordinator = coordinator or api.AuthorityGenerationCoordinator()
+    intents = SwappableIntents()
+    intents.active_intents = (value,)
+    audit = Audit(history, None, after_audit)
+    kernel = api.ControlKernel(
+        clock=clock,
+        unit_ids=UNITS,
+        intents=intents,
+        observations=Observations(current, previous, history),
+        authorizations=authorizations,
+        audit=audit,
+        arbiter=SelectingArbiter(value, history),
+        allocator=Allocator(proposals_for(value), history),
+        safety=Safety(output, history),
+        policy=SimpleNamespace(version="policy-5", max_telemetry_age_s=2.0),
+        generation_coordinator=coordinator,
+        configuration_version=12,
+        audit_event_factory=deterministic_audit_factory(api, clock),
+    )
+    return kernel, intents, authorizations, audit, coordinator
+
+
+async def test_kernel_never_mints_at_a_generation_the_repository_will_fence(api: Any):
+    """The live sequence: publish, TTL-lapse revocation, then a fresh intent.
+
+    The fresh intent's batch must actually PUBLISH -- authority lands, exactly
+    one audit row carries its cycle -- and the epoch the kernel consults must
+    stand strictly beyond the repository's permanent fence after the
+    revocation, or every later cycle is fenced with no error and no dispatch.
+    """
+    value = intent(api)
+    kernel, intents, authorizations, audit, coordinator = make_fenced_kernel(
+        api, value, decision_for(api, value)
+    )
+
+    # 1. The prior intent publishes at the coordinator's epoch.
+    await kernel.tick()
+    assert [batch.generation for batch in authorizations.published] == [0]
+
+    # 2. Its TTL lapses; the fail-closed tick revokes through the repository,
+    #    which fences that published generation permanently.  The coordinator
+    #    epoch the next tick mints at must reconcile past that fence.
+    intents.active_intents = ()
+    assert await kernel.tick() is None
+    fence = await authorizations.revoked_through(UNITS)
+    assert fence == 0, "the lapsed-intent revocation must fence the published generation"
+    assert (await coordinator.snapshot()).epoch > fence
+
+    # 3. A fresh intent must publish on its FIRST cycle, never at a fenced
+    #    generation: the batch lands, nothing is fenced, and its cycle carries
+    #    exactly one audit row (not the granted-plus-fenced pair the live
+    #    incident emitted under one cycle_id).
+    intents.active_intents = (value,)
+    decision = await kernel.tick()
+    assert decision is not None and decision.status is api.DecisionStatus.AUTHORIZED
+    assert authorizations.fenced == []
+    assert [batch.generation for batch in authorizations.published] == [0, fence + 1]
+    assert len(audit.events) == 2
+    assert len({event.cycle_id for event in audit.events}) == 2
+    assert audit.events[-1].authorized_active_w != 0
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["no_active_intent", "decision_not_authorized", "deadline_expired", "emergency_stop"],
+)
+async def test_every_kernel_revocation_reconciles_the_epoch_past_the_repository_fence(
+    api: Any, scenario: str
+):
+    """The direct invariant: after ANY kernel revocation path, the coordinator
+    epoch is strictly beyond the repository's permanent revoked-through fence."""
+    shared_store = StoreBackedAuthorizations()
+    shared_coordinator = api.AuthorityGenerationCoordinator()
+    prior = intent(api)
+    first, *_ = make_fenced_kernel(
+        api,
+        prior,
+        decision_for(api, prior),
+        authorizations=shared_store,
+        coordinator=shared_coordinator,
+    )
+    await first.tick()
+    assert shared_store.published, "every scenario starts from a published generation"
+
+    if scenario == "no_active_intent":
+        second, intents, *_ = make_fenced_kernel(
+            api,
+            prior,
+            decision_for(api, prior),
+            authorizations=shared_store,
+            coordinator=shared_coordinator,
+        )
+        intents.active_intents = ()
+    elif scenario == "decision_not_authorized":
+        rejected = Decision(
+            api.DecisionStatus.REJECTED,
+            decision_for(api, prior).setpoints,
+            ("blocking_fault",),
+        )
+        second, *_ = make_fenced_kernel(
+            api, prior, rejected, authorizations=shared_store, coordinator=shared_coordinator
+        )
+    elif scenario == "deadline_expired":
+        clock = Clock()
+        second, *_ = make_fenced_kernel(
+            api,
+            prior,
+            decision_for(api, prior),
+            clock=clock,
+            after_audit=lambda: clock.advance(1.0),
+            authorizations=shared_store,
+            coordinator=shared_coordinator,
+        )
+    else:
+        stop = intent(api, emergency=True)
+        second, intents, *_ = make_fenced_kernel(
+            api,
+            stop,
+            decision_for(api, stop),
+            authorizations=shared_store,
+            coordinator=shared_coordinator,
+        )
+        intents.active_intents = (stop,)
+
+    await second.tick()
+    fence = await shared_store.revoked_through(UNITS)
+    assert fence == 0, f"{scenario} must fence the published generation"
+    epoch = (await shared_coordinator.snapshot()).epoch
+    assert epoch > fence, (
+        f"{scenario} left the coordinator epoch {epoch} at or below the repository fence "
+        f"{fence}: the next tick would mint at a fenced generation forever"
+    )

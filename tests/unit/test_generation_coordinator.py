@@ -439,3 +439,91 @@ async def test_healthy_cycles_keep_generation_stable_and_use_fresh_cycle_ids(
     assert [batch.generation for batch in authorizations.published] == [5, 5]
     assert len({batch.cycle_id for batch in authorizations.published}) == 2
     assert coordinator.advance_calls == []
+
+
+# --- reconciliation past a fence another component already applied --------------
+#
+# 2026-08-23 live desync: a revocation that fences the repository without
+# advancing this coordinator leaves every later mint at a fenced epoch.  The
+# coordinator therefore owes a reconciliation operation: move strictly beyond
+# an already-applied fence, idempotently and without ever regressing.
+
+
+async def test_advance_past_moves_strictly_beyond_an_applied_fence(contract: Any) -> None:
+    coordinator = contract.AuthorityGenerationCoordinator()
+    assert inspect.iscoroutinefunction(coordinator.advance_past)
+    assert (await coordinator.advance_past(0, reason="publish-fence-reconciled")).epoch == 1
+    assert (await coordinator.snapshot()).epoch == 1
+
+
+async def test_advance_past_is_an_idempotent_no_op_when_already_beyond(contract: Any) -> None:
+    coordinator = contract.AuthorityGenerationCoordinator()
+    await coordinator.advance(reason="operator-stop")
+    await coordinator.advance(reason="unit-inhibit:mid")
+    # Reconciling an older fence must not regress or churn the live epoch.
+    assert (await coordinator.advance_past(0, reason="stale-fence")).epoch == 2
+    assert (await coordinator.advance_past(1, reason="stale-fence")).epoch == 2
+    assert (await coordinator.snapshot()).epoch == 2
+    assert (await coordinator.advance(reason="next-fence")).epoch == 3
+
+
+async def test_advance_past_jumps_just_beyond_a_far_fence_and_stays_irreversible(
+    contract: Any,
+) -> None:
+    coordinator = contract.AuthorityGenerationCoordinator()
+    assert (await coordinator.advance_past(6, reason="repository-fence:6")).epoch == 7
+    assert (await coordinator.advance_past(2, reason="older-fence")).epoch == 7
+    assert (await coordinator.advance_past(9, reason="repository-fence:9")).epoch == 10
+    assert (await coordinator.snapshot()).epoch == 10
+
+
+@pytest.mark.parametrize("epoch", [True, False, -1, MAX_GENERATION + 1, 1.0, "1", None])
+async def test_advance_past_rejects_malformed_epoch_without_mutation(
+    contract: Any, epoch: Any
+) -> None:
+    coordinator = contract.AuthorityGenerationCoordinator()
+    with pytest.raises((TypeError, ValueError)):
+        await coordinator.advance_past(epoch, reason="malformed-fence")
+    assert (await coordinator.snapshot()).epoch == 0
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [None, True, False, 1, "", " ", " leading", "trailing ", "bad\nreason", "x" * 201],
+)
+async def test_advance_past_rejects_malformed_reason_without_mutation(
+    contract: Any, reason: Any
+) -> None:
+    coordinator = contract.AuthorityGenerationCoordinator()
+    with pytest.raises((TypeError, ValueError)):
+        await coordinator.advance_past(4, reason=reason)
+    assert (await coordinator.snapshot()).epoch == 0
+
+
+async def test_advance_past_at_the_epoch_ceiling_fails_without_mutation(
+    contract: Any,
+) -> None:
+    coordinator = contract.AuthorityGenerationCoordinator()
+    with pytest.raises(OverflowError):
+        await coordinator.advance_past(MAX_GENERATION, reason="ceiling-fence")
+    assert (await coordinator.snapshot()).epoch == 0
+
+
+async def test_concurrent_advance_past_never_yields_an_epoch_at_or_below_the_fence(
+    contract: Any,
+) -> None:
+    coordinator = contract.AuthorityGenerationCoordinator()
+    start = asyncio.Event()
+
+    async def reconcile(fence: int) -> Any:
+        await start.wait()
+        return await coordinator.advance_past(fence, reason=f"concurrent-reconcile:{fence}")
+
+    tasks = [asyncio.create_task(reconcile(fence)) for fence in range(16)]
+    start.set()
+    outcomes = await asyncio.gather(*tasks)
+    final_epoch = (await coordinator.snapshot()).epoch
+    assert all(1 <= snapshot.epoch <= final_epoch for snapshot in outcomes)
+    assert final_epoch >= 16
+    for fence, snapshot in enumerate(outcomes):
+        assert snapshot.epoch > fence, "a reconciliation must never report a fenced epoch"

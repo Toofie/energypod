@@ -1153,3 +1153,151 @@ async def test_shutdown_stops_renewal_and_closes_the_transport_cleanly(
         await _shutdown_actors(runtime)
 
     _assert_replay_safety(journal)
+
+
+async def test_post_stop_intent_expiry_cannot_fence_every_later_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 2026-08-23 ~23:21Z publish-fence generation desync, replayed live.
+
+    After an emergency stop was acknowledged and the post-stop intent had
+    driven the unit and expired by TTL, every later cycle arbitrated
+    ``authorized`` while its watts never dispatched: the kernel minted at a
+    generation the repository had already fenced through, and each cycle
+    emitted a granted audit row plus a zero-authorized fenced row under one
+    cycle_id.  The kernel must reconcile the epoch it consults past the
+    repository's permanent fence, so a fresh intent after the expiry
+    publishes on its FIRST cycle -- authority lands, one audit row per cycle
+    -- and the coordinator epoch and the repository fence stay reconciled
+    after any revocation path.
+    """
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, _banks = _install_replay_transport(monkeypatch, clock)
+    runtime = _build(_validate(_config_payload(mode="write_enabled")), clock)
+    dispatches = itertools.count()
+
+    async def dispatch(*, ttl_s: float) -> None:
+        view = await runtime.facade.submit_intent(
+            unit_ids=[_UNIT_ID],
+            direction="charge",
+            watts=_CHARGE_W,
+            ttl_s=ttl_s,
+            reason="generation desync regression",
+            principal=OPERATOR,
+            idempotency_key=f"desync-dispatch-{next(dispatches)}",
+            request_id=f"desync-dispatch-{next(dispatches)}-request",
+        )
+        assert view["status"] == "accepted", view
+
+    async def cycle() -> None:
+        clock.advance(_CONTROL_PERIOD_S)
+        await runtime.actors[_UNIT_ID].poll_once()
+        await runtime.kernel.tick()
+        await runtime.actors[_UNIT_ID].heartbeat_once()
+
+    async def fence_epoch_gap() -> tuple[int, int]:
+        revoked_through = getattr(runtime.authorizations, "revoked_through", None)
+        assert revoked_through is not None, (
+            "the authorization port must expose the repository's permanent fence"
+        )
+        epoch = (await runtime.generation_coordinator.snapshot()).epoch
+        return epoch, await revoked_through([_UNIT_ID])
+
+    try:
+        actor = runtime.actors[_UNIT_ID]
+        await actor.start()
+        await _qualify(runtime, clock)
+        await _arm(runtime)
+        await cycle()
+
+        # The prior intent publishes and drives the unit, then the fleet is
+        # stopped and the stop acknowledged -- exactly the live preamble.
+        await dispatch(ttl_s=1.2)
+        await cycle()
+        assert len(journal.nonzero_pq_frames(_UNIT_HOST)) == 1
+        stop = await runtime.facade.emergency_stop(
+            unit_ids=[_UNIT_ID],
+            reason="generation desync regression stop",
+            principal=OPERATOR,
+        )
+        assert stop["status"] == "latched", stop
+        await runtime.facade.acknowledge_emergency_stop(
+            stop_id=stop["stop_id"],
+            principal=OPERATOR,
+            idempotency_key="desync-stop-acknowledge",
+            request_id="desync-stop-acknowledge-request",
+        )
+        # The stop's own fence advanced the coordinator before revoking, so
+        # the post-acknowledgement intent below publishes cleanly (the live
+        # counterexample): the desync arrives only with the intent-expiry
+        # revocation that follows.
+
+        # Re-qualify and re-arm; the prior intent's TTL has lapsed by now.
+        disarmed = await runtime.facade.disarm(
+            unit_ids=[_UNIT_ID],
+            principal=OPERATOR,
+            idempotency_key="desync-post-stop-disarm",
+            request_id="desync-post-stop-disarm-request",
+        )
+        assert disarmed["units"][0]["status"] == "disarmed", disarmed
+        await _qualify(runtime, clock)
+        await _arm(runtime)
+        clock.advance(2.4)
+        await actor.poll_once()
+
+        # The post-acknowledgement intent publishes cleanly at the live
+        # epoch, renews, and then expires by TTL.
+        await dispatch(ttl_s=1.2)
+        await cycle()
+        await cycle()
+        assert len(journal.nonzero_pq_frames(_UNIT_HOST)) == 3
+        # The TTL-lapse tick: the margin beyond the expiry defeats float
+        # accumulation, so the intent is unambiguously inactive and the tick
+        # takes the fail-closed no-intent revocation path.
+        clock.advance(_CONTROL_PERIOD_S + 0.05)
+        await actor.poll_once()
+        assert await runtime.kernel.tick() is None
+        await actor.heartbeat_once()
+
+        # The expiry tick revoked through the repository, fencing the
+        # published generation.  A fresh intent must still publish: the
+        # coordinator epoch it mints at must stand beyond that fence.
+        await dispatch(ttl_s=1.2)
+        decision = await runtime.kernel.tick()
+        assert decision is not None
+        assert decision.status is DecisionStatus.AUTHORIZED
+        assert await runtime.authorizations.peek(_UNIT_ID) is not None, (
+            "the fresh intent's authority must land in the repository, not die at "
+            "the publish fence while the cycle reports authorized"
+        )
+
+        # No per-cycle fenced record: every control cycle owns exactly one
+        # audit row (the live incident emitted granted-plus-fenced pairs
+        # sharing one cycle_id).
+        decisions = [
+            event
+            for event in runtime.audit.recent(limit=64)
+            if getattr(event, "event_type", None) == "control_decision"
+        ]
+        cycle_ids = [event.cycle_id for event in decisions]
+        assert len(cycle_ids) == len(set(cycle_ids)), (
+            "a cycle that published authority must not also carry a zero-authorized "
+            "fenced record under the same cycle id"
+        )
+
+        # The dispatched watts actually reach the device.
+        nonzero_before = len(journal.nonzero_pq_frames(_UNIT_HOST))
+        await actor.heartbeat_once()
+        assert len(journal.nonzero_pq_frames(_UNIT_HOST)) == nonzero_before + 1
+
+        # The direct invariant, pinned after the revocation path that caused
+        # the live incident: coordinator epoch strictly beyond the fence.
+        epoch, fence = await fence_epoch_gap()
+        assert epoch > fence, (
+            f"coordinator epoch {epoch} must reconcile past the repository fence {fence}"
+        )
+    finally:
+        await _shutdown_actors(runtime)
+
+    _assert_replay_safety(journal)
