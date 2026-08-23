@@ -349,6 +349,30 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-24 (plant-history console W1–W3 — THE OVERNIGHT PROGRAM
+  COMPLETE): the History view shipped (86909f2 wire model + read client,
+  f07bcc6 uPlot charts + HistoryView, ef64039 nav + morning states + shots
+  states; 773 web tests green, +57; tsc/build clean; uPlot 1.6.32 at
+  51 kB as its own lazy chunk — the design's recommendation held; jsdom
+  canvas-less degrades to the summary table, pinned). Verified against
+  the LIVE route directly and through the 5173 proxy (both tiers, the
+  full 422 matrix, 401), plus a Playwright drive of the real app
+  (Today-empty → 6h fleet → per-unit → 7d; zero console errors; the
+  recording note ticking). Live-found fix: on commissioning day Today
+  opens before the first sample — the empty note now points at 6 h and
+  names the 14-day bound. Not fabricated: per-sample quality is not on
+  the wire (window quality_worst only), so per-period dimming was left
+  out rather than invented — a future wire addition if wanted. With
+  this, the 2026-08-24 overnight board is fully landed: historian
+  backend + commissioning (LIVE, recording), night-charge backend
+  (staged present-but-off, toggle live-proven), flow wow-loop closed at
+  round 3 (approved; gallery for the operator), polish sweep live on
+  writemode38 (2156 backend tests; the schedule vocabulary's
+  units_disarmed word now in API_CONTRACTS + DESIGN_SCHEDULES), detector
+  live from the prior wave. Backend suite basis: the polish sweep's
+  final full run (2156) — no src/ changes since; docs-only commits
+  after it.
+
 - 2026-08-24 (flow wow-loop, round-3 gate — LOOP CLOSED): ROUND 3
   REVIEWED AND APPROVED; THE WOW-LOOP CLOSES AT THREE ROUNDS (9567a9d,
   eb85675, 8e07e31, 18a4a4b; 716/716 web tests; gallery regenerated
