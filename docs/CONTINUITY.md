@@ -968,8 +968,10 @@ direction, freshness, and watchdog timing per physical unit.
   intent.accepted payloads should carry expires_in_s (other operators'
   cards currently show "Remaining time: Not available"); audit.appended
   bus summaries should carry correlation_id so cards can join cycles by
-  id instead of unit membership. Full test suite launched for the first
-  clean end-to-end run since the hanging-tests fix.
+  id instead of unit membership. Full test suite: 1473 PASSED in 17.6 s
+  (exit 0) — the first complete clean run (unit+api+e2e+integration+golden
+  +simulator); the previous era stalled at 59% for hours on the two since-
+  fixed hanging startup tests.
 
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
