@@ -973,6 +973,34 @@ direction, freshness, and watchdog timing per physical unit.
   +simulator); the previous era stalled at 59% for hours on the two since-
   fixed hanging startup tests.
 
+- 2026-08-24 (soc): SOC-DISAGREEMENT STALESSNESS PROVEN; BMS-AUTHORITY
+  LANDED AND LIVE A/B-VERIFIED (23494d8, f0967c7; 21 red -> 0, 1263 unit
+  tests green). Mechanism definitively pinned: the system block 0x0100
+  (SOC at +17) is served on CYCLE 1 ONLY (excluded even from the cold
+  ring) and re-decodes from cache as quality GOOD forever — mid frozen
+  at 67.0 across 112 sequences while BMS climbed 73->83; boot resync
+  then freeze reproduced it exactly. Fix per operator direction: every
+  SOC bound (floor/ceiling/jump) evaluates bms_soc_pct; soc_disagreement
+  removed from deny reasons; informational soc_divergence_observed on
+  the authorizing path only; Observation.authoritative_soc_pct = BMS
+  (observations.py); the excess adviser follows it. Live A/B: pre-fix
+  binary rejected at divergence 6.0; post-fix binary at divergence 8.0
+  shows no soc_disagreement. READ-PLAN FOLLOW-UP QUEUED: promote
+  0x0100+17 or stop decoding system SOC as an input entirely (console
+  provenance only). NEW BLOCKER EXPOSED (armed into the running desync
+  audit): the ARM-TIME SOLE-WRITER PREFLIGHT latches external_writer
+  INHIBITED after any restart while a pod is AUTONOMOUSLY self-charging
+  (its own firmware holds a nonzero PQ objective ~-2.27 kW; fresh
+  process has no provenance). Race unwinnable: watchdog reverts a
+  bounded zero in ~1.34 s vs ~5-6 s re-qualification; ~40 arm attempts
+  failed over 25 min while mid self-charged at -2.2 kW throughout. The
+  battery's OWN daytime autonomy is being misclassified as a foreign
+  writer — remedy directions (autonomy-signature discrimination /
+  operator-acknowledged takeover) under design in the audit. INTERIM:
+  console control of mid may be blocked during deep self-charge until
+  the remedy lands; rhs/lhs unaffected; mid itself is physically fine
+  (charging via its own firmware).
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
