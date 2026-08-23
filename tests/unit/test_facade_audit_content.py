@@ -93,6 +93,8 @@ def assert_audit(rig: Any, expected: Mapping[str, Any]) -> None:
         # a facade event can never masquerade as a kernel grant.
         requested_active_w=0,
         authorized_active_w=0,
+        requested_watts_by_unit=None,
+        authorized_watts_by_unit=None,
         request_fingerprint=fingerprint(expected["facts"]),
         response_fingerprint=fingerprint({"result": expected["result"]}),
         result=expected["result"],

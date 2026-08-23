@@ -583,9 +583,14 @@ class _AsyncAuditRepository:
                     "reason_codes": list(getattr(event, "reason_codes", ()) or ()),
                     # Watt figures render straight off the stream (2026-08-23):
                     # the console must not re-fetch audit pages to label a
-                    # request card's requested/authorized power.
+                    # request card's requested/authorized power.  The per-unit
+                    # breakdowns ride the same payload (the 2026-08-23
+                    # fleet-row opacity fix) so a multi-battery card can name
+                    # each battery's own figures.
                     "requested_active_w": getattr(event, "requested_active_w", None),
                     "authorized_active_w": getattr(event, "authorized_active_w", None),
+                    "requested_watts_by_unit": getattr(event, "requested_watts_by_unit", None),
+                    "authorized_watts_by_unit": getattr(event, "authorized_watts_by_unit", None),
                 },
             }
         )

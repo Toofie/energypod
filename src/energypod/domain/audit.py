@@ -40,6 +40,15 @@ class AuditEvent(BaseModel):
     reason_codes: tuple[str, ...]
     requested_active_w: int
     authorized_active_w: int
+    # Per-unit watt breakdowns (2026-08-23 fleet-row opacity fix): unsigned
+    # per-unit magnitudes.  ``requested_watts_by_unit`` is the intent's own
+    # per-unit target map (null for scalar fleet-total intents);
+    # ``authorized_watts_by_unit`` is the decision's per-unit authorized watts
+    # (null when no batch was minted, matching authorized_active_w == 0).
+    # Both are optional so durable rows written before these fields existed
+    # keep decoding with null defaults.
+    requested_watts_by_unit: Mapping[str, int] | None = None
+    authorized_watts_by_unit: Mapping[str, int] | None = None
     request_fingerprint: str
     response_fingerprint: str
     result: str
@@ -53,6 +62,18 @@ class AuditEvent(BaseModel):
             raise ValueError("observation unit identifiers must be normalized")
         if any(sequence < 0 for sequence in copied.values()):
             raise ValueError("observation sequences must be non-negative")
+        return _FrozenStringMapping(copied)
+
+    @field_validator("requested_watts_by_unit", "authorized_watts_by_unit")
+    @classmethod
+    def _freeze_watts_by_unit(cls, value: Mapping[str, int] | None) -> Mapping[str, int] | None:
+        if value is None:
+            return None
+        copied = dict(value)
+        if any(not key or key != key.strip() for key in copied):
+            raise ValueError("per-unit watt keys must be normalized")
+        if any(watts < 0 for watts in copied.values()):
+            raise ValueError("per-unit watts must be non-negative")
         return _FrozenStringMapping(copied)
 
     @field_validator(

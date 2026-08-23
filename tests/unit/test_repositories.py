@@ -437,6 +437,47 @@ def test_sqlite_json_encoding_of_sets_is_deterministic() -> None:
     assert _json_value((3, 1, 2)) == [3, 1, 2]
 
 
+def test_sqlite_audit_rows_from_before_the_per_unit_fields_still_decode(tmp_path: Path) -> None:
+    """A durable audit database written by an earlier build must stay readable.
+
+    Rows persisted before the per-unit watt breakdown fields existed carry no
+    such keys; decoding fills the documented defaults instead of refusing the
+    whole page.  An UNKNOWN key is still refused -- only the omission of
+    optional fields is tolerated.
+    """
+    import json as _json
+
+    path = tmp_path / "audit.sqlite3"
+    database = _open_database(path)
+    repository = SQLiteAuditRepository(database)
+    try:
+        event = _audit_event("event-legacy", unit_id="mid", offset=1.0)
+        repository.append(event)
+        payload = database.connection.execute(
+            "SELECT payload FROM audit_events WHERE event_id = 'event-legacy'"
+        ).fetchone()[0]
+        values = _json.loads(payload)
+        legacy = {key: item for key, item in values.items() if "watts_by_unit" not in key}
+        database.connection.execute(
+            "UPDATE audit_events SET payload = ? WHERE event_id = 'event-legacy'",
+            (_json.dumps(legacy, sort_keys=True, separators=(",", ":")),),
+        )
+        (decoded,) = repository.recent(limit=1)
+        assert decoded.event_id == "event-legacy"
+        assert decoded.requested_watts_by_unit is None
+        assert decoded.authorized_watts_by_unit is None
+
+        unknown = dict(legacy, requested_watts_by_unit={"mid": 100}, mystery_field=1)
+        database.connection.execute(
+            "UPDATE audit_events SET payload = ? WHERE event_id = 'event-legacy'",
+            (_json.dumps(unknown, sort_keys=True, separators=(",", ":")),),
+        )
+        with pytest.raises(ValueError, match="invalid audit event keys"):
+            repository.recent(limit=1)
+    finally:
+        database.close()
+
+
 def test_audit_event_ids_are_append_only_and_unique(tmp_path: Path) -> None:
     """T-UNIT-REPO-011 / INV-AUDIT-001 / S1."""
     database = _open_database(tmp_path / "audit.sqlite3")

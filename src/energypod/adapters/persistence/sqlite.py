@@ -237,8 +237,20 @@ class SQLiteAuditRepository:
     @staticmethod
     def _decode(payload: str) -> AuditEvent:
         values = _load_json_object(payload)
-        expected = frozenset(AuditEvent.model_fields)
-        _require_exact_keys(values, expected, "audit event")
+        # Optional fields (added after the first durable deployments, e.g. the
+        # 2026-08-23 per-unit watt breakdowns) may be absent from rows an
+        # earlier build wrote; the model's defaults are the documented
+        # reading.  An unknown key is still refused, and a missing REQUIRED
+        # key is still refused -- only known-optional omissions decode.
+        fields = AuditEvent.model_fields
+        optional = frozenset(name for name, field in fields.items() if not field.is_required())
+        known = frozenset(fields)
+        actual = frozenset(values)
+        if actual - known:
+            raise ValueError(f"invalid audit event keys; extra={sorted(actual - known)}")
+        missing = known - actual
+        if missing - optional:
+            raise ValueError(f"invalid audit event keys; missing={sorted(missing - optional)}")
         values["occurred_at"] = datetime.fromisoformat(values["occurred_at"])
         if values["source"] is not None:
             values["source"] = IntentSource(values["source"])

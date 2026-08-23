@@ -28,6 +28,7 @@ from .test_control_kernel import (
     Authorizations,
     Clock,
     Decision,
+    Intent,
     Setpoint,
     api,
     decision_for,
@@ -149,6 +150,9 @@ class DeterministicAuditEventFactory:
             "unit_ids": sorted(intent_value.unit_ids),
             "watts": intent_value.watts,
         }
+        requested_watts_by_unit = getattr(intent_value, "watts_by_unit", None)
+        if requested_watts_by_unit is not None:
+            request_projection["watts_by_unit"] = dict(sorted(requested_watts_by_unit.items()))
         response_projection = {
             "schema": SCHEMA,
             "authorized_active_w": authorized,
@@ -185,6 +189,19 @@ class DeterministicAuditEventFactory:
             reason_codes=decision.reason_codes,
             requested_active_w=_signed(intent_value.direction, intent_value.watts),
             authorized_active_w=authorized,
+            requested_watts_by_unit=(
+                None
+                if requested_watts_by_unit is None
+                else dict(sorted(requested_watts_by_unit.items()))
+            ),
+            authorized_watts_by_unit=(
+                {
+                    item.unit_id: item.watts
+                    for item in sorted(decision.setpoints, key=lambda item: item.unit_id)
+                }
+                if batch is not None
+                else None
+            ),
             request_fingerprint=_fingerprint(request_projection),
             response_fingerprint=_fingerprint(response_projection),
             result=decision.status.value,
@@ -228,6 +245,57 @@ async def test_real_canonical_event_is_durable_before_atomic_publication(api: An
     assert history.index("audit") < history.index("publish")
     assert len(audit.events) == 1 and type(audit.events[0]) is AuditEvent
     assert len(auth.published) == 1
+
+
+async def test_control_decision_row_carries_the_per_unit_watt_breakdowns(api: Any):
+    """The 2026-08-23 fleet-row opacity fix: one control_decision row names
+    the per-unit requested targets AND the per-unit authorized watts, so a
+    fleet-level decision no longer needs fingerprint inference to explain
+    which battery got what.  Unsigned magnitudes, like the domain."""
+    from .test_control_kernel import Proposal
+
+    value = Intent(
+        "intent-per-unit",
+        api.IntentSource.MANUAL,
+        UNITS,
+        api.Direction.DISCHARGE,
+        600,
+        watts_by_unit={"lhs": 300, "mid": 100, "rhs": 200},
+    )
+    outcome = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        (
+            Setpoint("lhs", value.direction, 300, value.id),
+            Setpoint("mid", value.direction, 100, value.id),
+            Setpoint("rhs", value.direction, 200, value.id),
+        ),
+    )
+    factory = DeterministicAuditEventFactory()
+    kernel, _history, auth, audit = _kernel_with_factory(api, value, outcome, factory)
+    kernel._allocator.output = tuple(
+        Proposal(unit, value.direction, watts, value.id, value.expires_at_mono)
+        for unit, watts in (("lhs", 300), ("mid", 100), ("rhs", 200))
+    )
+    await kernel.tick()
+    (event,) = audit.events
+    assert dict(event.requested_watts_by_unit) == {"lhs": 300, "mid": 100, "rhs": 200}
+    assert dict(event.authorized_watts_by_unit) == {"lhs": 300, "mid": 100, "rhs": 200}
+    assert auth.published
+
+
+async def test_scalar_decisions_still_carry_their_per_unit_authorized_breakdown(api: Any):
+    """A scalar (fleet-total) intent has no per-unit request to record, but
+    its authorized breakdown is still per unit -- the row explains the split
+    the allocator chose without any fingerprint inference."""
+    value = intent(api)  # scalar 900 W over lhs/mid/rhs -> 300 W each
+    factory = DeterministicAuditEventFactory()
+    kernel, _history, _auth, audit = _kernel_with_factory(
+        api, value, decision_for(api, value), factory
+    )
+    await kernel.tick()
+    (event,) = audit.events
+    assert event.requested_watts_by_unit is None
+    assert dict(event.authorized_watts_by_unit) == {"lhs": 300, "mid": 300, "rhs": 300}
 
 
 async def test_factory_is_synchronous_and_receives_complete_explicit_facts(api: Any):

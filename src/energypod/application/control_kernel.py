@@ -342,6 +342,7 @@ class ControlKernel:
         expected_sequences = {
             unit_id: observations[unit_id].sequence for unit_id in sorted(observations)
         }
+        setpoints = tuple(sorted(getattr(decision, "setpoints", ()), key=lambda item: item.unit_id))
         expected_authorized = (
             sum(
                 (-item.watts if item.direction is Direction.CHARGE else item.watts)
@@ -354,6 +355,12 @@ class ControlKernel:
             (-intent.watts if intent.direction is Direction.CHARGE else intent.watts)
             if intent.direction is not Direction.IDLE
             else 0
+        )
+        expected_requested_map = getattr(intent, "watts_by_unit", None)
+        expected_authorized_map = (
+            {item.unit_id: item.watts for item in sorted(setpoints, key=lambda item: item.unit_id)}
+            if batch is not None
+            else None
         )
         expected_lifecycle = (
             UnitLifecycle.INHIBITED
@@ -379,6 +386,10 @@ class ControlKernel:
             or event.reason_codes != tuple(decision.reason_codes)
             or event.requested_active_w != expected_requested
             or event.authorized_active_w != expected_authorized
+            or event.requested_watts_by_unit
+            != (None if expected_requested_map is None else dict(expected_requested_map))
+            or event.authorized_watts_by_unit
+            != (None if expected_authorized_map is None else dict(expected_authorized_map))
             or event.result != decision.status.value
             or event.lifecycle is not expected_lifecycle
         ):

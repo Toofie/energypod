@@ -123,6 +123,13 @@ class AuditEventFactory:
             if authorization_batch is not None
             else 0
         )
+        # Per-unit watt breakdowns (2026-08-23 fleet-row opacity fix): the
+        # intent's own targets when it carried them, and the decision's per-
+        # unit authorized watts whenever a batch was minted.  Unsigned, like
+        # the domain; the fingerprint projections stay canonical (sorted
+        # keys, integers only) and gain the breakdown only when present so a
+        # scalar intent's fingerprint is byte-identical to before.
+        requested_watts_by_unit = getattr(intent, "watts_by_unit", None)
         request_projection = {
             "schema": _SCHEMA,
             "acceptance_revision": intent.acceptance_revision,
@@ -133,6 +140,8 @@ class AuditEventFactory:
             "unit_ids": sorted(selected_unit_ids),
             "watts": intent.watts,
         }
+        if requested_watts_by_unit is not None:
+            request_projection["watts_by_unit"] = dict(sorted(requested_watts_by_unit.items()))
         response_projection = {
             "schema": _SCHEMA,
             "authorized_active_w": authorized,
@@ -179,6 +188,16 @@ class AuditEventFactory:
             reason_codes=tuple(decision.reason_codes),
             requested_active_w=_signed_watts(intent.direction, intent.watts),
             authorized_active_w=authorized,
+            requested_watts_by_unit=(
+                None
+                if requested_watts_by_unit is None
+                else dict(sorted(requested_watts_by_unit.items()))
+            ),
+            authorized_watts_by_unit=(
+                {item.unit_id: item.watts for item in setpoints}
+                if authorization_batch is not None
+                else None
+            ),
             request_fingerprint=_canonical_fingerprint(request_projection),
             response_fingerprint=_canonical_fingerprint(response_projection),
             result=decision.status.value,
