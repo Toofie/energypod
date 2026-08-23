@@ -280,8 +280,36 @@ describe("InsightsView — the daily ledger rows", () => {
     const detail = within(row).getByText(/Counter A/i);
     expect(detail.textContent).toContain("Counter A 8.3 kWh");
     expect(detail.textContent).toContain("Counter B 12.8 kWh");
-    expect(detail.textContent).toContain("consistent with vendor_labels");
+    expect(detail.textContent).toContain("consistent with the vendor's labels");
     expect(detail.textContent).toContain("never come from these counters");
+  });
+
+  it("renders the honest not-yet-discriminating line when the day's verdict is null", async () => {
+    // The wire pin (2026-08-26): the backend emits consistent_with null on
+    // non-discriminating days — a first-class answer, never a missing field.
+    const day = energyDayRecord({
+      date: "2026-08-25",
+      counter_cross_check: {
+        grid_a_delta_kwh: 1.1,
+        grid_b_delta_kwh: 6.9,
+        consistent_with: null,
+        discriminating: false,
+      },
+    });
+    const harness = installHarness({
+      getEnergyDays: vi.fn(() => Promise.resolve(getEnergyDaysOk({ days: [day] }))),
+    });
+    renderView(harness);
+    const row = (await screen.findByRole("list", { name: /daily energy ledger/i }))
+      .querySelectorAll<HTMLElement>(":scope > li")
+      .item(0)!;
+    await userEvent.click(within(row).getByText(/grid counter cross-check/i));
+    const detail = within(row).getByText(/Counter A/i);
+    expect(detail.textContent).toContain("Counter A 1.1 kWh");
+    expect(detail.textContent).toContain("not yet discriminating");
+    expect(detail.textContent).toContain("(not discriminating)");
+    // No verdict is invented for a day that did not carry one.
+    expect(detail.textContent).not.toContain("consistent with");
   });
 });
 

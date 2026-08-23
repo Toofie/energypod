@@ -70,6 +70,23 @@ export type EnergyGridCounterRoles = "unpinned" | "vendor_labels" | "swapped";
 
 const GRID_ROLES: readonly EnergyGridCounterRoles[] = ["unpinned", "vendor_labels", "swapped"];
 
+/**
+ * The cross-check's consistency verdict — the wire's own pinned vocabulary
+ * (API_CONTRACTS.md "Energy scorecard", the 2026-08-26 wire pins): one of the
+ * two label orderings fit the day's tolerance test (`vendor_labels` /
+ * `swapped`), or the day's usable evidence did not single one out
+ * (`undiscriminating`). NULL is the backend's first-class "the day could not
+ * discriminate" answer — low coverage, a sub-0.5 kWh side, a grid-pair
+ * reset, or neither ordering fits the tolerance — not a missing field.
+ */
+export type EnergyCrossCheckVerdict = "vendor_labels" | "swapped" | "undiscriminating";
+
+const CROSS_CHECK_VERDICTS: readonly EnergyCrossCheckVerdict[] = [
+  "vendor_labels",
+  "swapped",
+  "undiscriminating",
+];
+
 /** The one per-metric flag the record defines (§2's reset handling). */
 export const ENERGY_METRIC_FLAGS: readonly string[] = ["counter_reset_observed"];
 
@@ -110,13 +127,14 @@ export interface EnergyDaySources {
 /**
  * The A-1 passive cross-check record (§3): both grid-counter deltas alongside
  * the integrated figures, plus the consistency verdict the record reports —
- * never auto-applied. `consistentWith` is kept as the wire's own string; "" is
- * the honest no-verdict.
+ * never auto-applied. `consistentWith` is the pinned verdict vocabulary or
+ * null (the backend's could-not-discriminate answer, and this model's honest
+ * no-verdict for a value outside the vocabulary); a verdict is never guessed.
  */
 export interface EnergyCounterCrossCheck {
   gridADeltaKwh: number | null;
   gridBDeltaKwh: number | null;
-  consistentWith: string;
+  consistentWith: EnergyCrossCheckVerdict | null;
   discriminating: boolean | null;
 }
 
@@ -194,10 +212,14 @@ function toCrossCheck(value: unknown): EnergyCounterCrossCheck | null {
   if (!isRecord(value)) {
     return null;
   }
+  const verdict = value.consistent_with;
   return {
     gridADeltaKwh: finiteOrNull(value.grid_a_delta_kwh),
     gridBDeltaKwh: finiteOrNull(value.grid_b_delta_kwh),
-    consistentWith: typeof value.consistent_with === "string" ? value.consistent_with : "",
+    consistentWith:
+      typeof verdict === "string" && (CROSS_CHECK_VERDICTS as readonly string[]).includes(verdict)
+        ? (verdict as EnergyCrossCheckVerdict)
+        : null,
     discriminating: typeof value.discriminating === "boolean" ? value.discriminating : null,
   };
 }
@@ -364,6 +386,28 @@ export function counterRolesNote(roles: EnergyGridCounterRoles): string {
       return "The pods' grid counter roles are confirmed SWAPPED from the vendor's labels (counter A = sold, counter B = bought).";
     default:
       return "The pods' two grid counters are recorded as counter A and counter B — which one counts as 'bought' is not confirmed yet, so the bought/sold figures are measured by the controller instead.";
+  }
+}
+
+/**
+ * The cross-check verdict in the operator's words (the A-1 evidence gate §3):
+ * the two pin verdicts say which label ordering the day's evidence fits, and
+ * null gets the honest "not yet discriminating" line — the backend emits null
+ * exactly when the day could not discriminate (low coverage, a sub-0.5 kWh
+ * side, a grid-pair reset, or neither ordering fits the tolerance). No
+ * wording here assigns a bought/sold role to either counter: the verdict is
+ * evidence, never a pin.
+ */
+export function crossCheckVerdictText(verdict: EnergyCrossCheckVerdict | null): string {
+  switch (verdict) {
+    case "vendor_labels":
+      return "consistent with the vendor's labels";
+    case "swapped":
+      return "consistent with the vendor's labels swapped";
+    case "undiscriminating":
+      return "undiscriminating — the day's evidence did not single out one label ordering";
+    default:
+      return "not yet discriminating — this day could not tell the counters apart (low coverage, a side under 0.5 kWh, a counter reset, or neither ordering fit the tolerance)";
   }
 }
 

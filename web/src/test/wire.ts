@@ -1561,7 +1561,15 @@ export interface WireEnergySources {
 export interface WireEnergyCrossCheck {
   readonly grid_a_delta_kwh: number | null;
   readonly grid_b_delta_kwh: number | null;
-  readonly consistent_with: string;
+  /**
+   * The wire's pinned verdict vocabulary (API_CONTRACTS.md "Energy scorecard",
+   * the 2026-08-26 console-coordination pins):
+   * `"vendor_labels" | "swapped" | "undiscriminating" | null` — null is the
+   * backend's own could-not-discriminate answer (low coverage, a sub-0.5 kWh
+   * side, a grid-pair reset, or neither ordering fits the tolerance), a
+   * first-class value, not a missing field.
+   */
+  readonly consistent_with: "vendor_labels" | "swapped" | "undiscriminating" | null;
   readonly discriminating: boolean;
 }
 

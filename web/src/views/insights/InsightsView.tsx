@@ -44,6 +44,7 @@ import {
   SOLAR_FOOTNOTE,
   counterRolesNote,
   coverageText,
+  crossCheckVerdictText,
   dayMarkerText,
   kwhText,
   metricFlagText,
@@ -433,10 +434,8 @@ function InsightsDayRow({ day }: { day: EnergyDayRecord }): JSX.Element {
           <summary>Grid counter cross-check (evidence)</summary>
           <p>
             Counter A {kwhText(crossCheck.gridADeltaKwh)} · Counter B{" "}
-            {kwhText(crossCheck.gridBDeltaKwh)}
-            {crossCheck.consistentWith === ""
-              ? ""
-              : ` — consistent with ${crossCheck.consistentWith}`}
+            {kwhText(crossCheck.gridBDeltaKwh)} —{" "}
+            {crossCheckVerdictText(crossCheck.consistentWith)}
             {crossCheck.discriminating === null
               ? ""
               : crossCheck.discriminating

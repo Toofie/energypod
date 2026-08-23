@@ -14,6 +14,7 @@ import { describe, expect, it } from "vitest";
 import {
   SOLAR_FOOTNOTE,
   counterRolesNote,
+  crossCheckVerdictText,
   dayMarkerText,
   gridProvenanceNote,
   kwhText,
@@ -105,6 +106,41 @@ describe("energy — the day-record parse (null-safe, absent-tolerant)", () => {
     expect(partial.solarProductionMeasured).toBeNull();
     expect(partial.counterCrossCheck).toBeNull();
   });
+
+  it("keeps the cross-check verdict's null FIRST-CLASS and never invents a verdict", () => {
+    // The wire pin (2026-08-26): consistent_with is
+    // "vendor_labels" | "swapped" | "undiscriminating" | null — null is the
+    // backend's own could-not-discriminate answer on non-discriminating days,
+    // not a missing field.
+    const noVerdict = toEnergyDayRecord(
+      energyDayRecord({
+        counter_cross_check: {
+          grid_a_delta_kwh: 1.1,
+          grid_b_delta_kwh: null,
+          consistent_with: null,
+          discriminating: false,
+        },
+      }),
+    )!;
+    expect(noVerdict.counterCrossCheck).toEqual({
+      gridADeltaKwh: 1.1,
+      gridBDeltaKwh: null,
+      consistentWith: null,
+      discriminating: false,
+    });
+    // A value outside the pinned vocabulary is unusable, not a guess: the
+    // honest no-verdict, never an unknown string rendered as evidence.
+    const unknown = toEnergyDayRecord({
+      ...energyDayRecord(),
+      counter_cross_check: {
+        grid_a_delta_kwh: 1.1,
+        grid_b_delta_kwh: 6.9,
+        consistent_with: "guessed",
+        discriminating: true,
+      },
+    })!;
+    expect(unknown.counterCrossCheck!.consistentWith).toBeNull();
+  });
 });
 
 describe("energy — the snapshot block, the route body, and the rollover event", () => {
@@ -188,6 +224,24 @@ describe("energy — the plain-language pins", () => {
     expect(counterRolesNote("unpinned")).toContain("measured by the controller");
     expect(counterRolesNote("vendor_labels")).toContain("confirmed as the vendor's labels");
     expect(counterRolesNote("swapped")).toContain("SWAPPED");
+  });
+
+  it("words the cross-check verdict: the two pins, the undiscriminating day, and the honest null", () => {
+    expect(crossCheckVerdictText("vendor_labels")).toBe("consistent with the vendor's labels");
+    expect(crossCheckVerdictText("swapped")).toBe("consistent with the vendor's labels swapped");
+    expect(crossCheckVerdictText("undiscriminating")).toContain(
+      "undiscriminating — the day's evidence did not single out one label ordering",
+    );
+    // NULL is first-class: the honest not-yet-discriminating line, naming why
+    // (the wire pin's own causes) and never a verdict the wire did not carry.
+    const none = crossCheckVerdictText(null);
+    expect(none).toContain("not yet discriminating");
+    expect(none).toContain("could not tell the counters apart");
+    expect(none).not.toMatch(/vendor|swapped/i);
+    // No wording ever assigns a bought/sold role to either counter — the
+    // verdict is evidence, never a pin.
+    expect(crossCheckVerdictText("vendor_labels")).not.toMatch(/[AB]\s*(is|=)\s*(bought|sold)/i);
+    expect(crossCheckVerdictText("swapped")).not.toMatch(/[AB]\s*(is|=)\s*(bought|sold)/i);
   });
 
   it("pins the solar footnote: sold is the export, never a measured production", () => {
