@@ -741,6 +741,33 @@ direction, freshness, and watchdog timing per physical unit.
   all units armed_idle, no faults, mid's ±1.2 kW self-charge oscillation
   continues (pre-existing, unexplained, day-scope observation).
 
+- 2026-08-23 (allocator): GREEDY-ALLOCATION STARVATION FIXED AND
+  LIVE-VERIFIED (4c41ed7, 58a03e6, d717deb). Root cause of "only one
+  device powers": the operator's dispatches were single FLEET intents
+  whose watts field is the fleet TOTAL — decoded from request
+  fingerprints, all four were [lhs,mid,rhs] at 900-1000 W total, and the
+  greedy first-fit gave lhs everything (2500 W headroom) with legal
+  zero-watt proposals for mid/rhs. The operator believed watts was PER
+  UNIT — a semantics mismatch now addressed two ways: (1) allocate_
+  fleet_power is now capacity-weighted with a one-watt participation
+  floor, exact integer largest-remainder split, permutation-invariant
+  ties, and a pinned concentration boundary (demand below the
+  participating-unit count concentrates; 300 W over 3 units splits
+  ~100/100/100); ineligible units keep zero-watt non-participation;
+  export-cap composes; exact-sum invariant kept; 11 new tests + a 250-
+  case property test, family 290 green. (2) LIVE-VERIFIED: one 3000 W
+  fleet discharge = 1000/1000/1000 per unit, 22 consecutive authorized
+  cycles (one first-cycle ramp clamp), all three ACTIVE simultaneously,
+  clean TTL return; controller PID 9036 / writemode17. PER-UNIT WATTS
+  design sketch delivered (watts_by_unit on IntentRequest/PowerIntent,
+  per-unit caps in the allocator, arbiter/safety unchanged; five open
+  contract questions incl. console form shape and audit per-unit
+  breakdown) — queued as its own contract cycle. ALSO queued (small):
+  the console dispatch form must label watts as the FLEET TOTAL
+  unmistakably (the operator's misread is the UX defect); fleet-level
+  control_decision rows should carry per-unit allocation breakdowns
+  (Phase 1 needed fingerprint inference to reconstruct requests).
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
