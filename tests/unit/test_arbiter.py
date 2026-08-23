@@ -35,14 +35,18 @@ class FakeIntentRepository:
 def api() -> SimpleNamespace:
     domain = importlib.import_module("energypod.domain")
     application = importlib.import_module("energypod.application")
+    arbiter = importlib.import_module("energypod.application.arbiter")
     required_domain = ("Direction", "IntentSource", "PowerIntent")
     missing = [name for name in required_domain if not hasattr(domain, name)]
     if not hasattr(application, "IntentArbiter"):
         missing.append("IntentArbiter")
+    if not hasattr(arbiter, "CycleArbitration"):
+        missing.append("CycleArbitration")
     assert not missing, f"public arbiter contract is not implemented: {', '.join(missing)}"
     return SimpleNamespace(
         **{name: getattr(domain, name) for name in required_domain},
         IntentArbiter=application.IntentArbiter,
+        CycleArbitration=arbiter.CycleArbitration,
     )
 
 
@@ -455,3 +459,407 @@ def test_nonpositive_ttl_is_rejected(api: SimpleNamespace, duration_s: float) ->
             source=api.IntentSource.MANUAL,
             duration_s=duration_s,
         )
+
+
+# --- concurrent per-unit arbitration (2026-08-24 operator requirement) ---------
+#
+# "I instructed MID to charge at 2,000 watts and RHS to discharge at 1,000
+# watts. Only one operation functions at a time. I require both to function
+# concurrently whenever a battery request is made."  The arbiter now selects a
+# PER-UNIT winner set: for each unit, the highest-priority live intent claiming
+# it wins that unit; an intent's effective scope is its selection minus units
+# claimed by higher-priority intents; an intent whose entire scope is claimed
+# away is simply not represented this cycle.  Priority order, the equal-priority
+# revision/id tie rules, expiry, and emergency-stop domination are unchanged --
+# applied per unit instead of to the whole fleet.
+
+
+def test_disjoint_intents_are_both_represented_concurrently(api: SimpleNamespace) -> None:
+    """The operator's exact scenario shape: MID charge + RHS discharge in one
+    cycle, both winners, neither superseding the other."""
+    mid_charge = make_intent(
+        api,
+        intent_id="mid-charge",
+        source=api.IntentSource.MANUAL,
+        direction=api.Direction.CHARGE,
+        watts=2_000,
+        selected_unit_ids=frozenset({"mid"}),
+    )
+    rhs_discharge = make_intent(
+        api,
+        intent_id="rhs-discharge",
+        source=api.IntentSource.MANUAL,
+        direction=api.Direction.DISCHARGE,
+        watts=1_000,
+        selected_unit_ids=frozenset({"rhs"}),
+    )
+
+    selection = api.IntentArbiter().arbitrate([rhs_discharge, mid_charge], NOW)
+
+    assert selection.emergency is None
+    assert dict(selection.winners) == {"mid": mid_charge, "rhs": rhs_discharge}
+    assert selection.units == frozenset({"mid", "rhs"})
+    assert dict(selection.scopes) == {
+        "mid-charge": frozenset({"mid"}),
+        "rhs-discharge": frozenset({"rhs"}),
+    }
+    assert set(selection.ranked) == {mid_charge, rhs_discharge}
+
+
+def test_higher_priority_intent_erodes_a_lower_priority_scope_per_unit(
+    api: SimpleNamespace,
+) -> None:
+    """A manual intent claiming lhs+mid erodes an agent intent claiming mid+rhs
+    to just rhs: the shared unit goes to the higher priority, the agent's OTHER
+    unit still runs."""
+    manual = make_intent(
+        api,
+        intent_id="manual-two",
+        source=api.IntentSource.MANUAL,
+        selected_unit_ids=frozenset({"lhs", "mid"}),
+    )
+    agent = make_intent(
+        api,
+        intent_id="agent-two",
+        source=api.IntentSource.AGENT,
+        selected_unit_ids=frozenset({"mid", "rhs"}),
+    )
+
+    selection = api.IntentArbiter().arbitrate([agent, manual], NOW)
+
+    assert dict(selection.winners) == {"lhs": manual, "mid": manual, "rhs": agent}
+    assert dict(selection.scopes) == {
+        "manual-two": frozenset({"lhs", "mid"}),
+        "agent-two": frozenset({"rhs"}),
+    }
+    assert selection.ranked == (manual, agent)
+
+
+@pytest.mark.parametrize(
+    ("winner_source", "loser_source"),
+    [
+        ("MANUAL", "AGENT"),
+        ("AGENT", "OPTIMIZER"),
+        ("OPTIMIZER", "SCHEDULE"),
+    ],
+)
+def test_each_adjacent_priority_dominates_per_unit_regardless_of_revision(
+    api: SimpleNamespace, loser_source: str, winner_source: str
+) -> None:
+    """The existing fleet-wide priority invariants, now per unit: an older,
+    lower-revision higher-priority intent still claims its unit against a newer
+    lower-priority one."""
+    higher = make_intent(
+        api,
+        intent_id="higher",
+        source=getattr(api.IntentSource, winner_source),
+        accepted_at_mono=80.0,
+        acceptance_revision=1,
+        duration_s=30.0,
+        selected_unit_ids=frozenset({"mid"}),
+    )
+    newer_lower = make_intent(
+        api,
+        intent_id="newer-lower",
+        source=getattr(api.IntentSource, loser_source),
+        accepted_at_mono=99.0,
+        acceptance_revision=999,
+        selected_unit_ids=frozenset({"mid"}),
+    )
+    selection = api.IntentArbiter().arbitrate([newer_lower, higher], NOW)
+    assert dict(selection.winners) == {"mid": higher}
+    assert dict(selection.scopes) == {"higher": frozenset({"mid"})}
+    assert selection.ranked == (higher,)
+
+
+def test_equal_priority_overlap_resolves_per_unit_by_revision_then_id(
+    api: SimpleNamespace,
+) -> None:
+    """Two manual intents both claiming lhs: the newest acceptance revision
+    takes lhs; the older intent keeps its other unit and stays represented."""
+    older = make_intent(
+        api,
+        intent_id="older",
+        source=api.IntentSource.MANUAL,
+        acceptance_revision=41,
+        selected_unit_ids=frozenset({"lhs", "rhs"}),
+    )
+    newer = make_intent(
+        api,
+        intent_id="newer",
+        source=api.IntentSource.MANUAL,
+        acceptance_revision=42,
+        selected_unit_ids=frozenset({"lhs", "mid"}),
+    )
+
+    selection = api.IntentArbiter().arbitrate([older, newer], NOW)
+
+    assert dict(selection.winners) == {"lhs": newer, "mid": newer, "rhs": older}
+    assert dict(selection.scopes) == {
+        "newer": frozenset({"lhs", "mid"}),
+        "older": frozenset({"rhs"}),
+    }
+
+
+def test_equal_revision_overlap_falls_back_to_stable_id_per_unit(
+    api: SimpleNamespace,
+) -> None:
+    alpha = make_intent(
+        api,
+        intent_id="intent-a",
+        source=api.IntentSource.MANUAL,
+        acceptance_revision=7,
+        selected_unit_ids=frozenset({"mid", "rhs"}),
+    )
+    zulu = make_intent(
+        api,
+        intent_id="intent-z",
+        source=api.IntentSource.MANUAL,
+        acceptance_revision=7,
+        selected_unit_ids=frozenset({"mid", "lhs"}),
+    )
+
+    selection = api.IntentArbiter().arbitrate([zulu, alpha], NOW)
+
+    assert dict(selection.winners) == {"lhs": zulu, "mid": alpha, "rhs": alpha}
+    assert dict(selection.scopes) == {
+        "intent-a": frozenset({"mid", "rhs"}),
+        "intent-z": frozenset({"lhs"}),
+    }
+
+
+def test_intent_whose_entire_scope_is_claimed_is_not_represented(
+    api: SimpleNamespace,
+) -> None:
+    """Scope erosion to nothing means the intent simply does not appear in the
+    cycle -- it is not an error, and it returns the moment its claimer lapses."""
+    manual = make_intent(
+        api,
+        intent_id="manual-wide",
+        source=api.IntentSource.MANUAL,
+        selected_unit_ids=frozenset({"lhs", "mid"}),
+    )
+    agent = make_intent(
+        api,
+        intent_id="agent-claimed",
+        source=api.IntentSource.AGENT,
+        selected_unit_ids=frozenset({"mid"}),
+    )
+
+    selection = api.IntentArbiter().arbitrate([agent, manual], NOW)
+
+    assert selection.ranked == (manual,)
+    assert dict(selection.scopes) == {"manual-wide": frozenset({"lhs", "mid"})}
+    assert dict(selection.winners) == {"lhs": manual, "mid": manual}
+
+    # The claimer's expiry releases the eroded intent on the very next cycle.
+    arbiter = api.IntentArbiter()
+    short_manual = make_intent(
+        api,
+        intent_id="manual-short",
+        source=api.IntentSource.MANUAL,
+        accepted_at_mono=95.0,
+        duration_s=10.0,
+        selected_unit_ids=frozenset({"lhs", "mid"}),
+    )
+    agent_persistent = make_intent(
+        api,
+        intent_id="agent-persistent",
+        source=api.IntentSource.AGENT,
+        duration_s=600.0,
+        selected_unit_ids=frozenset({"mid"}),
+    )
+    during = arbiter.arbitrate([short_manual, agent_persistent], NOW)
+    assert during.ranked == (short_manual,)
+    after = arbiter.arbitrate([short_manual, agent_persistent], 106.0)
+    assert after.ranked == (agent_persistent,)
+    assert dict(after.winners) == {"mid": agent_persistent}
+
+
+def test_emergency_stop_dominates_every_unit_and_is_the_whole_cycle(
+    api: SimpleNamespace,
+) -> None:
+    """A live stop is still the whole cycle: no other intent is represented,
+    the stop claims exactly its own units (the kernel then fences the fleet),
+    and the stop latches."""
+    stop = make_intent(
+        api,
+        intent_id="stop-1",
+        source=api.IntentSource.EMERGENCY_STOP,
+        selected_unit_ids=frozenset({"mid", "rhs"}),
+    )
+    manual = make_intent(
+        api,
+        intent_id="manual-other",
+        source=api.IntentSource.MANUAL,
+        selected_unit_ids=frozenset({"lhs", "mid"}),
+    )
+    arbiter = api.IntentArbiter()
+
+    selection = arbiter.arbitrate([manual, stop], NOW)
+
+    assert selection.emergency is stop
+    assert selection.ranked == (stop,)
+    assert dict(selection.scopes) == {"stop-1": frozenset({"mid", "rhs"})}
+    assert dict(selection.winners) == {"mid": stop, "rhs": stop}
+
+    # The latch outlives the stop's own TTL and every later intent, exactly as
+    # the single-winner arbiter always did.
+    latched = arbiter.arbitrate([manual], 500.0)
+    assert latched.emergency is stop
+    assert latched.ranked == (stop,)
+
+
+def test_single_intent_arbitration_matches_the_legacy_single_winner(
+    api: SimpleNamespace,
+) -> None:
+    """The single-intent regression anchor: one live intent produces exactly
+    the selection the single-winner arbiter would have run."""
+    intent = make_intent(
+        api,
+        intent_id="solo",
+        source=api.IntentSource.MANUAL,
+        direction=api.Direction.CHARGE,
+        watts=777,
+        selected_unit_ids=frozenset({"lhs", "rhs"}),
+    )
+    arbiter = api.IntentArbiter()
+
+    selection = arbiter.arbitrate([intent], NOW)
+
+    assert selection.single is intent
+    assert selection.emergency is None
+    assert dict(selection.winners) == {"lhs": intent, "rhs": intent}
+    assert dict(selection.scopes) == {"solo": frozenset({"lhs", "rhs"})}
+
+
+def test_idle_intent_wins_only_its_own_units(api: SimpleNamespace) -> None:
+    """A manual idle intent holds its units to zero while a lower-priority
+    active intent still runs its own -- idleness is per unit under concurrency."""
+    idle = make_intent(
+        api,
+        intent_id="manual-idle",
+        source=api.IntentSource.MANUAL,
+        direction=api.Direction.IDLE,
+        watts=0,
+        selected_unit_ids=frozenset({"mid"}),
+    )
+    discharge = make_intent(
+        api,
+        intent_id="agent-discharge",
+        source=api.IntentSource.AGENT,
+        selected_unit_ids=frozenset({"mid", "rhs"}),
+    )
+
+    selection = api.IntentArbiter().arbitrate([discharge, idle], NOW)
+
+    assert dict(selection.winners) == {"mid": idle, "rhs": discharge}
+    assert dict(selection.scopes) == {
+        "manual-idle": frozenset({"mid"}),
+        "agent-discharge": frozenset({"rhs"}),
+    }
+
+
+def test_no_live_intents_yield_an_empty_selection(api: SimpleNamespace) -> None:
+    arbiter = api.IntentArbiter()
+    selection = arbiter.arbitrate([], NOW)
+    assert selection.ranked == ()
+    assert dict(selection.winners) == {}
+    assert dict(selection.scopes) == {}
+    assert selection.emergency is None
+    assert selection.units == frozenset()
+    assert selection.single is None
+
+    expired = make_intent(
+        api,
+        intent_id="expired",
+        source=api.IntentSource.MANUAL,
+        accepted_at_mono=90.0,
+        duration_s=5.0,
+    )
+    assert arbiter.arbitrate([expired], NOW).ranked == ()
+
+
+def test_per_unit_arbitration_is_permutation_invariant(api: SimpleNamespace) -> None:
+    """The composed selection is a pure function of the intent set: identical
+    winners, scopes, and rank order under every input permutation."""
+    intents = [
+        make_intent(
+            api,
+            intent_id="schedule",
+            source=api.IntentSource.SCHEDULE,
+            selected_unit_ids=frozenset({"lhs", "rhs"}),
+        ),
+        make_intent(
+            api,
+            intent_id="agent",
+            source=api.IntentSource.AGENT,
+            selected_unit_ids=frozenset({"mid", "rhs"}),
+        ),
+        make_intent(
+            api,
+            intent_id="manual",
+            source=api.IntentSource.MANUAL,
+            selected_unit_ids=frozenset({"mid"}),
+        ),
+    ]
+    baseline = api.IntentArbiter().arbitrate(intents, NOW)
+    signatures = {
+        (
+            tuple(intent.id for intent in selection.ranked),
+            tuple(sorted((key, tuple(sorted(units))) for key, units in selection.scopes.items())),
+            tuple(sorted((unit, intent.id) for unit, intent in selection.winners.items())),
+        )
+        for selection in (
+            api.IntentArbiter().arbitrate(list(permutation), NOW)
+            for permutation in itertools.permutations(intents)
+        )
+    }
+    assert signatures == {
+        (
+            ("manual", "agent", "schedule"),
+            (("agent", ("rhs",)), ("manual", ("mid",)), ("schedule", ("lhs",))),
+            (("lhs", "schedule"), ("mid", "manual"), ("rhs", "agent")),
+        )
+    }
+    assert baseline.ranked[0].id == "manual"
+
+
+@pytest.mark.parametrize("now_mono", [True, "100", float("nan"), float("inf")])
+def test_per_unit_arbitration_validates_the_clock(api: SimpleNamespace, now_mono: Any) -> None:
+    intent = make_intent(api, intent_id="clock-probe", source=api.IntentSource.MANUAL)
+    with pytest.raises((TypeError, ValueError)):
+        api.IntentArbiter().arbitrate([intent], now_mono)
+
+
+def test_acknowledgement_releases_the_latched_stop_for_per_unit_arbitration(
+    api: SimpleNamespace,
+) -> None:
+    """The acknowledgement path is shared: releasing the latch lets ordinary
+    per-unit arbitration resume on the next cycle."""
+    stop = make_intent(
+        api,
+        intent_id="stop-per-unit",
+        source=api.IntentSource.EMERGENCY_STOP,
+        actor_identity="owner-a",
+    )
+    manual = make_intent(
+        api,
+        intent_id="manual-after",
+        source=api.IntentSource.MANUAL,
+        selected_unit_ids=frozenset({"lhs", "mid", "rhs"}),
+    )
+    repository = FakeIntentRepository(stop, manual)
+    arbiter = api.IntentArbiter(intent_repository=repository)
+    assert arbiter.arbitrate(repository.active(), NOW).emergency is stop
+
+    arbiter.acknowledge_emergency_stop(
+        intent_id="stop-per-unit",
+        actor_identity="authorized-operator",
+        operator_scopes=frozenset({STOP_ACKNOWLEDGE_SCOPE}),
+    )
+
+    released = arbiter.arbitrate(repository.active(), NOW + 1)
+    assert released.emergency is None
+    assert released.ranked == (manual,)
+    assert dict(released.winners) == {"lhs": manual, "mid": manual, "rhs": manual}

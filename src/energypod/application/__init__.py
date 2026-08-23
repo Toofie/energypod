@@ -1,6 +1,6 @@
 """Application use cases and safety authority."""
 
-from .arbiter import IntentArbiter
+from .arbiter import CycleArbitration, IntentArbiter
 from .audit import AuditEventFactory
 from .control_kernel import ControlKernel
 from .generation import AuthorityGenerationCoordinator, AuthorityGenerationSnapshot
@@ -12,6 +12,7 @@ __all__ = [
     "AuthorityGenerationSnapshot",
     "ControlDecision",
     "ControlKernel",
+    "CycleArbitration",
     "IntentArbiter",
     "SafetyKernel",
 ]
