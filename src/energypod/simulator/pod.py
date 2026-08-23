@@ -185,7 +185,7 @@ class SimulatedEnergyPod:
         # Night-writer scenario hook (API_CONTRACTS "Night-writer detector"):
         # a FOREIGN served objective -- another writer's words on the detail
         # block, never latched through our own apply path.
-        self._scripted_objective: tuple[int, int] | None = None
+        self._scripted_objective: tuple[int, int, bool] | None = None
         # Scripted per-pod CT scenario values (PROTOCOL_EVIDENCE 4c words):
         # the deterministic export scenario the excess-solar bound reads.
         self._scripted_grid_power_w = 0
@@ -326,7 +326,9 @@ class SimulatedEnergyPod:
         """
         self._scripted_grid_power_w = self._ct_word(watts, "grid power")
 
-    def script_objective(self, active_w: int, reactive_var: int) -> None:
+    def script_objective(
+        self, active_w: int, reactive_var: int, *, remote_mode: bool = True
+    ) -> None:
         """Scenario hook: place a FOREIGN served PQ objective on the wire.
 
         API_CONTRACTS "Night-writer detector": the scenario drives another
@@ -336,15 +338,18 @@ class SimulatedEnergyPod:
         stay untouched, exactly like an external application writing 0x0200
         behind this controller's back.  While scripted, the PCS live block's
         run-mode word reads 1 ("Remote PQ Power", the vendor's written-objective
-        state, GlobalFun.cs:178-188), the discriminator the detector's pattern
-        tier consumes; the pod's own CT-following autonomy reads 0
-        ("Matching Load").  The words persist until cleared — a scheduled
-        nightly writer refreshes continuously, and the scenario decides when
-        it stands down.
+        state, GlobalFun.cs:178-188) by default — the discriminator the
+        detector's pattern tier consumes; ``remote_mode=False`` serves 0
+        ("Matching Load"), the pod's own CT-following autonomy state.  The
+        words persist until cleared — a scheduled nightly writer refreshes
+        continuously, and the scenario decides when it stands down.
         """
+        if type(remote_mode) is not bool:
+            raise ValueError("remote_mode must be a boolean")
         self._scripted_objective = (
             self._ct_word(active_w, "active objective"),
             self._ct_word(reactive_var, "reactive objective"),
+            remote_mode,
         )
         self._rebuild()
 
@@ -500,8 +505,10 @@ class SimulatedEnergyPod:
         words[0] = 0x0101  # packed PCS software version
         words[1] = 3  # PCS status: on grid
         # Run mode: 1 "Remote PQ Power" while ANY writer's objective holds the
-        # lease -- ours, or the night-writer scenario's foreign words.
-        words[2] = 1 if self._lease_deadline_mono is not None or self._scripted_objective else 0
+        # lease -- ours, or the night-writer scenario's foreign words when the
+        # scenario says the PCS reports the written-objective state.
+        scripted_remote = bool(self._scripted_objective and self._scripted_objective[2])
+        words[2] = 1 if self._lease_deadline_mono is not None or scripted_remote else 0
         words[3] = pack_voltage_counts  # DC voltage x0.1 V
         words[13] = measured_word  # PCS active power, int16 W
         # Advisory per-pod CT words (PROTOCOL_EVIDENCE 4c), scripted scenario
@@ -528,9 +535,11 @@ class SimulatedEnergyPod:
         # The served objective words: the night-writer scenario's FOREIGN pair
         # overrides the applied pair while scripted (the external writer's
         # words are what the wire serves); otherwise the pod's own.
-        active_word, reactive_word = self._scripted_objective or (
-            applied_active_word,
-            applied_reactive_word,
+        scripted = self._scripted_objective
+        active_word, reactive_word = (
+            (scripted[0], scripted[1])
+            if scripted is not None
+            else (applied_active_word, applied_reactive_word)
         )
         words[17] = active_word & 0xFFFF  # active power objective, int16 W
         words[18] = reactive_word & 0xFFFF  # reactive power objective, int16 var

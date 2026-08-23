@@ -907,3 +907,25 @@ async def test_the_scenario_hook_validates_its_words_like_the_wire(simulator: An
     for bad in (32768, -32769, 1.5, "2400"):
         with pytest.raises((TypeError, ValueError), match="int16|integer"):
             pod.script_objective(bad, 0)  # type: ignore[arg-type]
+
+
+async def test_the_scenario_hook_may_serve_the_matching_load_mode(simulator: Any) -> None:
+    """The pod's own CT-following autonomy reads run mode 0 ("Matching
+    Load") while it still holds a nonzero objective -- the state the 2026-08
+    23 lhs evening hold was observed in.  The hook's ``remote_mode=False``
+    serves exactly that, so a scenario can stage pod autonomy as distinct
+    from a writer's Remote-PQ state."""
+    pod, transport, clock = build_unit(simulator)
+    await transport.connect()
+
+    pod.script_objective(-620, 0, remote_mode=False)
+    pod.poll()
+
+    assert await applied_objectives(transport) == (-620, 0)
+    live = await transport.read_holding(0x1000, 21)
+    assert live[2] == 0, "an autonomous pod matches load"
+
+    pod.script_objective(-620, 0)
+    pod.poll()
+    live = await transport.read_holding(0x1000, 21)
+    assert live[2] == 1, "a scripted writer holds the remote-PQ mode by default"
