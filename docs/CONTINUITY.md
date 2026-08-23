@@ -349,6 +349,42 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-24 (backend polish): THREE SMALL ITEMS LANDED (f49c522, e5856cc,
+  f7f1750). (1) SNAPSHOT PER-UNIT INTENT FIGURES (the console's precise
+  proposal; closes the cold-load structural gap the web hook documents in
+  web/src/app/useUnitIntentFigures.ts): the /api/v1/snapshot response now
+  carries top-level `intent` = {requested_watts_by_unit: Record[str,int]|null,
+  authorized_watts_by_unit: Record[str,int]|null, directions_by_unit:
+  Record[str,str]|null} — null when no live intent claims any unit — composed
+  across ALL active intents with the same per-unit winner-set arbitration a
+  kernel cycle uses (fresh throwaway IntentArbiter per read; facade projects,
+  never latches): each unit's requested figure is ITS winner's target
+  (watts_by_unit) or its exact largest-remainder integer share of the winner's
+  scalar total over its surviving scope; directions are per-unit winners';
+  authorized mirrors the FRESHEST control_decision audit row (one bounded
+  newest-first scan, limit 25; first decision in the window decides) filtered
+  to live-claimed units so ended requests never linger — null on no-batch /
+  no-decision / unreadable audit, never fabricated. Per-unit `requested_power`
+  scalars unchanged (compatibility). Contract-first: 7 red facade-family
+  tests (KeyError 'intent') → green; API_CONTRACTS snapshot section amended
+  with the exact shape. Field names match the audit-row maps the web already
+  parses. Also repaired 7 pre-existing red tests in test_facade_audit_content
+  (the 2026-08-24 directions_by_unit field never reached that family's
+  expected dicts). (2) The observe-only compose default
+  max_cell_imbalance_v 0.050 → 0.500 (composition.py _control_policy) now
+  matches the operator-directed live tier (a7297bf, config rev 4), pinned by
+  a new composition test; absolute per-cell bounds unchanged. (3) The two
+  forever-hanging startup tests in test_main_entry.py RETIMED off the hang:
+  the start-report rework completes the lifespan before the first kernel
+  tick, so the exploding-first-tick injection landed after
+  lifespan.startup.complete; the harness now delivers the failure through the
+  start-report path (one actor's start() raises in-window). Same pinned
+  contract (nonzero exit, startup.failed, 'serving failed'/'supervision
+  failed during startup'); both pass in ~0.6 s, the whole family green in
+  2.3 s — THE FULL SUITE IS UNBLOCKED for future runs. Checks per change:
+  scoped tests only, ruff + format + MYPYPATH=src mypy strict clean (45
+  files).
+
 - 2026-08-24 (concurrent per-unit operation): THE OPERATOR'S CONCURRENCY
   REQUIREMENT IMPLEMENTED — "I instructed MID to charge at 2,000 watts and RHS
   to discharge at 1,000 watts. Only one operation functions at a time. I
