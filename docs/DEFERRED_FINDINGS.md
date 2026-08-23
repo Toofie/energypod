@@ -86,6 +86,9 @@ From the 32-agent Milestone A implementation review (all P0/P1 were fixed in
    continues from the live edge.
 3. EventBus: abandoned subscriptions are never reclaimed (O(capacity) drain
    per publish forever).
+   Status: FIXED 2026-08-23 — the bus holds only weak references to live
+   subscriptions; an abandoned iterator is garbage-collected and its entry
+   reclaimed at the next publish, while aclose() still detaches eagerly.
 4. EventBus: envelope accepts non-string keys / non-mapping payloads; in-memory
    vs wire shape can diverge.
 5. EventBus: `resync_required` control type shares the publisher vocabulary; a

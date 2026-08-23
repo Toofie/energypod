@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import weakref
 from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
@@ -90,6 +91,13 @@ class _Subscription:
         # delivered after the marker.
         self._pending_resync = resync
         self._closed = False
+        # The bus keeps only this weak reference, so a subscription abandoned
+        # without ``aclose`` (a disconnected client whose adapter never ran
+        # its finally block) is garbage-collected instead of being drained on
+        # every publish forever.  The reference lives on the subscription so
+        # ``_detach`` removes exactly its own entry: distinct ``weakref.ref``
+        # objects to the same subscription never compare equal.
+        self._self_reference = weakref.ref(self)
         for event in replay:
             self._queue.put_nowait(event)
 
@@ -183,7 +191,7 @@ class EventBus:
         self._clock = clock
         self._queue_capacity = queue_capacity
         self._window: deque[dict[str, Any]] = deque(maxlen=retention)
-        self._subscribers: list[_Subscription] = []
+        self._subscribers: list[weakref.ReferenceType[_Subscription]] = []
         self._sequence = 0
 
     async def publish(self, body: Mapping[str, Any]) -> int:
@@ -198,7 +206,14 @@ class EventBus:
         # order and a failed publication consumes no sequence at all.
         self._sequence = sequence
         self._window.append(envelope)
-        for subscriber in tuple(self._subscribers):
+        for reference in tuple(self._subscribers):
+            subscriber = reference()
+            if subscriber is None:
+                # The subscription was abandoned without aclose: reclaim its
+                # entry instead of draining a dead queue on every publish.
+                with suppress(ValueError):
+                    self._subscribers.remove(reference)
+                continue
             subscriber.offer(envelope)
         return sequence
 
@@ -223,7 +238,7 @@ class EventBus:
             replay=replay,
             resync=resync,
         )
-        self._subscribers.append(subscription)
+        self._subscribers.append(subscription._self_reference)
         return subscription
 
     def _subscription_start(
@@ -270,8 +285,9 @@ class EventBus:
         return now.isoformat()
 
     def _detach(self, subscription: _Subscription) -> None:
+        reference = subscription._self_reference
         with suppress(ValueError):
-            self._subscribers.remove(subscription)
+            self._subscribers.remove(reference)
 
 
 __all__ = ["Clock", "EventBus"]
