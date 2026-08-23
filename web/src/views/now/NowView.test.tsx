@@ -594,6 +594,188 @@ describe("NowView — current request card", () => {
   });
 });
 
+// --- per-unit watt figures from the wire --------------------------------------
+//
+// The backend's native per-unit form (2026-08-23): an intent submitted as
+// `watts_by_unit` carries its map on the 202 acceptance view, the
+// `intent.accepted` frame, and every `control_decision` audit summary
+// (`requested_watts_by_unit` / `authorized_watts_by_unit`). The card prefers
+// those figures over any derivation — the per-battery expectation becomes
+// exact, and the Allowed fact finally names WHICH battery a headroom clamp
+// hit. Scalar intents keep the total ÷ count derivation (pinned above).
+
+describe("NowView — per-unit watt figures from the wire", () => {
+  /** A live channel over a three-armed-battery world. */
+  function armedFleetChannel() {
+    const snap = snapshotEnvelope([ARMED_MID, ARMED_RHS, { ...ARMED_MID, unit_id: "LHS" }]);
+    const channel = liveChannel([{ type: "snapshot", sequence: 41, data: snap }]);
+    api.client.getSnapshot.mockResolvedValue(snap);
+    api.client.openEvents.mockImplementation(() => channel.openEvents());
+    return channel;
+  }
+
+  it("renders Requested exactly from the intent's own per-unit targets — no approximation", async () => {
+    const channel = armedFleetChannel();
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    // The frame the facade publishes for a per-unit intent: the derived total
+    // plus the per-unit targets (service.py submit_intent).
+    channel.push({
+      type: "intent.accepted",
+      sequence: 42,
+      occurred_at: "2026-08-22T12:00:05+10:00",
+      payload: {
+        principal: "operator:home",
+        intent_id: "intent-9-1.000000",
+        direction: "discharge",
+        watts: 3000,
+        watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        unit_ids: ["MID", "RHS", "LHS"],
+      },
+    });
+
+    const requested = await waitFor(() => {
+      const node = screen.getByRole("group", { name: "Requested" });
+      expect(node.textContent).toContain("1,000 W per battery (3,000 W total)");
+      return node;
+    });
+    // Each target is that battery's own allocation cap on the wire now — the
+    // "≈" hedge belonged to the derived scalar split.
+    expect(requested.textContent).toContain("Discharge");
+    expect(requested.textContent).not.toContain("≈");
+  });
+
+  it("names the clamped battery on Allowed from the decision's per-unit authorized map", async () => {
+    const channel = armedFleetChannel();
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    channel.push({
+      type: "intent.accepted",
+      sequence: 42,
+      occurred_at: "2026-08-22T12:00:05+10:00",
+      payload: {
+        principal: "operator:home",
+        intent_id: "intent-9-1.000000",
+        direction: "discharge",
+        watts: 3000,
+        watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        unit_ids: ["MID", "RHS", "LHS"],
+      },
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("group", { name: "Requested" }).textContent).toContain(
+        "1,000 W per battery",
+      );
+    });
+
+    // The kernel's decision summary rides the audit bus: the site headroom
+    // only stretched to 400 W for RHS. The card names the battery.
+    channel.push({
+      type: "audit.appended",
+      sequence: 43,
+      occurred_at: "2026-08-22T12:00:07+10:00",
+      payload: {
+        event_id: "facade-43",
+        event_type: "control_decision",
+        unit_id: null,
+        generation: 9,
+        result: "clamped",
+        reason_codes: ["power_clamped"],
+        requested_active_w: 3000,
+        authorized_active_w: 2400,
+        requested_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        authorized_watts_by_unit: { MID: 1000, RHS: 400, LHS: 1000 },
+      },
+    });
+
+    const allowed = await waitFor(() => {
+      const node = screen.getByRole("group", { name: "Allowed" });
+      expect(node.textContent).toContain("RHS 400 W (headroom)");
+      return node;
+    });
+    expect(allowed.textContent).toContain("Discharge");
+    expect(allowed.textContent).toContain("MID 1,000 W");
+    expect(allowed.textContent).toContain("LHS 1,000 W");
+    // Only the clamped battery is marked; the plain-language note names it.
+    expect(allowed.textContent).not.toContain("MID 1,000 W (headroom)");
+    expect(allowed.textContent).toMatch(/RHS was held back.*headroom/i);
+  });
+
+  it("adopts the acceptance response's own per-unit targets before any frame lands", async () => {
+    const user = userEvent.setup();
+    // Before: armed and idle. After: the request is on the wire (the scalar
+    // total still repeats per covered unit in the snapshot) and the response's
+    // `requested` projection carries the per-unit targets.
+    const before = snapshotEnvelope([ARMED_MID, ARMED_RHS], 41);
+    const after = snapshotEnvelope(
+      [
+        { ...ACTIVE_MID, requested_power: { direction: "charge", watts: 3000 } },
+        { ...ACTIVE_MID, unit_id: "RHS", requested_power: { direction: "charge", watts: 3000 } },
+      ],
+      42,
+    );
+    let calls = 0;
+    api.client.getSnapshot.mockImplementation(() => {
+      calls += 1;
+      return Promise.resolve(calls >= 3 ? after : before);
+    });
+    api.client.postIntent.mockResolvedValue({
+      ...ACCEPTED_CHARGE,
+      requested: {
+        direction: "charge",
+        watts: 3000,
+        watts_by_unit: { MID: 1500, RHS: 1500 },
+      },
+    });
+    renderNow();
+
+    await user.click(await screen.findByRole("button", { name: /^charge/i }));
+    const dialog = screen.getByRole("dialog");
+    const watts = within(dialog).getByLabelText(/watts/i);
+    await user.clear(watts);
+    await user.type(watts, "1500");
+    await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
+
+    expect(await screen.findByText(/^accepted$/i)).toBeInTheDocument();
+    // The response's own map is the source: exact per-battery figures, no
+    // derived "≈" split even though the snapshot repeats the scalar total.
+    await waitFor(() => {
+      const requested = screen.getByRole("group", { name: "Requested" });
+      expect(requested.textContent).toContain("1,500 W per battery (3,000 W total)");
+      expect(requested.textContent).not.toContain("≈");
+    });
+  });
+
+  it("keeps the derived scalar split for a scalar intent arriving over the stream", async () => {
+    // Backwards compatibility: an intent sent the scalar way (another client,
+    // an older console, an in-flight request) carries no per-unit map — the
+    // card falls back to total ÷ count, honestly marked "≈".
+    const channel = armedFleetChannel();
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    channel.push({
+      type: "intent.accepted",
+      sequence: 42,
+      occurred_at: "2026-08-22T12:00:05+10:00",
+      payload: {
+        principal: "operator:home",
+        intent_id: "intent-10-1.000000",
+        direction: "discharge",
+        watts: 3000,
+        unit_ids: ["MID", "RHS", "LHS"],
+      },
+    });
+
+    await waitFor(() => {
+      const requested = screen.getByRole("group", { name: "Requested" });
+      expect(requested.textContent).toContain("≈1,000 W per battery (3,000 W total)");
+    });
+  });
+});
+
 // --- arm / disarm ------------------------------------------------------------
 
 describe("NowView — arm flow", () => {
@@ -748,10 +930,10 @@ describe("NowView — dispatch", () => {
     // One composed preview sentence carries the direction, the typed watts,
     // the selected unit, the limit, and the expiry: static helper copy cannot
     // satisfy it because it contains the operator's own inputs. The watts are
-    // PER BATTERY (2026-08-23 operator ruling), so a single selected battery
-    // shows both figures as the same number — never an unexplained total.
+    // PER BATTERY (2026-08-23 operator ruling) and now travel natively as each
+    // battery's own target, so the figures are exactly true — no "up to".
     const preview = tightestText(dialog, /charge/i, /1,?500\s*W/, /MID/);
-    expect(preview).toContain("Each battery: up to 1,500 W · Total: 1,500 W");
+    expect(preview).toContain("Each battery: 1,500 W · Total: 1,500 W");
     expect(preview).toMatch(/limit/i);
     expect(preview).toMatch(/5\s*min|300\s*s/i);
 
@@ -761,7 +943,7 @@ describe("NowView — dispatch", () => {
       expect.objectContaining({
         unit_ids: ["MID"],
         direction: "charge",
-        watts: 1500,
+        watts_by_unit: { MID: 1500 },
         ttl_s: 300,
       }),
       // One idempotency key per operator action is part of the pinned call.
@@ -799,18 +981,23 @@ describe("NowView — dispatch", () => {
     await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
 
     expect(api.client.postIntent).toHaveBeenCalledWith(
-      expect.objectContaining({ direction: "discharge", watts: 800, ttl_s: 300 }),
+      expect.objectContaining({
+        direction: "discharge",
+        watts_by_unit: { MID: 800 },
+        ttl_s: 300,
+      }),
       // One idempotency key per operator action is part of the pinned call.
       expect.any(String),
     );
   });
 
-  it("submits per-battery watts times the selected count as the payload's scalar fleet total", async () => {
+  it("submits the per-battery entry natively as watts_by_unit — one entry per selected unit, no scalar watts field", async () => {
     // The operator's ruling verbatim: "I asked for each setting to be one
-    // thousand, not a total of 1,000." Three armed batteries at 1,000 W each
-    // submit 3,000 W — the backend contract stays the scalar fleet-total
-    // `watts`; only the form's meaning is per battery. watts_by_unit lands
-    // separately and is not pre-implemented.
+    // thousand, not a total of 1,000." The backend's native per-unit form now
+    // carries that meaning on the wire: every selected unit gets the
+    // operator's entry as its own target, the scalar `watts` field is OMITTED
+    // (the two forms are mutually exclusive — both together is a 422), and the
+    // facade derives the 3,000 W fleet total itself.
     const user = userEvent.setup();
     api.client.getSnapshot.mockResolvedValue(
       snapshotEnvelope([ARMED_MID, ARMED_RHS, { ...ARMED_MID, unit_id: "LHS" }]),
@@ -834,11 +1021,54 @@ describe("NowView — dispatch", () => {
       expect.objectContaining({
         unit_ids: ["MID", "RHS", "LHS"],
         direction: "charge",
-        watts: 3000,
+        watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
         ttl_s: 300,
       }),
       expect.any(String),
     );
+    const [body] = api.client.postIntent.mock.calls[0] as unknown as [
+      Record<string, unknown>,
+      string | undefined,
+    ];
+    // The exact-key-set rule (rest.py IntentRequest): the map names every
+    // selected unit — all of them — and nothing else.
+    expect(Object.keys(body.watts_by_unit as Record<string, number>).sort()).toEqual([
+      "LHS",
+      "MID",
+      "RHS",
+    ]);
+    // The scalar form is never sent alongside: both together is a 422.
+    expect(body).not.toHaveProperty("watts");
+  });
+
+  it("keys watts_by_unit to exactly the batteries still selected when one is unticked", async () => {
+    // The client-side mirror of the wire's exact-key-set validation: a
+    // deselected battery must not ride along in the per-unit map, and every
+    // remaining selection must be present.
+    const user = userEvent.setup();
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([ARMED_MID, ARMED_RHS, { ...ARMED_MID, unit_id: "LHS" }]),
+    );
+    api.client.postIntent.mockResolvedValue(ACCEPTED_CHARGE);
+    renderNow();
+
+    const dialog = await openDispatch(user, /^charge/i);
+    await user.click(within(dialog).getByRole("checkbox", { name: /LHS/ }));
+    const watts = within(dialog).getByLabelText(/watts per battery/i);
+    await user.clear(watts);
+    await user.type(watts, "1000");
+    await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
+
+    expect(api.client.postIntent).toHaveBeenCalledTimes(1);
+    const [body] = api.client.postIntent.mock.calls[0] as unknown as [
+      Record<string, unknown>,
+      string | undefined,
+    ];
+    expect(body.unit_ids).toEqual(["MID", "RHS"]);
+    const map = body.watts_by_unit as Record<string, number>;
+    expect(Object.keys(map).sort()).toEqual(["MID", "RHS"]);
+    expect(map).toEqual({ MID: 1000, RHS: 1000 });
+    expect(body).not.toHaveProperty("watts");
   });
 
   it("re-derives the live per-battery math as the unit selection changes", async () => {
@@ -896,7 +1126,7 @@ describe("NowView — dispatch", () => {
       expect(api.client.postIntent).toHaveBeenCalledTimes(1);
     });
     expect(api.client.postIntent).toHaveBeenCalledWith(
-      expect.objectContaining({ watts: 2500, ttl_s: 300 }),
+      expect.objectContaining({ watts_by_unit: { MID: 2500 }, ttl_s: 300 }),
       expect.any(String),
     );
   });
@@ -985,8 +1215,11 @@ describe("NowView — dispatch", () => {
         code: "validation_error",
         message: "Request validation failed",
         details: {
+          // The form submits the per-unit form, so the API names that field;
+          // the per-battery input owns the error either way (a location naming
+          // the legacy scalar `watts` maps to the same field).
           errors: [
-            { location: ["body", "watts"], message: "Input should be greater than 0", type: "greater_than" },
+            { location: ["body", "watts_by_unit"], message: "Input should be greater than 0", type: "greater_than" },
           ],
         },
         request_id: "req-val-31",

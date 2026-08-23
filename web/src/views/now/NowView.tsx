@@ -57,17 +57,26 @@
  * to be one thousand, not a total of 1,000"): the dispatch form's watts field
  * is PER BATTERY, never a fleet total. The multiplication is shown live
  * before confirm ("1,000 W × 3 batteries selected = 3,000 W total"), the
- * confirm preview states both figures plainly ("Each battery: up to 1,000 W ·
- * Total: 3,000 W"), and the Requested fact derives the same per-battery
- * expectation for a multi-unit request. The SUBMITTED payload keeps the
- * backend contract exactly as it stands — the scalar fleet-total `watts`,
- * per-battery × selected count; the `watts_by_unit` extension lands
- * separately and is deliberately not pre-implemented here.
+ * confirm preview states both figures plainly ("Each battery: 1,000 W ·
+ * Total: 3,000 W"), and the submission uses the backend's native per-unit
+ * form: `watts_by_unit` carries the operator's entry once per selected unit
+ * (the scalar `watts` field is omitted entirely — the two forms are mutually
+ * exclusive on the wire, both together is a 422). The request card then reads
+ * the wire's own per-unit figures: Requested renders the intent's
+ * `watts_by_unit` exactly (no "≈" — the allocator honors each unit's target
+ * as its own cap), Allowed renders the decision's `authorized_watts_by_unit`
+ * per unit so a clamped battery is NAMED, and only scalar intents (in-flight
+ * or older) fall back to the total ÷ count derivation marked "≈".
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health } from "../../api/client";
+import {
+  toAuditUnitWatts,
+  toIntentFigures,
+  type WattsByUnit,
+} from "../../app/fleet";
 import { formatSeconds, formatWatts } from "../../lib/format";
 import "./now.css";
 
@@ -263,19 +272,41 @@ function displayDirection(direction: string): string {
 /**
  * The Requested fact for the units carrying an active request.
  *
- * The wire carries the newest intent's SCALAR total in every covered unit's
- * `requested_power.watts` (service.py `_requested_power` projects the intent's
- * own figure, never a per-unit split), so a request covering several units
- * reads on the wire as the same total repeated once per unit — the exact
- * fleet-total reading the 2026-08-23 operator ruling rejected. Units carrying
- * the identical direction and watts figure are the units one intent covers:
- * for them the fact derives the per-battery expectation from the split —
- * total ÷ covered units, marked "≈" because the allocator's headroom
- * weighting can shift any unit's share — alongside the plain total. A
- * single-unit request renders exactly as before: direction and its own
- * figure, no derived phrasing.
+ * Preferred source — the wire's own per-unit targets. An intent submitted in
+ * the per-unit form carries `watts_by_unit` on its `intent.accepted` frame,
+ * the 202 acceptance view, and every `control_decision` audit summary, so
+ * when the map covers the active units the per-battery figure is the wire's
+ * own number, exact, no "≈" (each target is that unit's own allocation cap).
+ *
+ * Fallback — the scalar split. The snapshot carries the newest intent's
+ * SCALAR total in every covered unit's `requested_power.watts` (service.py
+ * `_requested_power` projects the intent's own figure, never a per-unit
+ * split), so a scalar request covering several units reads as the same total
+ * repeated once per unit. Units carrying the identical direction and watts
+ * figure are the units one intent covers: for them the fact derives the
+ * per-battery expectation from the split — total ÷ covered units, marked "≈"
+ * because the allocator's headroom weighting can shift any unit's share —
+ * alongside the plain total. A single-unit request renders exactly as before:
+ * direction and its own figure, no derived phrasing.
  */
-function requestedFactText(activeUnits: WireUnit[]): string {
+function requestedFactText(activeUnits: WireUnit[], requestedByUnit: WattsByUnit | null): string {
+  if (requestedByUnit !== null && activeUnits.length > 0) {
+    const covered = activeUnits.filter((unit) => requestedByUnit[unit.unit_id] !== undefined);
+    if (covered.length === activeUnits.length) {
+      const direction = activeUnits[0]!.requested_power.direction;
+      const values = activeUnits.map((unit) => requestedByUnit[unit.unit_id]!);
+      const total = values.reduce((sum, watts) => sum + watts, 0);
+      if (activeUnits.length === 1) {
+        return `${displayDirection(direction)} · ${formatWatts(values[0]!)}`;
+      }
+      const perBattery = values.every((watts) => watts === values[0])
+        ? formatWatts(values[0]!)
+        : activeUnits
+            .map((unit) => `${unit.unit_id} ${formatWatts(requestedByUnit[unit.unit_id]!)}`)
+            .join(" · ");
+      return `${displayDirection(direction)} · ${perBattery} per battery (${formatWatts(total)} total)`;
+    }
+  }
   const groups: { direction: string; watts: number; count: number }[] = [];
   for (const unit of activeUnits) {
     const figure = unit.requested_power;
@@ -296,6 +327,47 @@ function requestedFactText(activeUnits: WireUnit[]): string {
       return `${displayDirection(group.direction)} · ≈${formatWatts(group.watts / group.count)} per battery (${formatWatts(group.watts)} total)`;
     })
     .join("; ");
+}
+
+/**
+ * The Allowed fact when the decision's per-unit authorized map is on hand
+ * (the `control_decision` audit summary's `authorized_watts_by_unit`): one
+ * figure per battery, so the operator finally sees WHICH battery a headroom
+ * clamp hit — the battery whose authorized watts fall below its own requested
+ * target is named "(headroom)" and spelled out in plain language beside the
+ * figures. Direction comes from the units' own authorized/requested figures;
+ * the map itself is magnitudes only.
+ */
+function allowedFactText(
+  units: WireUnit[],
+  authorizedByUnit: WattsByUnit,
+  requestedByUnit: WattsByUnit | null,
+): string | null {
+  const covered = units.filter((unit) => authorizedByUnit[unit.unit_id] !== undefined);
+  if (covered.length === 0) {
+    return null;
+  }
+  const parts: string[] = [];
+  const heldBack: string[] = [];
+  for (const unit of covered) {
+    const authorized = authorizedByUnit[unit.unit_id]!;
+    const requested = requestedByUnit?.[unit.unit_id];
+    const held = requested !== undefined && authorized < requested;
+    if (held) {
+      heldBack.push(unit.unit_id);
+    }
+    parts.push(`${unit.unit_id} ${formatWatts(authorized)}${held ? " (headroom)" : ""}`);
+  }
+  const withAuthorization = covered.find((unit) => unit.authorized_power !== null);
+  const direction =
+    withAuthorization?.authorized_power?.direction ??
+    covered[0]!.requested_power.direction;
+  const base = `${displayDirection(direction)} · ${parts.join(" · ")}`;
+  if (heldBack.length === 0) {
+    return base;
+  }
+  const names = heldBack.join(", ");
+  return `${base} — ${names} ${heldBack.length === 1 ? "was" : "were"} held back: less headroom than requested, so the safety system allowed less power for ${heldBack.length === 1 ? "that battery" : "those batteries"}.`;
 }
 
 // Watt and second figures render through the shared display-precision module
@@ -423,7 +495,9 @@ function apiErrorField(error: ApiClientError): "watts" | "minutes" | null {
   for (const entry of error.details.errors) {
     if (!isRecord(entry) || !Array.isArray(entry.location)) continue;
     const path = entry.location.map((segment) => String(segment));
-    if (path.includes("watts")) return "watts";
+    // The per-battery field submits as `watts_by_unit` (with the scalar
+    // `watts` still named by older/refusing services): both belong to it.
+    if (path.includes("watts") || path.includes("watts_by_unit")) return "watts";
     if (path.some((segment) => segment === "ttl_s" || segment === "ttl" || segment === "minutes" || segment === "duration")) {
       return "minutes";
     }
@@ -631,6 +705,20 @@ export function NowView({ client }: NowViewProps) {
   const [dispatchWatts, setDispatchWatts] = useState("");
   const [dispatchMinutes, setDispatchMinutes] = useState("5");
   const [selectedUnitIds, setSelectedUnitIds] = useState<string[]>([]);
+  /**
+   * The live intent's own per-unit watt targets (`watts_by_unit`), captured
+   * from the 202 acceptance view, the `intent.accepted` frame, or the
+   * `control_decision` audit summaries — the wire's native per-battery
+   * figures the Requested fact prefers over any derivation. Null while no
+   * per-unit intent is known (scalar intents and pre-intent states).
+   */
+  const [requestedByUnit, setRequestedByUnit] = useState<WattsByUnit | null>(null);
+  /**
+   * The decision's per-unit authorized watts (`authorized_watts_by_unit`),
+   * captured from `control_decision` audit summaries: the map that names
+   * WHICH battery a headroom clamp hit. Null until a minted batch is seen.
+   */
+  const [authorizedByUnit, setAuthorizedByUnit] = useState<WattsByUnit | null>(null);
   const [fieldErrors, setFieldErrors] = useState<FieldErrors | null>(null);
   const [dispatchApiError, setDispatchApiError] = useState<DispatchApiError | null>(null);
   const dispatchKeyRef = useRef<string | null>(null);
@@ -811,11 +899,36 @@ export function NowView({ client }: NowViewProps) {
                   ),
                 },
           );
+          // The newest intent's own per-unit targets — the exact per-battery
+          // figures when the per-unit form was submitted, null when it was
+          // scalar (the two forms are mutually exclusive on the wire). A new
+          // request also resets the authorized map: nothing is authorized for
+          // it until the kernel's next decision.
+          const figures = toIntentFigures(payload);
+          setRequestedByUnit(figures?.wattsByUnit ?? null);
+          setAuthorizedByUnit(null);
           // The published payload carries no expiry; the accepted response's
           // expires_in_s is the countdown source. Kept defensive for a future
           // wire addition.
           if (typeof payload.expires_in_s === "number") {
             setExpiry({ remainingS: payload.expires_in_s, atMs: monotonicNowMs() });
+          }
+        }
+      } else if (type === "audit.appended") {
+        // The kernel's per-tick decision summaries ride the audit bus
+        // (composition.py `_AsyncAuditRepository`): a `control_decision` row
+        // carries the intent's own per-unit targets and the decision's
+        // per-unit authorized watts, so the request card can speak in
+        // per-battery figures the moment the decision lands — before any
+        // snapshot refetch answers. Other audit kinds carry no maps and never
+        // disturb the live request's.
+        if (payload !== null && payload.event_type === "control_decision") {
+          const unitWatts = toAuditUnitWatts(payload);
+          if (unitWatts.requested !== null) {
+            setRequestedByUnit(unitWatts.requested);
+          }
+          if (unitWatts.authorized !== null) {
+            setAuthorizedByUnit(unitWatts.authorized);
           }
         }
       } else if (type === "unit.armed" || type === "unit.disarmed") {
@@ -845,6 +958,10 @@ export function NowView({ client }: NowViewProps) {
           );
         }
         setExpiry(null);
+        // The stop ends the request outright: the per-unit figures must not
+        // linger as a ghost of an intent that no longer exists.
+        setRequestedByUnit(null);
+        setAuthorizedByUnit(null);
         const frameStopId =
           payload !== null && typeof payload.stop_id === "string" ? payload.stop_id : "";
         setLatchedStop({
@@ -883,6 +1000,8 @@ export function NowView({ client }: NowViewProps) {
         // The request itself is over: the countdown must not linger on screen
         // as a ghost of an intent that no longer exists.
         setExpiry(null);
+        setRequestedByUnit(null);
+        setAuthorizedByUnit(null);
         const unitIds = unitIdsFromPayload(payload);
         const reason =
           payload !== null && typeof payload.reason === "string" && payload.reason !== ""
@@ -899,6 +1018,8 @@ export function NowView({ client }: NowViewProps) {
         // way once its intent-lifecycle event lands. The request card must not
         // linger as a ghost: the countdown goes and the world is re-read.
         setExpiry(null);
+        setRequestedByUnit(null);
+        setAuthorizedByUnit(null);
         setRevokedNotice("The power request ended.");
         refetchSnapshot();
       } else if (type === "authorization.granted") {
@@ -1065,20 +1186,29 @@ export function NowView({ client }: NowViewProps) {
     (unit): unit is WireUnit & { measured_watts: number } => unit.measured_watts !== null,
   );
 
-  // The Requested fact derives the per-battery expectation for a multi-unit
-  // request (see requestedFactText); "None" is the honest no-request state.
-  const requestedText = activeUnits.length > 0 ? requestedFactText(activeUnits) : "None";
+  // The Requested fact prefers the wire's own per-unit targets and falls back
+  // to the scalar split derivation (see requestedFactText); "None" is the
+  // honest no-request state.
+  const requestedText =
+    activeUnits.length > 0 ? requestedFactText(activeUnits, requestedByUnit) : "None";
+  // The Allowed fact prefers the decision's per-unit authorized map — the one
+  // source that names which battery a headroom clamp hit — and falls back to
+  // the snapshot's own per-unit authorized figures.
+  const allowedFromWire =
+    authorizedByUnit !== null ? allowedFactText(units, authorizedByUnit, requestedByUnit) : null;
   const allowedText =
-    authorizedUnits.length > 0
-      ? authorizedUnits
-          .map(
-            (unit) =>
-              `${displayDirection(unit.authorized_power.direction)} · ${formatWatts(unit.authorized_power.watts)}`,
-          )
-          .join("; ")
-      : activeUnits.length > 0
-        ? "None yet"
-        : "None";
+    allowedFromWire !== null
+      ? allowedFromWire
+      : authorizedUnits.length > 0
+        ? authorizedUnits
+            .map(
+              (unit) =>
+                `${displayDirection(unit.authorized_power.direction)} · ${formatWatts(unit.authorized_power.watts)}`,
+            )
+            .join("; ")
+        : activeUnits.length > 0
+          ? "None yet"
+          : "None";
   const actualText =
     measuredUnits.length > 0
       ? measuredUnits
@@ -1213,14 +1343,38 @@ export function NowView({ client }: NowViewProps) {
       });
       return;
     }
-    // The form is per battery; the submitted watts stays the backend contract
-    // exactly as it stands — the scalar fleet-total figure the intent endpoint
-    // defines. Per-battery × selected count IS that total; the `watts_by_unit`
-    // extension lands separately and is not pre-implemented here.
+    // The form is per battery; the submission is the backend's native per-unit
+    // form: one entry per selected unit carrying the operator's per-battery
+    // figure (the form has a single per-battery field, so every selected unit
+    // gets the same target). The scalar `watts` field is OMITTED — the two
+    // forms are mutually exclusive on the wire, and both together is a 422.
+    const wattsByUnit: Record<string, number> = {};
+    for (const unitId of selectedUnitIds) {
+      wattsByUnit[unitId] = wattsValue;
+    }
+    // Client-side mirror of the wire's exact-key-set rule (rest.py
+    // `IntentRequest`): the map names every selected unit, and nothing else.
+    // It holds by construction today; the guard keeps any future per-unit
+    // entry (mixed values, a deselected unit) honest before a POST.
+    const selection = new Set(selectedUnitIds);
+    const keys = Object.keys(wattsByUnit);
+    if (keys.length !== selection.size || keys.some((unitId) => !selection.has(unitId))) {
+      setDispatchApiError({
+        error: new ApiClientError({
+          code: "watts_by_unit_key_mismatch",
+          message: "The per-battery watts must name exactly the batteries selected.",
+          details: null,
+          request_id: "",
+          status: 0,
+        }),
+        field: "watts",
+      });
+      return;
+    }
     const body: Record<string, unknown> = {
       unit_ids: [...selectedUnitIds],
       direction,
-      watts: wattsValue * selectedUnitIds.length,
+      watts_by_unit: wattsByUnit,
       ttl_s: Math.round(minutesValue * 60),
     };
     // One caller-supplied idempotency key per operator action: a retry of the
@@ -1239,6 +1393,15 @@ export function NowView({ client }: NowViewProps) {
           if (outcome.expiresInSeconds !== null) {
             setExpiry({ remainingS: outcome.expiresInSeconds, atMs: monotonicNowMs() });
           }
+        }
+        // The acceptance view's own `requested` projection carries the
+        // per-unit targets: the card's exact per-battery figures start from
+        // the response itself, before any frame or refetch lands. Nothing is
+        // authorized for the new request yet.
+        const figures = toIntentFigures(result.requested);
+        if (figures !== null) {
+          setRequestedByUnit(figures.wattsByUnit);
+          setAuthorizedByUnit(null);
         }
         closeDialog();
         // Allowed and Actual are the two facts the API alone can answer after a
@@ -1305,8 +1468,11 @@ export function NowView({ client }: NowViewProps) {
   //
   // The form is per battery (the 2026-08-23 operator ruling): the live math
   // line shows the multiplication as it is typed and as units are ticked, and
-  // the confirm preview states both figures plainly — per battery and total —
-  // so the submitted scalar total is never a silent surprise.
+  // the confirm preview states both figures plainly — per battery and total.
+  // Both figures are now exactly true on the wire: the submission carries the
+  // operator's entry as each selected battery's own target, so "Each battery:
+  // 1,000 W · Total: 3,000 W" is what the pod was asked, not an approximation.
+  // A battery the site headroom later clamps is named by the Allowed fact.
 
   const wattsNumber = Number(dispatchWatts.trim());
   const minutesNumber = Number(dispatchMinutes.trim());
@@ -1315,7 +1481,7 @@ export function NowView({ client }: NowViewProps) {
     dispatchMinutes.trim() !== "" && Number.isFinite(minutesNumber) && minutesNumber > 0;
   const selectedCount = selectedUnitIds.length;
   const batteryWord = selectedCount === 1 ? "battery" : "batteries";
-  /** The submitted scalar total: per-battery watts × selected count. */
+  /** The fleet total the facade derives: per-battery watts × selected count. */
   const totalWatts = wattsValid ? wattsNumber * selectedCount : null;
   const wattsMathText = wattsValid
     ? `${formatWatts(wattsNumber)} × ${selectedCount} ${batteryWord} selected = ${formatWatts(totalWatts ?? 0)} total`
@@ -1327,7 +1493,7 @@ export function NowView({ client }: NowViewProps) {
         ? "Inhibit"
         : "Control";
   const previewUnits = selectedCount > 0 ? selectedUnitIds.join(", ") : "no units";
-  const previewPerBattery = wattsValid ? `up to ${formatWatts(wattsNumber)}` : "the watts you set";
+  const previewPerBattery = wattsValid ? formatWatts(wattsNumber) : "the watts you set";
   const previewTotal =
     totalWatts !== null ? formatWatts(totalWatts) : "the watts you set × the batteries you select";
   const previewDuration = minutesValid
