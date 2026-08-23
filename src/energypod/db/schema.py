@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-SCHEMA_VERSION: Final[int] = 1
+SCHEMA_VERSION: Final[int] = 2
 BASELINE_VERSION: Final[int] = 0
 
 _CREATE_VERSION_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS schema_version (
@@ -29,6 +29,18 @@ _STAMP_VERSION: Final[str] = (
     "INSERT INTO schema_version(singleton, version) VALUES (1, ?)"
     " ON CONFLICT(singleton) DO UPDATE SET version = excluded.version"
 )
+# DESIGN_ENERGY_SCORECARD section 5 (E3): the per-day energy ledger keyed by
+# local date and the durable live-day baseline keyed by unit.  Day records
+# are projections, not acts -- the audit store is deliberately not
+# overloaded for this.
+_CREATE_ENERGY_DAY_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS energy_day (
+    day TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+)"""
+_CREATE_ENERGY_BASELINE_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS energy_baseline (
+    unit_id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+)"""
 
 
 @dataclass(frozen=True)
@@ -49,8 +61,16 @@ class MigrationResult:
 
 # The migration chain. Version 1 is the schema the shipped stores already
 # create (audit_events, active_schedule) plus the version table itself, so a
-# pre-schema database upgrades in place without any data change.
-MIGRATIONS: tuple[Migration, ...] = (Migration(version=1, statements=(_CREATE_VERSION_TABLE,)),)
+# pre-schema database upgrades in place without any data change.  Version 2
+# adds the energy scorecard's ledger tables (E3): energy_day keyed by local
+# date, energy_baseline keyed by unit.
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(version=1, statements=(_CREATE_VERSION_TABLE,)),
+    Migration(
+        version=2,
+        statements=(_CREATE_ENERGY_DAY_TABLE, _CREATE_ENERGY_BASELINE_TABLE),
+    ),
+)
 
 
 class DatabaseLifecycleError(RuntimeError):

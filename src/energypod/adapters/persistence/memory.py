@@ -10,6 +10,59 @@ from typing import Any
 
 from energypod.domain import IntentSource
 from energypod.domain.authorization import AuthorizationBatch, StaleGenerationError
+from energypod.domain.energy import EnergyDayRecord, EnergyUnitBaseline
+
+
+class InMemoryEnergyLedgerRepository:
+    """Process-local energy ledger: day records keyed by date + the baseline.
+
+    DESIGN_ENERGY_SCORECARD section 5: ``record_day`` is idempotent by date
+    (the first record for a site-day stands -- the accountant finalizes a day
+    exactly once), ``latest_days`` returns newest-first within the caller's
+    bound, and the durable live-day baseline round-trips per unit.
+    """
+
+    def __init__(self) -> None:
+        self._days: dict[Any, EnergyDayRecord] = {}
+        self._baseline: dict[str, EnergyUnitBaseline] = {}
+        self._lock = RLock()
+
+    def record_day(self, record: EnergyDayRecord) -> None:
+        if type(record) is not EnergyDayRecord:
+            raise TypeError("record must be an EnergyDayRecord")
+        with self._lock:
+            self._days.setdefault(record.date, record)
+
+    def get_day(self, day: Any) -> EnergyDayRecord | None:
+        self._require_date(day)
+        with self._lock:
+            return self._days.get(day)
+
+    def latest_days(self, limit: int) -> tuple[EnergyDayRecord, ...]:
+        if type(limit) is not int or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        with self._lock:
+            days = sorted(self._days, reverse=True)[:limit]
+            return tuple(self._days[day] for day in days)
+
+    def load_baseline(self) -> dict[str, EnergyUnitBaseline]:
+        with self._lock:
+            return dict(self._baseline)
+
+    def save_baseline(self, baselines: Any) -> None:
+        if not isinstance(baselines, dict):
+            raise TypeError("baselines must map unit ids to EnergyUnitBaseline values")
+        if any(type(value) is not EnergyUnitBaseline for value in baselines.values()):
+            raise TypeError("baselines must map unit ids to EnergyUnitBaseline values")
+        with self._lock:
+            self._baseline = dict(baselines)
+
+    @staticmethod
+    def _require_date(day: object) -> None:
+        from datetime import date as _date
+
+        if type(day) is not _date:
+            raise TypeError("day must be a civil date")
 
 
 class InMemoryObservationRepository:

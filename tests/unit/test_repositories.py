@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,7 @@ try:
         PersistenceBusyError,
         SQLiteAuditRepository,
         SQLiteDatabase,
+        SQLiteEnergyLedgerRepository,
         SQLiteScheduleRepository,
     )
     from energypod.domain.audit import AuditEvent, DuplicateAuditEventError
@@ -41,6 +42,7 @@ except ImportError as exc:  # pragma: no cover - initial red phase only
     SQLiteAuditRepository: Any = None
     PersistenceBusyError: Any = None
     SQLiteDatabase: Any = None
+    SQLiteEnergyLedgerRepository: Any = None
     SQLiteScheduleRepository: Any = None
     AuditEvent: Any = None
     DuplicateAuditEventError: Any = None
@@ -596,5 +598,222 @@ def test_invalid_replacement_leaves_published_schedule_unchanged(tmp_path: Path)
                 entries=(original.entries[0], original.entries[0]),
             )
         assert repository.get() == original
+    finally:
+        database.close()
+
+
+# --- energy scorecard ledger (DESIGN_ENERGY_SCORECARD section 5, E3) -------------
+
+
+def _energy_day(day: date, *, kind: str = "complete", import_kwh: float = 1.5) -> Any:
+    _require_contract()
+    from energypod.domain.energy import (
+        CounterCrossCheck,
+        EnergyDayRecord,
+        FleetEnergyDay,
+        UnitEnergyDay,
+    )
+
+    return EnergyDayRecord(
+        date=day,
+        timezone="Australia/Brisbane",
+        utc_offset_minutes=600,
+        kind=kind,
+        units={
+            "mid": UnitEnergyDay(
+                grid_import_kwh=import_kwh,
+                grid_export_kwh=2.5,
+                battery_charged_kwh=0.8,
+                battery_discharged_kwh=0.4,
+                load_kwh=3.0,
+                charged_from_surplus_kwh=0.6,
+                coverage_pct=99.0,
+                metric_flags=frozenset({"counter_reset:charge"}),
+            )
+        },
+        fleet=FleetEnergyDay(
+            grid_import_kwh=import_kwh,
+            grid_export_kwh=2.5,
+            battery_charged_kwh=0.8,
+            battery_discharged_kwh=0.4,
+            load_kwh=3.0,
+            charged_from_surplus_kwh=0.6,
+            coverage_pct=99.0,
+        ),
+        sources={
+            "grid": "integrated_ct",
+            "battery": "device_counter",
+            "load": "device_counter",
+            "surplus": "attributed_adviser",
+        },
+        counter_cross_check=CounterCrossCheck(
+            grid_a_delta_kwh=import_kwh,
+            grid_b_delta_kwh=2.5,
+            consistent_with="vendor_labels",
+            discriminating=True,
+        ),
+        solar_production_measured=False,
+    )
+
+
+def _baseline(day: date, unit: str = "mid") -> Any:
+    _require_contract()
+    from energypod.domain.energy import EnergyUnitBaseline
+
+    return EnergyUnitBaseline(
+        date=day,
+        counter_start={"charge": 100.0},
+        counter_last={"charge": 100.5},
+        import_watt_seconds=5000.0,
+        export_watt_seconds=2500.0,
+        surplus_watt_seconds=0.0,
+        sampled_seconds=5.0,
+        last_capture_wall=datetime(2026, 8, 26, 4, 0, 0, tzinfo=UTC),
+        last_grid_watts=-1000.0,
+        flags=frozenset(),
+    )
+
+
+def test_memory_energy_ledger_round_trips_days_and_baseline() -> None:
+    """T-UNIT-REPO-015 / DESIGN_ENERGY_SCORECARD section 5 / S1."""
+    from energypod.adapters.persistence.memory import InMemoryEnergyLedgerRepository
+
+    repository = InMemoryEnergyLedgerRepository()
+    day = date(2026, 8, 26)
+    record = _energy_day(day)
+    repository.record_day(record)
+    repository.record_day(_energy_day(day, kind="partial"))
+
+    assert repository.get_day(day) == record, "record_day is idempotent by date"
+    assert repository.latest_days(8) == (record,)
+    assert repository.get_day(date(2026, 8, 27)) is None
+
+    repository.save_baseline({"mid": _baseline(day)})
+    restored = repository.load_baseline()
+    assert set(restored) == {"mid"}
+    assert restored["mid"] == _baseline(day)
+    repository.save_baseline({})
+    assert repository.load_baseline() == {}
+
+
+def test_memory_energy_ledger_latest_days_is_bounded_and_newest_first() -> None:
+    from energypod.adapters.persistence.memory import InMemoryEnergyLedgerRepository
+
+    repository = InMemoryEnergyLedgerRepository()
+    for index in range(5):
+        repository.record_day(_energy_day(date(2026, 8, 22) + timedelta(days=index)))
+    assert [record.date for record in repository.latest_days(3)] == [
+        date(2026, 8, 26),
+        date(2026, 8, 25),
+        date(2026, 8, 24),
+    ]
+    assert len(repository.latest_days(31)) == 5
+    assert repository.latest_days(0) == ()
+
+
+def test_sqlite_energy_ledger_round_trips_and_is_idempotent_by_date(
+    tmp_path: Path,
+) -> None:
+    """T-UNIT-REPO-016 / the durable day ledger + baseline / S0."""
+    database = _open_database(tmp_path / "energy.sqlite3")
+    repository = SQLiteEnergyLedgerRepository(database)
+    day = date(2026, 8, 26)
+    record = _energy_day(day)
+    try:
+        repository.record_day(record)
+        repository.record_day(_energy_day(day, kind="partial", import_kwh=9.9))
+        assert repository.get_day(day) == record, "the first record for a date stands"
+        assert repository.get_day(date(2026, 8, 25)) is None
+
+        repository.save_baseline({"mid": _baseline(day)})
+        second_database = SQLiteDatabase(tmp_path / "energy.sqlite3")
+        second_database.open()
+        try:
+            second = SQLiteEnergyLedgerRepository(second_database)
+            restored = second.load_baseline()
+            assert set(restored) == {"mid"}
+            assert restored["mid"] == _baseline(day)
+            assert second.get_day(day) == record
+        finally:
+            second_database.close()
+    finally:
+        database.close()
+
+
+def test_sqlite_energy_ledger_orders_and_bounds_latest_days(tmp_path: Path) -> None:
+    database = _open_database(tmp_path / "energy-days.sqlite3")
+    repository = SQLiteEnergyLedgerRepository(database)
+    try:
+        for index in range(4):
+            repository.record_day(
+                _energy_day(date(2026, 8, 23) + timedelta(days=index), import_kwh=1.0 + index)
+            )
+        assert [record.date for record in repository.latest_days(2)] == [
+            date(2026, 8, 26),
+            date(2026, 8, 25),
+        ]
+        assert len(repository.latest_days(31)) == 4
+    finally:
+        database.close()
+
+
+def test_energy_schema_migrates_a_version_one_database_in_place(
+    tmp_path: Path,
+) -> None:
+    """T-UNIT-REPO-017 / schema_version migration from the prior version / S0.
+
+    A database stamped at version 1 (the audit + schedule schema) upgrades in
+    place to the energy-ledger schema without touching the existing rows.
+    """
+    from energypod.db.schema import SCHEMA_VERSION
+
+    assert SCHEMA_VERSION >= 2
+    path = tmp_path / "migrate.sqlite3"
+    raw = sqlite3.connect(path)
+    try:
+        raw.execute(
+            "CREATE TABLE schema_version ("
+            "singleton INTEGER PRIMARY KEY CHECK (singleton = 1),"
+            "version INTEGER NOT NULL UNIQUE)"
+        )
+        raw.execute("INSERT INTO schema_version(singleton, version) VALUES (1, 1)")
+        raw.execute(
+            "CREATE TABLE audit_events ("
+            "sequence INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "event_id TEXT NOT NULL UNIQUE,"
+            "unit_id TEXT,"
+            "monotonic_offset_s REAL NOT NULL,"
+            "payload TEXT NOT NULL)"
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    database = _open_database(path)
+    try:
+        repository = SQLiteEnergyLedgerRepository(database)
+        day = date(2026, 8, 26)
+        repository.record_day(_energy_day(day))
+        stamped = database.connection.execute(
+            "SELECT version FROM schema_version WHERE singleton = 1"
+        ).fetchone()
+        assert stamped == (SCHEMA_VERSION,)
+        assert database.connection.execute("SELECT COUNT(*) FROM audit_events").fetchone() == (0,)
+        assert repository.get_day(day) is not None
+    finally:
+        database.close()
+
+
+def test_sqlite_energy_ledger_refuses_malformed_rows(tmp_path: Path) -> None:
+    """An unreadable or unknown-key payload fails closed at decode."""
+    database = _open_database(tmp_path / "energy-bad.sqlite3")
+    repository = SQLiteEnergyLedgerRepository(database)
+    try:
+        with database.connection:
+            database.connection.execute(
+                "INSERT INTO energy_day(day, payload) VALUES ('2026-08-26', '{}')"
+            )
+        with pytest.raises(ValueError):
+            repository.get_day(date(2026, 8, 26))
     finally:
         database.close()

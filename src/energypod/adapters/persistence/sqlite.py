@@ -14,6 +14,13 @@ from typing import Any, NoReturn
 
 from energypod.db.schema import apply_pending_migrations
 from energypod.domain.audit import AuditEvent, DuplicateAuditEventError
+from energypod.domain.energy import (
+    CounterCrossCheck,
+    EnergyDayRecord,
+    EnergyUnitBaseline,
+    FleetEnergyDay,
+    UnitEnergyDay,
+)
 from energypod.domain.intents import Direction, IntentSource
 from energypod.domain.observations import UnitLifecycle
 from energypod.domain.schedule import (
@@ -427,3 +434,283 @@ class SQLiteScheduleRepository:
             for item in value["entries"]
         )
         return SchedulePlan(version=value["version"], timezone=value["timezone"], entries=entries)
+
+
+class SQLiteEnergyLedgerRepository:
+    """The durable energy scorecard ledger (DESIGN_ENERGY_SCORECARD section 5).
+
+    ``energy_day`` holds one payload per local date (the first record for a
+    site-day stands -- the accountant finalizes a day exactly once, so a
+    re-record is the idempotent no-op the memory adapter performs too);
+    ``energy_baseline`` holds the live-day baseline per unit so a mid-day
+    restart re-baselines from the last seen cumulatives.  Day records are
+    projections, not acts: the audit store is deliberately not overloaded.
+    """
+
+    _UNIT_METRIC_KEYS = frozenset(
+        {
+            "grid_import_kwh",
+            "grid_export_kwh",
+            "battery_charged_kwh",
+            "battery_discharged_kwh",
+            "load_kwh",
+            "charged_from_surplus_kwh",
+            "coverage_pct",
+            "metric_flags",
+        }
+    )
+    _FLEET_KEYS = _UNIT_METRIC_KEYS - {"metric_flags"}
+    _BASELINE_KEYS = frozenset(
+        {
+            "date",
+            "counter_start",
+            "counter_last",
+            "import_watt_seconds",
+            "export_watt_seconds",
+            "surplus_watt_seconds",
+            "sampled_seconds",
+            "last_capture_wall",
+            "last_grid_watts",
+            "flags",
+        }
+    )
+
+    def __init__(self, database: SQLiteDatabase) -> None:
+        self._database = database
+        try:
+            with database.lock:
+                database.connection.execute(
+                    """CREATE TABLE IF NOT EXISTS energy_day (
+                        day TEXT PRIMARY KEY,
+                        payload TEXT NOT NULL
+                    )"""
+                )
+                database.connection.execute(
+                    """CREATE TABLE IF NOT EXISTS energy_baseline (
+                        unit_id TEXT PRIMARY KEY,
+                        payload TEXT NOT NULL
+                    )"""
+                )
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError(
+                    "energy ledger database is busy during initialization"
+                ) from exc
+            raise
+
+    def record_day(self, record: EnergyDayRecord) -> None:
+        if type(record) is not EnergyDayRecord:
+            raise TypeError("record must be an EnergyDayRecord")
+        payload = json.dumps(
+            record.payload(), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        day = record.date.isoformat()
+        try:
+            with self._database.lock:
+                connection = self._database.connection
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    # The first record for a date stands (finalize-once).
+                    connection.execute(
+                        "INSERT INTO energy_day(day, payload) VALUES (?, ?)"
+                        " ON CONFLICT(day) DO NOTHING",
+                        (day, payload),
+                    )
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("energy ledger is busy") from exc
+            raise
+
+    def get_day(self, day: date) -> EnergyDayRecord | None:
+        if type(day) is not date:
+            raise TypeError("day must be a civil date")
+        try:
+            with self._database.lock:
+                row = self._database.connection.execute(
+                    "SELECT payload FROM energy_day WHERE day = ?", (day.isoformat(),)
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("energy ledger is busy") from exc
+            raise
+        return None if row is None else self._decode_day(row[0])
+
+    def latest_days(self, limit: int) -> tuple[EnergyDayRecord, ...]:
+        if type(limit) is not int or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        if limit == 0:
+            return ()
+        try:
+            with self._database.lock:
+                rows = self._database.connection.execute(
+                    "SELECT payload FROM energy_day ORDER BY day DESC LIMIT ?", (limit,)
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("energy ledger is busy") from exc
+            raise
+        return tuple(self._decode_day(row[0]) for row in rows)
+
+    def load_baseline(self) -> dict[str, EnergyUnitBaseline]:
+        try:
+            with self._database.lock:
+                rows = self._database.connection.execute(
+                    "SELECT unit_id, payload FROM energy_baseline"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("energy ledger is busy") from exc
+            raise
+        return {str(unit_id): self._decode_baseline(payload) for unit_id, payload in rows}
+
+    def save_baseline(self, baselines: Mapping[str, EnergyUnitBaseline]) -> None:
+        if not isinstance(baselines, Mapping) or any(
+            type(value) is not EnergyUnitBaseline for value in baselines.values()
+        ):
+            raise TypeError("baselines must map unit ids to EnergyUnitBaseline values")
+        encoded = {
+            unit: json.dumps(
+                self._baseline_payload(baseline),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+            for unit, baseline in baselines.items()
+        }
+        try:
+            with self._database.lock:
+                connection = self._database.connection
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    # The baseline is a whole-fleet projection: rows for
+                    # units no longer configured must not linger.
+                    connection.execute("DELETE FROM energy_baseline")
+                    connection.executemany(
+                        "INSERT INTO energy_baseline(unit_id, payload) VALUES (?, ?)",
+                        sorted(encoded.items()),
+                    )
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("energy ledger is busy") from exc
+            raise
+
+    @staticmethod
+    def _baseline_payload(baseline: EnergyUnitBaseline) -> dict[str, Any]:
+        return {
+            "date": baseline.date.isoformat(),
+            "counter_start": dict(baseline.counter_start),
+            "counter_last": dict(baseline.counter_last),
+            "import_watt_seconds": baseline.import_watt_seconds,
+            "export_watt_seconds": baseline.export_watt_seconds,
+            "surplus_watt_seconds": baseline.surplus_watt_seconds,
+            "sampled_seconds": baseline.sampled_seconds,
+            "last_capture_wall": (
+                None
+                if baseline.last_capture_wall is None
+                else baseline.last_capture_wall.isoformat()
+            ),
+            "last_grid_watts": baseline.last_grid_watts,
+            "flags": sorted(baseline.flags),
+        }
+
+    def _decode_baseline(self, payload: str) -> EnergyUnitBaseline:
+        value = _load_json_object(payload)
+        _require_exact_keys(value, self._BASELINE_KEYS, "energy baseline")
+        return EnergyUnitBaseline(
+            date=date.fromisoformat(value["date"]),
+            counter_start={
+                str(key): float(number) for key, number in value["counter_start"].items()
+            },
+            counter_last={str(key): float(number) for key, number in value["counter_last"].items()},
+            import_watt_seconds=float(value["import_watt_seconds"]),
+            export_watt_seconds=float(value["export_watt_seconds"]),
+            surplus_watt_seconds=float(value["surplus_watt_seconds"]),
+            sampled_seconds=float(value["sampled_seconds"]),
+            last_capture_wall=(
+                None
+                if value["last_capture_wall"] is None
+                else datetime.fromisoformat(value["last_capture_wall"])
+            ),
+            last_grid_watts=(
+                None if value["last_grid_watts"] is None else float(value["last_grid_watts"])
+            ),
+            flags=frozenset(str(flag) for flag in value["flags"]),
+        )
+
+    def _decode_day(self, payload: str) -> EnergyDayRecord:
+        value = _load_json_object(payload)
+        _require_exact_keys(
+            value,
+            frozenset(
+                {
+                    "date",
+                    "timezone",
+                    "utc_offset_minutes",
+                    "kind",
+                    "units",
+                    "fleet",
+                    "sources",
+                    "counter_cross_check",
+                    "solar_production_measured",
+                }
+            ),
+            "energy day record",
+        )
+        if type(value["units"]) is not dict:
+            raise ValueError("energy day units must be a JSON object")
+        units = {
+            str(unit): self._decode_unit_metrics(unit, metrics)
+            for unit, metrics in value["units"].items()
+        }
+        if type(value["fleet"]) is not dict:
+            raise ValueError("energy day fleet must be a JSON object")
+        _require_exact_keys(value["fleet"], self._FLEET_KEYS, "energy fleet metrics")
+        fleet = FleetEnergyDay(**{key: value["fleet"][key] for key in self._FLEET_KEYS})
+        cross_check = value["counter_cross_check"]
+        if cross_check is not None:
+            if type(cross_check) is not dict:
+                raise ValueError("counter cross-check must be a JSON object")
+            _require_exact_keys(
+                cross_check,
+                frozenset(
+                    {"grid_a_delta_kwh", "grid_b_delta_kwh", "consistent_with", "discriminating"}
+                ),
+                "counter cross-check",
+            )
+            cross_check = CounterCrossCheck(**cross_check)
+        return EnergyDayRecord(
+            date=date.fromisoformat(value["date"]),
+            timezone=str(value["timezone"]),
+            utc_offset_minutes=int(value["utc_offset_minutes"]),
+            kind=str(value["kind"]),
+            units=units,
+            fleet=fleet,
+            sources={str(key): str(source) for key, source in value["sources"].items()},
+            counter_cross_check=cross_check,
+            solar_production_measured=bool(value["solar_production_measured"]),
+        )
+
+    def _decode_unit_metrics(self, unit: str, metrics: Any) -> UnitEnergyDay:
+        if type(metrics) is not dict:
+            raise ValueError(f"energy day unit {unit!r} metrics must be a JSON object")
+        _require_exact_keys(metrics, self._UNIT_METRIC_KEYS, f"energy unit {unit!r} metrics")
+        if type(metrics["metric_flags"]) is not list:
+            raise ValueError("metric_flags must be a JSON array")
+        return UnitEnergyDay(
+            grid_import_kwh=metrics["grid_import_kwh"],
+            grid_export_kwh=metrics["grid_export_kwh"],
+            battery_charged_kwh=metrics["battery_charged_kwh"],
+            battery_discharged_kwh=metrics["battery_discharged_kwh"],
+            load_kwh=metrics["load_kwh"],
+            charged_from_surplus_kwh=metrics["charged_from_surplus_kwh"],
+            coverage_pct=metrics["coverage_pct"],
+            metric_flags=frozenset(str(flag) for flag in metrics["metric_flags"]),
+        )

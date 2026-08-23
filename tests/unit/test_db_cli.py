@@ -317,16 +317,22 @@ def _no_temporary_files(directory: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def test_schema_version_is_one_and_present_from_day_one(tmp_path: Path) -> None:
-    """Opening a fresh database stamps the version before anything else runs."""
+def test_schema_version_is_stamped_from_day_one(tmp_path: Path) -> None:
+    """Opening a fresh database stamps the latest known version before
+    anything else runs (version 2 added the energy-ledger tables, E3)."""
     _require_contract()
-    assert SCHEMA_VERSION == 1
+    assert SCHEMA_VERSION == 2
     database = SQLiteDatabase(tmp_path / "controller.sqlite3")
     database.open()
     try:
         connection = database.connection
         row = connection.execute("SELECT singleton, version FROM schema_version").fetchone()
-        assert row == (1, 1)
+        assert row == (1, SCHEMA_VERSION)
+        for table in ("energy_day", "energy_baseline"):
+            present = connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
+            ).fetchone()
+            assert present is not None, table
     finally:
         database.close()
 
@@ -399,7 +405,7 @@ def test_db_migrate_applies_pending_migrations_to_a_legacy_database(
 
     first = run_cli(main_module, ["db", "migrate", str(config)], capsys)
     assert first.exit_code == 0, first.report()
-    assert "1" in first.stdout, first.report()
+    assert "2" in first.stdout, first.report()
     assert _stored_version(database) == SCHEMA_VERSION
     assert _audit_rows(database) == 1
 
@@ -660,7 +666,7 @@ def test_db_restore_validates_and_swaps_atomically(
         result = run_cli(main_module, ["db", "restore", "--in", str(backup), str(config)], capsys)
     assert result.exit_code == 0, result.report()
     assert "restored" in result.stdout, result.report()
-    assert "1" in result.stdout, result.report()
+    assert "2" in result.stdout, result.report()
     assert window.seen == []
 
     assert _audit_rows(database) == 2, "the backup content replaced the live database"
