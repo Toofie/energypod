@@ -49,18 +49,22 @@ def _intent(
     direction: str = "DISCHARGE",
     watts: int = 10,
     selected: frozenset[str] = frozenset({"a", "b"}),
+    per_unit: dict[str, int] | None = None,
 ) -> object:
-    return models.PowerIntent(
-        id="intent-allocation",
-        source=models.IntentSource.OPTIMIZER,
-        selected_unit_ids=selected,
-        direction=getattr(models.Direction, direction),
-        watts=watts,
-        duration_s=5.0,
-        accepted_at_mono=100.0,
-        acceptance_revision=7,
-        actor_identity="optimizer:test",
-    )
+    values: dict[str, Any] = {
+        "id": "intent-allocation",
+        "source": models.IntentSource.OPTIMIZER,
+        "selected_unit_ids": selected,
+        "direction": getattr(models.Direction, direction),
+        "watts": watts,
+        "duration_s": 5.0,
+        "accepted_at_mono": 100.0,
+        "acceptance_revision": 7,
+        "actor_identity": "optimizer:test",
+    }
+    if per_unit is not None:
+        values["watts_by_unit"] = per_unit
+    return models.PowerIntent(**values)
 
 
 def _headroom(
@@ -740,3 +744,242 @@ def test_generated_requests_reach_every_participating_unit(
         for unit in participating:
             ideal = request * capacities[unit] // total_capacity
             assert result.allocations[unit] <= ideal + 2
+
+
+# ---------------------------------------------------------------------------
+# Per-unit watt targets (the 2026-08-23 operator ruling: "I asked for each
+# setting to be one thousand, not a total of 1,000").  A watts_by_unit intent
+# names a different watt CAP per battery; watts stays the fleet total (the
+# sum of the targets), and the allocation never exceeds either bound.
+# ---------------------------------------------------------------------------
+
+
+def _per_unit_intent(
+    models: ModuleType,
+    targets: dict[str, int],
+    *,
+    direction: str = "DISCHARGE",
+) -> object:
+    return _intent(
+        models,
+        direction=direction,
+        watts=sum(targets.values()),
+        selected=frozenset(targets),
+        per_unit=dict(targets),
+    )
+
+
+def test_per_unit_targets_are_honored_exactly_under_ample_headroom() -> None:
+    """The operator scenario: different targets per battery, all deliverable.
+
+    Each unit runs at exactly its own target -- the capacity-weighted share is
+    clamped to the unit's target, and the watts released by that clamping are
+    redistributed to the units still below their targets, so the fleet total
+    lands exactly on the sum of the targets.
+    """
+    models = _models()
+    allocation = _allocation()
+    result = allocation.allocate_fleet_power(
+        _per_unit_intent(models, {"lhs": 1_200, "mid": 400, "rhs": 800}),
+        _live_like_headrooms(allocation),
+    )
+    assert dict(result.allocations) == {"lhs": 1_200, "mid": 400, "rhs": 800}
+    assert result.requested_watts == 2_400
+    assert result.allocated_watts == 2_400
+    assert result.unallocated_watts == 0
+
+
+def test_per_unit_target_above_headroom_clamps_and_reports_the_shortfall() -> None:
+    """A target beyond a unit's headroom stops at that headroom.
+
+    lhs asks for 1_200 W against 1_000 W of headroom: it runs at 1_000 W, the
+    other units stay at their own (already fully met) targets and stop
+    absorbing redistribution, and the undeliverable remainder is reported as
+    unallocated rather than forced onto any unit.
+    """
+    models = _models()
+    allocation = _allocation()
+    result = allocation.allocate_fleet_power(
+        _per_unit_intent(models, {"lhs": 1_200, "mid": 400, "rhs": 800}),
+        (
+            _headroom(allocation, "lhs", 1_000, 1_000),
+            _headroom(allocation, "mid", 8_056, 8_056),
+            _headroom(allocation, "rhs", 6_752, 6_752),
+        ),
+    )
+    assert dict(result.allocations) == {"lhs": 1_000, "mid": 400, "rhs": 800}
+    assert result.allocated_watts == 2_200
+    assert result.unallocated_watts == 200
+
+
+def test_per_unit_clamp_shortfall_redistributes_to_under_target_units() -> None:
+    """Watts released by clamping flow to units still below their targets.
+
+    Two equal-headroom units asking 10 W and 50 W: the capacity-weighted split
+    gives 30/30, a clamps to its 10 W target, and the 20 W it released moves to
+    b (the only unit with a remaining target-versus-allocation gap).
+    """
+    models = _models()
+    allocation = _allocation()
+    result = allocation.allocate_fleet_power(
+        _per_unit_intent(models, {"a": 10, "b": 50}),
+        (_headroom(allocation, "a", 1_000, 1_000), _headroom(allocation, "b", 1_000, 1_000)),
+    )
+    assert dict(result.allocations) == {"a": 10, "b": 50}
+    assert result.allocated_watts == 60
+
+
+def test_per_unit_redistribution_is_bounded_by_targets_headroom_and_total() -> None:
+    """No redistribution may push a unit past its own target or headroom.
+
+    a asks for 100 W with only 30 W of headroom and b for 200 W with plenty:
+    a can never exceed 30 W, b can never exceed its 200 W target, and the fleet
+    total can never exceed the request even though both units would absorb more.
+    """
+    models = _models()
+    allocation = _allocation()
+    result = allocation.allocate_fleet_power(
+        _per_unit_intent(models, {"a": 100, "b": 200}),
+        (_headroom(allocation, "a", 30, 30), _headroom(allocation, "b", 5_000, 5_000)),
+    )
+    assert dict(result.allocations) == {"a": 30, "b": 200}
+    assert result.allocated_watts == 230
+    assert result.unallocated_watts == 70
+
+
+def test_per_unit_intent_composes_with_the_export_cap() -> None:
+    """The measured-export min() term bounds the fleet demand, not the targets."""
+    models = _models()
+    allocation = _allocation()
+    result = allocation.allocate_fleet_power(
+        _per_unit_intent(models, {"a": 20, "b": 100}, direction="CHARGE"),
+        (_headroom(allocation, "a", 1_000, 0), _headroom(allocation, "b", 1_000, 0)),
+        export_cap_w=60,
+    )
+    # 60 W capacity-weighted over equal headroom is 30/30; a clamps to its 20 W
+    # target and the released 10 W redistributes to b, still under its target.
+    assert dict(result.allocations) == {"a": 20, "b": 40}
+    assert result.requested_watts == 120
+    assert result.allocated_watts == 60
+    assert result.unallocated_watts == 60
+
+
+def test_per_unit_ineligible_units_keep_explicit_zero_proposals() -> None:
+    """The zero-watt non-participation doctrine is unchanged per unit."""
+    models = _models()
+    allocation = _allocation()
+    result = allocation.allocate_fleet_power(
+        _per_unit_intent(models, {"a": 50, "b": 50}),
+        (
+            _headroom(allocation, "a", 1_000, 1_000, eligible=False),
+            _headroom(allocation, "b", 1_000, 1_000),
+        ),
+    )
+    assert dict(result.allocations) == {"a": 0, "b": 50}
+    assert result.allocated_watts == 50
+    assert result.unallocated_watts == 50
+
+
+def test_per_unit_allocation_is_permutation_invariant() -> None:
+    models = _models()
+    allocation = _allocation()
+    intent = _per_unit_intent(models, {"lhs": 1_200, "mid": 400, "rhs": 800})
+    units = (
+        _headroom(allocation, "lhs", 1_000, 1_000),
+        _headroom(allocation, "mid", 8_056, 8_056),
+        _headroom(allocation, "rhs", 6_752, 6_752),
+    )
+    expected = allocation.allocate_fleet_power(intent, units)
+    for ordered in (tuple(reversed(units)), units[1:] + units[:1], units[2:] + units[:2]):
+        assert allocation.allocate_fleet_power(intent, ordered) == expected
+
+
+def test_per_unit_concentration_boundary_below_one_watt_per_target() -> None:
+    """The concentration boundary, per-target: a demand smaller than the
+    participating-unit count concentrates by capacity priority, and the
+    unfillable tail receives explicit zero-watt proposals."""
+    models = _models()
+    allocation = _allocation()
+    every_watt = allocation.allocate_fleet_power(
+        _per_unit_intent(models, {"a": 1, "b": 1, "c": 1}),
+        tuple(_headroom(allocation, unit, 100, 100) for unit in ("a", "b", "c")),
+    )
+    assert dict(every_watt.allocations) == {"a": 1, "b": 1, "c": 1}
+    # An export cap below the target sum concentrates the demand: two watts
+    # over three one-watt targets fill a and b (capacity ties by unit id).
+    capped = allocation.allocate_fleet_power(
+        _per_unit_intent(models, {"a": 1, "b": 1, "c": 1}),
+        tuple(_headroom(allocation, unit, 100, 100) for unit in ("a", "b", "c")),
+        export_cap_w=2,
+    )
+    assert dict(capped.allocations) == {"a": 1, "b": 1, "c": 0}
+    assert capped.allocated_watts == 2
+
+
+def test_scalar_path_is_unchanged_when_watts_by_unit_is_absent() -> None:
+    """No regression: the scalar fleet-total split keeps its exact shape."""
+    models = _models()
+    allocation = _allocation()
+    intent = _intent(models, watts=2_400, selected=frozenset({"lhs", "mid", "rhs"}))
+    assert intent.watts_by_unit is None
+    result = allocation.allocate_fleet_power(intent, _live_like_headrooms(allocation))
+    assert dict(result.allocations) == {"lhs": 347, "mid": 1_117, "rhs": 936}
+    assert result.allocated_watts == 2_400
+
+
+@st.composite
+def _per_unit_cases(
+    draw: st.DrawFn,
+) -> tuple[list[tuple[str, int, int, bool]], dict[str, int]]:
+    count = draw(st.integers(min_value=1, max_value=8))
+    ids = [f"unit-{index:02d}" for index in range(count)]
+    charge = draw(st.lists(st.integers(0, 100_000), min_size=count, max_size=count))
+    discharge = draw(st.lists(st.integers(0, 100_000), min_size=count, max_size=count))
+    eligible = draw(st.lists(st.booleans(), min_size=count, max_size=count))
+    targets = dict(
+        zip(
+            ids,
+            draw(st.lists(st.integers(1, 100_000), min_size=count, max_size=count)),
+            strict=True,
+        )
+    )
+    rows = [
+        (unit, cap, dis, ok)
+        for unit, cap, dis, ok in zip(ids, charge, discharge, eligible, strict=True)
+        if unit in targets
+    ]
+    return rows, targets
+
+
+@given(_per_unit_cases(), st.sampled_from(("CHARGE", "DISCHARGE")))
+@settings(max_examples=250)
+def test_generated_per_unit_allocations_respect_every_bound_exactly(
+    allocation_api: SimpleNamespace,
+    case: tuple[list[tuple[str, int, int, bool]], dict[str, int]],
+    direction: str,
+) -> None:
+    """Property: every per-unit allocation lands at or below the unit's own
+    target and headroom, and the fleet allocates exactly the deliverable
+    total: min(fleet demand, sum of per-unit serving capacities)."""
+    models = allocation_api.models
+    allocation = allocation_api.allocation
+    rows, targets = case
+    units = tuple(
+        _headroom(allocation, unit, charge, discharge, eligible=ok)
+        for unit, charge, discharge, ok in rows
+    )
+    result = allocation.allocate_fleet_power(
+        _per_unit_intent(models, targets, direction=direction), units
+    )
+    index = 1 if direction == "CHARGE" else 2
+    selected = frozenset(targets)
+    headrooms = {row[0]: (int(row[index]) if row[3] else 0) for row in rows if row[0] in selected}
+    assert set(result.allocations) == selected
+    assert all(
+        type(value) is int and 0 <= value <= min(targets[unit], headrooms[unit])
+        for unit, value in result.allocations.items()
+    )
+    serving = sum(min(target, headrooms[unit]) for unit, target in targets.items())
+    expected_allocated = min(sum(targets.values()), serving)
+    assert result.allocated_watts == expected_allocated
+    assert result.unallocated_watts == sum(targets.values()) - expected_allocated

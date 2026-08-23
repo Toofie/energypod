@@ -248,6 +248,83 @@ def test_idle_intent_requires_exactly_zero_watts() -> None:
         models.PowerIntent(**_intent_kwargs(models, direction=models.Direction.IDLE, watts=1))
 
 
+# --- per-unit watt targets (the 2026-08-23 operator ruling: "I asked for each
+# setting to be one thousand, not a total of 1,000") ---------------------------
+
+
+def test_power_intent_carries_optional_per_unit_watts() -> None:
+    """One intent may name a different watt target per selected battery.
+
+    ``watts`` stays the fleet total (the sum of the targets) so every existing
+    consumer of the fleet figure is unchanged; the per-unit map is frozen with
+    normalized keys, and IDLE intents keep carrying ``None``.
+    """
+    models = _models()
+    intent = models.PowerIntent(
+        **_intent_kwargs(
+            models,
+            selected_unit_ids=frozenset({"mid", "rhs"}),
+            watts=2_600,
+            watts_by_unit={"mid": 1_000, "rhs": 1_600},
+        )
+    )
+    assert dict(intent.watts_by_unit) == {"mid": 1_000, "rhs": 1_600}
+    assert intent.watts == 2_600, "the fleet total must equal the sum of the per-unit targets"
+    with pytest.raises(TypeError):
+        intent.watts_by_unit["mid"] = 1  # type: ignore[index]
+    _assert_frozen(intent, "watts", 1)
+    # The default remains the fleet-total-only shape every existing intent uses.
+    assert models.PowerIntent(**_intent_kwargs(models)).watts_by_unit is None
+
+
+@pytest.mark.parametrize(
+    ("watts", "per_unit"),
+    [
+        (2_500, {"mid": 1_000}),  # a selected unit is missing its target
+        (2_600, {"mid": 1_000, "rhs": 1_000, "lhs": 600}),  # a target names an unselected unit
+        (1_000, {"mid": 0, "rhs": 1_000}),  # a per-unit target must be positive
+        (900, {"mid": -100, "rhs": 1_000}),
+        (2_600, {"mid": 1.0, "rhs": 1_600}),  # coerced float magnitude
+        (2_600, {"mid": True, "rhs": 1_600}),  # boolean magnitude
+        (2_600, {" mid ": 1_000, "rhs": 1_600}),  # unnormalized key
+        (2_500, {"mid": 1_000, "rhs": 1_400}),  # targets do not sum to the fleet total
+        (0, {}),
+    ],
+)
+def test_power_intent_rejects_malformed_per_unit_watts(watts: int, per_unit: object) -> None:
+    models = _models()
+    with pytest.raises((TypeError, ValueError)):
+        models.PowerIntent(
+            **_intent_kwargs(
+                models,
+                selected_unit_ids=frozenset({"mid", "rhs"}),
+                watts=watts,
+                watts_by_unit=per_unit,
+            )
+        )
+
+
+def test_power_intent_rejects_non_mapping_per_unit_watts() -> None:
+    models = _models()
+    with pytest.raises((TypeError, ValueError)):
+        models.PowerIntent(**_intent_kwargs(models, watts_by_unit=[("mid", 1_000)]))
+    with pytest.raises((TypeError, ValueError)):
+        models.PowerIntent(**_intent_kwargs(models, watts_by_unit="mid:1000"))
+
+
+def test_idle_intent_carries_no_per_unit_watts() -> None:
+    models = _models()
+    with pytest.raises((TypeError, ValueError)):
+        models.PowerIntent(
+            **_intent_kwargs(
+                models,
+                direction=models.Direction.IDLE,
+                watts=0,
+                watts_by_unit={"mid": 1, "rhs": 1},
+            )
+        )
+
+
 def _setpoint(models: ModuleType, **overrides: Any) -> object:
     values: dict[str, Any] = {
         "unit_id": "mid",

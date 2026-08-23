@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -30,6 +31,11 @@ class PowerIntent(BaseModel):
     selected_unit_ids: frozenset[str]
     direction: Direction
     watts: int
+    # Per-unit watt targets (the 2026-08-23 operator ruling: each setting is
+    # that battery's own request, never one fleet total).  ``watts`` stays the
+    # fleet total -- exactly the sum of these targets -- so every existing
+    # fleet-total consumer is unchanged.  IDLE intents carry ``None``.
+    watts_by_unit: Mapping[str, int] | None = None
     duration_s: float
     accepted_at_mono: float
     acceptance_revision: int = 0
@@ -48,6 +54,23 @@ class PowerIntent(BaseModel):
         if not value or any(not unit or unit != unit.strip() for unit in value):
             raise ValueError("selected unit identifiers must be non-empty and normalized")
         return value
+
+    @field_validator("watts_by_unit")
+    @classmethod
+    def _per_unit_watts(cls, value: Mapping[str, int] | None) -> Mapping[str, int] | None:
+        if value is None:
+            return None
+        copied = dict(value)
+        if not copied:
+            raise ValueError("per-unit watts must name every selected unit")
+        if any(not key or key != key.strip() for key in copied):
+            raise ValueError("per-unit watt keys must be non-empty and normalized")
+        if any(item <= 0 for item in copied.values()):
+            raise ValueError("per-unit watts must be positive")
+        # Deferred import: ``models`` already imports this module for Direction.
+        from .models import _FrozenStringMapping
+
+        return _FrozenStringMapping(copied)
 
     @field_validator("watts", "acceptance_revision")
     @classmethod
@@ -76,6 +99,13 @@ class PowerIntent(BaseModel):
             raise ValueError("idle requires zero watts; active directions require positive watts")
         if self.source is IntentSource.EMERGENCY_STOP and self.direction is not Direction.IDLE:
             raise ValueError("emergency stop intents must request idle")
+        if self.watts_by_unit is not None:
+            if self.direction is Direction.IDLE:
+                raise ValueError("idle intents carry no per-unit watts")
+            if set(self.watts_by_unit) != set(self.selected_unit_ids):
+                raise ValueError("per-unit watt keys must equal the selected units")
+            if sum(self.watts_by_unit.values()) != self.watts:
+                raise ValueError("per-unit watts must sum to the fleet total")
         return self
 
     @property

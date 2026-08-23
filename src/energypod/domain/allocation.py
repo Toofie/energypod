@@ -138,6 +138,35 @@ def _distribute_demand(demand: int, capacities: Mapping[str, int]) -> dict[str, 
     return {unit: base[unit] + floors[unit] + (1 if unit in bumped else 0) for unit in selected}
 
 
+def _distribute_per_unit_targets(
+    demand: int, capacities: Mapping[str, int], targets: Mapping[str, int]
+) -> dict[str, int]:
+    """Distribute one demand where every unit names its own watt target.
+
+    A target is a per-unit CAP (the 2026-08-23 operator ruling: each setting
+    is that battery's own request), never a floor.  The capacity-weighted
+    share is clamped to the unit's own target; the watts that clamping
+    released — chiefly the shortfall of units whose target exceeds their
+    headroom — are redistributed across the units still below their targets,
+    bounded by each unit's own target-versus-allocation gap and headroom.  A
+    unit whose target is fully met stops absorbing redistribution, and the
+    fleet total never exceeds the demand, so the exact-sum invariants and the
+    exported result ``allocated == min(demand, sum of serving capacities)``
+    hold by construction.  Concentration below one watt per participating
+    unit is inherited from :func:`_distribute_demand`, now per-target.
+    """
+    initial = _distribute_demand(demand, capacities)
+    serving = {unit: min(targets[unit], capacities[unit]) for unit in initial}
+    clamped = {unit: min(initial[unit], targets[unit]) for unit in initial}
+    released = sum(initial.values()) - sum(clamped.values())
+    # A unit whose weighted share already exceeds its target cannot also hold
+    # a serving gap: the share never exceeds headroom, so target < share
+    # implies target < headroom and the unit was clamped exactly to target.
+    gaps = {unit: serving[unit] - clamped[unit] for unit in initial}
+    redistributed = _distribute_demand(released, gaps)
+    return {unit: clamped[unit] + redistributed[unit] for unit in initial}
+
+
 def allocate_fleet_power(
     intent: PowerIntent,
     headrooms: tuple[UnitHeadroom, ...],
@@ -167,6 +196,11 @@ def allocate_fleet_power(
     missing = set(selected) - set(by_id)
     if missing:
         raise ValueError(f"missing headroom for selected units: {sorted(missing)}")
+    targets = intent.watts_by_unit
+    if targets is not None and set(targets) != set(selected):
+        # The domain model already refuses this shape; the allocator stays
+        # fail-closed against any future bypass of that validation.
+        raise ValueError("per-unit targets must name exactly the selected units")
     # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the
     # measured-export bound is ONE additional min() term on the effective
     # demand.  It can only lower power below today's limits and — crucially
@@ -186,7 +220,10 @@ def allocate_fleet_power(
         )
         for unit_id in selected
     }
-    allocations = _distribute_demand(demand, capacities)
+    if targets is None:
+        allocations = _distribute_demand(demand, capacities)
+    else:
+        allocations = _distribute_per_unit_targets(demand, capacities, targets)
     # The unallocated remainder keeps absorbing whatever the cap (or headroom)
     # denied, so the exact-sum invariants are unchanged: allocated plus
     # unallocated equals the intent's own request.
