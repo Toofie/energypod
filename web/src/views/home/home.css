@@ -232,6 +232,41 @@
   opacity: 0.75;
 }
 
+/* --- The solar-surplus tile (feature-detected: nothing renders while the
+       snapshot carries no adviser_state) ---------------------------------- */
+
+.home-solar-status {
+  margin: 0 0 0.4rem;
+  color: #3f3a30;
+}
+
+.home-solar-status[data-active="true"] {
+  font-weight: 600;
+}
+
+.home-solar-cap {
+  margin: 0 0 0.6rem;
+  font-size: 0.9rem;
+  color: #78716c;
+}
+
+.home-solar-units {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.4rem;
+}
+
+.home-solar-units li {
+  padding: 0.35rem 0.6rem;
+  border-left: 3px solid #9ae6b4;
+  background: #faf9f5;
+  border-radius: 0 0.4rem 0.4rem 0;
+  color: #57534e;
+  font-variant-numeric: tabular-nums;
+}
+
 /* --- Question 3: reserve ------------------------------------------------ */
 
 .home-reserve-total {

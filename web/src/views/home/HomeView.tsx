@@ -73,10 +73,17 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health, StreamEvent } from "../../api/client";
-import { toWattsByUnit, type WattsByUnit } from "../../app/fleet";
+import {
+  isRecord,
+  toAdviserState,
+  toWattsByUnit,
+  type AdviserState,
+  type WattsByUnit,
+} from "../../app/fleet";
 import { isPlaneSnapshot } from "../../app/SharedDataPlane";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../../lib/format";
+import { SolarSurplusTile } from "./SolarSurplusTile";
 import "./home.css";
 
 export interface HomeViewProps {
@@ -147,10 +154,15 @@ interface PowerFigureView {
 }
 
 /** The snapshot's nullable telemetry block — the reserve question needs SOC;
- * the limiting question needs the cell spread for the imbalance warning. */
+ * the limiting question needs the cell spread for the imbalance warning; the
+ * solar-surplus tile needs the advisory grid/load readthrough. */
 interface TelemetrySummaryView {
   socPct: number | null;
   cellSpreadMv: number | null;
+  /** Signed: negative = import, positive = export; null = no PCS live block. */
+  gridPowerW: number | null;
+  /** The pod's local load; null = not served. */
+  loadPowerW: number | null;
 }
 
 interface UnitView {
@@ -167,6 +179,12 @@ interface UnitView {
 interface SnapshotView {
   snapshot_sequence: number;
   units: UnitView[];
+  /**
+   * The snapshot's top-level `adviser_state` projection, feature-detected:
+   * null when the field is absent (the excess-solar feature is not composed
+   * here) — the tile renders nothing and nothing else changes.
+   */
+  adviserState: AdviserState | null;
 }
 
 function readPowerFigure(value: unknown): PowerFigureView | null {
@@ -191,10 +209,14 @@ function readTelemetrySoc(value: unknown): TelemetrySummaryView | null {
   const record = value as Record<string, unknown>;
   const soc = record.soc_pct;
   const spread = record.cell_spread_mv;
+  const grid = record.grid_power_w;
+  const load = record.load_power_w;
   return {
     socPct:
       typeof soc === "number" && Number.isFinite(soc) && soc >= 0 && soc <= 100 ? soc : null,
     cellSpreadMv: typeof spread === "number" && Number.isFinite(spread) ? spread : null,
+    gridPowerW: typeof grid === "number" && Number.isFinite(grid) ? grid : null,
+    loadPowerW: typeof load === "number" && Number.isFinite(load) ? load : null,
   };
 }
 
@@ -236,6 +258,9 @@ function readSnapshot(value: unknown): SnapshotView | null {
   return {
     snapshot_sequence: typeof record.snapshot_sequence === "number" ? record.snapshot_sequence : 0,
     units,
+    // Feature detection: an absent `adviser_state` (today's backend) is null —
+    // the excess-solar feature is not composed here and its tile stays hidden.
+    adviserState: isRecord(record.adviser_state) ? toAdviserState(record.adviser_state) : null,
   };
 }
 
@@ -1288,6 +1313,18 @@ export function HomeView({ client }: HomeViewProps) {
           </ul>
         )}
       </section>
+
+      {/* The solar-surplus tile: the excess-solar feature's one-glance story.
+          Renders nothing at all while the snapshot carries no adviser_state
+          (feature detection — the backend half is not composed). */}
+      <SolarSurplusTile
+        adviser={snapshot.adviserState}
+        units={units.map((unit) => ({
+          unitId: unit.unit_id,
+          gridPowerW: unit.telemetry?.gridPowerW ?? null,
+          loadPowerW: unit.telemetry?.loadPowerW ?? null,
+        }))}
+      />
 
       <section className="home-card" aria-labelledby={reserveHeadingId}>
         <h2 id={reserveHeadingId}>How full are the batteries?</h2>

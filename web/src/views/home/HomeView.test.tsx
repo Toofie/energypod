@@ -76,7 +76,8 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
 import type { ApiClient } from "../../api/client";
-import { telemetrySummary, type WireTelemetrySummary } from "../../test/wire";
+import { ADVISER_REASON_CODES } from "../../app/fleet";
+import { adviserState, telemetrySummary, type WireAdviserState, type WireTelemetrySummary } from "../../test/wire";
 import { HomeView, HEALTH_POLL_MS } from "./HomeView";
 
 vi.mock("../../api/client", async (importOriginal) => {
@@ -120,6 +121,12 @@ interface FleetView {
   snapshot_sequence: number;
   captured_at: string;
   units: UnitView[];
+  /**
+   * The excess-solar adviser projection (PENDING-BACKEND, feature-detected):
+   * absent from today's wire — the default fixture omits it exactly like the
+   * backend does; solar-surplus tests attach it explicitly.
+   */
+  adviser_state?: WireAdviserState;
 }
 
 interface HealthReport {
@@ -1655,5 +1662,203 @@ describe("HomeView — the limiting factors follow the live health envelope", ()
     await waitFor(() => {
       expect(screen.getByText(/nothing is limiting operation/i)).toBeInTheDocument();
     });
+  });
+});
+
+// --- the solar-surplus tile (excess-solar activation, feature-detected) -------
+//
+// The tile is the excess-solar feature's whole story in one glance
+// (DESIGN_EXCESS_ACTIVATION.md §5 W-A): ACTIVE names target, commanded watts,
+// and the fleet's export reading; INACTIVE renders the FIRST reason code's
+// plain sentence from the pinned vocabulary; per-unit rows carry the advisory
+// grid/load readthrough (negative grid = import, positive = export, absent =
+// "not available"). Everything is feature-detected: no adviser_state in the
+// snapshot renders NOTHING — today's backend, and any deployment without the
+// excess_charging block, sees exactly the console it had before.
+
+const SOLAR_REGION = /solar surplus/i;
+
+/** Units carrying the advisory readthrough: export, import, and absent. */
+function solarUnits(): UnitView[] {
+  return [
+    unit({
+      unit_id: "pod-mid",
+      telemetry: telemetrySummary({ grid_power_w: 620, load_power_w: 340 }),
+    }),
+    unit({
+      unit_id: "pod-rhs",
+      telemetry: telemetrySummary({ grid_power_w: -800, load_power_w: 210 }),
+    }),
+    unit({ unit_id: "pod-lhs", telemetry: null }),
+  ];
+}
+
+function solarWorld(adviser: WireAdviserState): FleetView {
+  return { ...fleet(solarUnits()), adviser_state: adviser };
+}
+
+describe("HomeView — the solar-surplus tile", () => {
+  it("renders nothing at all while the snapshot carries no adviser_state (feature detection)", async () => {
+    // Today's backend sends no adviser_state: no tile, no heading, no rows —
+    // the Home view is exactly what it was before the feature existed.
+    installClient();
+    renderHome();
+    await dataLanded();
+    expect(screen.queryByRole("region", { name: SOLAR_REGION })).toBeNull();
+    expect(screen.queryByRole("heading", { name: SOLAR_REGION })).toBeNull();
+  });
+
+  it("names the active story's three facts and the composed cap", async () => {
+    installClient({
+      snapshot: solarWorld(
+        adviserState({
+          active: true,
+          hysteresis_state: "holding",
+          target_unit_id: "pod-mid",
+          commanded_charge_w: 1400,
+          fleet_export_w: 1800,
+          charge_cap_w: 2500,
+          reason_codes: ["export_headroom_available"],
+        }),
+      ),
+    });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: SOLAR_REGION });
+    expect(region).toHaveTextContent(/Charging pod-mid at 1,400 W from 1,800 W export\./);
+    // The cap is the bare fact it is — the trial's 500 W renders "cap 500 W"
+    // with no invented label.
+    expect(region).toHaveTextContent(/cap 2,500 W/);
+    // The tile sits between "What is powering the home?" and the reserve card.
+    const power = screen.getByRole("region", { name: POWER_REGION });
+    const reserve = screen.getByRole("region", { name: RESERVE_REGION });
+    expect(
+      Boolean(power.compareDocumentPosition(region) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+    expect(
+      Boolean(region.compareDocumentPosition(reserve) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+  });
+
+  it("carries the per-unit grid/load readthrough with import/export wording and honest gaps", async () => {
+    installClient({ snapshot: solarWorld(adviserState()) });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: SOLAR_REGION });
+    const rows = within(region).getAllByRole("listitem");
+    expect(rows).toHaveLength(3);
+    expect(rows[0]!).toHaveTextContent(/pod-mid: grid \+620 W export · load 340 W/);
+    expect(rows[1]!).toHaveTextContent(/pod-rhs: grid -800 W import · load 210 W/);
+    // An absent datum reads "not available" — never zero-filled.
+    expect(rows[2]!).toHaveTextContent(/pod-lhs: grid not available · load not available/);
+  });
+
+  // One plain sentence per reason code in the ONE pinned vocabulary — the
+  // parametrization IS the completeness pin: a code added to the wire
+  // vocabulary without a row here fails the completeness test below.
+  const INACTIVE_CASES: { code: string; sentence: RegExp; fixture?: Partial<WireAdviserState> }[] = [
+    {
+      code: "disabled_by_config",
+      sentence: /Charging from solar surplus is off \(config\)\./,
+      fixture: { enabled: false, enabled_origin: "config" },
+    },
+    {
+      code: "disabled_by_runtime",
+      sentence: /off until the controller restarts/,
+      fixture: { enabled: false, enabled_origin: "runtime" },
+    },
+    {
+      code: "economics_acknowledgement_required",
+      sentence:
+        /Waiting on the one-time net-billing confirmation before solar-surplus charging can start\./,
+      fixture: { enabled: true, acknowledged_economics: false },
+    },
+    {
+      code: "export_evidence_missing",
+      sentence:
+        /Export reading unavailable on the fleet — standing down \(fail-closed\)\. Export figure: not available\./,
+      fixture: { export_evidence: "missing", fleet_export_w: null },
+    },
+    {
+      code: "export_evidence_bad",
+      sentence: /Export reading unavailable on the fleet/,
+      fixture: { export_evidence: "bad", fleet_export_w: null },
+    },
+    {
+      code: "export_evidence_stale",
+      sentence: /Export reading unavailable on the fleet/,
+      fixture: { export_evidence: "stale", fleet_export_w: null },
+    },
+    {
+      code: "no_export_headroom",
+      sentence: /Exporting 1,800 W — below the headroom margin, nothing to charge from\./,
+      fixture: { fleet_export_w: 1800 },
+    },
+    {
+      code: "no_acceleration_over_autonomy",
+      sentence: /Surplus too small — taking over would charge slower than the pod does by itself\./,
+    },
+    {
+      code: "below_exit_hysteresis",
+      sentence: /Surplus is falling — handing back to the pod's own charging\./,
+    },
+    {
+      code: "no_eligible_target",
+      sentence: /Solar surplus available, but no battery needs charging \(full, inhibited, or not armed\)\./,
+      fixture: { target_unit_id: null },
+    },
+    {
+      code: "yielding_to_higher_priority",
+      sentence: /Standing down — a manual request has pod-mid\./,
+      fixture: { target_unit_id: "pod-mid" },
+    },
+  ];
+
+  it("maps every code in the pinned vocabulary to a plain sentence (the table is complete)", () => {
+    // A vocabulary code with no row here would render a raw code to an
+    // operator; a table row with no vocabulary code is dead weight.
+    const tabled = INACTIVE_CASES.map((entry) => entry.code).sort();
+    expect(tabled).toEqual(
+      [...ADVISER_REASON_CODES].filter((code) => code !== "export_headroom_available").sort(),
+    );
+  });
+
+  it.each(INACTIVE_CASES)(
+    "renders the honest inactive sentence for $code",
+    async ({ code, sentence, fixture }) => {
+      installClient({
+        snapshot: solarWorld(
+          adviserState({
+            active: false,
+            hysteresis_state: "inactive",
+            reason_codes: [code],
+            ...fixture,
+          }),
+        ),
+      });
+      renderHome();
+      const region = await screen.findByRole("region", { name: SOLAR_REGION });
+      expect(region).toHaveTextContent(sentence);
+      // The cap line belongs to the active sentence only.
+      expect(region.textContent ?? "").not.toMatch(/cap \d/);
+    },
+  );
+
+  it("never zero-fills the fleet export: a null figure under failed evidence says not available", async () => {
+    installClient({
+      snapshot: solarWorld(
+        adviserState({
+          active: false,
+          export_evidence: "stale",
+          fleet_export_w: null,
+          reason_codes: ["export_evidence_stale"],
+        }),
+      ),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SOLAR_REGION });
+    const status = within(region).getByText(/Export reading unavailable/);
+    expect(status).toHaveTextContent(/Export figure: not available\./);
+    expect(status.textContent ?? "").not.toMatch(/0 W/);
   });
 });
