@@ -879,9 +879,12 @@ async def test_replayed_live_capture_decodes_real_telemetry_and_an_honest_snapsh
             assert observation.active_warnings == LIVE_CALIBRATION_WARNINGS, (
                 "the two calibration warnings every live unit reports must decode"
             )
+            # The energy_scorecard block is ABSENT in this composition: the
+            # decode emits the TWELVE-key shape (ten safety fields plus the
+            # two advisory CT words) and no cumulative-energy keys.
             assert set(observation.quality) == set(Observation.QUALITY_FIELDS) | set(
-                Observation.ADVISORY_QUALITY_FIELDS
-            ), "the decoder always emits the twelve-key quality shape"
+                Observation.CT_QUALITY_FIELDS
+            ), "an absent scorecard block composes no energy decode"
             assert all(
                 observation.quality[field] is DataQuality.GOOD
                 for field in Observation.QUALITY_FIELDS

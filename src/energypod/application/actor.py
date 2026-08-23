@@ -195,6 +195,9 @@ class EnergyPodActor:
         # B4 (SYNC_RESILIENCE_AUDIT): one-shot cell-tier promotion hint,
         # consumed by the next poll.
         self._cell_refresh_requested = False
+        # DESIGN_ENERGY_SCORECARD section 5: the day-rollover promotion flag
+        # (consumed by exactly one poll; see request_energy_refresh).
+        self._energy_refresh_requested = False
 
         self._mailbox: asyncio.PriorityQueue[tuple[int, int, _Message]] = asyncio.PriorityQueue()
         self._sequence = itertools.count()
@@ -572,6 +575,16 @@ class EnergyPodActor:
             hint = getattr(telemetry, "request_cell_refresh", None)
             if callable(hint):
                 hint()
+        if self._energy_refresh_requested:
+            # DESIGN_ENERGY_SCORECARD section 5 (the day-roll promotion): the
+            # accountant flagged the fleet at a rollover; forward the hint so
+            # the NEXT plan promotes the cold-ring energy block -- the new
+            # day's counter baseline is at most one control period old, not
+            # one ring period.  Exactly one promoted cycle.
+            self._energy_refresh_requested = False
+            hint = getattr(telemetry, "request_energy_refresh", None)
+            if callable(hint):
+                hint()
         essential = (self._essential_address, self._essential_count)
         blocks: dict[tuple[int, int], tuple[int, ...]] = {}
         for window in (essential, *telemetry.read_plan()):
@@ -581,6 +594,16 @@ class EnergyPodActor:
         observation = telemetry.decode(blocks, self.lifecycle)
         await self._accept_observation_owned(observation)
         return blocks[essential]
+
+    def request_energy_refresh(self) -> None:
+        """Schedule this unit's NEXT telemetry cycle to include 0x4101.
+
+        Set by the fleet loop at the energy accountant's day rollover: the
+        cumulative-energy block rides the cold ring (~108 s period), so
+        without the promotion the new day's counter baseline could be a full
+        ring period old.  Consumed by exactly one poll.
+        """
+        self._energy_refresh_requested = True
 
     def request_cell_refresh(self) -> None:
         """Schedule this unit's NEXT telemetry cycle to include 0x5200 (B4).

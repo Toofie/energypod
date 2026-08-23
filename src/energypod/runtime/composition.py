@@ -73,6 +73,7 @@ from energypod.adapters.modbus import decode as wire_decode
 from energypod.adapters.modbus.waveshare import TransportConnectionError
 from energypod.adapters.persistence.memory import (
     InMemoryAuthorizationRepository,
+    InMemoryEnergyLedgerRepository,
     InMemoryIntentRepository,
     InMemoryObservationRepository,
 )
@@ -80,6 +81,7 @@ from energypod.adapters.persistence.sqlite import (
     PersistenceBusyError,
     SQLiteAuditRepository,
     SQLiteDatabase,
+    SQLiteEnergyLedgerRepository,
     SQLiteScheduleRepository,
 )
 from energypod.api.mcp import create_mcp_server
@@ -88,6 +90,11 @@ from energypod.application.actor import EnergyPodActor
 from energypod.application.arbiter import STOP_ACKNOWLEDGE_SCOPE, IntentArbiter
 from energypod.application.audit import AuditEventFactory
 from energypod.application.control_kernel import ControlKernel
+from energypod.application.energy import (
+    EnergyAccountant,
+    EnergyAccountingSettings,
+    EnergyScorecardControl,
+)
 from energypod.application.events import EventBus
 from energypod.application.excess_charge import (
     ExcessAdviserController,
@@ -128,6 +135,7 @@ from energypod.domain import (
     allocate_fleet_power,
 )
 from energypod.domain.audit import AuditEvent, DuplicateAuditEventError
+from energypod.domain.energy import GRID_SOURCE_DEVICE_COUNTER, GRID_SOURCE_INTEGRATED
 from energypod.domain.schedule import SchedulePlan, ScheduleVersionConflict
 from energypod.runtime.config import ControllerConfig, ControllerMode
 from energypod.runtime.credentials import FileCredentialStore
@@ -195,6 +203,9 @@ _IDENTITY_BLOCK_BASE = 0x8106
 # judges the precondition at the control rate, never a cold-ring refresh old
 # enough to have missed a mode flip.
 _DEBUG_MODE_BLOCK_BASE = 0x8100
+# Cumulative-energy totals block (DESIGN_ENERGY_SCORECARD section 5): six
+# low-word-first uint32 x 0.1 kWh pairs in vendor order, riding the cold ring.
+_ENERGY_TOTALS_BLOCK_BASE = 0x4101
 
 _RUNTIME_PRINCIPAL = "energypod:runtime"
 _COMPOSITION_POLICY_VERSION = "composition"
@@ -247,6 +258,11 @@ _EXCESS_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 # ordinary dispatch needs.
 _SCHEDULE_RUNNER_PRINCIPAL_SUBJECT = "energypod:schedule-runner"
 _SCHEDULE_RUNNER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
+# DESIGN_ENERGY_SCORECARD section 7 (E4): the deterministic event id of the
+# operator's P-A1-active pinning fact.  A ``grid_counter_roles`` value other
+# than ``unpinned`` boots only when this fact exists in the durable store --
+# one keyed existence check, the excess-economics precedent.
+ENERGY_ROLES_PINNED_EVENT_ID = "energy-counter-roles-pinned"
 
 
 class Clock(Protocol):
@@ -1029,12 +1045,18 @@ class _SimulatorTelemetry:
         unit_id: str,
         expected_profile: str,
         expected_cell_count: int,
+        decode_energy_totals: bool = True,
     ) -> None:
         self._pod = pod
         self._clock = clock
         self._unit_id = unit_id
         self._expected_profile = expected_profile
         self._expected_cell_count = expected_cell_count
+        # DESIGN_ENERGY_SCORECARD section 7: the six cumulative fields decode
+        # only when the ``energy_scorecard`` block is present -- an absent
+        # block composes no energy decode, keeping observations byte-
+        # identical to the pre-scorecard shape.
+        self._decode_energy_totals = bool(decode_energy_totals)
         catalog = register_layout.RegisterCatalog()
         self._plan = tuple(
             (block.address, block.count)
@@ -1051,6 +1073,7 @@ class _SimulatorTelemetry:
         )
         self._cell_voltage_window = windows[_CELL_VOLTAGE_BASE]
         self._cell_temperature_window = windows[_CELL_TEMPERATURE_BASE]
+        self._totals_window = windows[_ENERGY_TOTALS_BLOCK_BASE]
 
     async def advance(self) -> None:
         """Advance the device model exactly once per telemetry cycle."""
@@ -1082,6 +1105,22 @@ class _SimulatorTelemetry:
         # decoder deliberately: one implementation, zero semantic drift.
         grid_power_w, grid_quality = wire_decode._measurement(pcs_live, 17, 1.0)
         load_power_w, load_quality = wire_decode._measurement(pcs_live, 20, 1.0)
+        # The six cumulative-energy pairs decode through the SAME helper the
+        # live wire decoder uses (one implementation, zero drift); absent
+        # feature keeps every field absent and the quality map at twelve keys.
+        energy_totals = (
+            wire_decode.decode_totals_block(blocks[self._totals_window])
+            if self._decode_energy_totals
+            else ((None, DataQuality.MISSING),) * 6
+        )
+        (
+            (energy_grid_a_kwh, energy_grid_a_quality),
+            (energy_grid_b_kwh, energy_grid_b_quality),
+            (energy_load_kwh, energy_load_quality),
+            (energy_pv_kwh, energy_pv_quality),
+            (energy_charge_kwh, energy_charge_quality),
+            (energy_discharge_kwh, energy_discharge_quality),
+        ) = energy_totals
         system_soc_word = wire_decode._served_word(system, 17)
         if system_soc_word is None:  # pragma: no cover - the plan serves it
             system_soc_pct, system_soc_quality = None, DataQuality.MISSING
@@ -1112,6 +1151,18 @@ class _SimulatorTelemetry:
             "dynamic_discharge_limit_w": dynamic_discharge_limit_w,
             "grid_power_w": grid_power_w,
             "load_power_w": load_power_w,
+            **(
+                {
+                    "energy_grid_a_kwh": energy_grid_a_kwh,
+                    "energy_grid_b_kwh": energy_grid_b_kwh,
+                    "energy_load_kwh": energy_load_kwh,
+                    "energy_pv_kwh": energy_pv_kwh,
+                    "energy_charge_kwh": energy_charge_kwh,
+                    "energy_discharge_kwh": energy_discharge_kwh,
+                }
+                if self._decode_energy_totals
+                else {}
+            ),
             # Cell blocks: millivolt words and raw-40-offset temperature words.
             # The evidenced window serves every cell the packing holds; the
             # unit's commissioned count takes the prefix it declares.  The
@@ -1134,6 +1185,18 @@ class _SimulatorTelemetry:
             "temperatures_c": DataQuality.GOOD,
             "grid_power_w": grid_quality,
             "load_power_w": load_quality,
+            **(
+                {
+                    "energy_grid_a_kwh": energy_grid_a_quality,
+                    "energy_grid_b_kwh": energy_grid_b_quality,
+                    "energy_load_kwh": energy_load_quality,
+                    "energy_pv_kwh": energy_pv_quality,
+                    "energy_charge_kwh": energy_charge_quality,
+                    "energy_discharge_kwh": energy_discharge_quality,
+                }
+                if self._decode_energy_totals
+                else {}
+            ),
         }
         # Scripted scenario degradation rides ON TOP of the derived judgment
         # and never touches the served words (MUTATION-3/6): BAD/MISSING also
@@ -1265,6 +1328,7 @@ class _LiveDecodeTelemetry:
         probe_address: int,
         probe_count: int,
         promote_pcs_live_block: bool = False,
+        decode_energy_totals: bool = True,
     ) -> None:
         if expected_profile != register_layout.ProtocolLayout.IOT.value:
             # The evidenced live decode covers the deployed IoT register plan
@@ -1293,6 +1357,11 @@ class _LiveDecodeTelemetry:
         # participates.  The plan stays inside the commissioned cadence
         # budget (steady state <= 8 windows plus the probe, bootstrap <= 10).
         self._promote_pcs_live_block = bool(promote_pcs_live_block)
+        # DESIGN_ENERGY_SCORECARD section 7: the six cumulative fields decode
+        # only when the ``energy_scorecard`` block is PRESENT -- the absent
+        # block composes no energy decode, so the served totals words never
+        # reach the observation and the quality map stays at twelve keys.
+        self._decode_energy_totals = bool(decode_energy_totals)
         self._catalog = register_layout.RegisterCatalog()
         self._sequence = itertools.count(1)
         self._probe: register_layout.LayoutProbe | None = None
@@ -1313,6 +1382,10 @@ class _LiveDecodeTelemetry:
         # owning actor after a cell-derived deny, consumed by the next
         # ``read_plan()``.
         self._cell_refresh_requested = False
+        # DESIGN_ENERGY_SCORECARD section 5: one-shot day-rollover promotion
+        # of the cumulative-energy window (the B4 precedent), set through
+        # ``request_energy_refresh()`` by the owning actor.
+        self._energy_refresh_requested = False
 
     def request_cell_refresh(self) -> None:
         """Promote the cell window into the NEXT plan regardless of phase.
@@ -1323,6 +1396,16 @@ class _LiveDecodeTelemetry:
         clock advances with it).  Exactly one promoted cycle.
         """
         self._cell_refresh_requested = True
+
+    def request_energy_refresh(self) -> None:
+        """Promote the cumulative-energy window into the NEXT plan.
+
+        The energy block rides the cold ring (~108 s period); at a day roll
+        the accountant asks for a fresh counter baseline through the fleet
+        loop, and exactly one promoted cycle makes the new day's baseline at
+        most one control period old instead of one ring period.
+        """
+        self._energy_refresh_requested = True
 
     async def advance(self) -> None:
         """Probe the served layout so this cycle's plan follows the wire."""
@@ -1406,6 +1489,12 @@ class _LiveDecodeTelemetry:
             cell_due = _CELL_VOLTAGE_BASE in by_base
         if cell_due:
             plan.append((_CELL_VOLTAGE_BASE, by_base[_CELL_VOLTAGE_BASE]))
+        if self._energy_refresh_requested and _ENERGY_TOTALS_BLOCK_BASE in by_base:
+            # DESIGN_ENERGY_SCORECARD section 5: the day-roll promotion --
+            # exactly one cycle includes the cumulative-energy window early;
+            # the cold ring's own rotation resumes afterwards.
+            self._energy_refresh_requested = False
+            plan.append((_ENERGY_TOTALS_BLOCK_BASE, by_base[_ENERGY_TOTALS_BLOCK_BASE]))
         cold = sorted(base for base in by_base if base not in core_bases | {_CELL_VOLTAGE_BASE})
         if cold and self._cycle % 8 == 0:
             # The rotation starts at the system overview block (0x0100 sorts
@@ -1463,6 +1552,7 @@ class _LiveDecodeTelemetry:
             cell_captured_at_mono=cell_captured,
             cell_sequence=cell_sequence,
             lifecycle=lifecycle,
+            decode_energy_totals=self._decode_energy_totals,
         )
 
     def _probe_require(self) -> register_layout.LayoutProbe:
@@ -1716,6 +1806,7 @@ class _Supervision:
         observations: _AsyncObservationRepository | None = None,
         recovery: RecoveryMonitor | None = None,
         schedule_runner: ScheduleRunner | None = None,
+        energy_accountant: EnergyAccountant | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -1735,6 +1826,11 @@ class _Supervision:
         # DESIGN_SCHEDULES §2: the schedule runner, ticked once per fleet
         # cycle AFTER the polls and BEFORE the adviser step (pinned below).
         self._schedule_runner = schedule_runner
+        # DESIGN_ENERGY_SCORECARD section 7: the daily energy accountant,
+        # ticked once per fleet cycle AFTER the polls BESIDE the adviser
+        # projection update (it consumes the fresh observations and reads --
+        # never writes -- the adviser state for the attribution predicate).
+        self._energy_accountant = energy_accountant
         # Self-healing awareness layer (R4): the passive detection monitor
         # driven once per fleet cycle, plus the two ports it reads through.
         self._intents_port = intents
@@ -1927,6 +2023,14 @@ class _Supervision:
                 # (observe_tick), so observability can never gate control.
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(self._adviser_step(), timeout=self._interval_s)
+            if self._energy_accountant is not None:
+                # DESIGN_ENERGY_SCORECARD section 7: one bounded accounting
+                # tick per fleet cycle, beside the adviser-projection update
+                # and before the kernel tick -- it consumes observations and
+                # never blocks (a failure is survivable per cycle exactly
+                # like an advisory failure; the durable ledger retries).
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self._energy_step(), timeout=self._interval_s)
             # A kernel tick that overruns the interval is a component failure,
             # not a survivable per-unit fault. Cancelling it is safe — the
             # kernel's BaseException path revokes authority first (shielded)
@@ -1954,6 +2058,23 @@ class _Supervision:
         decision = await self._adviser.tick()
         if self._excess_controller is not None:
             await self._excess_controller.observe_tick(decision)
+
+    async def _energy_step(self) -> None:
+        """One accounting tick over the fleet's latest observations.
+
+        The attribution predicate reads the adviser projection's OWN frozen
+        state (active + target) -- the accountant never writes it.
+        """
+        accountant = self._energy_accountant
+        observations_port = self._observations_port
+        assert accountant is not None and observations_port is not None
+        targets: frozenset[str] = frozenset()
+        if self._excess_controller is not None:
+            state = self._excess_controller.state()
+            if state.active and state.target_unit_id is not None:
+                targets = frozenset({state.target_unit_id})
+        latest = await observations_port.all_latest()
+        await accountant.tick(latest, adviser_active_targets=targets)
 
     async def _bounded_poll(self, actor: EnergyPodActor) -> str:
         """One bounded, survived poll; returns the cycle's bus-read outcome.
@@ -2419,6 +2540,15 @@ class ComposedRuntime:
     # runner the fleet loop ticks.  None otherwise (block-absent doctrine).
     schedule_surface: ScheduleSurfaceControl | None = None
     schedule_runner: ScheduleRunner | None = None
+    # DESIGN_ENERGY_SCORECARD sections 5-7: composed only when the
+    # ``energy_scorecard`` block is PRESENT -- the accountant the fleet loop
+    # ticks (one bounded step beside the adviser projection update), the
+    # durable ledger it records days and the live-day baseline through, and
+    # the facade-facing surface (energy_today + the days route body).  None
+    # otherwise (block-absent doctrine).
+    energy_accountant: EnergyAccountant | None = None
+    energy_ledger: SQLiteEnergyLedgerRepository | InMemoryEnergyLedgerRepository | None = None
+    energy_surface: EnergyScorecardControl | None = None
 
 
 def _simulator_pod(
@@ -2562,14 +2692,17 @@ def _build_runtime(
     # authority can survive a restart (observe-only boot).
     audit_store: _AuditStore
     schedule_store: SQLiteScheduleRepository | _InMemoryScheduleRepository
+    energy_store: SQLiteEnergyLedgerRepository | InMemoryEnergyLedgerRepository
     if database is not None:
         # The audit read path projects the durable row sequence so the facade
         # cursor pages the same way in every deployment mode.
         audit_store = _SequencedSQLiteAuditRepository(database)
         schedule_store = SQLiteScheduleRepository(database)
+        energy_store = SQLiteEnergyLedgerRepository(database)
     else:
         audit_store = _InMemoryAuditRepository(max_events=_MAX_IN_MEMORY_AUDIT_EVENTS)
         schedule_store = _InMemoryScheduleRepository()
+        energy_store = InMemoryEnergyLedgerRepository()
     intent_store = InMemoryIntentRepository(max_stored_intents=_MAX_IN_MEMORY_INTENTS)
     observation_store = InMemoryObservationRepository(
         max_history_per_unit=_MAX_OBSERVATION_HISTORY_PER_UNIT
@@ -2613,6 +2746,25 @@ def _build_runtime(
     # acknowledged); an absent block changes nothing anywhere (the default).
     excess_config = config.excess_charging
     excess_present = excess_config is not None
+    # DESIGN_ENERGY_SCORECARD sections 5+7 (E4): a PRESENT block composes the
+    # accountant, the energy decode, the snapshot key, and the route; an
+    # ABSENT block composes nothing at all.  The A-1 boot gate is keyed
+    # existence, exactly like the schedule's night acknowledgement: a PINNED
+    # grid-counter-roles value boots only when the operator's durable
+    # pinning fact is in the store.
+    energy_config = config.energy_scorecard
+    energy_present = energy_config is not None
+    if (
+        energy_config is not None
+        and energy_config.grid_counter_roles != "unpinned"
+        and not audit_store.contains_event(ENERGY_ROLES_PINNED_EVENT_ID)
+    ):
+        raise ValueError(
+            "energy_scorecard.grid_counter_roles is "
+            f"{energy_config.grid_counter_roles!r} but the durable pinning fact "
+            f"{ENERGY_ROLES_PINNED_EVENT_ID!r} is absent from the audit store: "
+            "record the operator's P-A1 pinning evidence before pinning the roles"
+        )
     audit_event_factory = AuditEventFactory(
         process_instance_id=process_instance_id,
         process_origin_mono=process_origin_mono,
@@ -2666,6 +2818,7 @@ def _build_runtime(
                 unit_id=unit.unit_id,
                 expected_profile=unit.protocol_profile.value,
                 expected_cell_count=unit.expected_cell_count,
+                decode_energy_totals=energy_present,
             )
             if simulators is not None:
                 simulators[unit.unit_id] = pod
@@ -2696,6 +2849,7 @@ def _build_runtime(
                 probe_address=probe.address,
                 probe_count=probe.count,
                 promote_pcs_live_block=excess_present,
+                decode_energy_totals=energy_present,
             )
         actors[unit.unit_id] = EnergyPodActor(
             unit_id=unit.unit_id,
@@ -2799,6 +2953,56 @@ def _build_runtime(
             store=schedule_store,
             acknowledged_night_windows=audit_store.contains_event(SCHEDULE_NIGHT_ACK_EVENT_ID),
         )
+    # --- energy scorecard composition (DESIGN_ENERGY_SCORECARD sections 5-7) ---
+    # Built BEFORE the facade (the facade projects through the control) and
+    # composed exactly when the block is PRESENT.  The accountant consumes
+    # observations only; its rollover promotion asks each actor for ONE
+    # promoted cold-ring read of the energy block (the B4 precedent).
+    energy_accountant: EnergyAccountant | None = None
+    energy_surface: EnergyScorecardControl | None = None
+    if energy_config is not None:
+        grid_source = (
+            GRID_SOURCE_DEVICE_COUNTER
+            if energy_config.grid_source == "device_counter"
+            else GRID_SOURCE_INTEGRATED
+        )
+
+        def _request_energy_refresh() -> None:
+            for handle in actors.values():
+                handle.request_energy_refresh()
+
+        energy_accountant = EnergyAccountant(
+            unit_ids=tuple(unit.unit_id for unit in config.units),
+            timezone=config.site.timezone,
+            settings=EnergyAccountingSettings(
+                grid_source=grid_source,
+                grid_counter_roles=energy_config.grid_counter_roles,
+                integration_max_gap_s=float(energy_config.integration_max_gap_s),
+                min_day_coverage_pct=float(energy_config.min_day_coverage_pct),
+            ),
+            clock=resolved_clock,
+            ledger=energy_store,
+            bus=bus,
+            audit=audit_port,
+            request_energy_refresh=_request_energy_refresh,
+            process_instance_id=process_instance_id,
+            process_origin_mono=process_origin_mono,
+            configuration_version=config.revision,
+        )
+        tariff = energy_config.tariff
+        energy_surface = EnergyScorecardControl(
+            accountant=energy_accountant,
+            clock=resolved_clock,
+            tariff=(
+                None
+                if tariff is None
+                else {
+                    "currency": tariff.currency,
+                    "import_cents_per_kwh": float(tariff.import_cents_per_kwh),
+                    "export_cents_per_kwh": float(tariff.export_cents_per_kwh),
+                }
+            ),
+        )
     facade = _ComposedFacade(
         site_id=config.site.site_id,
         clock=resolved_clock,
@@ -2812,6 +3016,7 @@ def _build_runtime(
         recovery=recovery_monitor,
         excess=excess_controller,
         schedules=schedule_surface,
+        energy=energy_surface,
     )
 
     # --- excess-solar advisory composition ---------------------------------
@@ -2969,6 +3174,7 @@ def _build_runtime(
         observations=observation_port,
         schedule_runner=schedule_runner,
         recovery=recovery_monitor,
+        energy_accountant=energy_accountant,
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision
@@ -2997,6 +3203,9 @@ def _build_runtime(
         excess_controller=excess_controller,
         schedule_surface=schedule_surface,
         schedule_runner=schedule_runner,
+        energy_accountant=energy_accountant,
+        energy_ledger=energy_store,
+        energy_surface=energy_surface,
     )
 
 

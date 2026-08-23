@@ -48,6 +48,7 @@ from energypod.domain import Direction, IntentSource, Observation, PowerIntent, 
 from energypod.domain.audit import AuditEvent
 
 from .arbiter import IntentArbiter
+from .energy import EnergyScorecardRefusal
 from .excess_charge import ExcessChargingRefusal
 from .scheduling import (
     SchedulePolicy,
@@ -109,6 +110,18 @@ _MAX_REASON_LENGTH: Final[int] = 500
 # API_CONTRACTS "Application service facade": the nullable per-unit telemetry
 # summary field set.  Every field is null when the observation lacks that
 # datum, never zero-filled or fabricated.
+# API_CONTRACTS "Energy scorecard": the six cumulative readthroughs ride the
+# per-unit projections ONLY when the energy_scorecard block is composed --
+# an absent block keeps the snapshot byte-identical, projections included.
+_ENERGY_READTHROUGH_FIELDS: Final[tuple[str, ...]] = (
+    "energy_grid_a_kwh",
+    "energy_grid_b_kwh",
+    "energy_load_kwh",
+    "energy_pv_kwh",
+    "energy_charge_kwh",
+    "energy_discharge_kwh",
+)
+
 _TELEMETRY_SUMMARY_FIELDS: Final[tuple[str, ...]] = (
     "soc_pct",
     "bms_soc_pct",
@@ -267,6 +280,19 @@ class ScheduleSurface(Protocol):
     async def replace_plan(self, *, expected_version: int, replacement: Any) -> None: ...
 
     def state_payload(self) -> dict[str, Any]: ...
+
+
+class EnergyScorecardSurface(Protocol):
+    """The composed energy scorecard's facade-facing half (block presence).
+
+    ``energypod.application.energy.EnergyScorecardControl`` is the composed
+    implementation.  Pure projection reads: the facade adds the snapshot key
+    and serves the days route, and NOTHING on this surface mutates anything.
+    """
+
+    def today_payload(self) -> dict[str, Any]: ...
+
+    def days_payload(self, limit: int) -> dict[str, Any]: ...
 
 
 class ActorHandle(Protocol):
@@ -759,7 +785,7 @@ def _numeric_series(raw: Any) -> tuple[float, ...] | None:
     return values or None
 
 
-def _telemetry_summary(observation: Any) -> dict[str, Any] | None:
+def _telemetry_summary(observation: Any, *, include_energy: bool = False) -> dict[str, Any] | None:
     """Nullable summary projection of one latest observation.
 
     ``None`` means the unit has no observation at all.  Inside the block every
@@ -810,6 +836,14 @@ def _telemetry_summary(observation: Any) -> dict[str, Any] | None:
         "ctrl_mode_w": _optional_int(getattr(observation, "ctrl_mode_w", None)),
         "work_mode_w": _optional_int(getattr(observation, "work_mode_w", None)),
         "run_mode_w": _optional_int(getattr(observation, "run_mode_w", None)),
+        **(
+            {
+                field: _optional_float(getattr(observation, field, None))
+                for field in _ENERGY_READTHROUGH_FIELDS
+            }
+            if include_energy
+            else {}
+        ),
     }
 
 
@@ -836,7 +870,9 @@ def _health_projection(
     }
 
 
-def _unit_projection(unit_id: str, observation: Any) -> dict[str, Any]:
+def _unit_projection(
+    unit_id: str, observation: Any, *, include_energy: bool = False
+) -> dict[str, Any]:
     """Full single-unit projection served by ``unit_detail``.
 
     A commissioned unit that has not published an observation yet is known but
@@ -860,7 +896,12 @@ def _unit_projection(unit_id: str, observation: Any) -> dict[str, Any]:
             getattr(observation, "cell_captured_at_mono", None)
         ),
         "wall_timestamp": wall.isoformat() if isinstance(wall, datetime) else None,
-        **(_telemetry_summary(observation) or dict.fromkeys(_TELEMETRY_SUMMARY_FIELDS)),
+        **(
+            _telemetry_summary(observation, include_energy=include_energy)
+            or dict.fromkeys(
+                _TELEMETRY_SUMMARY_FIELDS + (_ENERGY_READTHROUGH_FIELDS if include_energy else ())
+            )
+        ),
         "cell_voltages_v": list(cells) if cells is not None else None,
         "temperatures_c": list(temperatures) if temperatures is not None else None,
         "quality": (
@@ -889,6 +930,7 @@ class EnergyServiceFacade:
         recovery: RecoveryView | None = None,
         excess: ExcessChargingControl | None = None,
         schedules: ScheduleSurface | None = None,
+        energy: EnergyScorecardSurface | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -910,6 +952,7 @@ class EnergyServiceFacade:
         self._recovery = recovery
         self._excess = excess
         self._schedules = schedules
+        self._energy = energy
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._schedule_correlations = itertools.count(1)
@@ -956,6 +999,12 @@ class EnergyServiceFacade:
             # the same feature-detected addition pattern, single writer the
             # runner's post-tick update.
             view["schedule_state"] = self._schedules.state_payload()
+        if self._energy is not None:
+            # API_CONTRACTS "Energy scorecard": the in-progress day rides TOP
+            # LEVEL as ``energy_today`` (the record plus ``as_of`` and the
+            # optional tariff), present whenever the ``energy_scorecard``
+            # block is composed, ABSENT when it is not.
+            view["energy_today"] = self._energy.today_payload()
         # Console truth (2026-08-23): a latched emergency stop must be
         # visible in a snapshot taken after the latch event, not only on
         # the event stream.  Only non-acknowledged latches appear -- an
@@ -987,7 +1036,9 @@ class EnergyServiceFacade:
         if canonical_unit not in self._actors:
             raise LookupError(f"no unit with id {canonical_unit!r}")
         observation = await self._observations.latest(canonical_unit)
-        return _unit_projection(canonical_unit, observation)
+        return _unit_projection(
+            canonical_unit, observation, include_energy=self._energy is not None
+        )
 
     async def health(self, *, principal: Principal) -> dict[str, Any]:
         """Separate process liveness, dependency readiness, and control readiness."""
@@ -1095,6 +1146,28 @@ class EnergyServiceFacade:
             "acknowledged_night_windows": surface.acknowledged_night_windows,
             "next_action": None if plan is None else _schedule_next_action(plan, wall),
         }
+
+    async def get_energy_days(self, *, principal: Principal, limit: int = 8) -> dict[str, Any]:
+        """API_CONTRACTS "Energy scorecard": the rolled-days read (observe).
+
+        ``limit`` is 1..31 (default 8), answered newest-LAST from the durable
+        ledger.  Repository and pure-function reads only.  Answers 409
+        ``energy_scorecard_not_commissioned`` when the config block is absent
+        (the block-presence doctrine: absent composes nothing, this route's
+        data included).  There is deliberately no mutation on this surface.
+        """
+        self._admit(principal, "observe")
+        if isinstance(limit, bool) or type(limit) is not int:
+            raise ValueError("limit must be an integer")
+        if not 1 <= limit <= 31:
+            raise ValueError("limit must be between 1 and 31")
+        surface = self._energy
+        if surface is None:
+            raise EnergyScorecardRefusal(
+                "energy_scorecard_not_commissioned",
+                "the energy scorecard is not composed on this site",
+            )
+        return surface.days_payload(limit)
 
     # --- mutations ----------------------------------------------------------
 
@@ -2492,7 +2565,7 @@ class EnergyServiceFacade:
             "requested_power": _requested_power(unit_id, active_intents),
             "authorized_power": _authorized_projection(capability),
             "measured_watts": measured_watts,
-            "telemetry": _telemetry_summary(telemetry),
+            "telemetry": _telemetry_summary(telemetry, include_energy=self._energy is not None),
             # Inhibit truth for the console's latch affordance: the boolean is
             # the actor's live latch state; the cause names WHY it latched and
             # is null whenever the unit is not latched.

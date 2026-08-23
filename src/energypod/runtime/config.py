@@ -10,7 +10,7 @@ import math
 from enum import StrEnum
 from ipaddress import IPv4Network, IPv6Network
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -442,6 +442,61 @@ class ScheduleConfig(_FrozenModel):
         return tuple(cleaned)
 
 
+class EnergyTariffConfig(_FrozenModel):
+    """DESIGN_ENERGY_SCORECARD section 7: the OPTIONAL tariff keys.
+
+    Absent means kWh-only, no money figures anywhere.  Present means the
+    operator's own rates, labeled as theirs.
+    """
+
+    currency: Annotated[StrictStr, Field(min_length=3, max_length=3)]
+    import_cents_per_kwh: NonNegativeFiniteFloat
+    export_cents_per_kwh: NonNegativeFiniteFloat
+
+    @field_validator("currency")
+    @classmethod
+    def validate_currency(cls, value: str) -> str:
+        return _plain(value.upper(), label="currency")
+
+
+class EnergyScorecardConfig(_FrozenModel):
+    """API_CONTRACTS "Energy scorecard" + DESIGN_ENERGY_SCORECARD section 7.
+
+    Block-presence doctrine, symmetric with ``excess_charging``/``schedule``:
+    a PRESENT block composes the accountant into the fleet loop, the
+    ``energy_today`` snapshot key, and the days route; an ABSENT block
+    composes nothing (byte-identical snapshot, 409 on the route, no energy
+    decode).  There is deliberately NO ``enabled`` key: the scorecard is
+    advisory-only (no safety interaction), and a second master switch would
+    be a second way to be silently off.
+
+    The A-1 gate is structural at validation time: ``grid_source:
+    device_counter`` is REFUSED while ``grid_counter_roles`` is ``unpinned``
+    (the role-open pair must never become the display source).  A PINNED
+    roles value additionally requires the durable
+    ``energy_counter_roles_pinned`` audit fact at boot -- the composition
+    root's keyed existence check (the excess-economics precedent); a roles
+    key without the recorded evidence is a config error naming the missing
+    fact.
+    """
+
+    grid_source: Literal["integrated", "device_counter"] = "integrated"
+    grid_counter_roles: Literal["unpinned", "vendor_labels", "swapped"] = "unpinned"
+    integration_max_gap_s: PositiveFiniteFloat = 10.0
+    min_day_coverage_pct: Annotated[StrictFloat, Field(gt=0, le=100)] = 95.0
+    tariff: EnergyTariffConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_a1_gate(self) -> Self:
+        if self.grid_source == "device_counter" and self.grid_counter_roles == "unpinned":
+            raise ValueError(
+                "energy_scorecard.grid_source device_counter is refused while "
+                "grid_counter_roles is unpinned: the role-open counter pair must never "
+                "become the display source (the A-1 gate; pin the roles first)"
+            )
+        return self
+
+
 class ControllerConfig(_FrozenModel):
     schema_version: Annotated[StrictInt, Field(ge=1)]
     revision: Annotated[StrictInt, Field(ge=1)]
@@ -461,6 +516,10 @@ class ControllerConfig(_FrozenModel):
     # DESIGN_SCHEDULES §3/B5: declared last beside ``excess_charging`` so its
     # commissioning validator sees the already-validated timing.
     schedule: ScheduleConfig | None = None
+    # DESIGN_ENERGY_SCORECARD §7 (E4): the daily energy scorecard block,
+    # declared last beside its siblings so its commissioning validator sees
+    # the already-validated timing.
+    energy_scorecard: EnergyScorecardConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -633,6 +692,36 @@ class ControllerConfig(_FrozenModel):
                 "intents"
             )
         return schedule
+
+    @field_validator("energy_scorecard")
+    @classmethod
+    def validate_energy_scorecard(
+        cls, scorecard: EnergyScorecardConfig | None, info: ValidationInfo
+    ) -> EnergyScorecardConfig | None:
+        """The commissioning gates for a PRESENT scorecard block.
+
+        The numeric relations that need the timing block live here: the
+        integration gap must sit strictly above the control period (a gap
+        bound the polling loop cannot satisfy would starve coverage forever)
+        and at or below 60 s (a gap larger than a minute is an outage, not a
+        sampling cadence).
+        """
+        if scorecard is None:
+            return scorecard
+        timing = info.data.get("timing")
+        if timing is not None:
+            if scorecard.integration_max_gap_s <= timing.control_period_s:
+                raise ValueError(
+                    "energy_scorecard.integration_max_gap_s must exceed "
+                    "timing.control_period_s: the CT stream samples once per control "
+                    "cycle, so a smaller gap would exclude every interval"
+                )
+            if scorecard.integration_max_gap_s > 60:
+                raise ValueError(
+                    "energy_scorecard.integration_max_gap_s must stay at or below 60 "
+                    "seconds: a wider spacing is an outage, not a sampling cadence"
+                )
+        return scorecard
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:

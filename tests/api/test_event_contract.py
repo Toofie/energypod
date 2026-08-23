@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -1068,4 +1068,150 @@ async def test_window_events_are_transitions_never_heartbeats() -> None:
     assert len(submissions) == 3, "open + two renewals"
     assert [event["type"] for event in closing] == ["schedule_window.closing"]
     assert closing[0]["payload"]["reason"] == "window_ended"
+    await close_subscription(subscription)
+
+
+# --- DESIGN_ENERGY_SCORECARD section 6: energy.day_rolled (E4) ------------------
+
+
+def _energy_observation(unit_id: str, *, wall: datetime, mono: float, sequence: int) -> Any:
+    from energypod.domain.observations import DataQuality, Observation, UnitLifecycle
+
+    quality = {name: DataQuality.GOOD for name in Observation.QUALITY_FIELDS} | {
+        name: DataQuality.GOOD for name in Observation.ADVISORY_QUALITY_FIELDS
+    }
+    return Observation(
+        unit_id=unit_id,
+        wall_timestamp=wall,
+        captured_at_mono=mono,
+        sequence=sequence,
+        lifecycle=UnitLifecycle.ARMED_IDLE,
+        protocol_profile="iot",
+        system_soc_pct=50.0,
+        bms_soc_pct=50.0,
+        soh_pct=100.0,
+        battery_watts=-1500.0,
+        pack_voltage_v=200.0,
+        pack_current_a=-7.5,
+        dynamic_charge_limit_w=3000.0,
+        dynamic_discharge_limit_w=3000.0,
+        expected_cell_count=2,
+        cell_voltages_v=(3.3, 3.3),
+        expected_temperature_count=1,
+        temperatures_c=(24.0,),
+        grid_power_w=-1000.0,
+        load_power_w=None,
+        energy_grid_a_kwh=100.0,
+        energy_grid_b_kwh=50.0,
+        energy_load_kwh=200.0,
+        energy_pv_kwh=None,
+        energy_charge_kwh=100.0,
+        energy_discharge_kwh=50.0,
+        active_faults=frozenset(),
+        active_warnings=frozenset(),
+        quality=quality,
+    )
+
+
+async def test_energy_day_rolled_publishes_the_completed_record_once() -> None:
+    """The rollover is a TRANSITION: exactly one publication per completed
+    day, payload the record itself; renewal ticks within the new day publish
+    nothing (the no-heartbeat rule)."""
+    energy = load_contract_module("energypod.application.energy")
+    events = load_contract_module("energypod.application.events")
+    from zoneinfo import ZoneInfo
+
+    brisbane = ZoneInfo("Australia/Brisbane")
+    day = datetime(2026, 8, 26, 20, 0, tzinfo=brisbane)  # before midnight
+    midnight = datetime(2026, 8, 27, 0, 0, 30, tzinfo=brisbane)
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.wall = day.astimezone(UTC)
+            self.now = 1000.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def wall_now(self) -> datetime:
+            return self.wall
+
+    clock = _Clock()
+    bus = events.EventBus(retention=64, queue_capacity=64, clock=clock)
+
+    class _Ledger:
+        def __init__(self) -> None:
+            self.days: dict[Any, Any] = {}
+            self._baseline: dict[str, Any] = {}
+
+        def record_day(self, record: Any) -> None:
+            self.days[record.date] = record
+
+        def get_day(self, day: Any) -> Any | None:
+            return self.days.get(day)
+
+        def latest_days(self, limit: int) -> tuple[Any, ...]:
+            return tuple(self.days[day] for day in sorted(self.days, reverse=True)[:limit])
+
+        def load_baseline(self) -> dict[str, Any]:
+            return dict(self._baseline)
+
+        def save_baseline(self, baselines: dict[str, Any]) -> None:
+            self._baseline = dict(baselines)
+
+    accountant = energy.EnergyAccountant(
+        unit_ids=("mid",),
+        timezone="Australia/Brisbane",
+        settings=energy.EnergyAccountingSettings(integration_max_gap_s=3600.0),
+        clock=clock,
+        ledger=_Ledger(),
+        bus=bus,
+    )
+    subscription = bus.subscribe(after_sequence=None)
+
+    # Two ticks in the day, then the first observation of the next day.
+    accountant.observe(
+        _energy_observation("mid", wall=day.astimezone(UTC), mono=1000.0, sequence=1),
+        adviser_active_targets=frozenset({"mid"}),
+        now_mono=1000.0,
+    )
+    await accountant.flush()
+    accountant.observe(
+        _energy_observation(
+            "mid", wall=day.astimezone(UTC) + timedelta(seconds=60), mono=1060.0, sequence=2
+        ),
+        adviser_active_targets=frozenset({"mid"}),
+        now_mono=1060.0,
+    )
+    await accountant.flush()
+    accountant.observe(
+        _energy_observation("mid", wall=midnight.astimezone(UTC), mono=1120.0, sequence=3),
+        adviser_active_targets=frozenset(),
+        now_mono=1120.0,
+    )
+    await accountant.flush()
+    rolled = await drain(subscription, 1)
+    # Two more ticks inside the new day: no further publication.
+    accountant.observe(
+        _energy_observation(
+            "mid",
+            wall=midnight.astimezone(UTC) + timedelta(seconds=60),
+            mono=1180.0,
+            sequence=4,
+        ),
+        adviser_active_targets=frozenset(),
+        now_mono=1180.0,
+    )
+    await accountant.flush()
+    quiet = await drain(subscription, 0)
+
+    assert [event["type"] for event in rolled] == ["energy.day_rolled"]
+    payload = rolled[0]["payload"]
+    assert payload["date"] == "2026-08-26"
+    assert payload["kind"] in {"complete", "partial"}
+    assert payload["timezone"] == "Australia/Brisbane"
+    assert payload["fleet"]["charged_from_surplus_kwh"] == pytest.approx(
+        1500.0 * 60.0 / 3_600_000.0
+    )
+    assert quiet == [], "renewal ticks within a day publish nothing"
     await close_subscription(subscription)

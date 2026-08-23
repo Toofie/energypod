@@ -92,6 +92,21 @@ class EnergyAccountingError(ValueError):
     """The accounting settings or wiring are malformed."""
 
 
+class EnergyScorecardRefusal(Exception):
+    """The scorecard surface refused a read (the block-presence doctrine).
+
+    Mirrors the schedule surface's refusal type: the REST boundary maps it to
+    409 with the pinned code, so the shape stays one per feature.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        if not code or code != code.strip():
+            raise ValueError("refusal code must be non-empty and normalized")
+        self.code = code
+        self.message = message
+
+
 @dataclass(frozen=True, slots=True)
 class EnergyAccountingSettings:
     """The commissioned scorecard knobs (DESIGN section 7).
@@ -151,6 +166,57 @@ class _ClockPort(Protocol):
     def wall_now(self) -> datetime: ...
 
     def monotonic(self) -> float: ...
+
+
+class EnergyScorecardControl:
+    """The facade-facing scorecard surface (the block-presence projection).
+
+    Wraps the composed accountant with the two wire payloads the docs pin:
+    ``energy_today`` (the in-progress record plus ``as_of``) and the days
+    route body (rolled days newest-LAST, the roles key, solar never
+    measured).  The optional tariff rides both as the operator's own rates
+    -- null when the keys are absent, which is kWh-only.
+    """
+
+    def __init__(
+        self,
+        *,
+        accountant: EnergyAccountant,
+        clock: _ClockPort,
+        tariff: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(accountant, EnergyAccountant):
+            raise TypeError("accountant must be an EnergyAccountant")
+        for name in ("wall_now", "monotonic"):
+            if not callable(getattr(clock, name, None)):
+                raise TypeError("clock must provide wall_now() and monotonic()")
+        self._accountant = accountant
+        self._clock = clock
+        self._tariff: dict[str, Any] | None = None if tariff is None else dict(tariff)
+
+    @property
+    def accountant(self) -> EnergyAccountant:
+        return self._accountant
+
+    @property
+    def grid_counter_roles(self) -> str:
+        return self._accountant.grid_counter_roles()
+
+    def today_payload(self) -> dict[str, Any]:
+        return {
+            **self._accountant.today_summary().payload(),
+            "as_of": self._accountant.local_now_iso(),
+            "tariff": None if self._tariff is None else dict(self._tariff),
+        }
+
+    def days_payload(self, limit: int) -> dict[str, Any]:
+        days = self._accountant.latest_days(limit)
+        return {
+            "days": [record.payload() for record in reversed(days)],
+            "grid_counter_roles": self._accountant.grid_counter_roles(),
+            "solar_production_measured": False,
+            "tariff": None if self._tariff is None else dict(self._tariff),
+        }
 
 
 class _BusPort(Protocol):
@@ -424,6 +490,23 @@ class EnergyAccountant:
 
     def grid_counter_roles(self) -> str:
         return self._settings.grid_counter_roles
+
+    def local_now_iso(self) -> str:
+        """Now in the SITE timezone with its offset (``as_of`` on the wire).
+
+        The offset always rides the string so a console can read site-local
+        time straight off it, whatever the controller's process clock holds.
+        """
+        wall = self._clock.wall_now()
+        if not isinstance(wall, datetime) or wall.tzinfo is None:
+            raise EnergyAccountingError("clock wall time must be timezone-aware")
+        return wall.astimezone(self._zone).isoformat()
+
+    def latest_days(self, limit: int) -> tuple[EnergyDayRecord, ...]:
+        """The ledger's rolled days, newest-first (the surface reorders)."""
+        if self._ledger is None:
+            return ()
+        return self._ledger.latest_days(limit)
 
     # --- internals: day lifecycle --------------------------------------------
 

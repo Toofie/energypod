@@ -2726,3 +2726,313 @@ async def test_a_published_window_runs_the_full_composed_path(tmp_path: Path) ->
         assert replaced[0]["payload"]["diff"]["added"] == ["night-charge"]
     finally:
         await session.close()
+
+
+# --- DESIGN_ENERGY_SCORECARD sections 5-7 (E4): the composed scorecard ----------
+
+
+def _energy_payload(
+    database: Path,
+    *,
+    block: dict[str, Any] | None = None,
+    excess: dict[str, Any] | None = None,
+    schedule: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = _write_enabled_payload(database)
+    payload["energy_scorecard"] = dict(block or {})
+    if excess is not None:
+        payload["excess_charging"] = excess
+    if schedule is not None:
+        payload["schedule"] = schedule
+    return payload
+
+
+def compose_energy(
+    database: Path,
+    *,
+    clock: Any | None = None,
+    announce: Callable[[str], None] | None = None,
+    block: dict[str, Any] | None = None,
+    excess: dict[str, Any] | None = None,
+    schedule: dict[str, Any] | None = None,
+) -> Any:
+    config = _validate(_energy_payload(database, block=block, excess=excess, schedule=schedule))
+    return _compose_with(config, simulate=True, clock=clock, announce=announce)
+
+
+async def test_a_present_energy_block_composes_the_accountant_and_snapshot_key(
+    tmp_path: Path,
+) -> None:
+    """Block-present doctrine: the accountant, the ledger, the snapshot's
+    ``energy_today`` (the in-progress record plus ``as_of`` and a null
+    tariff), the neutral A/B naming, and the per-unit energy readthroughs
+    all compose; nothing on the surface mutates anything."""
+    announced: list[str] = []
+    runtime = compose_energy(
+        tmp_path / "energy.sqlite3",
+        announce=announced.append,
+        block={"integration_max_gap_s": 1.0},
+    )
+
+    assert runtime.energy_accountant is not None
+    assert runtime.energy_surface is not None
+    assert runtime.energy_ledger is not None
+
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert "energy_today" in snapshot
+    today = snapshot["energy_today"]
+    # The pinned record shape: exactly the design's nine keys plus the two
+    # snapshot-only extensions.
+    assert set(today) == {
+        "date",
+        "timezone",
+        "utc_offset_minutes",
+        "kind",
+        "units",
+        "fleet",
+        "sources",
+        "counter_cross_check",
+        "solar_production_measured",
+        "as_of",
+        "tariff",
+    }
+    assert today["kind"] == "in_progress"
+    assert today["timezone"] == "Australia/Brisbane"
+    assert today["utc_offset_minutes"] == 600
+    assert today["solar_production_measured"] is False
+    assert today["tariff"] is None, "no tariff keys commissioned = kWh only"
+    # as_of always carries the site offset (the console reads site-local off
+    # the ISO string).
+    assert today["as_of"].endswith("+10:00")
+    # The fleet block is the per-unit metric shape minus metric_flags, plus
+    # the worst-unit coverage rollup -- pinned exactly.
+    assert set(today["fleet"]) == {
+        "grid_import_kwh",
+        "grid_export_kwh",
+        "battery_charged_kwh",
+        "battery_discharged_kwh",
+        "load_kwh",
+        "charged_from_surplus_kwh",
+        "coverage_pct",
+    }
+    assert set(today["units"]) == set(UNIT_IDS)
+    for unit_metrics in today["units"].values():
+        assert set(unit_metrics) == {
+            "grid_import_kwh",
+            "grid_export_kwh",
+            "battery_charged_kwh",
+            "battery_discharged_kwh",
+            "load_kwh",
+            "charged_from_surplus_kwh",
+            "coverage_pct",
+            "metric_flags",
+        }
+        assert unit_metrics["metric_flags"] == []
+    assert today["sources"] == {
+        "grid": "integrated_ct",
+        "battery": "device_counter",
+        "load": "device_counter",
+        "surplus": "attributed_adviser",
+    }
+    # The per-unit projections carry the six neutral readthroughs (the
+    # null-filled detail shape names every field even before observations).
+    detail = await runtime.facade.unit_detail(principal=OPERATOR, unit_id=UNIT_IDS[0])
+    assert set(detail) >= {
+        "energy_grid_a_kwh",
+        "energy_grid_b_kwh",
+        "energy_load_kwh",
+        "energy_pv_kwh",
+        "energy_charge_kwh",
+        "energy_discharge_kwh",
+    }
+    assert detail["energy_charge_kwh"] is None, "no observation yet: null, never zero"
+
+
+async def test_an_absent_energy_block_composes_nothing(tmp_path: Path) -> None:
+    """Block-absent doctrine: no accountant, no ledger handle, no
+    ``energy_today`` key, and the per-unit projections carry NO energy
+    readthroughs -- the snapshot stays byte-identical to the pre-scorecard
+    shape."""
+    announced: list[str] = []
+    runtime = compose(tmp_path / "no-energy.sqlite3", simulate=True, announce=announced.append)
+
+    assert runtime.energy_accountant is None
+    assert runtime.energy_surface is None
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert "energy_today" not in snapshot
+    for unit in snapshot["units"]:
+        telemetry = unit["telemetry"] or {}
+        assert not {key for key in telemetry if key.startswith("energy_")}
+    detail = await runtime.facade.unit_detail(principal=OPERATOR, unit_id=UNIT_IDS[0])
+    assert not {key for key in detail if key.startswith("energy_")}
+
+
+async def test_the_composed_simulator_decode_carries_the_six_energy_fields(
+    tmp_path: Path,
+) -> None:
+    """A PRESENT block composes the energy decode: after one telemetry cycle
+    the unit detail carries the simulator's live cumulative counters under
+    the NEUTRAL grid A/B naming."""
+    clock = ScriptedClock()
+    runtime = compose_energy(tmp_path / "energy-decode.sqlite3", clock=clock)
+    session = _LifespanSession(runtime.app)
+    session.send("lifespan.startup")
+    try:
+        await session.pump_until(lambda: clock.elapsed_s > 1.0, message="one telemetry cycle")
+        detail = await runtime.facade.unit_detail(principal=OPERATOR, unit_id=UNIT_IDS[0])
+        assert detail["energy_charge_kwh"] is not None
+        assert detail["energy_discharge_kwh"] is not None
+        assert detail["energy_grid_a_kwh"] is not None
+        assert detail["energy_grid_b_kwh"] is not None
+        assert "energy_grid_buy_kwh" not in detail
+    finally:
+        await session.close()
+
+
+async def test_the_accountant_ticks_after_the_adviser_step(tmp_path: Path) -> None:
+    """DESIGN section 7 ordering: one bounded accounting tick per fleet
+    cycle, AFTER the polls and BESIDE the adviser projection update (the
+    accountant consumes the adviser state for the attribution predicate)."""
+    runtime = compose_energy(
+        tmp_path / "energy-order.sqlite3",
+        clock=ScriptedClock(),
+        excess={"enabled": False},
+        schedule={"allowed_windows_local": [["06:00", "20:00"]]},
+    )
+    assert runtime.excess_adviser is not None
+    order: list[str] = []
+    adviser_tick = runtime.excess_adviser.tick
+    accountant_tick = runtime.energy_accountant.tick
+
+    async def traced_adviser() -> Any:
+        order.append("adviser")
+        return await adviser_tick()
+
+    async def traced_accountant(*args: Any, **kwargs: Any) -> None:
+        order.append("accountant")
+        await accountant_tick(*args, **kwargs)
+
+    runtime.excess_adviser.tick = traced_adviser  # type: ignore[method-assign]
+    runtime.energy_accountant.tick = traced_accountant  # type: ignore[method-assign]
+
+    session = _LifespanSession(runtime.app)
+    session.send("lifespan.startup")
+    await session.pump_until(lambda: order.count("accountant") >= 2, message="two cycles")
+    await session.close()
+
+    assert order.index("adviser") < order.index("accountant"), (
+        "the accountant tick follows the adviser projection update in the same cycle"
+    )
+    from itertools import pairwise
+
+    assert all(
+        earlier == "adviser" for earlier, later in pairwise(order) if later == "accountant"
+    ), "every accountant tick follows an adviser tick"
+
+
+async def test_a_pinned_roles_value_boots_only_with_the_durable_pinning_fact(
+    tmp_path: Path,
+) -> None:
+    """DESIGN section 7: ``vendor_labels|swapped`` additionally requires the
+    durable ``energy_counter-roles-pinned`` audit fact -- one keyed existence
+    check; a roles key without the recorded evidence is a composition error
+    naming the missing fact."""
+    from energypod.adapters.persistence.sqlite import (
+        SQLiteAuditRepository,
+        SQLiteDatabase,
+    )
+    from energypod.domain.audit import AuditEvent
+    from energypod.domain.intents import IntentSource
+    from energypod.domain.observations import UnitLifecycle
+
+    database_path = tmp_path / "roles.sqlite3"
+    pinned_block = {"grid_counter_roles": "vendor_labels"}
+
+    with pytest.raises(ValueError, match="energy-counter-roles-pinned"):
+        compose_energy(database_path, block=pinned_block)
+
+    database = SQLiteDatabase(database_path)
+    database.open()
+    try:
+        SQLiteAuditRepository(database).append(
+            AuditEvent(
+                event_id="energy-counter-roles-pinned",
+                occurred_at=datetime(2026, 8, 27, 6, 0, tzinfo=UTC),
+                monotonic_offset_s=1.0,
+                process_instance_id="process-1",
+                event_type="energy_counter_roles_pinned",
+                principal="operator:owner",
+                source=IntentSource.MANUAL,
+                correlation_id="energy:roles:pinned",
+                policy_version="operator",
+                configuration_version=7,
+                observation_sequences={},
+                reason_codes=("roles_pinned",),
+                requested_active_w=0,
+                authorized_active_w=0,
+                request_fingerprint="sha256:request",
+                response_fingerprint="sha256:response",
+                result="recorded",
+                lifecycle=UnitLifecycle.OBSERVE_ONLY,
+            )
+        )
+    finally:
+        database.close()
+
+    # Run-mode composition (not simulate): the durable store is the one the
+    # keyed existence check reads.
+    config = _validate(_energy_payload(database_path, block=pinned_block))
+    runtime = _compose_with(config, simulate=False)
+    assert runtime.energy_accountant is not None
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert snapshot["energy_today"]["sources"]["grid"] == "integrated_ct"
+
+
+def _probe_transport() -> Any:
+    """A fake transport serving the seven-word IoT layout probe on demand."""
+
+    class _FakeTransport:
+        async def read_holding(self, address: int, count: int) -> tuple[int, ...]:
+            if (address, count) == (0x5000, 7):
+                return (0x0101, 3, 3, 1, 1, 6, 0)
+            return tuple(0 for _ in range(count))
+
+    return _FakeTransport()
+
+
+async def test_the_day_roll_promotion_serves_the_energy_block_exactly_once() -> None:
+    """DESIGN section 5, the B4 precedent: ``request_energy_refresh``
+    promotes the cold-ring energy window into exactly ONE plan."""
+    live_decode = _load_class("energypod.runtime.composition", "_LiveDecodeTelemetry")
+    clock = ScriptedClock()
+    telemetry = live_decode(
+        transport=_LazyTransport(_probe_transport()),
+        clock=clock,
+        unit_id=UNIT_IDS[0],
+        expected_identity="byd-00000001",
+        expected_profile="iot",
+        expected_cell_count=60,
+        probe_address=0x5000,
+        probe_count=7,
+        decode_energy_totals=True,
+    )
+    await telemetry.advance()
+    steady = telemetry.read_plan()
+    assert (0x4101, 12) not in steady, "the energy block rides the cold ring"
+
+    telemetry.request_energy_refresh()
+    promoted = telemetry.read_plan()
+    assert (0x4101, 12) in promoted, "the promoted plan serves the energy block"
+
+    again = telemetry.read_plan()
+    assert (0x4101, 12) not in again, "the promotion lasts exactly one cycle"
+
+
+class _LazyTransport:
+    """Duck-typed stand-in for the lazy transport the live decode expects."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    async def read_holding(self, address: int, count: int) -> tuple[int, ...]:
+        return await self._inner.read_holding(address, count)

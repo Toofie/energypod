@@ -197,7 +197,7 @@ def _decode_temperatures(
     return temperatures, DataQuality.GOOD
 
 
-def decode_energy_totals(
+def decode_totals_block(
     block: Sequence[int] | None,
 ) -> tuple[tuple[float | None, DataQuality], ...]:
     """Decode the six cumulative-energy pairs of the totals block 0x4101.
@@ -269,6 +269,7 @@ def decode_observation(
     cell_captured_at_mono: float | None = None,
     cell_sequence: int | None = None,
     lifecycle: UnitLifecycle = UnitLifecycle.OBSERVE_ONLY,
+    decode_energy_totals: bool = True,
 ) -> Observation:
     """Decode one polled set of holding-register blocks into an observation.
 
@@ -364,7 +365,14 @@ def decode_observation(
     # MISSING when the poll did not serve the block or served a partial pair
     # -- exactly like the CT pair: the quality map is the honest inventory of
     # what this poll saw, and an unserved energy block never refuses power.
-    energy_totals = decode_energy_totals(blocks.get(_ENERGY_TOTALS_BLOCK_BASE))
+    if decode_energy_totals:
+        energy_totals = decode_totals_block(blocks.get(_ENERGY_TOTALS_BLOCK_BASE))
+    else:
+        # DESIGN_ENERGY_SCORECARD section 7: an ABSENT scorecard block
+        # composes no energy decode -- every field stays absent and the
+        # quality map keeps the twelve-key shape (byte-identical to the
+        # pre-scorecard observation).
+        energy_totals = ((None, DataQuality.MISSING),) * _ENERGY_PAIR_COUNT
     (
         (energy_grid_a_kwh, energy_grid_a_quality),
         (energy_grid_b_kwh, energy_grid_b_quality),
@@ -387,13 +395,18 @@ def decode_observation(
         "temperatures_c": temperature_quality,
         "grid_power_w": grid_power_quality,
         "load_power_w": load_power_quality,
-        "energy_grid_a_kwh": energy_grid_a_quality,
-        "energy_grid_b_kwh": energy_grid_b_quality,
-        "energy_load_kwh": energy_load_quality,
-        "energy_pv_kwh": energy_pv_quality,
-        "energy_charge_kwh": energy_charge_quality,
-        "energy_discharge_kwh": energy_discharge_quality,
     }
+    if decode_energy_totals:
+        quality.update(
+            {
+                "energy_grid_a_kwh": energy_grid_a_quality,
+                "energy_grid_b_kwh": energy_grid_b_quality,
+                "energy_load_kwh": energy_load_quality,
+                "energy_pv_kwh": energy_pv_quality,
+                "energy_charge_kwh": energy_charge_quality,
+                "energy_discharge_kwh": energy_discharge_quality,
+            }
+        )
 
     # Fail-closed downgrade: with identity, profile, topology or fault-block
     # verification failed the values may still be reported, but nothing in
