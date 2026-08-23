@@ -77,6 +77,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
 import type { ApiClient } from "../../api/client";
 import { ADVISER_REASON_CODES } from "../../app/fleet";
+import { NIGHT_REASON_CODES } from "../../app/nightCharge";
 import { toScheduleState } from "../../app/schedule";
 import { NextScheduleCard } from "./NextScheduleCard";
 import {
@@ -88,6 +89,10 @@ import {
   excessAdviserStateChanged,
   excessChargingToggleOk,
   getScheduleOk,
+  nightChargeState,
+  nightChargeStateChanged,
+  nightChargingToggleOk,
+  nightUnitState,
   scheduleEntry,
   schedulePlan,
   schedulePolicy,
@@ -103,6 +108,7 @@ import {
   type WireAdviserState,
   type WireLastObjective,
   type WireEnergyToday,
+  type WireNightChargeState,
   type WireScheduleState,
   type WireTelemetrySummary,
 } from "../../test/wire";
@@ -174,6 +180,11 @@ interface FleetView {
    * today's wire by default; schedule-card tests attach it explicitly.
    */
   schedule_state?: WireScheduleState;
+  /**
+   * The night-charge projection (PENDING-BACKEND, feature-detected): absent
+   * from today's wire by default; night-tile tests attach it explicitly.
+   */
+  night_charge_state?: WireNightChargeState;
   /**
    * The energy scorecard's live-day block (PENDING-BACKEND, feature-detected):
    * absent from today's wire by default; Today-card tests attach it explicitly.
@@ -308,6 +319,7 @@ interface ClientSetup {
   getHealth?: () => Promise<HealthReport>;
   openEvents?: StreamFactory;
   postExcessCharging?: ApiClient["postExcessCharging"];
+  postNightCharging?: ApiClient["postNightCharging"];
   getSchedule?: ApiClient["getSchedule"];
 }
 
@@ -326,6 +338,10 @@ function installClient(setup: ClientSetup = {}): ApiClient {
     postInhibitAcknowledgement: vi.fn(() => Promise.reject(new Error("not used by HomeView"))),
     postExcessCharging: vi.fn(
       setup.postExcessCharging ??
+        (() => Promise.reject(new Error("not used by HomeView"))),
+    ),
+    postNightCharging: vi.fn(
+      setup.postNightCharging ??
         (() => Promise.reject(new Error("not used by HomeView"))),
     ),
     // The schedules facts read: answered only when the card is composed (the
@@ -2315,6 +2331,811 @@ describe("HomeView — the excess-charging toggle", () => {
     expect(alert).toHaveTextContent(sentence);
     expect(alert).toHaveTextContent(/excess_enable_refused/);
     // The refused enable leaves the toggle exactly where it was.
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+});
+
+// --- the night-charge tile (off-peak night strategy, feature-detected) ---------
+//
+// The tile is the night strategy's whole story in one glance
+// (DESIGN_NIGHT_CHARGE.md §7 W2), the solar tile's nocturnal mirror: ACTIVE
+// phases name their facts in the design's own wording (pacing names the
+// window's end and every battery's target; holding names the demand rule's
+// no-cycling guarantee; complete names the moment), INACTIVE states render
+// the FIRST reason code's plain sentence from the ONE pinned vocabulary, the
+// demand reading carries its evidence word (a non-good rollup holds
+// fail-closed and is loudly visible), and the window countdowns derive from
+// the projection's own instants. Everything is feature-detected: no
+// night_charge_state in the snapshot renders NOTHING.
+
+const NIGHT_REGION = /night charging/i;
+
+function nightWorld(
+  night: WireNightChargeState,
+  extra: Partial<FleetView> = {},
+): FleetView {
+  return {
+    ...fleet([unit({ unit_id: "pod-mid" }), unit({ unit_id: "pod-rhs" }), unit({ unit_id: "pod-lhs" })]),
+    night_charge_state: night,
+    ...extra,
+  };
+}
+
+describe("HomeView — the night-charge tile", () => {
+  it("renders nothing at all while the snapshot carries no night_charge_state (feature detection)", async () => {
+    // Today's backend sends no night_charge_state: no tile, no heading, no
+    // toggle — the Home view is exactly what it was before the feature existed.
+    installClient();
+    renderHome();
+    await dataLanded();
+    expect(screen.queryByRole("region", { name: NIGHT_REGION })).toBeNull();
+    expect(screen.queryByRole("heading", { name: NIGHT_REGION })).toBeNull();
+    expect(screen.queryByRole("switch")).toBeNull();
+  });
+
+  it("words the pacing story with every battery's own target and sits beside the solar tile", async () => {
+    installClient({
+      snapshot: nightWorld(
+        nightChargeState({
+          units: [
+            nightUnitState({ unit_id: "mid", soc_pct: 88, target_w: 1900 }),
+            nightUnitState({ unit_id: "lhs", soc_pct: 71.4, target_w: 1200 }),
+            nightUnitState({ unit_id: "rhs", soc_pct: 98, phase: "skipped_full", target_w: 0, reason: "at_ceiling" }),
+          ],
+        }),
+        // Both features composed: the night tile follows its daytime mirror.
+        { adviser_state: adviserState() },
+      ),
+    });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent(
+      /Charging toward full by 06:00: mid 1,900 W · lhs 1,200 W · rhs full, sitting out\./,
+    );
+    // The tile sits after the solar tile and before the reserve card — the
+    // two advisers are complements, never a minute shared.
+    const solar = screen.getByRole("region", { name: SOLAR_REGION });
+    const reserve = screen.getByRole("region", { name: RESERVE_REGION });
+    expect(
+      Boolean(solar.compareDocumentPosition(region) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+    expect(
+      Boolean(region.compareDocumentPosition(reserve) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+  });
+
+  it("carries the per-battery rows: each battery's own charge figure, target, and reason", async () => {
+    installClient({
+      snapshot: nightWorld(nightChargeState()),
+    });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    const rows = within(region).getAllByRole("listitem");
+    expect(rows).toHaveLength(3);
+    expect(rows[0]!).toHaveTextContent(/lhs — 71\.4% charged · lhs 2,500 W \(on plan\)/);
+    expect(rows[1]!).toHaveTextContent(/mid — 88% charged · mid 2,500 W \(on plan\)/);
+    expect(rows[2]!).toHaveTextContent(
+      /rhs — 98% charged · rhs full, sitting out \(at the charge ceiling\)/,
+    );
+  });
+
+  it("carries the demand reading with its threshold and evidence word, never zero-filled", async () => {
+    installClient({
+      snapshot: nightWorld(
+        nightChargeState({ demand_w: null, demand_evidence: "stale", phase: "holding_on_demand", reason_codes: ["demand_evidence_stale"] }),
+      ),
+    });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    const demand = within(region).getByText(/House demand/);
+    // The whole line, exact: the figure is "not available" (never a filled 0),
+    // the threshold is named, and the evidence word rides with it.
+    expect(demand.textContent).toBe(
+      "House demand not available · holds above 1,000 W · reading stale",
+    );
+    // The fail-closed hold is loudly visible in the status sentence, never a
+    // silent never-charges.
+    expect(region).toHaveTextContent(
+      /Holding — the demand reading is stale: batteries neither drain nor cycle while the grid meets the spike\./,
+    );
+  });
+
+  it("words the window countdowns: the open end while running, the next opening outside", async () => {
+    installClient({
+      snapshot: nightWorld(
+        nightChargeState({
+          enabled: false,
+          active: false,
+          phase: "idle",
+          held_intent_id: null,
+          window_ends_at: null,
+          window_ends_in_s: null,
+          next_window_at: "2026-08-28T00:00:00+10:00",
+          reason_codes: ["outside_window"],
+        }),
+      ),
+    });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    // The next window's instant is on the projection; the countdown derives
+    // from it (the captured_at fixture anchors the clock to render-time, so
+    // only the shape is pinned here, not a frozen figure).
+    expect(region).toHaveTextContent(/Window 00:00–06:00 — next opens 00:00 \(in \d+ h \d+ min\)\./);
+    expect(region).toHaveTextContent(
+      /Outside the charging window \(00:00–06:00\) — the next window opens at 00:00\./,
+    );
+  });
+
+  // The ACTIVE phase sentences, parametrized — the design's own §7 W2 wording.
+  it.each([
+    {
+      phase: "pacing",
+      fixture: {} as Partial<WireNightChargeState>,
+      sentence: /Charging toward full by 06:00: lhs 2,500 W · mid 2,500 W · rhs full, sitting out\./,
+    },
+    {
+      phase: "holding_on_demand",
+      fixture: {
+        demand_w: 2340,
+        reason_codes: ["demand_above_threshold"],
+        units: [nightUnitState({ phase: "holding_on_demand", target_w: 100, reason: "demand_above_threshold" })],
+      } as unknown as Partial<WireNightChargeState>,
+      sentence:
+        /Holding — house demand 2,340 W: batteries neither drain nor cycle while the grid meets the spike\./,
+    },
+    {
+      phase: "complete",
+      fixture: {
+        active: false,
+        held_intent_id: null,
+        window_ends_at: "2026-08-27T04:12:00+10:00",
+        window_ends_in_s: 0,
+        reason_codes: ["target_reached"],
+        units: [nightUnitState({ phase: "complete", target_w: 0, reason: "target_reached" })],
+      } as unknown as Partial<WireNightChargeState>,
+      sentence: /Batteries full — window complete at 04:12\./,
+    },
+    {
+      phase: "skipped_full",
+      fixture: {
+        active: false,
+        held_intent_id: null,
+        reason_codes: ["at_ceiling"],
+        units: [nightUnitState({ phase: "skipped_full", target_w: 0, reason: "at_ceiling" })],
+      } as unknown as Partial<WireNightChargeState>,
+      sentence: /Batteries were already full — nothing to charge this window\./,
+    },
+  ])("words the active $phase story in the design's own terms", async ({ phase, fixture, sentence }) => {
+    installClient({
+      snapshot: nightWorld(nightChargeState({ phase, ...fixture })),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent(sentence);
+  });
+
+  // One plain sentence per reason code in the ONE pinned vocabulary — the
+  // parametrization IS the completeness pin: a code added to the wire
+  // vocabulary without a row here fails the completeness test below.
+  const INACTIVE_CASES: { code: string; sentence: RegExp; fixture?: Partial<WireNightChargeState> }[] = [
+    {
+      code: "outside_window",
+      sentence: /Outside the charging window \(00:00–06:00\)/,
+      fixture: {
+        enabled: false,
+        active: false,
+        phase: "idle",
+        held_intent_id: null,
+        window_ends_at: null,
+        window_ends_in_s: null,
+        next_window_at: "2026-08-28T00:00:00+10:00",
+      },
+    },
+    {
+      code: "window_open",
+      sentence: /The charging window \(00:00–06:00\) is open\./,
+    },
+    {
+      code: "on_plan",
+      sentence: /Charging to plan\./,
+    },
+    {
+      code: "deadline_at_risk",
+      sentence: /Behind the plan — charging at the cap to reach full by the window's end\./,
+    },
+    {
+      code: "demand_above_threshold",
+      sentence: /House demand is above the hold line — batteries held, not cycling\./,
+    },
+    {
+      code: "demand_below_exit",
+      sentence: /House demand has fallen back below the hold line — charging resumes\./,
+    },
+    {
+      code: "demand_evidence_missing",
+      sentence: /Demand reading missing — holding so the batteries neither drain nor cycle\./,
+      fixture: { demand_w: null, demand_evidence: "missing" },
+    },
+    {
+      code: "demand_evidence_bad",
+      sentence: /Demand reading bad — holding so the batteries neither drain nor cycle\./,
+      fixture: { demand_w: null, demand_evidence: "bad" },
+    },
+    {
+      code: "demand_evidence_stale",
+      sentence: /Demand reading stale — holding so the batteries neither drain nor cycle\./,
+      fixture: { demand_w: null, demand_evidence: "stale" },
+    },
+    {
+      code: "at_ceiling",
+      sentence: /At the charge ceiling — nothing to charge\./,
+    },
+    {
+      code: "no_charge_headroom",
+      sentence: /The battery's own charge limit says full — nothing it will accept\./,
+    },
+    {
+      code: "target_reached",
+      sentence: /Targets reached — nothing left to charge\./,
+    },
+    {
+      code: "no_eligible_units",
+      sentence: /Window open, but no battery can charge \(full, held by another request, or no headroom\)\./,
+    },
+    {
+      code: "units_disarmed",
+      // Rendered as the arm instruction it is (§7 W2): the runner can never
+      // arm itself, and every restart disarms again.
+      sentence: /The batteries are disarmed — arm them before the window opens\./,
+      fixture: {
+        active: false,
+        phase: "idle",
+        held_intent_id: null,
+        units: [nightUnitState({ phase: "sitting_out", target_w: 0, reason: "units_disarmed" })],
+      },
+    },
+    {
+      code: "yielding_to_higher_priority",
+      sentence: /Standing down — another request has priority on the batteries\./,
+    },
+    {
+      code: "disabled_by_config",
+      sentence: /Night charging is off \(config\)\./,
+      fixture: { enabled: false, enabled_origin: "config" },
+    },
+    {
+      code: "disabled_by_runtime",
+      sentence: /Night charging is off until the controller restarts/,
+      fixture: { enabled: false, enabled_origin: "runtime" },
+    },
+    {
+      code: "night_acknowledgement_required",
+      sentence:
+        /Waiting on the one-time night-partition acknowledgement before night charging can start\./,
+      fixture: { acknowledged_partition: false },
+    },
+  ];
+
+  it("maps every code in the pinned vocabulary to a plain sentence (the table is complete)", () => {
+    // A vocabulary code with no row here would render a raw code to an
+    // operator; a table row with no vocabulary code is dead weight.
+    const tabled = INACTIVE_CASES.map((entry) => entry.code).sort();
+    expect(tabled).toEqual([...NIGHT_REASON_CODES].sort());
+  });
+
+  it.each(INACTIVE_CASES)(
+    "renders the honest inactive sentence for $code",
+    async ({ code, sentence, fixture }) => {
+      installClient({
+        snapshot: nightWorld(
+          nightChargeState({
+            enabled: false,
+            active: false,
+            phase: "idle",
+            held_intent_id: null,
+            reason_codes: [code],
+            ...fixture,
+          }),
+        ),
+      });
+      renderHome();
+      const region = await screen.findByRole("region", { name: NIGHT_REGION });
+      expect(region).toHaveTextContent(sentence);
+    },
+  );
+
+  it.each([
+    [{ enabled: true, enabled_origin: "config" } as Partial<WireNightChargeState>, "On (config)"],
+    [{ enabled: true, enabled_origin: "runtime" } as Partial<WireNightChargeState>, "On — until restart"],
+    [{ enabled: false, enabled_origin: "config" } as Partial<WireNightChargeState>, "Off (config)"],
+    [{ enabled: false, enabled_origin: "runtime" } as Partial<WireNightChargeState>, "Off — until restart"],
+  ])("shows the current state and origin ($enabled_origin, enabled $enabled)", async (fixture, expected) => {
+    installClient({
+      snapshot: nightWorld(
+        nightChargeState({
+          active: false,
+          phase: "idle",
+          held_intent_id: null,
+          reason_codes: ["outside_window"],
+          ...fixture,
+        }),
+      ),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent(`Night charging: ${expected}`);
+    // The runtime origin is the honest transience marker: a restart re-reads
+    // the commissioned config, and the console says so.
+    if (fixture.enabled_origin === "runtime") {
+      expect(region).toHaveTextContent(/the config's own setting takes over at restart/);
+    }
+  });
+
+  it("composes the charged-overnight story with the scorecard's energy_today where the design pins it", async () => {
+    installClient({
+      snapshot: nightWorld(nightChargeState(), {
+        energy_today: energyToday(),
+      }),
+    });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    // The nightly charge is real grid import; the scorecard measures it from
+    // day one (§6), and the money line stays absent until tariff keys exist —
+    // named, never invented (no wire shape carries the rate).
+    expect(region).toHaveTextContent(
+      /Charging at night is real grid import — the energy scorecard measures it \(bought from the grid today so far: 8\.4 kWh\)\. The cost appears once the tariff keys are commissioned\./,
+    );
+  });
+
+  it("renders no energy line while the scorecard is not composed (the night story stands alone)", async () => {
+    installClient({ snapshot: nightWorld(nightChargeState()) });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region.textContent ?? "").not.toMatch(/grid import/);
+  });
+
+  it("updates the tile live from state_changed frames: a phase change announces, a heartbeat re-prices silently", async () => {
+    const world = nightWorld(nightChargeState({ demand_w: 412 }));
+    const channel = liveChannel([snapshotFrame(world)]);
+    installClient({ snapshot: world, openEvents: channel.openEvents });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent(/Charging toward full by 06:00/);
+    expect(region).toHaveTextContent(/House demand 412 W/);
+
+    // The demand rule engages: the frame alone moves the tile — no snapshot
+    // refetch, no reload — and the phase change reaches the live region.
+    channel.push(
+      nightChargeStateChanged(43, {
+        phase: "holding_on_demand",
+        demand_w: 2340,
+        reason_codes: ["demand_above_threshold"],
+        units: [nightUnitState({ phase: "holding_on_demand", target_w: 100, reason: "demand_above_threshold" })],
+      }) as unknown as StreamFrame,
+    );
+    await waitFor(() => {
+      expect(region).toHaveTextContent(
+        /Holding — house demand 2,340 W: batteries neither drain nor cycle while the grid meets the spike\./,
+      );
+    });
+    expect(
+      await screen.findByText(
+        /Night charging is holding — house demand is high; the batteries neither drain nor cycle\./,
+      ),
+    ).toBeInTheDocument();
+
+    // A heartbeat republish: same state tuple, fresher figures — the tile
+    // re-prices with NO new announcement.
+    channel.push(
+      nightChargeStateChanged(44, {
+        heartbeat: true,
+        phase: "holding_on_demand",
+        demand_w: 2510,
+        reason_codes: ["demand_above_threshold"],
+        units: [nightUnitState({ phase: "holding_on_demand", target_w: 100, reason: "demand_above_threshold" })],
+      }) as unknown as StreamFrame,
+    );
+    await waitFor(() => {
+      expect(region).toHaveTextContent(/Holding — house demand 2,510 W/);
+    });
+    expect(screen.queryAllByText(/Night charging is holding/)).toHaveLength(1);
+  });
+
+  it("announces the stand-down when the window hands the batteries back over the stream", async () => {
+    const world = nightWorld(nightChargeState());
+    const channel = liveChannel([snapshotFrame(world)]);
+    installClient({ snapshot: world, openEvents: channel.openEvents });
+    renderHome();
+    await screen.findByRole("region", { name: NIGHT_REGION });
+
+    channel.push(
+      nightChargeStateChanged(43, {
+        enabled: false,
+        enabled_origin: "runtime",
+        active: false,
+        phase: "idle",
+        held_intent_id: null,
+        window_ends_at: null,
+        window_ends_in_s: null,
+        next_window_at: "2026-08-28T00:00:00+10:00",
+        reason_codes: ["disabled_by_runtime"],
+      }) as unknown as StreamFrame,
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/Night charging is off until the controller restarts/)).toBeInTheDocument();
+    });
+    expect(
+      await screen.findByText(/Night charging stood down — the batteries are back on their own\./),
+    ).toBeInTheDocument();
+  });
+});
+
+// --- the night-charging toggle (§3.4/B4's guarded confirmation) -----------------
+//
+// The tile's footer is the feature's front door: the current state and its
+// origin, a switch that never flips directly — it opens the typed-confirmation
+// dialog — and the FIRST enable's one-time night-partition acknowledgement
+// (the §8 item 2 assertion verbatim, a required checkbox, sent as
+// "night_posture": "PARTITION_ACKNOWLEDGED", never asked again). Refusals
+// render their envelopes inline; the 200's projection is adopted
+// optimistically. Disable asks for the NIGHT confirmation only.
+
+describe("HomeView — the night-charging toggle", () => {
+  it("first enable: NIGHT and the partition acknowledgement are both required, and the acknowledgement is sent", async () => {
+    const user = userEvent.setup();
+    // The ungranted boot state: composed but suspended, never acknowledged.
+    const offUnacked = nightChargeState({
+      enabled: false,
+      enabled_origin: "config",
+      acknowledged_partition: false,
+      active: false,
+      phase: "idle",
+      held_intent_id: null,
+      window_ends_at: null,
+      window_ends_in_s: null,
+      next_window_at: "2026-08-28T00:00:00+10:00",
+      reason_codes: ["night_acknowledgement_required"],
+    });
+    const enabledByToggle = nightChargeState({
+      enabled: true,
+      enabled_origin: "runtime",
+      acknowledged_partition: true,
+      phase: "idle",
+      active: false,
+      held_intent_id: null,
+      window_ends_at: null,
+      window_ends_in_s: null,
+      next_window_at: "2026-08-28T00:00:00+10:00",
+      reason_codes: ["outside_window"],
+    });
+    const postNightCharging = vi.fn(() => Promise.resolve(nightChargingToggleOk(enabledByToggle)));
+    installClient({
+      snapshot: nightWorld(offUnacked),
+      postNightCharging,
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+
+    // The switch opens the dialog; it never flips directly.
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn on night charging/i });
+    // The §8 item 2 instruction is stated, with the assertion verbatim as the
+    // required checkbox label.
+    expect(within(dialog).getByText(/One-time night-partition confirmation/i)).toBeVisible();
+    expect(within(dialog).getByLabelText(/the external writer applications stand down/i)).not.toBeChecked();
+    const confirm = within(dialog).getByRole("button", { name: "Turn on" });
+    expect(confirm).toBeDisabled();
+
+    // NIGHT alone is not enough while the acknowledgement is unchecked.
+    await user.type(within(dialog).getByLabelText(/Type NIGHT/i), "NIGHT");
+    expect(confirm).toBeDisabled();
+    await user.click(within(dialog).getByRole("checkbox"));
+    expect(confirm).toBeEnabled();
+
+    await user.click(confirm);
+    // The acknowledgement rides the first enable ever — and only it.
+    await waitFor(() => {
+      expect(postNightCharging).toHaveBeenCalledWith("enable", {
+        nightPosture: "PARTITION_ACKNOWLEDGED",
+      });
+    });
+
+    // The 200's night_charge_state is adopted optimistically: the dialog
+    // closes and the tile speaks the post-toggle state.
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(region).toHaveTextContent("Night charging: On — until restart");
+    expect(screen.getByRole("switch")).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("the acknowledgement is captured once: a later enable never asks again and never re-sends night_posture", async () => {
+    const user = userEvent.setup();
+    // Disabled at runtime, but the site HAS the durable fact (either surface's
+    // capture counts — it is one site fact).
+    const offAcked = nightChargeState({
+      enabled: false,
+      enabled_origin: "runtime",
+      acknowledged_partition: true,
+      active: false,
+      phase: "idle",
+      held_intent_id: null,
+      window_ends_at: null,
+      window_ends_in_s: null,
+      next_window_at: "2026-08-28T00:00:00+10:00",
+      reason_codes: ["outside_window"],
+    });
+    const postNightCharging = vi.fn(() =>
+      Promise.resolve(
+        nightChargingToggleOk(
+          nightChargeState({
+            enabled: true,
+            enabled_origin: "runtime",
+            acknowledged_partition: true,
+            phase: "idle",
+            active: false,
+            held_intent_id: null,
+            window_ends_at: null,
+            window_ends_in_s: null,
+            next_window_at: "2026-08-28T00:00:00+10:00",
+            reason_codes: ["outside_window"],
+          }),
+        ),
+      ),
+    );
+    installClient({
+      snapshot: nightWorld(offAcked),
+      postNightCharging,
+    });
+    renderHome();
+    await screen.findByRole("region", { name: NIGHT_REGION });
+
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn on night charging/i });
+    // No acknowledgement step the second time — captured once, never re-prompted.
+    expect(within(dialog).queryByRole("checkbox")).toBeNull();
+    const confirm = within(dialog).getByRole("button", { name: "Turn on" });
+    expect(confirm).toBeDisabled();
+    await user.type(within(dialog).getByLabelText(/Type NIGHT/i), "NIGHT");
+    expect(confirm).toBeEnabled();
+    await user.click(confirm);
+    await waitFor(() => {
+      // No night_posture key: the site's captured fact already satisfies it.
+      expect(postNightCharging).toHaveBeenCalledWith("enable", {});
+    });
+  });
+
+  it("disable asks only for the typed NIGHT confirmation", async () => {
+    const user = userEvent.setup();
+    const onByConfig = nightChargeState({ enabled: true, enabled_origin: "config" });
+    const offByToggle = nightChargeState({
+      enabled: false,
+      enabled_origin: "runtime",
+      active: false,
+      phase: "idle",
+      held_intent_id: null,
+      window_ends_at: null,
+      window_ends_in_s: null,
+      next_window_at: "2026-08-28T00:00:00+10:00",
+      reason_codes: ["outside_window"],
+    });
+    const postNightCharging = vi.fn(() => Promise.resolve(nightChargingToggleOk(offByToggle)));
+    installClient({
+      snapshot: nightWorld(onByConfig),
+      postNightCharging,
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent("Night charging: On (config)");
+
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn off night charging/i });
+    // Stopping is the safety-positive direction: no acknowledgement step, and
+    // disable is never refused.
+    expect(within(dialog).queryByRole("checkbox")).toBeNull();
+    const confirm = within(dialog).getByRole("button", { name: "Turn off" });
+    expect(confirm).toBeDisabled();
+    await user.type(within(dialog).getByLabelText(/Type NIGHT/i), "NIGHT");
+    expect(confirm).toBeEnabled();
+    await user.click(confirm);
+    await waitFor(() => {
+      expect(postNightCharging).toHaveBeenCalledWith("disable", {});
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(region).toHaveTextContent("Night charging: Off — until restart");
+    expect(screen.getByRole("switch")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("renders the not-commissioned refusal inline and keeps the dialog open", async () => {
+    const user = userEvent.setup();
+    const postNightCharging = vi.fn(() =>
+      Promise.reject(
+        refuse(
+          409,
+          "night_charging_not_commissioned",
+          "Night charging is not commissioned in this deployment's config.",
+        ),
+      ),
+    );
+    installClient({
+      snapshot: nightWorld(
+        nightChargeState({
+          enabled: true,
+          acknowledged_partition: true,
+          active: false,
+          phase: "idle",
+          held_intent_id: null,
+          window_ends_at: null,
+          window_ends_in_s: null,
+          next_window_at: "2026-08-28T00:00:00+10:00",
+          reason_codes: ["outside_window"],
+        }),
+      ),
+      postNightCharging,
+    });
+    renderHome();
+    await screen.findByRole("region", { name: NIGHT_REGION });
+
+    // A deployment whose block vanished between snapshot and toggle: the
+    // refusal names the honest state — nothing to turn off there either.
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn off/i });
+    await user.type(within(dialog).getByLabelText(/Type NIGHT/i), "NIGHT");
+    await user.click(within(dialog).getByRole("button", { name: "Turn off" }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveTextContent(/not commissioned in this deployment's config/);
+    expect(alert).toHaveTextContent(/night_charging_not_commissioned/);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("routes the acknowledgement-required refusal into the acknowledgement step (the 409 IS the routing)", async () => {
+    const user = userEvent.setup();
+    // The console's state says the fact is captured, but the site's durable
+    // record says otherwise (a restart, another console, the schedules surface
+    // never having captured it): the refusal routes the dialog into the step.
+    const postNightCharging = vi.fn(() =>
+      Promise.reject(
+        refuse(
+          409,
+          "night_acknowledgement_required",
+          "The night-partition acknowledgement must be captured before the first enable.",
+          { acknowledgement: "PARTITION_ACKNOWLEDGED" },
+        ),
+      ),
+    );
+    installClient({
+      snapshot: nightWorld(
+        nightChargeState({
+          enabled: false,
+          acknowledged_partition: true,
+          active: false,
+          phase: "idle",
+          held_intent_id: null,
+          window_ends_at: null,
+          window_ends_in_s: null,
+          next_window_at: "2026-08-28T00:00:00+10:00",
+          reason_codes: ["outside_window"],
+        }),
+      ),
+      postNightCharging,
+    });
+    renderHome();
+    await screen.findByRole("region", { name: NIGHT_REGION });
+
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn on/i });
+    // The stale local flag showed no acknowledgement step…
+    expect(within(dialog).queryByRole("checkbox")).toBeNull();
+    await user.type(within(dialog).getByLabelText(/Type NIGHT/i), "NIGHT");
+    await user.click(within(dialog).getByRole("button", { name: "Turn on" }));
+
+    // …the refusal brings it in, with its plain sentence.
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveTextContent(
+      /night-partition acknowledgement is required before the first enable/,
+    );
+    expect(within(dialog).getByRole("checkbox")).toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      holding: "units active under another request",
+      details: { reasons: ["unit_active_under_intent"], unit_ids: ["lhs", "mid"], stop_ids: [] },
+      sentence:
+        /Cannot enable while a request is still active on lhs, mid — finish or cancel the request on lhs, mid first\./,
+    },
+    {
+      holding: "a latched stop",
+      details: { reasons: ["latched_stop_holds"], unit_ids: [], stop_ids: ["stop-7"] },
+      sentence:
+        /Cannot enable while an emergency stop holds the fleet \(stop-7\) — acknowledge the stop first\./,
+    },
+  ])("names what holds a refused enable: $holding", async ({ details, sentence }) => {
+    const user = userEvent.setup();
+    const postNightCharging = vi.fn(() =>
+      Promise.reject(
+        refuse(
+          409,
+          "night_enable_refused",
+          "The fleet is not in a state where night charging can start.",
+          details,
+        ),
+      ),
+    );
+    installClient({
+      snapshot: nightWorld(
+        nightChargeState({
+          enabled: false,
+          acknowledged_partition: true,
+          active: false,
+          phase: "idle",
+          held_intent_id: null,
+          window_ends_at: null,
+          window_ends_in_s: null,
+          next_window_at: "2026-08-28T00:00:00+10:00",
+          reason_codes: ["outside_window"],
+        }),
+      ),
+      postNightCharging,
+    });
+    renderHome();
+    await screen.findByRole("region", { name: NIGHT_REGION });
+
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn on/i });
+    await user.type(within(dialog).getByLabelText(/Type NIGHT/i), "NIGHT");
+    await user.click(within(dialog).getByRole("button", { name: "Turn on" }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveTextContent(sentence);
+    expect(alert).toHaveTextContent(/night_enable_refused/);
+    // The refused enable leaves the toggle exactly where it was.
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("renders a validation refusal's envelope verbatim beside its plain sentence", async () => {
+    const user = userEvent.setup();
+    const postNightCharging = vi.fn(() =>
+      Promise.reject(
+        refuse(422, "validation_error", "Request validation failed", {
+          errors: [{ field: "confirmation", message: "the typed confirmation must be NIGHT" }],
+        }),
+      ),
+    );
+    installClient({
+      snapshot: nightWorld(
+        nightChargeState({
+          enabled: false,
+          acknowledged_partition: true,
+          active: false,
+          phase: "idle",
+          held_intent_id: null,
+          window_ends_at: null,
+          window_ends_in_s: null,
+          next_window_at: "2026-08-28T00:00:00+10:00",
+          reason_codes: ["outside_window"],
+        }),
+      ),
+      postNightCharging,
+    });
+    renderHome();
+    await screen.findByRole("region", { name: NIGHT_REGION });
+
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn on/i });
+    await user.type(within(dialog).getByLabelText(/Type NIGHT/i), "NIGHT");
+    await user.click(within(dialog).getByRole("button", { name: "Turn on" }));
+    const alert = await within(dialog).findByRole("alert");
+    // The envelope is the authority: its code and message render verbatim.
+    expect(alert).toHaveTextContent(/validation_error/);
+    expect(alert).toHaveTextContent(/Request validation failed/);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 });

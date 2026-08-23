@@ -90,6 +90,12 @@ import { UnitHealthTag } from "../../app/unitHealth";
 import { isPlaneSnapshot } from "../../app/SharedDataPlane";
 import { toEnergyToday, type EnergyToday } from "../../app/energy";
 import {
+  nightPhaseAnnouncement,
+  toNightChargeStateChangedEvent,
+  toNightChargeState,
+  type NightChargeState,
+} from "../../app/nightCharge";
+import {
   commandedBySomeoneElseText,
   isForeignObjective,
   objectiveFromForeignEvent,
@@ -110,6 +116,7 @@ import {
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../../lib/format";
 import { NextScheduleCard, toScheduleFacts, type ScheduleFacts } from "./NextScheduleCard";
+import { NightChargeTile } from "./NightChargeTile";
 import { SolarSurplusTile } from "./SolarSurplusTile";
 import { TodayCard } from "./TodayCard";
 import "./home.css";
@@ -234,6 +241,12 @@ interface SnapshotView {
    */
   scheduleState: ScheduleState | null;
   /**
+   * The snapshot's top-level `night_charge_state` projection (PENDING-BACKEND,
+   * feature-detected): null when the field is absent — the night strategy is
+   * not composed here, and Home's Night tile renders nothing at all.
+   */
+  nightState: NightChargeState | null;
+  /**
    * The snapshot's top-level `energy_today` block (PENDING-BACKEND,
    * feature-detected): null when the field is absent — the energy scorecard
    * is not composed here, and Home's Today card renders nothing at all.
@@ -321,6 +334,12 @@ function readSnapshot(value: unknown): SnapshotView | null {
     // — the schedules feature is not composed here, and Home's schedule card
     // renders nothing at all.
     scheduleState: isRecord(record.schedule_state) ? toScheduleState(record.schedule_state) : null,
+    // Feature detection: an absent `night_charge_state` (today's backend) is
+    // null — the night strategy is not composed here, and Home's Night tile
+    // renders nothing at all.
+    nightState: isRecord(record.night_charge_state)
+      ? toNightChargeState(record.night_charge_state)
+      : null,
     // Feature detection: an absent `energy_today` (today's backend) is null —
     // the energy scorecard is not composed here, and Home's Today card
     // renders nothing at all.
@@ -747,6 +766,11 @@ export function HomeView({ client }: HomeViewProps) {
    * to run a deferred updater.
    */
   const scheduleRef = useRef<ScheduleState | null>(null);
+  /**
+   * The night projection by reference (the same pattern): a phase-change
+   * announcement compares against the CURRENT projection synchronously.
+   */
+  const nightRef = useRef<NightChargeState | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [announcement, setAnnouncement] = useState("");
@@ -830,6 +854,7 @@ export function HomeView({ client }: HomeViewProps) {
       setSnapshot(parsed);
       adviserRef.current = parsed.adviserState;
       scheduleRef.current = parsed.scheduleState;
+      nightRef.current = parsed.nightState;
       lastSequenceRef.current = incoming;
       return true;
     };
@@ -1190,6 +1215,33 @@ export function HomeView({ client }: HomeViewProps) {
             setAnnouncement("Solar-surplus charging started.");
           } else if (previous !== null && previous.active && !next.active) {
             setAnnouncement("Solar-surplus charging stood down.");
+          }
+        }
+        return;
+      }
+      if (frame.type === "night_charge.state_changed") {
+        // The night adviser's own frame (feature-detected, the excess tile's
+        // pattern): the payload patches the tile's projection — the per-unit
+        // targets, SOC figures, and demand reading refresh on EVERY frame,
+        // heartbeats included, with no announcement; only a PHASE change is
+        // worth the operator's ear (pacing → holding → resume → complete is
+        // the supervised-night story the design wants visible). No refetch:
+        // the payload is the projection, and the plane's live cadence
+        // confirms it. The projection is read and kept current through
+        // nightRef: the phase comparison must happen NOW, not when React runs
+        // a deferred updater.
+        const payload: unknown = frame.payload;
+        const previous = nightRef.current;
+        const event = toNightChargeStateChangedEvent(previous, payload);
+        if (event !== null && event.state !== previous) {
+          const next = event.state;
+          nightRef.current = next;
+          setSnapshot((prior) => (prior === null ? prior : { ...prior, nightState: next }));
+          if (previous !== null && !event.heartbeat && previous.phase !== next.phase) {
+            const announcement = nightPhaseAnnouncement(previous.phase, next.phase);
+            if (announcement !== null) {
+              setAnnouncement(announcement);
+            }
           }
         }
         return;
@@ -1614,6 +1666,27 @@ export function HomeView({ client }: HomeViewProps) {
           adviserRef.current = adopted;
           setSnapshot((previous) =>
             previous === null ? previous : { ...previous, adviserState: adopted },
+          );
+        }}
+      />
+
+      {/* The night-charge tile: the off-peak strategy's one-glance story, right
+          beside its daytime complement (the two advisers never share a minute
+          — export exists only in daylight, the night window is darkness).
+          Renders nothing at all while the snapshot carries no
+          night_charge_state (feature detection — the backend half is not
+          composed). */}
+      <NightChargeTile
+        night={snapshot.nightState}
+        today={snapshot.energyToday}
+        client={client}
+        nowMs={nowMs}
+        onAdopt={(adopted) => {
+          // A toggle 200's own post-toggle projection, adopted optimistically;
+          // the next snapshot or night_charge.state_changed frame confirms.
+          nightRef.current = adopted;
+          setSnapshot((previous) =>
+            previous === null ? previous : { ...previous, nightState: adopted },
           );
         }}
       />
