@@ -1153,6 +1153,7 @@ def test_a_present_night_block_composes_with_the_pinned_defaults() -> None:
     assert block.demand_exit_hysteresis_w == 200
     assert block.hold_rate_w == 100
     assert block.demand_scope == "fleet"
+    assert block.demand_response == "hold", "the designed posture is the default"
     assert block.pacing == "cap_first"
     assert block.assumed_capacity_wh is None
     assert block.demand_telemetry_max_age_s == 3.0
@@ -1211,6 +1212,34 @@ def test_night_hold_rate_must_be_a_positive_charge_below_the_cap() -> None:
     back to matching autonomy, the opposite of the operator's intent."""
     _assert_night_rule(_night_config(hold_rate_w=0), message_contains="hold_rate_w")
     _assert_night_rule(_night_config(hold_rate_w=2500), message_contains="hold_rate_w")
+
+
+def test_the_demand_response_posture_is_one_of_the_two_commissioned_words() -> None:
+    """`demand_response` selects the demand posture: `hold` (the designed
+    default — a small positive charge whose objective replaces pod autonomy)
+    or `standby` (the operator's preference — measured demand stands units
+    down entirely).  The fail-closed rate `hold_rate_w` is required under
+    BOTH, so its own validation never lapses under `standby`."""
+    parsed = _validate(_night_config(demand_response="standby"))
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.demand_response == "standby"
+
+    _assert_night_rule(_night_config(demand_response="pause"), message_contains="demand_response")
+
+
+def test_standby_still_requires_the_positive_fail_closed_rate() -> None:
+    """Standby is a response to MEASURED demand, never to missing data: bad
+    evidence HOLDS at `hold_rate_w` under both postures, so a standby block
+    with a zero (or cap-equal) hold rate is refused exactly like a hold
+    block's."""
+    _assert_night_rule(
+        _night_config(demand_response="standby", hold_rate_w=0),
+        message_contains="hold_rate_w",
+    )
+    _assert_night_rule(
+        _night_config(demand_response="standby", hold_rate_w=2500),
+        message_contains="hold_rate_w",
+    )
 
 
 def test_night_hysteresis_must_sit_strictly_inside_the_threshold() -> None:
@@ -1323,6 +1352,9 @@ def test_the_live_write_examples_night_block_validates_as_documented() -> None:
     assert parsed.night_charging is not None
     assert parsed.night_charging.enabled is False
     assert parsed.night_charging.pacing == "cap_first"
+    assert parsed.night_charging.demand_response == "standby", (
+        "the example ships the operator's preferred demand posture"
+    )
     assert parsed.schedule is not None
     assert parsed.schedule.allowed_windows_local == (("00:00", "20:00"),)
 

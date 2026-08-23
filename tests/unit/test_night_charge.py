@@ -4,19 +4,22 @@ The module under test is ``energypod.application.night_charge`` (API_CONTRACTS
 "Off-peak night charge").  It is an ADVISORY strategy layer in the
 excess-adviser pattern: it computes a per-battery charge plan each tick inside
 a commissioned civil-time window, submits ordinary short-TTL ``OPTIMIZER``
-CHARGE intents through the facade twin, holds every participating battery at a
-small POSITIVE charge while measured site demand exceeds a threshold (the held
-objective replaces the pods' load-matching autonomy), resumes pacing when
-demand falls (with hysteresis), and lets batteries already at the ceiling sit
-out.  Hand-back at window end is NON-RENEWAL: no stop triple, no idle intent,
-ever.
+CHARGE intents through the facade twin, and answers measured site demand above
+the threshold per the commissioned POSTURE — ``hold`` keeps every participating
+battery in the submission at a small POSITIVE charge (the held objective
+replaces the pods' load-matching autonomy), ``standby`` (the operator's
+preference) stands units down entirely (zero-watt non-participation, excluded
+from the submission).  Both postures resume pacing when demand falls (with
+hysteresis), both FAIL CLOSED TO HOLD on bad evidence, and both let batteries
+already at the ceiling sit out.  Hand-back at window end is NON-RENEWAL: no
+stop triple, no idle intent, ever.
 
 Pinned contract (the red phase fails cleanly while the module is absent)::
 
     NightChargeSettings(               # every behavioural key of the block
         rate_cap_w, hold_rate_w, demand_threshold_w, demand_exit_hysteresis_w,
-        demand_scope, pacing, assumed_capacity_wh, demand_telemetry_max_age_s,
-        intent_ttl_s, windows, timezone, unit_ids,
+        demand_scope, demand_response, pacing, assumed_capacity_wh,
+        demand_telemetry_max_age_s, intent_ttl_s, windows, timezone, unit_ids,
     )
     in_window(local_now, windows) -> bool          # civil containment
     next_window_start(at, windows, zone) -> datetime
@@ -26,13 +29,16 @@ Pinned contract (the red phase fails cleanly while the module is absent)::
         async tick() -> NightChargeDecision
     NightChargeController(...)                     # participation + projection
 
-The design's two correctness pins are NAMED tests here:
+The design's named correctness pins are NAMED tests here:
 
 - the LOAD-word-not-grid-word demand rule — the grid word includes the
   adviser's OWN charging draw and a grid-word implementation would self-hold
   forever at cap rates;
 - the one-held-intent invariant — exactly one live ``night-`` intent, ever,
-  maintained by remove-then-submit renewal.
+  maintained by remove-then-submit renewal;
+- the posture-invariant fail-closed — missing/bad/stale evidence HOLDS under
+  the standby posture too (standby answers measured demand, never missing
+  data).
 """
 
 from __future__ import annotations
@@ -275,6 +281,7 @@ def make_settings(night: Any, **overrides: Any) -> Any:
         "demand_threshold_w": 1_000,
         "demand_exit_hysteresis_w": 200,
         "demand_scope": "fleet",
+        "demand_response": "hold",
         "pacing": "cap_first",
         "assumed_capacity_wh": None,
         "demand_telemetry_max_age_s": 3.0,
@@ -698,6 +705,200 @@ async def test_the_demand_rule_reads_the_load_words_never_the_grid_words(
     assert submit_two.submissions[0]["watts_by_unit"] == {"lhs": 100, "mid": 100}
 
 
+# --- the demand postures: standby vs hold (§2.4, the operator's choice) ----------
+
+
+async def test_standby_stands_measured_demand_holds_down_to_non_participation(
+    night: Any, api: Any
+) -> None:
+    """The operator's preferred posture: MEASURED demand above the line
+    stands every participating unit down entirely — zero-watt
+    non-participation, never a zero-watt submission (the facade refuses
+    those) — so nothing is submitted and the fleet phase names the
+    stand-by."""
+    # 400 + 400 + 300 = 1100 W of house load: the EV class of demand.
+    fleet = make_fleet(api, {"lhs": 400.0, "mid": 400.0, "rhs": 300.0})
+    adviser, intents, submit, _ = make_adviser(
+        night, api, fleet, settings=make_settings(night, demand_response="standby")
+    )
+
+    decision = await adviser.tick()
+
+    assert decision.phase == "standing_by_on_demand"
+    assert decision.demand_w == 1_100
+    assert decision.demand_evidence == "good"
+    assert decision.reason_codes == ("window_open", "demand_above_threshold")
+    assert decision.active_unit_ids == ()
+    by_unit = {plan.unit_id: plan for plan in decision.unit_plans}
+    assert by_unit["lhs"].phase == "standing_by_on_demand"
+    assert by_unit["lhs"].target_w == 0
+    assert by_unit["lhs"].reason == "demand_above_threshold"
+    assert submit.submissions == [], "zero-watt non-participation, never a submission"
+    assert intents.removed == []
+
+
+async def test_standby_withdraws_the_held_intent_and_resumes_on_hysteresis(
+    night: Any, api: Any
+) -> None:
+    """The full standby arc: pacing -> the EV arrives (the held intent is
+    WITHDRAWN, the TTL lapse plus watchdog hand the pods back) -> demand in
+    the hysteresis band keeps the stand-by (no flapping) -> below the exit
+    bound the units rejoin the submission and pacing resumes."""
+    fleet = make_fleet(api, {"lhs": 100.0, "mid": 100.0, "rhs": 100.0})
+    adviser, intents, submit, _ = make_adviser(
+        night, api, fleet, settings=make_settings(night, demand_response="standby")
+    )
+
+    pacing = await adviser.tick()
+    assert pacing.phase == "pacing"
+    held_id = adviser.held_intent_id
+
+    # The EV arrives mid-window: 1100 W measured.
+    for unit, load in (("lhs", 400.0), ("mid", 400.0), ("rhs", 300.0)):
+        object.__setattr__(fleet[unit], "load_power_w", load)
+    stood_down = await adviser.tick()
+
+    assert stood_down.phase == "standing_by_on_demand"
+    assert stood_down.action == "withdraw", "the charge intent lapses by design"
+    assert held_id in intents.removed
+    assert adviser.held_intent_id is None
+    assert submit.submissions[-1] is submit.submissions[0], "no renewal while stood down"
+
+    # Demand falls INTO the band (1000 > 900 > 800): still stood down.
+    for unit, load in (("lhs", 500.0), ("mid", 300.0), ("rhs", 100.0)):
+        object.__setattr__(fleet[unit], "load_power_w", load)
+    band = await adviser.tick()
+    assert band.phase == "standing_by_on_demand"
+    assert band.demand_w == 900
+    assert len(submit.submissions) == 1
+
+    # Below the exit bound (800): the units rejoin and pacing resumes.
+    for unit, load in (("lhs", 350.0), ("mid", 300.0), ("rhs", 100.0)):
+        object.__setattr__(fleet[unit], "load_power_w", load)
+    resumed = await adviser.tick()
+
+    assert resumed.phase == "pacing"
+    assert "demand_below_exit" in resumed.reason_codes
+    assert set(resumed.active_unit_ids) == {"lhs", "mid"}
+    assert submit.submissions[-1]["watts_by_unit"] == {"lhs": 2_500, "mid": 2_500}
+
+
+async def test_standby_ends_at_the_window_boundary_and_reopens_fresh(
+    night: Any, api: Any
+) -> None:
+    """The stand-by lasts only to the window's end (non-renewal, the pods'
+    own autonomy until the next window), and the hold latch does not carry
+    into the next window even if demand stays high."""
+    fleet = make_fleet(api, {"lhs": 400.0, "mid": 400.0, "rhs": 300.0})
+    clock = FakeClock()
+    adviser, intents, submit, _ = make_adviser(
+        night,
+        api,
+        fleet,
+        clock=clock,
+        settings=make_settings(night, demand_response="standby"),
+    )
+
+    stood_down = await adviser.tick()
+    assert stood_down.phase == "standing_by_on_demand"
+
+    clock.wall = datetime(2026, 8, 27, 6, 0, tzinfo=ZONE)
+    ended = await adviser.tick()
+    assert ended.action == "idle", "nothing was held while stood down"
+    assert ended.phase == "idle"
+    assert ended.reason_codes == ("outside_window",)
+
+    # The next window opens onto FRESH demand below the engage line: pacing
+    # immediately, the previous window's stand-by latch reset at the boundary.
+    clock.wall = datetime(2026, 8, 28, 0, 30, tzinfo=ZONE)
+    for unit, load in (("lhs", 300.0), ("mid", 300.0), ("rhs", 100.0)):
+        object.__setattr__(fleet[unit], "load_power_w", load)
+    fresh = await adviser.tick()
+
+    assert fresh.phase == "pacing"
+    assert fresh.reason_codes == ("window_open", "on_plan")
+    assert submit.submissions[-1]["watts_by_unit"] == {"lhs": 2_500, "mid": 2_500}
+
+
+@pytest.mark.parametrize(
+    ("loads", "word"),
+    [
+        ({"lhs": 100.0, "mid": 100.0, "rhs": None}, "missing"),
+        ({"lhs": 100.0, "mid": 100.0, "rhs": 100.0}, "bad"),
+        ({"lhs": 100.0, "mid": 100.0, "rhs": 100.0}, "stale"),
+    ],
+)
+async def test_standby_fails_closed_to_the_positive_hold(
+    night: Any, api: Any, loads: Mapping[str, float | None], word: str
+) -> None:
+    """THE POSTURE-INVARIANT FAIL-CLOSED PIN: standby is a response to
+    MEASURED demand, never to missing data.  A non-good word keeps (or
+    engages) the HOLD at hold_rate_w — the renewed objective preserves the
+    no-cycling guarantee under BOTH postures."""
+    overrides: dict[str, Any] = {}
+    if word == "bad":
+        overrides["rhs__load_quality"] = api.DataQuality.BAD
+    if word == "stale":
+        overrides["rhs__captured_at_mono"] = NOW - 5.0
+    fleet = make_fleet(api, loads, **overrides)
+    adviser, _, submit, _ = make_adviser(
+        night, api, fleet, settings=make_settings(night, demand_response="standby")
+    )
+
+    decision = await adviser.tick()
+
+    assert decision.demand_evidence == word
+    assert decision.demand_w is None
+    assert decision.phase == "holding_on_demand", "fail-closed holds, never stands by"
+    assert f"demand_evidence_{word}" in decision.reason_codes
+    assert targets(decision) == {"lhs": 100, "mid": 100}
+    assert submit.submissions[0]["watts_by_unit"] == {"lhs": 100, "mid": 100}
+
+
+async def test_standby_per_phase_stands_down_only_the_phase_showing_demand(
+    night: Any, api: Any
+) -> None:
+    fleet = make_fleet(api, {"lhs": 1_200.0, "mid": 300.0, "rhs": 300.0})
+    adviser, _, submit, _ = make_adviser(
+        night,
+        api,
+        fleet,
+        settings=make_settings(night, demand_response="standby", demand_scope="per_phase"),
+    )
+
+    decision = await adviser.tick()
+
+    assert decision.demand_w == 1_800
+    assert decision.phase == "standing_by_on_demand"
+    by_unit = {plan.unit_id: plan for plan in decision.unit_plans}
+    assert by_unit["lhs"].phase == "standing_by_on_demand"
+    # The clean phase keeps charging; the demanded phase is excluded from the
+    # submission entirely (zero-watt non-participation).
+    assert submit.submissions[0]["watts_by_unit"] == {"mid": 2_500}
+
+
+async def test_standby_per_phase_fails_closed_on_its_own_bad_word(
+    night: Any, api: Any
+) -> None:
+    """A phase whose OWN word went non-good holds at the positive rate (fail
+    closed) even under the standby posture, while the clean phase paces."""
+    fleet = make_fleet(api, {"lhs": 1_200.0, "mid": 300.0, "rhs": 300.0})
+    tainted = {**fleet["lhs"].quality, "load_power_w": api.DataQuality.BAD}
+    object.__setattr__(fleet["lhs"], "quality", tainted)
+    adviser, _, submit, _ = make_adviser(
+        night,
+        api,
+        fleet,
+        settings=make_settings(night, demand_response="standby", demand_scope="per_phase"),
+    )
+
+    decision = await adviser.tick()
+
+    assert decision.phase == "holding_on_demand"
+    assert "demand_evidence_bad" in decision.reason_codes
+    assert submit.submissions[0]["watts_by_unit"] == {"lhs": 100, "mid": 2_500}
+
+
 # --- precedence: claims and the dawn corner (§4) --------------------------------
 
 
@@ -914,6 +1115,7 @@ def make_controller(night: Any, **overrides: Any) -> Any:
         "rate_cap_w": 2_500,
         "hold_rate_w": 100,
         "demand_scope": "fleet",
+        "demand_response": "hold",
         "demand_threshold_w": 1_000,
         "windows": DEFAULT_WINDOW,
         "timezone": "Australia/Brisbane",
@@ -968,6 +1170,7 @@ def test_the_state_payload_is_the_section_five_shape() -> None:
         "rate_cap_w",
         "hold_rate_w",
         "demand_scope",
+        "demand_response",
         "demand_threshold_w",
         "demand_w",
         "demand_evidence",
@@ -979,6 +1182,10 @@ def test_the_state_payload_is_the_section_five_shape() -> None:
     }
     assert payload["enabled"] is False
     assert payload["posture"] == "partition"
+    assert payload["demand_response"] == "hold", "the designed default posture"
+    assert make_controller(night_module, demand_response="standby").state_payload()[
+        "demand_response"
+    ] == "standby"
     assert payload["window"] == {
         "start_local": "00:00",
         "end_local": "06:00",

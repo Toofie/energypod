@@ -468,14 +468,26 @@ schedule:
 # THE DEMAND RULE reads the per-pod LOAD CT words (0x1000+20), NEVER the
 # grid words: the grid word includes the adviser's OWN charging draw, so a
 # demand rule on it would read a 3 x 2500 W charge as 7.5 kW of "demand" and
-# hold forever. While measured demand exceeds demand_threshold_w every
-# participating battery drops to hold_rate_w — a small POSITIVE charge
-# (config refuses zero: a zero hold hands the pod back to matching autonomy,
-# the opposite of the operator's intent). The held objective REPLACES the
-# pods' load-matching autonomy, so batteries neither drain into the EV nor
-# cycle; the GRID meets the spike. Resume only below threshold - hysteresis.
-# Bad evidence (a missing/bad/stale load word) FAILS CLOSED TO HOLD —
-# loudly, never a silent never-charges.
+# hold forever. While measured demand exceeds demand_threshold_w the
+# commissioned posture decides the response:
+#   demand_response: "standby" — the OPERATOR'S PREFERENCE (this file's
+#     setting): participating batteries stand down entirely (zero-watt
+#     non-participation — excluded from the submission, the TTL lapse plus
+#     the ~3.5-4.0 s watchdog handing each pod back to its own autonomy)
+#     and resume charging when demand falls below threshold - hysteresis OR
+#     the window ends. Honest trade: during the stand-by the pods' own
+#     load-matching autonomy serves part of the house demand, so a battery
+#     may discharge into the spike — the operator's chosen posture.
+#   demand_response: "hold" — the original design: every participating
+#     battery drops to hold_rate_w, a small POSITIVE charge (config refuses
+#     zero) whose renewed objective REPLACES the pods' load-matching
+#     autonomy, so batteries neither drain into the EV nor cycle; the GRID
+#     meets the spike.
+# FAIL-CLOSED IS POSTURE-INVARIANT: bad evidence (a missing/bad/stale load
+# word) HOLDS at hold_rate_w under BOTH postures — standby is a response to
+# MEASURED demand, never to missing data, and hold_rate_w stays required and
+# validated under both. The hold-on-bad-evidence state is loud
+# (demand_evidence_stale etc.), never a silent never-charges.
 #
 # PRECEDENCE: manual/agent requests outrank it per battery (and their units
 # are excluded from the submission until the claim lapses); it ALWAYS yields
@@ -514,7 +526,10 @@ night_charging:
   rate_cap_w: 2500          # the per-battery cap (<= policy.max_unit_charge_w)
   demand_threshold_w: 1000  # the operator's own figure
   demand_exit_hysteresis_w: 200   # resume only below 800 W (no flapping)
-  hold_rate_w: 100          # a small POSITIVE charge while demand runs
+  hold_rate_w: 100          # the hold rate — AND the fail-closed rate under
+                            # BOTH postures (bad evidence holds, never stands by)
+  demand_response: "standby"  # the operator's preference: stand down on measured
+                            # demand (hold | standby; fail-closed holds either way)
   demand_scope: "fleet"     # fleet | per_phase (the graduation)
   pacing: "cap_first"       # Docker parity; `even` is deadline-paced (needs the map)
   demand_telemetry_max_age_s: 3.0

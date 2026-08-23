@@ -3276,6 +3276,7 @@ def _build_runtime(
             rate_cap_w=int(night_config.rate_cap_w),
             hold_rate_w=int(night_config.hold_rate_w),
             demand_scope=night_config.demand_scope,
+            demand_response=night_config.demand_response,
             demand_threshold_w=int(night_config.demand_threshold_w),
             windows=tuple(
                 (parse_hhmm(start), parse_hhmm(end)) for start, end in night_config.window_local
@@ -3539,6 +3540,7 @@ def _build_runtime(
                 demand_threshold_w=int(night_config.demand_threshold_w),
                 demand_exit_hysteresis_w=int(night_config.demand_exit_hysteresis_w),
                 demand_scope=night_config.demand_scope,
+                demand_response=night_config.demand_response,
                 pacing=night_config.pacing,
                 assumed_capacity_wh=dict(night_config.assumed_capacity_wh or {}),
                 demand_telemetry_max_age_s=float(night_config.demand_telemetry_max_age_s),

@@ -27,6 +27,18 @@ charging draw, so a demand rule on it would read a 3 x 2500 W charge as
 7.5 kW of "demand" and hold forever.  Evidence quality is the scorecard's
 family and FAILS CLOSED TO HOLD (preserving the no-cycling guarantee):
 charging blind into an EV at 7 kW is the exact outcome the operator refused.
+
+The demand RESPONSE is a commissioned posture (§2.4): ``hold`` (the
+original design) keeps every held unit in the submission at
+``hold_rate_w`` — a small positive charge whose renewed objective replaces
+the pod's load-matching autonomy — while ``standby`` (the operator's
+stated preference) stands MEASURED demand holds down entirely:
+zero-watt non-participation, exclusion at submission time (the
+6abd869/d2163a5 doctrine), the TTL lapse plus watchdog handing the pod
+back to its own autonomy until demand subsides or the window ends.  The
+fail-closed polarity is posture-invariant: missing/bad/stale evidence
+HOLDS at ``hold_rate_w`` under BOTH postures — standby is a response to
+measured demand, never to missing data.
 """
 
 from __future__ import annotations
@@ -68,12 +80,29 @@ _OWN_INTENT_PREFIX: Final[str] = "night-"
 # stop triple, an idle intent, or a zero-watt submission).
 Action = Literal["idle", "propose", "renew", "withdraw"]
 
-# §5's ONE phase vocabularies.
-NightPhase = Literal["idle", "pacing", "holding_on_demand", "complete", "skipped_full"]
-NightUnitPhase = Literal["pacing", "holding_on_demand", "skipped_full", "complete", "sitting_out"]
+# §5's ONE phase vocabularies.  ``standing_by_on_demand`` is the standby
+# posture's own word (fleet and unit): the demand rule engaged on MEASURED
+# demand and the unit is stood down entirely — zero-watt non-participation,
+# excluded from the submission, the pod back on its own autonomy.
+NightPhase = Literal[
+    "idle", "pacing", "holding_on_demand", "standing_by_on_demand", "complete", "skipped_full"
+]
+NightUnitPhase = Literal[
+    "pacing",
+    "holding_on_demand",
+    "standing_by_on_demand",
+    "skipped_full",
+    "complete",
+    "sitting_out",
+]
 EnabledOrigin = Literal["config", "runtime"]
 DemandScope = Literal["fleet", "per_phase"]
 PacingRule = Literal["cap_first", "even"]
+# The demand-response posture (§2.4): ``hold`` keeps a small positive charge
+# whose renewed objective replaces pod autonomy (the no-cycling guarantee);
+# ``standby`` stands measured demand holds down to zero-watt
+# non-participation.  Fail-closed evidence HOLDS under both.
+DemandResponse = Literal["hold", "standby"]
 
 # The participation states the tick alone cannot see (§5's vocabulary
 # additions, the excess pattern).
@@ -337,6 +366,7 @@ class NightChargeSettings:
     demand_threshold_w: int
     demand_exit_hysteresis_w: int
     demand_scope: DemandScope
+    demand_response: DemandResponse
     pacing: PacingRule
     assumed_capacity_wh: Mapping[str, int] | None
     demand_telemetry_max_age_s: float
@@ -480,6 +510,7 @@ class NightChargeAdviser:
         plans: list[NightUnitPlan] = []
         participating: list[str] = []
         held_units: list[str] = []
+        standing_units: list[str] = []
         at_risk = False
         remaining_s = self._remaining_s(wall)
         for unit_id in self._settings.unit_ids:
@@ -490,19 +521,34 @@ class NightChargeAdviser:
             plans.append(plan)
             if plan.phase in ("pacing", "holding_on_demand"):
                 participating.append(unit_id)
-            if plan.phase == "holding_on_demand":
+            if unit_held:
                 held_units.append(unit_id)
+                if plan.phase == "standing_by_on_demand":
+                    standing_units.append(unit_id)
 
         if not participating:
+            if standing_units:
+                # The standby posture with every demand-eligible unit stood
+                # down: zero-watt non-participation IS the response, so the
+                # demand code rides (a stand-by is by definition MEASURED
+                # demand; a fail-closed hold would be participating).
+                return await self._standby(
+                    "standing_by_on_demand",
+                    True,
+                    reading,
+                    ("window_open", "demand_above_threshold"),
+                    tuple(plans),
+                )
             reasons = ("window_open", *_no_participant_reasons(tuple(plans)))
             return await self._standby(
                 _completion_phase(tuple(plans)), True, reading, reasons, tuple(plans)
             )
 
-        # The demand hold's fleet code: the evidence word's code outranks the
-        # plain threshold code (the loud never-silent-hold requirement), and
-        # the tick that releases the hold says demand_below_exit (the resumed
-        # units are pacing by then — the code names the transition).
+        # The demand response's fleet code (either posture): the evidence
+        # word's code outranks the plain threshold code (the loud
+        # never-silent-hold requirement), and the tick that releases the
+        # response says demand_below_exit (the resumed units are pacing by
+        # then — the code names the transition).
         if held_units:
             if reading.evidence != "good":
                 hold_code = f"demand_evidence_{reading.evidence}"
@@ -534,7 +580,12 @@ class NightChargeAdviser:
         self._held_intent_id = submitted_id if isinstance(submitted_id, str) else None
         self._submitted_this_window = True
         self._participated = self._participated | frozenset(participating)
-        phase: NightPhase = "holding_on_demand" if held_units else "pacing"
+        if standing_units:
+            phase: NightPhase = "standing_by_on_demand"
+        elif held_units:
+            phase = "holding_on_demand"
+        else:
+            phase = "pacing"
         return NightChargeDecision(
             action=action,
             phase=phase,
@@ -598,7 +649,8 @@ class NightChargeAdviser:
         is adviser state (``_holding_fleet`` for the global scope,
         ``_holding_units`` per phase) reset at the window boundaries.  A
         non-good word FAILS CLOSED to the hold: bad evidence must PRESERVE
-        the no-cycling guarantee.
+        the no-cycling guarantee.  The DECISION here is posture-invariant;
+        ``_plan_unit`` chooses the RESPONSE (hold rate or stand-down).
         """
         threshold = self._settings.demand_threshold_w
         exit_bound = threshold - self._settings.demand_exit_hysteresis_w
@@ -619,6 +671,18 @@ class NightChargeAdviser:
                 return False, True
             return True, False
         return reading.demand_w > threshold, False
+
+    def _driving_word_good(self, unit_id: str, reading: DemandReading) -> bool:
+        """Whether the word DRIVING this unit's hold decision is GOOD.
+
+        The ``fleet`` scope holds on the rollup's worst word; ``per_phase``
+        holds on the unit's own word.  This is the standby posture's one
+        gate: only a MEASURED demand stand-down may hand a pod back — a
+        fail-closed hold (any non-good word) keeps the positive charge.
+        """
+        if self._settings.demand_scope == "per_phase":
+            return reading.per_unit.get(unit_id, "missing") == "good"
+        return reading.evidence == "good"
 
     def _plan_unit(
         self,
@@ -669,12 +733,35 @@ class NightChargeAdviser:
                 False,
             )
 
-        # 2/3. The rate under the pinned pacing rule, then the demand hold.
+        # 2/3. The rate under the pinned pacing rule, then the demand response.
         held, resumed = self._unit_is_held(unit_id, reading)
         self._latch_held(unit_id, held)
         if resumed:
             self._resumed_this_tick = True
         if held:
+            if (
+                self._settings.demand_response == "standby"
+                and self._driving_word_good(unit_id, reading)
+            ):
+                # The standby posture: MEASURED demand stands the unit down
+                # entirely — zero-watt non-participation, excluded from the
+                # submission (a zero-watt per-unit target is refused by the
+                # facade), the TTL lapse plus watchdog returning the pod to
+                # its own autonomy until demand subsides or the window ends.
+                # Missing/bad/stale evidence NEVER takes this arm: it fails
+                # closed to the positive hold below, preserving the
+                # no-cycling guarantee under BOTH postures.
+                return (
+                    NightUnitPlan(
+                        unit_id,
+                        soc_pct,
+                        "standing_by_on_demand",
+                        0,
+                        "demand_above_threshold",
+                    ),
+                    False,
+                    True,
+                )
             return (
                 NightUnitPlan(
                     unit_id,
@@ -841,6 +928,7 @@ class NightChargeState:
     rate_cap_w: int
     hold_rate_w: int
     demand_scope: DemandScope
+    demand_response: DemandResponse
     demand_threshold_w: int
     demand_w: int | None
     demand_evidence: DemandEvidence
@@ -868,6 +956,7 @@ class NightChargeState:
             "rate_cap_w": self.rate_cap_w,
             "hold_rate_w": self.hold_rate_w,
             "demand_scope": self.demand_scope,
+            "demand_response": self.demand_response,
             "demand_threshold_w": self.demand_threshold_w,
             "demand_w": self.demand_w,
             "demand_evidence": self.demand_evidence,
@@ -933,6 +1022,7 @@ class NightChargeController:
         rate_cap_w: int,
         hold_rate_w: int,
         demand_scope: DemandScope,
+        demand_response: DemandResponse,
         demand_threshold_w: int,
         windows: tuple[tuple[time, time], ...],
         timezone: str,
@@ -951,6 +1041,7 @@ class NightChargeController:
         self._rate_cap_w = int(rate_cap_w)
         self._hold_rate_w = int(hold_rate_w)
         self._demand_scope = demand_scope
+        self._demand_response = demand_response
         self._demand_threshold_w = int(demand_threshold_w)
         self._windows = windows
         self._timezone = timezone
@@ -1074,6 +1165,7 @@ class NightChargeController:
             rate_cap_w=self._rate_cap_w,
             hold_rate_w=self._hold_rate_w,
             demand_scope=self._demand_scope,
+            demand_response=self._demand_response,
             demand_threshold_w=self._demand_threshold_w,
             demand_w=self._last_demand_w,
             demand_evidence=self._last_evidence,
@@ -1182,6 +1274,7 @@ __all__ = [
     "Action",
     "DemandEvidence",
     "DemandReading",
+    "DemandResponse",
     "DemandScope",
     "EnabledOrigin",
     "NightChargeAdviser",
