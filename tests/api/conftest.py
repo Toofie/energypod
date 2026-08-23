@@ -176,6 +176,70 @@ class RecordingEnergyService:
     )
     schedule_refusal: Any = None
     schedule_error: Any = None
+    # The plant-history surface's scripted answers (DESIGN_PLANT_HISTORY
+    # section 3): a query body, an optional refusal, an optional validation
+    # error raised to the boundary.
+    history_view: dict[str, Any] = field(
+        default_factory=lambda: {
+            "from": "2026-08-25T06:00:00+00:00",
+            "to": "2026-08-26T06:00:00+00:00",
+            "resolution": "full",
+            "points": 600,
+            "fields": [
+                "bms_soc_pct",
+                "battery_watts",
+                "grid_power_w",
+                "temperature_min_c",
+                "temperature_max_c",
+            ],
+            "units": {
+                "mid": {
+                    "first_sample_at": "2026-08-25T06:00:30+00:00",
+                    "last_sample_at": "2026-08-26T05:59:30+00:00",
+                    "sample_count": 2871,
+                    "quality_worst": "good",
+                    "gaps": [
+                        {
+                            "from": "2026-08-26T02:10:00+00:00",
+                            "to": "2026-08-26T03:40:30+00:00",
+                        }
+                    ],
+                    "series": {
+                        "battery_watts": {
+                            "window_min": -2503.0,
+                            "window_min_at": "2026-08-26T00:41:00+00:00",
+                            "window_max": 914.0,
+                            "window_max_at": "2026-08-25T19:12:30+00:00",
+                            "sample_count": 2871,
+                            "points": [
+                                {"t": "2026-08-25T06:00:30+00:00", "v": -521.0},
+                                {"t": "2026-08-26T05:59:30+00:00", "v": -2498.0},
+                            ],
+                        }
+                    },
+                }
+            },
+            "fleet": {
+                "series": {
+                    "grid_power_w": {
+                        "window_min": -2901.0,
+                        "window_min_at": "2026-08-25T14:10:00+00:00",
+                        "window_max": 1204.0,
+                        "window_max_at": "2026-08-25T19:12:30+00:00",
+                        "sample_count": 2871,
+                        "points": [
+                            {"t": "2026-08-25T06:00:30+00:00", "v": -1521.0},
+                            {"t": "2026-08-26T05:59:30+00:00", "v": -2510.0},
+                        ],
+                    }
+                },
+                "gaps": [],
+            },
+        }
+    )
+    history_refusal: Any = None
+    history_error: Any = None
+    history_units: tuple[str, ...] = ("mid", "rhs")
     # The energy scorecard's scripted answers (API_CONTRACTS "Energy
     # scorecard"): the days body and an optional refusal.
     energy_days_view: dict[str, Any] = field(
@@ -398,6 +462,49 @@ class RecordingEnergyService:
         if self.energy_refusal is not None:
             raise self.energy_refusal
         return dict(self.energy_days_view)
+
+    async def get_plant_history(
+        self,
+        *,
+        principal: Any,
+        range_from: str,
+        range_to: str,
+        unit_ids: list[str] | None = None,
+        fields: list[str] | None = None,
+        points: int = 600,
+    ) -> dict[str, Any]:
+        # The production facade validates before reading; the fake applies
+        # the SAME parser so the boundary's 422 mapping is exercised against
+        # the real rule set (one implementation, zero drift), and a refused
+        # request never reaches the recorded call.
+        from energypod.application.history import parse_plant_history_query
+
+        parse_plant_history_query(
+            range_from=range_from,
+            range_to=range_to,
+            unit_ids=unit_ids,
+            fields=fields,
+            points=points,
+            configured_units=self.history_units,
+        )
+        self.calls.append(
+            (
+                "get_plant_history",
+                {
+                    "principal": principal,
+                    "range_from": range_from,
+                    "range_to": range_to,
+                    "unit_ids": unit_ids,
+                    "fields": fields,
+                    "points": points,
+                },
+            )
+        )
+        if self.history_refusal is not None:
+            raise self.history_refusal
+        if self.history_error is not None:
+            raise self.history_error
+        return dict(self.history_view)
 
     async def get_observed_objectives(self, *, principal: Any, last: str = "24h") -> dict[str, Any]:
         self.calls.append(("get_observed_objectives", {"principal": principal, "last": last}))

@@ -475,10 +475,15 @@ class PlantHistoryControl:
         envelope); a window the data cannot answer is an EMPTY 200, never an
         error.  One resolution per response, chosen by the data horizon.
         """
-        start, end = _parse_window(range_from, range_to, self._MAX_WINDOW)
-        effective_units = self._effective_units(unit_ids)
-        requested = _normalize_fields(fields)
-        threshold = _normalize_points(points)
+        start, end, effective_units, requested, threshold = parse_plant_history_query(
+            range_from=range_from,
+            range_to=range_to,
+            unit_ids=unit_ids,
+            fields=fields,
+            points=points,
+            configured_units=self._unit_ids,
+            max_window_days=31,
+        )
         oldest = self._repository.oldest_full_res_at()
         if oldest is not None:
             resolution = "full" if start >= oldest else "hourly"
@@ -719,6 +724,39 @@ class PlantHistoryControl:
 
 
 # --- the query engine's pinned helpers --------------------------------------------
+
+
+def parse_plant_history_query(
+    *,
+    range_from: Any,
+    range_to: Any,
+    unit_ids: Sequence[str] | None,
+    fields: Sequence[str] | None,
+    points: Any,
+    configured_units: Sequence[str],
+    max_window_days: int = 31,
+) -> tuple[datetime, datetime, tuple[str, ...], tuple[str, ...], int]:
+    """Validate and normalize one history query (the single rule set).
+
+    Every parameter rule raises ``ValueError`` naming its parameter -- the
+    rule set both the facade's query and the guarded boundaries share, so
+    the fake-driven boundary tests exercise the REAL validation (the
+    objectives-window precedent, one implementation, zero drift).
+    """
+    start, end = _parse_window(range_from, range_to, timedelta(days=max_window_days))
+    if unit_ids is None:
+        effective_units = tuple(configured_units)
+    else:
+        requested_units = tuple(unit_ids)
+        if not requested_units:
+            raise ValueError("unit_ids must name at least one configured unit")
+        unknown = [unit for unit in requested_units if unit not in set(configured_units)]
+        if unknown:
+            raise ValueError(f"unit_ids name units this site does not configure: {sorted(unknown)}")
+        effective_units = requested_units
+    requested_fields = _normalize_fields(fields)
+    threshold = _normalize_points(points)
+    return start, end, effective_units, requested_fields, threshold
 
 
 def _parse_instant(raw: Any, label: str) -> datetime:

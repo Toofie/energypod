@@ -51,6 +51,7 @@ from .arbiter import IntentArbiter
 from .energy import EnergyScorecardRefusal
 from .excess_charge import ExcessChargingRefusal
 from .foreign_objective import empty_objective_entry
+from .history import PLANT_HISTORY_NOT_COMMISSIONED, PlantHistoryRefusal
 from .scheduling import (
     SchedulePolicy,
     SchedulePublishValidationError,
@@ -357,6 +358,16 @@ class PlantHistorySurface(Protocol):
     """
 
     def state_payload(self) -> dict[str, Any]: ...
+
+    def query_payload(
+        self,
+        *,
+        range_from: str,
+        range_to: str,
+        unit_ids: Sequence[str] | None = None,
+        fields: Sequence[str] | None = None,
+        points: int = 600,
+    ) -> dict[str, Any]: ...
 
 
 class ActorHandle(Protocol):
@@ -1246,6 +1257,38 @@ class EnergyServiceFacade:
                 "the energy scorecard is not composed on this site",
             )
         return surface.days_payload(limit)
+
+    async def get_plant_history(
+        self,
+        *,
+        principal: Principal,
+        range_from: str,
+        range_to: str,
+        unit_ids: Sequence[str] | None = None,
+        fields: Sequence[str] | None = None,
+        points: int = 600,
+    ) -> dict[str, Any]:
+        """DESIGN_PLANT_HISTORY section 3: the windowed history read.
+
+        Observe scope, read-only (no mutation exists on this surface).
+        Answers 409 ``plant_history_not_commissioned`` when the config block
+        is absent; every parameter rule surfaces as ``ValueError`` (the
+        boundary's 422 envelope); a window the data cannot answer is an
+        EMPTY 200, never an error.
+        """
+        self._admit(principal, "observe")
+        if self._history is None:
+            raise PlantHistoryRefusal(
+                PLANT_HISTORY_NOT_COMMISSIONED,
+                "the plant history feature is not composed on this site",
+            )
+        return self._history.query_payload(
+            range_from=range_from,
+            range_to=range_to,
+            unit_ids=unit_ids,
+            fields=fields,
+            points=points,
+        )
 
     async def get_observed_objectives(
         self, *, principal: Principal, last: str = "24h"

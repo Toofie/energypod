@@ -293,3 +293,42 @@ async def test_mcp_idempotency_replay_uses_shared_service_path_once(
         replay = await client.call_tool("dispatch_intent", payload)
     assert first.data == replay.data
     assert len([name for name, _ in service.calls if name == "submit_intent"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_mcp_plant_history_is_a_read_only_ride_along(
+    service: RecordingEnergyService,
+) -> None:
+    """DESIGN_PLANT_HISTORY section 3: the observe-scoped windowed read; the
+    pinned ``from``/``to`` argument names ride despite the reserved word."""
+    server = await _server(service, principal_name="viewer-token")
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "get_plant_history",
+            {"from": "2026-08-25T06:00:00Z", "to": "2026-08-26T06:00:00Z"},
+        )
+        narrowed = await client.call_tool(
+            "get_plant_history",
+            {
+                "from": "2026-08-25T06:00:00Z",
+                "to": "2026-08-26T06:00:00Z",
+                "unit_ids": ["mid"],
+                "fields": ["battery_watts", "commanded"],
+                "points": 1200,
+            },
+        )
+        refused = await client.call_tool(
+            "get_plant_history",
+            {"from": "not-a-timestamp", "to": "2026-08-26T06:00:00Z"},
+            raise_on_error=False,
+        )
+
+    assert result.data["resolution"] == "full"
+    assert narrowed.data["units"]["mid"]["sample_count"] == 2871
+    assert refused.is_error, "a validation failure is a tool error, never a silent default"
+    forwarded = [values for name, values in service.calls if name == "get_plant_history"]
+    assert forwarded[0]["range_from"] == "2026-08-25T06:00:00Z"
+    assert forwarded[1]["unit_ids"] == ["mid"]
+    assert forwarded[1]["fields"] == ["battery_watts", "commanded"]
+    assert forwarded[1]["points"] == 1200
+    assert len(forwarded) == 2, "a refused window never reaches the service"
