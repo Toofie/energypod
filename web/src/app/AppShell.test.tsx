@@ -1481,15 +1481,17 @@ describe("AppShell — navigation", () => {
     // Home is the default view.
     expect(within(nav).getByRole("link", { name: "Home", current: "page" })).toBeVisible();
 
-    for (const name of ["Batteries", "Now", "Schedule", "Activity"]) {
+    for (const name of ["Batteries", "Now", "Schedule", "Activity", "Insights"]) {
       expect(within(nav).getByRole("link", { name })).toBeVisible();
     }
 
     // Every not-yet-built view says so and is never a dead link. Schedule is
     // deliberately NOT here anymore: its nav link is always offered and the
     // view itself answers a not-commissioned deployment honestly (the pinned
-    // decision in views.ts).
-    for (const name of ["Energy Flow", "Insights", "Plan history"]) {
+    // decision in views.ts). Insights left this list the same way when the
+    // energy scorecard's ledger landed — its link is always offered and the
+    // view answers a not-commissioned deployment honestly.
+    for (const name of ["Energy Flow", "Plan history"]) {
       expect(within(nav).queryByRole("link", { name: new RegExp(name, "i") })).toBeNull();
       const entry = within(nav).getByRole("listitem", { name: new RegExp(name, "i") });
       expectVisibleText(entry, /not available|coming soon|not yet/i);

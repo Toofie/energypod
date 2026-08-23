@@ -14,6 +14,7 @@ import type { ShellView, ViewId, ViewRegistry } from "./app/views";
 import { ActivityView } from "./views/activity/ActivityView";
 import { BatteriesView } from "./views/batteries/BatteriesView";
 import { HomeView } from "./views/home/HomeView";
+import { InsightsView } from "./views/insights/InsightsView";
 import { NowView } from "./views/now/NowView";
 import { ScheduleView } from "./views/schedule/ScheduleView";
 import "./styles.css";
@@ -24,6 +25,7 @@ const views: ViewRegistry = {
   now: NowView,
   schedule: ScheduleView,
   activity: ActivityView,
+  insights: InsightsView,
 } satisfies Partial<Record<ViewId, ShellView>>;
 
 const container = document.getElementById("root");
