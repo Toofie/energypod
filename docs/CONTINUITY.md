@@ -1001,6 +1001,74 @@ direction, freshness, and watchdog timing per physical unit.
   the remedy lands; rhs/lhs unaffected; mid itself is physically fine
   (charging via its own firmware).
 
+- 2026-08-23 (afternoon): DESYNC-RESILIENCE WAVE IMPLEMENTED AND LIVE-
+  VERIFIED — every class-B finding of docs/SYNC_RESILIENCE_AUDIT.md plus
+  S1 and the ADD-1 arm blocker (B1 dce48c4, B2 6e96d60, B3 8da9bde,
+  B5+cold-ring 27bb50a, B4 997ec49, S1 a1ba210, ADD-1 6c4254b; 30 red
+  -> 0 across the wave, 1288 unit tests green, ruff/format/mypy clean
+  each step; API_CONTRACTS amended per finding). B1: system SOC fully
+  advisory (out of _required_quality/safety_data_complete/_SAFETY_
+  QUALITY_FIELDS; informational system_soc_untrusted note; 12-key wire
+  shape unchanged; quality_bms_soc_pct keeps the hard gate). B2: soc_jump
+  deny removed -> informational soc_jump_observed on authorizing
+  decisions only; floor/ceiling still bind the FRESH BMS figure so a
+  jump across a bound still denies, safe direction. B3: first observation
+  is its own baseline (previous_observation_missing gone; _eligible/
+  _evidence_is_coherent accept a first observation; value checks
+  unchanged) — no more one-cycle block per restart. B5: device_mode_
+  not_remote performs ONE bounded fresh 0x0100 read through the owning
+  actor at refusal time (cached word alone never refuses; fresh-confirmed
+  non-Remote or two failed reads still refuse) AND 0x0100 moved to the
+  cold ring first slot (cycle 8) with the read-plan docstring fixed —
+  also the SOC-incident read-plan follow-up (system SOC semi-refreshes;
+  BMS stands in as authoritative while unserved). B4: cell-derived denies
+  (cell_voltage_low/high, cell_imbalance, cell_count_invalid) promote the
+  0x5200 window into the next poll regardless of cycle%3 (one promoted
+  cycle, 8->9 windows ~1.0 s inside the 1.5 s period/1.60 s renewal
+  budget; config comment amended) — the 2026-08-23 LHS manual
+  fresh-window confirmation automated; a persistent fresh violation
+  re-denies and re-promotes. S1: the EE-calibration codes DETERMINED —
+  the decoder generates {prefix}_{bit}, and the two signals are WARNING
+  bits PCS_Warning0_1 / DCDC_Warning0_1 (PROTOCOL_EVIDENCE 9); the old
+  human-name entries could never match AND the composition hard-wired
+  blocking_warning_codes empty — doubly inert. Now configurable and
+  wired (default empty). NOT ENABLED: both bits are STANDING-ACTIVE on
+  all three pods (re-confirmed live this run) and vendor evidence does
+  not establish severity, so enabling would deny every dispatch; the
+  example config documents both codes with the format and the decision
+  left to the operator. ADD-1 (the morning's ~40-failed-arm blocker),
+  both layers: (a) autonomy-signature discrimination — policy key
+  autonomous_charge_signature_max_w: 2500 (live-write example; rationale
+  commented) classifies a nonzero not-written readback with negative P
+  in band, Q zero as POD AUTONOMY: arm proceeds, our renewal replaces
+  the pod's own (beat-autonomy); discharge/beyond-band/reactive still
+  latch external_writer; (b) operator-acknowledged takeover — POST
+  /api/v1/arm {"confirmation":"ARM","takeover":"ACKNOWLEDGE"} arms
+  beyond-band objectives, audited (unit_armed reason arm_takeover_
+  acknowledged / arm_pod_autonomy + objective_classification in the
+  outcome and unit.armed payload); never persisted, boot observe-only.
+  LIVE VERIFICATION (writemode24, PID 3432, one intent mid/charge/
+  1000 W/60 s exactly): boot -> first snapshot mid DISARMED-qualified in
+  ~8 s with ctrl_mode honestly absent (cycle 1 no longer pins 0x0100),
+  then ctrl_mode_w=1/work_mode_w=6 served after the ring rotated (B5/
+  ADD-2 live-confirmed); POST arm WHILE mid's firmware holds its charge
+  objective -> 200 {"status":"armed","objective_classification":
+  "pod_autonomy"} FIRST ATTEMPT (audit row ['armed','arm_pod_autonomy'])
+  — the exact case that failed ~40 times this morning; intent accepted
+  202; every one of this process's 25 control decisions rejected ONLY
+  on zero_dynamic_capability — the pods are at 99% SOC with their BMS
+  dynamic charge limit reading 0 W, the battery's own fresh word (the
+  ~1000 W deeper trajectory was not physically available at 99%; no
+  desync-class block appeared: 0 previous_observation_missing/
+  soc_disagreement/soc_jump/quality_system_soc_pct this process, the
+  newest soc_disagreement row is pre-fix-era); clean TTL return
+  (requested -> idle/0); mid disarmed at handoff, all three pods
+  disarmed + idle, controller left running on the new build. Residual:
+  web/src/test/wire.ts still lists the retired reason codes (display
+  vocabulary only; web untouched per scope); controller.simulate.yaml
+  still carries the inert human-name blocking codes (S1 fixed only the
+  live-write example per scope).
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time

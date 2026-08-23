@@ -1,6 +1,13 @@
 # Desync-resilience audit of the EnergyPod control surface
 
-Status: design stage — read-only analysis; no source changes in this commit
+Status: IMPLEMENTED (2026-08-23) — B1 dce48c4, B2 6e96d60, B3 8da9bde,
+B5+cold-ring 27bb50a, B4 997ec49, S1 a1ba210, and the ADD-1 arm blocker
+(autonomy-signature discrimination + operator-acknowledged takeover) 6c4254b;
+each step contract-first (30 red → 0 across the wave), live-verified on
+writemode24. Class-A/C/D rows are unchanged by design. §5's S1 determination:
+the real codes are `PCS_Warning0_1` / `DCDC_Warning0_1` (WARNING tier), both
+standing-active on this fleet, so the block is documented-but-not-enabled in
+the shipped example.
 Prepared: 2026-08-24
 Trigger: the `soc_disagreement` incident. After a day of heavy cycling our cached
 "system SOC" (register 0x0100+17) diverged from the battery's live BMS SOC
