@@ -283,9 +283,100 @@ One `EnergyPodActor` owns one transport. No other object receives that transport
 
 ## Schedule
 
-Entries are immutable, timezone-aware local windows with day set, action, positive fleet watts,
-selected units and effective date range. Cross-midnight windows are supported; overlaps at the same
-priority are rejected. Evaluation returns a short-lived schedule intent, never a hardware command.
+Entries are immutable, timezone-aware local windows with day set, action, watts, selected units and
+effective date range. Cross-midnight windows are supported; overlaps at the same priority are
+rejected. Evaluation returns a short-lived schedule intent, never a hardware command. The full
+operator-facing contract — postures, UI plan, ordering rationale — is `docs/DESIGN_SCHEDULES.md`;
+this section is the wire contract.
+
+- **Watt form (dual, exactly the `PowerIntent` rules):** an entry carries EITHER scalar `watts`
+  (a non-negative integer fleet total — the original form, unchanged) OR `watts_by_unit` (one
+  positive integer per selected unit; key set exactly `unit_ids`; the fleet total is the sum);
+  never both, never neither. `idle` entries require scalar `watts: 0` and no mapping. The entry's
+  form is carried verbatim onto the evaluated intent; per-unit targets are caps at allocation
+  exactly as on REST dispatch.
+- **Composition (the `excess_charging` block-presence doctrine):** a PRESENT `schedule:` config
+  block composes the surface — both REST routes, the `ScheduleRunner` in the fleet cycle, the
+  `schedule_state` snapshot projection. An ABSENT block composes nothing (no runner, no projection
+  key) and both routes answer 409 `schedule_not_commissioned`. There is deliberately NO `enabled`
+  key: the plan is the state (empty plan or all-entries-disabled = off); a second master switch is
+  the invisible-starvation class. Keys: `allowed_windows_local` (list of `["HH:MM","HH:MM"]` local
+  civil pairs, cross-midnight allowed, union = the allowed command set; DEFAULT `[["06:00",
+  "20:00"]]` when the block omits it — the day-only YIELD posture; the shipped default doubles as
+  the named `DAY_DEFAULT` constant, and "night" means any civil minute outside it) and
+  `intent_ttl_s` (default 10.0; > `timing.control_period_s` and <= 300 s, validated). `posture` is
+  derived read-only: `partition` when the allowed set covers any minute outside `DAY_DEFAULT`,
+  else `yield`.
+- **Night-writer coordination (CONTINUITY 2026-08-23 environment fact — other applications write
+  these batteries at night):** publishing any ENABLED entry whose window (split across midnight
+  when it crosses) has any minute outside the union of `allowed_windows_local` is REFUSED at the
+  facade/REST layer with 409 `schedule_window_not_allowed` (`details`: `posture`,
+  `allowed_windows_local`, `offending` entries+windows; message names the posture and the two
+  honest paths — trim the windows, or the partition choice via a config revision widening the
+  policy plus the one-time acknowledgement). The FIRST publish ever on a site whose enabled
+  entries include any night minute must carry `"night_posture": "PARTITION_ACKNOWLEDGED"` unless
+  the site holds the durable audit fact `schedule_night_windows_acknowledged` (the
+  `excess_charging_economics_acknowledged` mechanics: keyed existence check at boot, never
+  re-prompted, durable-append-FIRST — an audit failure refuses the publish); otherwise 409
+  `night_posture_acknowledgement_required` (`details: {"acknowledgement":
+  "PARTITION_ACKNOWLEDGED"}`). The console cannot widen the policy — only a config revision can.
+  The CONTESTED posture is not implementable and not offered; the arm-time sole-writer preflight
+  is unchanged and remains the structural enforcement under PARTITION.
+- **Evaluation loop:** a `ScheduleRunner` ticks in the fleet cycle beside the excess adviser —
+  after the polls and recovery pass, BEFORE the adviser step and the kernel tick (the schedule's
+  claim is a published fact; the adviser observes it the same cycle), bounded and suppressed per
+  cycle exactly like the advisory step. Each tick it reads the plan through `ScheduleRepository`
+  (one singleton row — a publish lands within one cycle), evaluates, and maintains EXACTLY ONE
+  live `PowerIntent` with `source: SCHEDULE`, keyed `(plan.version, entry_id)`: submit on open,
+  remove-then-submit renewal while the window holds (the adviser's discipline), remove on window
+  end / entry disable / plan change. Intent TTL is `intent_ttl_s`; window end is non-renewal and
+  the firmware watchdog is the hand-back. Submissions enter through the composition-internal
+  facade twin `submit_schedule_intent` (the `submit_advisory_intent` pattern: source pinned to
+  `SCHEDULE`, intent-id prefix `schedule-`, same audit/publication contract, never routed) under
+  the principal `energypod:schedule-runner` (observe + dispatch, non-interactive, site-bound).
+- **Precedence (unchanged, pinned):** `emergency_stop > manual > agent > optimizer > schedule`,
+  per unit. A window opening while a higher-priority intent runs WAITS: the runner never checks
+  claims and never withdraws against a higher source — it keeps renewing and the arbiter
+  represents it the cycle after the claimer lapses. A schedule never suppresses the adviser
+  fleet-wide: suppression is per unit, by claim. The adviser's own yield is the new
+  `excess_charging.yield_to_schedule` (bool, DEFAULT true): when true a live SCHEDULE intent
+  claiming the adviser's target unit is a yield trigger exactly like MANUAL/AGENT (withdraw by
+  removal; re-entry after claim expiry AND entry-hysteresis re-qualification); when false the
+  adviser outranks schedules by arbiter and starves them invisibly (today's behavior — kept only
+  as an explicit opt-out).
+- **REST:** `GET /api/v1/schedule` (`observe`) returns `{"plan": <plan | null>, "policy":
+  {"posture", "allowed_windows_local", "intent_ttl_s"}, "acknowledged_night_windows": bool,
+  "next_action": <next occurrence | null>}`; `plan` is null before the first publish; wire entry
+  shape: `{entry_id, days: ["mon",...], start_local, end_local ("HH:MM"), action ("charge"|
+  "discharge"|"idle"), watts | watts_by_unit, unit_ids, effective_from, effective_until,
+  priority, enabled}`. `PUT /api/v1/schedule` (dispatch scope + INTERACTIVE principal +
+  Idempotency-Key) carries `{"expected_version": <int | null (null asserts no plan exists)>,
+  "timezone", "entries", "night_posture"?}`. Validation order: 422 `validation_error`
+  (shape/domain, per-entry); 409 `schedule_window_not_allowed`; 409
+  `night_posture_acknowledgement_required`; 409 `schedule_version_conflict` (`ScheduleVersionConflict`
+  mapped; `details: {"current_version": <int | null>}` — the console's answer is reload-and-
+  re-apply, never a silent merge). The new plan version is `current + 1`; the mutation commits
+  through `ScheduleRepository.replace` on the Impl-10 commit-then-audit pattern with
+  `submit_intent`'s compensating shape (an audit/publication failure restores the prior plan).
+  200: `{"version", "plan", "diff": {"added", "removed", "changed", "timezone_changed"},
+  "acknowledged_night_windows", "next_action"}`.
+- **Facade methods:** `get_schedule(principal)` (observe; repository + pure-function reads,
+  never triggers control), `replace_schedule(principal, *, expected_version, timezone, entries,
+  night_posture, idempotency_key, request_id)` (dispatch + interactive), and the internal
+  `submit_schedule_intent` twin. The pure next-occurrence helpers (`next_start`, `window_end`)
+  live beside `ScheduleEvaluator` and are the single implementation of every countdown (GET's
+  `next_action`, the projection, the Home card); no client reimplements civil-time arithmetic.
+- **Audit and events:** audit `schedule_replaced` (version from→to, diff summary, principal)
+  and the durable-once `schedule_night_windows_acknowledged`; bus `schedule.replaced`
+  (`{principal, version, diff}`), `schedule_window.opened` (`{entry_id, version, action, watts |
+  watts_by_unit, unit_ids, ends_at}`) and `schedule_window.closing` (`{entry_id, version,
+  unit_ids, reason: window_ended | plan_replaced | no_plan}`) — transitions only; countdowns are
+  snapshot-derived. The snapshot carries a feature-detected top-level `schedule_state` (absent
+  when the block is absent; single writer = the runner's post-tick update; `active` derives from
+  `held_intent_id`): `{version, active, entry_id, held_intent_id, ends_at, ends_in_s, next,
+  posture, last_action: idle|submit|renew|remove, last_tick_at, reason_codes}` with the pinned
+  vocabulary `no_plan | no_window_open | window_open | waiting_for_higher_priority |
+  window_ended | plan_changed`.
 
 ## API and MCP
 
