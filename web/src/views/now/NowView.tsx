@@ -1,15 +1,26 @@
 /**
  * "Now" (control) view — docs/UI_CONTRACTS.md, "Now (control)".
  *
- * The control surface of the console. It renders the current request as four
- * separate facts (requested / allowed / actual / remaining time), adopts the
- * WebSocket snapshot frame as the authoritative first picture and then applies
- * live intent events, and drives the deliberate control flows: arm (per-unit
- * readiness checklist + explicit "ARM" confirmation), disarm, charge and
- * discharge as separate dispatch actions with a composed preview and
- * constrained inputs, emergency stop with exact-id acknowledgement, and
- * inhibit acknowledgement. Every refusal is surfaced verbatim (the envelope's
- * code and message); the view never invents a reason the API did not give.
+ * The control surface of the console. It renders ONE CARD PER ACTIVE REQUEST
+ * (the pod runs concurrent per-battery requests: several intents coexist,
+ * each driving its own batteries — per-unit arbitration, each battery runs its
+ * highest-priority claimant). Each card is keyed by the intent id the wire
+ * itself names and carries only ITS batteries' facts: direction, requested
+ * per battery, allowed per battery (the cycle-level decision maps, attributed
+ * by unit membership), the countdown to ITS expiry, and its own Cancel
+ * button. A battery claimed by a newer same-priority request renders on the
+ * older card as "taken over by a newer request" while its other batteries
+ * continue — a card never visually supersedes another on units it did not
+ * name. Units the snapshot shows carrying a request no known card covers (a
+ * cold load mid-intent) render through the honest fleet-figure fallback row.
+ * The view adopts the WebSocket snapshot frame as the authoritative first
+ * picture and then applies live intent events, and drives the deliberate
+ * control flows: arm (per-unit readiness checklist + explicit "ARM"
+ * confirmation), disarm, charge and discharge as separate dispatch actions
+ * with a composed preview and constrained inputs, emergency stop with
+ * exact-id acknowledgement, and inhibit acknowledgement. Every refusal is
+ * surfaced verbatim (the envelope's code and message); the view never invents
+ * a reason the API did not give.
  *
  * Wire casing (UI_CONTRACTS.md "Wire casing"): enums arrive as lowercase
  * strings ("charge"/"discharge"/"idle", "disarmed"/"armed_idle"/"active"/
@@ -75,7 +86,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health } from "../../api/client";
-import type { WattsByUnit } from "../../app/fleet";
+import { toIntentFigures, toWattsByUnit, type WattsByUnit } from "../../app/fleet";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import { formatSeconds, formatWatts } from "../../lib/format";
 import "./now.css";
@@ -454,6 +465,62 @@ function asDispatchOutcome(value: unknown): DispatchOutcome | null {
 /** A remaining-time countdown is a marker, not a value: it must run down. */
 type ExpiryMarker = { remainingS: number; atMs: number };
 
+// ---------------------------------------------------------------------------
+// concurrent request cards (2026-08-24 backend contract)
+// ---------------------------------------------------------------------------
+//
+// The pod runs CONCURRENT per-battery requests: several intents coexist, each
+// driving its own batteries (per-unit arbitration — each battery runs its
+// highest-priority claimant). The request surface is therefore one card per
+// active intent, keyed by the intent id the wire itself names (`intent.accepted`
+// payloads and every 202 acceptance view carry `intent_id`). A card carries
+// ITS batteries' facts only; it never visually implies it superseded another
+// request on units it did not name, and a battery a NEWER same-priority
+// request claimed renders on the older card as released ("taken over by a
+// newer request") while its other batteries continue — exactly the arbiter's
+// erosion rule (arbiter.py: equal-priority ties go to the newer revision).
+
+/** One live power request, exactly as its own wire facts describe it. */
+type IntentCard = {
+  /** The wire's own id: the cancel endpoint's key and the card's identity. */
+  intentId: string;
+  /** Arrival order (the wire's acceptance revision order for manual intents). */
+  rank: number;
+  /** The request's direction, lowercase wire value. */
+  direction: string;
+  /** The fleet total the facade derives. */
+  watts: number;
+  /** The intent's own per-unit targets when it used the per-unit form. */
+  wattsByUnit: WattsByUnit | null;
+  /** The batteries this request named. */
+  unitIds: string[];
+  /** The countdown, captured from the acceptance (own dispatches; null when
+   * the wire has not named one — a request accepted by another operator
+   * carries no expiry on its bus frame). */
+  expiry: ExpiryMarker | null;
+};
+
+/** One card's cancel attempt: in flight, or refused with the envelope. */
+type CancelState = { pending: true } | { error: ApiClientError };
+
+/** The `intent_id` / `unit_ids` an intent-lifecycle frame carries. */
+function intentFrameIds(payload: Record<string, unknown> | null): {
+  intentId: string | null;
+  unitIds: string[];
+} {
+  if (payload === null) {
+    return { intentId: null, unitIds: [] };
+  }
+  return {
+    intentId: typeof payload.intent_id === "string" && payload.intent_id !== ""
+      ? payload.intent_id
+      : null,
+    unitIds: Array.isArray(payload.unit_ids)
+      ? payload.unit_ids.filter((entry): entry is string => typeof entry === "string")
+      : [],
+  };
+}
+
 type StopOutcome = {
   stopId: string | null;
   status: string;
@@ -667,7 +734,21 @@ export function NowView({ client }: NowViewProps) {
   const [healthNonce, setHealthNonce] = useState(0);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [health, setHealth] = useState<Health | null>(null);
-  const [expiry, setExpiry] = useState<ExpiryMarker | null>(null);
+  /**
+   * The live power requests, keyed by intent id. One card per active intent
+   * (concurrent per-battery requests coexist on the pod); a request's card is
+   * created by its own acceptance — this session's 202 response or any
+   * operator's `intent.accepted` bus frame — and cleared by its end
+   * (`intent.cancelled`, `intent.expired`, a full-scope revocation, or a
+   * latched stop). Units the snapshot shows as carrying a request no known
+   * card covers (a cold load mid-intent) render through the honest
+   * fleet-figure fallback row instead.
+   */
+  const [intentCards, setIntentCards] = useState<IntentCard[]>([]);
+  /** Arrival order for the cards: higher = newer (the arbiter's tie rule). */
+  const cardRankRef = useRef(0);
+  /** Per-card cancel attempts: in flight, or refused with the envelope. */
+  const [cancelStates, setCancelStates] = useState<Record<string, CancelState>>({});
   const [liveRefusal, setLiveRefusal] = useState<LiveRefusal | null>(null);
   const [latchedStop, setLatchedStop] = useState<LatchedStop | null>(null);
   /**
@@ -764,6 +845,34 @@ export function NowView({ client }: NowViewProps) {
 
   // --- REST snapshot (initial load + manual retry) ----------------------------
 
+  /**
+   * Upsert one card by intent id. A card the wire already knows keeps its
+   * arrival rank (an acceptance echo of an existing request — the shell's
+   * plane republishes frames — must not jump the arbitration order) and keeps
+   * a countdown it already carries when the new frame names none.
+   */
+  const upsertCard = useCallback((card: IntentCard): void => {
+    setIntentCards((previous) => {
+      const existing = previous.find((entry) => entry.intentId === card.intentId);
+      const merged =
+        existing === undefined
+          ? card
+          : { ...card, rank: existing.rank, expiry: card.expiry ?? existing.expiry };
+      return [...previous.filter((entry) => entry.intentId !== card.intentId), merged];
+    });
+  }, []);
+
+  /** Retire every card the predicate names (its request ended). */
+  const retireCards = useCallback((match: (card: IntentCard) => boolean): void => {
+    setIntentCards((previous) => previous.filter((card) => !match(card)));
+  }, []);
+
+  /** Mint the next arrival rank (the arbiter's newer-wins tie order). */
+  const nextCardRank = useCallback((): number => {
+    cardRankRef.current += 1;
+    return cardRankRef.current;
+  }, []);
+
   useEffect(() => {
     let cancelled = false;
     client
@@ -772,6 +881,9 @@ export function NowView({ client }: NowViewProps) {
         if (cancelled) return;
         const wire = asSnapshot(value);
         if (wire !== null) {
+          // The shared figure tracker seeds from the RAW envelope, whose
+          // `intent` block (feature-detected) the narrowed view drops.
+          unitFigures.adoptSnapshot(value);
           adoptSnapshot(wire, null);
         } else {
           setLoadFailed(
@@ -791,7 +903,7 @@ export function NowView({ client }: NowViewProps) {
     return () => {
       cancelled = true;
     };
-  }, [client, snapshotNonce, adoptSnapshot]);
+  }, [client, snapshotNonce, adoptSnapshot, unitFigures.adoptSnapshot]);
 
   // --- health (control readiness reasons are the live latch signal) -----------
 
@@ -840,7 +952,10 @@ export function NowView({ client }: NowViewProps) {
         .then((value: unknown) => {
           if (cancelled) return;
           const wire = asSnapshot(value);
-          if (wire !== null) adoptSnapshot(wire, null);
+          if (wire !== null) {
+            unitFigures.adoptSnapshot(value);
+            adoptSnapshot(wire, null);
+          }
         })
         .catch((error: unknown) => {
           if (!cancelled) setLoadFailed(toApiClientError(error));
@@ -887,6 +1002,7 @@ export function NowView({ client }: NowViewProps) {
         const unitIds = Array.isArray(payload.unit_ids)
           ? payload.unit_ids.filter((entry): entry is string => typeof entry === "string")
           : [];
+        const { intentId } = intentFrameIds(payload);
         if (direction !== null && watts !== null) {
           setSnapshot((previous) =>
             previous === null
@@ -900,13 +1016,44 @@ export function NowView({ client }: NowViewProps) {
                   ),
                 },
           );
-          // The published payload carries no expiry; the accepted response's
-          // expires_in_s is the countdown source. Kept defensive for a future
-          // wire addition.
-          if (typeof payload.expires_in_s === "number") {
-            setExpiry({ remainingS: payload.expires_in_s, atMs: monotonicNowMs() });
+          // The published payload names the request by id, so a card is born
+          // for it the moment the frame lands — whatever operator filed it.
+          // The payload carries no expiry (the 202 response is the countdown
+          // source); `expires_in_s` is read defensively for a future wire
+          // addition and otherwise leaves an existing countdown untouched.
+          if (intentId !== null) {
+            upsertCard({
+              intentId,
+              rank: nextCardRank(),
+              direction,
+              watts,
+              wattsByUnit: toWattsByUnit(payload.watts_by_unit),
+              unitIds,
+              expiry:
+                typeof payload.expires_in_s === "number"
+                  ? { remainingS: payload.expires_in_s, atMs: monotonicNowMs() }
+                  : null,
+            });
           }
         }
+      } else if (type === "intent.cancelled") {
+        // A request was cancelled (this session or another operator's): the
+        // card goes the moment its cancellation is on the bus, the notice
+        // names it, and the world is re-read. A frame naming neither an id
+        // nor units ends every card this view holds.
+        const { intentId, unitIds } = intentFrameIds(payload);
+        retireCards((card) =>
+          intentId !== null
+            ? card.intentId === intentId
+            : unitIds.length === 0 ||
+              card.unitIds.every((unitId) => unitIds.includes(unitId)),
+        );
+        setRevokedNotice(
+          intentId !== null
+            ? `Power request ${intentId} was cancelled.`
+            : "The power request was cancelled.",
+        );
+        refetchSnapshot();
       } else if (type === "unit.armed" || type === "unit.disarmed") {
         applyLifecycleRows(type === "unit.armed", mutationRowsFromPayload(payload));
       } else if (type === "emergency_stop.latched") {
@@ -933,10 +1080,11 @@ export function NowView({ client }: NowViewProps) {
                 },
           );
         }
-        setExpiry(null);
-        // The stop ends the request outright: the shared tracker (fed above)
-        // has already dropped the per-unit figures so they cannot linger as a
-        // ghost of an intent that no longer exists.
+        // The stop ends every request outright: no card may linger as a ghost
+        // of a request the fence killed (the shared tracker fed above has
+        // already dropped the per-unit figures the same way).
+        retireCards(() => true);
+        setCancelStates({});
         const frameStopId =
           payload !== null && typeof payload.stop_id === "string" ? payload.stop_id : "";
         setLatchedStop({
@@ -972,11 +1120,18 @@ export function NowView({ client }: NowViewProps) {
         // not only a latched inhibit. So the frame says "authority changed",
         // never "this unit latched": the view re-reads the snapshot and says
         // exactly that, without inventing a lifecycle the frame does not carry.
-        // The request itself is over: the countdown must not linger on screen
-        // as a ghost of an intent that no longer exists (the shared tracker
-        // has already dropped the per-unit figures).
-        setExpiry(null);
-        const unitIds = unitIdsFromPayload(payload);
+        // The request's authority is gone for exactly the frame's units: a
+        // card whose every battery is covered cannot act again (its countdown
+        // would be a ghost of authority that no longer exists), while a card
+        // still holding other batteries continues — concurrency preserved. A
+        // frame naming no units is the whole-session revocation.
+        const revokedUnits = unitIdsFromPayload(payload);
+        retireCards((card) =>
+          revokedUnits.length === 0
+            ? true
+            : card.unitIds.every((unitId) => revokedUnits.includes(unitId)),
+        );
+        const unitIds = revokedUnits;
         const reason =
           payload !== null && typeof payload.reason === "string" && payload.reason !== ""
             ? payload.reason
@@ -989,10 +1144,18 @@ export function NowView({ client }: NowViewProps) {
         refetchSnapshot();
       } else if (type === "intent.expired") {
         // Feature-detected: the backend publishes the end of a request this
-        // way once its intent-lifecycle event lands. The request card must not
-        // linger as a ghost: the countdown goes, the shared tracker has
-        // already dropped the per-unit figures, and the world is re-read.
-        setExpiry(null);
+        // way once its intent-lifecycle event lands. The card must not linger
+        // as a ghost: it goes by its own id (the wire's expiry payload names
+        // it), by unit coverage when the frame names none, and the world is
+        // re-read (the shared tracker fed above already dropped the units'
+        // per-unit figures).
+        const { intentId: expiredId, unitIds: expiredUnits } = intentFrameIds(payload);
+        retireCards((card) =>
+          expiredId !== null
+            ? card.intentId === expiredId
+            : expiredUnits.length === 0 ||
+              card.unitIds.every((unitId) => expiredUnits.includes(unitId)),
+        );
         setRevokedNotice("The power request ended.");
         refetchSnapshot();
       } else if (type === "authorization.granted") {
@@ -1045,6 +1208,7 @@ export function NowView({ client }: NowViewProps) {
             if (frame.type === "snapshot") {
               const wire = asSnapshot(frame.data);
               if (wire !== null) {
+                unitFigures.adoptSnapshot(frame.data);
                 adoptSnapshot(wire, wire.snapshot_sequence, resumed && firstSnapshot);
               }
               firstSnapshot = false;
@@ -1115,7 +1279,7 @@ export function NowView({ client }: NowViewProps) {
       cancelled = true;
       if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer);
     };
-  }, [client]);
+  }, [client, upsertCard, retireCards, nextCardRank]);
 
   // --- derived fleet state -----------------------------------------------------
 
@@ -1127,7 +1291,7 @@ export function NowView({ client }: NowViewProps) {
   // number that climbs past minutes while the pod is publishing fine.
   const needsTick =
     (snapshot?.units.some((unit) => unit.telemetry_age_s !== null) ?? false) ||
-    expiry !== null ||
+    intentCards.some((card) => card.expiry !== null) ||
     Object.keys(observations).length > 0;
   const nowMs = useTickingNow(needsTick);
   const elapsedSeconds = Math.max(0, (nowMs - capturedAtRef.current) / 1000);
@@ -1152,43 +1316,162 @@ export function NowView({ client }: NowViewProps) {
   const activeUnits = units.filter(
     (unit) => unit.requested_power.direction !== "idle" || unit.requested_power.watts > 0,
   );
-  const authorizedUnits = units.filter(
+
+  // --- the concurrent request cards ---------------------------------------------
+  //
+  // One card per live intent, newest first. A battery claimed by a NEWER
+  // same-priority request renders on the older card as released (the arbiter's
+  // tie rule: equal priority goes to the newer revision) while its other
+  // batteries continue — a card never visually supersedes another on units it
+  // did not name.
+
+  /** The cards in display order: newest request first. */
+  const displayCards = [...intentCards].sort((a, b) => b.rank - a.rank);
+  /** Whether a newer card has claimed this battery (take-over display). */
+  const takenOverByNewer = (card: IntentCard, unitId: string): boolean =>
+    intentCards.some(
+      (other) => other.rank > card.rank && other.unitIds.includes(unitId),
+    );
+  /** The batteries a card still holds (not claimed by any newer request). */
+  const heldUnitIds = (card: IntentCard): string[] =>
+    card.unitIds.filter((unitId) => !takenOverByNewer(card, unitId));
+
+  /** The card's own Requested fact: exact per-unit targets when it carried
+   * them, the honest "≈" scalar split across ITS batteries otherwise. */
+  const cardRequestedText = (card: IntentCard): string => {
+    const direction = displayDirection(card.direction);
+    if (card.wattsByUnit !== null) {
+      const values = card.unitIds
+        .map((unitId) => card.wattsByUnit?.[unitId])
+        .filter((watts): watts is number => watts !== undefined);
+      if (values.length === card.unitIds.length && values.length > 0) {
+        const total = values.reduce((sum, watts) => sum + watts, 0);
+        if (values.length === 1) {
+          return `${direction} · ${formatWatts(values[0]!)}`;
+        }
+        const perBattery = values.every((watts) => watts === values[0])
+          ? formatWatts(values[0]!)
+          : card.unitIds
+              .map((unitId) => `${unitId} ${formatWatts(card.wattsByUnit?.[unitId] ?? 0)}`)
+              .join(" · ");
+        return `${direction} · ${perBattery} per battery (${formatWatts(total)} total)`;
+      }
+    }
+    const count = card.unitIds.length;
+    if (count <= 1) {
+      return `${direction} · ${formatWatts(card.watts)}`;
+    }
+    return `${direction} · ≈${formatWatts(card.watts / count)} per battery (${formatWatts(card.watts)} total)`;
+  };
+
+  /** The card's own Allowed fact: the decision's per-unit authorized map,
+   * attributed to THIS card by unit membership (the audit maps are
+   * cycle-level across concurrent intents), falling back to the snapshot's
+   * own per-unit authorized figures for the batteries it still holds. */
+  const cardAllowedText = (card: IntentCard): string => {
+    const held = heldUnitIds(card);
+    const heldUnits = held
+      .map((unitId) => units.find((unit) => unit.unit_id === unitId))
+      .filter((unit): unit is WireUnit => unit !== undefined);
+    const fromMap =
+      unitFigures.authorizedByUnit !== null
+        ? allowedFactText(heldUnits, unitFigures.authorizedByUnit, card.wattsByUnit)
+        : null;
+    if (fromMap !== null) {
+      return fromMap;
+    }
+    const authorized = heldUnits.filter(
+      (unit): unit is WireUnit & { authorized_power: WirePower } =>
+        unit.authorized_power !== null,
+    );
+    if (authorized.length > 0) {
+      return authorized
+        .map(
+          (unit) =>
+            `${displayDirection(unit.authorized_power.direction)} · ${formatWatts(unit.authorized_power.watts)}`,
+        )
+        .join("; ");
+    }
+    return held.length > 0 ? "None yet" : "None";
+  };
+
+  /** The card's own Actual fact: what its held batteries are measured doing. */
+  const cardActualText = (card: IntentCard): string => {
+    const heldUnits = heldUnitIds(card)
+      .map((unitId) => units.find((unit) => unit.unit_id === unitId))
+      .filter((unit): unit is WireUnit => unit !== undefined);
+    const measured = heldUnits.filter(
+      (unit): unit is WireUnit & { measured_watts: number } => unit.measured_watts !== null,
+    );
+    if (measured.length === 0) {
+      return "No measurement available";
+    }
+    return measured
+      .map((unit) => {
+        const ageSeconds = displayedAge(unit);
+        const age = ageSeconds !== null ? ` (${formatSeconds(ageSeconds)} ago)` : "";
+        return `${formatWatts(unit.measured_watts)}${age}`;
+      })
+      .join("; ");
+  };
+
+  /** The card's own countdown, from its acceptance's expiry marker. */
+  const cardRemainingText = (card: IntentCard): string => {
+    if (card.expiry === null) {
+      return "Not available";
+    }
+    const remaining = Math.max(
+      0,
+      Math.ceil(card.expiry.remainingS - Math.max(0, (nowMs - card.expiry.atMs) / 1000)),
+    );
+    return `${formatSeconds(remaining)} left`;
+  };
+
+  // Snapshot units carrying a request NO known card covers (a cold load
+  // mid-intent, or a request accepted before this session opened): they render
+  // through the honest fleet-figure fallback row below — the snapshot's
+  // repeated total is never stamped per battery, and the shared tracker's maps
+  // (seeded live by the decision summaries, or cold by the snapshot `intent`
+  // block when the backend sends one) supply exact figures when they exist.
+  const cardedUnitIds = new Set(intentCards.flatMap((card) => card.unitIds));
+  const residualUnits = activeUnits.filter((unit) => !cardedUnitIds.has(unit.unit_id));
+  const residualAuthorizedUnits = residualUnits.filter(
     (unit): unit is WireUnit & { authorized_power: WirePower } => unit.authorized_power !== null,
   );
-  const measuredUnits = units.filter(
+  const residualMeasuredUnits = residualUnits.filter(
     (unit): unit is WireUnit & { measured_watts: number } => unit.measured_watts !== null,
   );
 
-  // The Requested fact prefers the wire's own per-unit targets and falls back
-  // to the scalar split derivation (see requestedFactText); "None" is the
-  // honest no-request state.
+  // The fallback row's facts (see requestedFactText): the wire's per-unit
+  // targets first, the derived scalar split second; "None" is the honest
+  // no-request state.
   const requestedText =
-    activeUnits.length > 0
-      ? requestedFactText(activeUnits, unitFigures.requestedByUnit)
+    residualUnits.length > 0
+      ? requestedFactText(residualUnits, unitFigures.requestedByUnit)
       : "None";
   // The Allowed fact prefers the decision's per-unit authorized map — the one
   // source that names which battery a headroom clamp hit — and falls back to
   // the snapshot's own per-unit authorized figures.
   const allowedFromWire =
     unitFigures.authorizedByUnit !== null
-      ? allowedFactText(units, unitFigures.authorizedByUnit, unitFigures.requestedByUnit)
+      ? allowedFactText(residualUnits, unitFigures.authorizedByUnit, unitFigures.requestedByUnit)
       : null;
   const allowedText =
     allowedFromWire !== null
       ? allowedFromWire
-      : authorizedUnits.length > 0
-        ? authorizedUnits
+      : residualAuthorizedUnits.length > 0
+        ? residualAuthorizedUnits
             .map(
               (unit) =>
                 `${displayDirection(unit.authorized_power.direction)} · ${formatWatts(unit.authorized_power.watts)}`,
             )
             .join("; ")
-        : activeUnits.length > 0
+        : residualUnits.length > 0
           ? "None yet"
           : "None";
   const actualText =
-    measuredUnits.length > 0
-      ? measuredUnits
+    residualMeasuredUnits.length > 0
+      ? residualMeasuredUnits
           .map((unit) => {
             const ageSeconds = displayedAge(unit);
             const age = ageSeconds !== null ? ` (${formatSeconds(ageSeconds)} ago)` : "";
@@ -1196,15 +1479,8 @@ export function NowView({ client }: NowViewProps) {
           })
           .join("; ")
       : "No measurement available";
-  const remainingSeconds =
-    expiry === null
-      ? null
-      : Math.max(
-          0,
-          Math.ceil(expiry.remainingS - Math.max(0, (nowMs - expiry.atMs) / 1000)),
-        );
-  const remainingText =
-    remainingSeconds !== null ? `${formatSeconds(remainingSeconds)} left` : "Not available";
+  // No card, no acceptance seen: no countdown is known for the fallback row.
+  const remainingText = "Not available";
 
   const controlReasons = health?.control_readiness.reasons ?? [];
 
@@ -1365,17 +1641,29 @@ export function NowView({ client }: NowViewProps) {
         const outcome = asDispatchOutcome(result);
         if (outcome !== null) {
           setDispatchOutcome(outcome);
-          // The countdown is captured as a marker (remaining + monotonic now),
-          // not as a frozen string: it must run down from here.
-          if (outcome.expiresInSeconds !== null) {
-            setExpiry({ remainingS: outcome.expiresInSeconds, atMs: monotonicNowMs() });
-          }
         }
-        // The acceptance view's own `requested` projection carries the
-        // per-unit targets: the card's exact per-battery figures start from
-        // the response itself, before any frame or refetch lands. Nothing is
-        // authorized for the new request yet.
-        unitFigures.adoptAcceptance(result.requested);
+        // The card is born from the response itself: the wire's own intent id
+        // (the cancel key), the selected batteries, and the countdown captured
+        // as a marker (remaining + monotonic now) that must run down. The
+        // acceptance view's `requested` projection carries the direction and
+        // the per-unit targets — exact per-battery figures before any frame or
+        // refetch lands. Nothing is authorized for the new request yet.
+        const figures = toIntentFigures(result.requested);
+        if (outcome?.intentId != null && figures !== null) {
+          upsertCard({
+            intentId: outcome.intentId,
+            rank: nextCardRank(),
+            direction: figures.direction,
+            watts: figures.watts,
+            wattsByUnit: figures.wattsByUnit,
+            unitIds: [...selectedUnitIds],
+            expiry:
+              outcome.expiresInSeconds !== null
+                ? { remainingS: outcome.expiresInSeconds, atMs: monotonicNowMs() }
+                : null,
+          });
+        }
+        unitFigures.adoptAcceptance(result.requested, selectedUnitIds);
         closeDialog();
         // Allowed and Actual are the two facts the API alone can answer after a
         // dispatch; without this read they stay frozen at connect time.
@@ -1384,6 +1672,32 @@ export function NowView({ client }: NowViewProps) {
       .catch((error: unknown) => {
         const apiError = toApiClientError(error);
         setDispatchApiError({ error: apiError, field: apiErrorField(apiError) });
+      });
+  };
+
+  /**
+   * Cancel one card's request (POST /api/v1/intents/cancel, body
+   * `{intent_id}`, one Idempotency-Key the client mints for the action). The
+   * 200 is authoritative: the card clears here and the bus's
+   * `intent.cancelled` frame (already handled above) agrees; a refusal
+   * renders the envelope verbatim inside the card, which stays.
+   */
+  const submitCancel = (intentId: string): void => {
+    setCancelStates((previous) => ({ ...previous, [intentId]: { pending: true } }));
+    client
+      .postIntentCancel(intentId)
+      .then(() => {
+        setCancelStates((previous) => {
+          const next = { ...previous };
+          delete next[intentId];
+          return next;
+        });
+        retireCards((card) => card.intentId === intentId);
+        setRevokedNotice(`Power request ${intentId} was cancelled.`);
+        refreshSnapshot();
+      })
+      .catch((error: unknown) => {
+        setCancelStates((previous) => ({ ...previous, [intentId]: { error: toApiClientError(error) } }));
       });
   };
 
@@ -1520,24 +1834,118 @@ export function NowView({ client }: NowViewProps) {
         </p>
       ) : (
         <>
-          <div className={connection === "lost" ? "facts facts-dimmed" : "facts"}>
-            <div role="group" aria-label="Requested">
-              <p className="fact-label">Requested</p>
-              <p className="fact-value">{requestedText}</p>
+          {displayCards.length > 0 ? (
+            <div
+              className={
+                connection === "lost" ? "intent-cards intent-cards--dimmed" : "intent-cards"
+              }
+            >
+              {displayCards.map((card) => {
+                const cancelState = cancelStates[card.intentId] ?? null;
+                const cancelError = cancelState !== null && "error" in cancelState ? cancelState.error : null;
+                const cancelPending = cancelState !== null && "pending" in cancelState;
+                return (
+                  <section
+                    key={card.intentId}
+                    aria-label={`Power request ${card.intentId}`}
+                    className="intent-card"
+                  >
+                    <p className="intent-card-title">
+                      Request {card.intentId}
+                    </p>
+                    <div className="facts">
+                      <div role="group" aria-label="Requested">
+                        <p className="fact-label">Requested</p>
+                        <p className="fact-value">{cardRequestedText(card)}</p>
+                      </div>
+                      <div role="group" aria-label="Allowed">
+                        <p className="fact-label">Allowed</p>
+                        <p className="fact-value">{cardAllowedText(card)}</p>
+                      </div>
+                      <div role="group" aria-label="Actual">
+                        <p className="fact-label">Actual</p>
+                        <p className="fact-value">{cardActualText(card)}</p>
+                      </div>
+                      <div role="group" aria-label="Remaining time">
+                        <p className="fact-label">Remaining time</p>
+                        <p className="fact-value">{cardRemainingText(card)}</p>
+                      </div>
+                    </div>
+                    <ul className="intent-units" aria-label={`Batteries in ${card.intentId}`}>
+                      {card.unitIds.map((unitId) => {
+                        if (takenOverByNewer(card, unitId)) {
+                          return (
+                            <li key={unitId} className="intent-unit intent-unit--taken">
+                              {unitId}: taken over by a newer request
+                            </li>
+                          );
+                        }
+                        const unit = units.find((entry) => entry.unit_id === unitId);
+                        const requestedWatts =
+                          card.wattsByUnit?.[unitId] ??
+                          (card.unitIds.length === 1 ? card.watts : undefined);
+                        const authorizedWatts =
+                          unitFigures.authorizedByUnit?.[unitId] ?? unit?.authorized_power?.watts;
+                        return (
+                          <li key={unitId} className="intent-unit">
+                            {unitId}: {displayDirection(card.direction)}
+                            {requestedWatts !== undefined
+                              ? `, requested ${formatWatts(requestedWatts)}`
+                              : ""}
+                            {authorizedWatts !== undefined
+                              ? `, allowed ${formatWatts(authorizedWatts)}`
+                              : ", allowed not available"}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                    <button
+                      type="button"
+                      className="intent-cancel"
+                      disabled={cancelPending}
+                      onClick={() => {
+                        submitCancel(card.intentId);
+                      }}
+                    >
+                      Cancel request
+                    </button>
+                    {cancelError !== null ? (
+                      <ApiErrorBlock
+                        id={`now-cancel-error-${card.intentId}`}
+                        error={cancelError}
+                      />
+                    ) : null}
+                  </section>
+                );
+              })}
             </div>
-            <div role="group" aria-label="Allowed">
-              <p className="fact-label">Allowed</p>
-              <p className="fact-value">{allowedText}</p>
+          ) : null}
+          {(residualUnits.length > 0 || displayCards.length === 0) && (
+            <div
+              className={
+                connection === "lost"
+                  ? "facts facts-dimmed facts--residual"
+                  : "facts facts--residual"
+              }
+            >
+              <div role="group" aria-label="Requested">
+                <p className="fact-label">Requested</p>
+                <p className="fact-value">{requestedText}</p>
+              </div>
+              <div role="group" aria-label="Allowed">
+                <p className="fact-label">Allowed</p>
+                <p className="fact-value">{allowedText}</p>
+              </div>
+              <div role="group" aria-label="Actual">
+                <p className="fact-label">Actual</p>
+                <p className="fact-value">{actualText}</p>
+              </div>
+              <div role="group" aria-label="Remaining time">
+                <p className="fact-label">Remaining time</p>
+                <p className="fact-value">{remainingText}</p>
+              </div>
             </div>
-            <div role="group" aria-label="Actual">
-              <p className="fact-label">Actual</p>
-              <p className="fact-value">{actualText}</p>
-            </div>
-            <div role="group" aria-label="Remaining time">
-              <p className="fact-label">Remaining time</p>
-              <p className="fact-value">{remainingText}</p>
-            </div>
-          </div>
+          )}
 
           {connection === "lost" ? (
             <p role="alert" className="disconnect-note">

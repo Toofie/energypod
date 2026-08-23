@@ -54,6 +54,7 @@ const api = vi.hoisted(() => {
     getHealth: vi.fn(),
     getAudit: vi.fn(),
     postIntent: vi.fn(),
+    postIntentCancel: vi.fn(),
     postArm: vi.fn(),
     postDisarm: vi.fn(),
     postEmergencyStop: vi.fn(),
@@ -95,6 +96,18 @@ type SnapshotEnvelope = {
   units: UnitView[];
   /** The amended snapshot contract's engaged stops (PENDING backend field). */
   active_stops?: ActiveStopEnvelope[];
+  /**
+   * The snapshot-level intent block (PENDING backend field): the live
+   * request's own per-unit figures for cold-load exactness. Absent = today's
+   * wire (feature detection).
+   */
+  intent?: SnapshotIntentEnvelope | null;
+};
+
+type SnapshotIntentEnvelope = {
+  requested_watts_by_unit: Record<string, number> | null;
+  authorized_watts_by_unit: Record<string, number> | null;
+  directions_by_unit: Record<string, string> | null;
 };
 
 type ActiveStopEnvelope = {
@@ -773,6 +786,322 @@ describe("NowView — per-unit watt figures from the wire", () => {
       const requested = screen.getByRole("group", { name: "Requested" });
       expect(requested.textContent).toContain("≈1,000 W per battery (3,000 W total)");
     });
+  });
+});
+
+// --- concurrent requests: one card per active intent ---------------------------
+//
+// The pod runs CONCURRENT per-battery requests (2026-08-24 backend contract):
+// several intents coexist, each driving its own batteries through per-unit
+// arbitration. The request surface is one card per live intent, keyed by the
+// intent id the wire itself names; a newer same-priority request claiming a
+// battery renders on the older card as a take-over, never as the older request
+// having been superseded everywhere.
+
+describe("NowView — concurrent request cards", () => {
+  /** A live channel over a three-armed-battery world. */
+  function armedFleetChannel() {
+    const snap = snapshotEnvelope([ARMED_MID, ARMED_RHS, { ...ARMED_MID, unit_id: "LHS" }]);
+    const channel = liveChannel([{ type: "snapshot", sequence: 41, data: snap }]);
+    api.client.getSnapshot.mockResolvedValue(snap);
+    api.client.openEvents.mockImplementation(() => channel.openEvents());
+    return channel;
+  }
+
+  /** The frame the facade publishes for one accepted per-unit intent. */
+  function acceptedFrame(
+    sequence: number,
+    intentId: string,
+    direction: "charge" | "discharge",
+    wattsByUnit: Record<string, number>,
+    occurredAt = "2026-08-22T12:00:05+10:00",
+  ): Frame {
+    const unitIds = Object.keys(wattsByUnit);
+    const watts = unitIds.reduce((total, unitId) => total + wattsByUnit[unitId]!, 0);
+    return {
+      type: "intent.accepted",
+      sequence,
+      occurred_at: occurredAt,
+      payload: {
+        principal: "operator:home",
+        intent_id: intentId,
+        direction,
+        watts,
+        watts_by_unit: wattsByUnit,
+        unit_ids: unitIds,
+      },
+    };
+  }
+
+  function card(intentId: string): HTMLElement {
+    return screen.getByRole("region", { name: `Power request ${intentId}` });
+  }
+
+  async function remainingSeconds(scope: HTMLElement): Promise<number> {
+    const text = within(scope).getByRole("group", { name: "Remaining time" }).textContent ?? "";
+    const match = /(\d+)\s*s/.exec(text);
+    expect(match).not.toBeNull();
+    return Number(match![1]);
+  }
+
+  it("renders two concurrent intents as two cards with opposite directions and independent countdowns", async () => {
+    const user = userEvent.setup();
+    armedFleetChannel();
+    // Two separate acceptances: a 5-minute charge over MID+RHS and a 2-minute
+    // discharge over LHS — concurrent, opposite, disjoint.
+    api.client.postIntent
+      .mockResolvedValueOnce({
+        intent_id: "intent-2-1.000000",
+        acceptance_revision: 2,
+        accepted_at_monotonic: 1000.5,
+        status: "accepted",
+        requested: { direction: "charge", watts: 2000, watts_by_unit: { MID: 1000, RHS: 1000 } },
+        authorized: null,
+        measured: null,
+        expires_in_s: 300,
+      })
+      .mockResolvedValueOnce({
+        intent_id: "intent-3-1.000000",
+        acceptance_revision: 3,
+        accepted_at_monotonic: 1001.5,
+        status: "accepted",
+        requested: { direction: "discharge", watts: 800, watts_by_unit: { LHS: 800 } },
+        authorized: null,
+        measured: null,
+        expires_in_s: 120,
+      });
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    // Request one (this console): charge MID and RHS at 1,000 W each, 5 min.
+    await user.click(screen.getByRole("button", { name: /^charge/i }));
+    let dialog = screen.getByRole("dialog");
+    await user.click(within(dialog).getByRole("checkbox", { name: /LHS/ }));
+    await user.type(within(dialog).getByLabelText(/watts/i), "1000");
+    await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
+
+    // Request two (this console): discharge LHS alone at 800 W, 2 min — the
+    // opposite direction, on batteries the first request did not name.
+    await user.click(screen.getByRole("button", { name: /^discharge/i }));
+    dialog = screen.getByRole("dialog");
+    await user.click(within(dialog).getByRole("checkbox", { name: /MID/ }));
+    await user.click(within(dialog).getByRole("checkbox", { name: /RHS/ }));
+    await user.clear(within(dialog).getByLabelText(/watts/i));
+    await user.type(within(dialog).getByLabelText(/watts/i), "800");
+    await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
+
+    const first = await screen.findByRole("region", { name: "Power request intent-2-1.000000" });
+    const second = card("intent-3-1.000000");
+
+    // Each card carries ITS batteries' direction and per-battery figures.
+    const firstRequested = within(first).getByRole("group", { name: "Requested" }).textContent ?? "";
+    expect(firstRequested).toContain("Charge");
+    expect(firstRequested).toContain("1,000 W per battery (2,000 W total)");
+    const secondRequested =
+      within(second).getByRole("group", { name: "Requested" }).textContent ?? "";
+    expect(secondRequested).toContain("Discharge");
+    expect(secondRequested).toContain("800 W");
+
+    // Independent countdowns: each runs down from ITS acceptance's expiry.
+    const firstRemaining = await remainingSeconds(first);
+    const secondRemaining = await remainingSeconds(second);
+    expect(firstRemaining).toBeLessThanOrEqual(300);
+    expect(firstRemaining).toBeGreaterThan(290);
+    expect(secondRemaining).toBeLessThanOrEqual(120);
+    expect(secondRemaining).toBeGreaterThan(110);
+
+    // Neither card visually supersedes the other on units it did not name.
+    expect(within(first).queryByText(/LHS/)).toBeNull();
+    expect(within(second).queryByText(/MID|2000|2,000/)).toBeNull();
+
+    // Each card owns its own cancel control.
+    expect(screen.getAllByRole("button", { name: /cancel request/i })).toHaveLength(2);
+  });
+
+  it("shows a battery claimed by a newer same-priority request as taken over, while the older card's other batteries continue", async () => {
+    const channel = armedFleetChannel();
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    // Request one covers MID and RHS; a newer request then claims RHS alone.
+    channel.push(acceptedFrame(42, "intent-9-1.000000", "discharge", { MID: 1000, RHS: 1000 }));
+    await screen.findByRole("region", { name: "Power request intent-9-1.000000" });
+    channel.push(acceptedFrame(43, "intent-10-1.000000", "charge", { RHS: 500 }, "2026-08-22T12:00:07+10:00"));
+    const newer = await screen.findByRole("region", { name: "Power request intent-10-1.000000" });
+
+    const older = card("intent-9-1.000000");
+
+    // The older card keeps its surviving battery and its own request figures.
+    const olderUnits = within(older).getByRole("list", { name: /batteries in/i });
+    expect(olderUnits.textContent ?? "").toMatch(/MID.*requested 1,000 W/);
+    expect(olderUnits.textContent ?? "").toMatch(/RHS.*taken over by a newer request/);
+    const olderRequested = within(older).getByRole("group", { name: "Requested" }).textContent ?? "";
+    expect(olderRequested).toContain("1,000 W per battery");
+
+    // The newer card carries the battery it claimed, with its own direction.
+    const newerUnits = within(newer).getByRole("list", { name: /batteries in/i });
+    expect(newerUnits.textContent ?? "").toMatch(/RHS.*requested 500 W/);
+    expect(newerUnits.textContent ?? "").not.toMatch(/taken over/);
+  });
+
+  it("attributes the cycle-level decision maps to each card by unit membership", async () => {
+    const channel = armedFleetChannel();
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    channel.push(acceptedFrame(42, "intent-9-1.000000", "discharge", { MID: 1000, RHS: 1000 }));
+    channel.push(acceptedFrame(43, "intent-10-1.000000", "charge", { LHS: 800 }, "2026-08-22T12:00:07+10:00"));
+
+    // One cycle composed from both intents: the maps are cycle-level (the
+    // audit row correlates to `cycle:...`, not to any intent id), so each
+    // card reads ITS units' entries out of them.
+    channel.push({
+      type: "audit.appended",
+      sequence: 44,
+      occurred_at: "2026-08-22T12:00:09+10:00",
+      payload: {
+        event_id: "facade-44",
+        event_type: "control_decision",
+        unit_id: null,
+        generation: 9,
+        result: "clamped",
+        reason_codes: ["power_clamped"],
+        requested_active_w: 2800,
+        authorized_active_w: 2200,
+        requested_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 800 },
+        authorized_watts_by_unit: { MID: 1000, RHS: 400, LHS: 800 },
+        directions_by_unit: { MID: "discharge", RHS: "discharge", LHS: "charge" },
+      },
+    });
+
+    const dischargeCard = await waitFor(() => {
+      const scope = card("intent-9-1.000000");
+      const allowed = within(scope).getByRole("group", { name: "Allowed" }).textContent ?? "";
+      expect(allowed).toContain("MID 1,000 W");
+      expect(allowed).toContain("RHS 400 W (headroom)");
+      // The charge request's battery never rides this card's figures.
+      expect(allowed).not.toContain("LHS");
+      return scope;
+    });
+    expect(
+      within(dischargeCard).getByRole("group", { name: "Allowed" }).textContent ?? "",
+    ).toMatch(/RHS was held back/i);
+
+    const chargeAllowed =
+      within(card("intent-10-1.000000")).getByRole("group", { name: "Allowed" }).textContent ?? "";
+    expect(chargeAllowed).toContain("LHS 800 W");
+    expect(chargeAllowed).not.toContain("MID");
+    expect(chargeAllowed).not.toContain("RHS");
+  });
+
+  it("cancels one card's request through the live cancel endpoint and clears exactly that card", async () => {
+    const user = userEvent.setup();
+    const channel = armedFleetChannel();
+    api.client.postIntentCancel.mockResolvedValue({
+      intent_id: "intent-9-1.000000",
+      status: "cancelled",
+      unit_ids: ["MID", "RHS"],
+    });
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    channel.push(acceptedFrame(42, "intent-9-1.000000", "discharge", { MID: 1000, RHS: 1000 }));
+    channel.push(acceptedFrame(43, "intent-10-1.000000", "charge", { LHS: 800 }, "2026-08-22T12:00:07+10:00"));
+    await screen.findByRole("region", { name: "Power request intent-9-1.000000" });
+
+    await user.click(within(card("intent-9-1.000000")).getByRole("button", { name: /cancel request/i }));
+
+    // The exact request body the endpoint's schema pins: the intent id alone.
+    expect(api.client.postIntentCancel).toHaveBeenCalledWith("intent-9-1.000000");
+    // The cancelled card clears; the concurrent card stays.
+    await waitFor(() => {
+      expect(screen.queryByRole("region", { name: "Power request intent-9-1.000000" })).toBeNull();
+    });
+    expect(screen.getByRole("region", { name: "Power request intent-10-1.000000" })).toBeInTheDocument();
+  });
+
+  it("renders a cancel refusal's envelope inside the card and keeps the request on screen", async () => {
+    const user = userEvent.setup();
+    const channel = armedFleetChannel();
+    api.client.postIntentCancel.mockRejectedValue(
+      new ApiClientError({
+        code: "intent_not_found",
+        message: "The intent identifier is not active",
+        details: {},
+        request_id: "req-cancel-3",
+        status: 404,
+      }),
+    );
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    channel.push(acceptedFrame(42, "intent-9-1.000000", "discharge", { MID: 1000 }));
+    const scope = await screen.findByRole("region", { name: "Power request intent-9-1.000000" });
+
+    await user.click(within(scope).getByRole("button", { name: /cancel request/i }));
+
+    // The refusal is the envelope's own words, in the card it belongs to.
+    expect(await within(scope).findByText("intent_not_found")).toBeInTheDocument();
+    expect(within(scope).getByText("The intent identifier is not active")).toBeInTheDocument();
+    expect(
+      within(scope).getByRole("group", { name: "Remaining time" }).textContent ?? "",
+    ).toContain("Not available");
+  });
+
+  it("clears a card when another operator cancels it over the bus", async () => {
+    const channel = armedFleetChannel();
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    channel.push(acceptedFrame(42, "intent-9-1.000000", "discharge", { MID: 1000 }));
+    await screen.findByRole("region", { name: "Power request intent-9-1.000000" });
+
+    // The facade's cancellation announcement (service.py cancel_intent):
+    // {principal, intent_id, unit_ids}.
+    channel.push({
+      type: "intent.cancelled",
+      sequence: 43,
+      occurred_at: "2026-08-22T12:01:00+10:00",
+      payload: { principal: "operator:other", intent_id: "intent-9-1.000000", unit_ids: ["MID"] },
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByRole("region", { name: "Power request intent-9-1.000000" })).toBeNull();
+    });
+    const notice = await screen.findByRole("status");
+    expect(notice.textContent ?? "").toMatch(/intent-9-1\.000000 was cancelled/);
+  });
+
+  it("seeds exact per-unit figures from the snapshot intent block at cold load (feature-detected)", async () => {
+    // A console opened mid-intent knows no card (no acceptance was seen in
+    // this session), but the snapshot's `intent` block carries the request's
+    // own per-unit figures: the fallback row renders them exactly, with no
+    // derived "≈" split, instead of stamping the repeated fleet total.
+    const snap: SnapshotEnvelope = {
+      ...snapshotEnvelope([
+        { ...ACTIVE_MID, requested_power: { direction: "discharge", watts: 3000 } },
+        { ...ACTIVE_MID, unit_id: "RHS", requested_power: { direction: "discharge", watts: 3000 } },
+        { ...ACTIVE_MID, unit_id: "LHS", requested_power: { direction: "discharge", watts: 3000 } },
+      ]),
+      intent: {
+        requested_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        authorized_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        directions_by_unit: { MID: "discharge", RHS: "discharge", LHS: "discharge" },
+      },
+    };
+    api.client.getSnapshot.mockResolvedValue(snap);
+    api.client.openEvents.mockImplementation(() =>
+      liveStream([{ type: "snapshot", sequence: 41, data: snap }]),
+    );
+
+    renderNow();
+
+    const requested = await screen.findByRole("group", { name: "Requested" });
+    expect(requested.textContent ?? "").toContain("1,000 W per battery (3,000 W total)");
+    expect(requested.textContent ?? "").not.toContain("≈");
+    const allowed = screen.getByRole("group", { name: "Allowed" });
+    expect(allowed.textContent ?? "").toContain("MID 1,000 W");
+    expect(allowed.textContent ?? "").not.toContain("headroom");
   });
 });
 
@@ -1816,13 +2145,20 @@ describe("NowView — the request card clears when the request ends", () => {
     expect(await screen.findByText(/^accepted$/i)).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "Remaining time" }).textContent ?? "").toMatch(/\d+ s left/);
 
-    // The dedicated expiry event (queued backend-side): feature-detected, so
-    // the console is ready the day it starts arriving.
+    // The dedicated expiry event: the wire's payload names the lapsed intent
+    // by id (composition.py `_TrackingIntentRepository`), so the card goes by
+    // its own identity.
     channel.push({
       type: "intent.expired",
       sequence: 45,
       occurred_at: "2026-08-22T12:05:00+10:00",
-      payload: { unit_ids: ["MID"] },
+      payload: {
+        intent_id: "intent-2-1.000000",
+        source: "manual",
+        direction: "charge",
+        watts: 1500,
+        unit_ids: ["MID"],
+      },
     });
     await waitFor(() => {
       expect(screen.getByRole("group", { name: "Remaining time" }).textContent ?? "").toContain(
