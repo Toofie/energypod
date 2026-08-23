@@ -43,6 +43,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { ApiClientError, isUnauthorizedError } from "../api/client";
 import type { ApiClientError as ApiClientErrorType, Health, StreamEvent } from "../api/client";
+import { formatWatts } from "../lib/format";
 import { isRecord, normalizeSnapshot, type FleetSnapshot, type Lifecycle } from "./fleet";
 import type { RealStream, SharedDataPlane } from "./SharedDataPlane";
 
@@ -507,8 +508,11 @@ function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void)
       const direction = typeof payload.direction === "string" ? payload.direction : "";
       dispatch({
         type: "polite",
+        // The announcement is a display string composed once and never
+        // re-formatted, so its watt figure is formatted here — the shared
+        // display-precision module, never a raw wire float.
         text: `Power request accepted${
-          watts === null ? "" : ` — ${direction} ${watts} W`
+          watts === null ? "" : ` — ${direction} ${formatWatts(watts)}`
         } for ${nameUnits(unitIds)}.`,
       });
       return true;

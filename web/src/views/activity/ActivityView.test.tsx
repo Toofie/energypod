@@ -34,7 +34,7 @@
 //     the disclosure the raw code must be not VISIBLE, not absent from the
 //     DOM
 //   - decision language: result "clamped" with the wire's watt figures ->
-//     "Reduced to 1500 W of the 3000 W requested"; reason power_clamped ->
+//     "Reduced to 1,500 W of the 3,000 W requested"; reason power_clamped ->
 //     "Power clamped"; a missing result -> "Result not recorded yet" (never
 //     a fabricated measurement)
 //   - kind chips "Observations", "Decisions", "Arming", "Stops",
@@ -264,7 +264,7 @@ describe("Activity view", () => {
     // mapped from the wire's result and the signed active-watt figures.
     expect(entry.getByText("operator.sam")).toBeVisible();
     expect(
-      entry.getByText("Reduced to 1500 W of the 3000 W requested"),
+      entry.getByText("Reduced to 1,500 W of the 3,000 W requested"),
     ).toBeVisible();
     expect(entry.getByText("Power reduced by the safety system")).toBeVisible();
     expect(entry.getByText("Power clamped")).toBeVisible();
@@ -281,6 +281,33 @@ describe("Activity view", () => {
     await user.click(entry.getByRole("button", { name: "Show technical detail" }));
 
     expect(entry.getByText("power_clamped")).toBeVisible();
+  });
+
+  it("renders the audit watt figures at the two-decimal display bound: a raw eight-decimal fixture never reaches the operator", async () => {
+    // The audit record's signed active-watt figures can arrive at full float
+    // precision; the shared display-precision module (src/lib/format.ts) is
+    // the render boundary — magnitudes with the direction in words, at most
+    // two decimals, thousands grouped like every other watt figure.
+    const preciseDecision = auditEvent({
+      sequence: 64,
+      event_type: "control_decision",
+      unit_id: null,
+      occurred_at: minutesAgo(4),
+      principal: PRINCIPAL,
+      result: "clamped",
+      reason_codes: ["power_clamped"],
+      requested_active_w: 3000.123456789,
+      authorized_active_w: 1500.98765432,
+    });
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([preciseDecision], null));
+
+    renderView();
+
+    const entry = within((await screen.findAllByRole("listitem"))[0] as HTMLElement);
+    expect(
+      entry.getByText("Reduced to 1,500.99 W of the 3,000.12 W requested"),
+    ).toBeVisible();
+    expect(entry.getByText(/Reduced to/).textContent ?? "").not.toMatch(/\d\.\d{3,}/);
   });
 
   it("renders a stop-held decision cycle honestly, naming the stop — never 'power allowed' at 0 W", async () => {

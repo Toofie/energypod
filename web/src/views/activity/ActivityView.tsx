@@ -37,6 +37,7 @@ import { Fragment } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, AuditEvent, StreamEvent } from "../../api/client";
+import { formatWatts } from "../../lib/format";
 import "./activity.css";
 
 export type ActivityConnection = "connected" | "disconnected";
@@ -426,8 +427,12 @@ function decidedLine(event: AuditEvent, stopId: string | null): string | null {
         return stopHeldLine(stopId);
       }
       return result === "clamped"
-        ? `Reduced to ${Math.abs(authorized)} W of the ${Math.abs(requested)} W requested`
-        : `Allowed ${Math.abs(authorized)} W of the ${Math.abs(requested)} W requested`;
+        ? `Reduced to ${formatWatts(Math.abs(authorized))} of the ${formatWatts(
+            Math.abs(requested),
+          )} requested`
+        : `Allowed ${formatWatts(Math.abs(authorized))} of the ${formatWatts(
+            Math.abs(requested),
+          )} requested`;
     }
   }
   switch (result) {

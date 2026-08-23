@@ -349,6 +349,34 @@ describe("NowView — current request card", () => {
     expect(fact("Remaining time")).toBeInTheDocument();
   });
 
+  it("renders requested, allowed, and actual at the two-decimal display bound: a raw eight-decimal fixture never reaches the operator", async () => {
+    // The wire can carry float-decoded power figures at full precision; the
+    // shared display-precision module (src/lib/format.ts) is the render
+    // boundary, so every fact on this card shows at most two decimals — the
+    // charging (negative) measurement keeps its sign and its bound.
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        {
+          ...ACTIVE_MID,
+          requested_power: { direction: "charge", watts: 1500.12345678 },
+          authorized_power: { direction: "charge", watts: 1000.98765432 },
+          measured_watts: -980.12345678,
+        },
+      ]),
+    );
+
+    renderNow();
+
+    await waitFor(() => {
+      expect(fact("Requested").textContent ?? "").toContain("1,500.12 W");
+      expect(fact("Allowed").textContent ?? "").toContain("1,000.99 W");
+      expect(fact("Actual").textContent ?? "").toContain("-980.12 W");
+    });
+    expect(fact("Requested").textContent ?? "").not.toMatch(/\d\.\d{3,}/);
+    expect(fact("Allowed").textContent ?? "").not.toMatch(/\d\.\d{3,}/);
+    expect(fact("Actual").textContent ?? "").not.toMatch(/\d\.\d{3,}/);
+  });
+
   it("reports allowed as explicitly none when a live request has no authorization", async () => {
     // requested from an accepted intent, authorized_power still null (not yet
     // granted): the requested watts must never echo into the Allowed fact.

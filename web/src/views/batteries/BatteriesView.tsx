@@ -62,6 +62,14 @@ import type {
   AuditPage,
   StreamEvent,
 } from "../../api/client";
+import {
+  formatMillivolts,
+  formatPercent,
+  formatTemp,
+  formatVolts,
+  formatWatts,
+  wholeSeconds,
+} from "../../lib/format";
 
 export type BatteriesConnection = "connected" | "disconnected";
 
@@ -264,31 +272,12 @@ function plainResult(result: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Formatting (values are human words; units are explicit, signs by direction)
+// Formatting (values are human words; units are explicit, signs by direction).
+// Every figure renders through the shared display-precision module
+// (src/lib/format.ts): at most two decimals, integers as integers — the card
+// carries the sign in its direction word, so the watt call sites pass the
+// magnitude and the shared formatWatts adds the unit.
 // ---------------------------------------------------------------------------
-
-function formatWatts(watts: number): string {
-  return Math.round(Math.abs(watts)).toLocaleString("en-US");
-}
-
-/** One decimal at most, trailing zeros dropped: 10 -> "10%", 48.5 -> "48.5%". */
-function formatPercent(value: number): string {
-  return `${Number(value.toFixed(1))}%`;
-}
-
-/** Pack voltage keeps its wire precision (192.4 V, 164.5 V). */
-function formatPackVolts(value: number): string {
-  return `${Number(value.toFixed(1))} V`;
-}
-
-/** Cell voltage is mV-resolution data: always three decimals. */
-function formatCellVolts(value: number): string {
-  return `${value.toFixed(3)} V`;
-}
-
-function formatCelsius(value: number): string {
-  return `${Number(value.toFixed(1))} °C`;
-}
 
 function directionWord(direction: string): string {
   if (direction === "charge") {
@@ -322,13 +311,13 @@ function cardPowerText(unit: ViewUnit): string {
   // Wire convention (PROTOCOL_EVIDENCE 4b, live-proven): a POSITIVE battery
   // watt figure is DISCHARGE, negative is CHARGE.
   if (measured > 0) {
-    return `Discharging ${formatWatts(measured)} W`;
+    return `Discharging ${formatWatts(measured)}`;
   }
   if (measured < 0) {
-    return `Charging ${formatWatts(Math.abs(measured))} W`;
+    return `Charging ${formatWatts(Math.abs(measured))}`;
   }
   const fallback = unit.authorized_power?.direction ?? unit.requested_power.direction;
-  return `${directionWord(fallback)} 0 W`;
+  return `${directionWord(fallback)} ${formatWatts(0)}`;
 }
 
 /** Charge row: the telemetry block's SOC, or the named gap. */
@@ -346,7 +335,7 @@ function cardPackVoltageText(unit: ViewUnit): string {
   if (volts === null || volts === undefined) {
     return missingText(unit.telemetry_age_s);
   }
-  return formatPackVolts(volts);
+  return formatVolts(volts);
 }
 
 /** Cell spread row: spread first, the population it was measured over named. */
@@ -361,9 +350,9 @@ function cardCellSpreadText(unit: ViewUnit): string {
     return `${count} cells`;
   }
   if (count === null) {
-    return `${spread} mV spread`;
+    return `${formatMillivolts(spread)} spread`;
   }
-  return `${spread} mV across ${count} cells`;
+  return `${formatMillivolts(spread)} across ${count} cells`;
 }
 
 /** Temperature row: the observed range, min to max. */
@@ -374,12 +363,12 @@ function cardTemperatureText(unit: ViewUnit): string {
     return missingText(unit.telemetry_age_s);
   }
   if (min === null) {
-    return `up to ${formatCelsius(max as number)}`;
+    return `up to ${formatTemp(max as number)}`;
   }
   if (max === null) {
-    return `from ${formatCelsius(min)}`;
+    return `from ${formatTemp(min)}`;
   }
-  return `${formatCelsius(min)} to ${formatCelsius(max)}`;
+  return `${formatTemp(min)} to ${formatTemp(max)}`;
 }
 
 /** Warnings row: the block's own words; an empty list is a real "None". */
@@ -398,7 +387,8 @@ function ageText(seconds: number | null): string {
   if (seconds === null) {
     return "age unknown";
   }
-  return `${seconds} ${seconds === 1 ? "second" : "seconds"} old`;
+  const whole = wholeSeconds(seconds);
+  return `${whole} ${whole === 1 ? "second" : "seconds"} old`;
 }
 
 function missingText(ageSeconds: number | null): string {
@@ -764,7 +754,7 @@ function SummaryPanel({
   const actual =
     measured === null
       ? "no data"
-      : `${directionWord(measured > 0 ? "discharge" : measured < 0 ? "charge" : "idle").toLowerCase()} ${formatWatts(Math.abs(measured))} W`;
+      : `${directionWord(measured > 0 ? "discharge" : measured < 0 ? "charge" : "idle").toLowerCase()} ${formatWatts(Math.abs(measured))}`;
   const telemetry = unit.telemetry;
   const soc = telemetry?.socPct ?? null;
   const soh = telemetry?.sohPct ?? null;
@@ -790,24 +780,24 @@ function SummaryPanel({
       </p>
       <p>
         <b>Power:</b> requested {directionWord(requested.direction).toLowerCase()}{" "}
-        {formatWatts(requested.watts)} W; allowed{" "}
+        {formatWatts(requested.watts)}; allowed{" "}
         {allowed === null
           ? "none recorded"
-          : `${directionWord(allowed.direction).toLowerCase()} ${formatWatts(allowed.watts)} W`}
+          : `${directionWord(allowed.direction).toLowerCase()} ${formatWatts(allowed.watts)}`}
         ; delivering {actual}
       </p>
       <p>
         <b>Limits:</b>{" "}
         {allowed === null
           ? "No authorized power recorded"
-          : `Allowed ${directionWord(allowed.direction).toLowerCase()} up to ${formatWatts(allowed.watts)} W`}
+          : `Allowed ${directionWord(allowed.direction).toLowerCase()} up to ${formatWatts(allowed.watts)}`}
       </p>
       <p>
         <b>Device limits (dynamic):</b>{" "}
         {chargeLimit === null && dischargeLimit === null
           ? missingText(unit.telemetry_age_s)
-          : `charge up to ${chargeLimit === null ? "no data" : `${formatWatts(chargeLimit)} W`}, discharge up to ${
-              dischargeLimit === null ? "no data" : `${formatWatts(dischargeLimit)} W`
+          : `charge up to ${chargeLimit === null ? "no data" : formatWatts(chargeLimit)}, discharge up to ${
+              dischargeLimit === null ? "no data" : formatWatts(dischargeLimit)
             }`}
       </p>
       <p>
@@ -931,27 +921,27 @@ function CellsPanel({
       )}
       <p>
         <b>Minimum cell voltage:</b>{" "}
-        {cellMin === null ? missingText(age) : formatCellVolts(cellMin)}
+        {cellMin === null ? missingText(age) : formatVolts(cellMin)}
       </p>
       <p>
         <b>Maximum cell voltage:</b>{" "}
-        {cellMax === null ? missingText(age) : formatCellVolts(cellMax)}
+        {cellMax === null ? missingText(age) : formatVolts(cellMax)}
       </p>
       <p>
-        <b>Voltage spread:</b> {spread === null ? missingText(age) : `${spread} mV`}
+        <b>Voltage spread:</b> {spread === null ? missingText(age) : formatMillivolts(spread)}
       </p>
       <p>
         <b>Temperature range:</b>{" "}
         {tempMin === null && tempMax === null
           ? missingText(age)
-          : `${tempMin === null ? "no data" : formatCelsius(tempMin)} to ${
-              tempMax === null ? "no data" : formatCelsius(tempMax)
+          : `${tempMin === null ? "no data" : formatTemp(tempMin)} to ${
+              tempMax === null ? "no data" : formatTemp(tempMax)
             }`}
       </p>
       {detailData.cellVoltages.length > 0 ? (
         <ul className="cell-grid" aria-label="Cell voltages">
           {detailData.cellVoltages.map((volts, index) => (
-            <li key={index}>{`Cell ${index + 1}: ${formatCellVolts(volts)}`}</li>
+            <li key={index}>{`Cell ${index + 1}: ${formatVolts(volts)}`}</li>
           ))}
         </ul>
       ) : (
@@ -960,7 +950,7 @@ function CellsPanel({
       {detailData.temperatures.length > 0 ? (
         <ul className="temp-grid" aria-label="Temperature sensors">
           {detailData.temperatures.map((celsius, index) => (
-            <li key={index}>{`Sensor ${index + 1}: ${formatCelsius(celsius)}`}</li>
+            <li key={index}>{`Sensor ${index + 1}: ${formatTemp(celsius)}`}</li>
           ))}
         </ul>
       ) : (

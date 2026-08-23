@@ -56,6 +56,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health, StreamEvent } from "../../api/client";
+import { formatPercent, formatSeconds, formatWatts } from "../../lib/format";
 import "./home.css";
 
 export interface HomeViewProps {
@@ -281,10 +282,6 @@ function badgeKey(label: string): string {
   return keys[label] ?? "none";
 }
 
-function formatWatts(watts: number): string {
-  return `${watts.toLocaleString("en-US")} W`;
-}
-
 function directionWord(direction: PowerFigureView["direction"]): string {
   if (direction === "charge") {
     return "Charging";
@@ -305,12 +302,12 @@ function dataAgeText(ageSeconds: number | null, updatesPaused: boolean): string 
     return "Data age: not available (telemetry missing)";
   }
   if (ageSeconds > FRESHNESS_BOUND_S) {
-    return `Data age: ${ageSeconds} s old — this reading is stale`;
+    return `Data age: ${formatSeconds(ageSeconds)} old — this reading is stale`;
   }
   if (updatesPaused) {
-    return `Data age: ${ageSeconds} s old — updates have paused; this reading may be stale`;
+    return `Data age: ${formatSeconds(ageSeconds)} old — updates have paused; this reading may be stale`;
   }
-  return `Data age: ${ageSeconds} s`;
+  return `Data age: ${formatSeconds(ageSeconds)}`;
 }
 
 /**
@@ -333,13 +330,13 @@ function fleetReserveText(units: UnitView[]): string {
       : `on average across the ${readings.length} pod${
           readings.length === 1 ? "" : "s"
         } reporting a charge reading`;
-  return `${Number(average.toFixed(1))}% ${scope}`;
+  return `${formatPercent(average)} ${scope}`;
 }
 
 /** One pod's own charge figure, or the named gap. */
 function unitReserveText(unit: UnitView): string {
   const soc = unit.telemetry?.socPct ?? null;
-  return soc === null ? "charge level not available" : `${Number(soc.toFixed(1))}% charged`;
+  return soc === null ? "charge level not available" : `${formatPercent(soc)} charged`;
 }
 
 function allowedText(unit: UnitView): string {
@@ -691,7 +688,7 @@ export function HomeView({ client }: HomeViewProps) {
         if (unitIds.length > 0 && watts !== null && direction !== null) {
           patchRequested(unitIds, direction, watts);
           setAnnouncement(
-            `Power request accepted — ${direction} ${watts} W for ${unitIds.join(", ")}.`,
+            `Power request accepted — ${direction} ${formatWatts(watts)} for ${unitIds.join(", ")}.`,
           );
         }
         refetchSnapshot();
@@ -1019,8 +1016,8 @@ export function HomeView({ client }: HomeViewProps) {
         </p>
         {dataStale && (
           <p role="status" className="home-connection home-connection--stale">
-            No fresh readings for {Math.floor(secondsSinceFreshData)} s — the numbers below may be
-            out of date until updates return.
+            No fresh readings for {formatSeconds(secondsSinceFreshData)} — the numbers below may
+            be out of date until updates return.
           </p>
         )}
         <p className="home-service-line">{serviceText(health)}</p>

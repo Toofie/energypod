@@ -57,6 +57,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health } from "../../api/client";
+import { formatSeconds, formatWatts } from "../../lib/format";
 import "./now.css";
 
 /** The one prop the shell hands every mounted view (views.ts ShellViewProps). */
@@ -248,17 +249,9 @@ function displayDirection(direction: string): string {
   return "Idle";
 }
 
-/** Locale-style grouping without depending on ICU data: 1500 -> "1,500 W". */
-function formatWatts(watts: number): string {
-  const grouped = Math.round(watts)
-    .toString()
-    .replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  return `${grouped} W`;
-}
-
-function formatSeconds(seconds: number): string {
-  return `${seconds} s`;
-}
+// Watt and second figures render through the shared display-precision module
+// (src/lib/format.ts): locale-style grouping without ICU data, at most two
+// decimals, integers as integers.
 
 /** Fits the service's canonical identifier grammar (rest.py `_ID_PATTERN`). */
 let dispatchKeyCounter = 0;

@@ -923,8 +923,8 @@ describe("Composed console — Batteries on the real wire", () => {
     await user.click(screen.getByRole("tab", { name: "Cells" }));
     const cells = await screen.findByRole("tabpanel");
     await waitFor(() => {
-      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.205 V/i);
-      expect(cells).toHaveTextContent(/maximum cell voltage:\s*3\.209 V/i);
+      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.21 V/i);
+      expect(cells).toHaveTextContent(/maximum cell voltage:\s*3\.21 V/i);
       expect(cells).toHaveTextContent(/voltage spread:\s*4 mV/i);
     });
     const grid = within(cells).getByRole("list", { name: /cell voltages/i });
@@ -1001,7 +1001,7 @@ describe("Composed console — Activity on the real audit read model", () => {
     // The whole real read model renders: `event_type` headlines, the string
     // `principal`, the signed watt figures, and `result` in words.
     expect(within(timeline).getByText("Power decision")).toBeInTheDocument();
-    expect(within(timeline).getByText("Reduced to 1200 W of the 1500 W requested")).toBeInTheDocument();
+    expect(within(timeline).getByText("Reduced to 1,200 W of the 1,500 W requested")).toBeInTheDocument();
     expect(within(timeline).getAllByText(/Requested by/).length).toBeGreaterThanOrEqual(2);
     // The default principal is the audit write model's own subject string.
     expect(within(timeline).getAllByText("operator:home")).toHaveLength(5);

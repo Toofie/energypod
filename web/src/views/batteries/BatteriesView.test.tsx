@@ -420,6 +420,73 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     expect(lhs).not.toHaveTextContent(/\d+\s*W/);
   });
 
+  it("renders every telemetry figure at the two-decimal display bound: a raw eight-decimal fixture never reaches the operator", async () => {
+    const user = userEvent.setup();
+    // The wire can carry float-decoded telemetry at full precision; the
+    // shared display-precision module (src/lib/format.ts) is the render
+    // boundary — at most two decimals, integers as integers, trailing zeros
+    // trimmed — for the card rows and the Cells tab alike. The negative
+    // battery watts ride the direction word (charging), magnitude bounded.
+    const precise: WireSnapshot = snapshot(
+      [
+        unitSnapshot({
+          unit_id: "MID",
+          lifecycle: "disarmed",
+          telemetry_age_s: 2.987654321,
+          measured_watts: null,
+          telemetry: telemetrySummary({
+            soc_pct: 46.55555555,
+            pack_voltage_v: 192.45678912,
+            battery_watts: -1132.56789012,
+            cell_spread_mv: 12.345678,
+            temperature_min_c: 23.456789,
+            temperature_max_c: 27.654321,
+          }),
+        }),
+      ],
+      { snapshot_sequence: 4500, captured_at: CAPTURED_AT },
+    );
+    const client = healthyClient(precise, fleetEvents(precise));
+    // The on-demand detail read carries the same full-precision floats.
+    client.getUnitDetail.mockResolvedValue(
+      unitDetail("MID", {
+        cell_min_v: 3.20512345678,
+        cell_max_v: 3.20987654321,
+        cell_spread_mv: 12.345678,
+        temperature_min_c: 23.456789,
+        temperature_max_c: 27.654321,
+        cell_voltages_v: [3.20512345678, 3.20987654321],
+        temperatures_c: [23.456789, 27.654321],
+      }),
+    );
+    renderView(client);
+
+    const mid = await screen.findByRole("group", { name: "MID" });
+    expect(mid).toHaveTextContent(/charge level:\s*46\.56%/i);
+    expect(mid).toHaveTextContent(/pack voltage:\s*192\.46 V/i);
+    expect(mid).toHaveTextContent(/power:\s*charging 1,132\.57 W/i);
+    expect(mid).toHaveTextContent(/cell spread:\s*12\.35 mV across 60 cells/i);
+    expect(mid).toHaveTextContent(/temperature:\s*23\.46 °C to 27\.65 °C/i);
+    // The fractional age lands on whole seconds, like every age on screen.
+    expect(mid).toHaveTextContent(/3 seconds old/);
+    expect(mid.textContent ?? "").not.toMatch(/\d\.\d{3,}/);
+
+    // The Cells tab's per-cell distribution holds the same bound.
+    await user.click(screen.getByRole("button", { name: "MID" }));
+    await user.click(screen.getByRole("tab", { name: "Cells" }));
+    const cells = await screen.findByRole("tabpanel");
+    await waitFor(() => {
+      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.21 V/i);
+      expect(cells).toHaveTextContent(/maximum cell voltage:\s*3\.21 V/i);
+      expect(cells).toHaveTextContent(/voltage spread:\s*12\.35 mV/i);
+    });
+    const grid = within(cells).getByRole("list", { name: /cell voltages/i });
+    const cellItems = within(grid).getAllByRole("listitem");
+    expect(cellItems[0]!.textContent).toBe("Cell 1: 3.21 V");
+    expect(cellItems[1]!.textContent).toBe("Cell 2: 3.21 V");
+    expect(cells.textContent ?? "").not.toMatch(/\d\.\d{3,}/);
+  });
+
   it("renders an explicit empty warning list as none, distinct from absent warnings", async () => {
     const quiet: WireSnapshot = {
       ...TELEMETRY_SNAPSHOT,
@@ -450,8 +517,8 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     await user.click(screen.getByRole("tab", { name: "Cells" }));
     const cells = await screen.findByRole("tabpanel");
     await waitFor(() => {
-      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.205 V/i);
-      expect(cells).toHaveTextContent(/maximum cell voltage:\s*3\.209 V/i);
+      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.21 V/i);
+      expect(cells).toHaveTextContent(/maximum cell voltage:\s*3\.21 V/i);
       expect(cells).toHaveTextContent(/voltage spread:\s*4 mV/i);
       expect(cells).toHaveTextContent(/temperature range:\s*23 °C to 28 °C/i);
     });
@@ -461,8 +528,8 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     const grid = within(cells).getByRole("list", { name: /cell voltages/i });
     const cellItems = within(grid).getAllByRole("listitem");
     expect(cellItems).toHaveLength(60);
-    expect(cellItems[0]!.textContent).toBe("Cell 1: 3.205 V");
-    expect(cellItems[59]!.textContent).toBe("Cell 60: 3.209 V");
+    expect(cellItems[0]!.textContent).toBe("Cell 1: 3.21 V");
+    expect(cellItems[59]!.textContent).toBe("Cell 60: 3.21 V");
 
     // The temperature sensors render as values too (BIC x 3 = 18 sensors).
     const sensors = within(cells).getByRole("list", { name: /temperature sensors/i });
@@ -493,11 +560,11 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     expect(await screen.findByRole("status", { name: /loading cell detail/i })).toBeInTheDocument();
     // No distribution can render while the read is pending — never a guess.
     const pending = screen.getByRole("tabpanel");
-    expect(pending).not.toHaveTextContent(/3\.205/);
+    expect(pending).not.toHaveTextContent(/3\.21\s*V/);
 
     resolveDetail(unitDetail("MID"));
     await waitFor(() => {
-      expect(screen.getByRole("tabpanel")).toHaveTextContent(/minimum cell voltage:\s*3\.205 V/i);
+      expect(screen.getByRole("tabpanel")).toHaveTextContent(/minimum cell voltage:\s*3\.21 V/i);
     });
   });
 
@@ -530,7 +597,7 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     await user.click(within(alert).getByRole("button", { name: /try again/i }));
     const cells = await screen.findByRole("tabpanel");
     await waitFor(() => {
-      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.205 V/i);
+      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.21 V/i);
     });
     expect(client.getUnitDetail).toHaveBeenCalledTimes(2);
   });
@@ -581,7 +648,7 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
       expect(cells).toHaveTextContent(/disconnected from live updates/i);
       expect(cells).toHaveTextContent(/showing the last known cell readings/i);
       // ...while the values stay on screen, dimmed-not-hidden
-      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.205 V/i);
+      expect(cells).toHaveTextContent(/minimum cell voltage:\s*3\.21 V/i);
     });
   });
 

@@ -478,6 +478,39 @@ describe("HomeView", () => {
     expect(silent.textContent ?? "").not.toMatch(/%/);
   });
 
+  it("renders every figure at the two-decimal display bound: a raw eight-decimal fixture never reaches the operator", async () => {
+    // The wire can carry float-decoded telemetry at full precision; the
+    // display bound (src/lib/format.ts) is the render boundary — at most two
+    // decimals, integers as integers, trailing zeros trimmed — so the view's
+    // three watt figures and the charge percentages never show more.
+    const snapshot = fleet([
+      unit({
+        unit_id: "pod-mid",
+        lifecycle: "active",
+        requested_power: { direction: "discharge", watts: 1234.56789012 },
+        authorized_power: { direction: "discharge", watts: 1000.98765432 },
+        measured_watts: 980.12345678,
+        telemetry: telemetrySummary({ soc_pct: 46.55555555 }),
+      }),
+      unit({ unit_id: "pod-rhs" }),
+      unit({ unit_id: "pod-lhs" }),
+    ]);
+    installClient({ snapshot });
+    renderHome();
+
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    expect(labeledFigure(entry, /requested/i).textContent ?? "").toContain("1,234.57 W");
+    expect(labeledFigure(entry, /allowed/i).textContent ?? "").toContain("1,000.99 W");
+    expect(labeledFigure(entry, /actual/i).textContent ?? "").toContain("980.12 W");
+    expect(entry.textContent ?? "").not.toMatch(/\d\.\d{3,}/);
+
+    // The reserve rows hold the same bound: the pod's own reading and the
+    // fleet average over reporting pods, both trimmed at two decimals.
+    const reserveRegion = await screen.findByRole("region", { name: RESERVE_REGION });
+    expectVisibleText(reserveRegion, /46\.56%/);
+    expect(reserveRegion.textContent ?? "").not.toMatch(/55555555/);
+  });
+
   it("shows the next planned action's direction and watts while an intent is active", async () => {
     const snapshot = fleet([
       unit({

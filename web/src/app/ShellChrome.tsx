@@ -5,6 +5,7 @@
  * AppShell; these components only render it.
  */
 import type { ReactElement } from "react";
+import { formatSeconds } from "../lib/format";
 import type { UnitModel } from "./fleet";
 import { fleetBanner, UNIT_LABELS } from "./fleet";
 import type { ConnectionHealth, ConsoleData, RefusalEnvelope } from "./useConsoleData";
@@ -21,7 +22,7 @@ const BADGE_ICONS: Record<string, string> = {
 };
 
 function ageText(unit: UnitModel): string {
-  return unit.telemetryAgeS === null ? "" : ` · ${unit.telemetryAgeS} s old`;
+  return unit.telemetryAgeS === null ? "" : ` · ${formatSeconds(unit.telemetryAgeS)} old`;
 }
 
 export function FleetBanner({ units }: { units: UnitModel[] }): ReactElement {
@@ -131,7 +132,9 @@ export function ConnectionStatusBadge({
   if (health === "live") {
     text = "Live";
   } else if (health === "stale") {
-    text = `Stale — last update ${secondsSinceUpdate ?? "many"} s ago`;
+    text = `Stale — last update ${
+      secondsSinceUpdate === null ? "many s" : formatSeconds(secondsSinceUpdate)
+    } ago`;
   } else if (health === "offline") {
     text = "Offline — the EnergyPod service cannot be reached";
   } else {
