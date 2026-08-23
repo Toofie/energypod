@@ -73,6 +73,10 @@ From the 32-agent Milestone A implementation review (all P0/P1 were fixed in
 
 1. EventBus: JSON enforcement bypassable via payload aliasing/mutation after
    publish (retention/subscribers can later hold non-serializable envelopes).
+   Status: FIXED 2026-08-23 — `_build_envelope` re-materializes the envelope
+   from its own JSON encoding, so the retained/delivered copy is exactly the
+   wire shape and post-publish caller mutation cannot reach it; nested
+   non-serializable values fail the publish.
 2. EventBus: future/negative cursors produce a silently dead iterator with no
    resync marker.
 3. EventBus: abandoned subscriptions are never reclaimed (O(capacity) drain

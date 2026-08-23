@@ -641,3 +641,32 @@ async def test_subscription_matches_the_adapter_eventsource_shape(bus_module: An
     assert isinstance(event, dict)
     assert isinstance(event.get("sequence"), int) and not isinstance(event.get("sequence"), bool)
     await close_subscription(iterator)
+
+
+async def test_publishing_detaches_the_envelope_from_caller_owned_objects(
+    bus_module: Any,
+) -> None:
+    # Deferred P2 (implementation review 2026-08-22): JSON enforcement was
+    # bypassable by mutating a payload after publish — retention and other
+    # subscribers would then hold non-serializable envelopes.  The retained
+    # copy must be the wire shape, immune to later caller mutation.
+    bus = make_bus(bus_module, retention=8, queue_capacity=8)
+    live = bus.subscribe(after_sequence=0)
+    payload: dict[str, Any] = {"watts": 900}
+    await bus.publish({"type": "observation.updated", "payload": payload})
+    payload["watts"] = object()  # non-serializable, post-publish mutation
+    event = await next_event(live)
+    assert event is not _EXHAUSTED and event["payload"] == {"watts": 900}
+    replay = bus.subscribe(after_sequence=0)
+    replayed = await next_event(replay)
+    assert replayed is not _EXHAUSTED and replayed["payload"] == {"watts": 900}
+    await close_subscription(live)
+    await close_subscription(replay)
+
+
+async def test_nested_non_serializable_payload_fails_the_publish(bus_module: Any) -> None:
+    # Fail-closed must reach nested values, not only the top-level body.
+    bus = make_bus(bus_module)
+    with pytest.raises((TypeError, ValueError)):
+        await bus.publish({"type": "observation.updated", "payload": {"cause": object()}})
+    assert bus.snapshot_sequence() == 0, "a failed publication consumes no sequence"

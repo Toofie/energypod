@@ -48,10 +48,13 @@ def _build_envelope(body: Mapping[str, Any], *, sequence: int, occurred_at: str)
     envelope.setdefault("payload", {})
     envelope["sequence"] = sequence
     envelope["occurred_at"] = occurred_at
-    # Fail closed at the publisher: an event that cannot be serialized must
-    # surface here rather than silently break every downstream subscriber.
-    json.dumps(envelope, allow_nan=False)
-    return envelope
+    # Fail closed at the publisher AND detach from caller-owned objects: the
+    # envelope is re-materialized from its own JSON encoding, so an event that
+    # cannot be serialized surfaces here (never silently breaking a downstream
+    # subscriber), and a caller mutating or aliasing its payload after publish
+    # can never reach the retention window or another subscriber's queue.  The
+    # retained copy is exactly the wire shape.
+    return json.loads(json.dumps(envelope, ensure_ascii=False, allow_nan=False))
 
 
 def _resync_marker(reason: str, snapshot_sequence: int) -> dict[str, Any]:
