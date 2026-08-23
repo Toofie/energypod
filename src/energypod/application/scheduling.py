@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from typing import Any, Final, Literal, Protocol
@@ -668,3 +668,99 @@ class ScheduleRunner:
             "starts_at": starts_at.isoformat(),
             "starts_in_s": max(0, int((starts_at - wall).total_seconds())),
         }
+
+
+# --- the refusal family and the facade-facing surface control (§3/§5) ----------
+
+
+class ScheduleRefusal(Exception):
+    """A schedule publish/read refusal carrying its wire code and details.
+
+    The facade raises exactly this for the surface's 409 shapes (the
+    ``ExcessChargingRefusal`` pattern); the guarded boundary maps ``code``
+    onto the error envelope verbatim.
+    """
+
+    def __init__(self, code: str, message: str, details: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = dict(details or {})
+
+
+class SchedulePublishValidationError(ScheduleValidationError):
+    """The 422 shape: domain rule violations naming the offending entries."""
+
+    def __init__(self, errors: Sequence[Mapping[str, Any]]) -> None:
+        summary = "; ".join(
+            f"{item.get('entry_id') or 'plan'}: {item.get('message')}" for item in errors
+        )
+        super().__init__(summary or "the schedule plan is not valid")
+        self.entry_errors: list[dict[str, Any]] = [dict(item) for item in errors]
+
+
+class SchedulePlanStorePort(Protocol):
+    """The durable singleton plan store (the SQLite/in-memory CAS contract)."""
+
+    def get(self) -> SchedulePlan | None: ...
+
+    def replace(self, *, expected_version: int, replacement: SchedulePlan) -> None: ...
+
+
+class ScheduleSurfaceControl:
+    """The facade-facing half of the composed schedule surface (the P6 block-
+    presence doctrine): the commissioned policy facts, the durable-once night
+    acknowledgement latch, the async plan-store adapter, and the projection
+    read off the bound runner.
+
+    Writers are split by ownership, never by race (the excess-controller
+    pattern): the facade's publish is the only writer of the plan store and
+    the acknowledgement latch; the fleet loop's runner is the single writer
+    of every projection field.  Composition builds this FIRST (the facade
+    projects through it), then the runner, then binds it.
+    """
+
+    def __init__(
+        self,
+        *,
+        policy: SchedulePolicy,
+        store: SchedulePlanStorePort,
+        acknowledged_night_windows: bool,
+    ) -> None:
+        self._policy = policy
+        self._store = store
+        self._acknowledged = bool(acknowledged_night_windows)
+        self._runner: ScheduleRunner | None = None
+
+    def bind_runner(self, runner: ScheduleRunner) -> None:
+        """Bind the runner for the projection read (exactly once)."""
+        if self._runner is not None:
+            raise RuntimeError("the schedule surface control is already bound")
+        self._runner = runner
+
+    @property
+    def policy(self) -> SchedulePolicy:
+        return self._policy
+
+    @property
+    def acknowledged_night_windows(self) -> bool:
+        """The once-ever durable night-partition fact, boot-loaded from the
+        audit store's keyed existence check and latched by the first audited
+        night publish; never re-prompted."""
+        return self._acknowledged
+
+    def mark_night_acknowledged(self) -> None:
+        """Latch the captured fact (after its durable append)."""
+        self._acknowledged = True
+
+    async def get_plan(self) -> SchedulePlan | None:
+        return self._store.get()
+
+    async def replace_plan(self, *, expected_version: int, replacement: SchedulePlan) -> None:
+        self._store.replace(expected_version=expected_version, replacement=replacement)
+
+    def state_payload(self) -> dict[str, Any]:
+        """The projection read; the bound runner is the single writer."""
+        if self._runner is None:  # pragma: no cover - composition binds before serving
+            raise RuntimeError("the schedule surface control has no bound runner")
+        return self._runner.state_payload()

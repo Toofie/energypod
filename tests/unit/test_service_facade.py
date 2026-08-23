@@ -647,6 +647,7 @@ class Rig:
     history: list[str]
     recovery: FakeRecoveryView | None = None
     excess: Any = None
+    schedules: Any = None
 
     def reset_recorders(self) -> None:
         self.intents.added.clear()
@@ -715,6 +716,7 @@ def make_rig(
     bus_sequence: int = 0,
     recovery: FakeRecoveryView | None = None,
     excess: Any = None,
+    schedules: Any = None,
 ) -> Rig:
     clock = FakeClock()
     history: list[str] = []
@@ -754,6 +756,7 @@ def make_rig(
         actors=handles,
         recovery=recovery,
         excess=excess,
+        schedules=schedules,
     )
     return Rig(
         api=api,
@@ -3685,3 +3688,576 @@ async def test_intent_acceptance_events_carry_the_remaining_lifetime(api: Any) -
     accepted = [body for body in rig.bus.published if body["type"] == "intent.accepted"]
     assert len(accepted) == 1
     assert accepted[0]["payload"]["expires_in_s"] == 42.0
+
+
+# --- DESIGN_SCHEDULES §5 B3: the schedule facade surface ------------------------
+
+
+def _scheduling() -> Any:
+    import energypod.application.scheduling as scheduling
+
+    return scheduling
+
+
+class FakeScheduleStore:
+    """In-memory singleton plan store mirroring the SQLite CAS contract."""
+
+    def __init__(self, plan: Any = None) -> None:
+        self.plan = plan
+
+    def get(self) -> Any:
+        return self.plan
+
+    def replace(self, *, expected_version: int, replacement: Any) -> None:
+        from energypod.domain.schedule import ScheduleVersionConflict
+
+        actual = 0 if self.plan is None else self.plan.version
+        if actual != expected_version or replacement.version != expected_version + 1:
+            raise ScheduleVersionConflict(expected_version, actual)
+        self.plan = replacement
+
+
+class FakeScheduleSurface:
+    """Inline stand-in for the composed ScheduleSurfaceControl port."""
+
+    def __init__(
+        self,
+        *,
+        windows: tuple[tuple[str, str], ...] = (("06:00", "20:00"),),
+        acknowledged: bool = False,
+        plan: Any = None,
+        ttl_s: float = 10.0,
+    ) -> None:
+        scheduling = _scheduling()
+        self.policy = scheduling.SchedulePolicy(
+            allowed_windows_local=tuple(
+                (scheduling.parse_hhmm(a), scheduling.parse_hhmm(b)) for a, b in windows
+            ),
+            intent_ttl_s=ttl_s,
+            timezone="Australia/Brisbane",
+        )
+        self.store = FakeScheduleStore(plan)
+        self._acknowledged = acknowledged
+        self.ack_flips = 0
+
+    @property
+    def acknowledged_night_windows(self) -> bool:
+        return self._acknowledged
+
+    def mark_night_acknowledged(self) -> None:
+        self.ack_flips += 1
+        self._acknowledged = True
+
+    async def get_plan(self) -> Any:
+        return self.store.get()
+
+    async def replace_plan(self, *, expected_version: int, replacement: Any) -> None:
+        self.store.replace(expected_version=expected_version, replacement=replacement)
+
+    def state_payload(self) -> dict[str, Any]:
+        return {
+            "version": None if self.store.plan is None else self.store.plan.version,
+            "active": False,
+            "entry_id": None,
+            "held_intent_id": None,
+            "ends_at": None,
+            "ends_in_s": None,
+            "next": None,
+            "posture": self.policy.posture,
+            "last_action": "idle",
+            "last_tick_at": "2026-08-21T01:02:03+00:00",
+            "reason_codes": ["no_window_open"],
+        }
+
+
+def make_schedule_rig(
+    api: Any,
+    surface: FakeScheduleSurface | None = None,
+    **rig_kwargs: Any,
+) -> tuple[Rig, FakeScheduleSurface]:
+    control = surface or FakeScheduleSurface()
+    rig_kwargs.setdefault("units", {"pod-a": {}, "pod-b": {}})
+    return make_rig(api, schedules=control, **rig_kwargs), control
+
+
+def wire_entry(**overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "entry_id": "day-charge",
+        "days": ["fri"],
+        "start_local": "09:00",
+        "end_local": "17:00",
+        "action": "charge",
+        "watts": 1200,
+        "unit_ids": ["pod-a"],
+        "effective_from": "2026-01-01",
+        "effective_until": "2026-12-31",
+        "priority": 0,
+        "enabled": True,
+    }
+    values.update(overrides)
+    return values
+
+
+def publish_kwargs(**overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "principal": OPERATOR,
+        "expected_version": None,
+        "timezone": "Australia/Brisbane",
+        "entries": [wire_entry()],
+        "night_posture": None,
+        "idempotency_key": "publish-key-1",
+        "request_id": "request-p1",
+    }
+    values.update(overrides)
+    return values
+
+
+def _refusal_code_of(error: BaseException) -> tuple[str, dict[str, Any]]:
+    return str(getattr(error, "code", "")), dict(getattr(error, "details", {}) or {})
+
+
+async def test_schedule_surface_without_a_composed_block_is_not_commissioned(api: Any) -> None:
+    rig = make_rig(api)
+
+    with pytest.raises(Exception) as caught_get:
+        await rig.facade.get_schedule(principal=OPERATOR)
+    with pytest.raises(Exception) as caught_put:
+        await rig.facade.replace_schedule(**publish_kwargs())
+
+    assert _refusal_code_of(caught_get.value)[0] == "schedule_not_commissioned"
+    assert _refusal_code_of(caught_put.value)[0] == "schedule_not_commissioned"
+
+
+async def test_get_schedule_serves_the_contract_view_before_the_first_publish(api: Any) -> None:
+    rig, _surface = make_schedule_rig(api)
+
+    view = await rig.facade.get_schedule(principal=OPERATOR)
+
+    assert view["plan"] is None
+    assert view["policy"] == {
+        "posture": "yield",
+        "allowed_windows_local": [["06:00", "20:00"]],
+        "intent_ttl_s": 10.0,
+    }
+    assert view["acknowledged_night_windows"] is False
+    assert view["next_action"] is None
+    assert rig.intents.added == [], "a read view never triggers control"
+
+
+async def test_get_schedule_answers_the_stored_plan_and_next_action(api: Any) -> None:
+    rig, _surface = make_schedule_rig(api)
+    await rig.facade.replace_schedule(**publish_kwargs())
+
+    view = await rig.facade.get_schedule(principal=OPERATOR)
+
+    assert view["plan"] is not None and view["plan"]["version"] == 1
+    assert view["plan"]["timezone"] == "Australia/Brisbane"
+    entry = view["plan"]["entries"][0]
+    assert entry["entry_id"] == "day-charge"
+    assert entry["days"] == ["fri"]
+    assert entry["watts"] == 1200
+    assert "watts_by_unit" not in entry
+    assert view["next_action"]["entry_id"] == "day-charge"
+    assert "starts_at" in view["next_action"] and "starts_in_s" in view["next_action"]
+
+
+async def test_replace_schedule_requires_dispatch_and_an_interactive_principal(api: Any) -> None:
+    rig, _surface = make_schedule_rig(api)
+    viewer = Principal(subject="person:viewer", scopes=frozenset({"observe"}))
+    automation = Principal(
+        subject="service:automation", scopes=frozenset({"observe", "dispatch"}), interactive=False
+    )
+
+    # GET is observe-only; PUT needs dispatch AND an interactive principal.
+    await rig.facade.get_schedule(principal=viewer)
+    with pytest.raises(PermissionError):
+        await rig.facade.replace_schedule(**publish_kwargs(principal=viewer))
+    with pytest.raises(PermissionError):
+        await rig.facade.replace_schedule(**publish_kwargs(principal=automation))
+
+
+async def test_first_publish_stores_the_plan_audits_and_publishes_the_replacement(
+    api: Any,
+) -> None:
+    rig, surface = make_schedule_rig(api)
+
+    result = await rig.facade.replace_schedule(**publish_kwargs())
+
+    assert result["version"] == 1
+    assert result["diff"] == {
+        "added": ["day-charge"],
+        "removed": [],
+        "changed": [],
+        "timezone_changed": False,
+    }
+    assert result["acknowledged_night_windows"] is False
+    assert surface.store.plan is not None and surface.store.plan.version == 1
+    replaced = [event for event in rig.audit.appended if event.event_type == "schedule_replaced"]
+    assert len(replaced) == 1
+    assert replaced[0].result == "replaced"
+    assert replaced[0].principal == OPERATOR.subject
+    assert replaced[0].correlation_id == "facade:schedule_replaced:request-p1"
+    announced = [body for body in rig.bus.published if body["type"] == "schedule.replaced"]
+    assert len(announced) == 1
+    assert announced[0]["payload"]["principal"] == OPERATOR.subject
+    assert announced[0]["payload"]["version"] == 1
+    assert announced[0]["payload"]["diff"]["added"] == ["day-charge"]
+
+
+async def test_publish_carries_per_unit_watts_as_the_native_form(api: Any) -> None:
+    rig, surface = make_schedule_rig(api)
+
+    result = await rig.facade.replace_schedule(
+        **publish_kwargs(
+            entries=[
+                wire_entry(
+                    watts=None,
+                    watts_by_unit={"pod-a": 800, "pod-b": 700},
+                    unit_ids=["pod-a", "pod-b"],
+                )
+            ],
+        )
+    )
+
+    stored = surface.store.plan.entries[0]
+    assert dict(stored.watts_by_unit or {}) == {"pod-a": 800, "pod-b": 700}
+    assert stored.watts == 1500
+    assert result["plan"]["entries"][0]["watts_by_unit"] == {"pod-a": 800, "pod-b": 700}
+    assert "watts" not in result["plan"]["entries"][0]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"watts": 1500, "watts_by_unit": {"pod-a": 1500}},
+        {"watts": None},
+        {"action": "idle", "watts": 100},
+        {"action": "idle", "watts": 0, "watts_by_unit": {"pod-a": 0}},
+        {"unit_ids": ["pod-ghost"]},
+        {"unit_ids": []},
+        {"days": ["monday"]},
+        {"days": []},
+        {"start_local": "9:00"},
+        {"start_local": "25:00"},
+        {"end_local": "09:00:00+10:00"},
+        {"effective_from": "2026-13-01"},
+        {"priority": "high"},
+        {"enabled": "yes"},
+        {"watts_by_unit": {"pod-a": 0}, "watts": None},
+        {"watts_by_unit": {"pod-b": 900}, "watts": None},
+    ],
+)
+async def test_per_entry_validation_errors_name_the_offending_entry(
+    api: Any, mutation: dict[str, Any]
+) -> None:
+    rig, surface = make_schedule_rig(api)
+
+    with pytest.raises(ValueError) as caught:
+        await rig.facade.replace_schedule(**publish_kwargs(entries=[wire_entry(**mutation)]))
+
+    errors = getattr(caught.value, "entry_errors", None)
+    assert errors, "the wire names the offending entry on every 422"
+    assert errors[0]["entry_id"] == "day-charge"
+    assert surface.store.plan is None
+    assert rig.audit.appended == []
+
+
+async def test_plan_level_validation_names_the_plan_not_an_entry(api: Any) -> None:
+    rig, surface = make_schedule_rig(api)
+
+    with pytest.raises(ValueError) as caught:
+        await rig.facade.replace_schedule(
+            **publish_kwargs(
+                entries=[
+                    wire_entry(entry_id="same", start_local="09:00", end_local="11:00"),
+                    wire_entry(entry_id="same", start_local="12:00", end_local="13:00"),
+                ]
+            )
+        )
+
+    assert caught.value.entry_errors[0]["entry_id"] is None
+    assert surface.store.plan is None
+
+    with pytest.raises(ValueError) as overlap:
+        await rig.facade.replace_schedule(
+            **publish_kwargs(
+                entries=[
+                    wire_entry(entry_id="a", start_local="09:00", end_local="11:00"),
+                    wire_entry(entry_id="b", start_local="10:00", end_local="12:00"),
+                ]
+            )
+        )
+    message = overlap.value.entry_errors[0]["message"]
+    assert "overlap" in message
+
+
+async def test_an_unknown_timezone_is_a_validation_error(api: Any) -> None:
+    rig, _surface = make_schedule_rig(api)
+
+    with pytest.raises(ValueError):
+        await rig.facade.replace_schedule(**publish_kwargs(timezone="Australia/NotAZone"))
+
+
+async def test_enabled_entries_outside_the_allowed_windows_are_refused(api: Any) -> None:
+    rig, surface = make_schedule_rig(api)
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.replace_schedule(
+            **publish_kwargs(entries=[wire_entry(start_local="22:30", end_local="06:00")])
+        )
+
+    code, details = _refusal_code_of(caught.value)
+    assert code == "schedule_window_not_allowed"
+    assert details["posture"] == "yield"
+    assert details["allowed_windows_local"] == [["06:00", "20:00"]]
+    assert details["offending"] == [
+        {"entry_id": "day-charge", "start_local": "22:30", "end_local": "06:00"}
+    ]
+    assert surface.store.plan is None
+    assert rig.audit.appended == []
+
+
+async def test_disabled_entries_are_exempt_from_the_window_gate(api: Any) -> None:
+    rig, surface = make_schedule_rig(api)
+
+    await rig.facade.replace_schedule(
+        **publish_kwargs(
+            entries=[wire_entry(start_local="22:30", end_local="06:00", enabled=False)]
+        )
+    )
+
+    assert surface.store.plan is not None, "a disabled entry commands nothing"
+
+
+def _night_surface() -> FakeScheduleSurface:
+    return FakeScheduleSurface(windows=(("00:00", "06:00"), ("06:00", "20:00")), acknowledged=False)
+
+
+async def test_first_night_publish_requires_the_one_time_acknowledgement(api: Any) -> None:
+    surface = _night_surface()
+    rig, _control = make_schedule_rig(api, surface)
+    night = wire_entry(start_local="00:01", end_local="05:59")
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.replace_schedule(**publish_kwargs(entries=[night]))
+
+    code, details = _refusal_code_of(caught.value)
+    assert code == "night_posture_acknowledgement_required"
+    assert details == {"acknowledgement": "PARTITION_ACKNOWLEDGED"}
+    assert surface.store.plan is None
+
+
+async def test_the_acknowledgement_lands_durably_first_and_only_once(api: Any) -> None:
+    surface = _night_surface()
+    rig, _control = make_schedule_rig(api, surface)
+    night = wire_entry(start_local="00:01", end_local="05:59")
+
+    first = await rig.facade.replace_schedule(
+        **publish_kwargs(entries=[night], night_posture="PARTITION_ACKNOWLEDGED")
+    )
+
+    from energypod.application.service import SCHEDULE_NIGHT_ACK_EVENT_ID
+
+    ack_rows = [
+        event
+        for event in rig.audit.appended
+        if event.event_type == "schedule_night_windows_acknowledged"
+    ]
+    assert len(ack_rows) == 1
+    assert ack_rows[0].event_id == SCHEDULE_NIGHT_ACK_EVENT_ID
+    assert ack_rows[0].result == "acknowledged"
+    assert first["acknowledged_night_windows"] is True
+
+    second = await rig.facade.replace_schedule(
+        **publish_kwargs(expected_version=1, entries=[night], night_posture=None)
+    )
+    assert second["acknowledged_night_windows"] is True
+    assert surface.ack_flips == 1
+
+
+async def test_an_audit_failure_refuses_the_night_publish_with_nothing_consumed(
+    api: Any,
+) -> None:
+    surface = _night_surface()
+    rig, _control = make_schedule_rig(api, surface)
+    rig.audit.failing = True
+    night = wire_entry(start_local="00:01", end_local="05:59")
+
+    with pytest.raises(OSError):
+        await rig.facade.replace_schedule(
+            **publish_kwargs(entries=[night], night_posture="PARTITION_ACKNOWLEDGED")
+        )
+
+    assert surface.store.plan is None
+    assert surface.acknowledged_night_windows is False
+
+
+async def test_a_stale_expected_version_is_an_honest_conflict(api: Any) -> None:
+    rig, surface = make_schedule_rig(api)
+    await rig.facade.replace_schedule(**publish_kwargs())
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.replace_schedule(**publish_kwargs(expected_version=None))
+
+    code, details = _refusal_code_of(caught.value)
+    assert code == "schedule_version_conflict"
+    assert details == {"current_version": 1}
+    assert surface.store.plan.version == 1
+
+
+async def test_a_non_null_expected_against_no_plan_is_a_conflict(api: Any) -> None:
+    rig, _surface = make_schedule_rig(api)
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.replace_schedule(**publish_kwargs(expected_version=4))
+
+    code, details = _refusal_code_of(caught.value)
+    assert code == "schedule_version_conflict"
+    assert details == {"current_version": None}
+
+
+async def test_the_diff_summary_names_added_removed_and_changed(api: Any) -> None:
+    rig, _surface = make_schedule_rig(api)
+    await rig.facade.replace_schedule(
+        **publish_kwargs(
+            entries=[
+                wire_entry(entry_id="keep", start_local="09:00", end_local="11:00"),
+                wire_entry(entry_id="old", start_local="12:00", end_local="13:00"),
+            ]
+        )
+    )
+
+    result = await rig.facade.replace_schedule(
+        **publish_kwargs(
+            expected_version=1,
+            entries=[
+                wire_entry(entry_id="keep", start_local="09:00", end_local="11:00", watts=900),
+                wire_entry(entry_id="new", start_local="12:00", end_local="13:00"),
+            ],
+        )
+    )
+
+    assert result["version"] == 2
+    assert result["diff"] == {
+        "added": ["new"],
+        "removed": ["old"],
+        "changed": ["keep"],
+        "timezone_changed": False,
+    }
+    timezone_moved = await rig.facade.replace_schedule(
+        **publish_kwargs(
+            expected_version=2,
+            timezone="Australia/Perth",
+            entries=[
+                wire_entry(entry_id="keep", start_local="09:00", end_local="11:00", watts=900)
+            ],
+        )
+    )
+    assert timezone_moved["diff"]["timezone_changed"] is True
+
+
+async def test_a_failed_record_after_commit_restores_the_prior_plan(api: Any) -> None:
+    rig, surface = make_schedule_rig(api)
+    await rig.facade.replace_schedule(**publish_kwargs())
+    original = surface.store.plan
+    rig.audit.failing = True
+
+    with pytest.raises(OSError):
+        await rig.facade.replace_schedule(
+            **publish_kwargs(expected_version=1, entries=[wire_entry(watts=900)])
+        )
+
+    assert surface.store.plan.version == 3, "compensated to a fresh version of the prior plan"
+    assert surface.store.plan.entries == original.entries
+    assert surface.store.plan.timezone == original.timezone
+
+
+async def test_a_failed_record_after_the_first_publish_restores_an_empty_plan(api: Any) -> None:
+    rig, surface = make_schedule_rig(api)
+    rig.audit.fail_first_appends = 1
+
+    with pytest.raises(OSError):
+        await rig.facade.replace_schedule(**publish_kwargs())
+
+    assert surface.store.plan is not None
+    assert surface.store.plan.entries == (), "the nearest inverse the CAS port allows: off"
+
+
+async def test_the_snapshot_carries_schedule_state_exactly_when_composed(api: Any) -> None:
+    rig, surface = make_schedule_rig(api)
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    assert snapshot["schedule_state"] == surface.state_payload()
+    bare = await make_rig(api).facade.snapshot(principal=OPERATOR)
+    assert "schedule_state" not in bare
+
+
+def _runner_principal() -> Principal:
+    return Principal(
+        subject="energypod:schedule-runner",
+        scopes=frozenset({"observe", "dispatch"}),
+        interactive=False,
+    )
+
+
+async def test_submit_schedule_intent_is_the_advisory_twin_with_schedule_mintage(
+    api: Any,
+) -> None:
+    rig = make_rig(api)
+
+    result = await rig.facade.submit_schedule_intent(
+        unit_ids=["pod-a", "pod-b"],
+        direction="charge",
+        watts=2000,
+        ttl_s=10.0,
+        principal=_runner_principal(),
+    )
+
+    assert result["intent_id"].startswith("schedule-")
+    stored = rig.intents.added[-1]
+    assert stored.source.value == "schedule"
+    assert stored.watts == 2000
+    assert rig.audit.appended[-1].event_type == "intent_accepted"
+    assert rig.audit.appended[-1].source.value == "schedule"
+    announced = [body for body in rig.bus.published if body["type"] == "intent.accepted"]
+    assert announced[-1]["payload"]["principal"] == "energypod:schedule-runner"
+
+
+async def test_submit_schedule_intent_carries_per_unit_watts_and_compensates(api: Any) -> None:
+    rig = make_rig(api)
+
+    result = await rig.facade.submit_schedule_intent(
+        unit_ids=["pod-a", "pod-b"],
+        direction="charge",
+        watts=None,
+        watts_by_unit={"pod-a": 600, "pod-b": 700},
+        ttl_s=10.0,
+        principal=_runner_principal(),
+    )
+
+    stored = rig.intents.added[-1]
+    assert dict(stored.watts_by_unit or {}) == {"pod-a": 600, "pod-b": 700}
+    assert stored.watts == 1300
+    assert result["requested"]["watts_by_unit"] == {"pod-a": 600, "pod-b": 700}
+
+    failing = await rig.facade.submit_schedule_intent(
+        unit_ids=["pod-a"],
+        direction="charge",
+        watts=500,
+        ttl_s=10.0,
+        principal=_runner_principal(),
+    )
+    assert failing["intent_id"] != stored.id
+    live_before = {intent.id for intent in rig.intents.added} - set(rig.intents.removed)
+    rig.audit.failing = True
+    with pytest.raises(OSError):
+        await rig.facade.submit_schedule_intent(
+            unit_ids=["pod-b"],
+            direction="charge",
+            watts=500,
+            ttl_s=10.0,
+            principal=_runner_principal(),
+        )
+    live_after = {intent.id for intent in rig.intents.added} - set(rig.intents.removed)
+    assert live_after == live_before, "a submission whose record failed leaves nothing stored"

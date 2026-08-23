@@ -49,6 +49,13 @@ from energypod.domain.audit import AuditEvent
 
 from .arbiter import IntentArbiter
 from .excess_charge import ExcessChargingRefusal
+from .scheduling import (
+    SchedulePolicy,
+    SchedulePublishValidationError,
+    ScheduleRefusal,
+    next_start,
+    schedule_wire_plan,
+)
 
 # DESIGN_EXCESS_ACTIVATION §3 P3: the once-ever net-billing acknowledgement
 # is ONE durable audit fact with a deterministic event id — the store's own
@@ -56,6 +63,25 @@ from .excess_charge import ExcessChargingRefusal
 # existence check instead of an unbounded audit scan.
 EXCESS_ECONOMICS_ACK_EVENT_ID: Final[str] = "excess-charging-economics-acknowledged"
 EXCESS_ECONOMICS_ASSERTION: Final[str] = "This site's billing nets across phases"
+
+# DESIGN_SCHEDULES §3: the once-ever night-partition acknowledgement is the
+# exact NET_BILLED mechanics — one durable audit fact with a deterministic
+# event id, boot-loaded via one keyed existence check, never re-prompted.
+SCHEDULE_NIGHT_ACK_EVENT_ID: Final[str] = "schedule-night-windows-acknowledged"
+# DESIGN_SCHEDULES §8 item 2, the captured assertion verbatim.
+SCHEDULE_NIGHT_ASSERTION: Final[str] = (
+    "the external writer applications stand down for the granted window; the controller owns it"
+)
+# The lower-case three-letter day names of the schedule wire (§5).
+_SCHEDULE_WIRE_DAYS: Final[dict[str, int]] = {
+    "mon": 0,
+    "tue": 1,
+    "wed": 2,
+    "thu": 3,
+    "fri": 4,
+    "sat": 5,
+    "sun": 6,
+}
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -214,6 +240,31 @@ class ExcessChargingControl(Protocol):
     def set_participation(self, *, enabled: bool) -> None: ...
 
     def mark_acknowledged(self) -> None: ...
+
+    def state_payload(self) -> dict[str, Any]: ...
+
+
+class ScheduleSurface(Protocol):
+    """The composed schedule surface's facade-facing half (P6 block presence).
+
+    ``energypod.application.scheduling.ScheduleSurfaceControl`` is the
+    composed implementation.  The facade PROJECTS the policy facts, flips
+    only the acknowledgement latch (after its durable append), and performs
+    every plan mutation through the store's CAS port; the fleet loop's
+    runner remains the single writer of the projection.
+    """
+
+    @property
+    def policy(self) -> SchedulePolicy: ...
+
+    @property
+    def acknowledged_night_windows(self) -> bool: ...
+
+    def mark_night_acknowledged(self) -> None: ...
+
+    async def get_plan(self) -> Any | None: ...
+
+    async def replace_plan(self, *, expected_version: int, replacement: Any) -> None: ...
 
     def state_payload(self) -> dict[str, Any]: ...
 
@@ -455,6 +506,216 @@ def _authorized_projection(capability: Any) -> dict[str, Any] | None:
     return {"direction": _enum_value(capability.direction), "watts": int(capability.watts)}
 
 
+def _schedule_entry_error(entry_id: Any, message: str) -> dict[str, Any]:
+    return {"entry_id": entry_id if isinstance(entry_id, str) else None, "message": message}
+
+
+def _parse_wire_hhmm(value: str) -> Any:
+    from datetime import time as _time
+
+    parts = value.split(":")
+    if len(parts) not in (2, 3) or not all(part.isdigit() and len(part) == 2 for part in parts):
+        raise ValueError("not HH:MM")
+    hour, minute = int(parts[0]), int(parts[1])
+    second = int(parts[2]) if len(parts) == 3 else 0
+    if hour > 23 or minute > 59 or second > 59:
+        raise ValueError("not a civil time")
+    return _time(hour, minute, second)
+
+
+def _parse_schedule_wire_entries(
+    raw_entries: Any, known_units: Mapping[str, Any]
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    """Parse the §5 PUT wire entries into domain entries, collecting errors.
+
+    Every per-entry failure names its ``entry_id`` on the error (the wire
+    contract's one-to-one mapping); plan-level rules (duplicate ids,
+    equal-priority overlaps) are judged by ``SchedulePlan`` construction and
+    carry a null entry id.  The watt form is exactly one of scalar ``watts``
+    or ``watts_by_unit`` — never both, never neither — and the fleet total
+    is derived as the sum of the per-unit targets.
+    """
+    from datetime import date as _date
+
+    from energypod.domain.schedule import (
+        ScheduleEntry,
+        SchedulePlan,
+        ScheduleValidationError,
+        Weekday,
+    )
+
+    if isinstance(raw_entries, str | bytes) or not isinstance(raw_entries, Sequence):
+        raise SchedulePublishValidationError(
+            [{"entry_id": None, "message": "entries must be a list of schedule entries"}]
+        )
+    errors: list[dict[str, Any]] = []
+    parsed: list[ScheduleEntry] = []
+    for item in raw_entries:
+        if not isinstance(item, Mapping):
+            errors.append(_schedule_entry_error(None, "each entry must be an object"))
+            continue
+        entry_id = item.get("entry_id")
+
+        def err(message: str, entry_id: Any = entry_id) -> None:
+            errors.append(_schedule_entry_error(entry_id, message))
+
+        days_raw = item.get("days")
+        if isinstance(days_raw, str | bytes) or not isinstance(days_raw, Sequence) or not days_raw:
+            err("days must be a non-empty list of three-letter day names")
+            continue
+        day_values: set[int] = set()
+        if any(
+            not isinstance(day, str) or _SCHEDULE_WIRE_DAYS.get(day) is None for day in days_raw
+        ):
+            err("days must be lowercase three-letter day names (mon..sun)")
+            continue
+        day_values.update(_SCHEDULE_WIRE_DAYS[day] for day in days_raw if isinstance(day, str))
+        times: dict[str, Any] = {}
+        for field in ("start_local", "end_local"):
+            value = item.get(field)
+            try:
+                if not isinstance(value, str):
+                    raise ValueError("not a string")
+                times[field] = _parse_wire_hhmm(value)
+            except ValueError:
+                err(f"{field} must be an HH:MM civil time")
+                break
+        if len(times) != 2:
+            continue
+        action_raw = item.get("action")
+        try:
+            action = Direction(action_raw if isinstance(action_raw, str) else "")
+        except ValueError:
+            err("action must be charge, discharge, or idle")
+            continue
+        units_raw = item.get("unit_ids")
+        if (
+            isinstance(units_raw, str | bytes)
+            or not isinstance(units_raw, Sequence)
+            or not units_raw
+            or any(not isinstance(unit, str) or unit not in known_units for unit in units_raw)
+        ):
+            err("unit_ids must be a non-empty list of units known on this site")
+            continue
+        unit_ids = list(units_raw)
+        watts = item.get("watts")
+        watts_by_unit = item.get("watts_by_unit")
+        if watts is not None and watts_by_unit is not None:
+            err("send watts or watts_by_unit, never both")
+            continue
+        resolved_watts: int
+        resolved_per_unit: dict[str, int] | None = None
+        if watts_by_unit is not None:
+            if not isinstance(watts_by_unit, Mapping):
+                err("watts_by_unit must be a mapping of unit to watts")
+                continue
+            values = dict(watts_by_unit)
+            if (
+                any(not isinstance(key, str) for key in values)
+                or any(isinstance(v, bool) or type(v) is not int or v <= 0 for v in values.values())
+                or set(values) != set(unit_ids)
+            ):
+                err("watts_by_unit must name every selected unit with positive integers")
+                continue
+            resolved_per_unit = values
+            resolved_watts = sum(values.values())
+        elif watts is None:
+            err("exactly one of watts or watts_by_unit is required")
+            continue
+        elif isinstance(watts, bool) or type(watts) is not int or watts < 0:
+            err("watts must be a non-negative integer")
+            continue
+        else:
+            resolved_watts = watts
+        dates: dict[str, Any] = {}
+        for field in ("effective_from", "effective_until"):
+            value = item.get(field)
+            try:
+                if not isinstance(value, str):
+                    raise ValueError("not a string")
+                dates[field] = _date.fromisoformat(value)
+            except ValueError:
+                err(f"{field} must be an ISO date")
+                break
+        if len(dates) != 2:
+            continue
+        priority = item.get("priority")
+        if isinstance(priority, bool) or type(priority) is not int:
+            err("priority must be an integer")
+            continue
+        enabled = item.get("enabled")
+        if type(enabled) is not bool:
+            err("enabled must be a boolean")
+            continue
+        try:
+            parsed.append(
+                ScheduleEntry(
+                    entry_id=entry_id if isinstance(entry_id, str) else "",
+                    days=frozenset(Weekday(day) for day in day_values),
+                    start_local=times["start_local"],
+                    end_local=times["end_local"],
+                    action=action,
+                    watts=resolved_watts,
+                    unit_ids=frozenset(unit_ids),
+                    effective_from=dates["effective_from"],
+                    effective_until=dates["effective_until"],
+                    priority=priority,
+                    enabled=enabled,
+                    watts_by_unit=resolved_per_unit,
+                )
+            )
+        except ScheduleValidationError as exc:
+            err(str(exc))
+    if errors:
+        return [], errors
+    try:
+        # Plan-level rules (duplicate ids, equal-priority overlaps) judged on
+        # a throwaway version; the real version is minted at the CAS below.
+        SchedulePlan(version=1, timezone="Australia/Brisbane", entries=tuple(parsed))
+    except ScheduleValidationError as exc:
+        return [], [_schedule_entry_error(None, str(exc))]
+    return parsed, []
+
+
+def _schedule_diff(old: Any | None, new: Any) -> dict[str, Any]:
+    """The publish's diff summary, entry-by-entry on ``entry_id``.
+
+    Same id and equal shape = unchanged; same id, different shape = changed;
+    an id on only one side = added/removed.  Exactly what the audit row and
+    the Activity sentence carry (DESIGN_SCHEDULES §5).
+    """
+    old_by_id = {entry.entry_id: entry for entry in (old.entries if old is not None else ())}
+    new_by_id = {entry.entry_id: entry for entry in new.entries}
+    added = sorted(set(new_by_id) - set(old_by_id))
+    removed = sorted(set(old_by_id) - set(new_by_id))
+    changed = sorted(
+        entry_id
+        for entry_id in set(old_by_id) & set(new_by_id)
+        if old_by_id[entry_id] != new_by_id[entry_id]
+    )
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "timezone_changed": old is not None and old.timezone != new.timezone,
+    }
+
+
+def _schedule_next_action(plan: Any, wall: Any) -> dict[str, Any] | None:
+    """The §5 ``next_action`` view off the pure helpers, server-computed."""
+    from .scheduling import schedule_wire_entry
+
+    found = next_start(plan, wall)
+    if found is None:
+        return None
+    entry, starts_at = found
+    return {
+        **schedule_wire_entry(entry),
+        "starts_at": starts_at.isoformat(),
+        "starts_in_s": max(0, int((starts_at - wall).total_seconds())),
+    }
+
+
 def _optional_float(raw: Any) -> float | None:
     if isinstance(raw, int | float) and not isinstance(raw, bool):
         return float(raw)
@@ -617,6 +878,7 @@ class EnergyServiceFacade:
         actors: Mapping[str, ActorHandle],
         recovery: RecoveryView | None = None,
         excess: ExcessChargingControl | None = None,
+        schedules: ScheduleSurface | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -637,8 +899,10 @@ class EnergyServiceFacade:
         self._actors = handles
         self._recovery = recovery
         self._excess = excess
+        self._schedules = schedules
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
+        self._schedule_correlations = itertools.count(1)
         self._latched_stops: dict[str, _LatchedStop] = {}
         self._acknowledged_stops: set[str] = set()
         self._process_instance_id = f"facade-{uuid.uuid4().hex}"
@@ -675,6 +939,13 @@ class EnergyServiceFacade:
             # is composed (including while suspended), ABSENT when the block
             # is absent — the same feature-detected addition pattern.
             view["adviser_state"] = self._excess.state_payload()
+        if self._schedules is not None:
+            # DESIGN_SCHEDULES §5: the schedule_state projection rides TOP
+            # LEVEL beside ``intent`` and ``adviser_state``, present whenever
+            # the ``schedule`` block is composed, ABSENT when it is not —
+            # the same feature-detected addition pattern, single writer the
+            # runner's post-tick update.
+            view["schedule_state"] = self._schedules.state_payload()
         # Console truth (2026-08-23): a latched emergency stop must be
         # visible in a snapshot taken after the latch event, not only on
         # the event stream.  Only non-acknowledged latches appear -- an
@@ -785,6 +1056,35 @@ class EnergyServiceFacade:
             if type(oldest) is int:
                 next_cursor = oldest
         return {"events": events, "next_cursor": next_cursor}
+
+    async def get_schedule(self, *, principal: Principal) -> dict[str, Any]:
+        """The §5 GET view: plan, policy posture, the durable night fact, next.
+
+        Repository and pure-function reads only — never triggers control.
+        Answers 409 ``schedule_not_commissioned`` when the config block is
+        absent (the P6 block-presence doctrine: an absent block composes
+        nothing at all).
+        """
+        self._admit(principal, "observe")
+        surface = self._schedules
+        if surface is None:
+            raise ScheduleRefusal(
+                "schedule_not_commissioned",
+                "the schedule feature is not composed on this site",
+            )
+        plan = await surface.get_plan()
+        policy = surface.policy
+        wall = self._clock.wall_now()
+        return {
+            "plan": None if plan is None else schedule_wire_plan(plan),
+            "policy": {
+                "posture": policy.posture,
+                "allowed_windows_local": policy.wire_windows(),
+                "intent_ttl_s": policy.intent_ttl_s,
+            },
+            "acknowledged_night_windows": surface.acknowledged_night_windows,
+            "next_action": None if plan is None else _schedule_next_action(plan, wall),
+        }
 
     # --- mutations ----------------------------------------------------------
 
@@ -1014,6 +1314,130 @@ class EnergyServiceFacade:
             "requested": {
                 "direction": resolved_direction.value,
                 "watts": resolved_watts,
+            },
+            "authorized": None,
+            "measured": None,
+            "expires_in_s": duration_s,
+        }
+
+    async def submit_schedule_intent(
+        self,
+        *,
+        unit_ids: Any,
+        direction: Any,
+        watts: Any,
+        ttl_s: Any,
+        reason: Any = None,
+        principal: Principal,
+        idempotency_key: Any = None,
+        request_id: Any = None,
+        watts_by_unit: Any = None,
+    ) -> dict[str, Any]:
+        """Accept one internal SCHEDULE intent; the runner's submission twin.
+
+        DESIGN_SCHEDULES §2: the exact ``submit_advisory_intent`` pattern —
+        same validation, audit event type, idempotency/correlation contract,
+        and publication — with the mintage source pinned to ``SCHEDULE`` and
+        its own intent-id prefix (``schedule-``), so audit attribution
+        separates the automation principal plus ``schedule`` tag from every
+        console, agent, and adviser row.  Composition-only wiring: never
+        routed on REST or MCP, and only the composed
+        ``energypod:schedule-runner`` principal ever reaches it.  The
+        per-battery watt form is native (the 2026-08-23 operator ruling),
+        exactly as on REST dispatch.
+        """
+        self._admit(principal, "dispatch")
+        units = _validated_units(unit_ids)
+        unknown = [unit_id for unit_id in units if unit_id not in self._actors]
+        if unknown:
+            raise ValueError(f"unknown units requested: {unknown}")
+        await self._refuse_undispatchable_modes(units)
+        resolved_direction = _dispatch_direction(direction)
+        resolved_watts, resolved_per_unit = _dispatch_watts(watts, watts_by_unit, units)
+        duration_s = _positive_duration(ttl_s)
+        _reason_text(reason, required=False)
+        resolved_idempotency = (
+            self._schedule_key("idempotency") if idempotency_key is None else idempotency_key
+        )
+        _correlation_key(resolved_idempotency, "idempotency_key")
+        request_source = self._schedule_key("request") if request_id is None else request_id
+        request = _correlation_key(request_source, "request_id")
+
+        now_mono = float(self._clock.monotonic())
+        revision = self._next_revision()
+        intent_id = f"schedule-{revision}-{now_mono:.6f}"
+        intent = PowerIntent(
+            id=intent_id,
+            source=IntentSource.SCHEDULE,
+            selected_unit_ids=frozenset(units),
+            direction=resolved_direction,
+            watts=resolved_watts,
+            watts_by_unit=resolved_per_unit,
+            duration_s=duration_s,
+            accepted_at_mono=now_mono,
+            acceptance_revision=revision,
+            actor_identity=principal.subject,
+        )
+        await self._intents.add(intent)
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="intent_accepted",
+                    subject=principal.subject,
+                    result="accepted",
+                    request_id=request,
+                    source=IntentSource.SCHEDULE,
+                    intent_id=intent_id,
+                    reason_codes=("accepted",),
+                    lifecycle=UnitLifecycle.DISARMED,
+                    payload={
+                        "direction": resolved_direction.value,
+                        "unit_ids": sorted(units),
+                        "watts": resolved_watts,
+                        **(
+                            {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                            if resolved_per_unit is not None
+                            else {}
+                        ),
+                    },
+                )
+            )
+            await self._publish(
+                "intent.accepted",
+                {
+                    "principal": principal.subject,
+                    "intent_id": intent_id,
+                    "direction": resolved_direction.value,
+                    "watts": resolved_watts,
+                    **(
+                        {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                        if resolved_per_unit is not None
+                        else {}
+                    ),
+                    "unit_ids": sorted(units),
+                    "expires_in_s": duration_s,
+                },
+            )
+        except Exception:
+            # Atomic with its audit and publication exactly like submit_intent
+            # and submit_advisory_intent: a schedule drive that failed here
+            # must leave nothing stored for the kernel to arbitrate on.
+            with contextlib.suppress(Exception):
+                await self._intents.remove(intent_id)
+            raise
+        return {
+            "intent_id": intent_id,
+            "acceptance_revision": revision,
+            "accepted_at_monotonic": now_mono,
+            "status": "accepted",
+            "requested": {
+                "direction": resolved_direction.value,
+                "watts": resolved_watts,
+                **(
+                    {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                    if resolved_per_unit is not None
+                    else {}
+                ),
             },
             "authorized": None,
             "measured": None,
@@ -1654,6 +2078,218 @@ class EnergyServiceFacade:
             "adviser_state": control.state_payload(),
         }
 
+    async def replace_schedule(
+        self,
+        *,
+        principal: Principal,
+        expected_version: Any,
+        timezone: Any,
+        entries: Any,
+        night_posture: Any = None,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """Whole-plan CAS publish (§5 PUT): validate, gate, commit, record.
+
+        The pinned validation order: (1) 422 validation — shape and every
+        domain rule, per-entry; (2) 409 ``schedule_window_not_allowed`` — the
+        §3 containment rule; (3) 409 ``night_posture_acknowledgement_required``
+        — the one-time gate, whose durable acknowledgement lands FIRST (an
+        audit failure refuses the publish — no night plan without the fact);
+        (4) 409 ``schedule_version_conflict`` — the CAS itself.  The commit
+        rides the Impl-10 commit-then-audit doctrine with ``submit_intent``'s
+        compensating shape: an audit/publication failure after the commit
+        restores the prior plan and surfaces the error — a publish is either
+        stored-and-recorded or rolled back, never stored-and-silent.
+        """
+        from energypod.domain.schedule import SchedulePlan, ScheduleValidationError
+
+        self._admit(principal, "dispatch", interactive=True)
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        surface = self._schedules
+        if surface is None:
+            raise ScheduleRefusal(
+                "schedule_not_commissioned",
+                "the schedule feature is not composed on this site",
+            )
+        # (1) 422 validation — request shape first, then per-entry/domain.
+        if expected_version is not None and (
+            isinstance(expected_version, bool)
+            or type(expected_version) is not int
+            or expected_version < 0
+        ):
+            raise SchedulePublishValidationError(
+                [
+                    {
+                        "entry_id": None,
+                        "message": "expected_version must be a non-negative integer or null",
+                    }
+                ]
+            )
+        if night_posture is not None and night_posture != "PARTITION_ACKNOWLEDGED":
+            raise SchedulePublishValidationError(
+                [
+                    {
+                        "entry_id": None,
+                        "message": "night_posture must be PARTITION_ACKNOWLEDGED when present",
+                    }
+                ]
+            )
+        if not isinstance(timezone, str) or not timezone:
+            raise SchedulePublishValidationError(
+                [{"entry_id": None, "message": "timezone must be an IANA timezone"}]
+            )
+        parsed_entries, entry_errors = _parse_schedule_wire_entries(entries, self._actors)
+        if entry_errors:
+            raise SchedulePublishValidationError(entry_errors)
+        try:
+            SchedulePlan(version=1, timezone=timezone, entries=tuple(parsed_entries))
+        except ScheduleValidationError as exc:
+            raise SchedulePublishValidationError([_schedule_entry_error(None, str(exc))]) from exc
+        # (2) 409 schedule_window_not_allowed — the §3 containment rule over
+        # every ENABLED entry (a disabled entry commands nothing).
+        policy = surface.policy
+        offending = [
+            {
+                "entry_id": entry.entry_id,
+                "start_local": entry.start_local.strftime("%H:%M"),
+                "end_local": entry.end_local.strftime("%H:%M"),
+            }
+            for entry in parsed_entries
+            if entry.enabled and not policy.contains_entry(entry)
+        ]
+        if offending:
+            posture = policy.posture
+            raise ScheduleRefusal(
+                "schedule_window_not_allowed",
+                "entries fall outside the allowed windows "
+                + ", ".join(
+                    f"{item['entry_id']} ({item['start_local']}-{item['end_local']})"
+                    for item in offending
+                )
+                + " — the night window belongs to the site's other writer applications ("
+                + posture
+                + " posture). Trim the entries to the allowed windows, or make the "
+                "partition choice: stand the external writers down and widen "
+                "allowed_windows_local in config, then acknowledge once in the console.",
+                {
+                    "posture": posture,
+                    "allowed_windows_local": policy.wire_windows(),
+                    "offending": offending,
+                },
+            )
+        # (3) 409 night_posture_acknowledgement_required — the one-time gate.
+        night_entries = [
+            entry for entry in parsed_entries if entry.enabled and policy.entry_is_night(entry)
+        ]
+        if night_entries and not surface.acknowledged_night_windows:
+            if night_posture != "PARTITION_ACKNOWLEDGED":
+                raise ScheduleRefusal(
+                    "night_posture_acknowledgement_required",
+                    "the first night schedule publish requires the one-time partition "
+                    "acknowledgement",
+                    {"acknowledgement": "PARTITION_ACKNOWLEDGED"},
+                )
+            # Durable-append-FIRST (the NET_BILLED mechanics): an audit
+            # failure refuses the publish — no night plan without the fact.
+            await self._append_audit(
+                self._mutation_audit(
+                    event_id=SCHEDULE_NIGHT_ACK_EVENT_ID,
+                    event_type="schedule_night_windows_acknowledged",
+                    subject=principal.subject,
+                    result="acknowledged",
+                    request_id=request,
+                    reason_codes=("partition_acknowledged",),
+                    lifecycle=self._fleet_lifecycle(),
+                    payload={
+                        "assertion": SCHEDULE_NIGHT_ASSERTION,
+                        "allowed_windows_local": policy.wire_windows(),
+                    },
+                )
+            )
+            surface.mark_night_acknowledged()
+        # (4) 409 schedule_version_conflict — the CAS itself.
+        current = await surface.get_plan()
+        current_version = 0 if current is None else current.version
+        expected = 0 if expected_version is None else expected_version
+        if expected != current_version:
+            raise ScheduleRefusal(
+                "schedule_version_conflict",
+                "the plan changed elsewhere — reload and re-apply",
+                {"current_version": None if current is None else current.version},
+            )
+        try:
+            new_plan = SchedulePlan(
+                version=current_version + 1, timezone=timezone, entries=tuple(parsed_entries)
+            )
+        except ScheduleValidationError as exc:  # pragma: no cover - pre-validated above
+            raise SchedulePublishValidationError([_schedule_entry_error(None, str(exc))]) from exc
+        diff = _schedule_diff(current, new_plan)
+        await surface.replace_plan(expected_version=current_version, replacement=new_plan)
+        # Impl-10 commit-then-audit with submit_intent's compensating shape:
+        # the publish above has committed; a failed record rolls the store
+        # back to the prior plan and the error surfaces, never a silent
+        # stored publish without its durable row.
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="schedule_replaced",
+                    subject=principal.subject,
+                    result="replaced",
+                    request_id=request,
+                    reason_codes=("replaced",),
+                    lifecycle=self._fleet_lifecycle(),
+                    payload={
+                        "version_from": None if current is None else current.version,
+                        "version_to": new_plan.version,
+                        "diff": diff,
+                        "timezone": new_plan.timezone,
+                    },
+                )
+            )
+            await self._publish(
+                "schedule.replaced",
+                {
+                    "principal": principal.subject,
+                    "version": new_plan.version,
+                    "diff": diff,
+                    "timezone": new_plan.timezone,
+                },
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                await self._restore_prior_plan(surface, current, new_plan)
+            raise
+        return {
+            "version": new_plan.version,
+            "plan": schedule_wire_plan(new_plan),
+            "diff": diff,
+            "acknowledged_night_windows": surface.acknowledged_night_windows,
+            "next_action": _schedule_next_action(new_plan, self._clock.wall_now()),
+        }
+
+    async def _restore_prior_plan(
+        self, surface: ScheduleSurface, prior: Any, published: Any
+    ) -> None:
+        """Compensate a failed record by restoring the prior plan (the same
+        CAS path).  The port has no delete, so the inverse of a FIRST publish
+        is the nearest inverse it allows: an empty plan (empty IS off — no
+        entry, no intent ever submitted)."""
+        from energypod.domain.schedule import SchedulePlan
+
+        replacement = (
+            SchedulePlan(version=published.version, timezone=prior.timezone, entries=prior.entries)
+            if prior is not None
+            else SchedulePlan(version=published.version, timezone=published.timezone, entries=())
+        )
+        replacement = SchedulePlan(
+            version=published.version + 1,
+            timezone=replacement.timezone,
+            entries=replacement.entries,
+        )
+        await surface.replace_plan(expected_version=published.version, replacement=replacement)
+
     # --- internal helpers ---------------------------------------------------
 
     async def _refuse_conflicted_enable(self) -> None:
@@ -1810,6 +2446,10 @@ class EnergyServiceFacade:
     def _advisory_key(self, prefix: str) -> str:
         """Deterministic facade-owned correlation for an internal advisory drive."""
         return f"excess-{prefix}-{next(self._advisory_correlations):08d}"
+
+    def _schedule_key(self, prefix: str) -> str:
+        """Deterministic facade-owned correlation for an internal schedule drive."""
+        return f"schedule-{prefix}-{next(self._schedule_correlations):08d}"
 
     async def _unit_view(
         self,

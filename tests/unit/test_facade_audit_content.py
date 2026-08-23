@@ -422,3 +422,53 @@ async def test_acknowledge_inhibit_audit_and_publication_content(facade_api: Any
             },
         },
     )
+
+
+async def test_schedule_replaced_audit_and_publication_content(facade_api: Any) -> None:
+    """DESIGN_SCHEDULES §5: one schedule_replaced row per publish with the
+    version from->to and the diff summary riding the fingerprint fact set."""
+    from tests.unit.test_service_facade import make_schedule_rig, publish_kwargs
+
+    rig, _surface = make_schedule_rig(facade_api)
+    await rig.facade.replace_schedule(**publish_kwargs())
+    assert_audit(
+        rig,
+        {
+            "event_type": "schedule_replaced",
+            "correlation_id": "facade:schedule_replaced:request-p1",
+            "reason_codes": ("replaced",),
+            "result": "replaced",
+            "lifecycle": facade_api.UnitLifecycle.DISARMED,
+            "facts": {
+                "event_type": "schedule_replaced",
+                "principal": OPERATOR.subject,
+                "result": "replaced",
+                "version_from": None,
+                "version_to": 1,
+                "diff": {
+                    "added": ["day-charge"],
+                    "removed": [],
+                    "changed": [],
+                    "timezone_changed": False,
+                },
+                "timezone": "Australia/Brisbane",
+            },
+        },
+    )
+    assert_published(
+        rig,
+        {
+            "type": "schedule.replaced",
+            "payload": {
+                "principal": OPERATOR.subject,
+                "version": 1,
+                "diff": {
+                    "added": ["day-charge"],
+                    "removed": [],
+                    "changed": [],
+                    "timezone_changed": False,
+                },
+                "timezone": "Australia/Brisbane",
+            },
+        },
+    )
