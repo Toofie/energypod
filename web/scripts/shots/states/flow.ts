@@ -9,11 +9,13 @@
  * - load_power_w: the pod's measured local load (the house on that phase).
  * - soc_pct / the CT figures are null when absent — never zero-filled.
  *
- * The nine states pin the view's whole state matrix, one per behavior family:
- * the resting site, the fleet charge, batteries pulling opposite ways, the
- * phases splitting import and export, the night window's two cadences (pacing
- * and the demand hold), the solar-surplus adviser commanding, a phase that
- * stopped reporting, and a live request's commanded-vs-measured overlay.
+ * The ten states pin the view's whole state matrix (the design brief's own
+ * list), one per behavior family: the resting site, the fleet charge,
+ * batteries pulling opposite ways, the phases splitting import and export,
+ * the night window's two cadences (pacing and the demand hold), the
+ * solar-surplus adviser commanding, a pod that has gone quiet, a live
+ * request's commanded-vs-measured overlay (one phase not moving yet), and the
+ * connection lost mid-picture.
  *
  * Figures are physically coherent per phase (grid ≈ battery + house ± losses)
  * so the arrows' thicknesses and directions tell one believable story per
@@ -73,17 +75,6 @@ function phase(unitId: string, figures: PhaseFigures): WireUnitSnapshot {
 /** The three-phase world, pinned to one fixed capture moment. */
 function world(units: readonly WireUnitSnapshot[]): WireSnapshot {
   return snapshot([...units], { captured_at: "2026-08-27T14:03:00+10:00" });
-}
-
-/** A phase whose poll served nothing at all — an absent observation. */
-function phaseWithNoObservation(unitId: string): WireUnitSnapshot {
-  return unitSnapshot({
-    unit_id: unitId,
-    lifecycle: "active",
-    telemetry: null,
-    measured_watts: null,
-    telemetry_age_s: null,
-  });
 }
 
 export const FLOW_STATES: readonly ShotStateDefinition[] = [
@@ -233,18 +224,34 @@ export const FLOW_STATES: readonly ShotStateDefinition[] = [
   {
     id: "one-phase-not-reporting",
     caption:
-      "mid has no observation at all — every figure 'not available', the dashed unknown stubs beside two healthy phases, and the fleet naming its partial scope.",
+      "mid has gone quiet — no contact: its column dimmed with dotted stubs while its last-known figures stay legible beside two healthy phases, and the fleet names its partial scope.",
     world: () =>
       world([
         phase("lhs", { grid: -310, battery: 0, load: 310, soc: 77 }),
-        phaseWithNoObservation("mid"),
+        // The disconnected pod's last-known observation: figures the wire
+        // still carries (grid, battery, SoC — a stale but real reading) with
+        // the load datum already absent, so the fleet's house sum names its
+        // "2 of 3 phases reporting" scope honestly.
+        unitSnapshot({
+          unit_id: "mid",
+          lifecycle: "disconnected",
+          telemetry: telemetrySummary({
+            soc_pct: 51,
+            battery_watts: -600,
+            grid_power_w: -540,
+            load_power_w: null,
+          }),
+          authorized_power: null,
+          measured_watts: null,
+          telemetry_age_s: 912,
+        }),
         phase("rhs", { grid: -330, battery: 0, load: 330, soc: 64 }),
       ]),
   },
   {
     id: "commanded-vs-measured-overlay",
     caption:
-      "A live request across all three phases: two delivering close to command and rhs moving against its discharge — the overlay's commanded-vs-delivering rows, including the honest mismatch.",
+      "A live request across all three phases: lhs delivering, mid charging close to command, and rhs commanded but not yet moving — the overlay's rows and the pulsing idle ring on the phase that has not answered.",
     world: () =>
       withSnapshotIntent(
         world([
@@ -263,8 +270,8 @@ export const FLOW_STATES: readonly ShotStateDefinition[] = [
             authorized: { direction: "charge", watts: 2500 },
           }),
           phase("rhs", {
-            grid: -590,
-            battery: -220,
+            grid: -370,
+            battery: 0,
             load: 370,
             soc: 90,
             authorized: { direction: "discharge", watts: 1500 },
@@ -276,5 +283,17 @@ export const FLOW_STATES: readonly ShotStateDefinition[] = [
           directions_by_unit: { lhs: "discharge", mid: "charge", rhs: "discharge" },
         },
       ),
+  },
+  {
+    id: "connection-lost",
+    caption:
+      "The stream dropped mid-afternoon: the march stopped everywhere, the whole picture dimmed to its last-known figures, and the connection line explains while the view reconnects on its own.",
+    connection: "lost",
+    world: () =>
+      world([
+        phase("lhs", { grid: 500, battery: 1600, load: 1100, soc: 55 }),
+        phase("mid", { grid: 150, battery: 1400, load: 1250, soc: 62 }),
+        phase("rhs", { grid: 20, battery: 1200, load: 1180, soc: 58 }),
+      ]),
   },
 ];

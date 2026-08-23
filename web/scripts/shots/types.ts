@@ -16,4 +16,11 @@ export interface ShotStateDefinition {
   readonly caption: string;
   /** Builds the seeded snapshot world (fresh clone per call). */
   readonly world: () => WireSnapshot;
+  /**
+   * The seeded connection's fate (default "live"): "lost" ends the stream
+   * after its authoritative first frame, so the view settles into its
+   * connection-lost picture — march stopped, last-known figures dimmed —
+   * while its own reconnect loop waits on a stream that never answers.
+   */
+  readonly connection?: "live" | "lost";
 }

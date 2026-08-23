@@ -73,7 +73,10 @@ if (viewId === null || stateId === null) {
   } else {
     document.documentElement.dataset.shotsView = view.id;
     document.documentElement.dataset.shotsState = state.id;
-    const client = seededClient(state.world());
+    const client = seededClient(
+      state.world(),
+      state.connection === undefined ? {} : { connection: state.connection },
+    );
     createRoot(root).render(
       <div className="shell">
         <main>

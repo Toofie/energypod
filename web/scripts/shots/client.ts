@@ -41,10 +41,21 @@ function absent(surface: string): ApiClientError {
  * Build the client for one seeded world. Every method a view may call during
  * a static render either answers from the world or refuses loudly; nothing
  * ever contacts the network.
+ *
+ * `connection: "lost"` seeds the connection's fate instead of its liveness:
+ * the first stream delivers its authoritative frame and then ENDS (the view
+ * reads "lost", stops its march, and dims its last-known picture), and every
+ * stream the view's own reconnect loop opens afterwards neither delivers nor
+ * settles — the lost picture is the settled one, deterministically.
  */
-export function seededClient(world: WireSnapshot): SeededClient {
+export function seededClient(
+  world: WireSnapshot,
+  options: { connection?: "live" | "lost" } = {},
+): SeededClient {
+  const lost = options.connection === "lost";
   let snapshotRead = false;
   let streamFrameDelivered = false;
+  let streamOpens = 0;
   let resolveReady: () => void = () => {};
   const ready = new Promise<void>((resolve) => {
     resolveReady = resolve;
@@ -108,12 +119,24 @@ export function seededClient(world: WireSnapshot): SeededClient {
       throw absent("the observed-objectives window");
     },
     openEvents: (): AsyncIterable<StreamEvent> => {
+      const isInitialStream = streamOpens === 0;
+      streamOpens += 1;
       async function* stream(): AsyncGenerator<StreamEvent, void, unknown> {
+        if (lost && !isInitialStream) {
+          // A reconnect attempt against a still-dead connection: it neither
+          // delivers nor fails, so the view waits in its lost picture.
+          await new Promise<never>(() => {});
+        }
         // The authoritative first frame of every connection, then silence:
         // the seeded world is a held breath, not a simulation.
         yield snapshotFrame(structuredClone(world));
         streamFrameDelivered = true;
         maybeReady();
+        if (lost) {
+          // The seeded connection drops after its authoritative frame — the
+          // one shot whose liveness cue is the loss itself.
+          return;
+        }
         await new Promise<never>(() => {});
       }
       return stream();
