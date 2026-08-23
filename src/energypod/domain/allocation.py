@@ -172,19 +172,38 @@ def allocate_fleet_power(
     headrooms: tuple[UnitHeadroom, ...],
     *,
     export_cap_w: int | None = None,
+    unit_ids: frozenset[str] | None = None,
 ) -> FleetAllocation:
+    """Allocate the intent's request, optionally over a SURVIVING scope only.
+
+    Concurrent per-unit arbitration (2026-08-24) erodes an intent's scope: the
+    units higher-priority intents claimed are gone from its allocation.
+    ``unit_ids`` names the surviving units (a subset of the intent's own
+    selection): a scalar intent distributes its whole demand across the
+    survivors exactly as the capacity-weighted contract prescribes, and a
+    per-unit intent carries each surviving unit's own target as its cap with
+    the demand re-summed over the survivors.  ``requested_watts`` stays the
+    intent's own full request; the eroded share surfaces as unallocated.
+    """
     if type(intent) is not PowerIntent:
         raise TypeError("intent must be a PowerIntent")
     if type(headrooms) is not tuple or any(type(item) is not UnitHeadroom for item in headrooms):
         raise TypeError("headrooms must be a tuple of UnitHeadroom values")
     if export_cap_w is not None and (type(export_cap_w) is not int or export_cap_w < 0):
         raise ValueError("export cap must be a non-negative integer")
+    if unit_ids is not None and (
+        type(unit_ids) is not frozenset or not unit_ids or not unit_ids <= intent.selected_unit_ids
+    ):
+        raise ValueError(
+            "the surviving allocation scope must be a non-empty subset of the "
+            "intent's selected units"
+        )
     by_id: dict[str, UnitHeadroom] = {}
     for item in headrooms:
         if item.unit_id in by_id:
             raise ValueError(f"duplicate headroom for {item.unit_id}")
         by_id[item.unit_id] = item
-    selected = sorted(intent.selected_unit_ids)
+    selected = sorted(intent.selected_unit_ids if unit_ids is None else unit_ids)
     if intent.direction is Direction.IDLE:
         return FleetAllocation(
             direction=intent.direction,
@@ -197,17 +216,21 @@ def allocate_fleet_power(
     if missing:
         raise ValueError(f"missing headroom for selected units: {sorted(missing)}")
     targets = intent.watts_by_unit
-    if targets is not None and set(targets) != set(selected):
-        # The domain model already refuses this shape; the allocator stays
-        # fail-closed against any future bypass of that validation.
-        raise ValueError("per-unit targets must name exactly the selected units")
+    if targets is not None:
+        if set(targets) != set(intent.selected_unit_ids):
+            # The domain model already refuses this shape; the allocator stays
+            # fail-closed against any future bypass of that validation.
+            raise ValueError("per-unit targets must name exactly the selected units")
+        if unit_ids is not None:
+            targets = {unit: targets[unit] for unit in selected}
     # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the
     # measured-export bound is ONE additional min() term on the effective
     # demand.  It can only lower power below today's limits and — crucially
     # for the all-zero doctrine — a cap of 0 stays a legitimate allocation
     # (every selected unit proposes explicit non-participation), never an
     # error and never a reversal.
-    demand = intent.watts if export_cap_w is None else min(intent.watts, export_cap_w)
+    demand_base = intent.watts if targets is None else sum(targets.values())
+    demand = demand_base if export_cap_w is None else min(demand_base, export_cap_w)
     capacities = {
         unit_id: (
             0
@@ -224,9 +247,9 @@ def allocate_fleet_power(
         allocations = _distribute_demand(demand, capacities)
     else:
         allocations = _distribute_per_unit_targets(demand, capacities, targets)
-    # The unallocated remainder keeps absorbing whatever the cap (or headroom)
-    # denied, so the exact-sum invariants are unchanged: allocated plus
-    # unallocated equals the intent's own request.
+    # The unallocated remainder keeps absorbing whatever the cap (or headroom,
+    # or an eroded scope) denied, so the exact-sum invariants are unchanged:
+    # allocated plus unallocated equals the intent's own request.
     allocated_watts = sum(allocations.values())
     return FleetAllocation(
         direction=intent.direction,

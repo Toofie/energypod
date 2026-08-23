@@ -49,6 +49,12 @@ class AuditEvent(BaseModel):
     # keep decoding with null defaults.
     requested_watts_by_unit: Mapping[str, int] | None = None
     authorized_watts_by_unit: Mapping[str, int] | None = None
+    # Per-unit direction breakdown (2026-08-24 concurrent operations): a cycle
+    # composed from several intents may run DIFFERENT directions on different
+    # units, so the row names each unit's own winning direction next to its
+    # watts.  Null on single-intent rows (the intent's direction already says
+    # it) and on durable rows written before this field existed.
+    directions_by_unit: Mapping[str, str] | None = None
     request_fingerprint: str
     response_fingerprint: str
     result: str
@@ -74,6 +80,20 @@ class AuditEvent(BaseModel):
             raise ValueError("per-unit watt keys must be normalized")
         if any(watts < 0 for watts in copied.values()):
             raise ValueError("per-unit watts must be non-negative")
+        return _FrozenStringMapping(copied)
+
+    @field_validator("directions_by_unit")
+    @classmethod
+    def _freeze_directions_by_unit(
+        cls, value: Mapping[str, str] | None
+    ) -> Mapping[str, str] | None:
+        if value is None:
+            return None
+        copied = dict(value)
+        if any(not key or key != key.strip() for key in copied):
+            raise ValueError("per-unit direction keys must be normalized")
+        if any(direction not in {"charge", "discharge", "idle"} for direction in copied.values()):
+            raise ValueError("per-unit directions must be charge, discharge, or idle")
         return _FrozenStringMapping(copied)
 
     @field_validator(

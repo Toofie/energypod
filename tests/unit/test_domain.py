@@ -570,3 +570,75 @@ def test_observation_rejects_undeclared_protocol_fields() -> None:
     models = _models()
     with pytest.raises((TypeError, ValueError)):
         models.Observation(**_observation_kwargs(models, signed_setpoint_watts=-1_000))
+
+
+# --- per-unit direction breakdown on audit facts (2026-08-24) ------------------
+#
+# Concurrent cycles compose several intents whose units may run DIFFERENT
+# directions; one decision row must therefore carry each unit's own direction
+# next to its watts.  ``directions_by_unit`` is optional exactly like the
+# per-unit watt maps so durable rows written before it existed keep decoding.
+
+
+def _audit_kwargs(audit: ModuleType, models: ModuleType, **overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "event_id": "event-0001",
+        "occurred_at": datetime(2026, 8, 24, tzinfo=UTC),
+        "monotonic_offset_s": 1.0,
+        "process_instance_id": "process-1",
+        "event_type": "control_decision",
+        "unit_id": None,
+        "generation": 1,
+        "cycle_id": "cycle-00000000000000000001",
+        "principal": "operator:owner",
+        "source": models.IntentSource.MANUAL,
+        "correlation_id": "cycle:cycle-1",
+        "intent_id": None,
+        "policy_version": "policy-1",
+        "configuration_version": 1,
+        "observation_sequences": {"mid": 3, "rhs": 4},
+        "reason_codes": ("safety_checks_passed",),
+        "requested_active_w": -1_000,
+        "authorized_active_w": -1_000,
+        "requested_watts_by_unit": {"mid": 2_000, "rhs": 1_000},
+        "authorized_watts_by_unit": {"mid": 2_000, "rhs": 1_000},
+        "directions_by_unit": {"mid": "charge", "rhs": "discharge"},
+        "request_fingerprint": "0" * 64,
+        "response_fingerprint": "1" * 64,
+        "result": "authorized",
+        "lifecycle": models.UnitLifecycle.ACTIVE,
+    }
+    values.update(overrides)
+    return values
+
+
+def test_audit_event_carries_the_per_unit_direction_breakdown() -> None:
+    models = _models()
+    audit = importlib.import_module("energypod.domain.audit")
+    event = audit.AuditEvent(**_audit_kwargs(audit, models))
+    assert dict(event.directions_by_unit) == {"mid": "charge", "rhs": "discharge"}
+    _assert_frozen(event, "directions_by_unit", {"mid": "discharge"})
+    with pytest.raises((TypeError, ValueError)):
+        event.directions_by_unit["mid"] = "discharge"  # type: ignore[index]
+
+
+def test_audit_directions_by_unit_is_optional_and_defaults_to_none() -> None:
+    models = _models()
+    audit = importlib.import_module("energypod.domain.audit")
+    values = _audit_kwargs(audit, models)
+    values.pop("directions_by_unit")
+    event = audit.AuditEvent(**values)
+    assert event.directions_by_unit is None
+
+
+def test_audit_directions_by_unit_rejects_unknown_directions_and_bad_keys() -> None:
+    models = _models()
+    audit = importlib.import_module("energypod.domain.audit")
+    for bad in (
+        {"mid": "reverse"},
+        {"mid": None},
+        {" mid": "charge"},
+        {"": "charge"},
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            audit.AuditEvent(**_audit_kwargs(audit, models, directions_by_unit=bad))

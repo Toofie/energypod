@@ -983,3 +983,164 @@ def test_generated_per_unit_allocations_respect_every_bound_exactly(
     expected_allocated = min(sum(targets.values()), serving)
     assert result.allocated_watts == expected_allocated
     assert result.unallocated_watts == sum(targets.values()) - expected_allocated
+
+
+# --- surviving-scope allocation (2026-08-24 concurrent operations) -------------
+#
+# Per-unit arbitration erodes an intent's scope: the units higher-priority
+# intents claimed are gone from its allocation.  ``allocate_fleet_power``
+# therefore accepts an explicit ``unit_ids`` scope -- the intent's SURVIVING
+# units -- and allocates only over it: a scalar intent distributes its whole
+# demand across the survivors (the capacity-weighted contract unchanged, just
+# over fewer units), a per-unit intent carries each surviving unit's own
+# target as its cap with the demand re-summed over the survivors.  The
+# intent's own ``requested_watts`` stays its full request; the eroded share
+# surfaces as unallocated.
+
+
+def test_surviving_scope_narrows_a_scalar_intents_distribution(
+    allocation_api: SimpleNamespace,
+) -> None:
+    models = allocation_api.models
+    allocation = allocation_api.allocation
+    intent = _intent(models, watts=1_000, selected=frozenset({"a", "b"}))
+    headrooms = (
+        _headroom(allocation, "a", 2_000, 2_000),
+        _headroom(allocation, "b", 2_000, 2_000),
+    )
+
+    result = allocation.allocate_fleet_power(intent, headrooms, unit_ids=frozenset({"b"}))
+
+    assert dict(result.allocations) == {"b": 1_000}
+    assert result.requested_watts == 1_000
+    assert result.allocated_watts == 1_000
+    assert result.unallocated_watts == 0
+
+
+def test_surviving_scope_scalar_shortfall_surfaces_unallocated(
+    allocation_api: SimpleNamespace,
+) -> None:
+    models = allocation_api.models
+    allocation = allocation_api.allocation
+    intent = _intent(models, watts=1_000, selected=frozenset({"a", "b"}))
+    headrooms = (
+        _headroom(allocation, "a", 2_000, 2_000),
+        _headroom(allocation, "b", 2_000, 300),
+    )
+
+    result = allocation.allocate_fleet_power(intent, headrooms, unit_ids=frozenset({"b"}))
+
+    assert dict(result.allocations) == {"b": 300}
+    assert result.requested_watts == 1_000
+    assert result.unallocated_watts == 700
+
+
+def test_surviving_scope_restricts_per_unit_targets_to_the_survivors(
+    allocation_api: SimpleNamespace,
+) -> None:
+    """A per-unit intent's demand over its surviving scope is the sum of the
+    SURVIVING targets: unit a's target left with a's claimer never leaks into
+    unit b's allocation."""
+    models = allocation_api.models
+    allocation = allocation_api.allocation
+    intent = _intent(
+        models,
+        watts=500,
+        selected=frozenset({"a", "b"}),
+        per_unit={"a": 300, "b": 200},
+    )
+    headrooms = (
+        _headroom(allocation, "a", 2_000, 2_000),
+        _headroom(allocation, "b", 2_000, 2_000),
+    )
+
+    result = allocation.allocate_fleet_power(intent, headrooms, unit_ids=frozenset({"b"}))
+
+    assert dict(result.allocations) == {"b": 200}
+    assert result.allocated_watts == 200
+    # The intent's own request is unchanged; a's eroded 300 W is unallocated.
+    assert result.requested_watts == 500
+    assert result.unallocated_watts == 300
+
+
+def test_full_surviving_scope_equals_the_default_allocation(
+    allocation_api: SimpleNamespace,
+) -> None:
+    models = allocation_api.models
+    allocation = allocation_api.allocation
+    intent = _intent(
+        models,
+        watts=500,
+        selected=frozenset({"a", "b"}),
+        per_unit={"a": 300, "b": 200},
+    )
+    headrooms = (
+        _headroom(allocation, "a", 2_000, 2_000),
+        _headroom(allocation, "b", 2_000, 2_000),
+    )
+
+    scoped = allocation.allocate_fleet_power(intent, headrooms, unit_ids=frozenset({"a", "b"}))
+    default = allocation.allocate_fleet_power(intent, headrooms)
+
+    assert dict(scoped.allocations) == dict(default.allocations)
+    assert scoped.requested_watts == default.requested_watts
+    assert scoped.unallocated_watts == default.unallocated_watts
+
+
+def test_surviving_scope_composes_with_the_export_cap(
+    allocation_api: SimpleNamespace,
+) -> None:
+    models = allocation_api.models
+    allocation = allocation_api.allocation
+    intent = _intent(models, watts=1_000, selected=frozenset({"a", "b"}))
+    headrooms = (
+        _headroom(allocation, "a", 2_000, 2_000),
+        _headroom(allocation, "b", 2_000, 2_000),
+    )
+
+    result = allocation.allocate_fleet_power(
+        intent, headrooms, export_cap_w=250, unit_ids=frozenset({"b"})
+    )
+
+    assert dict(result.allocations) == {"b": 250}
+    assert result.unallocated_watts == 750
+
+
+def test_surviving_scope_must_name_only_selected_units(
+    allocation_api: SimpleNamespace,
+) -> None:
+    models = allocation_api.models
+    allocation = allocation_api.allocation
+    intent = _intent(models, watts=1_000, selected=frozenset({"a", "b"}))
+    headrooms = (
+        _headroom(allocation, "a", 2_000, 2_000),
+        _headroom(allocation, "b", 2_000, 2_000),
+        _headroom(allocation, "c", 2_000, 2_000),
+    )
+
+    with pytest.raises(ValueError, match="scope"):
+        allocation.allocate_fleet_power(intent, headrooms, unit_ids=frozenset({"b", "c"}))
+
+
+def test_surviving_scope_still_requires_headroom_for_its_units(
+    allocation_api: SimpleNamespace,
+) -> None:
+    models = allocation_api.models
+    allocation = allocation_api.allocation
+    intent = _intent(models, watts=1_000, selected=frozenset({"a", "b"}))
+    headrooms = (_headroom(allocation, "b", 2_000, 2_000),)
+
+    with pytest.raises(ValueError, match="missing headroom"):
+        allocation.allocate_fleet_power(intent, headrooms, unit_ids=frozenset({"a", "b"}))
+
+
+def test_surviving_scope_for_an_idle_intent_keeps_explicit_zeros(
+    allocation_api: SimpleNamespace,
+) -> None:
+    models = allocation_api.models
+    allocation = allocation_api.allocation
+    intent = _intent(models, direction="IDLE", watts=0, selected=frozenset({"a", "b"}))
+
+    result = allocation.allocate_fleet_power(intent, (), unit_ids=frozenset({"b"}))
+
+    assert dict(result.allocations) == {"b": 0}
