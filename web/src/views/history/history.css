@@ -1,0 +1,385 @@
+/* History view — the plant-history console (DESIGN_PLANT_HISTORY.md §4).
+   The instrument doctrine: quiet paper, tabular numbers, honest states.
+   The charts ride uPlot's own DOM (uplot/dist/uPlot.min.css, imported by the
+   component) restyled here to the console's tokens; every fact a chart draws
+   also exists as the summary table beneath it. */
+
+.history-view {
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+  max-width: 60rem;
+}
+
+.history-view h2 {
+  margin: 0;
+  font-size: 1.25rem;
+}
+
+.history-view h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1.05rem;
+}
+
+.history-view h4 {
+  margin: 0 0 0.3rem;
+  font-size: 0.95rem;
+}
+
+.history-heading-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem 1.25rem;
+}
+
+.history-recording {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.history-loading,
+.history-empty-note {
+  margin: 0;
+  color: var(--ink-soft);
+}
+
+/* --- the window controls -------------------------------------------------- */
+
+.history-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1rem;
+  align-items: end;
+}
+
+.history-controls fieldset {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.35rem 0.6rem 0.55rem;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.history-controls legend {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-soft);
+  padding: 0 0.25rem;
+}
+
+.history-controls button {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.9rem;
+  border-radius: 7px;
+}
+
+.history-controls button[aria-pressed="true"] {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #fff;
+}
+
+.history-refresh {
+  margin-left: auto;
+}
+
+/* --- the honesty line ------------------------------------------------------- */
+
+.history-resolution {
+  margin: 0;
+  padding: 0.45rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--card);
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+}
+
+.history-resolution-word {
+  color: var(--ink);
+}
+
+/* --- the states -------------------------------------------------------------- */
+
+.history-empty {
+  border: 1px dashed var(--line);
+  border-radius: 12px;
+  padding: 0.8rem 1rem;
+  background: var(--card);
+}
+
+.history-empty h3 {
+  margin: 0 0 0.3rem;
+}
+
+.history-empty p,
+.history-not-commissioned p,
+.history-fleet-note,
+.history-fleet-soc-note {
+  margin: 0.2rem 0;
+  color: var(--ink-soft);
+  font-size: 0.93rem;
+}
+
+.history-not-commissioned,
+.history-error {
+  border-left: 4px solid var(--no);
+  background: #fdf3f2;
+  padding: 0.7rem 0.9rem;
+  border-radius: 0 10px 10px 0;
+}
+
+.history-not-commissioned {
+  border-left-color: var(--warn);
+  background: var(--warn-surface);
+}
+
+.history-not-commissioned h3 {
+  margin: 0 0 0.35rem;
+}
+
+.history-error-title {
+  margin: 0 0 0.25rem;
+  font-weight: 600;
+}
+
+.history-error-code {
+  margin: 0.2rem 0;
+  font-size: 0.85rem;
+}
+
+.history-error-message {
+  margin: 0.2rem 0;
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+}
+
+.history-error-request {
+  margin: 0.2rem 0;
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+}
+
+.history-error--refresh {
+  border-left-color: var(--warn);
+  background: var(--warn-surface);
+}
+
+.history-retry {
+  margin-top: 0.5rem;
+}
+
+/* --- the per-battery facts line ---------------------------------------------- */
+
+.history-unit-facts {
+  margin: 0;
+  font-size: 0.93rem;
+  color: var(--ink-soft);
+}
+
+.history-unit-id {
+  color: var(--ink);
+}
+
+.history-quality--degraded {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+/* --- the charts ---------------------------------------------------------------- */
+
+.history-block {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  padding: 0.7rem 0.9rem 0.8rem;
+}
+
+.history-chart {
+  margin: 0;
+}
+
+.history-chart-canvas {
+  width: 100%;
+}
+
+.history-chart-canvas .u-legend {
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+}
+
+.history-chart-canvas .u-legend .u-series th {
+  font-weight: 500;
+}
+
+.history-chart-canvas .u-tooltip {
+  font-size: 0.8rem;
+}
+
+.history-chart-note {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+  font-style: italic;
+}
+
+.history-chart-alt {
+  margin-top: 0.55rem;
+  border-top: 1px solid var(--line);
+  padding-top: 0.45rem;
+}
+
+.history-chart-summary {
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+.history-chart-summary caption {
+  text-align: left;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-soft);
+  padding-bottom: 0.25rem;
+}
+
+.history-chart-summary th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--ink);
+  padding: 0.15rem 0.9rem 0.15rem 0;
+  white-space: nowrap;
+}
+
+.history-chart-summary td {
+  padding: 0.15rem 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.history-chart-gaps {
+  margin: 0.4rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.83rem;
+  color: var(--no);
+}
+
+/* --- the archaeology strip ------------------------------------------------------- */
+
+.history-strip {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  padding: 0.7rem 0.9rem;
+}
+
+.history-strip-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin: 0;
+}
+
+.history-strip-row {
+  display: grid;
+  grid-template-columns: 5.5rem 1fr;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+.history-strip-row dt {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink-soft);
+}
+
+.history-strip-row dd {
+  margin: 0;
+}
+
+.history-bands {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  position: relative;
+  display: flex;
+  height: 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.history-band {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  padding: 0 0.35rem;
+  border-right: 1px solid rgba(255, 255, 255, 0.7);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.history-band-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.history-bands--lifecycle .history-band {
+  background: #eef1f6;
+  color: var(--ink);
+}
+
+.history-bands--health .history-band {
+  background: #edf5ef;
+  color: var(--ink);
+}
+
+.history-bands--command .history-band {
+  background: #f3efe3;
+  color: var(--armed);
+}
+
+.history-bands--command .history-band:empty {
+  background: var(--surface);
+}
+
+/* --- the secondary group ------------------------------------------------------------ */
+
+.history-secondary {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  padding: 0.7rem 0.9rem;
+}
+
+.history-secondary > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.history-secondary[open] > summary {
+  color: var(--ink);
+  margin-bottom: 0.6rem;
+}
+
+.history-secondary .history-block {
+  border: none;
+  padding: 0.2rem 0 0.4rem;
+}
+
+.history-secondary .history-block + .history-block {
+  border-top: 1px solid var(--line);
+  margin-top: 0.4rem;
+  padding-top: 0.6rem;
+}
