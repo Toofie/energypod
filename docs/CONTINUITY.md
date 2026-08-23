@@ -349,6 +349,29 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-24 (flow wow-loop, round-2 gate): ROUND 2 REVIEWED AND APPROVED AS
+  THE BASELINE (d17a3f0, 82ad0bc, 7f32224; 716/716 web tests; 30-PNG
+  gallery incl. a new tablet-768 viewport). Reviewed against fresh renders
+  (gallery regenerated from HEAD after the last commit — the round-1
+  gallery the gate first judged was STALE, pre-round-1 renders: fleet-last,
+  phone-as-table, italic SOC, strings absent from the code; the finding
+  list still drove useful fixes). Confirmed by direct render inspection
+  (tablet + narrow): the Whole Site lead reads unmistakably primary
+  (full-width band/tablet, first column desktop, first card phone, accent
+  strip + larger figures); the battery gold reads gold (deep-rim +
+  full-opacity token + marching dashes, validator re-passed, worst CVD
+  ΔE 21.5); SOC has hierarchy + an honest meter; rows land at the same y
+  across columns at 390/660/768/1024/1440; the phone carries the full bus
+  metaphor (arrows, dashes, meters — no more table). A CDN-cached vision
+  critique claiming fleet-last was REFUTED (self-contradictory order
+  claims; the code, structure pins, and direct renders all pin
+  fleet-first). Round 3 dispatched with fresh eyes: protect the approved
+  qualities, hunt the residual gap to "supreme polish," regenerate the
+  gallery from the final commit, no truth-contract drift. NOTE (hygiene,
+  no value recorded anywhere): one Playwright fill-retry log echoed the
+  console token into a local session log during probing; local-only
+  exposure; rotation is the operator's call in the morning.
+
 - 2026-08-24 (flow wow-loop, round-1 gate): ROUND 1 REVIEWED AND DECLINED
   AGAINST THE WOW BAR; ROUND 2 DISPATCHED WITH THE FINDINGS LIST. The
   round-1 build (c6c8fdc, 73b9b2d, 93e51d4; 714/714 web tests; 20-PNG
