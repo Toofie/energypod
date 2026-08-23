@@ -232,6 +232,25 @@ describe("SharedDataPlane — fan-out subscriptions can tell cached from current
     expect(frame.sequence).toBe(45);
     expect(frame.data).toEqual(second);
   });
+
+  it("routes the schedule reads straight through to the real client, never the plane cache", async () => {
+    // The plan is not a snapshot projection: a schedule read must always be
+    // the real client's own answer (the plane coalesces snapshot/health only).
+    const real = mockClient({
+      getSchedule: vi.fn(() => Promise.resolve({ plan: null })),
+      putSchedule: vi.fn((_body, key) => Promise.resolve({ version: 1, idempotency_key: key })),
+    });
+    const plane = new SharedDataPlane(real);
+    const view = sharedClient(plane, real);
+
+    await expect(view.getSchedule()).resolves.toEqual({ plan: null });
+    await expect(view.putSchedule({ expected_version: null }, "console-key")).resolves.toEqual({
+      version: 1,
+      idempotency_key: "console-key",
+    });
+    expect(real.getSchedule).toHaveBeenCalledTimes(1);
+    expect(real.putSchedule).toHaveBeenCalledWith({ expected_version: null }, "console-key");
+  });
 });
 
 describe("SharedDataPlane — the real stream handle", () => {

@@ -242,6 +242,28 @@ export interface ApiClient {
     action: "enable" | "disable",
     options?: { economics?: "NET_BILLED"; idempotencyKey?: string },
   ): Promise<Record<string, unknown>>;
+  /**
+   * The schedules read (GET /api/v1/schedule, observe scope): the whole
+   * published plan (null before the first publish), the derived policy, the
+   * durable night-acknowledgement fact, and the pure next occurrence. A
+   * deployment without the `schedule:` config block refuses with 409
+   * `schedule_not_commissioned` — the editor's honest not-commissioned state.
+   */
+  getSchedule(): Promise<Record<string, unknown>>;
+  /**
+   * The whole-plan publish (PUT /api/v1/schedule, dispatch scope + interactive
+   * principal + Idempotency-Key): `{expected_version, timezone, entries,
+   * night_posture?}`. A non-null `expected_version` that no longer matches the
+   * stored plan rejects with 409 `schedule_version_conflict` (the CAS — the
+   * console's answer is reload-and-re-apply, never a silent merge); the
+   * allowed-window and night-acknowledgement refusals are 409s with their own
+   * codes; shape/domain failures are 422 `validation_error` naming the
+   * offending entries.
+   */
+  putSchedule(
+    body: Record<string, unknown>,
+    idempotencyKey?: string,
+  ): Promise<Record<string, unknown>>;
   openEvents(afterSequence?: number): AsyncIterable<StreamEvent>;
 }
 
@@ -553,5 +575,12 @@ export function createApiClient(token: string): ApiClient {
     },
     openEvents: (afterSequence?: number) =>
       streamEvents(eventsUrl(afterSequence), fetchEventsTicket),
+    getSchedule: () => request<Record<string, unknown>>("/api/v1/schedule"),
+    putSchedule: (body, idempotencyKey) =>
+      request<Record<string, unknown>>("/api/v1/schedule", {
+        method: "PUT",
+        body,
+        idempotencyKey: withKey(idempotencyKey),
+      }),
   };
 }

@@ -57,6 +57,15 @@ import {
   type Lifecycle,
   type UnitHealth,
 } from "./fleet";
+import {
+  applyWindowClosing,
+  applyWindowOpened,
+  localTimeOfInstant,
+  toScheduleReplacedEvent,
+  toScheduleWindowClosingEvent,
+  toScheduleWindowOpenedEvent,
+  type ScheduleState,
+} from "./schedule";
 import { echoDiscriminatorText, incoherenceAnnouncement } from "./unitHealth";
 import type { RealStream, SharedDataPlane } from "./SharedDataPlane";
 import { useUnitIntentFigures } from "./useUnitIntentFigures";
@@ -169,6 +178,7 @@ type Action =
   | { type: "clear-restart-notice" }
   | { type: "stop-released"; stopId: string }
   | { type: "adviser-state"; state: AdviserState }
+  | { type: "schedule-state"; state: ScheduleState }
   | { type: "unit-health"; unitId: string; health: UnitHealth }
   | {
       type: "actuation-incoherent";
@@ -359,6 +369,16 @@ function reducer(state: State, action: Action): State {
       }
       return { ...state, snapshot: { ...state.snapshot, adviserState: action.state } };
     }
+    case "schedule-state": {
+      // A schedule window transition (§5 W-D): the projection moves NOW,
+      // state-locally — the card swaps without waiting for a poll, and the
+      // live-cadence snapshot is the reconciler (the countdowns are
+      // snapshot-derived; the events are the transition moments, not a clock).
+      if (state.snapshot === null) {
+        return state;
+      }
+      return { ...state, snapshot: { ...state.snapshot, scheduleState: action.state } };
+    }
     case "unit-health": {
       // A live recovery transition (unit.health_changed): the unit's health
       // moves NOW, state-locally — no refetch. The periodic snapshot remains
@@ -468,6 +488,22 @@ function nameUnits(ids: string[]): string {
   return ids.length === 0 ? "the fleet" : ids.join(", ");
 }
 
+/** A `schedule.replaced` diff as one plain clause ("added Night Charge,
+ * removed old-evening"); "" when no entry changed. */
+function scheduleDiffText(diff: { added: string[]; removed: string[]; changed: string[] }): string {
+  const parts: string[] = [];
+  if (diff.added.length > 0) {
+    parts.push(`added ${diff.added.join(", ")}`);
+  }
+  if (diff.removed.length > 0) {
+    parts.push(`removed ${diff.removed.join(", ")}`);
+  }
+  if (diff.changed.length > 0) {
+    parts.push(`changed ${diff.changed.join(", ")}`);
+  }
+  return parts.join(", ");
+}
+
 /**
  * Revocation reasons that mean a latched inhibit. Only the actor's latched
  * paths publish these (actor.py `_inhibit_owned(..., InhibitCause.LATCHED)`);
@@ -497,6 +533,7 @@ function applyEventFrame(
   frame: StreamEvent,
   dispatch: (action: Action) => void,
   adviser: AdviserState | null = null,
+  schedule: ScheduleState | null = null,
 ): boolean {
   switch (frame.type) {
     case "snapshot": {
@@ -720,6 +757,54 @@ function applyEventFrame(
             ? null
             : echoDiscriminatorText(detection.unitId, detection.echoClassification),
       });
+      return false;
+    }
+    case "schedule.replaced": {
+      // A publish landed (this session or another operator's): the plan is
+      // the runner's input, so the world is re-read — the projection and the
+      // schedule surfaces follow on the next snapshot. One polite line names
+      // the diff; the editor and Home refetch their own reads from the frame.
+      const event = toScheduleReplacedEvent(payloadOf(frame));
+      if (event === null) {
+        return false;
+      }
+      const diff = scheduleDiffText(event.diff);
+      dispatch({
+        type: "polite",
+        text: `Schedule published${
+          event.version === null ? "" : ` (v${event.version})`
+        }${diff === "" ? " — no entry changes" : ` — ${diff}`}.`,
+      });
+      return true;
+    }
+    case "schedule_window.opened": {
+      // A scheduled window started (§5 W-D): the projection moves NOW — the
+      // Home card swaps to "running" without waiting for a poll — and the
+      // moment gets one polite line. No refetch: the payload IS the
+      // transition, and the live-cadence snapshot reconciles the countdown.
+      const event = toScheduleWindowOpenedEvent(payloadOf(frame));
+      if (event === null) {
+        return false;
+      }
+      dispatch({ type: "schedule-state", state: applyWindowOpened(schedule, event, Date.now()) });
+      dispatch({
+        type: "polite",
+        text: `Scheduled window ${event.entryId} opened — running until ${
+          event.endsAt === null ? "its end time" : localTimeOfInstant(event.endsAt)
+        }.`,
+      });
+      return false;
+    }
+    case "schedule_window.closing": {
+      // The window's command ended (window_ended | plan_replaced | no_plan):
+      // the projection stops claiming a running window NOW; the intent
+      // lifecycle's own frames carry the request's end from here.
+      const event = toScheduleWindowClosingEvent(payloadOf(frame));
+      if (event === null) {
+        return false;
+      }
+      dispatch({ type: "schedule-state", state: applyWindowClosing(schedule, event) });
+      dispatch({ type: "polite", text: `Scheduled window ${event.entryId} ended.` });
       return false;
     }
     case "unit.unexpected_autonomy":
@@ -1186,7 +1271,14 @@ export function useConsoleData(
             } else {
               plane.publishEvent(frame);
             }
-            if (applyEventFrame(frame, dispatch, stateRef.current.snapshot?.adviserState ?? null)) {
+            if (
+              applyEventFrame(
+                frame,
+                dispatch,
+                stateRef.current.snapshot?.adviserState ?? null,
+                stateRef.current.snapshot?.scheduleState ?? null,
+              )
+            ) {
               scheduleAuthorityRefresh();
             }
           }

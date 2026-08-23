@@ -954,6 +954,13 @@ export interface WireSnapshot {
    * composed: no adviser, no tile, no toggle. Attach with `withAdviserState`.
    */
   readonly adviser_state?: WireAdviserState;
+  /**
+   * The schedules projection (PENDING, feature-detected): present whenever the
+   * `schedule:` config block is composed, ABSENT (the default, today's wire)
+   * otherwise — no Schedule card, nothing else changes. Attach with
+   * `withScheduleState`.
+   */
+  readonly schedule_state?: WireScheduleState;
 }
 
 /** The snapshot `intent` block's object form; every map nullable inside. */
@@ -1062,6 +1069,413 @@ export function adviserState(spec: Partial<WireAdviserState> = {}): WireAdviserS
 /** Attach the pending adviser projection to a snapshot world. */
 export function withAdviserState(world: WireSnapshot, state: WireAdviserState): WireSnapshot {
   return { ...world, adviser_state: state };
+}
+
+// ---------------------------------------------------------------------------
+// Schedules (DESIGN_SCHEDULES.md §5, API_CONTRACTS.md "Schedule") — the whole
+// family is PENDING-BACKEND: the REST routes, the schedule_state projection,
+// and the bus vocabulary are not live yet, so none of these types is in
+// PUBLISHED_EVENT_TYPES and the default snapshot omits `schedule_state`
+// entirely (an absent field is today's wire truth). Attach with
+// `withScheduleState`; build refusals with `scheduleRefusalEnvelope`.
+// ---------------------------------------------------------------------------
+
+/** The bus vocabulary the schedules surface publishes (transitions only). */
+export const SCHEDULE_REPLACED = "schedule.replaced" as const;
+export const SCHEDULE_WINDOW_OPENED = "schedule_window.opened" as const;
+export const SCHEDULE_WINDOW_CLOSING = "schedule_window.closing" as const;
+
+/** One plan entry exactly as the wire carries it: EITHER watt form, never both. */
+export interface WireScheduleEntry {
+  readonly entry_id: string;
+  readonly days: readonly string[];
+  readonly start_local: string;
+  readonly end_local: string;
+  readonly action: "charge" | "discharge" | "idle";
+  readonly watts?: number;
+  readonly watts_by_unit?: Readonly<Record<string, number>>;
+  readonly unit_ids: readonly string[];
+  readonly effective_from: string | null;
+  readonly effective_until: string | null;
+  readonly priority: number;
+  readonly enabled: boolean;
+}
+
+/** The days vocabulary (lowercase three-letter names, the wire's own order). */
+export const SCHEDULE_DAY_VALUES: readonly string[] = [
+  "mon",
+  "tue",
+  "wed",
+  "thu",
+  "fri",
+  "sat",
+  "sun",
+];
+
+/**
+ * A schedule-entry fixture. Defaults are the doc's own illustrative day-window
+ * example (§1's wording, made day-legal): "Day charge", every day, 06:30 to
+ * 18:00, charging the three captured units at 2,500 W each — the per-battery
+ * form the v1 editor defaults to. Pass `watts` for the scalar form; an
+ * explicit `watts_by_unit` wins over the default map.
+ */
+export function scheduleEntry(spec: Partial<WireScheduleEntry> = {}): WireScheduleEntry {
+  const unitIds = [...(spec.unit_ids ?? ["lhs", "mid", "rhs"])];
+  const wattsByUnit =
+    spec.watts_by_unit ??
+    Object.fromEntries(unitIds.map((unitId) => [unitId, 2500]));
+  const wattForm =
+    spec.watts !== undefined
+      ? { watts: spec.watts }
+      : { watts_by_unit: wattsByUnit as Record<string, number> };
+  return {
+    entry_id: spec.entry_id ?? "Day charge",
+    days: [...(spec.days ?? SCHEDULE_DAY_VALUES)],
+    start_local: spec.start_local ?? "06:30",
+    end_local: spec.end_local ?? "18:00",
+    action: spec.action ?? "charge",
+    ...wattForm,
+    unit_ids: unitIds,
+    effective_from: spec.effective_from ?? null,
+    effective_until: spec.effective_until ?? null,
+    priority: spec.priority ?? 0,
+    enabled: spec.enabled ?? true,
+  };
+}
+
+/** The published plan: one version, one IANA timezone, the entry list. */
+export interface WireSchedulePlan {
+  readonly version: number;
+  readonly timezone: string;
+  readonly entries: readonly WireScheduleEntry[];
+}
+
+export function schedulePlan(
+  entries: readonly WireScheduleEntry[],
+  spec: { version?: number; timezone?: string } = {},
+): WireSchedulePlan {
+  return {
+    version: spec.version ?? 4,
+    timezone: spec.timezone ?? "Australia/Brisbane",
+    entries: [...entries],
+  };
+}
+
+/** The derived, read-only policy GET carries beside the plan. */
+export interface WireSchedulePolicy {
+  readonly posture: "yield" | "partition";
+  readonly allowed_windows_local: readonly (readonly [string, string])[];
+  readonly intent_ttl_s: number;
+}
+
+/** A policy fixture; defaults are the shipped day-only YIELD posture (§3). */
+export function schedulePolicy(
+  spec: Partial<WireSchedulePolicy> = {},
+): WireSchedulePolicy {
+  return {
+    posture: spec.posture ?? "yield",
+    allowed_windows_local:
+      spec.allowed_windows_local ?? ([["06:00", "20:00"]] as readonly (readonly [string, string])[]),
+    intent_ttl_s: spec.intent_ttl_s ?? 10,
+  };
+}
+
+/**
+ * The pure next-occurrence object (§5.4) — GET's `next_action` and the
+ * projection's `next` share this shape. Defaults follow §5's Night Charge
+ * example, one hour out.
+ */
+export interface WireScheduleNextAction {
+  readonly entry_id: string;
+  readonly days: readonly string[];
+  readonly start_local: string;
+  readonly end_local: string;
+  readonly action: "charge" | "discharge" | "idle";
+  readonly watts?: number;
+  readonly watts_by_unit?: Readonly<Record<string, number>>;
+  readonly unit_ids: readonly string[];
+  readonly starts_at: string;
+  readonly starts_in_s: number;
+}
+
+export function scheduleNextAction(
+  spec: Partial<WireScheduleNextAction> = {},
+): WireScheduleNextAction {
+  const unitIds = [...(spec.unit_ids ?? ["lhs", "mid", "rhs"])];
+  const wattForm =
+    spec.watts !== undefined
+      ? { watts: spec.watts }
+      : {
+          watts_by_unit:
+            spec.watts_by_unit ??
+            (Object.fromEntries(unitIds.map((unitId) => [unitId, 2500])) as Record<string, number>),
+        };
+  return {
+    entry_id: spec.entry_id ?? "Night Charge",
+    days: [...(spec.days ?? SCHEDULE_DAY_VALUES)],
+    start_local: spec.start_local ?? "00:01",
+    end_local: spec.end_local ?? "05:59",
+    action: spec.action ?? "charge",
+    ...wattForm,
+    unit_ids: unitIds,
+    starts_at: spec.starts_at ?? "2026-08-24T00:01:00+10:00",
+    starts_in_s: spec.starts_in_s ?? 3600,
+  };
+}
+
+/**
+ * The snapshot's top-level `schedule_state` projection (§5), verbatim from the
+ * contract's own holding example: Night Charge running under the partition
+ * posture, ~46 min left. `next` defaults to null exactly like the example
+ * (the next occurrence after the running window).
+ */
+export interface WireScheduleState {
+  readonly version: number | null;
+  readonly active: boolean;
+  readonly entry_id: string | null;
+  readonly held_intent_id: string | null;
+  readonly ends_at: string | null;
+  readonly ends_in_s: number | null;
+  readonly next: WireScheduleNextAction | null;
+  readonly posture: "yield" | "partition";
+  readonly last_action: "idle" | "submit" | "renew" | "remove";
+  readonly last_tick_at: string;
+  readonly reason_codes: readonly string[];
+}
+
+export function scheduleState(spec: Partial<WireScheduleState> = {}): WireScheduleState {
+  return {
+    version: spec.version === undefined ? 4 : spec.version,
+    active: spec.active ?? true,
+    entry_id: spec.entry_id === undefined ? "Night Charge" : spec.entry_id,
+    held_intent_id: spec.held_intent_id === undefined ? "schedule-4-881.234117" : spec.held_intent_id,
+    ends_at: spec.ends_at === undefined ? "2026-08-24T05:59:00+10:00" : spec.ends_at,
+    ends_in_s: spec.ends_in_s === undefined ? 2743 : spec.ends_in_s,
+    next: spec.next === undefined ? null : spec.next,
+    posture: spec.posture ?? "partition",
+    last_action: spec.last_action ?? "renew",
+    last_tick_at: spec.last_tick_at ?? "2026-08-24T03:13:41+10:00",
+    reason_codes: [...(spec.reason_codes ?? ["window_open"])],
+  };
+}
+
+/** Attach the pending schedule projection to a snapshot world. */
+export function withScheduleState(
+  world: WireSnapshot,
+  state: WireScheduleState,
+): WireSnapshot {
+  return { ...world, schedule_state: state };
+}
+
+/**
+ * The `schedule.replaced` frame (`{principal, version, diff}` — one per
+ * publish; `version` is the NEW plan version). PENDING-BACKEND.
+ */
+export function scheduleReplaced(
+  sequence: number,
+  payload: {
+    principal?: string;
+    version?: number;
+    added?: readonly string[];
+    removed?: readonly string[];
+    changed?: readonly string[];
+  } = {},
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<{
+  principal: string;
+  version: number;
+  diff: { added: string[]; removed: string[]; changed: string[] };
+}> {
+  return frame(
+    SCHEDULE_REPLACED,
+    sequence,
+    {
+      principal: payload.principal ?? "operator:home",
+      version: payload.version ?? 5,
+      diff: {
+        added: [...(payload.added ?? ["Night Charge"])],
+        removed: [...(payload.removed ?? [])],
+        changed: [...(payload.changed ?? [])],
+      },
+    },
+    occurredAt,
+  );
+}
+
+/**
+ * The `schedule_window.opened` frame — the runner's first submit for a window
+ * key, carrying the window's whole command. PENDING-BACKEND.
+ */
+export function scheduleWindowOpened(
+  sequence: number,
+  payload: {
+    entry_id?: string;
+    version?: number;
+    action?: "charge" | "discharge" | "idle";
+    watts?: number;
+    watts_by_unit?: Readonly<Record<string, number>>;
+    unit_ids?: readonly string[];
+    ends_at?: string;
+  } = {},
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<Record<string, unknown>> {
+  const unitIds = [...(payload.unit_ids ?? ["lhs", "mid", "rhs"])];
+  return frame(
+    SCHEDULE_WINDOW_OPENED,
+    sequence,
+    {
+      entry_id: payload.entry_id ?? "Night Charge",
+      version: payload.version ?? 4,
+      action: payload.action ?? "charge",
+      ...(payload.watts !== undefined
+        ? { watts: payload.watts }
+        : {
+            watts_by_unit:
+              payload.watts_by_unit ??
+              (Object.fromEntries(unitIds.map((unitId) => [unitId, 2500])) as Record<string, number>),
+          }),
+      unit_ids: unitIds,
+      ends_at: payload.ends_at ?? "2026-08-24T05:59:00+10:00",
+    },
+    occurredAt,
+  );
+}
+
+/**
+ * The `schedule_window.closing` frame — the removal tick: the window's command
+ * just ended (`window_ended | plan_replaced | no_plan`). PENDING-BACKEND.
+ */
+export function scheduleWindowClosing(
+  sequence: number,
+  payload: {
+    entry_id?: string;
+    version?: number;
+    unit_ids?: readonly string[];
+    reason?: "window_ended" | "plan_replaced" | "no_plan";
+  } = {},
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<{
+  entry_id: string;
+  version: number;
+  unit_ids: string[];
+  reason: string;
+}> {
+  return frame(
+    SCHEDULE_WINDOW_CLOSING,
+    sequence,
+    {
+      entry_id: payload.entry_id ?? "Night Charge",
+      version: payload.version ?? 4,
+      unit_ids: [...(payload.unit_ids ?? ["lhs", "mid", "rhs"])],
+      reason: payload.reason ?? "window_ended",
+    },
+    occurredAt,
+  );
+}
+
+/** The GET /api/v1/schedule 200 body. PENDING-BACKEND. */
+export function getScheduleOk(view: {
+  plan?: WireSchedulePlan | null;
+  policy?: WireSchedulePolicy;
+  acknowledged_night_windows?: boolean;
+  next_action?: WireScheduleNextAction | null;
+}): Record<string, unknown> {
+  return {
+    plan: view.plan === undefined ? null : view.plan,
+    policy: view.policy ?? schedulePolicy(),
+    acknowledged_night_windows: view.acknowledged_night_windows ?? false,
+    next_action: view.next_action === undefined ? null : view.next_action,
+  };
+}
+
+/** The PUT /api/v1/schedule 200 body (the stored plan, the diff, the next). */
+export function putScheduleOk(view: {
+  version: number;
+  plan: WireSchedulePlan;
+  added?: readonly string[];
+  removed?: readonly string[];
+  changed?: readonly string[];
+  timezone_changed?: boolean;
+  acknowledged_night_windows?: boolean;
+  next_action?: WireScheduleNextAction | null;
+}): Record<string, unknown> {
+  return {
+    version: view.version,
+    plan: view.plan,
+    diff: {
+      added: [...(view.added ?? [])],
+      removed: [...(view.removed ?? [])],
+      changed: [...(view.changed ?? [])],
+      timezone_changed: view.timezone_changed ?? false,
+    },
+    acknowledged_night_windows: view.acknowledged_night_windows ?? false,
+    next_action: view.next_action === undefined ? null : view.next_action,
+  };
+}
+
+/**
+ * A refusal envelope for the schedule routes, shaped exactly as the thrown
+ * `ApiClientError` carries it (tests wrap: `new ApiClientError({...}))`).
+ * The two named shapes carry their contract-pinned details verbatim (§3).
+ */
+export function scheduleRefusalEnvelope(
+  code:
+    | "schedule_not_commissioned"
+    | "schedule_window_not_allowed"
+    | "night_posture_acknowledgement_required"
+    | "schedule_version_conflict"
+    | "validation_error",
+  options: {
+    message?: string;
+    details?: Record<string, unknown>;
+    status?: number;
+  } = {},
+): { status: number; code: string; message: string; details: Record<string, unknown> | null; request_id: string } {
+  const defaults: Record<string, { status: number; message: string; details: Record<string, unknown> | null }> = {
+    schedule_not_commissioned: {
+      status: 409,
+      message: "Scheduling is not commissioned in this deployment's config.",
+      details: null,
+    },
+    schedule_window_not_allowed: {
+      status: 409,
+      message:
+        "Night Charge (00:01–05:59) falls outside the allowed windows 06:00–20:00 — the night window belongs to the site's other writer applications (day-only posture). Trim the entry to the allowed windows, or make the partition choice: stand the external writers down and widen allowed_windows_local in config, then acknowledge once in the console.",
+      details: {
+        posture: "yield",
+        allowed_windows_local: [["06:00", "20:00"]],
+        offending: [{ entry_id: "Night Charge", start_local: "00:01", end_local: "05:59" }],
+      },
+    },
+    night_posture_acknowledgement_required: {
+      status: 409,
+      message:
+        "The first night-window publish needs the one-time partition acknowledgement.",
+      details: { acknowledgement: "PARTITION_ACKNOWLEDGED" },
+    },
+    schedule_version_conflict: {
+      status: 409,
+      message: "The plan changed elsewhere while you were editing.",
+      details: { current_version: 5 },
+    },
+    validation_error: {
+      status: 422,
+      message: "The schedule entries did not validate.",
+      details: {
+        entries: [
+          { entry_id: "Night Charge", field: "end_local", message: "window must outlast its start" },
+        ],
+      },
+    },
+  };
+  const pinned = defaults[code]!;
+  return {
+    status: options.status ?? pinned.status,
+    code,
+    message: options.message ?? pinned.message,
+    details: options.details ?? pinned.details,
+    request_id: `req-${code}`,
+  };
 }
 
 /**

@@ -8,6 +8,7 @@
  * and are the only strings shown to operators.
  */
 import { formatWatts } from "../lib/format";
+import { toScheduleState, type ScheduleState } from "./schedule";
 export type Lifecycle =
   | "boot"
   | "observe_only"
@@ -640,6 +641,13 @@ export interface FleetSnapshot {
    * detection: no tile, no toggle, nothing else renders.
    */
   adviserState: AdviserState | null;
+  /**
+   * The snapshot's top-level `schedule_state` projection (PENDING-BACKEND:
+   * present only when the `schedule:` config block is composed). Null when
+   * absent — today's wire — and that null IS the feature detection: no
+   * Schedule surfaces render anywhere in the console.
+   */
+  scheduleState: ScheduleState | null;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -754,6 +762,10 @@ export function normalizeSnapshot(raw: unknown): FleetSnapshot {
     // to "the excess-solar feature is not composed here" — the tile, the
     // toggle, and every adviser-derived surface stay hidden.
     adviserState: isRecord(record.adviser_state) ? toAdviserState(record.adviser_state) : null,
+    // Feature detection: an absent `schedule_state` (today's backend) normalizes
+    // to "the schedules feature is not composed here" — Home's card, the
+    // Schedule view, and every schedule-derived surface stay hidden.
+    scheduleState: isRecord(record.schedule_state) ? toScheduleState(record.schedule_state) : null,
   };
 }
 
