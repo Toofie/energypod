@@ -2161,6 +2161,48 @@ describe("HomeView — the excess-charging toggle", () => {
     });
   });
 
+  it("the operator's own spelling confirms: lowercase 'excess' unlocks the toggle", async () => {
+    const user = userEvent.setup();
+    // An acknowledged, disabled site: the typed word is the only gate left.
+    const offAcked = adviserState({
+      enabled: false,
+      enabled_origin: "runtime",
+      acknowledged_economics: true,
+      active: false,
+      hysteresis_state: "inactive",
+      commanded_charge_w: 0,
+      held_intent_id: null,
+      reason_codes: ["no_export_headroom"],
+      fleet_export_w: 900,
+    });
+    const postExcessCharging = vi.fn(() =>
+      Promise.resolve(excessChargingToggleOk(adviserState({ enabled: true, enabled_origin: "runtime" }))),
+    );
+    installClient({
+      snapshot: { ...fleet(solarUnits()), adviser_state: offAcked },
+      postExcessCharging,
+    });
+    renderHome();
+    await screen.findByRole("region", { name: SOLAR_REGION });
+
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn on charging from solar surplus/i });
+    const confirm = within(dialog).getByRole("button", { name: "Turn on" });
+    expect(confirm).toBeDisabled();
+    // The operator spec's literal instruction — "simply type 'excess'" —
+    // confirms the toggle; the wire still sends the literal "EXCESS".
+    await user.type(within(dialog).getByLabelText(/Type EXCESS/i), "excess");
+    expect(confirm).toBeEnabled();
+    await user.click(confirm);
+    await waitFor(() => {
+      expect(postExcessCharging).toHaveBeenCalledWith("enable", {});
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(screen.getByRole("switch")).toHaveAttribute("aria-checked", "true");
+  });
+
   it("disable asks only for the typed EXCESS confirmation", async () => {
     const user = userEvent.setup();
     const onByConfig = adviserState({ enabled: true, enabled_origin: "config" });

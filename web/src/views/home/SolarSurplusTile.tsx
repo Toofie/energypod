@@ -63,7 +63,13 @@ export interface SolarSurplusTileProps {
   onAdopt: (state: AdviserState) => void;
 }
 
-/** The typed confirmation the contract requires for BOTH actions (§3). */
+/**
+ * The typed confirmation the contract requires for BOTH actions (§3).  The
+ * operator's own phrasing of the feature is "type 'excess'" — the console
+ * gate therefore matches CASE-INSENSITIVELY (the label still teaches the
+ * contract's word); the client always sends the literal "EXCESS" the wire
+ * pins.
+ */
 export const EXCESS_CONFIRMATION = "EXCESS";
 
 /** The acknowledgement value the contract pins for the first enable (P3). */
@@ -254,7 +260,9 @@ function ExcessToggleDialog({
   // stale (another console captured it, or the local flag lagged a restart).
   const showAcknowledgement =
     needsAcknowledgement || refusal?.code === "economics_acknowledgement_required";
-  const typedOk = typed.trim() === EXCESS_CONFIRMATION;
+  // Case-insensitive: the operator's spec says "simply type 'excess'" and
+  // the lowercase spelling must confirm exactly like the contract's own word.
+  const typedOk = typed.trim().toUpperCase() === EXCESS_CONFIRMATION;
   const ready = typedOk && (!showAcknowledgement || acknowledged) && !pending;
 
   useEffect(() => {
