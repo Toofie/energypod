@@ -38,6 +38,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, AuditEvent, StreamEvent } from "../../api/client";
 import { toUnexpectedAutonomyEvent } from "../../app/fleet";
+import {
+  localTimeOfInstant,
+  toScheduleReplacedEvent,
+  toScheduleWindowOpenedEvent,
+  wattsSummaryText,
+} from "../../app/schedule";
 import { formatWatts } from "../../lib/format";
 import "./activity.css";
 
@@ -282,6 +288,53 @@ function autonomyEntryFromFrame(frame: StreamEvent): AuditEvent | null {
   } as unknown as AuditEvent;
 }
 
+/**
+ * A `schedule.replaced` frame as a QUIET timeline entry (§6 W-D): one row per
+ * publish, the plain diff the payload carries ("Schedule v2→v3 — added Night
+ * Charge, removed old-evening"). Informational only — publishing is an
+ * operator act, not an alarm; the same sentence the audit row will carry.
+ */
+function scheduleReplacedEntryFromFrame(frame: StreamEvent): AuditEvent | null {
+  const event = toScheduleReplacedEvent(frame.payload);
+  if (event === null) {
+    return null;
+  }
+  return {
+    event_type: "schedule_replaced",
+    occurred_at: typeof frame.occurred_at === "string" ? frame.occurred_at : "",
+    sequence: typeof frame.sequence === "number" ? frame.sequence : 0,
+    principal: event.principal ?? undefined,
+    version: event.version ?? undefined,
+    added: [...event.diff.added],
+    removed: [...event.diff.removed],
+    changed: [...event.diff.changed],
+  } as unknown as AuditEvent;
+}
+
+/**
+ * A `schedule_window.opened` frame as a QUIET timeline entry: a published
+ * window's command began — the entry, its direction, its per-battery watts,
+ * and the local time it ends. The window's end is the intent lifecycle's own
+ * business (the runner simply stops renewing); no closing row is invented.
+ */
+function scheduleWindowOpenedEntryFromFrame(frame: StreamEvent): AuditEvent | null {
+  const event = toScheduleWindowOpenedEvent(frame.payload);
+  if (event === null) {
+    return null;
+  }
+  return {
+    event_type: "schedule_window_opened",
+    occurred_at: typeof frame.occurred_at === "string" ? frame.occurred_at : "",
+    sequence: typeof frame.sequence === "number" ? frame.sequence : 0,
+    entry_id: event.entryId,
+    action: event.action,
+    ...(event.wattsByUnit === null ? {} : { watts_by_unit: event.wattsByUnit }),
+    ...(event.watts === null ? {} : { watts: event.watts }),
+    unit_ids: [...event.unitIds],
+    ends_at: event.endsAt ?? undefined,
+  } as unknown as AuditEvent;
+}
+
 /** A raw wire code as calm words: telemetry_stale -> "Telemetry stale". */
 function humanize(code: string): string {
   const words = code.toLowerCase().split(/[_\s]+/).filter((word) => word !== "");
@@ -371,6 +424,12 @@ function headlineFor(eventType: string): string {
       // Quiet-tier evidence (the awareness layer's recorder): the headline is
       // the whole alarm budget this entry ever gets.
       return "Uncommanded activity";
+    case "schedule_replaced":
+      // Quiet informational (§6 W-D): a publish is an operator act, and the
+      // diff below is the whole story.
+      return "Schedule published";
+    case "schedule_window_opened":
+      return "Schedule window opened";
     case "unit_armed":
       return "Arm request";
     case "unit_disarmed":
@@ -505,6 +564,51 @@ function happenedLine(event: AuditEvent, stopId: string | null): string | null {
     return measured !== undefined
       ? `Measured ${formatWatts(measured)} with no request claiming this battery`
       : "Measured with no request claiming this battery";
+  }
+  if (eventType === "schedule_replaced") {
+    // The plain diff sentence the audit row carries too: versions, then the
+    // entry-level changes. A REST-loaded audit row may spell the versions
+    // version_from/version_to; a bus frame carries the new `version`.
+    const from = numberField(event, "version_from");
+    const to = numberField(event, "version_to") ?? numberField(event, "version");
+    const source = isRecord(event.diff) ? event.diff : event;
+    const parts: string[] = [];
+    for (const [key, verb] of [
+      ["added", "added"],
+      ["removed", "removed"],
+      ["changed", "changed"],
+    ] as const) {
+      const names = Array.isArray(source[key])
+        ? (source[key] as unknown[]).filter((name): name is string => typeof name === "string")
+        : [];
+      if (names.length > 0) {
+        parts.push(`${verb} ${names.join(", ")}`);
+      }
+    }
+    const versions =
+      from !== undefined && to !== undefined
+        ? `v${from}→v${to}`
+        : to !== undefined
+          ? `v${to}`
+          : "a new version";
+    return `Schedule ${versions} published${parts.length === 0 ? " — no entry changes" : ` — ${parts.join(", ")}`}`;
+  }
+  if (eventType === "schedule_window_opened") {
+    // The window's own command: the entry, its direction and figures, and the
+    // local time it ends. Quiet wording — the request it holds is an ordinary
+    // request and already has its own rows while it runs.
+    const entryId = stringField(event, "entry_id");
+    const wattsByUnit =
+      isRecord(event.watts_by_unit) ? (event.watts_by_unit as Record<string, number>) : null;
+    const summary = wattsSummaryText({
+      action: (stringField(event, "action") ?? "charge") as "charge" | "discharge" | "idle",
+      watts: numberField(event, "watts") ?? null,
+      wattsByUnit,
+    });
+    const endsAt = stringField(event, "ends_at");
+    const endsAtText = localTimeOfInstant(endsAt ?? null);
+    const endsWord = endsAtText === "" ? "" : ` until ${endsAtText}`;
+    return `${entryId ?? "A scheduled window"} began — ${summary}${endsWord}`;
   }
   if (isStopHeldDecision(event)) {
     return stopHeldLine(stopId);
@@ -680,6 +784,21 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
               // Quiet-tier evidence, never an alarm: the timeline entry is
               // the whole console surface for this frame.
               const entry = autonomyEntryFromFrame(frame);
+              if (entry !== null) {
+                appendLiveEntry(entry);
+              }
+            } else if (frame.type === "schedule.replaced") {
+              // Quiet informational (§6 W-D): one timeline row per publish,
+              // the plain diff the payload carries.
+              const entry = scheduleReplacedEntryFromFrame(frame);
+              if (entry !== null) {
+                appendLiveEntry(entry);
+              }
+            } else if (frame.type === "schedule_window.opened") {
+              // Quiet informational: a published window's command began. The
+              // window's end needs no row of its own — it is the intent
+              // lifecycle's ordinary end (non-renewal).
+              const entry = scheduleWindowOpenedEntryFromFrame(frame);
               if (entry !== null) {
                 appendLiveEntry(entry);
               }

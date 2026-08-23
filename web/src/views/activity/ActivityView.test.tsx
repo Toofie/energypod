@@ -77,6 +77,9 @@ import {
   auditPage,
   observationPublished,
   resyncRequired,
+  scheduleReplaced,
+  scheduleWindowClosing,
+  scheduleWindowOpened,
   unitUnexpectedAutonomy,
   type WireAuditEvent,
 } from "../../test/wire";
@@ -1168,6 +1171,160 @@ describe("Activity view — unexpected-autonomy evidence (quiet tier)", () => {
     await user.click(screen.getByRole("button", { name: "MID" }));
     expect(screen.getAllByRole("listitem")).toHaveLength(1);
     await user.click(screen.getByRole("button", { name: "RHS" }));
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The schedules surface's quiet timeline entries (DESIGN_SCHEDULES.md §6 W-D):
+// a publish and a window-opening each become exactly one informational row —
+// the plain diff and the window's own command, never an alarm. The window's
+// END needs no row of its own: non-renewal is the intent lifecycle's ordinary
+// end, which already has its rows. PENDING-BACKEND frames from wire.ts.
+// ---------------------------------------------------------------------------
+
+describe("Activity view — schedule events (quiet informational)", () => {
+  /** A controllable shared stream, as the live-update suite builds one. */
+  function streamChannel(): {
+    openEvents: () => AsyncGenerator<Record<string, unknown>, void, unknown>;
+    push(frame: Record<string, unknown>): void;
+  } {
+    const queue: Record<string, unknown>[] = [];
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    return {
+      openEvents: () =>
+        (async function* channel(): AsyncGenerator<Record<string, unknown>, void, unknown> {
+          while (true) {
+            while (queue.length > 0) {
+              const next = queue.shift();
+              if (next !== undefined) {
+                yield next;
+                if (next.type === "resync_required") {
+                  return;
+                }
+              }
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        })(),
+      push: (frame) => {
+        queue.push(frame);
+        notify();
+      },
+    };
+  }
+
+  it("appends one quiet publish row per schedule.replaced frame, with the plain diff", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push(
+      scheduleReplaced(91, {
+        version: 5,
+        added: ["Night Charge"],
+        removed: ["old-evening"],
+        changed: ["morning-topup"],
+      }) as unknown as Record<string, unknown>,
+    );
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("Schedule published");
+    expect(items[0]!.textContent).toContain(
+      "Schedule v5 published — added Night Charge, removed old-evening, changed morning-topup",
+    );
+    // Quiet: no refetch was forced and no second read ran for the frame.
+    expect(client.getAudit).toHaveBeenCalledTimes(1);
+  });
+
+  it("states a publish with no entry changes honestly", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push(
+      scheduleReplaced(91, { version: 6, added: [], removed: [], changed: [] }) as unknown as Record<
+        string,
+        unknown
+      >,
+    );
+    const items = await screen.findAllByRole("listitem");
+    expect(items[0]!.textContent).toContain("Schedule v6 published — no entry changes");
+  });
+
+  it("renders a window-opening row with the entry's own command and end time", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push(
+      scheduleWindowOpened(92, {
+        entry_id: "Night Charge",
+        version: 5,
+        action: "charge",
+        watts_by_unit: { lhs: 2500, mid: 2500, rhs: 2500 },
+        unit_ids: ["lhs", "mid", "rhs"],
+        ends_at: "2026-08-24T05:59:00+10:00",
+      }) as unknown as Record<string, unknown>,
+    );
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("Schedule window opened");
+    expect(items[0]!.textContent).toContain(
+      "Night Charge began — 2,500 W per battery (lhs, mid, rhs) until 05:59",
+    );
+  });
+
+  it("renders a REST-loaded schedule_replaced audit row's own version fields", async () => {
+    // The audit row the backend will write carries version_from/version_to;
+    // the view reads both spellings rather than inventing a version.
+    const replacedRow = {
+      ...auditEvent({
+        sequence: 61,
+        event_type: "schedule_replaced",
+        occurred_at: minutesAgo(4),
+        principal: PRINCIPAL,
+        result: "replaced",
+      }),
+      version_from: 4,
+      version_to: 5,
+      added: ["Night Charge"],
+    } as unknown as WireAuditEvent;
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([replacedRow]));
+    renderView();
+    const items = await screen.findAllByRole("listitem");
+    expect(items[0]!.textContent).toContain("Schedule published");
+    expect(items[0]!.textContent).toContain(
+      "Schedule v4→v5 published — added Night Charge",
+    );
+  });
+
+  it("never invents a window-closing row: the window's end is the intent lifecycle's own", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push(scheduleWindowClosing(93, { entry_id: "Night Charge" }) as unknown as Record<string, unknown>);
+    // Nothing landed: the closing frame is a transition for the live card,
+    // not a timeline fact of its own.
+    await waitFor(() => {
+      expect(channel).toBeDefined();
+    });
     expect(screen.queryAllByRole("listitem")).toHaveLength(0);
   });
 });
