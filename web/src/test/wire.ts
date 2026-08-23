@@ -89,6 +89,15 @@ export const EMERGENCY_STOP_LATCHED = "emergency_stop.latched" as const;
 export const EMERGENCY_STOP_ACKNOWLEDGED = "emergency_stop.acknowledged" as const;
 export const INHIBIT_ACKNOWLEDGED = "inhibit.acknowledged" as const;
 
+/**
+ * The excess-solar adviser's state announcement (DESIGN_EXCESS_ACTIVATION.md
+ * §2): published only when the semantic state tuple changes, plus a 30 s
+ * `"heartbeat": true` republish while enabled. PENDING-BACKEND — the backend
+ * half of the package is not live yet, so this type is not in
+ * PUBLISHED_EVENT_TYPES; suites attach it with `excessAdviserStateChanged`.
+ */
+export const EXCESS_ADVISER_STATE_CHANGED = "excess_adviser.state_changed" as const;
+
 /** Every event type the composed service publishes, as a runtime checklist. */
 export const PUBLISHED_EVENT_TYPES: readonly string[] = [
   OBSERVATION_PUBLISHED,
@@ -552,6 +561,58 @@ export function inhibitAcknowledged(
   );
 }
 
+/**
+ * One `excess_adviser.state_changed` payload exactly as the design contract §2
+ * spells it: the §1 projection's state tuple and watt figures plus
+ * `heartbeat`, and deliberately WITHOUT `charge_cap_w` / `last_action` /
+ * `last_tick_at` (the payload is a patch onto the snapshot's projection, not a
+ * replacement — consumers must keep the snapshot's composed cap). Defaults are
+ * the contract's own illustrative holding example. PENDING-BACKEND.
+ */
+export interface ExcessAdviserStateChangedPayload {
+  readonly enabled: boolean;
+  readonly enabled_origin: "config" | "runtime";
+  readonly acknowledged_economics: boolean;
+  readonly active: boolean;
+  readonly hysteresis_state: "inactive" | "entering" | "holding" | "exiting";
+  readonly target_unit_id: string | null;
+  readonly commanded_charge_w: number;
+  readonly eligible_export_charge_w: number;
+  readonly fleet_export_w: number | null;
+  readonly export_evidence: "good" | "missing" | "bad" | "stale";
+  readonly reason_codes: readonly string[];
+  readonly held_intent_id: string | null;
+  readonly heartbeat: boolean;
+}
+
+export function excessAdviserStateChanged(
+  sequence: number,
+  payload: Partial<ExcessAdviserStateChangedPayload> = {},
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<ExcessAdviserStateChangedPayload> {
+  const base = adviserState(payload);
+  return frame(
+    EXCESS_ADVISER_STATE_CHANGED,
+    sequence,
+    {
+      enabled: base.enabled,
+      enabled_origin: base.enabled_origin,
+      acknowledged_economics: base.acknowledged_economics,
+      active: base.active,
+      hysteresis_state: base.hysteresis_state,
+      target_unit_id: base.target_unit_id,
+      commanded_charge_w: base.commanded_charge_w,
+      eligible_export_charge_w: base.eligible_export_charge_w,
+      fleet_export_w: base.fleet_export_w,
+      export_evidence: base.export_evidence,
+      reason_codes: base.reason_codes,
+      held_intent_id: base.held_intent_id,
+      heartbeat: payload.heartbeat ?? false,
+    },
+    occurredAt,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Stream frames the REST relay builds (rest.py)
 // ---------------------------------------------------------------------------
@@ -693,6 +754,13 @@ export interface WireSnapshot {
    * and every consumer keeps its current fallbacks.
    */
   readonly intent?: WireSnapshotIntent | null;
+  /**
+   * The excess-solar adviser projection (PENDING, feature-detected, §1):
+   * present whenever the `excess_charging` block is composed — including while
+   * suspended — and ABSENT (the default, today's wire) when nothing is
+   * composed: no adviser, no tile, no toggle. Attach with `withAdviserState`.
+   */
+  readonly adviser_state?: WireAdviserState;
 }
 
 /** The snapshot `intent` block's object form; every map nullable inside. */
@@ -744,6 +812,63 @@ export function withActiveStops(
   stops: readonly WireActiveStop[],
 ): WireSnapshot {
   return { ...world, active_stops: [...stops] };
+}
+
+/**
+ * The excess-solar adviser projection (DESIGN_EXCESS_ACTIVATION.md §1): the
+ * snapshot's top-level `adviser_state` block, present whenever the
+ * `excess_charging` config block is composed, ABSENT otherwise (the default
+ * snapshot omits it — an absent field is today's wire truth). PENDING-BACKEND:
+ * attach it with `withAdviserState` and treat it as optional everywhere.
+ */
+export interface WireAdviserState {
+  readonly enabled: boolean;
+  readonly enabled_origin: "config" | "runtime";
+  readonly acknowledged_economics: boolean;
+  readonly active: boolean;
+  readonly hysteresis_state: "inactive" | "entering" | "holding" | "exiting";
+  readonly target_unit_id: string | null;
+  readonly commanded_charge_w: number;
+  readonly eligible_export_charge_w: number;
+  /** Σ per-unit grid_power_w; NULL when any unit's grid evidence fails — never 0. */
+  readonly fleet_export_w: number | null;
+  readonly export_evidence: "good" | "missing" | "bad" | "stale";
+  readonly charge_cap_w: number;
+  readonly held_intent_id: string | null;
+  readonly last_action: "idle" | "propose" | "renew" | "withdraw";
+  readonly last_tick_at: string;
+  readonly reason_codes: readonly string[];
+}
+
+/**
+ * An adviser-projection fixture. Defaults are the contract's own illustrative
+ * holding example (§1's JSON, verbatim); explicit nulls are preserved — an
+ * explicit `fleet_export_w: null` is the fail-closed export answer, distinct
+ * from leaving the default.
+ */
+export function adviserState(spec: Partial<WireAdviserState> = {}): WireAdviserState {
+  return {
+    enabled: spec.enabled ?? true,
+    enabled_origin: spec.enabled_origin ?? "runtime",
+    acknowledged_economics: spec.acknowledged_economics ?? true,
+    active: spec.active ?? true,
+    hysteresis_state: spec.hysteresis_state ?? "holding",
+    target_unit_id: spec.target_unit_id === undefined ? "mid" : spec.target_unit_id,
+    commanded_charge_w: spec.commanded_charge_w ?? 1400,
+    eligible_export_charge_w: spec.eligible_export_charge_w ?? 1600,
+    fleet_export_w: spec.fleet_export_w === undefined ? 1800 : spec.fleet_export_w,
+    export_evidence: spec.export_evidence ?? "good",
+    charge_cap_w: spec.charge_cap_w ?? 2500,
+    held_intent_id: spec.held_intent_id === undefined ? "opt-3f9c21" : spec.held_intent_id,
+    last_action: spec.last_action ?? "renew",
+    last_tick_at: spec.last_tick_at ?? "2026-08-25T11:04:31+10:00",
+    reason_codes: spec.reason_codes ?? ["export_headroom_available"],
+  };
+}
+
+/** Attach the pending adviser projection to a snapshot world. */
+export function withAdviserState(world: WireSnapshot, state: WireAdviserState): WireSnapshot {
+  return { ...world, adviser_state: state };
 }
 
 export function snapshot(
@@ -814,6 +939,15 @@ export interface WireTelemetrySummary {
   readonly temperature_max_c: number | null;
   readonly active_faults: readonly string[] | null;
   readonly active_warnings: readonly string[] | null;
+  /**
+   * Advisory per-pod CT power, readthrough-style (service.py
+   * `_telemetry_summary`, live on today's wire): `grid_power_w` is signed —
+   * negative = import, positive = export — and `load_power_w` is the pod's
+   * local load. Both null when the poll served no PCS live block, never
+   * zero-filled.
+   */
+  readonly grid_power_w: number | null;
+  readonly load_power_w: number | null;
 }
 
 /**
@@ -841,6 +975,11 @@ export function telemetrySummary(spec: Partial<WireTelemetrySummary> = {}): Wire
     cell_spread_mv: spec.cell_spread_mv === undefined ? 4 : spec.cell_spread_mv,
     temperature_min_c: spec.temperature_min_c === undefined ? 23 : spec.temperature_min_c,
     temperature_max_c: spec.temperature_max_c === undefined ? 28 : spec.temperature_max_c,
+    // Null by default: the commissioning capture's poll served no PCS live
+    // block, and an absent datum is never a stand-in value. Tests that need
+    // per-phase figures set them explicitly.
+    grid_power_w: spec.grid_power_w === undefined ? null : spec.grid_power_w,
+    load_power_w: spec.load_power_w === undefined ? null : spec.load_power_w,
     active_faults: spec.active_faults === undefined ? [] : spec.active_faults,
     active_warnings:
       spec.active_warnings === undefined
@@ -881,6 +1020,9 @@ export interface WireUnitDetail {
   readonly cell_spread_mv: number | null;
   readonly temperature_min_c: number | null;
   readonly temperature_max_c: number | null;
+  /** Same readthrough fields as the snapshot's telemetry block (see there). */
+  readonly grid_power_w: number | null;
+  readonly load_power_w: number | null;
   readonly active_faults: readonly string[] | null;
   readonly active_warnings: readonly string[] | null;
   readonly cell_voltages_v: readonly number[] | null;
@@ -1043,6 +1185,8 @@ export function unitDetail(unitId: string, spec: Partial<WireUnitDetail> = {}): 
         : Math.round((facts.cellMaxV - facts.cellMinV) * 1000),
     temperature_min_c: facts === undefined ? null : facts.tempMinC,
     temperature_max_c: facts === undefined ? null : facts.tempMaxC,
+    grid_power_w: spec.grid_power_w === undefined ? null : spec.grid_power_w,
+    load_power_w: spec.load_power_w === undefined ? null : spec.load_power_w,
     active_faults: [],
     active_warnings: ["PCS_Warning0_1", "DCDC_Warning0_1"],
     cell_voltages_v: cells,
@@ -1084,6 +1228,8 @@ export function emptyUnitDetail(unitId: string): WireUnitDetail {
     cell_spread_mv: null,
     temperature_min_c: null,
     temperature_max_c: null,
+    grid_power_w: null,
+    load_power_w: null,
     active_faults: null,
     active_warnings: null,
     cell_voltages_v: null,

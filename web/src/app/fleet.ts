@@ -7,6 +7,7 @@
  * works in those wire values; the human-capitalized labels live next to them
  * and are the only strings shown to operators.
  */
+import { formatWatts } from "../lib/format";
 export type Lifecycle =
   | "boot"
   | "observe_only"
@@ -186,6 +187,193 @@ export function toSnapshotIntentFigures(value: unknown): SnapshotIntentFigures {
   };
 }
 
+// --- the excess-solar adviser projection (DESIGN_EXCESS_ACTIVATION.md §1) -----
+
+export type AdviserEnabledOrigin = "config" | "runtime";
+export type AdviserHysteresisState = "inactive" | "entering" | "holding" | "exiting";
+export type AdviserExportEvidence = "good" | "missing" | "bad" | "stale";
+export type AdviserTickAction = "idle" | "propose" | "renew" | "withdraw";
+
+/**
+ * The adviser's ONE pinned reason vocabulary, verbatim from the design contract
+ * §1: the implemented tick decision codes plus the projection-only states the
+ * tick alone cannot see. The console's plain sentences map from these codes —
+ * the codes are the wire. Renderers must treat every code in this list (an
+ * unknown code is rendered honestly, never silently dropped).
+ */
+export const ADVISER_REASON_CODES: readonly string[] = [
+  "disabled_by_config",
+  "disabled_by_runtime",
+  "economics_acknowledgement_required",
+  "export_evidence_missing",
+  "export_evidence_bad",
+  "export_evidence_stale",
+  "no_export_headroom",
+  "no_acceleration_over_autonomy",
+  "below_exit_hysteresis",
+  "no_eligible_target",
+  "yielding_to_higher_priority",
+  "export_headroom_available",
+];
+
+/**
+ * The snapshot's top-level `adviser_state` projection (the design contract §1):
+ * the excess-solar adviser's whole tick-decision state in one object — whether
+ * the feature participates, what it last commanded, what the fleet is
+ * exporting, and WHY it is idle, in the pinned vocabulary above.
+ *
+ * The field is ABSENT on today's wire (PENDING-BACKEND): absence is the
+ * feature detection — no tile, no toggle, nothing else changes. Once present,
+ * parsing is null-safe and absent-field-tolerant per field: a malformed datum
+ * falls back to its honest default, never to a fabricated figure.
+ */
+export interface AdviserState {
+  /** The adviser is participating this process (config at boot, or the toggle since). */
+  enabled: boolean;
+  /** "runtime" = last changed by the toggle: operational only until restart. */
+  enabledOrigin: AdviserEnabledOrigin;
+  /** The site has ever captured the net-billing acknowledgement; durable. */
+  acknowledgedEconomics: boolean;
+  /** A live adviser intent exists right now (derived from held_intent_id). */
+  active: boolean;
+  hysteresisState: AdviserHysteresisState;
+  /** This tick's neediest eligible unit; null when no target qualified. */
+  targetUnitId: string | null;
+  /** The last tick's achievable command; 0 when not commanding. */
+  commandedChargeW: number;
+  /** The deterministic export bound from the last tick. */
+  eligibleExportChargeW: number;
+  /**
+   * Σ per-unit `grid_power_w` (positive = export). NULL when any unit's grid
+   * evidence is missing/bad/stale — never zero-filled: one unreadable phase is
+   * never treated as zero export.
+   */
+  fleetExportW: number | null;
+  exportEvidence: AdviserExportEvidence;
+  /** The composed `max_charge_from_export_w` — the commissioned envelope. */
+  chargeCapW: number;
+  /** The live adviser intent id; null when holding nothing. */
+  heldIntentId: string | null;
+  lastAction: AdviserTickAction;
+  /** Wall time of the last completed tick (the projection is tick-granular). */
+  lastTickAt: string;
+  /** The pinned vocabulary above; empty never while enabled. */
+  reasonCodes: string[];
+}
+
+const ENABLED_ORIGINS: readonly AdviserEnabledOrigin[] = ["config", "runtime"];
+const HYSTERESIS_STATES: readonly AdviserHysteresisState[] = [
+  "inactive",
+  "entering",
+  "holding",
+  "exiting",
+];
+const EXPORT_EVIDENCES: readonly AdviserExportEvidence[] = ["good", "missing", "bad", "stale"];
+const TICK_ACTIONS: readonly AdviserTickAction[] = ["idle", "propose", "renew", "withdraw"];
+
+function oneOf<T extends string>(value: unknown, vocabulary: readonly T[], fallback: T): T {
+  return typeof value === "string" && (vocabulary as readonly string[]).includes(value)
+    ? (value as T)
+    : fallback;
+}
+
+function toFiniteWatts(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function toNullableId(value: unknown, fallback: string | null): string | null {
+  return typeof value === "string" && value !== "" ? value : fallback;
+}
+
+/**
+ * Narrow one adviser projection (a snapshot's `adviser_state`, a toggle 200's
+ * `adviser_state`, or an `excess_adviser.state_changed` payload). Null when the
+ * value is not an object — a garbage frame is never half-adopted. Absent fields
+ * inherit from `base` when one is given (the event payload carries no
+ * `charge_cap_w` / `last_action` / `last_tick_at`: those stay whatever the
+ * snapshot last said), else take their honest defaults.
+ */
+export function toAdviserState(value: unknown, base: AdviserState | null = null): AdviserState | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  return {
+    enabled: typeof value.enabled === "boolean" ? value.enabled : (base?.enabled ?? false),
+    enabledOrigin: oneOf(value.enabled_origin, ENABLED_ORIGINS, base?.enabledOrigin ?? "config"),
+    acknowledgedEconomics:
+      typeof value.acknowledged_economics === "boolean"
+        ? value.acknowledged_economics
+        : (base?.acknowledgedEconomics ?? false),
+    active: typeof value.active === "boolean" ? value.active : (base?.active ?? false),
+    hysteresisState: oneOf(
+      value.hysteresis_state,
+      HYSTERESIS_STATES,
+      base?.hysteresisState ?? "inactive",
+    ),
+    targetUnitId: toNullableId(value.target_unit_id, base?.targetUnitId ?? null),
+    commandedChargeW: toFiniteWatts(value.commanded_charge_w, base?.commandedChargeW ?? 0),
+    eligibleExportChargeW: toFiniteWatts(
+      value.eligible_export_charge_w,
+      base?.eligibleExportChargeW ?? 0,
+    ),
+    // NULL IS A REAL ANSWER here: an explicit wire null means the export
+    // evidence did not hold, and only a genuinely absent key inherits the
+    // base's figure (the event patch must not erase the snapshot's export
+    // reading just because the payload omits it).
+    fleetExportW:
+      typeof value.fleet_export_w === "number" && Number.isFinite(value.fleet_export_w)
+        ? value.fleet_export_w
+        : value.fleet_export_w === null
+          ? null
+          : (base?.fleetExportW ?? null),
+    exportEvidence: oneOf(value.export_evidence, EXPORT_EVIDENCES, base?.exportEvidence ?? "missing"),
+    chargeCapW: toFiniteWatts(value.charge_cap_w, base?.chargeCapW ?? 0),
+    heldIntentId: toNullableId(value.held_intent_id, base?.heldIntentId ?? null),
+    lastAction: oneOf(value.last_action, TICK_ACTIONS, base?.lastAction ?? "idle"),
+    lastTickAt: typeof value.last_tick_at === "string" ? value.last_tick_at : (base?.lastTickAt ?? ""),
+    reasonCodes: Array.isArray(value.reason_codes)
+      ? value.reason_codes.filter((code): code is string => typeof code === "string")
+      : (base?.reasonCodes ?? []),
+  };
+}
+
+/**
+ * Apply one `excess_adviser.state_changed` payload onto the current projection
+ * (the design contract §2): the payload carries the state tuple and the watt
+ * figures but NOT the composed cap or the tick bookkeeping, so absent fields
+ * keep the current values. A payload that is not an object changes nothing.
+ */
+export function patchAdviserState(
+  current: AdviserState | null,
+  payload: unknown,
+): AdviserState | null {
+  if (!isRecord(payload)) {
+    return current;
+  }
+  return toAdviserState(payload, current);
+}
+
+/**
+ * The per-unit grid-tie row the Home tile and the Batteries figures share, in
+ * the design contract's own wording ("mid: grid +620 W export · load 340 W"):
+ * `grid_power_w` is signed (negative = import, positive = export — the live
+ * capture's own convention), `load_power_w` is the pod's local load. An absent
+ * datum reads "not available" — never zero-filled, and a 0 W grid figure is
+ * neither import nor export.
+ */
+export function gridLoadText(gridPowerW: number | null, loadPowerW: number | null): string {
+  const grid =
+    gridPowerW === null
+      ? "grid not available"
+      : gridPowerW > 0
+        ? `grid +${formatWatts(gridPowerW)} export`
+        : gridPowerW < 0
+          ? `grid ${formatWatts(gridPowerW)} import`
+          : "grid 0 W";
+  const load = loadPowerW === null ? "load not available" : `load ${formatWatts(loadPowerW)}`;
+  return `${grid} · ${load}`;
+}
+
 export interface UnitModel {
   unitId: string;
   lifecycle: Lifecycle;
@@ -239,6 +427,13 @@ export interface FleetSnapshot {
    * per-unit truth for it".
    */
   intentFigures: SnapshotIntentFigures | null;
+  /**
+   * The snapshot's top-level `adviser_state` projection when the field is
+   * present (PENDING-BACKEND: the excess_charging block's commissioning
+   * contract); null when absent — today's wire — and that null IS the feature
+   * detection: no tile, no toggle, nothing else renders.
+   */
+  adviserState: AdviserState | null;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -323,6 +518,10 @@ export function normalizeSnapshot(raw: unknown): FleetSnapshot {
     // per-unit figures from this snapshot"; the units' own figures and the
     // bus-fed maps stay the truth either way.
     intentFigures: isRecord(record.intent) ? toSnapshotIntentFigures(record.intent) : null,
+    // Feature detection: an absent `adviser_state` (today's backend) normalizes
+    // to "the excess-solar feature is not composed here" — the tile, the
+    // toggle, and every adviser-derived surface stay hidden.
+    adviserState: isRecord(record.adviser_state) ? toAdviserState(record.adviser_state) : null,
   };
 }
 
