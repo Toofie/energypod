@@ -44,7 +44,11 @@ from datetime import UTC, date, datetime
 from typing import Any, Final, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from energypod.domain.history import TelemetrySampleRow, worst_quality
+from energypod.domain.history import (
+    TelemetrySampleRow,
+    format_history_timestamp,
+    worst_quality,
+)
 from energypod.domain.intents import IntentSource
 from energypod.domain.observations import DataQuality, Observation
 
@@ -365,6 +369,82 @@ class TelemetryHistorian:
             for unit_id in sorted(selection.scopes.get(getattr(intent, "id", ""), ()) or ()):
                 winners[unit_id] = (word, _direction_word(getattr(intent, "direction", None)))
         return winners
+
+
+class PlantHistoryRefusal(Exception):
+    """The history surface refused a read (the block-presence doctrine).
+
+    Mirrors the schedule and scorecard refusal types: the REST boundary maps
+    it to 409 with the pinned code, so the shape stays one per feature.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        if not code or code != code.strip():
+            raise ValueError("refusal code must be non-empty and normalized")
+        self.code = code
+        self.message = message
+
+
+PLANT_HISTORY_NOT_COMMISSIONED = "plant_history_not_commissioned"
+
+
+class PlantHistoryQueryRepository(Protocol):
+    """The read port the query surface projects through."""
+
+    def samples(
+        self, unit_ids: Sequence[str], from_at: datetime, to_at: datetime
+    ) -> tuple[TelemetrySampleRow, ...]: ...
+
+    def rollup_hours(
+        self, unit_ids: Sequence[str], from_at: datetime, to_at: datetime
+    ) -> tuple[Any, ...]: ...
+
+    def oldest_full_res_at(self) -> datetime | None: ...
+
+    def last_sample_at(self, unit_ids: Sequence[str]) -> dict[str, datetime | None]: ...
+
+
+class PlantHistoryControl:
+    """The facade-facing history surface (H3: the snapshot's ``history_state``).
+
+    Composed exactly when the ``plant_history`` block is PRESENT; the query
+    engine (DESIGN section 3) joins in H4 through the same control.
+    """
+
+    def __init__(
+        self,
+        *,
+        unit_ids: Sequence[str],
+        sample_interval_s: float,
+        retention_full_resolution_days: int,
+        repository: PlantHistoryQueryRepository,
+    ) -> None:
+        units = tuple(unit_ids)
+        if not units or any(
+            not isinstance(unit, str) or not unit or unit != unit.strip() for unit in units
+        ):
+            raise ValueError("unit_ids must be non-empty normalized identifiers")
+        if len(set(units)) != len(units):
+            raise ValueError("unit_ids must be unique")
+        self._unit_ids = units
+        self._sample_interval_s = float(sample_interval_s)
+        self._retention_full_resolution_days = int(retention_full_resolution_days)
+        self._repository = repository
+
+    def state_payload(self) -> dict[str, Any]:
+        """The snapshot's feature-detected ``history_state`` projection."""
+        latest = self._repository.last_sample_at(self._unit_ids)
+        return {
+            "sample_interval_s": self._sample_interval_s,
+            "retention_full_resolution_days": self._retention_full_resolution_days,
+            "last_sample_at": {
+                unit: (
+                    None if latest.get(unit) is None else format_history_timestamp(latest[unit])  # type: ignore[arg-type]
+                )
+                for unit in self._unit_ids
+            },
+        }
 
 
 def _direction_word(direction: Any) -> str:

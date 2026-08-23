@@ -1047,3 +1047,67 @@ def test_the_live_write_examples_energy_block_validates_as_documented() -> None:
     assert parsed.energy_scorecard.grid_source == "integrated"
     assert parsed.energy_scorecard.grid_counter_roles == "unpinned"
     assert parsed.energy_scorecard.tariff is None
+
+
+# --- plant history (DESIGN_PLANT_HISTORY section 2.5, H3) ------------------------
+
+
+def test_plant_history_defaults_validate_and_round_trip() -> None:
+    """DESIGN section 2.5: the three keys with their commissioned defaults;
+    every key may be stated explicitly too."""
+    payload = _valid_config()
+    payload["plant_history"] = {}
+    parsed = _validate(payload)
+    assert parsed.plant_history is not None
+    assert parsed.plant_history.sample_interval_s == 30.0
+    assert parsed.plant_history.retention_full_resolution_days == 14
+    assert parsed.plant_history.retention_rollup_days == 0
+
+    payload["plant_history"] = {
+        "sample_interval_s": 15.0,
+        "retention_full_resolution_days": 30,
+        "retention_rollup_days": 365,
+    }
+    parsed = _validate(payload)
+    assert parsed.plant_history is not None
+    assert parsed.plant_history.sample_interval_s == 15.0
+    assert parsed.plant_history.retention_full_resolution_days == 30
+    assert parsed.plant_history.retention_rollup_days == 365
+
+
+@pytest.mark.parametrize(
+    ("block", "location_contains"),
+    [
+        # sample_interval_s must exceed the control period (0.40 s here) and
+        # stay at or below one hour.
+        ({"sample_interval_s": 0.40}, "plant_history"),
+        ({"sample_interval_s": 3600.5}, "plant_history"),
+        ({"sample_interval_s": 0.0}, "plant_history"),
+        # retention_full_resolution_days is 1..3650.
+        ({"retention_full_resolution_days": 0}, "retention_full_resolution_days"),
+        ({"retention_full_resolution_days": 3651}, "retention_full_resolution_days"),
+        # retention_rollup_days is 0 (forever) or a positive day count.
+        ({"retention_rollup_days": -1}, "retention_rollup_days"),
+        # There is deliberately NO enabled key (the block-presence doctrine).
+        ({"enabled": True}, "enabled"),
+    ],
+)
+def test_plant_history_matrix_rejects_out_of_bounds_and_unknown_keys(
+    block: dict[str, Any], location_contains: str
+) -> None:
+    payload = _valid_config()
+    payload["plant_history"] = block
+    _assert_invalid(payload, location_contains=location_contains)
+
+
+def test_a_present_plant_history_block_requires_the_storage_block() -> None:
+    """DESIGN section 2.5: durable history is the entire point -- a historian
+    silently keeping its rows in the memory of a database-less deployment is
+    exactly the invisible-off class this project refuses."""
+    payload = _valid_config()
+    payload.pop("storage")
+    payload["plant_history"] = {}
+    error = _assert_invalid(payload, location_contains="plant_history")
+    assert any("storage" in str(item["msg"]) for item in error.errors()), (
+        "the refusal must name the missing storage block"
+    )
