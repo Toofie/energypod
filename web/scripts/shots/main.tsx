@@ -75,7 +75,18 @@ if (viewId === null || stateId === null) {
     document.documentElement.dataset.shotsState = state.id;
     const client = seededClient(
       state.world(),
-      state.connection === undefined ? {} : { connection: state.connection },
+      {
+        ...(state.connection === undefined ? {} : { connection: state.connection }),
+        ...(state.history === undefined ? {} : { history: state.history }),
+        ...(state.historyRefusal === undefined
+          ? {}
+          : {
+              historyRefusal: {
+                status: state.historyRefusal.status,
+                body: state.historyRefusal.body,
+              },
+            }),
+      },
     );
     createRoot(root).render(
       <div className="shell">

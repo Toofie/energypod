@@ -27,6 +27,7 @@ export type ViewId =
   | "home"
   | "batteries"
   | "flow"
+  | "history"
   | "now"
   | "schedule"
   | "activity"
@@ -43,6 +44,7 @@ export const VIEWS: readonly ViewDescriptor[] = [
   { id: "home", label: "Home" },
   { id: "batteries", label: "Batteries" },
   { id: "flow", label: "Flow" },
+  { id: "history", label: "History" },
   { id: "now", label: "Now" },
   { id: "schedule", label: "Schedule" },
   { id: "activity", label: "Activity" },
@@ -75,5 +77,12 @@ export const VIEWS: readonly ViewDescriptor[] = [
  * telemetry (grid/load/battery watts, charge level), so the link is always
  * offered and the view always has an answer — its honest states ("not
  * available" per absent datum) are the view's own, never a placeholder.
+ *
+ * "History" (plant history) was promoted out of this list when the telemetry
+ * historian's console view landed (DESIGN_PLANT_HISTORY.md §4, the pinned
+ * Schedule-view deviation verbatim): the link is ALWAYS offered and the view
+ * itself answers a not-commissioned deployment honestly on the route's 409,
+ * an empty young database honestly on the 200, and the recorded windows
+ * everywhere else.
  */
-export const PLANNED_VIEWS: readonly string[] = ["Plan history"];
+export const PLANNED_VIEWS: readonly string[] = [];

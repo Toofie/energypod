@@ -23,4 +23,16 @@ export interface ShotStateDefinition {
    * while its own reconnect loop waits on a stream that never answers.
    */
   readonly connection?: "live" | "lost";
+  /**
+   * The seeded history window (the plant-history route's 200 body, built from
+   * the shared wire fixtures): present only for views that read history —
+   * absent means the seeded world refuses the route loudly (the view's honest
+   * error state on camera). Built fresh per call, like the world.
+   */
+  readonly history?: () => Record<string, unknown>;
+  /**
+   * The seeded history route's REFUSAL (status + the structured envelope),
+   * for the not-commissioned shot: the view reads its honest 409 state.
+   */
+  readonly historyRefusal?: { status: number; body: Record<string, unknown> };
 }

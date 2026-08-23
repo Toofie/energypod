@@ -1481,7 +1481,7 @@ describe("AppShell — navigation", () => {
     // Home is the default view.
     expect(within(nav).getByRole("link", { name: "Home", current: "page" })).toBeVisible();
 
-    for (const name of ["Batteries", "Flow", "Now", "Schedule", "Activity", "Insights"]) {
+    for (const name of ["Batteries", "Flow", "History", "Now", "Schedule", "Activity", "Insights"]) {
       expect(within(nav).getByRole("link", { name })).toBeVisible();
     }
 
@@ -1493,12 +1493,13 @@ describe("AppShell — navigation", () => {
     // view answers a not-commissioned deployment honestly. Flow (Energy flow)
     // left the same way when the live flow view landed: its link is always
     // offered and the view always has an answer from the snapshot's own
-    // telemetry.
-    for (const name of ["Plan history"]) {
-      expect(within(nav).queryByRole("link", { name: new RegExp(name, "i") })).toBeNull();
-      const entry = within(nav).getByRole("listitem", { name: new RegExp(name, "i") });
-      expectVisibleText(entry, /not available|coming soon|not yet/i);
-    }
+    // telemetry. History (plant history) left the same way when the telemetry
+    // historian's view landed — always offered, answering a not-commissioned
+    // deployment and an empty young database honestly. Nothing is planned
+    // now, so the nav carries links only.
+    expect(within(nav).getAllByRole("link").length).toBe(
+      within(nav).getAllByRole("listitem").length,
+    );
 
     expect(screen.getByRole("main")).toBeVisible();
   });
@@ -1532,6 +1533,11 @@ describe("AppShell — navigation", () => {
     const flowLink = within(nav).getByRole("link", { name: "Flow" });
     expect(flowLink).toHaveFocus();
     expect(flowLink).toBeVisible();
+
+    await user.tab();
+    const historyLink = within(nav).getByRole("link", { name: "History" });
+    expect(historyLink).toHaveFocus();
+    expect(historyLink).toBeVisible();
 
     await user.tab();
     const nowLink = within(nav).getByRole("link", { name: "Now" });

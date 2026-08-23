@@ -7,7 +7,9 @@
  */
 import type { ShellView } from "../../src/app/views";
 import { FlowView } from "../../src/views/flow/FlowView";
+import { HistoryView } from "../../src/views/history/HistoryView";
 import { FLOW_STATES } from "./states/flow";
+import { HISTORY_STATES } from "./states/history";
 import type { ShotStateDefinition } from "./types";
 
 /** One shootable view: the real component plus its state matrix. */
@@ -43,4 +45,5 @@ export const SHOT_VIEWPORTS: readonly ShotViewport[] = [
 
 export const SHOT_VIEWS: readonly ShotViewDefinition[] = [
   { id: "flow", label: "Flow", Component: FlowView, states: FLOW_STATES },
+  { id: "history", label: "History", Component: HistoryView, states: HISTORY_STATES },
 ];

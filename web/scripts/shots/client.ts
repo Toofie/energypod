@@ -50,18 +50,30 @@ function absent(surface: string): ApiClientError {
  */
 export function seededClient(
   world: WireSnapshot,
-  options: { connection?: "live" | "lost" } = {},
+  options: {
+    connection?: "live" | "lost";
+    history?: () => Record<string, unknown>;
+    historyRefusal?: { status: number; body: Record<string, unknown> };
+  } = {},
 ): SeededClient {
   const lost = options.connection === "lost";
   let snapshotRead = false;
   let streamFrameDelivered = false;
+  /**
+   * The History view reads history instead of the stream (the historian
+   * publishes no bus event by design — polling IS the update path), so the
+   * gate accepts EITHER consumption path: snapshot + first stream frame, or
+   * snapshot + one settled history read (resolved OR refused — the honest
+   * not-commissioned/error states are settled pictures too).
+   */
+  let historySettled = false;
   let streamOpens = 0;
   let resolveReady: () => void = () => {};
   const ready = new Promise<void>((resolve) => {
     resolveReady = resolve;
   });
   const maybeReady = (): void => {
-    if (snapshotRead && streamFrameDelivered) {
+    if (snapshotRead && (streamFrameDelivered || historySettled)) {
       resolveReady();
     }
   };
@@ -118,6 +130,38 @@ export function seededClient(
     getObservedObjectives: async () => {
       throw absent("the observed-objectives window");
     },
+    getPlantHistory: (() => {
+      const settle = (): void => {
+        historySettled = true;
+        maybeReady();
+      };
+      if (options.historyRefusal !== undefined) {
+        const { status, body } = options.historyRefusal;
+        return async () => {
+          try {
+            throw new ApiClientError({ status, ...body });
+          } finally {
+            settle();
+          }
+        };
+      }
+      if (options.history !== undefined) {
+        return async () => {
+          try {
+            return structuredClone(options.history()) as Record<string, unknown>;
+          } finally {
+            settle();
+          }
+        };
+      }
+      return async () => {
+        try {
+          throw absent("the history window");
+        } finally {
+          settle();
+        }
+      };
+    })(),
     openEvents: (): AsyncIterable<StreamEvent> => {
       const isInitialStream = streamOpens === 0;
       streamOpens += 1;

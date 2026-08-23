@@ -720,6 +720,37 @@ export function commandedSegmentText(segment: CommandedSegment): string {
   return `${commandedSourceText(segment.source)} — ${direction}${watts}`;
 }
 
+/** One held word segment (the strip's rows are made of these). */
+export interface WordSegment {
+  readonly from: number;
+  readonly to: number;
+  readonly v: string;
+}
+
+/**
+ * Word change points as held segments — the lifecycle and health strips'
+ * step encoding, the commanded segments' exact mechanics applied to plain
+ * words. The last change holds to the window's end (the state was still true
+ * when the window closed); the space BEFORE the first change renders empty,
+ * never back-filled.
+ */
+export function wordSegments(
+  changes: readonly HistoryChange[],
+  windowTo: number,
+): WordSegment[] {
+  const segments: WordSegment[] = [];
+  for (let index = 0; index < changes.length; index += 1) {
+    const change = changes[index]!;
+    const next = changes[index + 1];
+    const to = Math.min(next === undefined ? windowTo : next.t, windowTo);
+    if (to <= change.t) {
+      continue;
+    }
+    segments.push({ from: change.t, to, v: change.v });
+  }
+  return segments;
+}
+
 // --- the recording note (the view's data-age line) -----------------------------------
 
 /**
@@ -768,7 +799,7 @@ export function emptyWindowNote(
         ? "Recording is active — no samples have landed yet; the first appears within a cadence of the controller starting."
         : "Recording state is not available from the snapshot.";
   if (window.resolution === "hourly") {
-    return `No rollup hours cover this window. ${recording} Hourly points appear once hours roll up past the full-resolution horizon (14 days by default) — pick a shorter range (6 h or Today) to see the live samples.`;
+    return `No rollup hours cover this window. ${recording} Hourly points appear once hours roll up past the full-resolution horizon (14 days by default) — pick the shortest range (6 h) to see the live samples${state !== null && state.retentionFullResolutionDays !== null ? ` (full-resolution samples are kept ${state.retentionFullResolutionDays} days)` : ""}.`;
   }
   return `No samples were recorded in this window. ${recording}`;
 }
