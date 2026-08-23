@@ -364,6 +364,16 @@ def test_domain_rejects_nonfinite_safety_data_before_control(
         make_observation(api, **{field: value})
 
 
+@pytest.mark.parametrize("field", ["max_soc_jump_pct", "max_soc_disagreement_pct"])
+def test_policy_rejects_degenerate_zero_soc_tolerances(api: SimpleNamespace, field: str) -> None:
+    # CONTINUITY deferred P2: a zero SOC-jump or zero SOC-disagreement
+    # tolerance is a degenerate policy — every live observation would violate
+    # it and the fleet could never re-arm — so the model refuses it rather
+    # than letting a mis-typed config arm a permanent inhibit.
+    with pytest.raises(ValidationError, match="positive"):
+        make_policy(api, **{field: 0.0})
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
