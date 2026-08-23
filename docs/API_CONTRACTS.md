@@ -895,6 +895,69 @@ idempotent by key. The net-billing acknowledgement is ONE durable audit fact
 keyed existence check, never re-prompted); its durable append lands BEFORE the latch
 flips, and an append failure refuses the enable.
 
+## Energy scorecard (advisory accounting — DESIGN_ENERGY_SCORECARD, 2026-08-26)
+
+Accepted design, pending implementation. Pure advisory read path — no new authority, no
+writes, no read-plan cadence change. Full contracts, the A-1 buy/sell pinning protocol,
+and the ordered implementation plan live in `docs/DESIGN_ENERGY_SCORECARD.md`; this
+section pins the wire-facing shapes.
+
+- `Observation` gains six ADVISORY cumulative-energy fields (float kWh, `None` when the
+  `0x4101` cold-ring window was not served this observation): `energy_grid_a_kwh`,
+  `energy_grid_b_kwh` (NEUTRAL names — the pair's decode ORDER is vendor-confirmed but
+  its buy/sell ROLE labels are evidence-open, field-mapping A-1; renaming to
+  bought/sold happens only behind the `grid_counter_roles` config gate below),
+  `energy_load_kwh`, `energy_pv_kwh`, `energy_charge_kwh`, `energy_discharge_kwh`
+  (the charge/discharge role labels ARE capture-confirmed). Their quality keys join
+  `ADVISORY_QUALITY_FIELDS` (the twelve-key quality map extends to eighteen by the same
+  mechanism); the fields stay OUTSIDE every safety completeness set — an unserved
+  energy block must never refuse power. Decode is low-word-first `uint32 × 0.1` in
+  vendor pair order (PROTOCOL_EVIDENCE §6); the snapshot/unit-detail projections
+  expose all six readthrough-style, nullable, never zero-filled.
+- The scorecard's metric sources are pinned per metric (DESIGN §2): battery
+  charged/discharged and load from DEVICE-COUNTER daily deltas (role-confirmed,
+  device-side coverage); grid bought/sold from OUR OWN integration of the per-pod CT
+  `grid_power_w` (`0x1000+17`, the control-grade PCS view ONLY — never merged with the
+  `0x0137` view) at the control rate, sign-split import/export, zero-order-hold over
+  observation capture times, gaps above `integration_max_gap_s` excluded (never
+  interpolated) with a per-unit/day coverage fraction, worst-unit fleet rollup, and a
+  `partial` day marker below `min_day_coverage_pct`. `charged_from_surplus_kwh`
+  integrates measured battery watts over ticks where `adviser_state.active` and the
+  adviser's target is that unit (the excess graduation economics evidence). A
+  DECREASING cumulative is a reset, not a negative delta: the unit-metric-day is
+  re-baselined and flagged `counter_reset_observed` (audited).
+- `EnergyDayRecord` (frozen, per site-day in the site timezone; DST days store
+  `utc_offset_minutes`): `{date, timezone, utc_offset_minutes,
+  kind: complete|partial|in_progress, units: {unit → per-unit metrics +
+  coverage_pct + metric_flags}, fleet: {the five sums + charged_from_surplus},
+  sources, counter_cross_check {grid A/B deltas, consistency verdict},
+  solar_production_measured: false}`. `null` per-unit figures mean source-absent-all-day,
+  never 0. Solar production is NEVER presented as measured (site PV is not wired to the
+  pod inputs — the PV counter is readthrough-only).
+- **`GET /api/v1/energy/days?limit=N`** (observe; N ∈ 1..31 default 8, newest-last) →
+  `{"days": [EnergyDayRecord...], "grid_counter_roles": "unpinned|vendor_labels|swapped",
+  "solar_production_measured": false}`; answers 409 `energy_scorecard_not_commissioned`
+  when the config block is absent. There is deliberately NO mutation on this surface.
+- Snapshot top-level `energy_today` (feature-detected: absent key when the block is
+  absent) = the in-progress day's record plus `as_of`. Bus event `energy.day_rolled`
+  (the completed record) is a rollover TRANSITION only — never a heartbeat. Audit
+  facts: `energy_day_recorded`, `energy_counter_reset_observed`, and — when the
+  operator lands the active pinning protocol — `energy_counter_roles_pinned`.
+- Config block `energy_scorecard:` (block-presence doctrine: PRESENT composes the
+  accountant into the fleet loop + snapshot key + route; ABSENT is byte-identical with
+  409; no `enabled` key — decommissioning removes the block): `grid_source:
+  integrated|device_counter` (default `integrated`; `device_counter` REFUSED at
+  validation while roles are unpinned), `grid_counter_roles: unpinned|vendor_labels|
+  swapped` (default `unpinned`; a pinned value additionally requires the durable
+  `energy_counter_roles_pinned` audit fact at boot — the excess-economics
+  keyed-existence precedent), `integration_max_gap_s` (> `control_period_s`, ≤ 60),
+  `min_day_coverage_pct` ((0, 100]), optional `tariff {currency,
+  import_cents_per_kwh, export_cents_per_kwh}` (absent ⇒ kWh-only, no money figures).
+- Persistence: an `EnergyLedgerRepository` port (`record_day`, `get_day`,
+  `latest_days`, `load_baseline`/`save_baseline` — the live-day baseline is durable so
+  counter deltas survive restarts by design) with memory and SQLite adapters (a
+  schema_version migration); MCP gains the read-only `get_energy_days(limit)` tool.
+
 ## Device-mode telemetry and dispatch gating
 
 - `Observation` gains four more ADVISORY words (2026-08-23 incident 1), same doctrine as the CT

@@ -1,200 +1,153 @@
 # What to build next — delta analysis and recommendation
 
-Prepared: 2026-08-23 (post-`b6b5bcf`). Research and documentation only — no code,
-API, hardware, or test interaction was performed to produce this document.
+Prepared: 2026-08-26 (post-`f0b9288`; fourth edition — the 2026-08-23 next-3 is
+fully delivered). Research and documentation only — no code, API, hardware, or
+test interaction was performed to produce this document.
 
-Sources: `docs/PRODUCT_ROADMAP.md`, `docs/CONTINUITY.md` (state of record through
-the 2026-08-24 backend-polish entry), `docs/CONTROL_SURFACE_GAP_ANALYSIS.md`
-(R1–R10), `docs/DESIGN_EXCESS_CHARGING.md`, `config/config.live-write-example.yaml`
-(`excess_charging` block), `docs/DEFERRED_FINDINGS.md`,
-`docs/SYNC_RESILIENCE_AUDIT.md`, `docs/POD_RECOVERY_RESEARCH.md`, plus a code
-verification pass (`src/energypod/application/excess_charge.py`,
-`scheduling.py`, `arbiter.py`, `service.py`, `src/energypod/api/rest.py`,
-`web/src`).
+Sources: `docs/CONTINUITY.md` (state of record through the schedules live-test
+entry: the operator published v1/v2 and a window RAN end to end), the delivered
+designs `DESIGN_EXCESS_ACTIVATION.md` / `DESIGN_SCHEDULES.md` /
+`DESIGN_EXCESS_CHARGING.md`, `docs/CONTROL_SURFACE_GAP_ANALYSIS.md` (R1–R10),
+`docs/PROTOCOL_EVIDENCE.md` + `docs/evidence/field-mapping-2026-08-22.md`
+(the `0x4101` counter evidence and A-1), `docs/DEFERRED_FINDINGS.md`, plus a
+read-only verification pass (`register_layout.py`, `composition.py` read-plan
+tiers, `observations.py`, `rest.py` route inventory, `simulator/pod.py`).
 
-Operator framing this answers: the core is baseline; review the docs; name the
-next item. Specific flag: excess-solar charging exists with **no UI to enable
-it** — "will we simply rely on scheduling?"
+Operator framing this answers: the previous next-3 is delivered and, where it
+could be, operator-tested live. Name the next item.
 
 ---
 
-## 1. Delivered baseline vs remaining (roadmap intent → status)
+## 1. Delivered baseline (the 2026-08-23 next-3, closed)
 
-| Roadmap intent | Status |
+| The 2026-08-23 recommendation | Status |
 |---|---|
-| **Phase 1 — Observe-only validated telemetry** | **DELIVERED and exceeded.** Live telemetry from all three units since 2026-08-22; identity-pinned units, tiered read plan, honest quality/staleness, full console, packaging/ops (Milestone C), 1473-test clean full suite. Docker image build still environment-blocked (no Docker on this host). |
-| **Phase 2 — Manually armed, guarded dispatch** | **DELIVERED and far exceeded.** Live write-enabled control commissioned 2026-08-22 and hardened through the 2026-08-23/24 waves: per-unit watt targets, concurrent per-battery operation (live-verified mid charge + rhs discharge simultaneously, 11/11 combination matrix), per-intent cancel, mode-word gating with fresh re-read, beat-autonomy arm classification, BMS-authoritative SOC, publish-fence and allocator fixes, console at parity (one card per request, live cancel, per-battery truth everywhere). |
-| **Phase 3 — Deterministic tariffs and schedules** | **~40% delivered — domain only.** `ScheduleEntry`/`SchedulePlan` validation (cross-midnight, overlap, timezone, DST), `ScheduleEvaluator` emitting short-TTL `SCHEDULE` intents, and the `ScheduleRepository.get()/replace(version, entries)` port all exist. **No REST endpoint, no facade exposure, no evaluation loop in composition, no UI** (nav placeholder "Schedule — not available yet"). The night-writer coordination constraint (below) is unaddressed. |
-| **Phase 4 — Weather/PV/Amber providers** | **NOT STARTED** (by design — never scheduled). One adjacent piece exists: per-unit grid/load CT words (`grid_power_w`/`load_power_w`) decoded and projected through the facade as advisory telemetry (the excess-solar work), though the console does not render them yet. |
-| **Phase 5 — Forecasting, optimization, MCP** | **PARTIALLY PREEMPTED by the excess-solar adviser.** A bounded, advisory-only optimizer actor (`ExcessChargeAdviser`) is **fully implemented, simulator-proven, and dormant** — config-gated OFF (`excess_charging` absent block), with the deterministic export bound in the allocator, kernel export-evidence defense, beat-autonomy hysteresis, and per-unit yield under concurrent arbitration. MCP is read-only by default with an optional capped `dispatch_intent`. No forecasting, no plan optimizer, no MCP control surface. |
-| **Beyond roadmap (operator-driven)** | Desync-resilience wave (B1–B6 + S1) implemented and live-verified; pod remote-recovery researched and staged (detection buildable, any `0x8000` write commissioning-gated); S1 EE-calibration warning bits documented, enabled by operator decision only. |
+| **C1 — Excess-solar activation package** | **DELIVERED AND COMMISSIONED PRESENT-BUT-OFF.** Backend (projection, events, guarded toggle, net-billing durable acknowledgement, P6 composition) landed; console W1–W3 landed (the Home tile, the EXCESS toggle, event wiring, per-phase figures); config commissioned with `enabled: false` and the trial shape — the trial-cap/entry-threshold tension RESOLVED (`assumed_autonomous_charge_w: 300` puts entry at 400 W inside the 500 W cap). Everything now awaits two operator acts: the one-time NET_BILLED acknowledgement and the toggle. |
+| **C2 — Schedules surface** | **DELIVERED, COMMISSIONED DAY-ONLY (YIELD), AND OPERATOR-TESTED END TO END.** B1–B6 + console W1–W3 landed; a live 422-on-publish was root-caused to a backend deviation from the design and fixed same-day; the operator's own retries published v1 then v2 and the window RAN (pre-arm refusals audit-visible, authorized per tick after arming, clean non-renewal hand-back). FINDING recorded: `schedule_state` cannot say "window open but units disarmed" — the operator discovered the arm requirement by trying (§2 S3). |
+| **C3 — Verification-and-atomicity wave** | **DELIVERED.** Impl-10 commit-then-audit extended to every mutation (with compensating restores); simulator literal register-image golden program (MUTATION-2); honest per-field decode quality + scriptable quality (MUTATION-3/6); full suite green throughout. The wave's residue: the golden ENERGY/SOC scenario and half the validation matrices remain SKIPPED (DEFERRED_FINDINGS 3/4) — consumed by the item ranked #1 below. |
 
-The delta in one sentence: the project skipped past Phase 3 and delivered the
-safety-relevant heart of Phase 5 ahead of it, because the operator's live
-priorities (direct per-battery control, honest display, autonomy preservation)
-pulled it there. The consequence is a gap shaped exactly like the operator's
-flag: a finished, dormant automation feature with no activation surface, and a
-finished scheduling domain with no product surface.
+Where the standing R-list stands: R1 mode display DONE (device-mode words
+decoded, exposed, dispatch-gating, plus the recovery awareness layer's
+health_state surface); R2 explanations DONE in substance (per-unit attribution,
+requested/authorized/actual as separate facts, plain-language limiting factors);
+R3 one-tap presets PARTIALLY OVERTAKEN (per-battery watt dispatch + the
+schedule editor cover the daily-use shape; what remains is polish); R4
+starvation DONE (capacity-weighted + per-unit caps + concurrent per-unit
+operation, live-proven 11/11); R5 schedules DONE; R6 per-phase display DONE
+(the tile + Batteries rows); **R7 NOT STARTED** (neither the read view nor the
+guarded changes — no policy read endpoint exists); **R8 NOT STARTED** (no
+energy decode, no surface); R9 DONE (state surface + toggle live);
+R10 partially done (recovery/quiet-evidence rendering landed; instance
+identity, server-side audit filters, MCP unit detail outstanding).
+
+The delta in one sentence: every control theme the operator has touched is
+delivered; what remains untouched is exactly the family their prior dashboard
+led with — the day's energy numbers — plus a short honesty queue and the
+slow-burn policy-surface work.
 
 ## 2. Candidate list (scored against the operator's demonstrated priorities)
 
-Operator priorities observed this week, in order of evidence: direct per-battery
-control (done), honesty of display (done), **autonomy preservation** (doctrine
-settled, live-proven), **solar utilization** (built, dormant), **minimal
-physical intervention** (researched, staged). Effort/Value/Risk are S/M/L.
+Observed priorities, in order of evidence: per-battery control (done), honesty
+of display (done, repeatedly enforced), solar utilization (built, commissioned
+present-but-off, awaiting the operator's toggle), scheduling (done,
+operator-tested), **money/energy legibility** (demonstrated by their prior
+dashboard leading with kWh figures and the vendor home chart noted approvingly
+— nothing built for it), **dislike of invisible states** (the driver behind
+most incidents; two small invisible states remain open). Effort/Value/Risk are
+S/M/L.
 
-| # | Candidate (source) | Effort | Value | Risk | Score and note |
+| # | Candidate (source) | Effort | Value | Risk | Verdict |
 |---|---|---|---|---|---|
-| C1 | **Excess-solar activation package** — net-billing confirmation flow, console switch + live state display, grid/export display (R6 UI half), 500 W first-trial protocol (R9 + design §Phase 1; CONTINUITY "REMAINING NEXT") | S–M (state projection + one guarded toggle + UI; all engineering done) | **H** — the operator's #1 dormant value; solar utilization is one of two remaining themes | L — advisory-only, every gate built; one operator decision gates it | **Build first.** Highest value-per-effort on the board. |
-| C2 | **Schedules surface** (R5; Phase 3 domain exists) | M (2 REST endpoints + facade + evaluation loop + one view + night-writer design) | **H** — the operator's historical use case (Night Charge 00:01–05:59 @2500 W); answers their literal question | M — night-writer conflict must be designed around, not coded around | **Build second.** The domain is done; the risk is coordination, not code. |
-| C3 | **Promoted-P1 hygiene wave** — Impl-10 commit-then-raise facade atomicity, simulator literal register image (~90 mutation survivors), simulator blanket-GOOD quality masking (CONTINUITY 2026-08-23 P2 pass) | M | M — protects the verification oracle exactly as more automation (C1 trial rehearsal, C2 evaluator) rides the simulator; Impl-10 is load-bearing for C1's toggle endpoint | L | **Build third / fold partially into C1.** The toggle and schedule-PUT are new facade mutations; land them on the atomic pattern (submit_intent) and extend Impl-10 to the remaining ops in the same pass. |
-| C4 | **Pod-recovery detection layer (R4)** — actuation-coherence watchdog, objective echo readback, bus-answer classifier, console recovery states (POD_RECOVERY_RESEARCH §3 R4; queue items iii/vi) | M | M — serves "minimal physical intervention"; buildable now, no authorization | L | Runner-up. No Class-2 wedge observed in the live record; value is contingent on recurrence. Natural follow-on after C1/C2. |
-| C5 | **One-tap dispatch presets + visible holds** (R3) | S | M — daily-use polish the operator would feel immediately | L | Runner-up; UI-only; can ride any web-agent slot. |
-| C6 | **Small backend niceties** — `intent.accepted` carries `expires_in_s`; `audit.appended` carries correlation id; distinct arm-refusal reason for already-armed (CONTINUITY console-complete + matrix) | S | S — polish | L | Fold into C1's contract cycle (same files, same bus payloads). |
-| C7 | **Safety-bounds read view (R7 i)** | S | M — explains `soc_above_charge_ceiling` refusals the operator has hit live | L | Ride-along for any contract cycle. |
-| C8 | **Energy totals view (R8, 0x4101)** | S–M | M — money legibility; sells the excess feature's benefit | M — energy role labels need evidence pinning first | After C1 (it is how the adviser's value becomes visible in dollars). |
-| C9 | **Foreign-objective detector, overnight observe run, day/night partition, VLAN** (census queue) | S (detector) / operator (rest) | M — closes the night blind spot | L | The detector rides C2's design; the rest are operator agreements. |
-| C10 | **Docker image build** (Milestone C residual) | S | M — packaging completeness | L | Environment-gated (Docker absent here); opportunistic. |
+| S1 | **DAILY ENERGY SCORECARD (R8)** — bought/sold/charged/discharged/load per day + charged-from-surplus attribution; A-1 buy/sell pinning protocol with our-own-integration fallback (`DESIGN_ENERGY_SCORECARD.md`) | M (decode + accountant + store + 1 route + 1 card/strip; the data already flows — `0x4101` is read at the cold ring and discarded) | **H** — the operator's untouched demonstrated value; makes the excess feature's worth visible in kWh (its graduation criterion 6 has NO evidence surface today); the honest-money surface | L — advisory read path only, no authority, no cadence change | **Build first.** Designed in full; dispatchable. |
+| S2 | **Night-writer between-cycles foreign-objective detector** (census queue; CONTINUITY "QUEUED") — fold the already-read served-objective words into telemetry, alert `foreign_objective_observed` when disarmed/idle, characterize the 7.3 h night blind spot at last | S (decode + one classifier + event; zero extra frames — `0x1060` is already in the plan) | **M–H** — closes the last standing invisible STATE; its night evidence feeds the pending night-partition operator decision | L | **Build second — recommended as S1's companion dispatch** (same decode/composition files; separate contract cycle). |
+| S3 | **`schedule_state` disarmed-window reason** (the live FINDING from the operator's own publish test) — the vocabulary cannot say "window open but the units are disarmed"; the operator had to discover arming by trying | S (one projection vocabulary addition + console sentence) | M — an invisible state the operator HIT LIVE during acceptance | L | Ride-along for the next contract cycle; honest fix the operator already implicitly requested. |
+| S4 | **Adjustable safety bounds (R7)** — (i) read-only Settings>Safety view of the active policy, then (ii) guarded SOC floor/ceiling + cap changes | (i) S / (ii) M | M — real when the operator wants "keep mid above 20% for the fridge"; they have not asked in any recorded session; they hit the ceiling refusal once and it was explained | (i) L / (ii) M — (ii) is a new policy-mutation surface, the heaviest authority class after the excess toggle | **Build third, staged** — (i) after S1/S2; (ii) only after the operator asks. |
+| S5 | **Arm-refusal de-conflation** (fix-queue vii; live-observed) — arm-while-armed returns `actor_failure`; also the console niceties residue (correlation ids on audit.appended) | S | S — honesty polish on a path the operator exercises every session | L | Fold into any facade contract cycle. |
+| S6 | **One-tap presets remainder (R3)** | S | S — overtaken by per-battery dispatch + schedules; the remaining shape is "remembered preset" polish | L | Queue; ride a web-agent slot. |
+| S7 | **Test debt**: golden energy/SOC scenario + simulator/facade validation matrices (DEFERRED_FINDINGS 3/4) | S–M | M as verification; S as product | L | **The golden half is CONSUMED BY S1** (its §9 family 8); the matrices ride S1's simulator edit. |
+| S8 | **Console polish (R10)** — health instance identity (`process_instance_id`/`uptime_s` rendering), reconnect banner, server-side audit filters, MCP `get_unit_detail` | S | S–M | L | Opportunistic web slots. |
+| S9 | **Docker image build** (Milestone C residual) | S | M — packaging completeness | L | Environment-gated (Docker absent on this host); opportunistic. |
 
-Not candidates: MCP `get_unit_detail` (trivial, ride-along), the mid ±1.2 kW
-oscillation (a live-diagnosis item needing the operator's window, not a build
-item — fold its mode-word snapshot into C4's classifier capture), any `0x8000`
-write (commissioning-grade, separately authorized, per POD_RECOVERY_RESEARCH).
+Not candidates now: the excess-solar trial and graduation (engineering done;
+the remaining acts are the operator's — the NET_BILLED acknowledgement, the
+toggle, then the §4 trial review against graduation criteria, one of which S1
+supplies the evidence for); the mid/lhs ±1.2 kW oscillation (standing
+live-diagnosis item needing the operator's observation window — the awareness
+layer already timestamps it as quiet evidence); the overnight observe run,
+day/night partition grant, and VLAN (operator agreements/infrastructure, not
+build items — S2 makes the first one informative); any `0x8000` write or other
+Part-4 exclusion (standing).
 
-## 3. The ranked next three
+## 3. The ranked next: the DAILY ENERGY SCORECARD (S1)
 
-### Next 1 — Excess-solar activation package
+**Why it wins.** Every other theme the operator has demonstrated is delivered;
+the one they have visibly enjoyed elsewhere — the day's kWh/money numbers —
+has no surface in our product. The vendor app's home chart and their prior
+dashboard led with exactly these figures (CONTROL_SURFACE_GAP_ANALYSIS R8:
+"'sell to grid' is why the excess-solar feature exists"). It is also the
+missing evidence surface for the arc we just finished: the excess feature sits
+commissioned-but-off awaiting the operator's conviction, and its graduation
+criterion 6 is literally "the operator reviews and accepts the economics (kWh
+shifted vs the autonomy baseline)" — a number no console shows today. And it
+is the cheapest high-value item left: the counters are already read every
+cold-ring rotation and discarded; the per-phase CT stream is already
+control-rate and live-proven; the persistence, event, snapshot, and
+feature-detection patterns are all established. Risk is structurally low —
+advisory reads only, no authority anywhere in the design.
 
-The engineering is finished and proven: the adviser composes when enabled,
-ticks inside the fleet loop, submits short-TTL `OPTIMIZER` intents under
-`energypod:excess-adviser`, yields per-unit under concurrent arbitration, and
-hands back by non-renewal. What is missing is everything the operator touches.
-Two things genuinely gate it, both cheap: one operator decision (net billing)
-and one visible surface. Scope:
+**The evidence gate, honestly.** The counter DECODE (order, word order, ×0.1
+kWh) and the charge/discharge ROLE labels are confirmed; the grid buy/sell
+ROLE labels are not (field-mapping A-1). The design does not wait on A-1 and
+does not gamble on it: bought/sold come from OUR OWN integration of the
+per-pod CT `grid_power_w` (we own the samples at the 1.5 s cadence; sign
+contract live-proven; gaps excluded, never interpolated, with a coverage
+fraction and partial-day markers — accuracy assessed honestly in the design
+§4), while BOTH grid counter pairs are decoded and recorded from day one as
+the passive pinning evidence. The active pinning protocol is one half-hour
+read-only observation of a known-import evening. Pinning NEVER self-applies —
+promotion to the device counters (strictly better coverage: they count
+through our downtime) is an operator config revision gated on the recorded
+fact. Site PV is not wired to the pod inputs: the scorecard never presents
+solar production as measured — its solar story is the surplus the site
+exported and the surplus the batteries captured, both measured.
 
-- **Contract** (`docs/API_CONTRACTS.md` advisory section + a small toggle
-  contract): an `adviser_state` projection — enabled, last decision
-  (`idle`/`propose`/`renew`/`withdraw`), reason codes (`no_export_headroom`,
-  `no_acceleration_over_autonomy`, `below_exit_hysteresis`,
-  `no_eligible_target`, `yielding_to_higher_priority`), target unit, current
-  export bound, proposed watts, held intent id — on snapshot/health; one
-  guarded mutation `POST /api/v1/settings/excess-charging` (arm + interactive
-  principal, typed confirmation, idempotency key, audited, mirroring
-  inhibit-acknowledgement's shape) flipping the composed adviser at runtime;
-  boot composes from the config file value (a runtime toggle does not silently
-  persist — decide persistence explicitly). Build it on the atomic
-  commit-then-audit pattern (the Impl-10 discipline applied to this one
-  operation). Fold C6 (expires_in_s, correlation ids) into the same contract.
-- **Backend**: facade projection of the adviser's state (the tick decision is
-  computed every cycle and currently discarded beyond its intent); the toggle
-  mutation; grid/load figures are already in the snapshot telemetry summary —
-  verify the wire model and expose a fleet net-export figure.
-- **UI**: Home tile ("Solar surplus charging mid from 1.4 kW export — adviser
-  active" / honest inactive states with the reason), a Settings on/off switch
-  with confirmation, and the per-phase grid/load figures on Home/Batteries
-  (R6's UI half — this is what makes the feature legible: "that export is what
-  charged rhs"). Activity attribution already works (principal + source).
-- **Protocol**: the operator's net-billing confirmation, then the design's
-  Phase 1 trial — 500 W cap (`max_charge_from_export_w: 500`), one neediest
-  unit, daytime surplus window, other writer apps quiescent, abort criteria as
-  written in `DESIGN_EXCESS_CHARGING.md`.
+**Headline shapes** (full contracts in `docs/DESIGN_ENERGY_SCORECARD.md`;
+wire-facing pins already landed in API_CONTRACTS "Energy scorecard"): six
+advisory `energy_*_kwh` observation fields (grid pair under NEUTRAL A/B
+names until pinned); an `EnergyAccountant` in the fleet loop integrating the
+CT stream, deltaing the counters, rolling days at site-timezone midnight
+(one B4-style promoted energy read at the boundary); a frozen
+`EnergyDayRecord` with per-unit metrics, coverage, provenance, and the
+counter cross-check; `GET /api/v1/energy/days` + snapshot `energy_today` +
+`energy.day_rolled` (transition-only); an `energy_scorecard` config block
+(block-presence doctrine, `grid_source`/`grid_counter_roles` A-1 gates,
+optional tariff keys for money); Home "Today" card + the Insights view's
+first real content. The build also consumes the deferred golden energy/SOC
+scenario as its reference-model test family.
 
-### Next 2 — Schedules surface (Phase 3 made real)
+**Companion (S2)**: dispatch the night-writer foreign-objective detector as a
+separate contract cycle in the same window — it touches the same decode and
+composition files, costs zero extra frames, and closes the night blind spot
+whose characterization the operator's pending night-partition decision needs.
+S3 (the disarmed-window reason) is a natural third rider on the same files.
 
-This answers "will we simply rely on scheduling?" concretely (see §4: no) by
-making scheduling a first-class product feature on the existing domain. Scope:
+## 4. Operator decisions required (standing + new)
 
-- **Contract**: `GET /api/v1/schedule` (versioned plan + next evaluated action)
-  and `PUT /api/v1/schedule` (compare-and-swap on version —
-  `ScheduleVersionConflict` already models it); audit events for publication;
-  bus events for schedule transitions; the evaluation loop's position in the
-  fleet cycle.
-- **Backend**: facade methods over `ScheduleRepository`; an evaluation loop in
-  `_run_fleet` (evaluate the active plan each cycle, maintain exactly one live
-  `SCHEDULE` intent per plan version through the ordinary intent repository —
-  the evaluator and TTL discipline already exist); SQLite persistence of the
-  plan (repository classes already delivered).
-- **UI**: the Schedule view (v1: a readable list editor with validation
-  feedback, not a full timeline painter), next-action on Home (the slot exists
-  and says "nothing is scheduled"), pause/skip, publication audit in Activity.
-- **The night-writer constraint (must be designed, not coded around)**: the
-  operator's environment fact is pinned in CONTINUITY — other applications
-  write these batteries **only at night**, exactly when a Night Charge schedule
-  would run, and our arm-time sole-writer preflight latches `external_writer`
-  by design ("coordinate, don't fight"). Three honest postures, requiring an
-  explicit operator choice: (a) **partition** — the controller owns the night
-  window and the external night writers are stood down (the clean path; make
-  the schedule's first-night activation an operator-acknowledged takeover);
-  (b) **yield** — the schedule is a daytime/off-peak feature and the night
-  window stays with the existing writers (schedule windows validated against a
-  configured allowed window); (c) **contested** — the schedule runs, arms fail
-  against the preflight, and the console says so honestly every night (worst;
-  rejected). Recommend (a) with the partition recorded in config, plus the
-  between-cycles foreign-objective detector (C9) so any residual writer is
-  surfaced rather than fought.
-- **Excess × schedule interaction** (design now, cheap later): source priority
-  is already `emergency_stop > manual > agent > optimizer > schedule`, and the
-  adviser yields only to sources **above** optimizer — so an active schedule
-  does **not** displace the adviser today. Physics mostly arbitrates: export
-  exists only in daylight, night-charge windows exist only in darkness, and at
-  dusk the adviser's own bound collapses to zero as export collapses. Where
-  both could claim one unit (an operator's unusual daytime schedule), decide
-  the default: recommend a per-unit adviser yield-to-schedule (one extra check
-  in the existing withdraw path, config-gated `yield_to_schedule: true`) so a
-  deliberately published plan always outranks opportunism; without it, the
-  adviser wins and the schedule is starved invisibly — exactly the failure
-  class the operator has already had to explain once.
-
-### Next 3 — Verification-and-atomicity hygiene wave (the promoted P1s)
-
-Not glamorous, but it is the slot that keeps C1 and C2 honest as they land:
-the simulator is now the reference model for both features, and both add facade
-mutations. Scope: Impl-10 (extend `submit_intent`'s atomic commit-then-audit
-pattern to arm/disarm/acknowledge — and to C1's toggle and C2's schedule-PUT
-as they are built); the simulator literal register-image golden program
-(~90 mutation survivors — "a misplaced word would pass silently"); simulator
-blanket-GOOD quality masking (the 62,535 W headroom artifact). If the operator
-prefers resilience over quality debt, C4 (the recovery detection layer) is the
-alternate for this slot — it is buildable now with no authorization and serves
-the minimal-physical-intervention theme; nothing in the docs outranks C1 and
-C2 either way.
-
-## 4. Should excess-solar rely on scheduling?
-
-No — and it deliberately does not. The adviser is **reactive by design**: it
-acts whenever fleet export exists and nobody of higher priority is commanding,
-it re-decides every tick (default 10 s TTL), and it hands back by non-renewal
-so the pod's own CT-following autonomy resumes within the ~3.5–4 s watchdog
-window. Scheduling is the wrong mechanism for a solar-surplus follower because
-sunlight is not a timetable: a fixed window would either miss surplus (charge
-at 2 pm while exporting, stop at 3 while still exporting) or chase it badly.
-Scheduling instead **composes** with it: a schedule is a separate,
-priority-lower, window-scoped intent source (`schedule` ranks below
-`optimizer` in the arbiter), best expressed as the operator's night-charge
-windows — disjoint from the adviser's daylight export by physics, with the
-adviser optionally yielding per-unit to a published schedule where they could
-overlap. Use the schedule for what is predictable (tariff windows, overnight
-top-ups) and the adviser for what is reactive (spare solar); neither needs the
-other to be safe, and the safety kernel governs both identically.
-
-## 5. Operator decisions required
-
-1. **Net-billing confirmation** (gates C1 production enablement): is site
-   billing netted across phases? Per-phase billing changes the economics,
-   never the safety. Pending since the 2026-08-23 design.
-2. **First-trial authorization** (C1): authorize the single-unit, 500 W-capped,
-   daytime-surplus trial window with other writer apps quiescent, per the
-   design's Phase 1 protocol and abort criteria.
-3. **Toggle policy** (C1): who may flip it (recommend arm + interactive
-   principal) and whether a runtime toggle persists across restart (recommend:
-   boot composes from the config file; persistence is an explicit, audited
-   write-back if wanted).
-4. **Night-window partition** (C2, deciding posture): stand down the external
-   night writers and let the controller own the night, or constrain schedules
-   to the day window, before any Night Charge schedule is published.
-5. **Adviser-vs-schedule precedence default** (C2): confirm the recommended
-   `yield_to_schedule: true` (a published plan outranks opportunism per unit).
-6. **Standing, non-blocking**: whether the EE-calibration warning bits
-   (`PCS_Warning0_1`/`DCDC_Warning0_1`, standing-active on all three pods)
-   should ever be blocking — documented, disabled, awaiting a ruling; and a
-   window for the mid ±1.2 kW oscillation observation if C4 is chosen.
+1. **NEW — Commission the scorecard** (S1): add the `energy_scorecard` block
+   and restart; choose the A-1 pinning path (passive ~3-day cross-check, or
+   name one known-import half-hour evening); decide source promotion after
+   pinning (recommend the device counters); supply tariff keys or stay
+   kWh-only. All verbatim-ready in DESIGN_ENERGY_SCORECARD §11.
+2. **STANDING — Excess trial start** (everything is built): the one-time
+   NET_BILLED acknowledgement, then the console toggle for the 500 W trial —
+   plus the operator's arming of the neediest unit. Graduation per
+   DESIGN_EXCESS_ACTIVATION §4 (criterion 6's economics review is what S1
+   surfaces).
+3. **STANDING — Night partition** (DESIGN_SCHEDULES §8): the YIELD day-only
+   posture is commissioned; any night schedule needs the explicit stand-down
+   grant (config widening + the one-time acknowledgement). S2's night
+   evidence should inform this decision, not follow it.
+4. **STANDING, non-blocking**: whether the EE-calibration warning bits should
+   ever block (documented, disabled, awaiting a ruling); an observation
+   window for the mid/lhs oscillation; the S4(ii) adjustable-bounds flow —
+   build on request.

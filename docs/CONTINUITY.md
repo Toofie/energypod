@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane)
+Last updated: 2026-08-26 (Australia/Brisbane)
 
 ## Purpose
 
@@ -348,6 +348,46 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-26 (scorecard design): THE NEXT FEATURE SELECTED AND DESIGNED —
+  docs only, no code. PRODUCT_NEXT's 2026-08-23 next-3 is fully delivered
+  (excess activation commissioned present-but-off with the trial-cap tension
+  resolved via assumed_autonomous_charge_w 300; schedules commissioned
+  day-only and operator-tested end to end through the live 422 fix; the
+  verification/atomicity wave landed), so the 2026-08-26 edition re-ranked
+  everything against the operator's demonstrated values. WINNER: the DAILY
+  ENERGY SCORECARD (R8 — bought/sold/charged/discharged/load per day plus
+  charged-from-surplus attribution), the one remaining untouched family the
+  operator has visibly valued elsewhere (their prior dashboard and the vendor
+  home chart led with these numbers) AND the missing evidence surface for the
+  excess feature's graduation criterion 6 (kWh shifted vs the autonomy
+  baseline — no console shows it today). Accepted design:
+  docs/DESIGN_ENERGY_SCORECARD.md + the wire-facing pins in API_CONTRACTS
+  "Energy scorecard" section. Key honesty positions: the 0x4101 counter
+  DECODE and charge/discharge ROLE labels are capture-confirmed, but the grid
+  buy/sell ROLES are A-1-open — so bought/sold come from OUR OWN integration
+  of the per-pod CT grid word (control-rate on this deployment, sign
+  live-proven, gaps excluded never interpolated, per-unit/day coverage with
+  partial-day markers), BOTH grid pairs decode and record from day one as
+  the passive A-1 pinning evidence, pinning never self-applies (promotion to
+  the coverage-complete device counters is an operator config revision gated
+  on the recorded fact), the grid pair renders under NEUTRAL A/B names until
+  pinned, and site PV is never presented as measured (inputs unwired; the
+  solar story is exported-surplus + captured-surplus). Advisory only — no
+  authority, no writes, no read-plan cadence change (0x4101 already rides
+  the cold ring; one B4-style promoted read at the day boundary). The build
+  CONSUMES the deferred golden energy/SOC scenario (DEFERRED_FINDINGS 3) and
+  half the validation matrices (item 4) as its reference-model test family.
+  RUNNER-UP designated the same-wave companion: the night-writer
+  between-cycles foreign-objective detector (census queue; zero extra
+  frames; closes the 7.3 h night blind spot and feeds the pending
+  night-partition decision), plus the schedule_state disarmed-window reason
+  (the live FINDING from the operator's own publish test) as a third rider —
+  both touch the same decode/composition files. NOT candidates: the excess
+  trial/graduation (the operator's acts), the mid/lhs oscillation (needs
+  their window), the overnight run/VLAN (operator agreements). Operator
+  decisions verbatim-ready in DESIGN_ENERGY_SCORECARD §11 (commission the
+  block; A-1 path; source promotion; tariff keys; naming check).
 
 - 2026-08-23 (schedules wire contract): LIVE 422 ON PUBLISH FIXED — the docs
   govern. The operator's first editor publish (per-battery watts, no advanced
