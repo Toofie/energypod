@@ -308,6 +308,12 @@ class ControlKernel:
         decision_id: str,
         decided_at_mono: float,
     ) -> Any:
+        # Console per-unit attribution (2026-08-23 Activity view): a decision
+        # that selected exactly one unit carries that unit's id on its audit
+        # row; a genuinely multi-unit decision stays fleet-level -- one row
+        # cannot honestly name one of several units.
+        selected = self._selected_units(intent)
+        attributed_unit: str | None = next(iter(selected)) if len(selected) == 1 else None
         event = self._audit_event_factory.create(
             authorization_batch=batch,
             configuration_version=self._configuration_version,
@@ -319,6 +325,7 @@ class ControlKernel:
             intent=intent,
             observations=observations,
             policy_version=self._policy.version,
+            unit_id=attributed_unit,
         )
         if type(event) is not AuditEvent:
             raise TypeError("audit event factory must return an exact AuditEvent")
@@ -359,7 +366,7 @@ class ControlKernel:
         )
         if (
             event.event_type != "control_decision"
-            or event.unit_id is not None
+            or event.unit_id != attributed_unit
             or event.connection_epoch is not None
             or event.generation != generation
             or event.cycle_id != cycle_id

@@ -96,8 +96,14 @@ class AuditEventFactory:
         intent: Any,
         observations: Mapping[str, Any],
         policy_version: str | int,
+        unit_id: str | None = None,
     ) -> AuditEvent:
-        """Build one canonical event without performing I/O."""
+        """Build one canonical event without performing I/O.
+
+        ``unit_id`` attributes the decision to exactly one unit when the
+        cycle selected one (2026-08-23 console Activity per-unit filters);
+        a multi-unit decision stays fleet-level (``None``).
+        """
         occurred_at = self._wall_now()
         if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
             raise ValueError("wall_now must return a timezone-aware datetime")
@@ -105,6 +111,8 @@ class AuditEventFactory:
         event_id = _required_identity("event_id", self._event_id_factory())
         cycle_id = _required_identity("cycle_id", cycle_id)
         decision_id = _required_identity("decision_id", decision_id)
+        if unit_id is not None:
+            unit_id = _required_identity("unit_id", unit_id)
 
         setpoints = tuple(sorted(decision.setpoints, key=lambda item: item.unit_id))
         selected_unit_ids = getattr(intent, "selected_unit_ids", None)
@@ -147,13 +155,20 @@ class AuditEventFactory:
             monotonic_offset_s=float(decided_at_mono) - self._process_origin_mono,
             process_instance_id=self._process_instance_id,
             event_type="control_decision",
-            unit_id=None,
+            unit_id=unit_id,
             connection_epoch=None,
             generation=generation,
             cycle_id=cycle_id,
             principal=intent.actor_identity,
             source=intent.source,
-            correlation_id=f"intent:{intent.id}:revision:{intent.acceptance_revision}",
+            # A decision held by a latched stop correlates to the stop itself
+            # (2026-08-23 console Activity): the row names its stop without
+            # guessing from the newest latch event.
+            correlation_id=(
+                f"emergency_stop:{intent.id}"
+                if intent.source is IntentSource.EMERGENCY_STOP
+                else f"intent:{intent.id}:revision:{intent.acceptance_revision}"
+            ),
             intent_id=intent.id,
             policy_version=policy_version,
             configuration_version=configuration_version,

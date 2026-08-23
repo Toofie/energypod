@@ -484,6 +484,19 @@ eligible_charge_w = min(max_charge_from_export_w,
   advisory doctrine, with the safety kernel's staleness gates as the backstop. The controller never
   writes `0x8000`/`0x0101`; the mode words are read-only evidence.
 
+## Control-decision audit attribution
+
+- A `control_decision` audit row whose cycle selected exactly ONE unit carries that unit's `unit_id`
+  (2026-08-23 console Activity per-unit filters); a genuinely multi-unit decision stays fleet-level
+  (`unit_id: null`) because one row cannot honestly name one of several units. Fleet-level fields —
+  the full observation-sequence map, both watt figures, the cycle and decision ids, the fingerprints
+  — are unchanged on every row, and the kernel still rejects a factory event that attributes the
+  wrong unit.
+- A decision held by a latched emergency stop correlates to the stop explicitly:
+  `correlation_id = "emergency_stop:{stop_id}"` (other decisions keep
+  `intent:{intent_id}:revision:{revision}`), so the Activity view names the stop on the row itself
+  instead of inferring it from the newest latch event.
+
 ### Read-plan tier promotion
 
 With the feature enabled, the live decode strategy promotes the PCS live block `0x1000` (grid at
