@@ -70,6 +70,34 @@ export interface Snapshot {
   snapshot_sequence: number;
   captured_at: string;
   units: UnitSnapshot[];
+  /**
+   * The telemetry historian's feature-detected block (API_CONTRACTS.md
+   * "Plant history"): present only while the `plant_history` config block is
+   * composed — the console's "history is recording" hint. `last_sample_at`
+   * carries one ISO instant per configured unit, null for a unit not yet
+   * sampled. Absent on a historian-less deployment.
+   */
+  history_state?: {
+    sample_interval_s?: number;
+    retention_full_resolution_days?: number;
+    last_sample_at?: Record<string, string | null>;
+  };
+}
+
+/**
+ * `GET /api/v1/history`'s query (observe scope, read-only — no mutation exists
+ * on this surface, so no idempotency key exists either). `from`/`to` are
+ * REQUIRED ISO-8601 instants WITH an explicit UTC offset (`Z` or `±HH:MM`; a
+ * naive timestamp is refused 422 — an implicit local zone is a silent lie);
+ * the window must satisfy `from < to` and stay ≤ 31 days.
+ */
+export interface PlantHistoryQuery {
+  from: string;
+  to: string;
+  /** Comma-separated field vocabulary; omitted = the route's default set. */
+  fields?: string;
+  /** The per-series downsample target, 50..2000. */
+  points?: number;
 }
 
 /**
@@ -317,6 +345,20 @@ export interface ApiClient {
    * Pure read — no mutation exists on this surface.
    */
   getObservedObjectives(last?: string): Promise<Record<string, unknown>>;
+  /**
+   * The telemetry historian's windowed read (GET /api/v1/history, observe
+   * scope; DESIGN_PLANT_HISTORY.md §3): server-side LTTB-downsampled series
+   * for the window, one resolution per response (`full` raw samples or
+   * `hourly` rollups — chosen by the data horizon, never by the client), with
+   * server-computed gaps (never interpolated), per-series window extremes the
+   * downsample may not show, step-encoded lifecycle/health/commanded change
+   * arrays, and fleet sums computed over the raw rows. A deployment without
+   * the `plant_history` config block refuses with 409
+   * `plant_history_not_commissioned`; a window before the first recorded
+   * sample is a 200 with empty series and `first_sample_at: null` — absence
+   * is data, not an error. The body is parsed by web/src/app/history.ts.
+   */
+  getPlantHistory(query: PlantHistoryQuery): Promise<Record<string, unknown>>;
   openEvents(afterSequence?: number): AsyncIterable<StreamEvent>;
 }
 
@@ -662,5 +704,15 @@ export function createApiClient(token: string): ApiClient {
       request<Record<string, unknown>>(
         `/api/v1/objectives/observed${last === undefined ? "" : `?last=${encodeURIComponent(last)}`}`,
       ),
+    getPlantHistory: (query) => {
+      const params = new URLSearchParams({ from: query.from, to: query.to });
+      if (query.fields !== undefined) {
+        params.set("fields", query.fields);
+      }
+      if (query.points !== undefined) {
+        params.set("points", String(query.points));
+      }
+      return request<Record<string, unknown>>(`/api/v1/history?${params.toString()}`);
+    },
   };
 }

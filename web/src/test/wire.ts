@@ -1144,6 +1144,14 @@ export interface WireSnapshot {
    * else changes. Attach with `withEnergyToday`.
    */
   readonly energy_today?: WireEnergyToday;
+  /**
+   * The telemetry historian's recording hint (LIVE wire — the plant_history
+   * config block is commissioned): present only while the historian is
+   * composed; ABSENT (a historian-less deployment) = the history route
+   * answers 409 and the view renders its not-commissioned state. Attach with
+   * `withHistoryState`.
+   */
+  readonly history_state?: WireHistoryState;
 }
 
 /** The snapshot `intent` block's object form; every map nullable inside. */
@@ -2965,4 +2973,201 @@ function defaultLifecycleFor(eventType: string): string {
  */
 export function auditPage(events: readonly WireAuditEvent[], nextCursor: number | null = null): AuditPage {
   return { events: [...events] as unknown as AuditEvent[], next_cursor: nextCursor };
+}
+
+// ---------------------------------------------------------------------------
+// Plant history (the telemetry historian) — LIVE wire, verified against the
+// composed controller's GET /api/v1/history (schema v3, 30 s cadence):
+// the snapshot's feature-detected `history_state` block and the windowed
+// history body. Shapes are the route's own, never invented for a suite.
+// ---------------------------------------------------------------------------
+
+/** The snapshot's `history_state` block (API_CONTRACTS.md "Plant history"). */
+export interface WireHistoryState {
+  readonly sample_interval_s: number;
+  readonly retention_full_resolution_days: number;
+  readonly last_sample_at: Record<string, string | null>;
+}
+
+/** One full-resolution point: a real stored sample, verbatim. */
+export interface WireHistoryPoint {
+  readonly t: string;
+  readonly v: number;
+}
+
+/** One hourly-rollup point: the hour's mean, its own min/max, and n samples. */
+export interface WireHistoryHourlyPoint {
+  readonly t: string;
+  readonly v: number;
+  readonly min: number | null;
+  readonly max: number | null;
+  readonly n: number;
+}
+
+export interface WireHistorySeries {
+  readonly points: readonly (WireHistoryPoint | WireHistoryHourlyPoint)[];
+  readonly sample_count: number;
+  readonly window_min: number | null;
+  readonly window_min_at: string | null;
+  readonly window_max: number | null;
+  readonly window_max_at: string | null;
+}
+
+export interface WireHistoryGap {
+  readonly from: string;
+  readonly to: string;
+}
+
+export interface WireHistoryChange {
+  readonly t: string;
+  readonly v: string;
+}
+
+export interface WireCommandedChange {
+  readonly t: string;
+  readonly source: string | null;
+  readonly direction: string | null;
+  readonly watts: number | null;
+}
+
+export interface WireHistoryUnit {
+  readonly first_sample_at: string | null;
+  readonly last_sample_at: string | null;
+  readonly sample_count: number;
+  readonly quality_worst: string | null;
+  readonly gaps: readonly WireHistoryGap[];
+  readonly series: Record<string, WireHistorySeries>;
+  readonly lifecycle_changes: readonly WireHistoryChange[];
+  readonly health_state_changes: readonly WireHistoryChange[];
+  readonly commanded_changes: readonly WireCommandedChange[];
+}
+
+export interface WireHistoryBody {
+  readonly from: string;
+  readonly to: string;
+  readonly resolution: "full" | "hourly";
+  readonly points: number;
+  readonly fields: readonly string[];
+  readonly units: Record<string, WireHistoryUnit>;
+  readonly fleet: {
+    readonly series: Record<string, WireHistorySeries>;
+    readonly gaps: readonly WireHistoryGap[];
+  };
+}
+
+/** The recording hint, exactly as the snapshot carries it. */
+export function historyState(
+  spec: Partial<WireHistoryState> = {},
+): WireHistoryState {
+  return {
+    sample_interval_s: 30,
+    retention_full_resolution_days: 14,
+    last_sample_at: spec.last_sample_at ?? {
+      mid: "2026-08-24T06:03:00+00:00",
+      rhs: "2026-08-24T06:03:00+00:00",
+      lhs: "2026-08-24T06:03:00+00:00",
+    },
+    ...spec,
+  };
+}
+
+/** Attach the historian's recording hint to a snapshot world. */
+export function withHistoryState(
+  world: WireSnapshot,
+  state: WireHistoryState | null,
+): WireSnapshot {
+  // A null state leaves the key ABSENT (exactOptionalPropertyTypes: an
+  // explicit undefined is not the same wire as a missing key — the missing
+  // key IS the feature detection).
+  return state === null ? { ...world } : { ...world, history_state: state };
+}
+
+/**
+ * One series from {instant → value} pairs, order-preserved: the wire's points
+ * are time-ordered real samples, so the fixture builder takes them that way.
+ * Extremes default to the pairs' own min/max (a coherent world); override per
+ * fixture to pin the "downsample dropped the peak" honesty case.
+ */
+export function historySeries(
+  pairs: readonly { t: string; v: number }[],
+  spec: Partial<WireHistorySeries> = {},
+): WireHistorySeries {
+  const values = pairs.map((pair) => pair.v);
+  const min = values.reduce((a, b) => Math.min(a, b), Number.POSITIVE_INFINITY);
+  const max = values.reduce((a, b) => Math.max(a, b), Number.NEGATIVE_INFINITY);
+  const minPair = pairs.find((pair) => pair.v === min);
+  const maxPair = pairs.find((pair) => pair.v === max);
+  return {
+    points: pairs.map((pair) => ({ t: pair.t, v: pair.v })),
+    sample_count: pairs.length,
+    window_min: pairs.length > 0 ? min : null,
+    window_min_at: pairs.length > 0 ? (minPair?.t ?? null) : null,
+    window_max: pairs.length > 0 ? max : null,
+    window_max_at: pairs.length > 0 ? (maxPair?.t ?? null) : null,
+    ...spec,
+  };
+}
+
+/** One hourly series from the hour tuples. */
+export function historyHourlySeries(
+  hours: readonly { t: string; v: number; min: number | null; max: number | null; n: number }[],
+): WireHistorySeries {
+  return {
+    points: hours.map((hour) => ({ ...hour })),
+    sample_count: hours.reduce((sum, hour) => sum + hour.n, 0),
+    window_min: hours.length > 0
+      ? hours.reduce((low, hour) => (hour.min !== null && (low === null || hour.min < low) ? hour.min : low), null as number | null)
+      : null,
+    window_min_at: hours.find((hour) => hour.min !== null)?.t ?? null,
+    window_max: hours.length > 0
+      ? hours.reduce((high, hour) => (hour.max !== null && (high === null || hour.max > high) ? hour.max : high), null as number | null)
+      : null,
+    window_max_at: hours.find((hour) => hour.max !== null)?.t ?? null,
+  };
+}
+
+/** One unit's history block with every honest default in place. */
+export function historyUnit(
+  spec: Partial<WireHistoryUnit> & { series?: Record<string, WireHistorySeries> } = {},
+): WireHistoryUnit {
+  const series = spec.series ?? {};
+  return {
+    first_sample_at: spec.first_sample_at ?? null,
+    last_sample_at: spec.last_sample_at ?? null,
+    sample_count: spec.sample_count ?? 0,
+    quality_worst: spec.quality_worst ?? null,
+    gaps: spec.gaps ?? [],
+    series,
+    lifecycle_changes: spec.lifecycle_changes ?? [],
+    health_state_changes: spec.health_state_changes ?? [],
+    commanded_changes: spec.commanded_changes ?? [],
+  };
+}
+
+/** The history route's 200 body around one units/fleet pair. */
+export function historyBody(
+  spec: Partial<WireHistoryBody> & {
+    units: Record<string, WireHistoryUnit>;
+    resolution: "full" | "hourly";
+  },
+): WireHistoryBody {
+  return {
+    from: spec.from ?? "2026-08-24T00:00:00+00:00",
+    to: spec.to ?? "2026-08-24T06:00:00+00:00",
+    resolution: spec.resolution,
+    points: spec.points ?? 900,
+    fields: spec.fields ?? [],
+    units: spec.units,
+    fleet: spec.fleet ?? { series: {}, gaps: [] },
+  };
+}
+
+/** The route's not-commissioned refusal (the schedules precedent verbatim). */
+export function historyNotCommissionedRefusal(): Record<string, unknown> {
+  return {
+    code: "plant_history_not_commissioned",
+    message: "Plant history is not commissioned in this deployment's config",
+    details: null,
+    request_id: "req-history-1",
+  };
 }

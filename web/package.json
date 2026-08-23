@@ -13,7 +13,8 @@
   },
   "dependencies": {
     "react": "19.2.8",
-    "react-dom": "19.2.8"
+    "react-dom": "19.2.8",
+    "uplot": "^1.6.32"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "6.9.1",

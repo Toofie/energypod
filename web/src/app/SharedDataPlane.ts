@@ -328,6 +328,11 @@ export function sharedClient(plane: SharedDataPlane, real: ApiClient): ApiClient
     // The night-writer session view passes through the same way: a plain
     // observe read, per-view, no coalescing value.
     getObservedObjectives: (last) => real.getObservedObjectives(last),
+    // The historian's windowed read passes through too: the History view owns
+    // its own windows and re-queries on its own cadence (the historian
+    // publishes no bus event by design — samples are projections, not acts),
+    // so coalescing would only tie two ranges' reads together.
+    getPlantHistory: (query) => real.getPlantHistory(query),
     postIntent: (body, idempotencyKey) => real.postIntent(body, idempotencyKey),
     postIntentCancel: (intentId, idempotencyKey) =>
       real.postIntentCancel(intentId, idempotencyKey),
