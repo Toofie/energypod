@@ -716,6 +716,31 @@ direction, freshness, and watchdog timing per physical unit.
   cap); promoted-P1 contract cycle (Impl-10 commit-then-raise, simulator
   register image, blanket GOOD quality).
 
+- 2026-08-23 (imbalance): CELL-IMBALANCE INCIDENT CLOSED — real drift, not
+  phantom. The operator's blocked fleet discharges were LHS alone at 54 mV
+  spread (4 mV over the 0.050 V gate) vetoing every fleet decision via the
+  reason union; mechanism is top-of-charge balancing at 99% SOC after a day
+  of heavy cycling (rhs/lhs charged to full; LHS BMS charge limit closed).
+  Phantom ruled out four ways (stable spread across 9 cell windows, fresh
+  advancing cell data, all-GOOD quality, kernel judges the exact projected
+  tuple). Spreads: mid 22 / rhs 31 / lhs 54 mV, easing to 45 mV after the
+  verification discharge. OPERATOR-DIRECTED POLICY (a7297bf, config rev 4):
+  maximum_cell_imbalance_v 0.050 -> 0.500 (10x) — imbalance demoted to an
+  early-warning tier; the ABSOLUTE per-cell bounds (2.80/3.65 V) remain the
+  hard over/under-charge gates; console warning tier >50 mV landed (5453c6a:
+  Batteries amber line + Home "what's limiting" factor). VERIFIED LIVE: 900 W
+  fleet discharge, 24/24 cycles authorized safety_checks_passed, LHS went
+  ACTIVE at ~900 W, clean TTL return; zero imbalance rejections on rev 4.
+  The verification again exposed the GREEDY-ALLOCATOR starvation in fleet
+  intents (lhs absorbed the entire 900 W; mid/rhs correctly drew 0 W —
+  per-unit intents remain the workaround; the capacity-aware allocation fix
+  stays at the head of the promoted queue). POST-MERGE NOTES queued: align
+  the observe-only hardcoded default max_cell_imbalance_v (composition.py
+  ~1881) with the relaxed live policy; extend per-unit attribution to
+  fleet-level control_decision rows. Controller: PID 2860, writemode16,
+  all units armed_idle, no faults, mid's ±1.2 kW self-charge oscillation
+  continues (pre-existing, unexplained, day-scope observation).
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
