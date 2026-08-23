@@ -404,6 +404,79 @@ direction, freshness, and watchdog timing per physical unit.
   then commission + restart), flow round 2 in web/. Detector live and
   quiet-classified on the real Docker writer (expected_nightly_charge).
 
+- 2026-08-26 (night-charge backend): THE OFF-PEAK NIGHT CHARGE BACKEND
+  IMPLEMENTED AND STAGED (B1-B6; d29fea7 config, c8a438a strategy, 2e6e3ca
+  facade, 42bbdeb REST, 78c07ac composition, + this pass) against the
+  accepted contract docs/DESIGN_NIGHT_CHARGE.md (a791fb6) + API_CONTRACTS
+  "Off-peak night charge" — the docs govern every shape; nothing deviates.
+  The console half (b98d98c..939b0f9) was already built against the same
+  shapes and reconciles cleanly (one delta, noted below). (1) CONFIG (B1):
+  NightChargingConfig on the block-presence doctrine, REQUIRED civil-time
+  timezone, canonical cross-midnight window pairs, every §3.1 gate bound to
+  block-PRESENCE (write_enabled + policy; cap <= max_unit_charge_w; 0 <
+  hold < cap; 0 < hysteresis < threshold; freshness > control+read bound;
+  ttl inside (0,300] and > control; capacity map exactly-the-fleet IFF
+  pacing even), and the PARTITION grant — a PRESENT schedule block whose
+  allowed union covers the window ENTIRELY, the refusal naming the widening
+  path. (2) STRATEGY (B2, energypod/application/night_charge.py): the pure
+  civil-time helpers (single implementation of every countdown, DST-honest);
+  the demand rollup over the per-pod LOAD CT words — never the grid words,
+  the design's one non-obvious catch, a NAMED test: a full-rate 3x2500 W
+  charge with grid words at -7.5 kW keeps pacing — worst-word-wins evidence
+  with FAIL-CLOSED-TO-HOLD polarity; the per-unit plan under cap_first
+  (Docker parity) and even (deadline-paced from MEASURED SOC each tick,
+  self-correcting to cap when behind, no escalation mode); ceiling/headroom/
+  disarmed sit-outs honest (skipped_full / no_charge_headroom /
+  units_disarmed); the §2.5 tick — participation read at tick start,
+  window-end NON-RENEWAL, per-unit exclusion at SUBMISSION time under every
+  claim class (manual/agent/schedule/not-own optimizer — the dawn corner;
+  the night- prefix means its own held intent never excludes itself), a
+  live emergency stop withdrawing entirely, and the ONE-HELD-INTENT
+  invariant (remove-then-submit) as the second NAMED test;
+  NightChargeController = the ExcessAdviserController mirror (participation
+  + the PARTITION latch, the §5 projection with read-time countdowns, the
+  state_changed throttle + 30 s heartbeat, nothing while disabled).
+  (3) FACADE (B3): submit_night_intent (the advisory twin verbatim — source
+  pinned OPTIMIZER, night- prefix, per-battery watts native, never routed)
+  and set_night_charging (the excess toggle pattern: NIGHT confirmation,
+  arm+interactive to enable, the three refusal envelopes, and the SHARED
+  durable-once partition acknowledgement — the schedules surface's own
+  historical event id, either surface's capture counts, both latches flip,
+  durable-append-FIRST, an append failure refuses). (4) REST (B4): POST
+  /api/v1/night-charging with the same boundary discipline (literals 422,
+  409 night_charging_not_commissioned / night_acknowledgement_required
+  {acknowledgement: PARTITION_ACKNOWLEDGED} / night_enable_refused with
+  unit_ids+stop_ids; 200 carries persisted:false + the projection).
+  (5) COMPOSITION (B5): block-presence wiring (absent = byte-identical),
+  the fleet-cycle ordering pin (schedule -> excess -> NIGHT -> accountant ->
+  historian -> kernel; free surplus before paid import), the PCS live-block
+  promotion widened to either-block, and supervision as the projection's
+  single writer. (6) SIMULATOR + STAGING (B6): the scripted-night scenario
+  in tests/simulator/test_simulated_pod.py — disarmed boot -> pacing from
+  real SOCs with rhs full sitting out -> the EV hold at 100 W -> the
+  hysteresis band -> the resume -> a manual claim excluding one battery ->
+  the dawn-corner optimizer claim -> completion before 06:00 -> window-end
+  non-renewal. VERIFICATION: contract-first red -> green across six families
+  (config 19, strategy 32, facade 13, REST 12, composition 7, events 6,
+  simulator 1); FULL SUITE 2145 green; ruff + format + MYPYPATH=src mypy
+  strict clean each commit. SIMULATOR DEMO (../night-charge-demo/, run
+  TWICE, identical digest — see the entry's figures in the final report).
+  LIVE STAGING (writemode36): the config block PRESENT with enabled:false
+  and the PARTITION grant widened in the same revision (schedule posture
+  now partition); controller restarted clean; the snapshot carries
+  night_charge_state in its disabled_by_config state, the toggle answers
+  night_acknowledgement_required for an enable (nothing captured yet — the
+  operator's first enable captures it), fleet unchanged, log clean. NO live
+  trial: the §3.4 cutover's steps 2-7 (arm -> stand Docker down -> enable ->
+  one supervised night -> decommission -> close the detector expectation)
+  remain the operator's acts. CONSOLE RECONCILIATION (one delta, in the
+  contract's favor): the fixtures' per-unit rows are a superset — the
+  console renders a sitting_out unit's row verbatim from the projection, and
+  the backend's skipped_full/no_charge_headroom reasons are inside the
+  console's ONE reason vocabulary already; the toggle 200, the event
+  payload, and the refusal envelopes match fixture-for-fixture. OPERATOR
+  NEXT: §8's four decisions, then the cutover in order.
+
 - 2026-08-26 (night-writer detector): THE NIGHT-WRITER DETECTOR IMPLEMENTED,
   COMMISSIONED, AND LIVE-PROVEN ON THE REAL NIGHTLY WRITER (46c828a
   contract, bc7e95f red, b72935e the known-writer amendment, b6d693e

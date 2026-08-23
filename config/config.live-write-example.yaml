@@ -423,15 +423,101 @@ excess_charging:
 # COMMISSIONED 2026-08-24 (operator request): the block below is live — the
 # routes, runner, and snapshot projection compose, the console editor is
 # enabled, and an EMPTY plan commands nothing until the operator publishes
-# one. The posture stays the day-only YIELD default: schedules may command
-# 06:00-20:00 local; night remains with the site's external writer
-# applications until an explicit PARTITION grant (config revision + the
-# one-time acknowledgement).
+# one.
+#
+# PARTITION GRANTED 2026-08-24 (DESIGN_NIGHT_CHARGE §3.2, the cutover's step
+# 1 — the machinery staged, the night strategy still suspended): the windows
+# below widened from the day-only YIELD default [["06:00","20:00"]] to cover
+# 00:00-06:00 as well, in the SAME revision that adds the `night_charging:`
+# block, because commissioning night charge and granting the night partition
+# are one deliberate config revision — the validation refuses the one without
+# the other. The site's derived posture is now `partition` (GET /api/v1/
+# schedule and `schedule_state` report it; the night projection carries it
+# too). The published-plan doctrine is unchanged: no night schedule is
+# published and none should be (§4.3 — the night adviser IS the night
+# mechanism; two writers of the same minutes is the invisible-starvation
+# class).
 schedule:
   # The allowed command windows, local civil time ("HH:MM" pairs; a pair
   # may cross midnight). The UNION of the pairs is what a schedule may
-  # command. OMITTED = the day-only YIELD default shown here.
-  allowed_windows_local: [["06:00", "20:00"]]
+  # command. The night half of the union is the PARTITION grant, held for
+  # the night strategy adviser — not for published schedules.
+  allowed_windows_local: [["00:00", "20:00"]]
+  intent_ttl_s: 10.0
+
+# ---------------------------------------------------------------------------
+# OFF-PEAK NIGHT CHARGE — THE NIGHT STRATEGY ADVISER
+# (DESIGN_NIGHT_CHARGE + API_CONTRACTS "Off-peak night charge").
+#
+# The operator-confirmed replacement for the site's Docker solution (all
+# three batteries at 2,500 W per unit, 00:00-06:00 nightly, dropping to a
+# very low rate when house demand is high). A strategy layer in the
+# excess-adviser pattern: per battery, inside the commissioned window and
+# while enabled, reach the SOC charge ceiling by window end at <= rate_cap_w
+# under the pinned pacing rule, submitting ordinary short-TTL `optimizer`
+# CHARGE intents under the composed automation principal
+# `energypod:night-adviser` (audit-attributable, never on REST/MCP).
+#
+# PRESENT-BUT-SUSPENDED is the shipped state (mirroring how the excess trial
+# shipped): a PRESENT block composes the adviser, the `night_charge_state`
+# snapshot projection, the `night_charge.state_changed` events, the guarded
+# toggle route, and the PCS live-block promotion — `enabled: false` keeps
+# participation OFF until the operator's cutover. An ABSENT block composes
+# nothing at all and the toggle answers 409 night_charging_not_commissioned.
+#
+# THE DEMAND RULE reads the per-pod LOAD CT words (0x1000+20), NEVER the
+# grid words: the grid word includes the adviser's OWN charging draw, so a
+# demand rule on it would read a 3 x 2500 W charge as 7.5 kW of "demand" and
+# hold forever. While measured demand exceeds demand_threshold_w every
+# participating battery drops to hold_rate_w — a small POSITIVE charge
+# (config refuses zero: a zero hold hands the pod back to matching autonomy,
+# the opposite of the operator's intent). The held objective REPLACES the
+# pods' load-matching autonomy, so batteries neither drain into the EV nor
+# cycle; the GRID meets the spike. Resume only below threshold - hysteresis.
+# Bad evidence (a missing/bad/stale load word) FAILS CLOSED TO HOLD —
+# loudly, never a silent never-charges.
+#
+# PRECEDENCE: manual/agent requests outrank it per battery (and their units
+# are excluded from the submission until the claim lapses); it ALWAYS yields
+# per unit to a published SCHEDULE claim (no opt-out flag); and it excludes
+# units claimed by the excess adviser (FREE surplus outranks PAID import,
+# the dawn corner — one direction only). Window end is NON-RENEWAL: the TTL
+# lapse plus the ~3.5-4.0 s firmware watchdog return each pod to its own
+# autonomy. No stop triples, no idle intents, ever.
+#
+# COMMISSIONING GATES (bind to block-PRESENCE; the runtime toggle can raise
+# participation but never a cap, window, pacing choice, or grant):
+# write_enabled mode with a policy; rate_cap_w <= policy.max_unit_charge_w;
+# 0 < hold_rate_w < rate_cap_w; 0 < demand_exit_hysteresis_w <
+# demand_threshold_w; demand_telemetry_max_age_s > control_period_s +
+# essential_read_timeout_s; 0 < intent_ttl_s <= 300 and > control_period_s;
+# assumed_capacity_wh present with exactly the fleet units IFF pacing is
+# `even`; and the PARTITION grant above.
+#
+# THE CUTOVER (§3.4 — the remaining steps are the operator's, in order):
+# arm the units (a human act; boot is disarmed and every restart re-arms
+# nothing) -> stand Docker down -> enable at the toggle (the first enable
+# carries "night_posture": "PARTITION_ACKNOWLEDGED" and captures the
+# durable once-ever fact) -> one supervised night -> decommission Docker,
+# verified by the night-writer detector's quiet window -> remove
+# foreign_objective_expected_charge_w from the policy.
+#
+# PARITY NOTE (§3.4 step 1, stated honestly): max_fleet_charge_w 6000 below
+# caps a simultaneous three-pod 2,500 W charge (7,500 W — what Docker ran
+# nightly, so the wiring takes it); widen to 7500 for exact parity or keep
+# 6000 as a deliberate ceiling — the kernel clamps per direction honestly
+# either way and the tile shows the clamped rates.
+night_charging:
+  timezone: "Australia/Brisbane"   # REQUIRED — the off-peak window is a civil-time fact
+  window_local: [["00:00", "06:00"]]   # the commissioned off-peak window
+  enabled: false            # suspended; the toggle starts it (the cutover's step 4)
+  rate_cap_w: 2500          # the per-battery cap (<= policy.max_unit_charge_w)
+  demand_threshold_w: 1000  # the operator's own figure
+  demand_exit_hysteresis_w: 200   # resume only below 800 W (no flapping)
+  hold_rate_w: 100          # a small POSITIVE charge while demand runs
+  demand_scope: "fleet"     # fleet | per_phase (the graduation)
+  pacing: "cap_first"       # Docker parity; `even` is deadline-paced (needs the map)
+  demand_telemetry_max_age_s: 3.0
   intent_ttl_s: 10.0
 
 # ---------------------------------------------------------------------------

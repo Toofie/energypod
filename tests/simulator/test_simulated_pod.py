@@ -22,9 +22,12 @@ PROTOCOL_EVIDENCE word orders, never through the production decoder round trip.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import importlib
 import socket
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -929,3 +932,302 @@ async def test_the_scenario_hook_may_serve_the_matching_load_mode(simulator: Any
     pod.poll()
     live = await transport.read_holding(0x1000, 21)
     assert live[2] == 1, "a scripted writer holds the remote-PQ mode by default"
+
+
+# --- off-peak night charge (DESIGN_NIGHT_CHARGE B6): the scripted night ----------
+#
+# The full composed scenario over the SIMULATED fleet: the demand rule driven
+# by the simulator's own `script_load_power_w` hook (the LOAD CT words the
+# rule reads), pacing from the pods' real SOCs, one battery already full
+# sitting out, the EV spike engaging the hold, the hysteresis band holding,
+# demand falling releasing it, a manual request outranking per battery, the
+# dawn-corner optimizer claim excluding its unit, completion before the
+# window ends, the units_disarmed boot state, and window-end non-renewal.
+
+_NIGHT_WINDOW_UTC_START = datetime(2026, 8, 21, 18, 30, tzinfo=UTC)  # 04:30 Brisbane
+_NIGHT_WINDOW_UTC_END = datetime(2026, 8, 21, 20, 0, tzinfo=UTC)  # 06:00 Brisbane
+
+
+@dataclass
+class _NightScriptedClock:
+    """A deterministic clock starting inside the commissioned window."""
+
+    elapsed_s: float = 0.0
+
+    def wall_now(self) -> datetime:
+        return _NIGHT_WINDOW_UTC_START + timedelta(seconds=self.elapsed_s)
+
+    def monotonic(self) -> float:
+        return self.elapsed_s
+
+    async def sleep(self, seconds: float) -> None:
+        self.elapsed_s += max(0.0, float(seconds))
+        await asyncio.sleep(0)
+
+
+def _night_operator() -> Any:
+    from tests.unit.test_composition import OPERATOR
+
+    return OPERATOR
+
+
+def _compose_night_fleet(database: Any, clock: Any) -> Any:
+    """A three-unit simulate composition with the partition granted and the
+    night block present-but-suspended (the operator enables it at runtime)."""
+    from tests.unit.test_composition import (
+        _authentication_payload,
+        _compose_with,
+        _policy_payload,
+        _timing_payload,
+        _unit_payload,
+        _validate,
+    )
+
+    payload = {
+        "schema_version": 1,
+        "revision": 7,
+        "mode": "write_enabled",
+        "site": {
+            "site_id": "home",
+            "timezone": "Australia/Brisbane",
+            "expected_unit_count": 3,
+        },
+        "units": [
+            _unit_payload("mid", "BEP-MID", "192.168.1.11"),
+            _unit_payload("rhs", "BEP-RHS", "192.168.1.12"),
+            _unit_payload("lhs", "BEP-LHS", "192.168.1.13"),
+        ],
+        "timing": _timing_payload(),
+        # The simulator's SOC model clamps at 94.5%, so the scenario's
+        # ceiling sits at 94.0: a battery the model can actually fill.
+        "policy": {**_policy_payload(), "maximum_soc_pct": 94.0},
+        "authentication": _authentication_payload(),
+        "storage": {"database_path": str(database), "busy_timeout_ms": 250},
+        "schedule": {"allowed_windows_local": [["00:00", "20:00"]]},
+        "night_charging": {"timezone": "Australia/Brisbane"},
+    }
+    return _compose_with(_validate(payload), simulate=True, clock=clock)
+
+
+def _pod_full(pod: Any) -> None:
+    """Place one simulated battery above the scenario's 94% ceiling (rhs
+    tonight): the model's own clamp (94.5%) holds it there through polls."""
+    pod._soc_pct = 96.0
+    pod._rebuild()
+
+
+def _script_load(runtime: Any, watts_by_unit: dict[str, int]) -> None:
+    for unit_id, watts in watts_by_unit.items():
+        runtime.simulators[unit_id].script_load_power_w(watts)
+
+
+def _state(runtime: Any) -> dict[str, Any]:
+    controller = runtime.night_controller
+    assert controller is not None
+    return controller.state_payload()
+
+
+def _targets(state: dict[str, Any]) -> dict[str, int]:
+    return {
+        unit["unit_id"]: unit["target_w"]
+        for unit in state["units"]
+        if unit["phase"] in ("pacing", "holding_on_demand")
+    }
+
+
+async def test_the_scripted_night_runs_the_full_strategy(tmp_path: Any) -> None:
+    """The night trajectory, end to end over the simulated fleet: disarmed
+    boot -> pacing from real SOCs with the full battery sitting out -> the EV
+    hold -> the hysteresis band -> the resume -> a manual claim excluding one
+    battery -> the dawn-corner optimizer claim -> completion -> window-end
+    non-renewal."""
+    from tests.unit.test_composition import _LifespanSession
+
+    clock = _NightScriptedClock()
+    runtime = _compose_night_fleet(tmp_path / "night-scenario.sqlite3", clock)
+    operator = _night_operator()
+    controller = runtime.night_controller
+    assert controller is not None
+
+    enabled = await runtime.facade.set_night_charging(
+        action="enable",
+        confirmation="NIGHT",
+        night_posture="PARTITION_ACKNOWLEDGED",
+        principal=operator,
+        idempotency_key="night-scenario-enable",
+        request_id="night-scenario-enable-request",
+    )
+    assert enabled["enabled"] is True
+    assert enabled["acknowledged_partition"] is True
+
+    # rhs sits above the ceiling from the first night: a zero-watt
+    # non-participant, exactly like the commissioning fleet.
+    _pod_full(runtime.simulators["rhs"])
+    _script_load(runtime, {"mid": 100, "rhs": 100, "lhs": 100})
+
+    session = _LifespanSession(runtime.app)
+    session.send("lifespan.startup")
+    try:
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete"),
+            message="the lifespan never reported startup",
+        )
+
+        # The boot state: the runner can never self-arm, and the projection
+        # says so honestly (the S3 lesson, designed in from day one).
+        await session.pump_until(
+            lambda: "units_disarmed" in _state(runtime)["reason_codes"],
+            message="the disarmed boot state never surfaced",
+        )
+        disarmed = _state(runtime)
+        assert disarmed["phase"] == "idle"
+        assert _targets(disarmed) == {}
+
+        # The operator's standing ritual: arm the fleet once (the actor's
+        # own stable-sample qualification must land first).
+        await session.pump_until(
+            lambda: all(getattr(actor, "qualified", False) for actor in runtime.actors.values()),
+            message="the simulated fleet never qualified",
+            attempts=12000,
+        )
+        await runtime.facade.arm(
+            unit_ids=["mid", "rhs", "lhs"],
+            principal=operator,
+            idempotency_key="night-scenario-arm",
+            request_id="night-scenario-arm-request",
+        )
+        await session.pump_until(
+            lambda: _state(runtime)["phase"] == "pacing",
+            message="the fleet never started pacing after arming",
+            attempts=12000,
+        )
+        pacing = _state(runtime)
+        assert pacing["active"] is True
+        assert (pacing["held_intent_id"] or "").startswith("night-")
+        assert pacing["demand_w"] == 300
+        assert pacing["demand_evidence"] == "good"
+        by_unit = {unit["unit_id"]: unit for unit in pacing["units"]}
+        assert by_unit["rhs"]["phase"] == "skipped_full"
+        assert by_unit["rhs"]["target_w"] == 0
+        assert by_unit["rhs"]["reason"] == "at_ceiling"
+        assert _targets(pacing) == {"mid": 2_500, "lhs": 2_500}, "cap_first Docker parity"
+
+        # The EV arrives: 500 + 500 + 300 = 1300 W of house load, and every
+        # participating battery drops to the small positive hold.
+        _script_load(runtime, {"mid": 500, "rhs": 300, "lhs": 500})
+        await session.pump_until(
+            lambda: _state(runtime)["phase"] == "holding_on_demand",
+            message="the demand hold never engaged",
+        )
+        held = _state(runtime)
+        assert held["demand_w"] == 1_300
+        assert "demand_above_threshold" in held["reason_codes"]
+        assert _targets(held) == {"mid": 100, "lhs": 100}, "a small POSITIVE charge"
+
+        # Into the hysteresis band (900 W: above the 800 W exit bound): the
+        # hold must NOT release.
+        _script_load(runtime, {"mid": 400, "rhs": 200, "lhs": 300})
+        for _ in range(24):
+            await asyncio.sleep(0)
+        band = _state(runtime)
+        assert band["phase"] == "holding_on_demand", "the band never flaps"
+        assert band["demand_w"] == 900
+
+        # Demand falls below the exit bound: pacing resumes.
+        _script_load(runtime, {"mid": 300, "rhs": 100, "lhs": 300})
+        await session.pump_until(
+            lambda: _state(runtime)["phase"] == "pacing",
+            message="pacing never resumed below the exit bound",
+        )
+        resumed = _state(runtime)
+        assert _targets(resumed) == {"mid": 2_500, "lhs": 2_500}
+
+        # A manual request outranks per battery: mid is excluded from the
+        # submission while lhs keeps charging.
+        manual = await runtime.facade.submit_intent(
+            unit_ids=["mid"],
+            direction="charge",
+            watts=700,
+            ttl_s=30.0,
+            principal=operator,
+            idempotency_key="night-scenario-manual",
+            request_id="night-scenario-manual-request",
+        )
+        await session.pump_until(
+            lambda: _targets(_state(runtime)) == {"lhs": 2_500},
+            message="the manual claim never excluded its battery",
+        )
+        yielding_state = _state(runtime)
+        by_unit = {unit["unit_id"]: unit for unit in yielding_state["units"]}
+        assert by_unit["mid"]["phase"] == "sitting_out"
+        assert by_unit["mid"]["reason"] == "yielding_to_higher_priority"
+        await runtime.facade.cancel_intent(
+            intent_id=manual["intent_id"],
+            principal=operator,
+            idempotency_key="night-scenario-cancel",
+            request_id="night-scenario-cancel-request",
+        )
+        await session.pump_until(
+            lambda: _targets(_state(runtime)) == {"mid": 2_500, "lhs": 2_500},
+            message="the released battery never rejoined",
+        )
+
+        # The dawn corner: a live not-own OPTIMIZER intent (the excess
+        # adviser's class, identified by claim at tick time) excludes its
+        # unit too -- free surplus outranks paid import.
+        from energypod.domain import Direction, IntentSource, PowerIntent
+
+        await runtime.intents.add(
+            PowerIntent(
+                id="opt-dawn-1",
+                source=IntentSource.OPTIMIZER,
+                selected_unit_ids=frozenset({"mid"}),
+                direction=Direction.CHARGE,
+                watts=1_800,
+                duration_s=60.0,
+                accepted_at_mono=clock.monotonic(),
+                acceptance_revision=999,
+                actor_identity="energypod:excess-adviser",
+            )
+        )
+        await session.pump_until(
+            lambda: _targets(_state(runtime)) == {"lhs": 2_500},
+            message="the dawn-corner claim never excluded its battery",
+        )
+        dawn = _state(runtime)
+        by_unit = {unit["unit_id"]: unit for unit in dawn["units"]}
+        assert by_unit["mid"]["reason"] == "yielding_to_higher_priority"
+        await runtime.intents.remove("opt-dawn-1")
+
+        # Completion before the window ends: both needy batteries reach the
+        # ceiling and the projection says complete, nothing charging.
+        _pod_full(runtime.simulators["mid"])
+        _pod_full(runtime.simulators["lhs"])
+        await session.pump_until(
+            lambda: _state(runtime)["phase"] == "complete",
+            message="the window never completed",
+        )
+        complete = _state(runtime)
+        assert "target_reached" in complete["reason_codes"]
+        assert complete["active"] is False
+        assert _targets(complete) == {}
+
+        # Window end is NON-RENEWAL: past 06:00 the projection idles with
+        # outside_window and holds nothing.
+        clock.elapsed_s += (_NIGHT_WINDOW_UTC_END - _NIGHT_WINDOW_UTC_START).total_seconds() + 60.0
+        await session.pump_until(
+            lambda: _state(runtime)["reason_codes"] == ["outside_window"],
+            message="the window never ended by non-renewal",
+        )
+        ended = _state(runtime)
+        assert ended["phase"] == "idle"
+        assert ended["active"] is False
+        assert ended["next_window_at"] is not None, "the next night is named"
+    finally:
+        session.send("lifespan.shutdown")
+        await session.pump_until(
+            lambda: session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed"),
+            message="the lifespan never reported shutdown",
+            attempts=20000,
+        )

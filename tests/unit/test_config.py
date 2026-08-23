@@ -1270,6 +1270,35 @@ def test_unknown_night_keys_are_refused() -> None:
     )
 
 
+def test_the_live_write_examples_night_block_validates_as_documented() -> None:
+    """B6: the example's `night_charging:` block — present but `enabled:
+    false`, the grant widened beside it in the same revision — parses
+    cleanly, so what the operator reads on the example is what the
+    controller composes (the projection visible, participation off)."""
+    from pathlib import Path
+
+    import yaml
+
+    example = Path(__file__).resolve().parents[2] / "config" / "config.live-write-example.yaml"
+    document = yaml.safe_load(example.read_text(encoding="utf-8"))
+    assert isinstance(document, dict), "the example must stay one YAML document"
+    assert "night_charging" in document, "the night block is present-but-suspended"
+    assert document["night_charging"]["enabled"] is False
+    assert document["schedule"]["allowed_windows_local"] == [["00:00", "20:00"]], (
+        "the PARTITION grant ships in the same revision as the night block"
+    )
+
+    payload = _valid_config()
+    payload["schedule"] = document["schedule"]
+    payload["night_charging"] = document["night_charging"]
+    parsed = ControllerConfig.model_validate(payload)
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.enabled is False
+    assert parsed.night_charging.pacing == "cap_first"
+    assert parsed.schedule is not None
+    assert parsed.schedule.allowed_windows_local == (("00:00", "20:00"),)
+
+
 # --- plant history (DESIGN_PLANT_HISTORY section 2.5, H3) ------------------------
 
 
