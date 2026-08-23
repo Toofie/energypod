@@ -475,7 +475,7 @@ describe("Composed console — the Now control surface", () => {
       status: "accepted",
       intent_id: "intent-77",
       expires_in_s: 300,
-      requested: { direction: "discharge", watts: 1500 },
+      requested: { direction: "discharge", watts: 3000 },
     };
     harness.install();
     render(<AppShell views={views} />);
@@ -539,9 +539,14 @@ describe("Composed console — the Now control surface", () => {
     expect(offeredUnits).toContain("RHS");
     expect(offeredUnits).not.toContain("LHS");
 
-    await user.type(within(dispatchDialog).getByLabelText("Watts"), "1500");
+    await user.type(within(dispatchDialog).getByLabelText("Watts per battery"), "1500");
+    // The form is per battery (2026-08-23 operator ruling): the live math and
+    // the preview both carry the multiplication, never a silent total.
     expect(
-      within(dispatchDialog).getByText(/Discharge MID, RHS at 1,500 W for 5 min/),
+      within(dispatchDialog).getByText("1,500 W × 2 batteries selected = 3,000 W total"),
+    ).toBeInTheDocument();
+    expect(
+      within(dispatchDialog).getByText(/Discharge MID, RHS\. Each battery: up to 1,500 W · Total: 3,000 W\./),
     ).toBeInTheDocument();
     await user.click(within(dispatchDialog).getByRole("button", { name: "Confirm" }));
 
@@ -552,11 +557,13 @@ describe("Composed console — the Now control surface", () => {
     expect(intentPost[0]!.headers.Authorization).toBe(`Bearer ${OPERATOR_TOKEN}`);
     expect(intentPost[0]!.headers["Content-Type"]).toBe("application/json");
     expect(intentPost[0]!.headers["Idempotency-Key"]).toMatch(ID_PATTERN);
-    // The refused unit never rides along on a dispatch.
+    // The refused unit never rides along on a dispatch, and the submitted
+    // watts stay the backend contract's scalar fleet total: 1,500 W per
+    // battery × 2 selected batteries = 3,000 W.
     expect(JSON.parse(intentPost[0]!.body ?? "{}")).toEqual({
       unit_ids: ["MID", "RHS"],
       direction: "discharge",
-      watts: 1500,
+      watts: 3000,
       ttl_s: 300,
     });
 
@@ -566,7 +573,7 @@ describe("Composed console — the Now control surface", () => {
       intentAccepted(4112, {
         intent_id: "intent-77",
         direction: "discharge",
-        watts: 1500,
+        watts: 3000,
         unit_ids: ["MID", "RHS"],
       }),
     );
@@ -580,7 +587,9 @@ describe("Composed console — the Now control surface", () => {
     });
     const requested = screen.getByRole("group", { name: "Requested" }).textContent ?? "";
     expect(requested).toContain("Discharge");
-    expect(requested).toContain("1,500 W");
+    // The wire repeats the intent's scalar total per covered unit; the card
+    // derives the per-battery expectation from the split for the operator.
+    expect(requested).toContain("≈1,500 W per battery (3,000 W total)");
   });
 });
 
