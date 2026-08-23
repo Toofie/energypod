@@ -2200,3 +2200,93 @@ async def test_disjoint_intents_run_concurrently_over_the_simulated_fleet(
         for actor in runtime.actors.values():
             with contextlib.suppress(Exception):
                 await actor.shutdown()
+
+
+# --- self-healing awareness layer (R4): supervision drives the monitor -----------
+
+
+async def test_supervision_drives_the_recovery_monitor_every_cycle(tmp_path: Path) -> None:
+    """API_CONTRACTS "Self-healing awareness layer": the composed fleet loop
+    itself drives the detection pass -- the peeked authority, the poll
+    outcomes, the fresh observations -- without any external caller, and the
+    facade projects the derived view.  A healthy simulated fleet never alarms."""
+    runtime = compose_write_enabled(
+        tmp_path / "fleet.sqlite3",
+        simulate=True,
+        clock=ScriptedClock(),
+        # The simulated fleet's top-of-charge balancing spread sits above the
+        # 0.050 V commissioning gate; the operator-relaxed 0.500 V tier
+        # (live config rev 4) is the policy this fleet actually dispatches
+        # under, so the kernel mints authority for the scenario to observe.
+        policy_overrides={"maximum_cell_imbalance_v": 0.50},
+    )
+    session = _LifespanSession(runtime.app)
+    try:
+        session.send("lifespan.startup")
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete")
+            or session.seen("lifespan.startup.failed"),
+            message="the application lifespan never reported supervision startup",
+        )
+        assert session.seen("lifespan.startup.complete"), f"startup failed: {session.events!r}"
+        await session.pump_until(
+            lambda: all(actor.qualified is True for actor in runtime.actors.values()),
+            message="the simulated fleet never qualified",
+        )
+        # The monitor is driven by the loop alone: its records hold fresh
+        # facts (observe_cycle is the only writer of these).
+        await session.pump_until(
+            lambda: all(
+                runtime.recovery._records[unit_id].measured_watts is not None
+                for unit_id in UNIT_IDS
+            ),
+            message="supervision never handed the recovery monitor an observation",
+        )
+        await runtime.facade.arm(
+            unit_ids=list(UNIT_IDS),
+            principal=OPERATOR,
+            idempotency_key="recovery-arm",
+            request_id="recovery-arm-request",
+        )
+        await runtime.facade.submit_intent(
+            unit_ids=["mid"],
+            direction="charge",
+            watts=600,
+            ttl_s=30.0,
+            reason="recovery supervision wiring",
+            principal=OPERATOR,
+            idempotency_key="recovery-dispatch",
+            request_id="recovery-dispatch-request",
+        )
+        # The loop peeks the authority the heartbeat consumes and hands it to
+        # the monitor: the record's authorized figure must go positive.
+        await session.pump_until(
+            lambda: runtime.recovery._records["mid"].authorized_watts > 0,
+            message="supervision never reported the authorized watts to the monitor",
+        )
+
+        states = await runtime.recovery.unit_health_states()
+        assert set(states) == set(UNIT_IDS)
+        snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+        units = {view["unit_id"]: view for view in snapshot["units"]}
+        for unit_id in UNIT_IDS:
+            assert units[unit_id]["health_state"] in {"healthy", "self_healing"}, units[unit_id]
+            assert units[unit_id]["health_state"] == states[unit_id].state.value
+
+        # A healthy simulated fleet never raises a detection fact.
+        for event in runtime.audit.recent(limit=128):
+            assert event.event_type not in {
+                "actuation_incoherent",
+                "objective_echo",
+                "unexpected_autonomy",
+            }, event.event_type
+
+        session.send("lifespan.shutdown")
+        await session.pump_until(
+            lambda: session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed"),
+            message="the application lifespan never reported supervision shutdown",
+        )
+        assert session.seen("lifespan.shutdown.complete"), f"shutdown failed: {session.events!r}"
+    finally:
+        await session.close()

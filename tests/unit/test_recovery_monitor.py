@@ -229,8 +229,11 @@ async def test_authorized_but_still_cycles_trigger_exactly_once(api: Any) -> Non
 async def test_a_coherent_cycle_re_arms_the_alarm(api: Any) -> None:
     """Throttle semantics: re-arm only after a coherent cycle or a control
     state change.  Movement reaching the authorized figure closes the episode
-    and returns health to derived-from-observation; a LATER silent streak
-    alarms again."""
+    and returns health to derived-from-observation; a LATER silent streak --
+    from a FRESH pre-command baseline, after the authorization lapsed and the
+    pod settled -- alarms again.  (A wedge pinned at the level an unchanged
+    command already delivered is not this watchdog's case: movement alone
+    cannot distinguish it from delivery, and the docstring pins the limit.)"""
     audit, bus = RecordingAudit(), RecordingBus()
     clock = ManualClock()
     mon = monitor(api, audit=audit, bus=bus, clock=clock)
@@ -262,12 +265,28 @@ async def test_a_coherent_cycle_re_arms_the_alarm(api: Any) -> None:
     assert health.state is not api.HealthState.ACTUATION_INCOHERENT
     assert health.state == api.HealthState.HEALTHY
 
-    # It wedges again: a fresh episode alarms exactly once more.
+    # Steady delivery holds coherent forever: same command, same level.
     for _ in range(4):
         clock.now += 1.5
         await idle_cycle(
             mon,
-            battery_watts=+1120.0,  # pinned at the new baseline, command lost
+            battery_watts=+1120.0,
+            authorized_watts=1000,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+    assert len([e for e in audit.appended if e.event_type == "actuation_incoherent"]) == 1
+
+    # The command lapses; the pod settles at its idle float; a NEW episode
+    # from that fresh baseline wedges and alarms exactly once more.
+    clock.now += 1.5
+    await idle_cycle(mon, battery_watts=-637.0, authorized_watts=0)
+    for _ in range(4):
+        clock.now += 1.5
+        await idle_cycle(
+            mon,
+            battery_watts=-637.0,
             authorized_watts=1000,
             authorized_direction="discharge",
             claimed=True,

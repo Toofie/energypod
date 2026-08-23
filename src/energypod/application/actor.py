@@ -313,6 +313,26 @@ class EnergyPodActor:
         words = await self._submit("refresh_mode_words", None, _CONTROL_PRIORITY)
         return (int(words[0]) & 0xFFFF, int(words[1]) & 0xFFFF)
 
+    async def read_objective_echo(self) -> tuple[str, tuple[int, int]]:
+        """One bounded fresh read of the served PQ objective (P1 iii).
+
+        The coherence watchdog's trigger-time discriminator (vendor
+        precedent: ``DebugModeRead`` immediately after every mode write,
+        MiniESapp.cs:2166-2167): reads the served objective readback once
+        through this actor's sole transport, inside the mailbox dispatch,
+        and classifies it against the last objective THIS actor applied --
+        ``echo_matches_write`` (the transport and write path are fine, the
+        incoherence is pod-side), ``objective_not_served`` (the readback is
+        zero while we are authorized), or ``external_writer`` (somebody
+        else's nonzero objective is being served).  Returns the
+        classification plus the signed (active, reactive) words read.
+        Never called per heartbeat: the budget is one read per incoherent
+        episode, from the recovery layer only.  A failing or unwired read
+        raises and the caller records ``echo_unreadable``.
+        """
+        result = await self._submit("read_objective_echo", None, _CONTROL_PRIORITY)
+        return (str(result[0]), (int(result[1][0]), int(result[1][1])))
+
     async def acknowledge_inhibit(self) -> None:
         """Clear one latched inhibit cause.
 
@@ -475,6 +495,8 @@ class EnergyPodActor:
             return await self._attempt_zero_owned()
         if operation == "refresh_mode_words":
             return await self._refresh_mode_words_owned()
+        if operation == "read_objective_echo":
+            return await self._read_objective_echo_owned()
         if operation == "acknowledge_inhibit":
             return self._acknowledge_inhibit_owned()
         if operation == "stop":
@@ -592,6 +614,31 @@ class EnergyPodActor:
                 f"{self.unit_id}: the mode-word window did not serve ctrlMode and workMode"
             )
         return (int(words[1]) & 0xFFFF, int(words[2]) & 0xFFFF)
+
+    async def _read_objective_echo_owned(self) -> tuple[str, tuple[int, int]]:
+        """The P1 iii bounded fresh read + classification of the served objective."""
+        address = self._objective_readback_address
+        if address is None:
+            raise RuntimeError(f"{self.unit_id}: no objective readback window is wired")
+        try:
+            async with asyncio.timeout(self._heartbeat_margin or 0.1):
+                words = tuple(
+                    await self._transport.read_holding(address, _OBJECTIVE_READBACK_COUNT)
+                )
+            if len(words) < _OBJECTIVE_READBACK_COUNT:
+                raise ValueError("objective readback did not cover P and Q")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise RuntimeError(
+                f"{self.unit_id}: the served PQ objective readback is unreadable"
+            ) from error
+        served = (self._signed_objective(int(words[0])), self._signed_objective(int(words[1])))
+        if served == (0, 0):
+            return ("objective_not_served", served)
+        if self._applied_objective is not None and served == self._applied_objective:
+            return ("echo_matches_write", served)
+        return ("external_writer", served)
 
     def _latching_fault_present(self, observation: Any) -> bool:
         # Blocking-fault classification is the policy's: composition wires the

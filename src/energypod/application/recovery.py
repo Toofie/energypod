@@ -428,6 +428,16 @@ class RecoveryMonitor:
         the 150 W floor, so it is never declared incoherent OR coherent and
         no streak accumulates; a fully silent pod (movement ~0) falls below
         the proportional band and still alarms.
+
+        Movement is judged against the PRE-COMMAND baseline for the whole
+        authorization episode: a steady command holding the measured power at
+        its commanded level reads coherent forever (that IS delivery).  Known
+        limit, deliberately: a mid-flight loss under an UNCHANGED command --
+        the pod pinned at the level it already reached -- is indistinguishable
+        from delivery by movement alone and is not this watchdog's case; the
+        incident class it exists for (22:11Z, the publish-fence wedge) is the
+        command that NEVER lands, and an authorization ending re-arms the
+        detector from whatever level the battery then holds.
         """
         if authorized_watts is None or authorized_watts <= 0:
             # A control-state change ends any episode silently: an uncommanded
@@ -459,9 +469,6 @@ class RecoveryMonitor:
             record.episode_open = False
             record.incoherent_active = False
             record.echo_classification = None
-            # Re-baseline on confident actuation: movement is judged against
-            # where the measured power actually settled.
-            record.baseline_watts = measured
             return False
         if movement < min(required, floor):
             record.streak += 1

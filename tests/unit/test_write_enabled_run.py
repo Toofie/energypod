@@ -362,6 +362,14 @@ class ReplayJournal:
     captured_hosts: frozenset[str] = field(default_factory=frozenset)
     # Fail-closed preflight probe: the served objective readback is unreadable.
     refuse_objective_readback: bool = False
+    # Self-healing awareness scenarios (R4/P1 vi+iii): model the firmware-
+    # wedge class.  ``wedge_actuation`` keeps every write ACKing while the
+    # served battery power NEVER follows the objective; ``objective_echo_mode``
+    # pins what the served objective readback shows once writes land --
+    # "reflect" (our own objective, the pod-side wedge signature), "zero"
+    # (no objective served at all), or "foreign" (somebody else's objective).
+    wedge_actuation: bool = False
+    objective_echo_mode: str = "reflect"
 
     def pq_frames(self, host: str) -> tuple[tuple[int, tuple[int, ...]], ...]:
         return tuple(
@@ -464,10 +472,23 @@ def _install_replay_transport(
                 raise ValueError("only the evidenced three-register PQ objective is writable")
             # Live-proven device behavior (PROTOCOL_EVIDENCE 4b): the objective
             # readback echoes the applied word, and battery power follows the
-            # applied objective — negative for a charge command.
-            banks[self._host][_OBJECTIVE_READBACK_ADDRESS] = registers[1]
-            banks[self._host][_OBJECTIVE_READBACK_ADDRESS + 1] = registers[2]
-            banks[self._host][_BMS_BATTERY_POWER_ADDRESS] = registers[1]
+            # applied objective — negative for a charge command.  The wedge
+            # modes keep the write ACKing while splitting that reflection:
+            # the battery-power word never moves (actuation lost), and the
+            # served objective readback shows whichever scenario pins.
+            if not journal.wedge_actuation:
+                banks[self._host][_BMS_BATTERY_POWER_ADDRESS] = registers[1]
+            if journal.objective_echo_mode == "zero":
+                banks[self._host][_OBJECTIVE_READBACK_ADDRESS] = 0
+                banks[self._host][_OBJECTIVE_READBACK_ADDRESS + 1] = 0
+            elif journal.objective_echo_mode == "foreign":
+                banks[self._host][_OBJECTIVE_READBACK_ADDRESS] = protocol_codec.encode_pq_registers(
+                    -900, 0
+                )[1]
+                banks[self._host][_OBJECTIVE_READBACK_ADDRESS + 1] = 0
+            else:
+                banks[self._host][_OBJECTIVE_READBACK_ADDRESS] = registers[1]
+                banks[self._host][_OBJECTIVE_READBACK_ADDRESS + 1] = registers[2]
             journal.writes.append((self._host, address, registers, clock.monotonic()))
 
         async def close(self) -> None:
@@ -1673,4 +1694,328 @@ async def test_concurrent_intents_reach_both_batteries_in_one_cycle(
     finally:
         await _shutdown_actors(runtime)
 
+    _assert_replay_safety(journal)
+
+
+# --- self-healing awareness layer over the replayed live fleet (R4/P1 vi+iii) ----
+#
+# The detection layer's live-hardware contracts (docs/POD_RECOVERY_RESEARCH.md
+# R4; the promoted P1 items vi and iii): the actuation-coherence watchdog that
+# would have caught the 22:11Z silent actuation loss within ~6 s, the
+# trigger-time objective echo read-back through the OWNING actor, and the
+# unexpected-autonomy evidence recorder.  The replay double models the two
+# device behaviors the wedge class needs: a write that ACKs while the served
+# battery power never moves, and a served PQ objective readback that may
+# echo our write, stay zero, or carry somebody else's objective.
+
+
+async def _observe_recovery_cycle(runtime: Any, clock: ManualClock) -> Any:
+    """Drive one unit's recovery observation exactly as the fleet loop does.
+
+    Mirrors ``_Supervision._run_fleet``: peek the authority the heartbeat is
+    about to consume, renew, poll, then hand the fresh facts to the composed
+    recovery monitor (and, on a trigger, perform the echo read-back through
+    the owning actor).
+    """
+    actor = runtime.actors[_UNIT_ID]
+    capability = await runtime.authorizations.peek(_UNIT_ID)
+    authorized_watts = int(getattr(capability, "watts", 0) or 0)
+    direction = getattr(capability, "direction", None)
+    authorized_direction = None if direction is None else getattr(direction, "value", direction)
+    await actor.heartbeat_once()
+    await actor.poll_once()
+    findings = await runtime.recovery.observe_cycle(
+        _UNIT_ID,
+        authorized_watts=authorized_watts,
+        authorized_direction=authorized_direction,
+        claimed=True,
+        lifecycle=actor.lifecycle,
+        inhibit_latched=bool(actor.inhibit_latched),
+        inhibit_reason=actor.inhibit_reason,
+        observation=await runtime.observations.latest(_UNIT_ID),
+        now_mono=clock.monotonic(),
+    )
+    if findings.coherence_trigger:
+        classification, served = await actor.read_objective_echo()
+        await runtime.recovery.record_incoherence_echo(
+            _UNIT_ID,
+            classification=classification,
+            served_active_w=served[0],
+            served_reactive_var=served[1],
+        )
+    return findings
+
+
+def _recovery_events(runtime: Any, event_type: str) -> tuple[Any, ...]:
+    return tuple(
+        event for event in runtime.audit.recent(limit=64) if event.event_type == event_type
+    )
+
+
+async def _drive_wedge(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    objective_echo_mode: str,
+    cycles: int = 6,
+) -> tuple[Any, ReplayJournal, ManualClock]:
+    """Qualify, arm, and dispatch onto a pod whose writes ACK but never act.
+
+    ``objective_echo_mode`` pins what the served objective readback shows
+    once the writes land: ``reflect`` (our own objective -- the transport is
+    fine, the pod is not actuating), ``zero`` (no objective served at all),
+    or ``foreign`` (somebody else's objective).
+    """
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, _banks = _install_replay_transport(monkeypatch, clock)
+    journal.wedge_actuation = True
+    journal.objective_echo_mode = objective_echo_mode
+    runtime = _build(_validate(_config_payload(mode="write_enabled")), clock)
+    try:
+        actor = runtime.actors[_UNIT_ID]
+        await actor.start()
+        await _qualify(runtime, clock)
+        await _arm(runtime)
+        clock.advance(_CONTROL_PERIOD_S)
+        await actor.poll_once()
+        view = await runtime.facade.submit_intent(
+            unit_ids=[_UNIT_ID],
+            direction="charge",
+            watts=_CHARGE_W,
+            ttl_s=30.0,
+            reason="coherence watchdog replay scenario",
+            principal=OPERATOR,
+            idempotency_key="coherence-wedge-dispatch",
+            request_id="coherence-wedge-dispatch-request",
+        )
+        assert view["status"] == "accepted", view
+        for _ in range(cycles):
+            clock.advance(_CONTROL_PERIOD_S)
+            await _observe_recovery_cycle(runtime, clock)
+            await runtime.kernel.tick()
+        assert journal.nonzero_pq_frames(_UNIT_HOST), "the wedge still receives our writes"
+        assert actor.lifecycle is UnitLifecycle.ACTIVE
+    except BaseException:
+        await _shutdown_actors(runtime)
+        raise
+    return runtime, journal, clock
+
+
+async def test_a_silent_wedge_alarms_once_and_the_echo_proves_it_pod_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE detector (P1 vi): the kernel authorizes, the writes ACK, the
+    measured battery power never leaves its pre-command baseline.  Within the
+    configured streak the composed monitor appends exactly one
+    ``actuation_incoherent`` audit fact, the echo read-back through the
+    owning actor classifies ``echo_matches_write`` (our objective IS being
+    served -- the defect is pod-side), and the snapshot carries the state,
+    the reason, and the R5 physical-restart guidance."""
+    runtime, journal, clock = await _drive_wedge(monkeypatch, objective_echo_mode="reflect")
+    try:
+        incoherent = _recovery_events(runtime, "actuation_incoherent")
+        assert len(incoherent) == 1, "one detection fact per episode, throttled"
+        (event,) = incoherent
+        assert event.unit_id == _UNIT_ID
+        assert event.authorized_active_w == -_CHARGE_W
+        assert "authorized_not_actuating" in event.reason_codes
+
+        echoes = _recovery_events(runtime, "objective_echo")
+        assert len(echoes) == 1
+        assert echoes[0].reason_codes == ("echo_matches_write",)
+
+        events = await _drain_bus(runtime)
+        detections = [e for e in events if e["type"] == "actuation.incoherent"]
+        assert detections, "the detection must reach the console stream"
+        assert detections[-1]["payload"]["echo_classification"] == "echo_matches_write"
+        assert detections[-1]["payload"]["served_active_w"] == -_CHARGE_W
+        assert detections[-1]["payload"]["authorized_watts"] == _CHARGE_W
+
+        snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+        unit = _unit_view(snapshot)
+        assert unit["health_state"] == "actuation_incoherent"
+        assert "authorized_not_actuating" in unit["health_reasons"]
+        assert "echo_matches_write" in unit["health_reasons"]
+        assert unit["remediation_hint"] is not None
+        assert "physical restart" in unit["remediation_hint"]
+
+        report = await runtime.facade.health(principal=OPERATOR)
+        assert f"{_UNIT_ID}:actuation_incoherent" in report["control_readiness"]["reasons"]
+        wedge_unit = next(u for u in report["units"] if u["unit_id"] == _UNIT_ID)
+        assert wedge_unit["health_state"] == "actuation_incoherent"
+        assert wedge_unit["remediation_hint"] is not None
+
+        # The wedge persists: no second alarm inside the episode.
+        for _ in range(3):
+            clock.advance(_CONTROL_PERIOD_S)
+            await _observe_recovery_cycle(runtime, clock)
+            await runtime.kernel.tick()
+        assert len(_recovery_events(runtime, "actuation_incoherent")) == 1
+    finally:
+        await _shutdown_actors(runtime)
+    _assert_replay_safety(journal)
+
+
+async def test_a_zero_objective_echo_names_the_mode_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wedge variant where the served objective readback stays zero while
+    we are authorized: the objective is not being served at all, the R2a
+    mode/autonomy conflict class -- the hint points at the vendor-app mode
+    checklist, never at a physical restart."""
+    runtime, journal, _clock = await _drive_wedge(monkeypatch, objective_echo_mode="zero")
+    try:
+        (echo,) = _recovery_events(runtime, "objective_echo")
+        assert echo.reason_codes == ("objective_not_served",)
+        snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+        unit = _unit_view(snapshot)
+        assert unit["health_state"] == "actuation_incoherent"
+        assert unit["remediation_hint"] is not None
+        assert "Normal Mode" in unit["remediation_hint"]
+        assert "Remote" in unit["remediation_hint"]
+        assert "physical restart" not in unit["remediation_hint"]
+    finally:
+        await _shutdown_actors(runtime)
+    _assert_replay_safety(journal)
+
+
+async def test_a_foreign_objective_echo_resurfaces_the_external_writer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wedge variant where the readback carries somebody else's nonzero
+    objective: the classification rides the existing ``external_writer``
+    vocabulary, and the monitor adds no terminal guidance (finding the other
+    writer is the existing latch's remediation, not a pod restart)."""
+    runtime, journal, _clock = await _drive_wedge(monkeypatch, objective_echo_mode="foreign")
+    try:
+        (echo,) = _recovery_events(runtime, "objective_echo")
+        assert echo.reason_codes == ("external_writer",)
+        snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+        unit = _unit_view(snapshot)
+        assert unit["health_state"] == "actuation_incoherent"
+        assert "external_writer" in unit["health_reasons"]
+        assert unit["remediation_hint"] is None
+    finally:
+        await _shutdown_actors(runtime)
+    _assert_replay_safety(journal)
+
+
+async def test_healthy_actuation_never_triggers_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reflective pod (live-proven behavior): writes land, the measured
+    battery power follows the objective.  The watchdog stays silent across
+    many authorized cycles, and the derived state stays healthy."""
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, _banks = _install_replay_transport(monkeypatch, clock)
+    runtime = _build(_validate(_config_payload(mode="write_enabled")), clock)
+    try:
+        actor = runtime.actors[_UNIT_ID]
+        await actor.start()
+        await _qualify(runtime, clock)
+        await _arm(runtime)
+        clock.advance(_CONTROL_PERIOD_S)
+        await actor.poll_once()
+        view = await runtime.facade.submit_intent(
+            unit_ids=[_UNIT_ID],
+            direction="charge",
+            watts=_CHARGE_W,
+            ttl_s=30.0,
+            reason="coherence watchdog healthy control",
+            principal=OPERATOR,
+            idempotency_key="coherence-healthy-dispatch",
+            request_id="coherence-healthy-dispatch-request",
+        )
+        assert view["status"] == "accepted", view
+        for _ in range(6):
+            clock.advance(_CONTROL_PERIOD_S)
+            await _observe_recovery_cycle(runtime, clock)
+            await runtime.kernel.tick()
+        for event_type in ("actuation_incoherent", "objective_echo", "unexpected_autonomy"):
+            assert _recovery_events(runtime, event_type) == (), event_type
+        assert actor.lifecycle is UnitLifecycle.ACTIVE
+        snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+        unit = _unit_view(snapshot)
+        assert unit["health_state"] == "healthy"
+        assert unit["health_reasons"] == []
+        assert unit["remediation_hint"] is None
+    finally:
+        await _shutdown_actors(runtime)
+    _assert_replay_safety(journal)
+
+
+async def test_uncommanded_out_of_band_power_is_timestamped_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """mid's standing unexplained oscillation, made evidence: measured power
+    outside the commissioned autonomy band with NO intent claiming the unit
+    appends one ``unexpected_autonomy`` fact (throttled per interval) with
+    the measured watts and the mode words, while health stays informational
+    -- no block, no alarm tier."""
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, banks = _install_replay_transport(monkeypatch, clock)
+    runtime = _build(_validate(_config_payload(mode="write_enabled")), clock)
+    try:
+        actor = runtime.actors[_UNIT_ID]
+        await actor.start()
+        await _qualify(runtime, clock)
+
+        # The pod discharges +1200 W with nothing commanding it.
+        banks[_UNIT_HOST][_BMS_BATTERY_POWER_ADDRESS] = protocol_codec.encode_pq_registers(1200, 0)[
+            1
+        ]
+        clock.advance(0.05)
+        await actor.poll_once()
+        observation = await runtime.observations.latest(_UNIT_ID)
+        assert observation is not None and observation.battery_watts == 1200.0
+
+        findings = await runtime.recovery.observe_cycle(
+            _UNIT_ID,
+            authorized_watts=0,
+            authorized_direction=None,
+            claimed=False,
+            lifecycle=actor.lifecycle,
+            inhibit_latched=bool(actor.inhibit_latched),
+            inhibit_reason=actor.inhibit_reason,
+            observation=observation,
+            now_mono=clock.monotonic(),
+        )
+        assert findings.unexpected_autonomy is True
+
+        (event,) = _recovery_events(runtime, "unexpected_autonomy")
+        assert event.unit_id == _UNIT_ID
+        assert event.authorized_active_w == 0
+        assert "outside_expected_autonomy_band" in event.reason_codes
+
+        events = await _drain_bus(runtime)
+        (payload,) = [e["payload"] for e in events if e["type"] == "unit.unexpected_autonomy"]
+        assert payload["unit_id"] == _UNIT_ID
+        assert payload["measured_watts"] == 1200.0
+        assert payload["soc_pct"] == observation.bms_soc_pct
+        assert payload["debug_mode_w"] == observation.debug_mode_w
+
+        # Throttled inside the interval; the state stays informational.
+        clock.advance(1.5)
+        await actor.poll_once()
+        findings = await runtime.recovery.observe_cycle(
+            _UNIT_ID,
+            authorized_watts=0,
+            authorized_direction=None,
+            claimed=False,
+            lifecycle=actor.lifecycle,
+            inhibit_latched=bool(actor.inhibit_latched),
+            inhibit_reason=actor.inhibit_reason,
+            observation=await runtime.observations.latest(_UNIT_ID),
+            now_mono=clock.monotonic(),
+        )
+        assert findings.unexpected_autonomy is False
+        assert len(_recovery_events(runtime, "unexpected_autonomy")) == 1
+
+        snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+        unit = _unit_view(snapshot)
+        assert unit["health_state"] == "healthy", "evidence capture is not a state change"
+    finally:
+        await _shutdown_actors(runtime)
     _assert_replay_safety(journal)

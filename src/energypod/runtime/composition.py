@@ -71,6 +71,7 @@ from energypod.adapters.modbus import (
     register_layout,
 )
 from energypod.adapters.modbus import decode as wire_decode
+from energypod.adapters.modbus.waveshare import TransportConnectionError
 from energypod.adapters.persistence.memory import (
     InMemoryAuthorizationRepository,
     InMemoryIntentRepository,
@@ -95,6 +96,14 @@ from energypod.application.excess_charge import (
     eligible_export_charge_w,
 )
 from energypod.application.generation import AuthorityGenerationCoordinator
+from energypod.application.recovery import (
+    CONNECT_FAILED,
+    ECHO_UNREADABLE,
+    READ_FAILED,
+    READ_OK,
+    RecoveryMonitor,
+    RecoverySettings,
+)
 from energypod.application.safety import SafetyKernel
 from energypod.application.service import EnergyServiceFacade
 from energypod.domain import (
@@ -1588,6 +1597,9 @@ class _Supervision:
         process_instance_id: str,
         process_origin_mono: float,
         adviser: ExcessChargeAdviser | None = None,
+        intents: _AsyncIntentRepository | None = None,
+        observations: _AsyncObservationRepository | None = None,
+        recovery: RecoveryMonitor | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -1601,6 +1613,11 @@ class _Supervision:
         self._process_instance_id = process_instance_id
         self._process_origin_mono = process_origin_mono
         self._adviser = adviser
+        # Self-healing awareness layer (R4): the passive detection monitor
+        # driven once per fleet cycle, plus the two ports it reads through.
+        self._intents_port = intents
+        self._observations_port = observations
+        self._recovery = recovery
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
@@ -1713,6 +1730,10 @@ class _Supervision:
                 report.set_result(None)
         while True:
             await self._clock.sleep(self._interval_s)
+            # Self-healing awareness (R4): peek the authority each heartbeat
+            # is about to consume BEFORE it is consumed, so the coherence
+            # watchdog judges exactly the watts the fleet is holding.
+            authorized = await self._peek_authorizations()
             for actor in self._actors:
                 failure: BaseException | None = None
                 try:
@@ -1744,11 +1765,18 @@ class _Supervision:
             # fleet cycle the bound is structural — a poll that overruns the
             # interval is cancelled (its observation is only appended at the
             # end of the poll, so abandoned reads never become evidence) and
-            # the cycle proceeds to the tick, keeping renewal cadence.
-            await asyncio.gather(
-                *(self._bounded_poll(actor) for actor in self._actors),
-                return_exceptions=True,
-            )
+            # the cycle proceeds to the tick, keeping renewal cadence.  Each
+            # poll's outcome feeds the recovery classifier's responsiveness
+            # streaks (connect failure = gateway class, read failure = the
+            # pod-silent wedge class).
+            outcomes = await asyncio.gather(*(self._bounded_poll(actor) for actor in self._actors))
+            # The detection pass is bounded and fully suppressed: observability
+            # must never delay the renewal cadence or the kernel tick.
+            with contextlib.suppress(Exception, asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self._observe_recovery(authorized, tuple(outcomes)),
+                    timeout=self._interval_s,
+                )
             if self._adviser is not None:
                 # API_CONTRACTS "Excess-solar accelerated charging
                 # (advisory)": one bounded advisory renewal per fleet cycle,
@@ -1781,9 +1809,130 @@ class _Supervision:
                 for actor in self._actors:
                     actor.request_cell_refresh()
 
-    async def _bounded_poll(self, actor: EnergyPodActor) -> None:
-        with contextlib.suppress(Exception, asyncio.TimeoutError):
-            await asyncio.wait_for(_poll_once(actor), timeout=self._interval_s)
+    async def _bounded_poll(self, actor: EnergyPodActor) -> str:
+        """One bounded, survived poll; returns the cycle's bus-read outcome.
+
+        The failure classification is the recovery layer's R4 discriminator:
+        a ``TransportConnectionError`` is the gateway/TCP class (unreachable),
+        anything else that escapes the actor's poll is a failed read attempt
+        (the pod-silent-on-the-bus wedge class).  Both stay survived per
+        cycle exactly as before — only the outcome is now recorded.
+        """
+        try:
+            await asyncio.wait_for(actor.poll_once(), timeout=self._interval_s)
+        except asyncio.CancelledError:
+            raise
+        except TransportConnectionError:
+            outcome = CONNECT_FAILED
+        except Exception:
+            outcome = READ_FAILED
+        else:
+            outcome = READ_OK
+        if self._recovery is not None:
+            with contextlib.suppress(Exception):
+                self._recovery.record_read_outcome(actor.unit_id, outcome)
+        return outcome
+
+    async def _peek_authorizations(self) -> dict[str, tuple[int, str | None] | None]:
+        """The authority each unit's heartbeat is about to consume (or None).
+
+        ``peek`` is the non-consuming projection read; an unreadable store is
+        the honest unknown and judges nothing that cycle.
+        """
+        authorized: dict[str, tuple[int, str | None] | None] = {}
+        for actor in self._actors:
+            try:
+                capability = await self._authorizations.peek(actor.unit_id)
+            except Exception:
+                capability = None
+            if capability is None:
+                authorized[actor.unit_id] = None
+                continue
+            watts = getattr(capability, "watts", None)
+            direction = getattr(getattr(capability, "direction", None), "value", None)
+            authorized[actor.unit_id] = (
+                int(watts) if isinstance(watts, int) else 0,
+                direction if isinstance(direction, str) else None,
+            )
+        return authorized
+
+    async def _observe_recovery(
+        self,
+        authorized: Mapping[str, tuple[int, str | None] | None],
+        outcomes: Sequence[str],
+    ) -> None:
+        """One detection pass: fresh facts in, derived health state out.
+
+        Runs after the polls (fresh measurements) and before the kernel tick,
+        mirroring the fleet cycle the actor/kernel contracts pin.  Every step
+        is suppressed per unit: a failing detection path never survives into
+        control.  On a coherence trigger the objective echo read-back runs
+        through the OWNING actor (P1 iii — one bounded read per episode).
+        """
+        if self._recovery is None or self._intents_port is None or self._observations_port is None:
+            return
+        now_mono = float(self._clock.monotonic())
+        claimed: frozenset[str] | None
+        try:
+            active = await self._intents_port.active(now_mono)
+            claimed = frozenset(
+                unit_id
+                for intent in active
+                for unit_id in (getattr(intent, "selected_unit_ids", ()) or ())
+            )
+        except Exception:
+            # Unknown claim state fails safe for evidence: treat every unit
+            # as claimed so nothing is recorded as "uncommanded".
+            claimed = None
+        for index, actor in enumerate(self._actors):
+            unit_id = actor.unit_id
+            held = authorized.get(unit_id)
+            # Only a cycle whose poll landed contributes fresh evidence; a
+            # failed poll leaves the previous observation in place and judges
+            # nothing (the responsiveness streaks already carry the failure).
+            observation = None
+            if outcomes[index] == READ_OK:
+                with contextlib.suppress(Exception):
+                    observation = await self._observations_port.latest(unit_id)
+            is_claimed = True if claimed is None else unit_id in claimed
+            with contextlib.suppress(Exception):
+                findings = await self._recovery.observe_cycle(
+                    unit_id,
+                    authorized_watts=0 if held is None else held[0],
+                    authorized_direction=None if held is None else held[1],
+                    claimed=is_claimed,
+                    lifecycle=actor.lifecycle,
+                    inhibit_latched=bool(actor.inhibit_latched),
+                    inhibit_reason=actor.inhibit_reason,
+                    observation=observation,
+                    now_mono=now_mono,
+                )
+                if findings is not None and findings.coherence_trigger:
+                    classification, served_active, served_reactive = await self._objective_echo(
+                        actor
+                    )
+                    await self._recovery.record_incoherence_echo(
+                        unit_id,
+                        classification=classification,
+                        served_active_w=served_active,
+                        served_reactive_var=served_reactive,
+                    )
+
+    async def _objective_echo(self, actor: EnergyPodActor) -> tuple[str, int | None, int | None]:
+        """One bounded objective echo read through the owning actor (P1 iii).
+
+        The read rides the actor's serialized mailbox under the cycle bound;
+        a failing or unwired read is honestly classified ``echo_unreadable``
+        instead of guessed at.
+        """
+        try:
+            async with asyncio.timeout(self._interval_s):
+                classification, served = await actor.read_objective_echo()
+            return classification, int(served[0]), int(served[1])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return ECHO_UNREADABLE, None, None
 
     async def _record_suppressed_heartbeat(
         self, actor: EnergyPodActor, error: BaseException
@@ -1909,12 +2058,6 @@ class _Supervision:
                     await actor.shutdown()
 
 
-async def _poll_once(actor: EnergyPodActor) -> None:
-    """One supervised telemetry cycle; a poll failure is survived, not fatal."""
-    with contextlib.suppress(Exception):
-        await actor.poll_once()
-
-
 _LAST_SUPERVISION: _Supervision | None = None
 
 
@@ -1935,6 +2078,25 @@ def _attach_lifespan(app: FastAPI, supervision: _Supervision) -> None:
 # ---------------------------------------------------------------------------
 # Policy construction.
 # ---------------------------------------------------------------------------
+
+
+def _recovery_settings(config: ControllerConfig) -> RecoverySettings:
+    """The detection layer's commissioned knobs (policy keys when a policy is
+    configured; the pinned defaults otherwise, so observe-only deployments
+    detect with the same eyes).
+
+    Detection only: no control path consumes these values (the safety kernel
+    and the actors never see them).
+    """
+    configured = config.policy
+    if configured is None:
+        return RecoverySettings()
+    band_low, band_high = configured.expected_autonomy_band_w
+    return RecoverySettings(
+        actuation_coherence_cycles=configured.actuation_coherence_cycles,
+        actuation_coherence_min_movement_w=configured.actuation_coherence_min_movement_w,
+        expected_autonomy_band_w=(band_low, band_high),
+    )
 
 
 def _control_policy(config: ControllerConfig) -> ControlPolicy:
@@ -2093,6 +2255,10 @@ class ComposedRuntime:
     app: FastAPI
     mcp_server_factory: Callable[..., FastMCP]
     simulators: Mapping[str, SimulatedEnergyPod] | None
+    # API_CONTRACTS "Self-healing awareness layer": the composed recovery
+    # monitor (detection only — audit facts, bus events, and the derived
+    # per-unit health view the facade projects).
+    recovery: RecoveryMonitor | None = None
     # API_CONTRACTS "Excess-solar accelerated charging (advisory)": composed
     # only when the configuration enables the feature; None otherwise.
     excess_adviser: ExcessChargeAdviser | None = None
@@ -2426,6 +2592,19 @@ def _build_runtime(
         )
 
     # --- application facade, guarded API, and MCP surface -------------------
+    # The self-healing awareness monitor (R4): composed for every deployment,
+    # driven by supervision once per fleet cycle, projecting the derived
+    # per-unit health view through the facade.  Passive by construction.
+    recovery_monitor = RecoveryMonitor(
+        unit_ids=unit_ids,
+        settings=_recovery_settings(config),
+        clock=resolved_clock,
+        audit=audit_port,
+        bus=bus,
+        process_instance_id=process_instance_id,
+        process_origin_mono=process_origin_mono,
+        configuration_version=config.revision,
+    )
     facade = _ComposedFacade(
         site_id=config.site.site_id,
         clock=resolved_clock,
@@ -2436,6 +2615,7 @@ def _build_runtime(
         events=bus,
         coordinator=coordinator,
         actors={unit_id: _ActorCommandHandle(actor) for unit_id, actor in actors.items()},
+        recovery=recovery_monitor,
     )
 
     # --- excess-solar advisory composition ---------------------------------
@@ -2535,6 +2715,9 @@ def _build_runtime(
         process_instance_id=process_instance_id,
         process_origin_mono=process_origin_mono,
         adviser=excess_adviser,
+        intents=intent_port,
+        observations=observation_port,
+        recovery=recovery_monitor,
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision
@@ -2558,6 +2741,7 @@ def _build_runtime(
         app=app,
         mcp_server_factory=mcp_server_factory,
         simulators=simulators,
+        recovery=recovery_monitor,
         excess_adviser=excess_adviser,
     )
 
