@@ -32,6 +32,13 @@ REQUIRED_QUALITY_FIELDS = (
     "cell_voltages_v",
     "temperatures_c",
 )
+# SYNC_RESILIENCE_AUDIT B1 (2026-08-24): the system controller's SOC word is
+# ADVISORY.  The quality-map key stays (the decoder keeps emitting it and the
+# wire-decode vectors pin the twelve-key shape), but only these fields are
+# safety-critical -- every one of them is served at the control rate.
+REQUIRED_FOR_DENY_QUALITY_FIELDS = tuple(
+    field for field in REQUIRED_QUALITY_FIELDS if field != "system_soc_pct"
+)
 
 
 @pytest.fixture(scope="module")
@@ -315,7 +322,7 @@ def test_missing_previous_observation_fails_closed_for_nonzero_power(
         "SUSPECT",
     ],
 )
-@pytest.mark.parametrize("field", REQUIRED_QUALITY_FIELDS)
+@pytest.mark.parametrize("field", REQUIRED_FOR_DENY_QUALITY_FIELDS)
 def test_every_required_field_and_non_good_quality_class_fails_closed(
     api: SimpleNamespace, quality: str, field: str
 ) -> None:
@@ -327,6 +334,55 @@ def test_every_required_field_and_non_good_quality_class_fails_closed(
 
     assert_rejected(decision, api)
     assert f"quality_{field}" in reasons(decision)
+
+
+def test_advisory_system_soc_quality_never_denies_while_bms_soc_is_good(
+    api: SimpleNamespace,
+) -> None:
+    """SYNC_RESILIENCE_AUDIT B1: a once-per-process system-SOC word must not veto.
+
+    The system controller's SOC block is served on cycle 1 and re-decoded from
+    cache for the process lifetime, so a single BAD decode (or a SUSPECT
+    blanket downgrade it can never recover from) denies EVERY cycle while the
+    battery's own BMS SOC reads fresh and GOOD.  The battery is readable and
+    fine; only our stale tier says otherwise -- so the system-SOC quality gate
+    is advisory and the decision authorizes with an informational note.
+    """
+    for quality in ("MISSING", "STALE", "BAD", "SUSPECT"):
+        quality_map = {field: api.DataQuality.GOOD for field in REQUIRED_QUALITY_FIELDS}
+        quality_map["system_soc_pct"] = getattr(api.DataQuality, quality)
+        observation = make_observation(api, system_soc_pct=None, quality=quality_map)
+
+        decision = evaluate(api, current_observations={"mid": observation})
+
+        assert decision.status is api.DecisionStatus.AUTHORIZED, (
+            f"a {quality} system SOC is advisory and must never deny power"
+        )
+        assert "quality_system_soc_pct" not in reasons(decision)
+        assert "nonfinite_safety_data" not in reasons(decision)
+
+
+def test_system_soc_untrusted_note_rides_authorizing_decisions_only(
+    api: SimpleNamespace,
+) -> None:
+    """A non-GOOD system SOC surfaces as the informational sibling of the
+    divergence note (SYNC_RESILIENCE_AUDIT B1): visible on the audit trail,
+    never a denial -- and never present on a rejected decision."""
+    quality_map = {field: api.DataQuality.GOOD for field in REQUIRED_QUALITY_FIELDS}
+    quality_map["system_soc_pct"] = api.DataQuality.BAD
+    observation = make_observation(api, system_soc_pct=None, quality=quality_map)
+
+    decision = evaluate(api, current_observations={"mid": observation})
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert "system_soc_untrusted" in reasons(decision)
+
+    rejected = evaluate(
+        api,
+        current_observations={"mid": make_raw_observation(api, captured_at_mono=90.0)},
+    )
+    assert rejected.status is api.DecisionStatus.REJECTED
+    assert "system_soc_untrusted" not in reasons(rejected)
 
 
 def test_overall_telemetry_age_boundary_is_inclusive_then_stale(api: SimpleNamespace) -> None:
@@ -377,7 +433,10 @@ def test_policy_rejects_degenerate_zero_soc_tolerances(api: SimpleNamespace, fie
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("system_soc_pct", math.nan),
+        # B1: the system SOC is advisory -- a raw non-finite system figure is
+        # rejected by the DOMAIN validator (the parametrization above) and is
+        # no longer part of the kernel's defensive net, because no bound
+        # consumes it any more.
         ("bms_soc_pct", math.inf),
         ("soh_pct", -math.inf),
         ("battery_watts", math.nan),

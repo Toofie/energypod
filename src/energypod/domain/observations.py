@@ -74,6 +74,18 @@ class Observation(BaseModel):
     # so a deployment whose read plan does not serve the PCS block keeps fully
     # qualified observations for ordinary control.
     ADVISORY_QUALITY_FIELDS: ClassVar[frozenset[str]] = frozenset({"grid_power_w", "load_power_w"})
+    # SYNC_RESILIENCE_AUDIT B1 (2026-08-24): the system controller's SOC word
+    # (0x0100+17) is ADVISORY telemetry too.  The tiered read plan serves its
+    # block once per process and merges it from cache thereafter, so its
+    # quality can be hours stale -- or permanently BAD/SUSPECT from one bad
+    # cycle-1 decode -- while the battery's own BMS SOC (0x5000+9) reads fresh
+    # and GOOD at the control rate.  No bound consumes the system figure any
+    # more (the BMS SOC is authoritative), so its quality gate is demoted from
+    # the safety-critical set: the quality-map KEY stays (honest inventory;
+    # the decoder keeps emitting it), only the required membership moves.
+    REQUIRED_SAFETY_QUALITY_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        QUALITY_FIELDS - {"system_soc_pct"}
+    )
     model_config = ConfigDict(
         frozen=True, strict=True, extra="forbid", arbitrary_types_allowed=True
     )
@@ -323,8 +335,11 @@ class Observation(BaseModel):
 
     @property
     def safety_data_complete(self) -> bool:
+        # The system SOC figure and its quality are advisory (B1): the BMS SOC
+        # stands in as the authoritative SOC everywhere a bound consumes one,
+        # and an untrusted system word surfaces as an informational note
+        # rather than incomplete safety data.
         required = (
-            self.system_soc_pct,
             self.bms_soc_pct,
             self.soh_pct,
             self.battery_watts,
@@ -334,7 +349,10 @@ class Observation(BaseModel):
             self.dynamic_discharge_limit_w,
         )
         return (
-            all(self.quality[field] is DataQuality.GOOD for field in self.QUALITY_FIELDS)
+            all(
+                self.quality[field] is DataQuality.GOOD
+                for field in self.REQUIRED_SAFETY_QUALITY_FIELDS
+            )
             and all(value is not None for value in required)
             and self.cells_complete
             and self.temperatures_complete

@@ -118,6 +118,17 @@ deny reasons only, so the note can never be confused with a blocking code. Zero-
 proposals alike are unaffected by divergence, and every other SOC protection still blocks exactly
 as before, now via the battery's own figure.
 
+The demotion is COMPLETE for the quality gate too (SYNC_RESILIENCE_AUDIT B1, 2026-08-24): the
+system SOC word is ADVISORY TELEMETRY, outside the kernel's required-quality set
+(`quality_system_soc_pct` is no longer a deny reason), outside `Observation.safety_data_complete`
+(the domain's `REQUIRED_SAFETY_QUALITY_FIELDS` is the nine control-rate fields), and outside the
+actor's qualification judgment. The quality-map KEY stays (the decoder keeps emitting it; the
+wire-decode vectors pin the twelve-key shape), and a non-GOOD or absent system SOC surfaces as the
+informational reason code `system_soc_untrusted` — carried ONLY on authorizing decisions, exactly
+like `soc_disagreement_observed` — never a denial and never a qualification reset.
+`quality_bms_soc_pct` (the authoritative figure) keeps its full fail-closed gate: non-GOOD BMS
+SOC still denies and still blocks qualification.
+
 `IntentArbiter.arbitrate(intents, now_mono) -> CycleArbitration` removes expired intents and
 selects a PER-UNIT WINNER SET: for each unit, the highest-priority live intent claiming it wins
 that unit (priority order unchanged: emergency stop > manual > agent > optimizer > schedule;

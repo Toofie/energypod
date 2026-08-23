@@ -7,7 +7,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
-from energypod.domain import DataQuality, DecisionStatus, Direction, UnitLifecycle, UnitSetpoint
+from energypod.domain import (
+    DataQuality,
+    DecisionStatus,
+    Direction,
+    Observation,
+    UnitLifecycle,
+    UnitSetpoint,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,18 +27,14 @@ class ControlDecision:
 class SafetyKernel:
     """Turn allocator proposals into bounded, short-lived authorizations."""
 
-    _required_quality = (
-        "system_soc_pct",
-        "bms_soc_pct",
-        "soh_pct",
-        "battery_watts",
-        "pack_voltage_v",
-        "pack_current_a",
-        "dynamic_charge_limit_w",
-        "dynamic_discharge_limit_w",
-        "cell_voltages_v",
-        "temperatures_c",
-    )
+    # SYNC_RESILIENCE_AUDIT B1 (2026-08-24): every field here is served by the
+    # control-rate core tier, so non-GOOD genuinely means "this cycle's read
+    # is contradictory or unreadable" (class D, fail-closed correct).  The
+    # system controller's SOC word -- served once per process and merged from
+    # cache thereafter -- is deliberately absent: it is advisory telemetry
+    # (see ``_system_soc_untrusted``), with the BMS SOC as the authoritative
+    # figure every SOC bound consumes.
+    _required_quality = tuple(sorted(Observation.REQUIRED_SAFETY_QUALITY_FIELDS))
 
     def evaluate(
         self,
@@ -80,6 +83,7 @@ class SafetyKernel:
         limits: dict[str, int] = {}
         expiries: dict[str, float] = {}
         divergence_observed = False
+        system_soc_untrusted = False
         for proposal in proposals:
             observation = current_observations.get(proposal.unit_id)
             previous = previous_observations.get(proposal.unit_id)
@@ -102,6 +106,12 @@ class SafetyKernel:
                 # safe; the note below rides the decision's reason codes so
                 # the audit trail and console keep seeing the disagreement.
                 divergence_observed = True
+            if observation is not None and self._system_soc_untrusted(observation):
+                # B1's informational sibling: the once-per-process system-SOC
+                # word decoded BAD/SUSPECT/absent while the BMS SOC is fresh
+                # and GOOD.  Advisory only -- the note rides authorizing
+                # decisions exactly like the divergence note.
+                system_soc_untrusted = True
             unit_reasons = self._deny_reasons(proposal, observation, previous, policy, now_mono)
             if not unit_reasons and getattr(proposal, "export_bounded", False):
                 # API_CONTRACTS "Excess-solar accelerated charging
@@ -180,6 +190,10 @@ class SafetyKernel:
             # -- so ``soc_disagreement_observed`` can never be mistaken for a
             # blocking reason on the rejecting path.
             outcome_reasons.add("soc_disagreement_observed")
+        if system_soc_untrusted:
+            # Informational only (B1), same doctrine and same unreachable-on-
+            # rejection path as the divergence note above.
+            outcome_reasons.add("system_soc_untrusted")
         status = DecisionStatus.CLAMPED if clamped else DecisionStatus.AUTHORIZED
         reason_codes = tuple(sorted(outcome_reasons)) or ("safety_checks_passed",)
         setpoints = tuple(
@@ -262,7 +276,6 @@ class SafetyKernel:
         if observation.lifecycle not in {UnitLifecycle.ARMED_IDLE, UnitLifecycle.ACTIVE}:
             reasons.add("lifecycle_not_controllable")
         numeric = (
-            observation.system_soc_pct,
             observation.bms_soc_pct,
             observation.soh_pct,
             observation.battery_watts,
@@ -376,6 +389,23 @@ class SafetyKernel:
         if observation.active_warnings & policy.blocking_warning_codes:
             reasons.add("blocking_warning")
         return reasons
+
+    @staticmethod
+    def _system_soc_untrusted(observation: Any) -> bool:
+        """Whether the advisory system-SOC word failed to decode GOOD.
+
+        SYNC_RESILIENCE_AUDIT B1 (2026-08-24): the system controller's SOC
+        block is the once-per-process tier, so a BAD/SUSPECT decode is cached
+        for the process lifetime while the BMS SOC reads fresh and GOOD every
+        cycle.  The figure is no longer consumed by any bound (the BMS SOC is
+        authoritative), so its quality is surfaced as the informational
+        ``system_soc_untrusted`` note on authorizing decisions -- never a
+        denial and never a qualification reset.  The BMS SOC keeps its full
+        fail-closed gate (``quality_bms_soc_pct``).
+        """
+        quality = getattr(observation, "quality", None)
+        flag = quality.get("system_soc_pct") if isinstance(quality, Mapping) else None
+        return flag is not None and flag is not DataQuality.GOOD
 
     @staticmethod
     def _soc_divergence_observed(observation: Any, policy: Any) -> bool:

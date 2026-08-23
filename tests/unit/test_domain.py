@@ -475,10 +475,33 @@ def test_missing_values_are_explicit_and_never_fabricated_as_zero() -> None:
 def test_non_good_required_quality_is_never_safety_complete(quality_name: str) -> None:
     models = _models()
     quality = _quality(models)
-    quality["system_soc_pct"] = getattr(models.DataQuality, quality_name)
+    quality["bms_soc_pct"] = getattr(models.DataQuality, quality_name)
     assert not models.Observation(
         **_observation_kwargs(models, quality=quality)
     ).safety_data_complete
+
+
+def test_system_soc_quality_is_advisory_and_never_blocks_completeness() -> None:
+    """SYNC_RESILIENCE_AUDIT B1 (2026-08-24): the system controller's SOC word
+    is ADVISORY telemetry -- served once per process by the tiered read plan
+    and merged from cache thereafter, so a BAD or SUSPECT decode of that one
+    stale word must never block qualification while the battery's own BMS SOC
+    reads fresh and GOOD every cycle.  The quality-map key stays (honest
+    inventory); only the safety-critical membership moves."""
+    models = _models()
+    for quality_name in ["STALE", "MISSING", "BAD", "SUSPECT"]:
+        quality = _quality(models)
+        quality["system_soc_pct"] = getattr(models.DataQuality, quality_name)
+        observation = models.Observation(
+            **_observation_kwargs(
+                models,
+                system_soc_pct=None,
+                quality=quality,
+            )
+        )
+        assert observation.safety_data_complete, (
+            f"a non-GOOD system SOC ({quality_name}) is advisory, never incomplete safety data"
+        )
 
 
 def test_partial_arrays_are_visible_but_not_complete() -> None:

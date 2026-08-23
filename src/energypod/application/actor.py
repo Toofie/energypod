@@ -26,7 +26,13 @@ from .generation import AuthorityGenerationCoordinator
 # serve the PCS block (advisory MISSING) must never keep a unit from
 # qualifying, and the advisory words gate their own fail-closed export
 # bound instead.
-_SAFETY_QUALITY_FIELDS: Final[frozenset[str]] = Observation.QUALITY_FIELDS
+#
+# SYNC_RESILIENCE_AUDIT B1 (2026-08-24): the system controller's SOC word is
+# advisory for the same reason -- its block is the once-per-process tier, so
+# a single BAD cycle-1 decode (or a SUSPECT blanket downgrade it can never
+# refresh away) would otherwise permanently reset this actor's stable-sample
+# counter while the battery's own BMS SOC reads fresh and GOOD every cycle.
+_SAFETY_QUALITY_FIELDS: Final[frozenset[str]] = Observation.REQUIRED_SAFETY_QUALITY_FIELDS
 
 _HEARTBEAT_PRIORITY: Final = 0
 _CONTROL_PRIORITY: Final = 10

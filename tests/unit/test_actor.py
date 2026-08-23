@@ -330,6 +330,54 @@ async def test_boot_is_observe_only_and_requires_qualification_then_explicit_arm
     await actor.shutdown()
 
 
+async def test_advisory_system_soc_quality_does_not_block_qualification(
+    contract: Any,
+) -> None:
+    """SYNC_RESILIENCE_AUDIT B1: a once-per-process system-SOC word must not
+    permanently reset qualification.  A quality map whose ONLY non-GOOD entry
+    is the advisory system SOC (the cycle-1 read decoded BAD, cached forever)
+    still qualifies the unit, because every safety-critical field is served
+    fresh at the control rate and reads GOOD."""
+    from types import SimpleNamespace
+
+    quality: dict[str, str] = {
+        field: "good"
+        for field in (
+            "system_soc_pct",
+            "bms_soc_pct",
+            "soh_pct",
+            "battery_watts",
+            "pack_voltage_v",
+            "pack_current_a",
+            "dynamic_charge_limit_w",
+            "dynamic_discharge_limit_w",
+            "cell_voltages_v",
+            "temperatures_c",
+        )
+    }
+    quality["system_soc_pct"] = "bad"
+    observation = SimpleNamespace(
+        unit_id=UNIT_ID,
+        device_identity=IDENTITY,
+        protocol_profile=PROFILE,
+        connection_epoch=1,
+        sequence=1,
+        safety_data_complete=True,
+        quality=quality,
+        active_faults=(),
+        cells=None,
+    )
+
+    actor, _, _, _, _ = make_actor(contract)
+    await actor.start()
+    await actor.accept_observation(observation)
+
+    assert actor.lifecycle is contract.UnitLifecycle.DISARMED, (
+        "an advisory system-SOC quality failure must never reset qualification"
+    )
+    await actor.shutdown()
+
+
 async def test_transport_operations_are_serialized_by_the_actor(contract: Any) -> None:
     auth = AuthorizationRecord()
     actor, _, transport, _, _ = make_actor(
