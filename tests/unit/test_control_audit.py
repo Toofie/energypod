@@ -115,11 +115,15 @@ class DeterministicAuditEventFactory:
         if self.result is not _UNSET:
             return self.result  # type: ignore[return-value]
         number = len(self.calls)
+        intent_value = facts["intent"]
+        correlation = (
+            f"emergency_stop:{intent_value.id}"
+            if intent_value.source is IntentSource.EMERGENCY_STOP
+            else f"intent:{intent_value.id}:revision:{intent_value.acceptance_revision}"
+        )
         identity = AuditIdentity(
             event_id=f"event-{number:04d}",
-            correlation_id=(
-                f"intent:{facts['intent'].id}:revision:{facts['intent'].acceptance_revision}"
-            ),
+            correlation_id=correlation,
             occurred_at=self.first_wall_time + timedelta(microseconds=number - 1),
         )
         return self._build(identity=identity, **facts)
@@ -167,7 +171,7 @@ class DeterministicAuditEventFactory:
             monotonic_offset_s=facts["decided_at_mono"] - self.process_origin_mono,
             process_instance_id=self.process_instance_id,
             event_type="control_decision",
-            unit_id=None,
+            unit_id=facts.get("unit_id"),
             connection_epoch=None,
             generation=facts["generation"],
             cycle_id=facts["cycle_id"],
@@ -243,6 +247,7 @@ async def test_factory_is_synchronous_and_receives_complete_explicit_facts(api: 
         "intent",
         "observations",
         "policy_version",
+        "unit_id",
     }
     assert factory.calls[0]["authorization_batch"] is auth.published[0]
 
@@ -510,3 +515,69 @@ async def test_missing_selected_unit_observation_audits_rejection_without_crashi
     assert len(audit.events) == 1
     assert audit.events[0].authorized_active_w == 0
     assert not auth.published and auth.revocations
+
+
+# --- per-unit attribution and stop linkage (2026-08-23 console Activity) -------
+#
+# The console's Activity view filters audit rows by unit_id, so a fleet-wide
+# control_decision with unit_id None never appears under a unit filter.  A
+# decision that selects exactly ONE unit now carries that unit's id on its
+# row (fleet-level fields unchanged); a genuinely multi-unit decision stays
+# fleet-level.  And a decision held by a latched emergency stop correlates
+# to the stop id explicitly, so the Activity view names the stop on the row
+# itself instead of guessing from the newest latch event.
+
+
+async def test_single_unit_decisions_carry_unit_attribution(api: Any):
+    value = intent(api, units=frozenset({"mid"}))
+    kernel, _, auth, audit = _kernel_with_factory(
+        api, value, decision_for(api, value), DeterministicAuditEventFactory()
+    )
+    await kernel.tick()
+    assert auth.published
+    (event,) = audit.events
+    assert event.unit_id == "mid"
+    # Fleet-level evidence is unchanged: the full observation map, the cycle,
+    # and both watt figures still name the whole decision.
+    assert dict(event.observation_sequences) == {"mid": 10}
+    assert event.requested_active_w == 900
+    assert event.authorized_active_w == 900
+
+
+async def test_multi_unit_decisions_stay_fleet_level(api: Any):
+    """A row that names three units cannot carry one unit id: it stays
+    fleet-level and appears under All units, exactly as before."""
+    value = intent(api)
+    kernel, _, _, audit = _kernel_with_factory(
+        api, value, decision_for(api, value), DeterministicAuditEventFactory()
+    )
+    await kernel.tick()
+    (event,) = audit.events
+    assert event.unit_id is None
+    assert set(event.observation_sequences) == set(value.unit_ids)
+
+
+async def test_stop_held_decisions_correlate_to_the_stop_id(api: Any):
+    value = intent(api, emergency=True)
+    kernel, _, _, audit = _kernel_with_factory(
+        api, value, decision_for(api, value), DeterministicAuditEventFactory()
+    )
+    await kernel.tick()
+    (event,) = audit.events
+    assert event.source is IntentSource.EMERGENCY_STOP
+    assert event.intent_id == value.id
+    assert event.correlation_id == f"emergency_stop:{value.id}"
+
+
+async def test_a_factory_attributing_the_wrong_unit_is_rejected(api: Any):
+    value = intent(api, units=frozenset({"mid"}))
+    honest = DeterministicAuditEventFactory()
+    kernel, _, _, audit = _kernel_with_factory(api, value, decision_for(api, value), honest)
+    await kernel.tick()
+    assert audit.events[0].unit_id == "mid"
+    forged = audit.events[0].model_copy(update={"unit_id": "rhs"})
+    factory = DeterministicAuditEventFactory(result=forged)
+    kernel, _, auth, audit = _kernel_with_factory(api, value, decision_for(api, value), factory)
+    with pytest.raises(ValueError, match="audit event does not match control cycle facts"):
+        await kernel.tick()
+    assert not audit.events and not auth.published and auth.revocations
