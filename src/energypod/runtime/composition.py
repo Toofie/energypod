@@ -111,6 +111,11 @@ from energypod.application.foreign_objective import (
 )
 from energypod.application.generation import AuthorityGenerationCoordinator
 from energypod.application.history import PlantHistoryControl, TelemetryHistorian
+from energypod.application.night_charge import (
+    NightChargeAdviser,
+    NightChargeController,
+    NightChargeSettings,
+)
 from energypod.application.recovery import (
     CONNECT_FAILED,
     ECHO_UNREADABLE,
@@ -262,6 +267,14 @@ def decision_requests_cell_refresh(decision: Any) -> bool:
 # special authority anywhere.
 _EXCESS_ADVISER_PRINCIPAL_SUBJECT = "energypod:excess-adviser"
 _EXCESS_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
+
+# DESIGN_NIGHT_CHARGE §2.1: the composed automation principal the night
+# strategy adviser submits under — the excess/schedule adviser pattern
+# exactly.  Audit attribution separates its rows by principal plus the
+# ``optimizer`` source tag; non-interactive, site-bound, and holding nothing
+# beyond what an ordinary dispatch needs.
+_NIGHT_ADVISER_PRINCIPAL_SUBJECT = "energypod:night-adviser"
+_NIGHT_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 
 # DESIGN_SCHEDULES §2: the composed automation principal the schedule runner
 # submits under — the adviser pattern exactly.  Audit attribution separates
@@ -1726,6 +1739,22 @@ class _ScheduleRunnerPrincipal:
     site_id: str
 
 
+@dataclass(slots=True)
+class _NightAdviserPrincipal:
+    """The composed night-strategy automation principal (DESIGN_NIGHT_CHARGE §2.1).
+
+    ``energypod:night-adviser``: observe + dispatch only, non-interactive,
+    site-bound — the adviser principal's exact shape, so the night
+    strategy's ``intent_accepted`` rows are attributable distinct from every
+    console, agent, schedule-runner, and excess-adviser writer.
+    """
+
+    subject: str
+    scopes: frozenset[str]
+    interactive: bool
+    site_id: str
+
+
 def _announce_dev_credential_to_stdout(token: str) -> None:
     """The default startup sink: print the token once (API_CONTRACTS)."""
     print(f"energypod simulate: development principal bearer token: {token}")
@@ -1841,6 +1870,8 @@ class _Supervision:
         process_origin_mono: float,
         adviser: ExcessChargeAdviser | None = None,
         excess_controller: ExcessAdviserController | None = None,
+        night_adviser: NightChargeAdviser | None = None,
+        night_controller: NightChargeController | None = None,
         intents: _AsyncIntentRepository | None = None,
         observations: _AsyncObservationRepository | None = None,
         recovery: RecoveryMonitor | None = None,
@@ -1864,6 +1895,12 @@ class _Supervision:
         # DESIGN_EXCESS_ACTIVATION §2: the projection controller driven
         # post-tick by this loop (its single writer).
         self._excess_controller = excess_controller
+        # DESIGN_NIGHT_CHARGE §2.5/§5: the night strategy adviser, ticked
+        # once per fleet cycle AFTER the excess adviser and BEFORE the
+        # energy accountant (pinned below), plus its projection controller
+        # driven by the same suppressed step.
+        self._night_adviser = night_adviser
+        self._night_controller = night_controller
         # DESIGN_SCHEDULES §2: the schedule runner, ticked once per fleet
         # cycle AFTER the polls and BEFORE the adviser step (pinned below).
         self._schedule_runner = schedule_runner
@@ -2083,6 +2120,20 @@ class _Supervision:
                 # (observe_tick), so observability can never gate control.
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(self._adviser_step(), timeout=self._interval_s)
+            if self._night_adviser is not None:
+                # DESIGN_NIGHT_CHARGE §2.5 (ordering pinned): one bounded,
+                # suppressed night tick per fleet cycle, AFTER the excess
+                # adviser and BEFORE the energy accountant and kernel tick —
+                # published facts first (the schedule), then the opportunists
+                # in economics order (FREE surplus before PAID import), so
+                # the excess adviser's same-cycle claim is already in the
+                # active set when the night adviser looks and the dawn-corner
+                # exclusion resolves deterministically within one cycle.  A
+                # failure is survivable per cycle exactly like an advisory
+                # failure; CancelledError is never swallowed; the TTL lapse
+                # plus the firmware watchdog are the designed hand-back.
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self._night_step(), timeout=self._interval_s)
             if self._energy_accountant is not None:
                 # DESIGN_ENERGY_SCORECARD section 7: one bounded accounting
                 # tick per fleet cycle, beside the adviser-projection update
@@ -2127,6 +2178,13 @@ class _Supervision:
         decision = await self._adviser.tick()
         if self._excess_controller is not None:
             await self._excess_controller.observe_tick(decision)
+
+    async def _night_step(self) -> None:
+        """One night tick plus the projection's single-writer update."""
+        assert self._night_adviser is not None
+        decision = await self._night_adviser.tick()
+        if self._night_controller is not None:
+            await self._night_controller.observe_tick(decision)
 
     async def _history_step(self, authorized: Mapping[str, Any]) -> None:
         """One suppressed historian tick with the cycle's peeked authority."""
@@ -2676,6 +2734,14 @@ class ComposedRuntime:
     foreign_objective: ForeignObjectiveMonitor | None = None
     # API_CONTRACTS "Excess-solar accelerated charging (advisory)": composed
     # only when the configuration enables the feature; None otherwise.
+    # DESIGN_NIGHT_CHARGE §2/§5: composed only when the ``night_charging``
+    # block is PRESENT — the night strategy adviser the fleet loop ticks
+    # (after the excess adviser, before the accountant) and its projection
+    # controller (participation, the PARTITION acknowledgement latch, the
+    # ``night_charge_state`` view, the state_changed publication).  None
+    # otherwise (block-absent doctrine).
+    night_adviser: NightChargeAdviser | None = None
+    night_controller: NightChargeController | None = None
     excess_adviser: ExcessChargeAdviser | None = None
     # DESIGN_EXCESS_ACTIVATION §1/§2: the projection controller (the
     # participation flag, the acknowledgement latch, the frozen state view,
@@ -2939,6 +3005,17 @@ def _build_runtime(
     # acknowledged); an absent block changes nothing anywhere (the default).
     excess_config = config.excess_charging
     excess_present = excess_config is not None
+    # DESIGN_NIGHT_CHARGE §3/§3.3: a PRESENT night block composes the night
+    # adviser surface below (suspended at boot unless enabled AND
+    # acknowledged — the acknowledgement boot-loads from the durable store);
+    # an absent block changes nothing anywhere.  The PCS live-block promotion
+    # widens to EITHER block: the demand rule reads `load_power_w` (0x1000+20)
+    # at control rate, and on the cold ring that word serves only every
+    # ~96-108 s — `demand_telemetry_max_age_s` would then classify every read
+    # stale and the feature would HOLD forever (the same budgeted plan, one
+    # widened predicate, no new tier).
+    night_config = config.night_charging
+    night_present = night_config is not None
     # DESIGN_ENERGY_SCORECARD sections 5+7 (E4): a PRESENT block composes the
     # accountant, the energy decode, the snapshot key, and the route; an
     # ABSENT block composes nothing at all.  The A-1 boot gate is keyed
@@ -3041,7 +3118,7 @@ def _build_runtime(
                 expected_cell_count=unit.expected_cell_count,
                 probe_address=probe.address,
                 probe_count=probe.count,
-                promote_pcs_live_block=excess_present,
+                promote_pcs_live_block=excess_present or night_present,
                 decode_energy_totals=energy_present,
             )
         actors[unit.unit_id] = EnergyPodActor(
@@ -3161,6 +3238,36 @@ def _build_runtime(
             store=schedule_store,
             acknowledged_night_windows=audit_store.contains_event(SCHEDULE_NIGHT_ACK_EVENT_ID),
         )
+    # --- night charge composition (DESIGN_NIGHT_CHARGE §3: block PRESENT) ---
+    # Built BEFORE the facade (the facade projects and toggles through it)
+    # and BEFORE the adviser (the adviser consumes its participation verdict
+    # at tick start; the controller binds the adviser for the live held
+    # read).  §3.2: the once-ever night-partition acknowledgement boot-loads
+    # from the durable store — one keyed existence check under the schedule
+    # surface's own historical event id (either surface's capture counts);
+    # an unacknowledged site composes SUSPENDED even with `enabled: true`.
+    night_controller: NightChargeController | None = None
+    if night_config is not None:
+        night_controller = NightChargeController(
+            pacing=night_config.pacing,
+            rate_cap_w=int(night_config.rate_cap_w),
+            hold_rate_w=int(night_config.hold_rate_w),
+            demand_scope=night_config.demand_scope,
+            demand_threshold_w=int(night_config.demand_threshold_w),
+            windows=tuple(
+                (parse_hhmm(start), parse_hhmm(end)) for start, end in night_config.window_local
+            ),
+            timezone=night_config.timezone,
+            posture=(
+                schedule_surface.policy.posture
+                if schedule_surface is not None
+                else "yield"  # pragma: no cover - the grant requires the block
+            ),
+            clock=resolved_clock,
+            acknowledged_partition=audit_store.contains_event(SCHEDULE_NIGHT_ACK_EVENT_ID),
+            config_enabled=night_config.enabled,
+            bus=bus,
+        )
     # --- energy scorecard composition (DESIGN_ENERGY_SCORECARD sections 5-7) ---
     # Built BEFORE the facade (the facade projects through the control) and
     # composed exactly when the block is PRESENT.  The accountant consumes
@@ -3266,6 +3373,7 @@ def _build_runtime(
         objectives=foreign_objective_monitor,
         excess=excess_controller,
         schedules=schedule_surface,
+        night=night_controller,
         energy=energy_surface,
         history=history_surface,
     )
@@ -3363,6 +3471,65 @@ def _build_runtime(
         )
         schedule_surface.bind_runner(schedule_runner)
 
+    # --- night charge advisory composition (DESIGN_NIGHT_CHARGE §2) ---------
+    night_adviser: NightChargeAdviser | None = None
+    if night_config is not None and night_controller is not None:
+        # The adviser is composed exactly when the block is PRESENT —
+        # participating only while enabled AND acknowledged — under the
+        # composed automation principal, driving the facade's internal night
+        # submission (never REST/MCP).  A night charge is an ordinary
+        # OPTIMIZER intent: the arbiter, allocator, SafetyKernel, actor, and
+        # authority path downstream are exactly the existing ones.
+        night_principal = _NightAdviserPrincipal(
+            subject=_NIGHT_ADVISER_PRINCIPAL_SUBJECT,
+            scopes=_NIGHT_ADVISER_PRINCIPAL_SCOPES,
+            interactive=False,
+            site_id=config.site.site_id,
+        )
+
+        async def _submit_night_drive(
+            *,
+            unit_ids: Any,
+            direction: Any,
+            watts: Any,
+            ttl_s: Any,
+            watts_by_unit: Any = None,
+        ) -> Any:
+            return await facade.submit_night_intent(
+                unit_ids=unit_ids,
+                direction=direction,
+                watts=watts,
+                ttl_s=ttl_s,
+                watts_by_unit=watts_by_unit,
+                principal=night_principal,
+            )
+
+        night_adviser = NightChargeAdviser(
+            settings=NightChargeSettings(
+                rate_cap_w=int(night_config.rate_cap_w),
+                hold_rate_w=int(night_config.hold_rate_w),
+                demand_threshold_w=int(night_config.demand_threshold_w),
+                demand_exit_hysteresis_w=int(night_config.demand_exit_hysteresis_w),
+                demand_scope=night_config.demand_scope,
+                pacing=night_config.pacing,
+                assumed_capacity_wh=dict(night_config.assumed_capacity_wh or {}),
+                demand_telemetry_max_age_s=float(night_config.demand_telemetry_max_age_s),
+                intent_ttl_s=float(night_config.intent_ttl_s),
+                windows=tuple(
+                    (parse_hhmm(start), parse_hhmm(end)) for start, end in night_config.window_local
+                ),
+                timezone=night_config.timezone,
+                unit_ids=tuple(unit.unit_id for unit in config.units),
+            ),
+            policy=policy,
+            clock=resolved_clock,
+            observations=observation_port,
+            intents=intent_port,
+            submit=_submit_night_drive,
+            participation=night_controller.participation_verdict,
+        )
+        night_controller.bind_adviser(night_adviser)
+
     def mcp_server_factory(*, principal: Any) -> FastMCP:
         # MCP is read-only by default: dispatch needs explicit configuration
         # plus a separately issued automation credential (API_CONTRACTS).
@@ -3421,6 +3588,8 @@ def _build_runtime(
         process_origin_mono=process_origin_mono,
         adviser=excess_adviser,
         excess_controller=excess_controller,
+        night_adviser=night_adviser,
+        night_controller=night_controller,
         intents=intent_port,
         observations=observation_port,
         schedule_runner=schedule_runner,
@@ -3453,6 +3622,8 @@ def _build_runtime(
         simulators=simulators,
         recovery=recovery_monitor,
         foreign_objective=foreign_objective_monitor,
+        night_adviser=night_adviser,
+        night_controller=night_controller,
         excess_adviser=excess_adviser,
         excess_controller=excess_controller,
         schedule_surface=schedule_surface,

@@ -3227,3 +3227,292 @@ class _LazyTransport:
 
     async def read_holding(self, address: int, count: int) -> tuple[int, ...]:
         return await self._inner.read_holding(address, count)
+
+
+# --- DESIGN_NIGHT_CHARGE §3/§5 B5: the composed night surface --------------------
+
+
+def _night_surface_payload(
+    database: Path,
+    *,
+    night: dict[str, Any] | None = None,
+    excess: dict[str, Any] | None = None,
+    windows: list[list[str]] | None = None,
+) -> dict[str, Any]:
+    payload = _write_enabled_payload(database)
+    payload["schedule"] = {"allowed_windows_local": windows or [["00:00", "20:00"]]}
+    payload["night_charging"] = dict(night or {"timezone": "Australia/Brisbane"})
+    if excess is not None:
+        payload["excess_charging"] = excess
+    return payload
+
+
+def compose_night(
+    database: Path,
+    *,
+    clock: Any | None = None,
+    announce: Callable[[str], None] | None = None,
+    night: dict[str, Any] | None = None,
+    excess: dict[str, Any] | None = None,
+    windows: list[list[str]] | None = None,
+) -> Any:
+    config = _validate(
+        _night_surface_payload(database, night=night, excess=excess, windows=windows)
+    )
+    return _compose_with(config, simulate=True, clock=clock, announce=announce)
+
+
+async def test_a_present_night_block_composes_the_adviser_and_projection(
+    tmp_path: Path,
+) -> None:
+    """Block-presence doctrine: a PRESENT block (explicitly suspended) composes
+    the adviser, the controller, and the feature-detected snapshot projection
+    with the partition posture the grant produced."""
+    runtime = compose_night(tmp_path / "night.sqlite3")
+
+    assert runtime.night_adviser is not None, "a present block composes the adviser"
+    assert runtime.night_controller is not None
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert "night_charge_state" in snapshot
+    state = snapshot["night_charge_state"]
+    assert state["enabled"] is False, "suspended at boot is the default"
+    assert state["enabled_origin"] == "config"
+    assert state["acknowledged_partition"] is False
+    assert state["posture"] == "partition"
+    assert state["active"] is False
+    assert state["phase"] == "idle"
+    assert state["reason_codes"] == ["disabled_by_config"]
+    # The toggle is commissioned on a present block: disable answers noop.
+    result = await runtime.facade.set_night_charging(
+        action="disable",
+        confirmation="NIGHT",
+        principal=OPERATOR,
+        idempotency_key="night-composed-disable",
+        request_id="night-composed-disable-request",
+    )
+    assert result["enabled"] is False
+    await _shutdown_actors(runtime)
+
+
+async def test_an_absent_night_block_composes_nothing_and_refuses_the_toggle(
+    tmp_path: Path,
+) -> None:
+    """An ABSENT block composes nothing — no adviser, no controller, no
+    projection key, the toggle answering not-commissioned. Byte-identical to
+    today's absent-block behavior."""
+    runtime = compose_write_enabled(tmp_path / "no-night.sqlite3")
+
+    assert runtime.night_adviser is None
+    assert runtime.night_controller is None
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert "night_charge_state" not in snapshot
+    with pytest.raises(Exception) as caught:
+        await runtime.facade.set_night_charging(
+            action="enable",
+            confirmation="NIGHT",
+            night_posture="PARTITION_ACKNOWLEDGED",
+            principal=OPERATOR,
+            idempotency_key="night-absent",
+            request_id="night-absent-request",
+        )
+    assert getattr(caught.value, "code", "") == "night_charging_not_commissioned"
+
+
+async def test_an_enabled_night_block_without_the_acknowledgement_composes_suspended(
+    tmp_path: Path,
+) -> None:
+    """§3.2's fail-closed gate at the composition level: even a config
+    `enabled: true` cannot silently participate without the captured fact —
+    the site composes suspended with `night_acknowledgement_required`."""
+    runtime = compose_night(
+        tmp_path / "night-unacked.sqlite3",
+        night={"timezone": "Australia/Brisbane", "enabled": True},
+    )
+
+    controller = runtime.night_controller
+    assert controller is not None
+    assert controller.enabled is True, "the desired participation reads enabled"
+    assert controller.acknowledged_partition is False
+    assert controller.participation_verdict() == "night_acknowledgement_required"
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    state = snapshot["night_charge_state"]
+    assert state["enabled"] is True
+    assert state["acknowledged_partition"] is False
+    assert "night_acknowledgement_required" in state["reason_codes"]
+    with pytest.raises(Exception) as caught:
+        await runtime.facade.set_night_charging(
+            action="enable",
+            confirmation="NIGHT",
+            principal=OPERATOR,
+            idempotency_key="night-unacked",
+            request_id="night-unacked-request",
+        )
+    assert getattr(caught.value, "code", "") == "night_acknowledgement_required"
+    await _shutdown_actors(runtime)
+
+
+async def test_the_night_acknowledgement_is_durable_and_boot_loads_into_the_gate(
+    tmp_path: Path,
+) -> None:
+    """§3.2: the once-ever fact is a durable audit row (the schedule surface's
+    own deterministic event id) loaded at boot into the gate — the first
+    enable of the NEXT process needs no posture field.  Simulator persistence
+    is in-memory by design; this pins the durable run-mode path."""
+    database = tmp_path / "night-ack.sqlite3"
+    payload = _night_surface_payload(database)
+    first = _compose_with(_validate(payload), simulate=False)
+    captured = await first.facade.set_night_charging(
+        action="enable",
+        confirmation="NIGHT",
+        night_posture="PARTITION_ACKNOWLEDGED",
+        principal=OPERATOR,
+        idempotency_key="night-ack-capture",
+        request_id="night-ack-capture-request",
+    )
+    assert captured["acknowledged_partition"] is True
+    await _shutdown_actors(first)
+
+    second = _compose_with(_validate(payload), simulate=False)
+    controller = second.night_controller
+    assert controller is not None
+    assert controller.acknowledged_partition is True, "boot loads the durable fact"
+    # The participation toggle itself never persisted — boot recomposes from
+    # the config default (disabled), acknowledged.
+    assert controller.enabled is False
+    assert controller.enabled_origin == "config"
+    result = await second.facade.set_night_charging(
+        action="enable",
+        confirmation="NIGHT",
+        principal=OPERATOR,
+        idempotency_key="night-ack-restart",
+        request_id="night-ack-restart-request",
+    )
+    assert result["enabled"] is True, "no posture field needed ever again"
+    assert result["acknowledged_partition"] is True
+    await _shutdown_actors(second)
+
+
+async def test_the_night_adviser_ticks_after_the_excess_adviser_and_before_the_accountant(
+    tmp_path: Path,
+) -> None:
+    """§2.5's ordering, pinned: published facts first (the schedule), then the
+    opportunists in economics order — FREE surplus before PAID import — so the
+    excess adviser's same-cycle claim is already in the active set when the
+    night adviser looks; the energy accountant follows; the kernel last."""
+    payload = _night_surface_payload(tmp_path / "night-order.sqlite3", excess={"enabled": False})
+    payload["energy_scorecard"] = {"integration_max_gap_s": 1.0}
+    runtime = _compose_with(_validate(payload), simulate=True, clock=ScriptedClock())
+    assert runtime.excess_adviser is not None
+    assert runtime.night_adviser is not None
+    assert runtime.energy_accountant is not None
+
+    order: list[str] = []
+    excess_tick = runtime.excess_adviser.tick
+    night_tick = runtime.night_adviser.tick
+    accountant_tick = runtime.energy_accountant.tick
+
+    async def traced_excess() -> Any:
+        order.append("excess")
+        return await excess_tick()
+
+    async def traced_night() -> Any:
+        order.append("night")
+        return await night_tick()
+
+    async def traced_accountant(*args: Any, **kwargs: Any) -> None:
+        order.append("energy")
+        await accountant_tick(*args, **kwargs)
+
+    runtime.excess_adviser.tick = traced_excess  # type: ignore[method-assign]
+    runtime.night_adviser.tick = traced_night  # type: ignore[method-assign]
+    runtime.energy_accountant.tick = traced_accountant  # type: ignore[method-assign]
+
+    session = _LifespanSession(runtime.app)
+    session.send("lifespan.startup")
+    await session.pump_until(lambda: order.count("energy") >= 2, message="two full fleet cycles")
+    await session.close()
+
+    assert order.index("excess") < order.index("night"), "free surplus before paid import"
+    assert order.index("night") < order.index("energy"), "the night step precedes accounting"
+    from itertools import pairwise
+
+    for earlier, later in pairwise(order):
+        if later == "night":
+            assert earlier == "excess", "every night tick follows the excess tick in-cycle"
+        if later == "energy":
+            assert earlier == "night", "every accounting tick follows the night tick in-cycle"
+
+
+async def test_the_night_block_promotes_the_pcs_live_block_without_excess(
+    tmp_path: Path,
+) -> None:
+    """§3.3: the promotion predicate widens to EITHER block — the demand rule
+    reads `load_power_w` at control rate, and on the cold ring the word serves
+    only every ~96-108 s, which `demand_telemetry_max_age_s` would classify
+    stale forever."""
+    runtime = _compose_with(
+        _validate(_night_surface_payload(tmp_path / "night-pcs.sqlite3")), simulate=False
+    )
+    for actor in runtime.actors.values():
+        telemetry = getattr(actor, "_telemetry", None)
+        assert getattr(telemetry, "_promote_pcs_live_block", None) is True, (
+            "a night block alone promotes the PCS live block"
+        )
+
+    plain = compose_write_enabled(tmp_path / "no-night-pcs.sqlite3")
+    for actor in plain.actors.values():
+        telemetry = getattr(actor, "_telemetry", None)
+        assert getattr(telemetry, "_promote_pcs_live_block", None) is False
+
+
+async def test_supervision_drives_the_night_projection_and_publishes_state_events(
+    tmp_path: Path,
+) -> None:
+    """The composed fleet loop itself drives the post-tick projection update
+    and publishes `night_charge.state_changed` on the shared bus — no
+    external caller, no separate publisher task."""
+    runtime = compose_night(
+        tmp_path / "night-events.sqlite3",
+        clock=ScriptedClock(),
+        night={"timezone": "Australia/Brisbane", "enabled": True},
+    )
+    controller = runtime.night_controller
+    assert controller is not None
+
+    seen: list[dict[str, Any]] = []
+
+    async def consume(iterator: Any) -> None:
+        async for event in iterator:
+            if event.get("type") == "night_charge.state_changed":
+                seen.append(event)
+                return
+
+    subscription = runtime.event_bus.subscribe(after_sequence=None)
+    consumer = asyncio.create_task(consume(subscription))
+    session = _LifespanSession(runtime.app)
+    try:
+        session.send("lifespan.startup")
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete")
+            or session.seen("lifespan.startup.failed"),
+            message="the application lifespan never reported supervision startup",
+        )
+        assert session.seen("lifespan.startup.complete"), f"startup failed: {session.events!r}"
+        await session.pump_until(
+            lambda: bool(seen), message="supervision never published a night state event"
+        )
+    finally:
+        session.send("lifespan.shutdown")
+        await session.pump_until(
+            lambda: session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed"),
+            message="the application lifespan never reported supervision shutdown",
+        )
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+        await close_subscription(subscription)
+
+    state = seen[0]["payload"]
+    assert state["enabled"] is True
+    assert state["enabled_origin"] == "config"

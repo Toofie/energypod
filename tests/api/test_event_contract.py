@@ -1371,3 +1371,269 @@ async def test_quiet_tiers_publish_nothing_at_all() -> None:
     # The drain helper settles without hanging on an idle stream: an empty
     # list IS the "nothing was published" verdict.
     assert await drain(subscription, 1) == []
+
+
+# --- night_charge.state_changed (DESIGN_NIGHT_CHARGE §5, B5) ---------------------
+#
+# The exact excess_adviser.state_changed mechanics, mirrored: published only
+# when the semantic tuple (enabled, enabled_origin, acknowledged_partition,
+# active, phase, active_unit_ids, demand_evidence, reason_codes) changes —
+# the watt/SOC figures ride every publication but never trigger — with the
+# 30 s heartbeat republish while enabled and NOTHING while disabled (a
+# boot-composed disabled site never publishes at all).  The REAL EventBus and
+# the REAL adviser/controller drive these contracts.
+
+
+def _night_modules() -> Any:
+    try:
+        import energypod.application.events as events
+        import energypod.application.night_charge as night
+    except ImportError as error:  # pragma: no cover - contract modules exist
+        raise AssertionError(f"night event contract dependency missing: {error}") from error
+    return SimpleNamespace(events=events, night=night)
+
+
+def _night_rig(api_domain: Any, loads: Any, *, config_enabled: bool = True) -> Any:
+    """A real night adviser + controller over the real bus (deterministic clock)."""
+    from tests.unit.test_night_charge import (
+        DEFAULT_WINDOW as NIGHT_WINDOW,
+    )
+    from tests.unit.test_night_charge import (
+        FakeClock as NightClock,
+    )
+    from tests.unit.test_night_charge import (
+        FakeIntents as NightIntents,
+    )
+    from tests.unit.test_night_charge import (
+        FakeObservations as NightObservations,
+    )
+    from tests.unit.test_night_charge import (
+        FakeSubmit as NightSubmit,
+    )
+    from tests.unit.test_night_charge import (
+        make_fleet as make_night_fleet,
+    )
+    from tests.unit.test_night_charge import (
+        make_policy as make_night_policy,
+    )
+    from tests.unit.test_night_charge import (
+        make_settings as make_night_settings,
+    )
+
+    modules = _night_modules()
+    clock = NightClock()
+    bus = modules.events.EventBus(retention=64, queue_capacity=64, clock=clock)
+    controller = modules.night.NightChargeController(
+        pacing="cap_first",
+        rate_cap_w=2_500,
+        hold_rate_w=100,
+        demand_scope="fleet",
+        demand_threshold_w=1_000,
+        windows=NIGHT_WINDOW,
+        timezone="Australia/Brisbane",
+        posture="partition",
+        clock=clock,
+        acknowledged_partition=True,
+        config_enabled=config_enabled,
+        bus=bus,
+    )
+    observations = NightObservations(latest=make_night_fleet(api_domain, loads))
+    adviser = modules.night.NightChargeAdviser(
+        settings=make_night_settings(modules.night),
+        policy=make_night_policy(api_domain),
+        clock=clock,
+        observations=observations,
+        intents=NightIntents(),
+        submit=NightSubmit(),
+        participation=controller.participation_verdict,
+    )
+    controller.bind_adviser(adviser)
+    return SimpleNamespace(
+        controller=controller,
+        adviser=adviser,
+        observations=observations,
+        clock=clock,
+        bus=bus,
+    )
+
+
+async def test_night_first_tick_publishes_the_contract_payload(api_domain: Any) -> None:
+    rig = _night_rig(api_domain, {"lhs": 100.0, "mid": 100.0, "rhs": 100.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    events = await drain(subscription, 4)
+
+    assert [event["type"] for event in events] == ["night_charge.state_changed"]
+    payload = events[0]["payload"]
+    assert set(payload) == {
+        "enabled",
+        "enabled_origin",
+        "acknowledged_partition",
+        "posture",
+        "active",
+        "phase",
+        "window",
+        "window_ends_at",
+        "window_ends_in_s",
+        "next_window_at",
+        "pacing",
+        "rate_cap_w",
+        "hold_rate_w",
+        "demand_scope",
+        "demand_threshold_w",
+        "demand_w",
+        "demand_evidence",
+        "held_intent_id",
+        "units",
+        "reason_codes",
+        "heartbeat",
+    }
+    assert payload["enabled"] is True
+    assert payload["enabled_origin"] == "config"
+    assert payload["acknowledged_partition"] is True
+    assert payload["posture"] == "partition"
+    assert payload["active"] is True
+    assert payload["phase"] == "pacing"
+    assert payload["window"] == {
+        "start_local": "00:00",
+        "end_local": "06:00",
+        "timezone": "Australia/Brisbane",
+    }
+    assert payload["window_ends_at"].startswith("2026-08-27T06:00")
+    assert payload["next_window_at"] is None, "null while a window is open"
+    assert payload["pacing"] == "cap_first"
+    assert payload["rate_cap_w"] == 2_500
+    assert payload["hold_rate_w"] == 100
+    assert payload["demand_w"] == 300
+    assert payload["demand_evidence"] == "good"
+    assert payload["held_intent_id"] == "night-1"
+    assert [unit["unit_id"] for unit in payload["units"]] == ["lhs", "mid", "rhs"]
+    assert payload["reason_codes"] == ["window_open", "on_plan"]
+    assert payload["heartbeat"] is False
+    await close_subscription(subscription)
+
+
+async def test_night_watt_and_soc_wander_never_triggers_a_publication(
+    api_domain: Any,
+) -> None:
+    """The pinned throttle: demand figures re-price every tick under the
+    load words, and publishing that would put one event per cycle on the bus
+    for figure wander the console already gets elsewhere."""
+    from tests.unit.test_night_charge import NOW as NIGHT_NOW
+
+    rig = _night_rig(api_domain, {"lhs": 100.0, "mid": 100.0, "rhs": 100.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    first = await drain(subscription, 2)
+    assert len(first) == 1
+
+    # 3 x (150, 250, 330) = 450, 750, 990 W: real re-pricing, all below the
+    # threshold, so the semantic state never changes.
+    for cycle, wander in enumerate((150.0, 250.0, 330.0), start=1):
+        rig.clock.now = NIGHT_NOW + 1.5 * cycle
+        for unit in rig.observations.latest.values():
+            object.__setattr__(unit, "load_power_w", wander)
+            object.__setattr__(unit, "captured_at_mono", rig.clock.now)
+        await rig.controller.observe_tick(await rig.adviser.tick())
+
+    assert rig.controller.state().demand_w == 990
+    quiet = await drain(subscription, 2)
+    assert quiet == [], "figure wander must never publish"
+    await close_subscription(subscription)
+
+
+async def test_a_night_semantic_change_publishes_and_carries_the_new_figures(
+    api_domain: Any,
+) -> None:
+    """Demand crossing the threshold mid-window is the semantic change the
+    console announces: pacing -> holding_on_demand, one event, the hold
+    figures carried."""
+    from tests.unit.test_night_charge import NOW as NIGHT_NOW
+
+    rig = _night_rig(api_domain, {"lhs": 100.0, "mid": 100.0, "rhs": 100.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert len(await drain(subscription, 2)) == 1
+
+    rig.clock.now = NIGHT_NOW + 1.5
+    for unit in rig.observations.latest.values():
+        object.__setattr__(unit, "load_power_w", 500.0)
+        object.__setattr__(unit, "captured_at_mono", rig.clock.now)
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    events = await drain(subscription, 2)
+
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["phase"] == "holding_on_demand"
+    assert payload["reason_codes"] == ["window_open", "demand_above_threshold"]
+    assert payload["demand_w"] == 1_500
+    assert {unit["unit_id"]: unit["target_w"] for unit in payload["units"]} == {
+        "lhs": 100,
+        "mid": 100,
+        "rhs": 0,
+    }
+    await close_subscription(subscription)
+
+
+async def test_the_night_heartbeat_republishes_every_30_seconds_while_enabled(
+    api_domain: Any,
+) -> None:
+    from tests.unit.test_night_charge import NOW as NIGHT_NOW
+
+    rig = _night_rig(api_domain, {"lhs": 100.0, "mid": 100.0, "rhs": 100.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert len(await drain(subscription, 2)) == 1
+
+    rig.clock.now = NIGHT_NOW + 29.0
+    for unit in rig.observations.latest.values():
+        object.__setattr__(unit, "captured_at_mono", rig.clock.now)
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert (await drain(subscription, 2)) == [], "29 s is not the heartbeat cadence"
+
+    rig.clock.now = NIGHT_NOW + 30.0
+    for unit in rig.observations.latest.values():
+        object.__setattr__(unit, "captured_at_mono", rig.clock.now)
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    events = await drain(subscription, 2)
+    assert len(events) == 1
+    assert events[0]["payload"]["heartbeat"] is True
+    await close_subscription(subscription)
+
+
+async def test_a_boot_disabled_night_site_publishes_nothing(api_domain: Any) -> None:
+    """§5: while disabled there is no heartbeat and no publication at all —
+    a boot-composed disabled site's first snapshot frame carries the
+    projection instead."""
+    rig = _night_rig(api_domain, {"lhs": 100.0, "mid": 100.0, "rhs": 100.0}, config_enabled=False)
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+
+    assert await drain(subscription, 1) == [], "a boot-disabled site never publishes"
+    await close_subscription(subscription)
+
+
+async def test_the_disable_carrying_tick_is_the_last_night_event(api_domain: Any) -> None:
+    """The state_changed that CARRIES the disable is the last event; nothing
+    publishes afterwards while disabled."""
+    rig = _night_rig(api_domain, {"lhs": 100.0, "mid": 100.0, "rhs": 100.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert len(await drain(subscription, 2)) == 1
+
+    rig.controller.set_participation(enabled=False)
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    events = await drain(subscription, 2)
+    assert len(events) == 1
+    assert events[0]["payload"]["enabled"] is False
+    assert events[0]["payload"]["reason_codes"] == ["disabled_by_runtime"]
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert (await drain(subscription, 2)) == [], "nothing while disabled"
+    await close_subscription(subscription)
