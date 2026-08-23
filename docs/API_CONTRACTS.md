@@ -417,6 +417,13 @@ coordinator, the event bus, and per-unit actor handles.
   (from the event bus), `captured_at` wall time, and per-unit `lifecycle`, `telemetry_age_s`,
   `quality`, `requested_power` (from the newest active intent for that unit), `authorized_power`
   (from the current authorization, if any), and `measured_watts` (from the latest observation).
+  `authorized_power` is a NON-CONSUMING peek at the single-use capability store: authority is
+  minted as one single-use setpoint per heartbeat and is consumed by the actor's write, so a
+  fully-authorized unit reads `null` here BETWEEN consumptions (the 2026-08-25 console UI audit
+  proved this live). It is a liveness hint, never a standing figure — the standing authorized
+  watts live in the snapshot's top-level `intent.authorized_watts_by_unit` (mirroring the
+  freshest `control_decision` audit row) and in the `control_decision`/`authorization.granted`
+  events.
   Each unit additionally carries a nullable `telemetry` summary projection from the latest
   observation — `soc_pct`, `bms_soc_pct`, `soh_pct`, `pack_voltage_v`, `pack_current_a`,
   `battery_watts`, `dynamic_charge_limit_w`, `dynamic_discharge_limit_w`, `cell_count`,
@@ -683,6 +690,83 @@ eligible_charge_w = min(max_charge_from_export_w,
   not by the general safety completeness set.
 - The facade snapshot telemetry summary and the unit-detail projection expose both fields
   readthrough-style: nullable, never zero-filled, never fabricated.
+
+### The activation surface (DESIGN_EXCESS_ACTIVATION, 2026-08-25)
+
+The operator-facing three: the `adviser_state` projection, the
+`excess_adviser.state_changed` event, and the guarded activation toggle. Nothing here
+changes the adviser's authority, the export bound, the hysteresis, the yield rules, or any
+safety path.
+
+**Composition semantics (P6).** A PRESENT `excess_charging` block composes the machinery —
+export triple armed, PCS live block promoted into the control-rate read plan, adviser
+constructed, `adviser_state` present in the snapshot (including while suspended) — with
+`enabled` gating PARTICIPATION. An explicit `enabled: false` composes suspended at boot and
+is enableable at runtime; an ABSENT block composes nothing (no adviser, no triple, no tier
+promotion, no projection key, toggle answers 409) — byte-identical behavior. The
+commissioning gates bind to block-PRESENCE: a disabled block that could never be enabled
+safely is refused at validation time. Effective participation is `enabled AND
+acknowledged_economics`: an unacknowledged site composes SUSPENDED even with config
+`enabled: true`.
+
+**The `adviser_state` projection** rides the snapshot TOP LEVEL beside `intent` (feature
+detected: the key is absent when the block is absent). Exact shape:
+
+```json
+"adviser_state": {
+  "enabled": true, "enabled_origin": "runtime", "acknowledged_economics": true,
+  "active": true, "hysteresis_state": "holding", "target_unit_id": "mid",
+  "commanded_charge_w": 1400, "eligible_export_charge_w": 1600,
+  "fleet_export_w": 1800, "export_evidence": "good", "charge_cap_w": 2500,
+  "held_intent_id": "excess-3-100.000000", "last_action": "renew",
+  "last_tick_at": "2026-08-25T11:04:31+00:00",
+  "reason_codes": ["export_headroom_available"]
+}
+```
+
+`active` derives from `held_intent_id` (never a lifecycle guess), `fleet_export_w` is
+Σ `grid_power_w` over the fleet (positive = export) and is NULL on any missing/bad/stale
+grid word — never zero-filled; `export_evidence` is the worst per-unit grid word under the
+bound's own fail-closed rules (precedence `missing > bad > stale`). One writer: the fleet
+loop's post-tick update; the toggle flips only the participation flag and the next tick
+observes it. `reason_codes` is ONE pinned vocabulary — the tick's own codes verbatim
+(`no_export_headroom`, `no_acceleration_over_autonomy`, `below_exit_hysteresis`,
+`no_eligible_target`, `yielding_to_higher_priority`, `export_headroom_available`) plus
+exactly the projection states the tick alone cannot see (`disabled_by_config`,
+`disabled_by_runtime`, `economics_acknowledgement_required`, `export_evidence_missing`,
+`export_evidence_bad`, `export_evidence_stale`); it is never empty. When the rollup
+collapses, the evidence word REPLACES `no_export_headroom` (whose definition requires GOOD
+evidence).
+
+**The `excess_adviser.state_changed` event** carries the same payload minus
+`charge_cap_w`/`last_action`/`last_tick_at`, plus `"heartbeat": bool`. Publication is
+throttled on the semantic tuple `(enabled, enabled_origin, acknowledged_economics, active,
+hysteresis_state, target_unit_id, export_evidence, reason_codes)` — the watt figures ride
+every publication but never trigger one. While `enabled` is true a heartbeat republish
+fires every 30 s (a constant, not a config key); while disabled NOTHING publishes: the
+state_changed carrying the disable is the last event.
+
+**The guarded toggle** — `POST /api/v1/excess-charging` (arm scope; an interactive
+principal additionally to enable; Idempotency-Key required):
+
+```json
+{"action": "enable" | "disable", "confirmation": "EXCESS", "economics": "NET_BILLED"}
+```
+
+`economics` is optional and consulted only on the first enable ever. The 200 body is
+`{"feature": "excess_charging", "enabled", "enabled_origin", "persisted": false,
+"acknowledged_economics", "adviser_state"}` — `persisted` is always false and spelled
+anyway (P1: runtime toggles never survive restart; boot recomposes from config). Refusals
+are the structured envelope with code `excess_charging_not_commissioned` (absent block),
+`economics_acknowledgement_required` (`details: {"acknowledgement": "NET_BILLED"}`), or
+`excess_enable_refused` (`details: {"reasons": [...], "unit_ids": [...], "stop_ids":
+[...]}` — enable is refused while any unit runs under a manual/agent/schedule request or
+any latched stop holds; latched inhibits do NOT refuse; disable is never refused). Every
+call is audited (`excess_charging_toggled`, result `enabled`/`disabled`/`noop`) and
+idempotent by key. The net-billing acknowledgement is ONE durable audit fact
+(`excess_charging_economics_acknowledged`, deterministic event id, boot-loaded via one
+keyed existence check, never re-prompted); its durable append lands BEFORE the latch
+flips, and an append failure refuses the enable.
 
 ## Device-mode telemetry and dispatch gating
 

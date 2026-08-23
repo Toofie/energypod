@@ -505,6 +505,21 @@ def test_excess_charging_is_disabled_by_default() -> None:
 # --- still changes nothing anywhere.
 
 
+def test_the_documented_trial_shape_validates_inside_every_gate() -> None:
+    """DESIGN_EXCESS_ACTIVATION §4 / B4: the live-write example's documented
+    trial wiring — an explicit `enabled: false` block with the 500 W trial
+    cap — parses cleanly against the commissioned policy and timing, so the
+    operator can uncomment exactly what the example shows."""
+    payload = _valid_config()
+    payload["excess_charging"] = {"enabled": False, "max_charge_from_export_w": 500}
+
+    parsed = _validate(payload)
+
+    assert parsed.excess_charging is not None
+    assert parsed.excess_charging.enabled is False
+    assert parsed.excess_charging.max_charge_from_export_w == 500
+
+
 def test_a_disabled_excess_block_still_requires_write_enabled_mode() -> None:
     payload = _valid_config(mode="observe_only")
     payload["excess_charging"] = {"enabled": False}

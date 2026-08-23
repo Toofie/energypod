@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-24 (Australia/Brisbane)
+Last updated: 2026-08-25 (Australia/Brisbane)
 
 ## Purpose
 
@@ -348,6 +348,79 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (excess activation backend): THE OPERATOR-FACING ACTIVATION
+  PACKAGE IMPLEMENTED (B1-B4 + the two UI-audit extras; ce0d825, 158679d,
+  1bd075c, + this pass) against the accepted contract
+  docs/DESIGN_EXCESS_ACTIVATION.md (582ca4d), backend half only — the
+  console agent builds W1-W3 against the same shapes in parallel.
+  (1) PROJECTION (B1): ExcessChargeDecision now carries the fleet grid
+  rollup (export_evidence + fleet_export_w, null on any missing/bad/stale
+  word, worst-word-wins precedence missing > bad > stale, computed by the
+  SAME per-unit classifier as the bound); ExcessAdviserController is the
+  single writer (observe_tick, driven by the fleet loop) of the frozen
+  ExcessAdviserState: active derives from the adviser's LIVE held_intent_id
+  (never a lifecycle guess — the withdraw-then-tick race cannot show
+  inactive while an intent is live), hysteresis walks
+  inactive/entering/holding/exiting tick-granularly, reason codes are the
+  tick's own vocabulary VERBATIM plus exactly three projection codes
+  (disabled_by_config / disabled_by_runtime /
+  economics_acknowledgement_required); the adviser consumes a tick-start
+  participation port — a disabled tick still computes fresh evidence,
+  withdraws-if-held once by removal, then idles with the projection code.
+  (2) EVENTS (B2): excess_adviser.state_changed, payload = the §2 subset +
+  heartbeat flag, throttled on the semantic tuple (watts ride but never
+  trigger), 30 s heartbeat while enabled (a constant), NOTHING while
+  disabled (the disable-carrying state_changed is the last event; a
+  boot-composed disabled site never publishes — the snapshot's first frame
+  carries the projection). Vocabulary correction en route: a collapsed
+  rollup REPLACES no_export_headroom with its evidence word (the code's own
+  definition requires GOOD evidence).
+  (3) TOGGLE + GATE + RESCOPE (B3): facade set_excess_charging + POST
+  /api/v1/excess-charging (arm scope; interactive additionally to enable;
+  Idempotency-Key; audited excess_charging_toggled result
+  enabled/disabled/noop on the Impl-10 commit-then-audit pattern; 200 body
+  carries persisted: false always — P1). 409 refusals:
+  excess_charging_not_commissioned / economics_acknowledgement_required
+  (details {acknowledgement: NET_BILLED}) / excess_enable_refused (details
+  reasons + unit_ids + stop_ids; manual/agent/schedule claims and latched
+  stops refuse, latched INHIBITS do not, disable never refused). The
+  net-billing acknowledgement is ONE durable audit fact under a
+  DETERMINISTIC event id (excess-charging-economics-acknowledged) —
+  store-uniqueness enforces once-ever, boot-load is one keyed existence
+  check (_AuditStore.contains_event added to both stores; SQLite indexed),
+  durable-append lands BEFORE the latch flips, an append failure REFUSES
+  the enable. P6: block-PRESENT composes (triple armed, PCS block promoted,
+  adviser + controller + adviser_state in the snapshot) with enabled gating
+  participation; enabled: false composes suspended, runtime-enableable;
+  ABSENT block byte-identical (no adviser/triple/projection key; toggle
+  409s); config gates bind to block-PRESENCE (a never-safely-enableable
+  disabled block is refused). P1 verified across a restart: boot recomposes
+  from config, acknowledged; the participation toggle leaves no durable
+  trace. (4) CONFIG/TRIAL (B4): the live-write example's commented block
+  documents the §4 trial shape (enabled: false explicit + the 500 W trial
+  cap) and the P6 semantics; the trial-shape-validates test pins it.
+  EXTRAS from the console UI audit: intent.accepted bus payloads (manual +
+  advisory paths) now carry expires_in_s (the 202 always did); the
+  snapshot's per-unit authorized_power is documented as a non-consuming
+  peek that reads null BETWEEN single-use consumptions — the standing
+  figure is intent.authorized_watts_by_unit (API_CONTRACTS amended).
+  OPEN OPERATOR DECISION flagged in the example: with the commissioned
+  assumed_autonomous_charge_w: 520 + min_acceleration_w: 100 the ENTRY
+  threshold is 620 W, so the §4 500 W cap as literally written can never
+  clear it — commissioning the trial must also revisit the autonomy key
+  (e.g. 300 W -> entry 400 W) or raise the cap; P5 forbids the runtime
+  toggle from touching either. Verification: contract-first red per family
+  (excess-charge projection block 13; event-contract 6 over the real bus;
+  facade 13; REST 7 + boundary 1; composition 4 rescoped; config 4); 701
+  green across every touched + neighboring family incl. e2e; ruff +
+  format + MYPYPATH=src mypy strict clean each commit. NO live trial
+  (operator decisions §7 pending; the ack gate would correctly refuse).
+  Console migration: the moment the console's W1-W3 meet this build, the
+  Home tile lights from snapshot adviser_state, the toggle from POST
+  /api/v1/excess-charging, and the event case from
+  excess_adviser.state_changed — nothing else moves (all additions are
+  feature-detected on the key's presence).
 
 - 2026-08-24 (recovery): THE SELF-HEALING AWARENESS LAYER LANDED (b20058d,
   8f840ea, 6da8541, 7b491b3 + docs) — detection and honest surfacing of the

@@ -244,9 +244,15 @@ storage:
   database_path: var/live-write.sqlite3
   busy_timeout_ms: 250
 
-# Excess-solar accelerated charging (advisory) — DEFAULT OFF.  An absent
-# block is identical to `enabled: false`: no adviser is composed, the policy
-# gains no export triple, no register tier is promoted, nothing changes.
+# Excess-solar accelerated charging (advisory) — DEFAULT OFF, and this
+# block stays COMMENTED OUT on this deployment: an ABSENT block composes
+# nothing at all (no adviser, no export triple, no register-tier promotion,
+# no `adviser_state` in the snapshot, and the activation toggle answers 409
+# excess_charging_not_commissioned) — byte-identical behavior.  A PRESENT
+# block composes the machinery with `enabled` gating PARTICIPATION
+# (DESIGN_EXCESS_ACTIVATION P6): an explicit `enabled: false` composes
+# suspended at boot and is enableable at the runtime toggle — which is what
+# makes the console's first enable possible without a config edit.
 #
 # The feature is an ADVISER: it submits ordinary short-TTL `optimizer`
 # charge intents under the composed automation principal
@@ -258,18 +264,39 @@ storage:
 # non-renewal only — the TTL lapse plus the ~3.5-4.0 s firmware watchdog.
 # A manual or agent intent always displaces it (arbiter priority).
 #
-# Commissioning gates (refused at validation time otherwise): write_enabled
-# mode with a policy; max_charge_from_export_w <= policy.max_unit_charge_w;
-# export_telemetry_max_age_s > control_period_s + essential_read_timeout_s;
-# exit_hysteresis_w < min_acceleration_w; 0 < intent_ttl_s <= 300 and
-# > control_period_s.  The values below are the commissioned defaults; the
-# NET-BILLING assumption (site billing netted across phases) must be
-# operator-confirmed before production enablement.
+# Commissioning gates (refused at validation time otherwise, and they bind
+# to block-PRESENCE — a disabled block that could never be enabled safely
+# is refused too, because the runtime toggle can never raise a cap or relax
+# a gate): write_enabled mode with a policy; max_charge_from_export_w <=
+# policy.max_unit_charge_w; export_telemetry_max_age_s >
+# control_period_s + essential_read_timeout_s; exit_hysteresis_w <
+# min_acceleration_w; 0 < intent_ttl_s <= 300 and > control_period_s.
+#
+# FIRST-TRIAL WIRING (DESIGN_EXCESS_ACTIVATION §4): the trial deliberately
+# starts at the RUNTIME toggle, not `enabled: true` — the window's start
+# and end are the operator's console acts, boot is off, and a mid-trial
+# reboot degrades to off (P1's fail-safe direction).  The ONLY key changed
+# from the commissioned defaults is the cap: `max_charge_from_export_w:
+# 500` for the whole trial; graduation to 2500 is a config edit and
+# restart (the commissioned path), never the runtime toggle (P5).  The
+# NET-BILLING acknowledgement ("this site's billing nets across phases")
+# is NOT a config key: it is captured ONCE, durably, through the first
+# enable's `"economics": "NET_BILLED"` field and never re-prompted.
+#
+# OPERATOR DECISION STILL OPEN (flagged by the backend implementation,
+# 2026-08-23): with the commissioned `assumed_autonomous_charge_w: 520` and
+# `min_acceleration_w: 100`, the beat-autonomy ENTRY threshold is 620 W —
+# a 500 W cap can never clear it, so a 500 W trial as literally wired in
+# §4 would never command.  Commissioning the trial must ALSO revisit
+# `assumed_autonomous_charge_w` (e.g. 300 W puts the entry threshold at
+# 400 W, inside the 500 W cap) or raise the trial cap above 620 W.  This
+# example keeps the commissioned autonomy value and names the tension
+# rather than deciding it.
 #
 # excess_charging:
-#   enabled: false
+#   enabled: false            # suspended at boot; the trial STARTS at the toggle
 #   export_headroom_margin_w: 200
-#   max_charge_from_export_w: 2500
+#   max_charge_from_export_w: 500   # the trial cap (graduation restores 2500)
 #   export_telemetry_max_age_s: 3.0
 #   assumed_autonomous_charge_w: 520
 #   min_acceleration_w: 100
