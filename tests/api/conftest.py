@@ -146,6 +146,36 @@ UNIT_DETAIL_PROJECTIONS: dict[str, dict[str, Any]] = {
 class RecordingEnergyService:
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     next_revision: int = 40
+    # The schedule surface's scripted answers (DESIGN_SCHEDULES §5): a view
+    # body, an optional refusal (ScheduleRefusal-shaped), and an optional
+    # validation error raised to the boundary.
+    schedule_view: dict[str, Any] = field(
+        default_factory=lambda: {
+            "plan": None,
+            "policy": {
+                "posture": "yield",
+                "allowed_windows_local": [["06:00", "20:00"]],
+                "intent_ttl_s": 10.0,
+            },
+            "acknowledged_night_windows": False,
+            "next_action": None,
+        }
+    )
+    schedule_result: dict[str, Any] = field(
+        default_factory=lambda: {
+            "version": 1,
+            "plan": {
+                "version": 1,
+                "timezone": "Australia/Brisbane",
+                "entries": [],
+            },
+            "diff": {"added": [], "removed": [], "changed": [], "timezone_changed": False},
+            "acknowledged_night_windows": False,
+            "next_action": None,
+        }
+    )
+    schedule_refusal: Any = None
+    schedule_error: Any = None
 
     async def snapshot(self, *, principal: Principal) -> dict[str, Any]:
         self.calls.append(("snapshot", {"principal": principal}))
@@ -269,6 +299,20 @@ class RecordingEnergyService:
                 "reason_codes": ["export_headroom_available"],
             },
         }
+
+    async def get_schedule(self, *, principal: Any) -> dict[str, Any]:
+        self.calls.append(("get_schedule", {"principal": principal}))
+        if self.schedule_refusal is not None:
+            raise self.schedule_refusal
+        return dict(self.schedule_view)
+
+    async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("replace_schedule", kwargs))
+        if self.schedule_refusal is not None:
+            raise self.schedule_refusal
+        if self.schedule_error is not None:
+            raise self.schedule_error
+        return dict(self.schedule_result)
 
 
 class MutableMonotonicClock:

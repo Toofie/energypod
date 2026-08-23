@@ -1419,3 +1419,288 @@ def test_excess_charging_refusals_map_to_their_structured_envelopes(
 
     _assert_error(response, 409, refusal.code)
     assert response.json()["details"] == expected_details
+
+
+# --- DESIGN_SCHEDULES §5 B4: the schedule REST surface --------------------------
+
+from energypod.application.scheduling import (  # noqa: E402
+    SchedulePublishValidationError,
+    ScheduleRefusal,
+)
+
+
+def _wire_entry(**overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "entry_id": "day-charge",
+        "days": ["mon"],
+        "start_local": "09:00",
+        "end_local": "17:00",
+        "action": "charge",
+        "watts": 1200,
+        "unit_ids": ["pod-a"],
+        "effective_from": "2026-01-01",
+        "effective_until": "2026-12-31",
+        "priority": 0,
+        "enabled": True,
+    }
+    values.update(overrides)
+    return values
+
+
+def _put_body(**overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "expected_version": None,
+        "timezone": "Australia/Brisbane",
+        "entries": [_wire_entry()],
+    }
+    values.update(overrides)
+    return values
+
+
+def test_schedule_get_requires_authentication_and_serves_the_view(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        anonymous = client.get(f"{API}/schedule")
+        refused = client.get(f"{API}/schedule", headers=_auth("viewer-token"))
+
+    _assert_error(anonymous, 401, "authentication_required")
+    assert refused.status_code == 200
+    assert refused.json() == service.schedule_view
+    forwarded = [values for name, values in service.calls if name == "get_schedule"]
+    assert forwarded[0]["principal"].subject == "person:viewer"
+
+
+def test_schedule_get_maps_the_not_commissioned_refusal_verbatim(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    service.schedule_refusal = ScheduleRefusal(
+        "schedule_not_commissioned", "the schedule feature is not composed on this site"
+    )
+    with _client(service, authenticator) as client:
+        response = client.get(f"{API}/schedule", headers=_auth("viewer-token"))
+
+    _assert_error(response, 409, "schedule_not_commissioned")
+
+
+def test_schedule_put_publishes_the_whole_plan_with_an_idempotency_key(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        missing_key = client.put(
+            f"{API}/schedule", json=_put_body(), headers=_auth("operator-token")
+        )
+        accepted = client.put(
+            f"{API}/schedule",
+            json=_put_body(),
+            headers=_mutation_headers("operator-token", key="publish-1"),
+        )
+        replay = client.put(
+            f"{API}/schedule",
+            json=_put_body(),
+            headers=_mutation_headers("operator-token", key="publish-1"),
+        )
+
+    _assert_error(missing_key, 400, "idempotency_key_required")
+    assert accepted.status_code == 200
+    assert accepted.json() == service.schedule_result
+    assert replay.status_code == 200
+    assert replay.json() == accepted.json()
+    forwarded = [values for name, values in service.calls if name == "replace_schedule"]
+    assert len(forwarded) == 1, "a replay never re-reaches the service"
+    call = forwarded[0]
+    assert call["expected_version"] is None
+    assert call["timezone"] == "Australia/Brisbane"
+    assert call["entries"][0]["entry_id"] == "day-charge"
+    assert call["night_posture"] is None
+    assert call["principal"].subject == "person:operator"
+
+
+def test_schedule_put_reusing_a_key_with_another_body_is_a_conflict(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        first = client.put(
+            f"{API}/schedule",
+            json=_put_body(),
+            headers=_mutation_headers("operator-token", key="publish-1"),
+        )
+        conflict = client.put(
+            f"{API}/schedule",
+            json=_put_body(timezone="Australia/Perth"),
+            headers=_mutation_headers("operator-token", key="publish-1"),
+        )
+
+    assert first.status_code == 200
+    _assert_error(conflict, 409, "idempotency_conflict")
+
+
+def test_schedule_put_requires_dispatch_scope_and_an_interactive_principal(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        viewer = client.put(
+            f"{API}/schedule", json=_put_body(), headers=_mutation_headers("viewer-token")
+        )
+        automation = client.put(
+            f"{API}/schedule",
+            json=_put_body(),
+            headers=_mutation_headers("noninteractive-operator-token"),
+        )
+
+    _assert_error(viewer, 403, "insufficient_scope")
+    _assert_error(automation, 403, "interactive_operator_required")
+    assert all(name != "replace_schedule" for name, _ in service.calls)
+
+
+@pytest.mark.parametrize(
+    ("refusal", "details"),
+    [
+        (
+            ScheduleRefusal(
+                "schedule_window_not_allowed",
+                "entries fall outside the allowed windows (day-only posture)",
+                {
+                    "posture": "yield",
+                    "allowed_windows_local": [["06:00", "20:00"]],
+                    "offending": [
+                        {"entry_id": "Night Charge", "start_local": "00:01", "end_local": "05:59"}
+                    ],
+                },
+            ),
+            {
+                "posture": "yield",
+                "allowed_windows_local": [["06:00", "20:00"]],
+                "offending": [
+                    {"entry_id": "Night Charge", "start_local": "00:01", "end_local": "05:59"}
+                ],
+            },
+        ),
+        (
+            ScheduleRefusal(
+                "night_posture_acknowledgement_required",
+                "the first night schedule publish requires the one-time partition acknowledgement",
+                {"acknowledgement": "PARTITION_ACKNOWLEDGED"},
+            ),
+            {"acknowledgement": "PARTITION_ACKNOWLEDGED"},
+        ),
+        (
+            ScheduleRefusal(
+                "schedule_version_conflict",
+                "the plan changed elsewhere — reload and re-apply",
+                {"current_version": 3},
+            ),
+            {"current_version": 3},
+        ),
+    ],
+)
+def test_schedule_put_maps_every_refusal_shape_verbatim(
+    service: RecordingEnergyService,
+    authenticator: FakeAuthenticator,
+    refusal: ScheduleRefusal,
+    details: dict[str, Any],
+) -> None:
+    service.schedule_refusal = refusal
+    with _client(service, authenticator) as client:
+        response = client.put(
+            f"{API}/schedule",
+            json=_put_body(),
+            headers=_mutation_headers("operator-token", key=f"refuse-{refusal.code}"),
+        )
+
+    _assert_error(response, 409, refusal.code)
+    assert response.json()["details"] == details
+
+
+def test_schedule_put_maps_facade_validation_errors_with_entry_names(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    service.schedule_error = SchedulePublishValidationError(
+        [{"entry_id": "day-charge", "message": "idle entries require zero watts"}]
+    )
+    with _client(service, authenticator) as client:
+        response = client.put(
+            f"{API}/schedule",
+            json=_put_body(),
+            headers=_mutation_headers("operator-token"),
+        )
+
+    body = _assert_error(response, 422, "validation_error")
+    assert body["details"]["errors"] == [
+        {"entry_id": "day-charge", "message": "idle entries require zero watts"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"days": ["monday"]},
+        {"days": []},
+        {"action": "hold"},
+        {"watts": -100},
+        {"watts": True},
+        {"priority": "high"},
+        {"enabled": "yes"},
+        {"unit_ids": []},
+        {"effective_from": "2026-1-1"},
+        {"night_posture": "SILENT"},
+        {"expected_version": -1},
+        {"unknown": "field"},
+    ],
+)
+def test_schedule_put_rejects_malformed_wire_shapes_before_the_service(
+    service: RecordingEnergyService,
+    authenticator: FakeAuthenticator,
+    mutation: dict[str, Any],
+) -> None:
+    body = _put_body()
+    if mutation.keys() & {
+        "days",
+        "action",
+        "watts",
+        "priority",
+        "enabled",
+        "unit_ids",
+        "effective_from",
+    }:
+        body["entries"] = [
+            _wire_entry(
+                **{
+                    k: v
+                    for k, v in mutation.items()
+                    if k != "night_posture" and k != "expected_version" and k != "unknown"
+                }
+            )
+        ]
+        mutation = {
+            k: v
+            for k, v in mutation.items()
+            if k
+            not in {"days", "action", "watts", "priority", "enabled", "unit_ids", "effective_from"}
+        }
+    if mutation:
+        body.update(mutation)
+    with _client(service, authenticator) as client:
+        response = client.put(
+            f"{API}/schedule",
+            json=body,
+            headers=_mutation_headers("operator-token", key=f"bad-{abs(hash(str(mutation)))}"),
+        )
+
+    _assert_error(response, 422, "validation_error")
+    assert all(name != "replace_schedule" for name, _ in service.calls)
+
+
+def test_schedule_put_accepts_an_empty_entries_list_as_off(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        response = client.put(
+            f"{API}/schedule",
+            json=_put_body(entries=[]),
+            headers=_mutation_headers("operator-token"),
+        )
+
+    assert response.status_code == 200
+    forwarded = [values for name, values in service.calls if name == "replace_schedule"]
+    assert forwarded[0]["entries"] == []

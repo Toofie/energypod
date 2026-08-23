@@ -840,3 +840,232 @@ async def test_missing_evidence_replaces_the_headroom_code_in_the_vocabulary(
     assert payload["reason_codes"] == ["export_evidence_missing"]
     assert payload["hysteresis_state"] == "exiting"
     await close_subscription(subscription)
+
+
+# --- schedule.replaced / schedule_window events (DESIGN_SCHEDULES §5) -----------
+#
+# The REAL EventBus carries the publications: the facade's schedule.replaced
+# (one per publish) and the runner's window transitions (opened on the first
+# submit for a key, closing on the removal tick — transitions only, never a
+# per-tick heartbeat).
+
+
+def _generation_module() -> Any:
+    import energypod.application.generation as generation
+
+    return generation
+
+
+def _schedule_modules() -> Any:
+    try:
+        import energypod.application.events as events
+        import energypod.application.scheduling as scheduling
+        import energypod.application.service as service
+    except ImportError as error:  # pragma: no cover - contract modules exist
+        raise AssertionError(f"schedule event contract dependency missing: {error}") from error
+    return SimpleNamespace(events=events, scheduling=scheduling, service=service)
+
+
+def _schedule_surface(modules: Any, *, night: bool = False) -> Any:
+    windows = (("00:00", "06:00"), ("06:00", "20:00")) if night else (("06:00", "20:00"),)
+    return modules.scheduling.ScheduleSurfaceControl(
+        policy=modules.scheduling.SchedulePolicy(
+            allowed_windows_local=tuple(
+                (modules.scheduling.parse_hhmm(a), modules.scheduling.parse_hhmm(b))
+                for a, b in windows
+            ),
+            intent_ttl_s=10.0,
+            timezone="Australia/Brisbane",
+        ),
+        store=_PlanStore(),
+        acknowledged_night_windows=night,
+    )
+
+
+class _PlanStore:
+    def __init__(self) -> None:
+        self.plan: Any = None
+
+    def get(self) -> Any:
+        return self.plan
+
+    def replace(self, *, expected_version: int, replacement: Any) -> None:
+        actual = 0 if self.plan is None else self.plan.version
+        assert actual == expected_version and replacement.version == expected_version + 1
+        self.plan = replacement
+
+
+def _schedule_facade_rig(modules: Any, *, night: bool = False) -> Any:
+    from tests.unit.test_service_facade import (
+        OPERATOR,
+        FakeActorHandle,
+        FakeAuditRepository,
+        FakeAuthorizationRepository,
+        FakeClock,
+        FakeIntentRepository,
+        FakeObservationRepository,
+        RecordingCoordinator,
+    )
+
+    clock = FakeClock()
+    history: list[str] = []
+    handles = {
+        unit: FakeActorHandle(
+            unit_id=unit,
+            lifecycle=SimpleNamespace(value="disarmed"),
+            armed_lifecycle=SimpleNamespace(value="armed_idle"),
+            history=history,
+        )
+        for unit in ("pod-a", "pod-b")
+    }
+    surface = _schedule_surface(modules, night=night)
+    bus = modules.events.EventBus(retention=64, queue_capacity=64, clock=clock)
+    facade = modules.service.EnergyServiceFacade(
+        site_id="home",
+        clock=clock,
+        intents=FakeIntentRepository(),
+        observations=FakeObservationRepository(),
+        authorizations=FakeAuthorizationRepository({}, now_mono=clock.monotonic()),
+        audit=FakeAuditRepository(),
+        events=bus,
+        coordinator=RecordingCoordinator(
+            SimpleNamespace(
+                AuthorityGenerationCoordinator=_generation_module().AuthorityGenerationCoordinator
+            ),
+            history,
+        ),
+        actors=handles,
+        schedules=surface,
+    )
+    return SimpleNamespace(facade=facade, surface=surface, bus=bus, clock=clock, operator=OPERATOR)
+
+
+def _publish_body() -> dict[str, Any]:
+    return {
+        "principal": None,
+        "expected_version": None,
+        "timezone": "Australia/Brisbane",
+        "entries": [
+            {
+                "entry_id": "day-charge",
+                "days": ["mon", "tue", "wed", "thu", "fri"],
+                "start_local": "09:00",
+                "end_local": "17:00",
+                "action": "charge",
+                "watts": 1200,
+                "unit_ids": ["pod-a"],
+                "effective_from": "2020-01-01",
+                "effective_until": "2035-12-31",
+                "priority": 0,
+                "enabled": True,
+            }
+        ],
+        "idempotency_key": "publish-key-1",
+        "request_id": "request-p1",
+    }
+
+
+async def test_schedule_replaced_publishes_the_contract_payload() -> None:
+    modules = _schedule_modules()
+    rig = _schedule_facade_rig(modules)
+    subscription = rig.bus.subscribe(after_sequence=None)
+    body = _publish_body()
+    body["principal"] = rig.operator
+
+    await rig.facade.replace_schedule(**body)
+    events = await drain(subscription, 1)
+
+    assert [event["type"] for event in events] == ["schedule.replaced"]
+    payload = events[0]["payload"]
+    assert payload["principal"] == rig.operator.subject
+    assert payload["version"] == 1
+    assert payload["diff"] == {
+        "added": ["day-charge"],
+        "removed": [],
+        "changed": [],
+        "timezone_changed": False,
+    }
+    await close_subscription(subscription)
+
+
+async def test_window_events_are_transitions_never_heartbeats() -> None:
+    """opened publishes on the first submit for a window key only; renewal
+    ticks publish nothing; the removal tick publishes closing exactly once."""
+    from datetime import date, time
+
+    from energypod.domain.intents import Direction
+    from energypod.domain.schedule import ScheduleEntry, SchedulePlan, Weekday
+
+    modules = _schedule_modules()
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.now = 100.0
+            self.wall = datetime(2026, 8, 21, 1, 30, tzinfo=UTC)
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def wall_now(self) -> datetime:
+            return self.wall
+
+    clock = _Clock()
+    bus = modules.events.EventBus(retention=64, queue_capacity=64, clock=clock)
+    entry = ScheduleEntry(
+        entry_id="day-charge",
+        days=frozenset({Weekday.FRIDAY}),
+        start_local=time(9, 0),
+        end_local=time(17, 0),
+        action=Direction.CHARGE,
+        watts=1500,
+        unit_ids=frozenset({"pod-a", "pod-b"}),
+        effective_from=date(2020, 1, 1),
+        effective_until=date(2035, 12, 31),
+        priority=0,
+        enabled=True,
+        watts_by_unit={"pod-a": 700, "pod-b": 800},
+    )
+    store = _PlanStore()
+    store.plan = SchedulePlan(version=1, timezone="Australia/Brisbane", entries=(entry,))
+
+    async def get() -> Any:
+        return store.get()
+
+    submissions: list[dict[str, Any]] = []
+
+    async def submit(**kwargs: Any) -> dict[str, Any]:
+        submissions.append(kwargs)
+        return {"intent_id": f"schedule-{len(submissions)}"}
+
+    intents = FakeIntents()
+    runner = modules.scheduling.ScheduleRunner(
+        store=SimpleNamespace(get=get),
+        evaluator=modules.scheduling.ScheduleEvaluator(intent_ttl_s=10.0),
+        clock=clock,
+        submit=submit,
+        intents=intents,
+        bus=bus,
+    )
+    subscription = bus.subscribe(after_sequence=None)
+
+    await runner.tick()
+    opened = await drain(subscription, 1)
+    await runner.tick()
+    await runner.tick()
+    clock.wall = datetime(2026, 8, 21, 7, 0, tzinfo=UTC)  # 17:00 Friday: the window ends
+    await runner.tick()
+    closing = await drain(subscription, 1)
+
+    assert [event["type"] for event in opened] == ["schedule_window.opened"]
+    payload = opened[0]["payload"]
+    assert payload["entry_id"] == "day-charge"
+    assert payload["version"] == 1
+    assert payload["action"] == "charge"
+    assert payload["watts"] == 1500
+    assert payload["watts_by_unit"] == {"pod-a": 700, "pod-b": 800}
+    assert payload["unit_ids"] == ["pod-a", "pod-b"]
+    assert payload["ends_at"].startswith("2026-08-21T17:00")
+    assert len(submissions) == 3, "open + two renewals"
+    assert [event["type"] for event in closing] == ["schedule_window.closing"]
+    assert closing[0]["payload"]["reason"] == "window_ended"
+    await close_subscription(subscription)

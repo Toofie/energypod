@@ -438,3 +438,70 @@ async def test_excess_toggle_boundary_hardening() -> None:
         assert malformed.status_code == 200, malformed.text
     calls = [name for name, _ in service.calls if name == "set_excess_charging"]
     assert calls, "the authenticated toggle must reach the service"
+
+
+async def test_schedule_publish_boundary_hardening() -> None:
+    """DESIGN_SCHEDULES §5: the whole-plan publish gets the same hardened
+    boundary as every mutation — bearer before anything, dispatch scope plus
+    an interactive principal, an Idempotency-Key always, and a malformed body
+    never reaching the service."""
+    from fastapi.testclient import TestClient
+
+    from energypod.api.rest import create_api_app
+    from energypod.application.scheduling import ScheduleRefusal
+
+    service = RecordingEnergyService()
+    app = create_api_app(
+        service=service,
+        authenticator=FakeAuthenticator(),
+        event_source=FakeEventSource(),
+    )
+    body = {
+        "expected_version": None,
+        "timezone": "Australia/Brisbane",
+        "entries": [
+            {
+                "entry_id": "day-charge",
+                "days": ["mon"],
+                "start_local": "09:00",
+                "end_local": "17:00",
+                "action": "charge",
+                "watts": 1200,
+                "unit_ids": ["pod-a"],
+                "effective_from": "2026-01-01",
+                "effective_until": "2026-12-31",
+                "priority": 0,
+                "enabled": True,
+            }
+        ],
+    }
+    with TestClient(app) as client:
+        anonymous = client.put("/api/v1/schedule", json=body)
+        # Bearer first: an anonymous caller never learns more than the envelope.
+        assert anonymous.status_code == 401
+        assert anonymous.json()["code"] == "authentication_required"
+        keyless = client.put(
+            "/api/v1/schedule", json=body, headers={"Authorization": "Bearer operator-token"}
+        )
+        assert keyless.status_code == 400
+        assert keyless.json()["code"] == "idempotency_key_required"
+        accepted = client.put(
+            "/api/v1/schedule",
+            json=body,
+            headers={"Authorization": "Bearer operator-token", "Idempotency-Key": "sched-1"},
+        )
+        assert accepted.status_code == 200
+        # A refusal is never cached as success: the retry re-reaches the service.
+        service.schedule_refusal = ScheduleRefusal(
+            "schedule_version_conflict", "the plan changed elsewhere", {"current_version": 1}
+        )
+        refused = client.put(
+            "/api/v1/schedule",
+            json=body,
+            headers={"Authorization": "Bearer operator-token", "Idempotency-Key": "sched-2"},
+        )
+        assert refused.status_code == 409
+        assert refused.json()["code"] == "schedule_version_conflict"
+        assert refused.json()["details"] == {"current_version": 1}
+    calls = [name for name, _ in service.calls if name == "replace_schedule"]
+    assert len(calls) == 2, "the accepted publish and the refused retry both reached the service"

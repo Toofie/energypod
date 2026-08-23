@@ -23,6 +23,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    StrictBool,
     StrictFloat,
     StrictInt,
     field_validator,
@@ -31,6 +32,7 @@ from pydantic import (
 from starlette.websockets import WebSocketDisconnect
 
 from energypod.application.excess_charge import ExcessChargingRefusal
+from energypod.application.scheduling import SchedulePublishValidationError, ScheduleRefusal
 
 from .idempotency import IdempotencyConflictError, IdempotencyCoordinator, StoredResult
 
@@ -70,6 +72,8 @@ class EnergyService(Protocol):
     async def acknowledge_emergency_stop(self, **kwargs: Any) -> dict[str, Any]: ...
     async def acknowledge_inhibit(self, **kwargs: Any) -> dict[str, Any]: ...
     async def set_excess_charging(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
 class EventSource(Protocol):
@@ -208,6 +212,64 @@ class ExcessChargingRequest(StrictRequest):
     action: Literal["enable", "disable"]
     confirmation: Literal["EXCESS"]
     economics: Literal["NET_BILLED"] | None = None
+
+
+class ScheduleEntryRequest(StrictRequest):
+    """DESIGN_SCHEDULES §5: one entry of the whole-plan PUT body.
+
+    The boundary pins the wire SHAPE (typed fields, both watt forms optional
+    at parse time); every domain rule — cross-midnight legality, dual-form
+    exclusivity against the selection, name uniqueness, equal-priority
+    overlap, the allowed-window containment — is the facade's, whose errors
+    name the offending ``entry_id`` one-to-one.
+    """
+
+    entry_id: str = Field(min_length=1, max_length=128)
+    days: list[Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]] = Field(min_length=1)
+    start_local: str = Field(min_length=4, max_length=8)
+    end_local: str = Field(min_length=4, max_length=8)
+    action: Literal["charge", "discharge", "idle"]
+    watts: StrictInt | None = Field(default=None, ge=0)
+    watts_by_unit: dict[str, StrictInt] | None = None
+    unit_ids: list[str] = Field(min_length=1)
+    effective_from: str = Field(min_length=10, max_length=10)
+    effective_until: str = Field(min_length=10, max_length=10)
+    priority: StrictInt
+    enabled: StrictBool
+
+    @field_validator("unit_ids")
+    @classmethod
+    def validate_units(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value) or any(not _valid_id(item) for item in value):
+            raise ValueError("unit identifiers must be unique and canonical")
+        return value
+
+    @field_validator("watts_by_unit")
+    @classmethod
+    def validate_watts_by_unit(cls, value: dict[str, int] | None) -> dict[str, int] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("watts_by_unit must name every selected unit")
+        if any(watts <= 0 for watts in value.values()):
+            raise ValueError("watts_by_unit values must be positive")
+        return value
+
+
+class SchedulePutRequest(StrictRequest):
+    """DESIGN_SCHEDULES §5: the whole-plan CAS publish.
+
+    ``expected_version`` is the plan the editor loaded (``null`` asserts no
+    plan exists — the first publish); ``night_posture`` is consulted only on
+    the first night publish ever and only the literal acknowledgement is
+    valid.
+    """
+
+    expected_version: StrictInt | None = Field(default=None, ge=0)
+    timezone: str = Field(min_length=1, max_length=64)
+    # An empty entries list is legal and means OFF ("the plan IS the state").
+    entries: list[ScheduleEntryRequest] = Field(default_factory=list)
+    night_posture: Literal["PARTITION_ACKNOWLEDGED"] | None = None
 
 
 class BoundaryError(Exception):
@@ -856,6 +918,72 @@ def create_api_app(
             request=request,
             identity=identity,
             operation_name="set_excess_charging",
+            payload=payload,
+            status_code=200,
+            invoke=invoke,
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.get(f"{API_PREFIX}/schedule")
+    async def get_schedule(identity: Principal = observe_dependency) -> Any:
+        """DESIGN_SCHEDULES §5: the schedule view (observe scope).
+
+        Answers 409 ``schedule_not_commissioned`` verbatim when the config
+        block is absent — an absent block composes nothing, including this
+        route's data.
+        """
+        try:
+            return await service.get_schedule(principal=identity)
+        except ScheduleRefusal as exc:
+            raise BoundaryError(409, exc.code, exc.message, exc.details) from exc
+
+    @app.put(f"{API_PREFIX}/schedule")
+    async def put_schedule(
+        body: SchedulePutRequest,
+        request: Request,
+        identity: Principal = dispatch_dependency,
+    ) -> JSONResponse:
+        """DESIGN_SCHEDULES §5: the whole-plan CAS publish.
+
+        Dispatch scope PLUS an interactive principal (a publish is a
+        deliberate operator act) PLUS the Idempotency-Key every mutation
+        carries.  The facade's pinned validation order surfaces here
+        verbatim: 422 ``validation_error`` with the per-entry errors naming
+        the offending ``entry_id``, then the three 409 shapes.
+        """
+        if not identity.interactive:
+            raise BoundaryError(
+                403,
+                "interactive_operator_required",
+                "Interactive operator required",
+            )
+        payload = body.model_dump(mode="json")
+
+        async def invoke() -> dict[str, Any]:
+            try:
+                return await service.replace_schedule(
+                    expected_version=payload["expected_version"],
+                    timezone=payload["timezone"],
+                    entries=payload["entries"],
+                    night_posture=payload.get("night_posture"),
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
+            except ScheduleRefusal as exc:
+                raise BoundaryError(409, exc.code, exc.message, exc.details) from exc
+            except SchedulePublishValidationError as exc:
+                raise BoundaryError(
+                    422,
+                    "validation_error",
+                    "Request validation failed",
+                    {"errors": list(exc.entry_errors)},
+                ) from exc
+
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="replace_schedule",
             payload=payload,
             status_code=200,
             invoke=invoke,
