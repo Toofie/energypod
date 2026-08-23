@@ -95,6 +95,9 @@ def assert_audit(rig: Any, expected: Mapping[str, Any]) -> None:
         authorized_active_w=0,
         requested_watts_by_unit=None,
         authorized_watts_by_unit=None,
+        # Facade events describe no cycle composition (2026-08-24 concurrent
+        # operations added the field to every row): no directions map either.
+        directions_by_unit=None,
         request_fingerprint=fingerprint(expected["facts"]),
         response_fingerprint=fingerprint({"result": expected["result"]}),
         result=expected["result"],

@@ -1059,6 +1059,202 @@ async def test_snapshot_requested_power_follows_the_newest_active_intent(api: An
     assert units["pod-b"]["requested_power"] == {"direction": "idle", "watts": 0}
 
 
+# --- snapshot per-unit intent figures (2026-08-24 console cold-load fix) -----
+#
+# API_CONTRACTS "Application service facade": the snapshot's top-level
+# ``intent`` view carries the LIVE request's per-unit figures so a cold page
+# load mid-intent renders exact per-battery numbers instead of a labeled fleet
+# total.  Composed across ALL active intents under per-unit arbitration: each
+# unit's entry comes from THAT unit's winning intent, and the authorized map
+# mirrors the freshest control-decision row.  Null when no live intent claims
+# any unit.
+
+
+def decision_row(*, sequence: int, authorized: Mapping[str, int] | None) -> SimpleNamespace:
+    """One durable control_decision row as the audit port returns them."""
+    return SimpleNamespace(
+        sequence=sequence,
+        event_type="control_decision",
+        authorized_watts_by_unit=None if authorized is None else dict(authorized),
+    )
+
+
+def per_unit_intent(
+    api: Any,
+    *,
+    revision: int,
+    targets: Mapping[str, int],
+    direction: str = "discharge",
+    source: str = "manual",
+) -> Any:
+    """One live intent carrying explicit per-unit watt targets."""
+    units = frozenset(targets)
+    return api.PowerIntent(
+        id=f"intent-{revision}",
+        source=api.IntentSource(source),
+        selected_unit_ids=units,
+        direction=api.Direction(direction),
+        watts=sum(targets.values()),
+        watts_by_unit=dict(targets),
+        duration_s=60.0,
+        accepted_at_mono=90.0,
+        acceptance_revision=revision,
+        actor_identity="person:operator",
+    )
+
+
+async def test_snapshot_intent_view_is_null_without_any_live_intent(api: Any) -> None:
+    """No live claimant: the whole intent view is null and the audit trail --
+    the authorized map's only source -- is not even read."""
+    rig = make_rig(
+        api,
+        audit_events=(decision_row(sequence=3, authorized={"pod-a": 100}),),
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    assert snapshot["intent"] is None
+    assert rig.audit.recent_calls == [], "no live claimant means no decision scan"
+
+
+async def test_snapshot_intent_view_expires_with_the_intent(api: Any) -> None:
+    rig = make_rig(
+        api,
+        seeded_intents=(
+            manual_intent(api, revision=3, watts=900, accepted_at_mono=90.0, duration_s=5.0),
+        ),
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    assert snapshot["intent"] is None, "an expired intent claims no unit"
+
+
+async def test_snapshot_intent_view_splits_a_scalar_fleet_total_per_unit(api: Any) -> None:
+    """A scalar intent's fleet total becomes the exact integer share over its
+    surviving scope (largest remainder, ties by unit id) -- never the fleet
+    total repeated once per covered unit, which is what forced the console's
+    labeled-total fallback."""
+    rig = make_rig(
+        api,
+        units={"pod-a": {}, "pod-b": {}, "pod-c": {}},
+        seeded_intents=(
+            manual_intent(
+                api,
+                revision=4,
+                watts=1000,
+                unit_ids=frozenset({"pod-a", "pod-b", "pod-c"}),
+            ),
+        ),
+        audit_events=(
+            decision_row(sequence=9, authorized={"pod-a": 334, "pod-b": 333, "pod-c": 333}),
+        ),
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    assert snapshot["intent"] == {
+        "requested_watts_by_unit": {"pod-a": 334, "pod-b": 333, "pod-c": 333},
+        "authorized_watts_by_unit": {"pod-a": 334, "pod-b": 333, "pod-c": 333},
+        "directions_by_unit": {
+            "pod-a": "discharge",
+            "pod-b": "discharge",
+            "pod-c": "discharge",
+        },
+    }
+    # Compatibility: the per-unit scalar keeps projecting the intent's own
+    # fleet total exactly as before; only the new top-level view is per-unit.
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["requested_power"] == {"direction": "discharge", "watts": 1000}
+
+
+async def test_snapshot_intent_view_carries_exact_per_unit_targets(api: Any) -> None:
+    """A watts_by_unit intent shows each battery's own target exactly, even
+    before any decision has landed (authorized stays null, never fabricated)."""
+    rig = make_rig(
+        api,
+        seeded_intents=(per_unit_intent(api, revision=6, targets={"pod-a": 700, "pod-b": 300}),),
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    assert snapshot["intent"] == {
+        "requested_watts_by_unit": {"pod-a": 700, "pod-b": 300},
+        "authorized_watts_by_unit": None,
+        "directions_by_unit": {"pod-a": "discharge", "pod-b": "discharge"},
+    }
+
+
+async def test_snapshot_intent_view_composes_each_units_own_winner(api: Any) -> None:
+    """Two concurrent live intents on disjoint units (the operator's
+    2026-08-24 scenario: one battery charging while another discharges): every
+    unit's entry -- requested figure AND direction -- comes from ITS OWN
+    winning intent, one scalar and one per-unit, composed into one view."""
+    rig = make_rig(
+        api,
+        seeded_intents=(
+            manual_intent(
+                api,
+                revision=4,
+                watts=500,
+                direction="charge",
+                unit_ids=frozenset({"pod-a"}),
+            ),
+            per_unit_intent(
+                api,
+                revision=2,
+                targets={"pod-b": 400},
+                direction="discharge",
+                source="optimizer",
+            ),
+        ),
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    assert snapshot["intent"] == {
+        "requested_watts_by_unit": {"pod-a": 500, "pod-b": 400},
+        "authorized_watts_by_unit": None,
+        "directions_by_unit": {"pod-a": "charge", "pod-b": "discharge"},
+    }
+
+
+async def test_snapshot_intent_view_mirrors_the_freshest_decision_row(api: Any) -> None:
+    """The authorized map is the FRESHEST control-decision row's per-unit
+    figures, restricted to the units a live intent still claims: newer
+    non-decision rows are skipped, older decisions never override, and an
+    ended request's units never linger as ghosts."""
+    rig = make_rig(
+        api,
+        seeded_intents=(manual_intent(api, revision=3, watts=900),),
+        audit_events=(
+            SimpleNamespace(sequence=30, event_type="intent_accepted"),
+            decision_row(sequence=29, authorized={"pod-a": 600}),
+            decision_row(sequence=12, authorized={"pod-a": 111, "pod-b": 999}),
+        ),
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    assert snapshot["intent"]["requested_watts_by_unit"] == {"pod-a": 900}
+    assert snapshot["intent"]["authorized_watts_by_unit"] == {"pod-a": 600}
+
+
+async def test_snapshot_intent_view_survives_an_unreadable_audit_trail(api: Any) -> None:
+    """A degraded audit read leaves the authorized map null -- the requested
+    targets still render; nothing is fabricated."""
+    rig = make_rig(api, seeded_intents=(manual_intent(api, revision=3, watts=900),))
+    rig.audit.failing = True
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    assert snapshot["intent"] == {
+        "requested_watts_by_unit": {"pod-a": 900},
+        "authorized_watts_by_unit": None,
+        "directions_by_unit": {"pod-a": "discharge"},
+    }
+
+
 async def test_snapshot_is_read_only_and_never_triggers_control(api: Any) -> None:
     rig = make_rig(api)
 

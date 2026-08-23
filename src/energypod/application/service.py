@@ -33,6 +33,8 @@ from typing import Any, Final, Protocol
 from energypod.domain import Direction, IntentSource, Observation, PowerIntent, UnitLifecycle
 from energypod.domain.audit import AuditEvent
 
+from .arbiter import IntentArbiter
+
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
 # API_CONTRACTS: a latched stop carries a fixed duration of at least 24 hours
@@ -44,6 +46,13 @@ _LATCHED_STOP_DURATION_S: Final[float] = 86_400.0
 # facade has no policy, so its snapshot view applies only this conservative
 # display bound: telemetry older than this is never labelled "good".
 _SNAPSHOT_GOOD_TELEMETRY_MAX_AGE_S: Final[float] = 30.0
+
+# API_CONTRACTS "Application service facade" (2026-08-24 cold-load fix): the
+# snapshot's per-unit intent view mirrors the FRESHEST control-decision row for
+# its authorized figures.  One bounded newest-first read is scanned for the
+# newest decision; when the window holds none, the authorized map is null --
+# never fabricated and never dug out of older history.
+_SNAPSHOT_DECISION_SCAN_LIMIT: Final[int] = 25
 
 _ARMED_LIFECYCLES: Final[frozenset[str]] = frozenset({"armed_idle", "active"})
 _FACADE_POLICY_VERSION: Final[str] = "facade"
@@ -332,6 +341,25 @@ def _requested_power(unit_id: str, intents: Sequence[Any]) -> dict[str, Any]:
     return {"direction": _enum_value(newest.direction), "watts": int(newest.watts)}
 
 
+def _scalar_unit_shares(total_watts: int, units: Sequence[str]) -> dict[str, int]:
+    """Exact integer shares of one scalar fleet total over its surviving scope.
+
+    A scalar intent names no per-unit attribution, so the snapshot projects its
+    total as the headroom-blind request-time share: largest-remainder over the
+    sorted surviving scope, ties by unit id, summing exactly to the intent's
+    own total.  The decision's capacity-weighted split stays the authorized
+    map's job (the freshest decision row); the two are deliberately different
+    projections of the same request.
+    """
+    ordered = sorted(units)
+    if not ordered:
+        return {}
+    base, remainder = divmod(int(total_watts), len(ordered))
+    return {
+        unit_id: base + (1 if index < remainder else 0) for index, unit_id in enumerate(ordered)
+    }
+
+
 def _authorized_projection(capability: Any) -> dict[str, Any] | None:
     if capability is None:
         return None
@@ -518,6 +546,9 @@ class EnergyServiceFacade:
             "snapshot_sequence": sequence,
             "captured_at": self._clock.wall_now().isoformat(),
             "units": units,
+            # Per-unit intent figures (2026-08-24 cold-load fix): null when no
+            # live intent claims any unit.
+            "intent": await self._intent_projection(active, now_mono),
             # Console truth (2026-08-23): a latched emergency stop must be
             # visible in a snapshot taken after the latch event, not only on
             # the event stream.  Only non-acknowledged latches appear -- an
@@ -1381,6 +1412,90 @@ class EnergyServiceFacade:
             if inhibit_latched and inhibit_cause is not None
             else None,
         }
+
+    async def _intent_projection(
+        self, active: Sequence[Any], now_mono: float
+    ) -> dict[str, Any] | None:
+        """The live request's per-unit figures, composed across every winner.
+
+        Concurrent per-unit arbitration (2026-08-24) means several intents can
+        hold different batteries at once, so the view is composed with the SAME
+        per-unit winner-set arbitration the kernel's cycle uses -- a fresh,
+        throwaway arbiter per read, since the facade only ever projects.  Each
+        claimed unit's entry comes from ITS OWN winning intent: the requested
+        figure is that unit's target when the winner carried per-unit targets,
+        else its exact share of the winner's scalar total over its surviving
+        scope; the direction is the winner's direction.  The authorized map
+        mirrors the freshest control-decision row, restricted to the units a
+        live intent still claims so an ended request's figures never linger.
+        """
+        selection = IntentArbiter().arbitrate(active, now_mono)
+        requested: dict[str, int] = {}
+        directions: dict[str, str] = {}
+        for intent in selection.ranked:
+            scope = sorted(selection.scopes.get(intent.id, frozenset()))
+            targets = getattr(intent, "watts_by_unit", None)
+            target_map = targets if isinstance(targets, Mapping) else None
+            shares = (
+                None
+                if target_map is not None
+                else _scalar_unit_shares(int(getattr(intent, "watts", 0)), scope)
+            )
+            for unit_id in scope:
+                target = target_map.get(unit_id) if target_map is not None else None
+                requested[unit_id] = (
+                    int(target) if type(target) is int else int((shares or {}).get(unit_id, 0))
+                )
+                directions[unit_id] = _enum_value(intent.direction)
+        if not requested:
+            # No live intent claims any unit (an expired intent claims none):
+            # the whole view is null, and the audit trail was never read.
+            return None
+        freshest = await self._latest_decision_authorized_watts()
+        authorized = (
+            None
+            if freshest is None
+            else (
+                {unit_id: watts for unit_id, watts in freshest.items() if unit_id in requested}
+                or None
+            )
+        )
+        return {
+            "requested_watts_by_unit": dict(sorted(requested.items())),
+            "authorized_watts_by_unit": (
+                None if authorized is None else dict(sorted(authorized.items()))
+            ),
+            "directions_by_unit": dict(sorted(directions.items())),
+        }
+
+    async def _latest_decision_authorized_watts(self) -> dict[str, int] | None:
+        """The freshest control-decision row's per-unit authorized watts.
+
+        One bounded newest-first audit read; the first ``control_decision`` row
+        in the window decides, exactly as the kernel's own per-tick audit does.
+        A row that minted no batch carries no map, and a window without a
+        decision or an unreadable audit trail both mean the same thing here:
+        no decision to mirror, so ``None`` -- never an older row dug out of
+        history and never a fabricated figure.
+        """
+        try:
+            events = await self._audit.recent(limit=_SNAPSHOT_DECISION_SCAN_LIMIT)
+        except Exception:
+            # A degraded audit read is the absence of a freshest decision, not
+            # a snapshot failure: the requested targets still render.
+            return None
+        for event in events:
+            if getattr(event, "event_type", None) != "control_decision":
+                continue
+            raw = getattr(event, "authorized_watts_by_unit", None)
+            if not isinstance(raw, Mapping):
+                return None
+            return {
+                str(unit_id): int(watts)
+                for unit_id, watts in sorted(raw.items())
+                if type(watts) is int
+            }
+        return None
 
     def _quality_projection(self, telemetry: Any, age_s: float | None) -> str:
         if telemetry is None:

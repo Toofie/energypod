@@ -341,6 +341,25 @@ coordinator, the event bus, and per-unit actor handles.
   unit view additionally carries `inhibit_latched: bool` and `inhibit_cause: str | null` (the
   actor's recorded latch cause, null whenever the unit is not latched) so a console opened after
   a latch renders the release affordance from the snapshot alone.
+- The snapshot additionally carries a top-level `intent` view (2026-08-24 cold-load fix) with the
+  live request's per-unit figures, so a page opened mid-intent renders exact per-battery numbers
+  instead of a labeled fleet total: `{"requested_watts_by_unit": Record[str, int] | null,
+  "authorized_watts_by_unit": Record[str, int] | null, "directions_by_unit": Record[str, str] |
+  null}` — the whole view is `null` when no live intent claims any unit (an expired intent claims
+  none, and then the audit trail is not even read). The view is composed across ALL active
+  intents with the same per-unit winner-set arbitration a kernel cycle uses, so under concurrent
+  operations each unit's entry comes from THAT unit's winning intent: `requested_watts_by_unit`
+  is the unit's own target when its winner carried `watts_by_unit`, else its exact integer share
+  of the winner's scalar fleet total over its surviving scope (largest remainder over the sorted
+  scope, summing to the intent's own total — the headroom-blind request-time projection, distinct
+  from the capacity-weighted authorized split); `directions_by_unit` is each unit's winner's
+  direction (units may differ under concurrent intents, including `idle` under a latched stop);
+  `authorized_watts_by_unit` mirrors the FRESHEST `control_decision` audit row's per-unit
+  authorized map — newest-first scan, first decision row in the window decides, restricted to the
+  units a live intent still claims so an ended request's figures never linger — and is `null`
+  when that row minted no batch, the window holds no decision, or the audit read fails (never an
+  older row, never a fabricated figure). The per-unit `requested_power` scalars are unchanged and
+  keep projecting the intent's own fleet total for every covered unit.
 - `unit_detail(principal, unit_id)` (REST `GET /api/v1/units/{unit_id}`, `observe` scope)
   returns the full latest observation projection for one unit: identity (`device_identity`),
   `protocol_profile`, `connection_epoch`, telemetry and cell sequences and capture times, all
