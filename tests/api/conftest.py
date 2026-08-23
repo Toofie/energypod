@@ -176,6 +176,47 @@ class RecordingEnergyService:
     )
     schedule_refusal: Any = None
     schedule_error: Any = None
+    # The energy scorecard's scripted answers (API_CONTRACTS "Energy
+    # scorecard"): the days body and an optional refusal.
+    energy_days_view: dict[str, Any] = field(
+        default_factory=lambda: {
+            "days": [
+                {
+                    "date": "2026-08-25",
+                    "timezone": "Australia/Brisbane",
+                    "utc_offset_minutes": 600,
+                    "kind": "complete",
+                    "units": {},
+                    "fleet": {
+                        "grid_import_kwh": 8.3,
+                        "grid_export_kwh": 12.8,
+                        "battery_charged_kwh": 6.2,
+                        "battery_discharged_kwh": 4.1,
+                        "load_kwh": 14.7,
+                        "charged_from_surplus_kwh": 3.1,
+                        "coverage_pct": 99.4,
+                    },
+                    "sources": {
+                        "grid": "integrated_ct",
+                        "battery": "device_counter",
+                        "load": "device_counter",
+                        "surplus": "attributed_adviser",
+                    },
+                    "counter_cross_check": {
+                        "grid_a_delta_kwh": 8.3,
+                        "grid_b_delta_kwh": 12.8,
+                        "consistent_with": "vendor_labels",
+                        "discriminating": True,
+                    },
+                    "solar_production_measured": False,
+                }
+            ],
+            "grid_counter_roles": "unpinned",
+            "solar_production_measured": False,
+            "tariff": None,
+        }
+    )
+    energy_refusal: Any = None
 
     async def snapshot(self, *, principal: Principal) -> dict[str, Any]:
         self.calls.append(("snapshot", {"principal": principal}))
@@ -305,6 +346,12 @@ class RecordingEnergyService:
         if self.schedule_refusal is not None:
             raise self.schedule_refusal
         return dict(self.schedule_view)
+
+    async def get_energy_days(self, *, principal: Any, limit: int = 8) -> dict[str, Any]:
+        self.calls.append(("get_energy_days", {"principal": principal, "limit": limit}))
+        if self.energy_refusal is not None:
+            raise self.energy_refusal
+        return dict(self.energy_days_view)
 
     async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("replace_schedule", kwargs))

@@ -31,6 +31,7 @@ from pydantic import (
 )
 from starlette.websockets import WebSocketDisconnect
 
+from energypod.application.energy import EnergyScorecardRefusal
 from energypod.application.excess_charge import ExcessChargingRefusal
 from energypod.application.scheduling import SchedulePublishValidationError, ScheduleRefusal
 
@@ -74,6 +75,7 @@ class EnergyService(Protocol):
     async def set_excess_charging(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
     async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_energy_days(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
 class EventSource(Protocol):
@@ -992,6 +994,23 @@ def create_api_app(
             invoke=invoke,
         )
         return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.get(f"{API_PREFIX}/energy/days")
+    async def get_energy_days(
+        limit: int = Query(default=8, ge=1, le=31),
+        identity: Principal = observe_dependency,
+    ) -> Any:
+        """API_CONTRACTS "Energy scorecard": the rolled-days read.
+
+        Observe scope; ``limit`` in 1..31 (default 8), answered newest-LAST.
+        Answers 409 ``energy_scorecard_not_commissioned`` verbatim when the
+        config block is absent.  There is deliberately NO mutation on this
+        surface -- the scorecard is read-only by construction.
+        """
+        try:
+            return await service.get_energy_days(principal=identity, limit=limit)
+        except EnergyScorecardRefusal as exc:
+            raise BoundaryError(409, exc.code, exc.message) from exc
 
     @app.post(f"{API_PREFIX}/events/session")
     async def create_events_session(

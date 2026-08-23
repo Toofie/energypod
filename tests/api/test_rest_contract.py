@@ -1483,6 +1483,96 @@ def test_schedule_get_maps_the_not_commissioned_refusal_verbatim(
     _assert_error(response, 409, "schedule_not_commissioned")
 
 
+# --- energy scorecard days route (API_CONTRACTS "Energy scorecard", E5) --------
+
+
+def test_energy_days_requires_authentication_and_serves_the_pinned_body(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """Observe scope; the body is exactly the pinned days shape (plus the
+    null-when-absent tariff key): rolled days newest-LAST, the roles key,
+    solar never measured."""
+    with _client(service, authenticator) as client:
+        anonymous = client.get(f"{API}/energy/days")
+        unscoped = client.get(f"{API}/energy/days", headers=_auth("audit-only-token"))
+        viewed = client.get(f"{API}/energy/days", headers=_auth("viewer-token"))
+
+    _assert_error(anonymous, 401, "authentication_required")
+    _assert_error(unscoped, 403, "insufficient_scope")
+    assert viewed.status_code == 200
+    body = viewed.json()
+    assert set(body) == {
+        "days",
+        "grid_counter_roles",
+        "solar_production_measured",
+        "tariff",
+    }
+    assert body["grid_counter_roles"] == "unpinned"
+    assert body["solar_production_measured"] is False
+    assert body["tariff"] is None
+    assert [day["date"] for day in body["days"]] == ["2026-08-25"]
+    forwarded = [values for name, values in service.calls if name == "get_energy_days"]
+    assert forwarded[0]["principal"].subject == "person:viewer"
+    assert forwarded[0]["limit"] == 8, "the default limit"
+
+
+@pytest.mark.parametrize("limit", [1, 31])
+def test_energy_days_limit_bounds_are_inclusive(
+    limit: int, service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        response = client.get(
+            f"{API}/energy/days", params={"limit": limit}, headers=_auth("viewer-token")
+        )
+    assert response.status_code == 200
+    forwarded = [values for name, values in service.calls if name == "get_energy_days"]
+    assert forwarded[-1]["limit"] == limit
+
+
+@pytest.mark.parametrize("limit", [0, 32, -1, "many"])
+def test_energy_days_refuses_limits_outside_one_to_thirty_one(
+    limit: Any, service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        response = client.get(
+            f"{API}/energy/days", params={"limit": limit}, headers=_auth("viewer-token")
+        )
+    assert response.status_code == 422
+
+
+def test_energy_days_maps_the_not_commissioned_refusal_verbatim(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    from energypod.application.energy import EnergyScorecardRefusal
+
+    service.energy_refusal = EnergyScorecardRefusal(
+        "energy_scorecard_not_commissioned",
+        "the energy scorecard is not composed on this site",
+    )
+    with _client(service, authenticator) as client:
+        response = client.get(f"{API}/energy/days", headers=_auth("viewer-token"))
+
+    _assert_error(response, 409, "energy_scorecard_not_commissioned")
+
+
+def test_the_energy_surface_has_no_mutation(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """The scorecard is read-only by construction: every method on the days
+    route refuses, and the service double never sees a mutation."""
+    with _client(service, authenticator) as client:
+        posted = client.post(
+            f"{API}/energy/days", json={}, headers=_mutation_headers("operator-token")
+        )
+        put = client.put(f"{API}/energy/days", json={}, headers=_mutation_headers("operator-token"))
+        deleted = client.delete(f"{API}/energy/days", headers=_auth("operator-token"))
+
+    assert posted.status_code == 405
+    assert put.status_code == 405
+    assert deleted.status_code == 405
+    assert not [values for name, values in service.calls if name != "get_energy_days"]
+
+
 def test_schedule_put_publishes_the_whole_plan_with_an_idempotency_key(
     service: RecordingEnergyService, authenticator: FakeAuthenticator
 ) -> None:

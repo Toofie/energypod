@@ -46,6 +46,28 @@ async def test_default_mcp_surface_is_read_only_and_has_no_hidden_control_tools(
 
 
 @pytest.mark.asyncio
+async def test_mcp_energy_days_is_a_read_only_ride_along(
+    service: RecordingEnergyService,
+) -> None:
+    """API_CONTRACTS "Energy scorecard": the observe-scoped days read; no MCP
+    surface can touch sources or roles."""
+    server = await _server(service, principal_name="viewer-token")
+    async with Client(server) as client:
+        days = await client.call_tool("get_energy_days", {})
+        limited = await client.call_tool("get_energy_days", {"limit": 2})
+        with pytest.raises(Exception, match="(?i)limit"):
+            await client.call_tool("get_energy_days", {"limit": 32})
+
+    assert days.data["grid_counter_roles"] == "unpinned"
+    assert days.data["solar_production_measured"] is False
+    assert limited.data["days"][0]["date"] == "2026-08-25"
+    forwarded = [values for name, values in service.calls if name == "get_energy_days"]
+    assert forwarded[0]["limit"] == 8
+    assert forwarded[1]["limit"] == 2
+    assert len(forwarded) == 2, "a refused limit never reaches the service"
+
+
+@pytest.mark.asyncio
 async def test_default_tool_discovery_contains_no_mutation_schema_or_secret(
     service: RecordingEnergyService,
 ) -> None:

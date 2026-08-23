@@ -41,6 +41,7 @@ class EnergyService(Protocol):
     async def snapshot(self, *, principal: Principal) -> dict[str, Any]: ...
     async def health(self, *, principal: Principal) -> dict[str, Any]: ...
     async def recent_audit(self, *, principal: Principal, limit: int) -> dict[str, Any]: ...
+    async def get_energy_days(self, **kwargs: Any) -> dict[str, Any]: ...
     async def submit_intent(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
@@ -116,6 +117,16 @@ def create_mcp_server(
         """Return liveness, service readiness, and control readiness."""
         _require(session_principal, "observe")
         return await service.health(principal=session_principal)
+
+    @server.tool
+    async def get_energy_days(limit: StrictInt = 8) -> dict[str, Any]:
+        """Return the rolled daily energy records, newest last (read-only)."""
+        # API_CONTRACTS "Energy scorecard": a read-only ride-along tool -- no
+        # MCP surface can touch sources or roles.
+        _require(session_principal, "observe")
+        if isinstance(limit, bool) or not 1 <= limit <= 31:
+            raise ValueError("limit must be between 1 and 31")
+        return await service.get_energy_days(principal=session_principal, limit=limit)
 
     @server.tool
     async def get_recent_audit(limit: StrictInt = 100) -> dict[str, Any]:
