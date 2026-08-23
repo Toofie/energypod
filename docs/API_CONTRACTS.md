@@ -662,6 +662,17 @@ eligible_charge_w = min(max_charge_from_export_w,
   evidence — a read plan without the mode blocks, or a unit yet to publish — refuses nothing: the
   advisory doctrine, with the safety kernel's staleness gates as the backstop. The controller never
   writes `0x8000`/`0x0101`; the mode words are read-only evidence.
+- Read-plan tier correction + fresh re-read before refusal (SYNC_RESILIENCE_AUDIT B5, 2026-08-24):
+  the system overview block (0x0100 — ctrlMode +1, workMode +2, the advisory system SOC +17) rides
+  the COLD RING (one window every 8th cycle, ~108 s rotation) — it is no longer a once-per-process
+  cycle-1 read, so the mode words and the advisory SOC semi-refresh instead of being pinned to
+  process start. Because a cached ctrlMode word can still be ~a ring period stale, the
+  `device_mode_not_remote` refusal path performs ONE bounded fresh read of the 0x0100 mode words
+  through the owning actor (a serialized mailbox operation below heartbeat priority, bounded by
+  `write_timeout_s`; one retry on a failed read) whenever the cached word would refuse: the cached
+  word alone NEVER refuses. A fresh-confirmed non-Remote still refuses; two consecutive failed
+  refresh reads refuse (genuinely unreadable, class D). The debug-mode half of the gate is
+  unchanged — its word rides the control-rate core and is judged as decoded.
 
 ## Control-decision audit attribution
 
@@ -693,9 +704,9 @@ every telemetry cycle. The plan stays inside the commissioned cadence budget: st
 ≤ 8 windows plus the probe (~0.9 s at the 0.1 s inter-frame gap, inside the 1.5 s control
 period; bootstrap cycle ≤ 10 windows). With the feature absent or disabled the plan matches
 today's in structure, budget, and ring period — PCS block included in the ~108 s cold ring —
-with one rotation-phase change: the default ring now visits the PCS block first (cycle 8)
-rather than at cycle 72, so advisory grid data appears within seconds of boot instead of
-~108 s.
+with one rotation-phase change: the default ring now visits the SYSTEM OVERVIEW first (cycle 8,
+B5's cold-ring move) and the PCS block at cycle 16, so the advisory mode words and system SOC
+appear within seconds of boot instead of at the ring's tail.
 
 ### Beat-autonomy hysteresis
 

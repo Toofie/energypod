@@ -17,6 +17,7 @@ sequence may turn the response into an error, but it never removes a step.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import itertools
@@ -181,6 +182,12 @@ class ActorHandle(Protocol):
     async def acknowledge_inhibit(self) -> None: ...
 
     async def request_bounded_zero(self, reason: str) -> None: ...
+
+    # B5 (SYNC_RESILIENCE_AUDIT): the bounded fresh mode-word read the
+    # dispatch refusal path performs before denying on a cached non-Remote
+    # word.  Read defensively through ``getattr`` -- a handle without the
+    # port fails its refresh reads and the two-failure policy refuses.
+    async def refresh_mode_words(self) -> tuple[int, int]: ...
 
 
 @dataclass(frozen=True)
@@ -1316,6 +1323,14 @@ class EnergyServiceFacade:
         (a read plan without the mode blocks, or a unit yet to publish)
         changes nothing -- the advisory doctrine, and the safety kernel's own
         staleness gates remain the backstop.
+
+        SYNC_RESILIENCE_AUDIT B5 (2026-08-24): the debug-mode word rides the
+        control-rate core, but ctrlMode rides the cold ring (~108 s), so a
+        cached non-Remote word may be minutes stale.  The CACHED word alone
+        never refuses: before denying, the path performs ONE bounded fresh
+        read of the mode words through the owning actor (one retry on a
+        failed read), and only a fresh-confirmed non-Remote -- or two failed
+        refresh reads, genuinely-unreadable class D -- refuses.
         """
         debugging: list[str] = []
         local: list[str] = []
@@ -1323,12 +1338,46 @@ class EnergyServiceFacade:
             observation = await self._latest_observation(unit_id)
             if getattr(observation, "debug_mode_active", None) is True:
                 debugging.append(unit_id)
-            elif getattr(observation, "ctrl_mode_remote", None) is False:
+            elif getattr(observation, "ctrl_mode_remote", None) is False and (
+                await self._fresh_confirmed_not_remote(unit_id)
+            ):
                 local.append(unit_id)
         if debugging:
             raise ValueError(f"device_debug_mode_active: {sorted(debugging)}")
         if local:
             raise ValueError(f"device_mode_not_remote: {sorted(local)}")
+
+    async def _fresh_confirmed_not_remote(self, unit_id: str) -> bool:
+        """B5: re-read the mode words once (bounded) before refusing on them.
+
+        Returns whether the unit is CONFIRMED non-Remote on fresh evidence.
+        A fresh ctrlMode 1 (Remote) clears the cached refusal -- the operator
+        flipping the pod to Remote takes effect at the very next dispatch,
+        not at the next cold-ring rotation.  Any other fresh value, or two
+        failed refresh reads, confirms the refusal: the mode word is then
+        either genuinely Local or genuinely unreadable (class D).
+        """
+        handle = self._actors.get(unit_id)
+        refresh = getattr(handle, "refresh_mode_words", None)
+        served: list[tuple[int, int]] = []
+        failures: list[BaseException] = []
+        for _ in range(2):
+            try:
+                if not callable(refresh):
+                    raise RuntimeError(f"{unit_id}: no mode refresh port is wired")
+                served.append(await refresh())
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # One bounded retry; a second failure leaves ``served`` empty
+                # and the refusal below stands (genuinely unreadable, class D).
+                failures.append(error)
+            else:
+                break
+        del failures
+        if not served:
+            return True
+        return int(served[-1][0]) != 1
 
     async def _latest_observation(self, unit_id: str) -> Any | None:
         """The unit's latest observation, or ``None`` when it cannot be read.

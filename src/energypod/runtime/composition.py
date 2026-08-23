@@ -1202,16 +1202,29 @@ class _LiveDecodeTelemetry:
     def read_plan(self) -> tuple[tuple[int, int], ...]:
         """This cycle's windows under the commissioned tiered refresh.
 
-        Every cycle: the BMS block and the three IoT fault blocks (everything
-        the safety kernel consumes at the control rate) plus temperatures —
-        and, with the excess-solar feature enabled, the PCS live block so the
-        advisory grid word rides the control rate.  Every third cycle: the
-        cell-voltage window (the domain already models cells on their own
+        Every cycle: the BMS block, the three IoT fault blocks and the cell
+        temperatures (everything the safety kernel consumes at the control
+        rate), the two-word identity pair (a physically swapped unit must
+        latch on the very next poll), and the one-word debug-mode readback
+        (the vendor's dispatch precondition, judged at the control rate);
+        with the excess-solar feature enabled the PCS live block joins them
+        so the advisory grid word rides the control rate.  Every third cycle:
+        the cell-voltage window (the domain already models cells on their own
         slower capture clock; the policy's cell-age bound covers the tier).
-        First cycle: the stable identity pair, cached for the process
-        lifetime.  Every eighth cycle: one cold-ring window (PCS/DCDC detail,
-        system overview, parameters, balance, energy) so the unit-detail
-        surface stays populated without threatening the renewal cadence.
+        Every eighth cycle: ONE cold-ring window (system overview, PCS/DCDC
+        live and detail, parameters, balance, network, energy) rotating
+        through the remaining blocks so the unit-detail surface stays
+        populated without threatening the renewal cadence.
+
+        SYNC_RESILIENCE_AUDIT B5 (2026-08-24): the system overview block
+        (0x0100: ctrlMode +1, workMode +2, the ADVISORY system SOC +17) is
+        NOT a once-per-process read any more.  The old cycle-1-only tier is
+        exactly the shape that froze mid's system SOC at 67 % for 112
+        sequences (the 2026-08-24 soc incident) and would pin a boot-time
+        Local mode word for the process lifetime; it now rotates with the
+        cold ring (~108 s period), the ring serves one window per 8th cycle
+        either way, and the B5 dispatch-refusal refresh plus B1's advisory
+        demotion cover the words the ring cannot serve promptly.
         """
         probe = self._probe_require()
         full = [
@@ -1243,18 +1256,13 @@ class _LiveDecodeTelemetry:
         plan = [(base, by_base[base]) for base in sorted(core_bases) if base in by_base]
         if _CELL_VOLTAGE_BASE in by_base and self._cycle % 3 == 1:
             plan.append((_CELL_VOLTAGE_BASE, by_base[_CELL_VOLTAGE_BASE]))
-        if self._cycle == 1 and _SYSTEM_BLOCK_BASE in by_base:
-            plan.append((_SYSTEM_BLOCK_BASE, by_base[_SYSTEM_BLOCK_BASE]))
-        cold = sorted(
-            base
-            for base in by_base
-            if base not in core_bases | {_CELL_VOLTAGE_BASE, _SYSTEM_BLOCK_BASE}
-        )
+        cold = sorted(base for base in by_base if base not in core_bases | {_CELL_VOLTAGE_BASE})
         if cold and self._cycle % 8 == 0:
-            # The rotation starts at the PCS live block: with the feature
-            # disabled that keeps the advisory grid word inside the FIRST
-            # cold-ring refresh of any observation window (and the ring's
-            # ~108 s period unchanged), instead of its old last-place slot.
+            # The rotation starts at the system overview block (0x0100 sorts
+            # first): the advisory system SOC and the display-mode words get
+            # the FIRST cold-ring refresh (cycle 8, ~12 s at the 1.5 s
+            # cadence) instead of a former last-place slot, and the ring's
+            # one-window-per-8th-cycle shape keeps the per-cycle budget.
             chosen = cold[((self._cycle // 8) - 1) % len(cold)]
             plan.append((chosen, by_base[chosen]))
         return tuple(plan)
@@ -1355,6 +1363,10 @@ class _ActorCommandHandle:
 
     async def request_bounded_zero(self, reason: str) -> None:
         await self._actor.request_bounded_zero(reason)
+
+    async def refresh_mode_words(self) -> tuple[int, int]:
+        """B5: the actor-owned bounded fresh mode-word read."""
+        return await self._actor.refresh_mode_words()
 
     async def fence(self, reason: str) -> int:
         # The facade's emergency stop fences the actor so an in-flight
@@ -2332,6 +2344,10 @@ def _build_runtime(
                 _OBJECTIVE_READBACK_ADDRESS if write_enabled and not simulate else None
             ),
             blocking_fault_codes=frozenset(policy.blocking_fault_codes),
+            # B5: the bounded fresh mode-word read behind the dispatch
+            # refusal path -- wired wherever a register bank actually serves
+            # the system overview (every live and simulated unit does).
+            mode_refresh_window=(_SYSTEM_BLOCK_BASE, 3),
             telemetry=telemetry,
         )
 

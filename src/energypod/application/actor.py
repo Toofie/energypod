@@ -87,6 +87,7 @@ class EnergyPodActor:
         heartbeat_safety_margin_s: float,
         objective_readback_address: int | None = None,
         blocking_fault_codes: frozenset[str] | None = None,
+        mode_refresh_window: tuple[int, int] | None = None,
         telemetry: Any | None = None,
     ) -> None:
         if stable_observations_required < 1:
@@ -101,6 +102,14 @@ class EnergyPodActor:
             not code or code != code.strip() for code in blocking_fault_codes
         ):
             raise ValueError("blocking_fault_codes must be non-empty and normalized")
+        if mode_refresh_window is not None and (
+            len(mode_refresh_window) != 2
+            or type(mode_refresh_window[0]) is not int
+            or type(mode_refresh_window[1]) is not int
+            or mode_refresh_window[0] < 0
+            or mode_refresh_window[1] < 3
+        ):
+            raise ValueError("mode_refresh_window must be an (address, count>=3) pair")
 
         self.unit_id = unit_id
         self._transport = transport
@@ -125,6 +134,13 @@ class EnergyPodActor:
         self._heartbeat_interval = heartbeat_interval_s
         self._heartbeat_margin = heartbeat_safety_margin_s
         self._blocking_fault_codes = frozenset(blocking_fault_codes or ())
+        # SYNC_RESILIENCE_AUDIT B5 (2026-08-24): the bounded fresh read of the
+        # system-mode window (0x0100: ctrlMode +1, workMode +2) the dispatch
+        # refusal path performs when the CACHED ctrlMode word would refuse.
+        # The cached word rides the cold ring (~108 s), so without this port a
+        # pod that was in Local at some earlier moment could refuse dispatch
+        # on stale evidence.  ``None`` keeps the arm path exactly as today.
+        self._mode_refresh_window = mode_refresh_window
         # Optional telemetry strategy (structural port): the composition root
         # may inject the poll->decode->deliver strategy so one telemetry cycle
         # reads the selected register-layout plan through this actor's sole
@@ -250,6 +266,20 @@ class EnergyPodActor:
         owes its own bounded zero before closing the transport.
         """
         await self._submit("zero", reason, _ZERO_PRIORITY)
+
+    async def refresh_mode_words(self) -> tuple[int, int]:
+        """One bounded fresh read of the system-mode words (B5).
+
+        Reads exactly the wired system-mode window (0x0100, three words) once
+        through this actor's sole transport, inside the mailbox dispatch, so
+        the API refusal path can judge ctrlMode on FRESH evidence instead of
+        the cold-ring cache.  The read is bounded by the heartbeat margin
+        (wired from ``write_timeout_s``) and runs below heartbeat priority,
+        so it can never delay a renewal; a failing or unwired read raises,
+        and the caller's two-failures policy does the rest.
+        """
+        words = await self._submit("refresh_mode_words", None, _CONTROL_PRIORITY)
+        return (int(words[0]) & 0xFFFF, int(words[1]) & 0xFFFF)
 
     async def acknowledge_inhibit(self) -> None:
         """Clear one latched inhibit cause.
@@ -411,6 +441,8 @@ class EnergyPodActor:
             return await self._heartbeat_owned()
         if operation == "zero":
             return await self._attempt_zero_owned()
+        if operation == "refresh_mode_words":
+            return await self._refresh_mode_words_owned()
         if operation == "acknowledge_inhibit":
             return self._acknowledge_inhibit_owned()
         if operation == "stop":
@@ -486,6 +518,25 @@ class EnergyPodActor:
         observation = telemetry.decode(blocks, self.lifecycle)
         await self._accept_observation_owned(observation)
         return blocks[essential]
+
+    async def _refresh_mode_words_owned(self) -> tuple[int, int]:
+        """The B5 bounded fresh read of (ctrlMode, workMode) served words."""
+        window = self._mode_refresh_window
+        if window is None:
+            raise RuntimeError(f"{self.unit_id}: no mode refresh window is wired for this actor")
+        address, count = window
+        try:
+            async with asyncio.timeout(self._heartbeat_margin or 0.1):
+                words = tuple(await self._transport.read_holding(address, count))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            raise RuntimeError(f"{self.unit_id}: the mode-word refresh read failed") from error
+        if len(words) < 3:
+            raise RuntimeError(
+                f"{self.unit_id}: the mode-word window did not serve ctrlMode and workMode"
+            )
+        return (int(words[1]) & 0xFFFF, int(words[2]) & 0xFFFF)
 
     def _latching_fault_present(self, observation: Any) -> bool:
         # Blocking-fault classification is the policy's: composition wires the

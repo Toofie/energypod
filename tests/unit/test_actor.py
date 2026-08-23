@@ -270,6 +270,7 @@ def make_actor(
     observations: FakeObservationRepository | None = None,
     authorizations: FakeAuthorizationRepository | None = None,
     blocking_fault_codes: frozenset[str] | None = None,
+    mode_refresh_window: tuple[int, int] | None = None,
 ) -> tuple[Any, FakeClock, SpyTransport, FakeObservationRepository, FakeAuthorizationRepository]:
     test_clock = clock or FakeClock()
     test_transport = transport or SpyTransport()
@@ -292,6 +293,7 @@ def make_actor(
         heartbeat_interval_s=1.0,
         heartbeat_safety_margin_s=0.2,
         blocking_fault_codes=blocking_fault_codes,
+        mode_refresh_window=mode_refresh_window,
     )
     return actor, test_clock, test_transport, observation_repo, authorization_repo
 
@@ -327,6 +329,34 @@ async def test_boot_is_observe_only_and_requires_qualification_then_explicit_arm
     assert actor.lifecycle is contract.UnitLifecycle.ARMED_IDLE
     assert transport.writes == []
 
+    await actor.shutdown()
+
+
+async def test_mode_word_refresh_reads_one_bounded_window_through_the_transport(
+    contract: Any,
+) -> None:
+    """SYNC_RESILIENCE_AUDIT B5: the dispatch-refusal path needs a FRESH
+    ctrlMode word (the cached one rides the once-per-process system tier).
+    The refresh is a mailbox operation on this actor -- the sole transport
+    owner -- reading exactly the three-word system-mode window, bounded by
+    the heartbeat margin, never touching the control cadence."""
+    actor, _, transport, _, _ = make_actor(contract, mode_refresh_window=(0x0100, 3))
+    await actor.start()
+
+    words = await actor.refresh_mode_words()
+
+    assert words == (0, 0), "the raw served ctrl/work words, decoded from +1/+2"
+    reads = [detail for name, detail in transport.history if name == "read:start"]
+    assert (0x0100, 3) in reads, "the refresh reads exactly the system-mode window"
+    await actor.shutdown()
+
+
+async def test_mode_word_refresh_without_a_wired_window_fails_closed(contract: Any) -> None:
+    actor, _, _, _, _ = make_actor(contract)
+    await actor.start()
+
+    with pytest.raises(RuntimeError, match="mode refresh window"):
+        await actor.refresh_mode_words()
     await actor.shutdown()
 
 

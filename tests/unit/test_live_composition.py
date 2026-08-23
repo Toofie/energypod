@@ -779,12 +779,13 @@ async def test_replayed_live_capture_serves_the_full_run_mode_read_plan(
             assert wired[0].port == expectation.port
             assert wired[0].device_id == expectation.device_id
             windows = journal.windows_for(expectation.host)
-            # Commissioned tiered refresh (2026-08-22): one cycle reads the
-            # control-rate core (BMS, the three fault blocks, temperatures,
-            # the identity pair) plus the cycle-1 bootstrap windows (cells and
-            # the system overview); the remaining evidenced windows rotate on
-            # slower tiers, so the full plan is covered across cycles, not
-            # within one.
+            # Commissioned tiered refresh (2026-08-22; B5 2026-08-24): one
+            # cycle reads the control-rate core (BMS, the three fault blocks,
+            # temperatures, the identity pair, the debug readback) plus the
+            # cycle-1 cell window; the system overview now rides the cold
+            # ring (no longer a once-per-process read), and the remaining
+            # evidenced windows rotate on slower tiers, so the full plan is
+            # covered across cycles, not within one.
             core = {
                 (0x5000, 31),
                 (0x1040, 22),
@@ -793,11 +794,10 @@ async def test_replayed_live_capture_serves_the_full_run_mode_read_plan(
                 (0x523C, expectation.bic_count * 3),
                 (0x8106, 2),
                 (0x5200, min(expectation.bic_count * 10, 100)),
-                (0x0100, 61),
             }
             assert windows >= core, (
                 f"{expectation.unit_id} read {sorted(windows)}; one cycle must read "
-                "the control-rate core plus the cycle-1 bootstrap windows"
+                "the control-rate core plus the cycle-1 cell window"
             )
             assert (0x5000, 7) in windows, "the essential layout probe stays part of the cycle"
     finally:
@@ -827,6 +827,16 @@ async def test_replayed_live_capture_decodes_real_telemetry_and_an_honest_snapsh
             await actor.start()
             await actor.poll_once()
             await runtime.clock.sleep(0.05)
+            # B5: the system overview rides the cold ring and is served on
+            # cycle 8; until then the BMS SOC stands in for the advisory
+            # system figure exactly as the decoder's stand-in doctrine pins.
+            first = await runtime.observations.latest(expectation.unit_id)
+            assert first is not None
+            assert first.system_soc_pct == pytest.approx(expectation.bms_soc_pct), (
+                "before the cold ring serves the system block, the BMS figure stands in"
+            )
+            for _ in range(7):
+                await actor.poll_once()
             await actor.poll_once()
 
             history = await runtime.observations.history(expectation.unit_id)
@@ -1341,7 +1351,9 @@ async def test_pcs_live_block_is_promoted_to_the_control_rate_core_for_excess_ch
 
     default_plans: list[tuple[tuple[int, int], ...]] = []
     strategy = _live_decode_strategy(bank, promote_pcs_live_block=False)
-    for _ in range(9):
+    # B5 added the system overview to the cold ring (9 rotating windows), so
+    # the PCS live block serves at cycle 16 of a 17-cycle sample.
+    for _ in range(17):
         await strategy.advance()
         default_plans.append(strategy.read_plan())
     coldring_cycles = [plan for plan in default_plans if window in plan]
@@ -1363,3 +1375,39 @@ async def test_pcs_live_block_is_promoted_to_the_control_rate_core_for_excess_ch
             f"cycle {cycle} reads {len(plan)} windows; the promoted plan must stay inside "
             "the commissioned cadence budget"
         )
+
+
+async def test_the_system_overview_block_rides_the_cold_ring_not_a_once_per_process_read() -> None:
+    """SYNC_RESILIENCE_AUDIT B5 + the SOC-incident read-plan follow-up.
+
+    The system overview (0x0100: ctrlMode +1, workMode +2, the advisory
+    system SOC +17) was read on CYCLE 1 ONLY and cached for the process
+    lifetime -- the exact tier shape that froze mid's system SOC at 67 % for
+    112 sequences and that would pin a boot-time Local mode word forever.
+    It now rides the cold ring: served on a rotating minority of cycles after
+    cycle 1 (so the mode words and the advisory SOC semi-refresh ~every ring
+    period instead of never), the steady per-cycle window count stays inside
+    the commissioned budget, and the BMS SOC stands in as authoritative
+    everywhere while the block is unserved.
+    """
+    bank = _register_banks_by_host()["192.168.1.11"]
+    system_window = (0x0100, 61)
+
+    plans: list[tuple[tuple[int, int], ...]] = []
+    strategy = _live_decode_strategy(bank, promote_pcs_live_block=False)
+    for _ in range(17):
+        await strategy.advance()
+        plans.append(strategy.read_plan())
+
+    assert system_window not in plans[0], "cycle 1 must not pin the system block anymore"
+    serving_cycles = [index + 1 for index, plan in enumerate(plans) if system_window in plan]
+    assert serving_cycles and all(cycle > 1 for cycle in serving_cycles), (
+        "the system overview must rotate in on the cold ring after cycle 1"
+    )
+    # The rotation is one cold window per 8th cycle, and 0x0100 sorts first:
+    # cycle 8 serves it, then once every full ring period.
+    assert 8 in serving_cycles
+    assert all(len(plan) <= 9 for plan in plans), (
+        "the steady plan must stay inside the commissioned cadence budget "
+        "(<= 9 windows: 7 core + one tier window + one cold window)"
+    )

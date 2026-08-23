@@ -11,6 +11,7 @@ the facade is the only real module under test.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import importlib
 import math
@@ -484,6 +485,7 @@ class FakeActorHandle:
         inhibit_cause: str | None = None,
         arm_error: BaseException | None = None,
         zero_error: BaseException | None = None,
+        refresh_outcomes: tuple[tuple[int, int] | BaseException, ...] = (),
     ) -> None:
         self.unit_id = unit_id
         self.lifecycle = lifecycle
@@ -495,6 +497,21 @@ class FakeActorHandle:
         self.arm_error = arm_error
         self.zero_error = zero_error
         self.history = history
+        # B5 (SYNC_RESILIENCE_AUDIT): the bounded fresh mode-word read the
+        # dispatch refusal path performs through the owning actor.  Each call
+        # pops one outcome; an exhausted or empty queue models an unreadable
+        # refresh (which the facade must treat as a failed read).
+        self.refresh_outcomes = collections.deque(refresh_outcomes)
+        self.refresh_calls = 0
+
+    async def refresh_mode_words(self) -> tuple[int, int]:
+        self.refresh_calls += 1
+        if self.refresh_outcomes:
+            outcome = self.refresh_outcomes.popleft()
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+        raise OSError("mode refresh read failed")
 
     async def arm(self) -> None:
         self.history.append(f"arm:{self.unit_id}")
@@ -669,6 +686,7 @@ def make_rig(
             inhibit_cause=spec.get("inhibit_cause"),
             arm_error=spec.get("arm_error"),
             zero_error=spec.get("zero_error"),
+            refresh_outcomes=tuple(spec.get("refresh_outcomes", ())),
         )
         for unit_id, spec in specs.items()
     }
@@ -2781,6 +2799,73 @@ async def test_submit_intent_is_refused_while_a_unit_is_not_remote(api: Any) -> 
     with pytest.raises(ValueError, match="device_mode_not_remote"):
         await _invoke(rig.facade, "submit_intent", OPERATOR)
     assert rig.intents.added == []
+
+
+# --- B5: the cached mode word alone never refuses -----------------------------
+#
+# SYNC_RESILIENCE_AUDIT B5 (2026-08-24): the ctrlMode word rides the
+# once-per-process system tier, so a pod that was in Local at controller boot
+# refused EVERY dispatch for the process lifetime -- even after the operator
+# flipped it to Remote -- exactly the soc incident's shape one register over.
+# The refusal path now performs ONE bounded fresh read of the mode words
+# through the owning actor before denying: the cached word alone never
+# refuses; a fresh-confirmed non-Remote (or two failed refresh reads) still
+# does (class D).
+
+
+async def test_a_cached_local_word_refreshed_to_remote_accepts_the_intent(api: Any) -> None:
+    rig = make_rig(
+        api,
+        telemetry={"pod-a": Telemetry("pod-a", 99.5, 100.0, good_quality(), ctrl_mode_w=2)},
+        units={
+            "pod-a": {"refresh_outcomes": ((1, 6),)},
+            "pod-b": {},
+        },
+    )
+    accepted = await _invoke(rig.facade, "submit_intent", OPERATOR)
+    assert accepted["status"] == "accepted"
+    handles = rig.handles
+    assert handles["pod-a"].refresh_calls == 1, (
+        "the refusal path must refresh the mode words exactly once before denying"
+    )
+
+
+async def test_refresh_recovering_after_one_failed_read_still_accepts(api: Any) -> None:
+    rig = make_rig(
+        api,
+        telemetry={"pod-a": Telemetry("pod-a", 99.5, 100.0, good_quality(), ctrl_mode_w=2)},
+        units={"pod-a": {"refresh_outcomes": (OSError("gateway hiccup"), (1, 6))}},
+    )
+    accepted = await _invoke(rig.facade, "submit_intent", OPERATOR)
+    assert accepted["status"] == "accepted"
+    assert rig.handles["pod-a"].refresh_calls == 2
+
+
+async def test_a_fresh_confirmed_local_word_still_refuses(api: Any) -> None:
+    rig = make_rig(
+        api,
+        telemetry={"pod-a": Telemetry("pod-a", 99.5, 100.0, good_quality(), ctrl_mode_w=2)},
+        units={"pod-a": {"refresh_outcomes": ((2, 6),)}},
+    )
+    with pytest.raises(ValueError, match="device_mode_not_remote"):
+        await _invoke(rig.facade, "submit_intent", OPERATOR)
+    assert rig.intents.added == []
+    assert rig.handles["pod-a"].refresh_calls == 1
+
+
+async def test_two_failed_mode_refresh_reads_refuse_dispatch(api: Any) -> None:
+    """An unreadable mode word is genuinely-unreadable evidence (class D):
+    one bounded retry, then the refusal stands -- the cached word alone never
+    refuses, but neither does a mode we cannot read."""
+    rig = make_rig(
+        api,
+        telemetry={"pod-a": Telemetry("pod-a", 99.5, 100.0, good_quality(), ctrl_mode_w=2)},
+        units={"pod-a": {"refresh_outcomes": (OSError("gateway hiccup"),)}},
+    )
+    with pytest.raises(ValueError, match="device_mode_not_remote"):
+        await _invoke(rig.facade, "submit_intent", OPERATOR)
+    assert rig.intents.added == []
+    assert rig.handles["pod-a"].refresh_calls == 2, "exactly one bounded retry"
 
 
 async def test_submit_intent_dispatchable_modes_and_absent_evidence_both_accept(

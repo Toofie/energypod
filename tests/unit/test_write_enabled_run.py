@@ -1415,12 +1415,23 @@ async def test_mode_words_gate_dispatch_on_replayed_live_hardware(
         await actor.poll_once()
 
         # The captured fleet is dispatchable, and the words are visible: the
-        # debug readback from the core window, ctrlMode/workMode from the
-        # cycle-1 system block.
+        # debug readback rides the core window every cycle, while ctrlMode/
+        # workMode ride the COLD RING (B5: no longer the cycle-1 system
+        # block), so the first poll carries the debug word and an honestly
+        # absent mode word, and the eighth poll serves the system block.
         observation = await runtime.observations.latest(_UNIT_ID)
         assert observation is not None
         assert observation.debug_mode_w == 0
         assert observation.debug_mode_active is False
+        assert observation.ctrl_mode_w is None, (
+            "the cold-ring system block is unserved on cycle 1; absent mode evidence "
+            "refuses nothing"
+        )
+        for _ in range(7):
+            clock.advance(0.05)
+            await actor.poll_once()
+        observation = await runtime.observations.latest(_UNIT_ID)
+        assert observation is not None
         assert observation.ctrl_mode_w == 1
         assert observation.ctrl_mode_remote is True
         snapshot = await runtime.facade.snapshot(principal=OPERATOR)
