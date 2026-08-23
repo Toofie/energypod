@@ -1459,3 +1459,182 @@ describe("Activity view — the night-writer detector's alert tier", () => {
     });
   });
 });
+
+// --- the night strategy's audit facts (quiet informational) --------------------
+//
+// DESIGN_NIGHT_CHARGE §5/§7 W3: the participation toggle writes
+// `night_charging_toggled` (result enabled/disabled/noop, the Impl-10
+// commit-then-audit pattern) and the FIRST enable (or the schedules surface)
+// captures the shared durable-once `schedule_night_windows_acknowledged`.
+// Both are quiet rows — an operator act and a one-time site fact, never an
+// alarm — arriving through the ordinary audit.appended path and the REST page.
+
+describe("Activity view — the night strategy's audit facts (quiet informational)", () => {
+  it("renders the toggle row's result vocabulary in household words", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage([
+        auditEvent({
+          sequence: 71,
+          event_type: "night_charging_toggled",
+          unit_id: null,
+          occurred_at: minutesAgo(3),
+          principal: PRINCIPAL,
+          result: "enabled",
+          reason_codes: [],
+        }),
+        auditEvent({
+          sequence: 72,
+          event_type: "night_charging_toggled",
+          unit_id: null,
+          occurred_at: minutesAgo(2),
+          principal: PRINCIPAL,
+          result: "disabled",
+          reason_codes: [],
+        }),
+        auditEvent({
+          sequence: 73,
+          event_type: "night_charging_toggled",
+          unit_id: null,
+          occurred_at: minutesAgo(1),
+          principal: PRINCIPAL,
+          result: "noop",
+          reason_codes: [],
+        }),
+      ]),
+    );
+    renderView();
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(3);
+    expect(items[0]!.textContent).toContain("Night charging toggle");
+    expect(items[0]!.textContent).toContain("No change — night charging was already in that state");
+    expect(items[1]!.textContent).toContain("Night charging turned off");
+    expect(items[2]!.textContent).toContain("Night charging turned on");
+  });
+
+  it("keeps the toggle row under the Decisions chip — an operator control act", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage([
+        auditEvent({
+          sequence: 71,
+          event_type: "night_charging_toggled",
+          unit_id: null,
+          occurred_at: minutesAgo(3),
+          principal: PRINCIPAL,
+          result: "enabled",
+          reason_codes: [],
+        }),
+      ]),
+    );
+    renderView();
+    expect(await screen.findByText("Night charging turned on")).toBeVisible();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Decisions" }));
+    expect(screen.getByText("Night charging turned on")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Arming" }));
+    expect(screen.getByText("No activity matches these filters")).toBeVisible();
+  });
+
+  it("renders the one-time night-partition acknowledgement as history, never a question", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage([
+        auditEvent({
+          sequence: 74,
+          event_type: "schedule_night_windows_acknowledged",
+          unit_id: null,
+          occurred_at: minutesAgo(10),
+          principal: PRINCIPAL,
+          result: "acknowledged",
+          reason_codes: [],
+        }),
+      ]),
+    );
+    renderView();
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("Night windows acknowledged");
+    expect(items[0]!.textContent).toContain(
+      "The one-time night-partition acknowledgement was captured — the night window belongs to the controller",
+    );
+  });
+
+  it("keeps the acknowledgement row under the Acknowledgements chip", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage([
+        auditEvent({
+          sequence: 74,
+          event_type: "schedule_night_windows_acknowledged",
+          unit_id: null,
+          occurred_at: minutesAgo(10),
+          principal: PRINCIPAL,
+          result: "acknowledged",
+          reason_codes: [],
+        }),
+      ]),
+    );
+    renderView();
+    expect(await screen.findAllByRole("listitem")).toHaveLength(1);
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Acknowledgements" }));
+    expect(
+      screen.getByText(/The one-time night-partition acknowledgement was captured/),
+    ).toBeVisible();
+  });
+
+  it("appends the toggle's live audit.appended frame without another REST read", async () => {
+    /** A controllable shared stream, as the live-update suite builds one. */
+    function streamChannel(): {
+      openEvents: () => AsyncGenerator<Record<string, unknown>, void, unknown>;
+      push(frame: Record<string, unknown>): void;
+    } {
+      const queue: Record<string, unknown>[] = [];
+      let wake: (() => void) | null = null;
+      const notify = (): void => {
+        const release = wake;
+        wake = null;
+        release?.();
+      };
+      return {
+        openEvents: () =>
+          (async function* channel(): AsyncGenerator<Record<string, unknown>, void, unknown> {
+            while (true) {
+              while (queue.length > 0) {
+                const next = queue.shift();
+                if (next !== undefined) {
+                  yield next;
+                  if (next.type === "resync_required") {
+                    return;
+                  }
+                }
+              }
+              await new Promise<void>((resolve) => {
+                wake = resolve;
+              });
+            }
+          })(),
+        push: (frame) => {
+          queue.push(frame);
+          notify();
+        },
+      };
+    }
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push(
+      auditAppended(94, {
+        event_type: "night_charging_toggled",
+        event_id: "facade-night-1",
+        result: "enabled",
+        reason_codes: [],
+      }),
+    );
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("Night charging turned on");
+    // Quiet: no refetch was forced and no second read ran for the frame.
+    expect(client.getAudit).toHaveBeenCalledTimes(1);
+  });
+});

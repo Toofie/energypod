@@ -113,12 +113,22 @@ const KIND_CHIPS: readonly { readonly id: KindKey; readonly label: string }[] =
   ];
 
 /** The `event_type` values the audit trail holds (wire.ts AUDIT_EVENT_TYPES). */
-const AUDIT_TYPE_DECISIONS: readonly string[] = ["control_decision", "intent_accepted"];
+const AUDIT_TYPE_DECISIONS: readonly string[] = [
+  "control_decision",
+  "intent_accepted",
+  // The night strategy's participation toggle (DESIGN_NIGHT_CHARGE §5 audit):
+  // an operator control act over the fleet — the Decisions family.
+  "night_charging_toggled",
+];
 const AUDIT_TYPE_ARMING: readonly string[] = ["unit_armed", "unit_disarmed"];
 const AUDIT_TYPE_STOPS: readonly string[] = ["emergency_stop", "authorization_revoked"];
 const AUDIT_TYPE_ACKNOWLEDGEMENTS: readonly string[] = [
   "stop_acknowledged",
   "inhibit_acknowledged",
+  // The one-time night-partition fact (§3.2): an acknowledgement whichever
+  // surface captured it — the night toggle's first enable or the schedules
+  // publish path. It is one durable site fact, never a stop.
+  "schedule_night_windows_acknowledged",
 ];
 
 /**
@@ -470,6 +480,13 @@ function headlineFor(eventType: string): string {
       return "Schedule published";
     case "schedule_window_opened":
       return "Schedule window opened";
+    case "night_charging_toggled":
+      // Quiet informational (DESIGN_NIGHT_CHARGE §5 audit): the participation
+      // gate flipped — an operator act, never an alarm.
+      return "Night charging toggle";
+    case "schedule_night_windows_acknowledged":
+      // The one-time night-partition fact, whichever surface captured it.
+      return "Night windows acknowledged";
     case "unit_armed":
       return "Arm request";
     case "unit_disarmed":
@@ -663,6 +680,28 @@ function happenedLine(event: AuditEvent, stopId: string | null): string | null {
     const endsAtText = localTimeOfInstant(endsAt ?? null);
     const endsWord = endsAtText === "" ? "" : ` until ${endsAtText}`;
     return `${entryId ?? "A scheduled window"} began — ${summary}${endsWord}`;
+  }
+  if (eventType === "night_charging_toggled") {
+    // The participation gate's own result vocabulary (§5 audit:
+    // enabled/disabled/noop), in household words. Quiet informational — the
+    // tile and the projection carry the live story.
+    const result = stringField(event, "result");
+    if (result === "enabled") {
+      return "Night charging turned on";
+    }
+    if (result === "disabled") {
+      return "Night charging turned off";
+    }
+    if (result === "noop") {
+      return "No change — night charging was already in that state";
+    }
+    return "Night charging toggled";
+  }
+  if (eventType === "schedule_night_windows_acknowledged") {
+    // The durable once-only fact: the night window belongs to the controller
+    // and the external writers stand down. Never re-prompted — the row is the
+    // history, not a question.
+    return "The one-time night-partition acknowledgement was captured — the night window belongs to the controller";
   }
   if (isStopHeldDecision(event)) {
     return stopHeldLine(stopId);
