@@ -103,6 +103,7 @@ _TOTALS_BASE = 0x4101
 _RTU_ID_BASE = 0x8106
 _DEVICE_PARAMETERS_BASE = 0x8102
 _PCS_LIVE_BASE = 0x1000
+_PCS_DETAIL_BASE = 0x1060
 _DEBUG_MODE_BASE = 0x8100
 
 _REQUIRED_BLOCKS: tuple[int, ...] = (
@@ -117,11 +118,12 @@ _REQUIRED_BLOCKS: tuple[int, ...] = (
 
 # The PCS live block 0x1000 became advisory-CONSUMED with the excess-solar
 # contract (grid_power_w at +17, load_power_w at +20 — PROTOCOL_EVIDENCE 4c),
-# and the cumulative-energy block 0x4101 became advisory-CONSUMED with the
-# energy scorecard (DESIGN_ENERGY_SCORECARD §5, E1: six neutral cumulative
-# fields); neither belongs in the unconsumed set below.
+# the cumulative-energy block 0x4101 became advisory-CONSUMED with the energy
+# scorecard (DESIGN_ENERGY_SCORECARD §5, E1: six neutral cumulative fields),
+# and the PCS detail block 0x1060 became advisory-CONSUMED with the night-
+# writer detector (API_CONTRACTS "Night-writer detector": the served PQ
+# objective words at +17/+18); none belongs in the unconsumed set below.
 _UNCONSUMED_BLOCKS: tuple[int, ...] = (
-    0x1060,
     0x2000,
     0x2060,
     _BALANCE_BASE,
@@ -1196,3 +1198,96 @@ def test_truncated_totals_block_decodes_only_fully_served_pairs(
             assert getattr(observation, field) is None, field
             assert observation.quality[field] is DataQuality.MISSING, field
     assert observation.safety_data_complete is True
+
+
+# --- the served PQ objective words (night-writer detector, 0x1060+17/+18) --------
+
+
+def test_served_objective_words_decode_from_the_pcs_detail_block(
+    wire_decode: Any, capture: Any
+) -> None:
+    """T-UNIT-WIRE-036 / API_CONTRACTS "Night-writer detector" / S1.
+
+    The PCS detail block's +17/+18 words are the served PQ objective
+    (PROTOCOL_EVIDENCE 4b — the live -200 W commissioning write read back
+    immediately at +17).  They decode as SIGNED unscaled int words on the
+    observation, exactly like the device-mode words: present only when the
+    block was served, never quality-map keys.  The authorized 2026-08-22
+    capture holds the baseline pair (0, 0) on every unit.
+    """
+    for key in _UNIT_KEYS:
+        observation = _decode_unit(wire_decode, capture, key)
+        assert observation.served_active_objective_w == 0, key
+        assert observation.served_reactive_objective_var == 0, key
+
+
+def test_served_objective_words_decode_signed_and_unscaled(wire_decode: Any, capture: Any) -> None:
+    """T-UNIT-WIRE-037 / signed objective words / S1.
+
+    A night writer's -2400 W charge objective (word 0xF650) and a +1000 W
+    discharge objective (word 0x03E8) both decode to their signed values;
+    the reactive word follows the same convention.
+    """
+    blocks = _blocks_of(capture, "MID")
+    detail = list(blocks[_PCS_DETAIL_BASE])
+    detail[17] = -2400 & 0xFFFF
+    detail[18] = 1000 & 0xFFFF
+    blocks[_PCS_DETAIL_BASE] = tuple(detail)
+
+    observation = _decode_unit(wire_decode, capture, "MID", blocks=blocks)
+
+    assert observation.served_active_objective_w == -2400
+    assert observation.served_reactive_objective_var == 1000
+
+
+def test_absent_detail_block_leaves_the_objective_words_null(
+    wire_decode: Any, capture: Any
+) -> None:
+    """T-UNIT-WIRE-038 / absent source / S0.
+
+    A poll that did not serve the detail block (every cycle between cold-ring
+    rotations) reports no objective words -- null, never zero-filled -- and
+    the quality map keeps exactly its legal shape (the objective words are
+    advisory mode-word-class fields, never quality keys).
+    """
+    baseline = _decode_unit(wire_decode, capture, "MID")
+    blocks = _blocks_of(capture, "MID")
+    del blocks[_PCS_DETAIL_BASE]
+
+    observation = _decode_unit(wire_decode, capture, "MID", blocks=blocks)
+
+    assert observation.served_active_objective_w is None
+    assert observation.served_reactive_objective_var is None
+    assert observation.objective_captured_at_mono is None
+    assert set(observation.quality) == set(baseline.quality), "no new quality keys"
+
+
+def test_the_objective_capture_time_passes_through_verbatim(wire_decode: Any, capture: Any) -> None:
+    """T-UNIT-WIRE-039 / caller-supplied capture metadata / S1.
+
+    The wire plan carries no capture-time registers: the telemetry strategy
+    supplies the serving's capture clock, and the decode passes it through
+    verbatim so consumers can tell a fresh serving from a cached ride-along.
+    """
+    observation = _decode_unit(
+        wire_decode, capture, "MID", objective_captured_at_mono=_CELL_CAPTURED_AT_MONO
+    )
+
+    assert observation.objective_captured_at_mono == _CELL_CAPTURED_AT_MONO
+
+
+def test_a_truncated_detail_block_does_not_source_partial_objective_words(
+    wire_decode: Any, capture: Any
+) -> None:
+    """T-UNIT-WIRE-040 / truncated block / S0.
+
+    A block shorter than the objective offsets serves neither word: both stay
+    null rather than decoding a half-served pair.
+    """
+    blocks = _blocks_of(capture, "MID")
+    blocks[_PCS_DETAIL_BASE] = blocks[_PCS_DETAIL_BASE][:17]
+
+    observation = _decode_unit(wire_decode, capture, "MID", blocks=blocks)
+
+    assert observation.served_active_objective_w is None
+    assert observation.served_reactive_objective_var is None

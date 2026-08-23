@@ -7,7 +7,9 @@ the red TDD phase.
 
 from __future__ import annotations
 
+import re
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -690,6 +692,86 @@ def test_expected_autonomy_band_must_span_the_self_charge_region() -> None:
         payload["policy"]["expected_autonomy_band_w"] = bad
         with pytest.raises(ValidationError, match="expected_autonomy_band_w"):
             _validate(payload)
+
+
+# --- night-writer detector (API_CONTRACTS "Night-writer detector") ----------------
+
+
+def test_policy_carries_the_foreign_objective_defaults() -> None:
+    """The detector composes ALWAYS with defaulted policy keys, so an
+    unchanged policy keeps the pinned sampling/escalation posture."""
+    parsed = _validate(_valid_config())
+
+    policy = parsed.policy
+    assert policy is not None
+    assert policy.foreign_objective_sample_interval_s == 30.0
+    assert policy.foreign_objective_sustained_samples == 3
+    assert policy.foreign_objective_self_charge_class_w == 1000
+    assert policy.foreign_objective_handback_grace_s == 12.0
+
+
+def test_foreign_objective_keys_are_commissionable() -> None:
+    payload = _valid_config()
+    payload["policy"].update(
+        {
+            "foreign_objective_sample_interval_s": 60.0,
+            "foreign_objective_sustained_samples": 5,
+            "foreign_objective_self_charge_class_w": 1500,
+            "foreign_objective_handback_grace_s": 30.0,
+        }
+    )
+
+    parsed = _validate(payload)
+
+    assert parsed.policy is not None
+    assert parsed.policy.foreign_objective_sample_interval_s == 60.0
+    assert parsed.policy.foreign_objective_sustained_samples == 5
+    assert parsed.policy.foreign_objective_self_charge_class_w == 1500
+    assert parsed.policy.foreign_objective_handback_grace_s == 30.0
+
+
+@pytest.mark.parametrize(
+    ("key", "bad"),
+    [
+        ("foreign_objective_sample_interval_s", 0.0),
+        ("foreign_objective_sample_interval_s", 3601.0),
+        ("foreign_objective_sustained_samples", 0),
+        ("foreign_objective_sustained_samples", 101),
+        ("foreign_objective_self_charge_class_w", 0),
+        ("foreign_objective_self_charge_class_w", 50001),
+        ("foreign_objective_handback_grace_s", 0.0),
+        ("foreign_objective_handback_grace_s", 301.0),
+    ],
+)
+def test_foreign_objective_keys_are_bounded(key: str, bad: Any) -> None:
+    """Every knob has a sane bound (API_CONTRACTS): a sub-second interval or a
+    beyond-hours grace is a commissioning error, refused at configuration
+    time rather than misbehaving at runtime."""
+    payload = _valid_config()
+    payload["policy"][key] = bad
+    with pytest.raises(ValidationError, match=key):
+        _validate(payload)
+
+
+def test_the_live_write_example_documents_the_detector_keys() -> None:
+    """The deployed example (the live controller's own config) documents the
+    four keys with the commissioned defaults, so the detector's posture is
+    visible to the operator reading their configuration."""
+    text = (
+        Path(__file__)
+        .resolve()
+        .parents[2]
+        .joinpath("config", "config.live-write-example.yaml")
+        .read_text(encoding="utf-8")
+    )
+
+    for key, value in (
+        ("foreign_objective_sample_interval_s", "30.0"),
+        ("foreign_objective_sustained_samples", "3"),
+        ("foreign_objective_self_charge_class_w", "1000"),
+        ("foreign_objective_handback_grace_s", "12.0"),
+    ):
+        assert re.search(rf"^\s*{key}:\s*{value}\s*$", text, re.MULTILINE), key
 
 
 # --- DESIGN_SCHEDULES §3/B5: the schedule config block ---------------------------

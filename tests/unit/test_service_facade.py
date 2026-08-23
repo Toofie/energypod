@@ -70,6 +70,11 @@ OPERATOR = Principal(
     subject="person:operator",
     scopes=frozenset({"observe", "dispatch", "arm", "stop", "stop:acknowledge"}),
 )
+VIEWER = Principal(
+    subject="person:viewer",
+    scopes=frozenset(),
+    interactive=False,
+)
 STRANGER = Principal(
     subject="person:outsider",
     scopes=frozenset({"observe", "dispatch", "arm", "stop", "stop:acknowledge"}),
@@ -646,6 +651,7 @@ class Rig:
     handles: dict[str, FakeActorHandle]
     history: list[str]
     recovery: FakeRecoveryView | None = None
+    objectives: FakeForeignObjectiveView | None = None
     excess: Any = None
     schedules: Any = None
 
@@ -715,6 +721,7 @@ def make_rig(
     audit_events: tuple[Any, ...] = (),
     bus_sequence: int = 0,
     recovery: FakeRecoveryView | None = None,
+    objectives: FakeForeignObjectiveView | None = None,
     excess: Any = None,
     schedules: Any = None,
 ) -> Rig:
@@ -744,6 +751,10 @@ def make_rig(
     audit = FakeAuditRepository(audit_events, history)
     bus = FakeEventBus(bus_sequence, history)
     coordinator = RecordingCoordinator(api, history)
+    # The detector's port is passed only when a rig asks for it, so the red
+    # phase stays scoped to the objective-watch family (an unpassed optional
+    # port is exactly the "detector not wired" case those tests pin).
+    objective_kwargs = {} if objectives is None else {"objectives": objectives}
     facade = api.EnergyServiceFacade(
         site_id=SITE_ID,
         clock=clock,
@@ -757,6 +768,7 @@ def make_rig(
         recovery=recovery,
         excess=excess,
         schedules=schedules,
+        **objective_kwargs,
     )
     return Rig(
         api=api,
@@ -771,6 +783,7 @@ def make_rig(
         handles=handles,
         history=history,
         recovery=recovery,
+        objectives=objectives,
         excess=excess,
     )
 
@@ -1758,6 +1771,9 @@ async def test_health_view_carries_per_unit_recovery_states(api: Any) -> None:
         "health_state": "healthy",
         "reasons": [],
         "remediation_hint": None,
+        # API_CONTRACTS "Night-writer detector": the per-unit last-objective
+        # summary rides the health view too (null until a sample records).
+        "last_objective_observed": None,
     }
     assert units["pod-b"]["health_state"] == "actuation_incoherent"
     assert units["pod-b"]["reasons"] == ["authorized_not_actuating", "echo_matches_write"]
@@ -1806,6 +1822,174 @@ async def test_recovery_fields_are_null_when_no_monitor_is_wired(api: Any) -> No
         assert unit["health_state"] is None
         assert unit["reasons"] is None
         assert unit["remediation_hint"] is None
+
+
+# --- night-writer detector views (API_CONTRACTS "Night-writer detector") ----------
+
+
+class FakeForeignObjectiveView:
+    """Inline stand-in for the composed detector's read projection.
+
+    Serves the pinned payload shapes so the facade's snapshot/health
+    projections and the observed-objectives read can be pinned without
+    composing the monitor itself.
+    """
+
+    def __init__(
+        self,
+        last_by_unit: Mapping[str, Mapping[str, Any]] | None = None,
+        *,
+        window: Mapping[str, Any] | None = None,
+        failing: bool = False,
+    ) -> None:
+        self.last_by_unit = dict(last_by_unit or {})
+        self.window = dict(
+            window
+            if window is not None
+            else {
+                "as_of": "2026-08-26T22:30:00+00:00",
+                "last": "24h",
+                "window_s": 86400,
+                "units": [
+                    {
+                        "unit_id": unit_id,
+                        "first_seen_at": None,
+                        "last_seen_at": None,
+                        "sample_count": 0,
+                        "charge_sample_count": 0,
+                        "discharge_sample_count": 0,
+                        "min_active_w": None,
+                        "typical_active_w": None,
+                        "max_active_w": None,
+                        "foreign_episode_count": 0,
+                        "foreign_active": False,
+                        "foreign_reason": None,
+                        "last_objective_observed": self.last_by_unit.get(unit_id),
+                    }
+                    for unit_id in sorted(self.last_by_unit)
+                ],
+            }
+        )
+        self.failing = failing
+        self.window_calls: list[int] = []
+
+    def unit_last_observed(self, unit_id: str) -> Any:
+        if self.failing:
+            raise OSError("objective view unavailable")
+        return self.last_by_unit.get(unit_id)
+
+    def window_payload(self, *, last_hours: int) -> dict[str, Any]:
+        self.window_calls.append(last_hours)
+        if self.failing:
+            raise OSError("objective view unavailable")
+        return dict(self.window)
+
+
+_MID_LAST_OBSERVED = {
+    "observed_at": "2026-08-26T22:29:31+00:00",
+    "active_w": -2400,
+    "reactive_var": 0,
+    "classification": "foreign_objective_observed",
+    "reason": "sustained_charge_without_pv_evidence",
+}
+
+
+async def test_snapshot_carries_the_last_objective_summary_per_unit(api: Any) -> None:
+    """The detector composes ALWAYS, so every snapshot unit carries the COMPACT
+    ``last_objective_observed`` summary -- five pinned keys, null before any
+    sample, never the full evidence record (that is the endpoint's shape)."""
+    rig = make_rig(
+        api,
+        objectives=FakeForeignObjectiveView(
+            {"pod-a": dict(_MID_LAST_OBSERVED), "pod-b": None},
+        ),
+    )
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["last_objective_observed"] == _MID_LAST_OBSERVED
+    assert units["pod-b"]["last_objective_observed"] is None
+    assert rig.audit.appended == [] and rig.bus.published == []
+
+
+async def test_health_view_carries_the_same_last_objective_summary(api: Any) -> None:
+    rig = make_rig(api, objectives=FakeForeignObjectiveView({"pod-a": dict(_MID_LAST_OBSERVED)}))
+
+    report = await rig.facade.health(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in report["units"]}
+    assert units["pod-a"]["last_objective_observed"] == _MID_LAST_OBSERVED
+    assert units["pod-b"]["last_objective_observed"] is None
+
+
+async def test_objective_fields_are_null_when_the_detector_is_not_wired(api: Any) -> None:
+    """An uncomposed detector (embedded tests, older rigs) degrades to explicit
+    nulls on both views -- never fabricated evidence."""
+    rig = make_rig(api)
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    report = await rig.facade.health(principal=OPERATOR)
+
+    for unit in snapshot["units"]:
+        assert unit["last_objective_observed"] is None
+    for unit in report["units"]:
+        assert unit["last_objective_observed"] is None
+
+
+async def test_a_failing_objective_view_never_breaks_the_views(api: Any) -> None:
+    rig = make_rig(api, objectives=FakeForeignObjectiveView({"pod-a": {}}, failing=True))
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    report = await rig.facade.health(principal=OPERATOR)
+
+    assert snapshot["units"][0]["last_objective_observed"] is None
+    assert report["units"][0]["last_objective_observed"] is None
+    assert report["service_readiness"]["ready"] is True
+
+
+async def test_get_observed_objectives_serves_the_window_payload(api: Any) -> None:
+    """The night-window characterization read: observe scope, the ``last``
+    window parsed to hours (``24h`` -> 24), the detector's payload verbatim."""
+    objectives = FakeForeignObjectiveView({"pod-a": dict(_MID_LAST_OBSERVED)})
+    rig = make_rig(api, objectives=objectives)
+
+    payload = await rig.facade.get_observed_objectives(principal=OPERATOR, last="24h")
+
+    assert objectives.window_calls == [24]
+    assert payload["window_s"] == 86400
+    assert payload["units"][0]["last_objective_observed"]["active_w"] == -2400
+
+    denied = rig.facade.get_observed_objectives(principal=VIEWER, last="24h")
+    with pytest.raises(Exception, match="scope"):
+        await denied
+
+
+async def test_get_observed_objectives_parses_and_bounds_the_window(api: Any) -> None:
+    rig = make_rig(api, objectives=FakeForeignObjectiveView({"pod-a": {}}))
+
+    assert (await rig.facade.get_observed_objectives(principal=OPERATOR, last="6h"))[
+        "window_s"
+    ] == 6 * 3600
+    assert (await rig.facade.get_observed_objectives(principal=OPERATOR, last="7d"))[
+        "window_s"
+    ] == 7 * 24 * 3600
+
+    for bad in ("0h", "169h", "24", "24m", "", "hours"):
+        with pytest.raises(ValueError, match="last"):
+            await rig.facade.get_observed_objectives(principal=OPERATOR, last=bad)
+
+
+async def test_get_observed_objectives_serves_nulls_when_uncomposed(api: Any) -> None:
+    rig = make_rig(api)
+
+    payload = await rig.facade.get_observed_objectives(principal=OPERATOR, last="24h")
+
+    assert payload["last"] == "24h"
+    assert {unit["unit_id"] for unit in payload["units"]} == set(rig.handles)
+    for unit in payload["units"]:
+        assert unit["sample_count"] == 0
+        assert unit["last_objective_observed"] is None
 
 
 async def test_a_failing_recovery_view_never_breaks_the_views(api: Any) -> None:

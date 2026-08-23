@@ -853,3 +853,57 @@ def test_constructor_validates_every_commissioning_shape(
     clock = FakeMonotonicClock()
     with pytest.raises((TypeError, ValueError), match=fragment):
         simulator.SimulatedEnergyPod(clock=clock, **kwargs)
+
+
+# --- night-writer detector scenario hook: a foreign served objective --------------
+
+
+async def test_script_objective_serves_a_foreign_pq_objective(simulator: Any) -> None:
+    """API_CONTRACTS "Night-writer detector": the scenario hook places ANOTHER
+    writer's objective on the served wire -- the detail block's +17/+18 words
+    read back exactly the scripted pair while the pod's own applied state
+    stays untouched (the foreign writer's words, not ours)."""
+    pod, transport, clock = build_unit(simulator)
+    await transport.connect()
+
+    pod.script_objective(-2400, 0)
+    pod.poll()
+
+    assert await applied_objectives(transport) == (-2400, 0)
+    # The pod's own applied objective is untouched: this is a FOREIGN word.
+    assert pod._applied_active_w == 0 and pod._lease_deadline_mono is None
+
+
+async def test_a_scripted_objective_puts_the_pcs_into_remote_pq_mode(simulator: Any) -> None:
+    """The discriminator the pattern tier consumes: a written objective puts
+    the PCS into run mode 1 ("Remote PQ Power" -- the vendor's written-objective
+    state); the pod's own CT-following autonomy reads 0 ("Matching Load")."""
+    pod, transport, clock = build_unit(simulator)
+    await transport.connect()
+
+    pod.poll()
+    idle = await transport.read_holding(0x1000, 21)
+    assert idle[2] == 0, "an autonomous pod matches load"
+
+    pod.script_objective(-2400, 0)
+    pod.poll()
+    written = await transport.read_holding(0x1000, 21)
+    assert written[2] == 1, "a scripted (foreign) objective holds the remote-PQ mode"
+
+
+async def test_clearing_the_scripted_objective_restores_the_served_words(simulator: Any) -> None:
+    pod, transport, clock = build_unit(simulator)
+    await transport.connect()
+
+    pod.script_objective(-2400, 300)
+    pod.clear_scripted_objective()
+    pod.poll()
+
+    assert await applied_objectives(transport) == (0, 0)
+
+
+async def test_the_scenario_hook_validates_its_words_like_the_wire(simulator: Any) -> None:
+    pod, transport, clock = build_unit(simulator)
+    for bad in (24000, -24000, 1.5, "2400"):
+        with pytest.raises((TypeError, ValueError), match="int16"):
+            pod.script_objective(bad, 0)  # type: ignore[arg-type]

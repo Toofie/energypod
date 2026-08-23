@@ -217,6 +217,46 @@ class RecordingEnergyService:
         }
     )
     energy_refusal: Any = None
+    # The night-writer detector's scripted answer (API_CONTRACTS "Night-writer
+    # detector"): the observed-objectives window body and an optional error.
+    observed_objectives_view: dict[str, Any] = field(
+        default_factory=lambda: {
+            "as_of": "2026-08-26T22:30:00+00:00",
+            "last": "24h",
+            "window_s": 86400,
+            "units": [
+                {
+                    "unit_id": "pod-a",
+                    "first_seen_at": "2026-08-25T23:41:00+00:00",
+                    "last_seen_at": "2026-08-26T22:29:31+00:00",
+                    "sample_count": 641,
+                    "charge_sample_count": 641,
+                    "discharge_sample_count": 0,
+                    "min_active_w": -2400,
+                    "typical_active_w": -2400,
+                    "max_active_w": -2400,
+                    "foreign_episode_count": 1,
+                    "foreign_active": True,
+                    "foreign_reason": "sustained_charge_without_pv_evidence",
+                    "last_objective_observed": {
+                        "observed_at": "2026-08-26T22:29:31+00:00",
+                        "active_w": -2400,
+                        "reactive_var": 0,
+                        "classification": "foreign_objective_observed",
+                        "reason": "sustained_charge_without_pv_evidence",
+                        "lifecycle": "disarmed",
+                        "claimed": False,
+                        "run_mode_w": 1,
+                        "ctrl_mode_w": 1,
+                        "work_mode_w": 6,
+                        "debug_mode_w": 0,
+                        "grid_power_w": -1500.0,
+                    },
+                }
+            ],
+        }
+    )
+    observed_objectives_error: Any = None
 
     async def snapshot(self, *, principal: Principal) -> dict[str, Any]:
         self.calls.append(("snapshot", {"principal": principal}))
@@ -352,6 +392,12 @@ class RecordingEnergyService:
         if self.energy_refusal is not None:
             raise self.energy_refusal
         return dict(self.energy_days_view)
+
+    async def get_observed_objectives(self, *, principal: Any, last: str = "24h") -> dict[str, Any]:
+        self.calls.append(("get_observed_objectives", {"principal": principal, "last": last}))
+        if self.observed_objectives_error is not None:
+            raise self.observed_objectives_error
+        return dict(self.observed_objectives_view)
 
     async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("replace_schedule", kwargs))

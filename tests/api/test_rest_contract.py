@@ -1828,3 +1828,87 @@ def test_schedule_put_accepts_the_optional_effective_dates_as_absent_or_null(
     assert forwarded[0]["entries"][0]["effective_until"] is None
     assert forwarded[1]["entries"][0]["effective_from"] is None
     assert forwarded[1]["entries"][0]["effective_until"] == "2026-12-31"
+
+
+# --- observed-objectives route (API_CONTRACTS "Night-writer detector") -----------
+
+
+def test_observed_objectives_requires_authentication_and_serves_the_pinned_body(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """Observe scope; the night window's characterization body is the pinned
+    window shape with the FULL per-sample evidence record inside
+    ``last_objective_observed`` (the snapshot carries only the compact five-key
+    summary)."""
+    with _client(service, authenticator) as client:
+        anonymous = client.get(f"{API}/objectives/observed")
+        unscoped = client.get(f"{API}/objectives/observed", headers=_auth("audit-only-token"))
+        viewed = client.get(f"{API}/objectives/observed", headers=_auth("viewer-token"))
+
+    _assert_error(anonymous, 401, "authentication_required")
+    _assert_error(unscoped, 403, "insufficient_scope")
+    assert viewed.status_code == 200
+    body = viewed.json()
+    assert set(body) == {"as_of", "last", "window_s", "units"}
+    assert body["last"] == "24h"
+    assert body["window_s"] == 86400
+    (unit,) = body["units"]
+    assert unit["unit_id"] == "pod-a"
+    assert unit["foreign_active"] is True
+    assert unit["foreign_reason"] == "sustained_charge_without_pv_evidence"
+    assert set(unit["last_objective_observed"]) == {
+        "observed_at",
+        "active_w",
+        "reactive_var",
+        "classification",
+        "reason",
+        "lifecycle",
+        "claimed",
+        "run_mode_w",
+        "ctrl_mode_w",
+        "work_mode_w",
+        "debug_mode_w",
+        "grid_power_w",
+    }
+    forwarded = [values for name, values in service.calls if name == "get_observed_objectives"]
+    assert forwarded[0]["principal"].subject == "person:viewer"
+    assert forwarded[0]["last"] == "24h", "the default window"
+
+
+@pytest.mark.parametrize("last", ["1h", "6h", "168h", "7d"])
+def test_observed_objectives_accepts_the_bounded_window_spellings(
+    last: str, service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        response = client.get(
+            f"{API}/objectives/observed", params={"last": last}, headers=_auth("viewer-token")
+        )
+    assert response.status_code == 200
+    forwarded = [values for name, values in service.calls if name == "get_observed_objectives"]
+    assert forwarded[-1]["last"] == last
+
+
+@pytest.mark.parametrize("last", ["0h", "169h", "24", "24m", "yes", ""])
+def test_observed_objectives_refuses_malformed_or_unbounded_windows(
+    last: str, service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """The window spelling is strict (``Nh``/``Nd``, 1..168 hours): anything
+    else is a 422 validation error, never a silent default."""
+    with _client(service, authenticator) as client:
+        response = client.get(
+            f"{API}/objectives/observed", params={"last": last}, headers=_auth("viewer-token")
+        )
+    assert response.status_code == 422
+
+
+def test_observed_objectives_has_no_mutation_on_the_surface(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """Read-only evidence machinery: POST/PUT/DELETE answer 405 exactly like
+    the scorecard's days route."""
+    with _client(service, authenticator) as client:
+        for method in ("post", "put", "delete"):
+            response = getattr(client, method)(
+                f"{API}/objectives/observed", headers=_auth("operator-token")
+            )
+            assert response.status_code == 405, method

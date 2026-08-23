@@ -1215,3 +1215,158 @@ async def test_energy_day_rolled_publishes_the_completed_record_once() -> None:
     )
     assert quiet == [], "renewal ticks within a day publish nothing"
     await close_subscription(subscription)
+
+
+# --- foreign_objective.observed (API_CONTRACTS "Night-writer detector") ----------
+#
+# The alert tier's ONE bus event, driven over the REAL EventBus by the REAL
+# monitor: one publication per foreign episode (or per reason change inside
+# one), never per sample, and nothing at all on the quiet tiers.
+
+
+def _objective_modules() -> Any:
+    try:
+        import energypod.application.events as events
+        import energypod.application.foreign_objective as foreign_objective
+    except ImportError as error:  # pragma: no cover - contract modules exist
+        raise AssertionError(f"objective event contract dependency missing: {error}") from error
+    return SimpleNamespace(events=events, foreign_objective=foreign_objective)
+
+
+def _objective_rig(units: tuple[str, ...] = ("mid",)) -> Any:
+    modules = _objective_modules()
+    clock = FakeClock()
+    clock.now = 1_000.0
+    bus = modules.events.EventBus(retention=64, queue_capacity=64, clock=clock)
+
+    class _NoopAudit:
+        async def append(self, event: Any) -> None:
+            return None
+
+    monitor = modules.foreign_objective.ForeignObjectiveMonitor(
+        unit_ids=frozenset(units),
+        settings=modules.foreign_objective.ForeignObjectiveSettings(
+            sample_interval_s=1.0,
+        ),
+        clock=clock,
+        audit=_NoopAudit(),
+        bus=bus,
+        process_instance_id="objective-event-test",
+        process_origin_mono=clock.now,
+        configuration_version=1,
+    )
+    return SimpleNamespace(monitor=monitor, bus=bus, clock=clock)
+
+
+async def test_a_foreign_episode_publishes_exactly_one_alert_event() -> None:
+    rig = _objective_rig()
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    for now in (1_000.0, 1_040.0, 1_080.0, 1_120.0):
+        rig.clock.now = now
+        await rig.monitor.observe_cycle(
+            "mid",
+            lifecycle="disarmed",
+            claimed=False,
+            authorized_watts=0,
+            observation=SimpleNamespace(
+                served_active_objective_w=-3000,
+                served_reactive_objective_var=0,
+                objective_captured_at_mono=now,
+                grid_power_w=-1500.0,
+                run_mode_w=None,
+                ctrl_mode_w=1,
+                work_mode_w=6,
+                debug_mode_w=0,
+                sequence=int(now),
+                wall_timestamp=datetime(2026, 8, 26, 22, 30, tzinfo=UTC),
+            ),
+            now_mono=now,
+        )
+
+    events = await drain(subscription, 1)
+    assert [event["type"] for event in events] == ["foreign_objective.observed"]
+    payload = events[0]["payload"]
+    assert set(payload) == {
+        "unit_id",
+        "observed_at",
+        "active_w",
+        "reactive_var",
+        "classification",
+        "reason",
+        "lifecycle",
+        "claimed",
+        "run_mode_w",
+        "ctrl_mode_w",
+        "work_mode_w",
+        "debug_mode_w",
+        "grid_power_w",
+        "pv_evidence",
+    }
+    assert payload["unit_id"] == "mid"
+    assert payload["classification"] == "foreign_objective_observed"
+    assert payload["reason"] == "outside_autonomy_band"
+    assert payload["pv_evidence"] is False
+
+
+async def test_quiet_tiers_publish_nothing_at_all() -> None:
+    """In-band autonomy and handback-grace samples are EVIDENCE, not alarms:
+    the quiet tiers never reach the bus."""
+    rig = _objective_rig()
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    # Our own command, then its lapse inside the grace window.
+    rig.clock.now = 1_000.0
+    await rig.monitor.observe_cycle(
+        "mid",
+        lifecycle="active",
+        claimed=True,
+        authorized_watts=1500,
+        observation=None,
+        now_mono=1_000.0,
+    )
+    rig.clock.now = 1_002.0
+    await rig.monitor.observe_cycle(
+        "mid",
+        lifecycle="armed_idle",
+        claimed=False,
+        authorized_watts=0,
+        observation=SimpleNamespace(
+            served_active_objective_w=-1500,
+            served_reactive_objective_var=0,
+            objective_captured_at_mono=1_002.0,
+            grid_power_w=None,
+            run_mode_w=1,
+            ctrl_mode_w=None,
+            work_mode_w=None,
+            debug_mode_w=None,
+            sequence=2,
+            wall_timestamp=datetime(2026, 8, 26, 22, 30, tzinfo=UTC),
+        ),
+        now_mono=1_002.0,
+    )
+    # Then the pod's own quiet self-charge, twice.
+    for now in (1_040.0, 1_080.0):
+        rig.clock.now = now
+        await rig.monitor.observe_cycle(
+            "mid",
+            lifecycle="disarmed",
+            claimed=False,
+            authorized_watts=0,
+            observation=SimpleNamespace(
+                served_active_objective_w=-620,
+                served_reactive_objective_var=0,
+                objective_captured_at_mono=now,
+                grid_power_w=900.0,
+                run_mode_w=0,
+                ctrl_mode_w=1,
+                work_mode_w=6,
+                debug_mode_w=0,
+                sequence=int(now),
+                wall_timestamp=datetime(2026, 8, 26, 22, 31, tzinfo=UTC),
+            ),
+            now_mono=now,
+        )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(drain(subscription, 1), timeout=0.05)
