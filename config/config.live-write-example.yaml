@@ -303,3 +303,59 @@ excess_charging:
   min_acceleration_w: 100
   exit_hysteresis_w: 50
   intent_ttl_s: 10.0
+
+# Schedules (DESIGN_SCHEDULES §3) — this block stays COMMENTED OUT on this
+# deployment: an ABSENT block composes NOTHING at all (no evaluation loop, no
+# `schedule_state` in the snapshot, and GET/PUT /api/v1/schedule answer 409
+# schedule_not_commissioned) — byte-identical behavior. A schedule can never
+# act on a site that did not commission scheduling.
+#
+# A PRESENT block composes the whole surface: both REST routes, the
+# ScheduleRunner in the fleet cycle (one bounded tick AFTER the polls and
+# BEFORE the excess adviser — the schedule's claim is a published fact, the
+# adviser the opportunist), and the `schedule_state` snapshot projection.
+# There is deliberately NO `enabled` key: the plan IS the state (an empty
+# plan is off, an entry's own `enabled` flag is its pause, "pause
+# everything" is one publish disabling every entry) — a second master switch
+# would be a second way to be silently off.
+#
+# THE NIGHT-WRITER POSTURES. The site's other applications write these
+# batteries AT NIGHT, and the arm-time sole-writer preflight latches
+# external_writer by design ("coordinate, don't fight"):
+#   - YIELD (the shipped default, below): schedules are a DAY-WINDOW feature.
+#     Only the union of `allowed_windows_local` may be commanded; the night
+#     stays with the existing writers.
+#   - PARTITION (the operator-granted upgrade): the external writers stand
+#     down for a granted window — a config revision WIDENING these windows
+#     plus a restart, then the first night publish carries
+#     "night_posture": "PARTITION_ACKNOWLEDGED" once (the durable
+#     once-ever audit fact; never re-prompted).
+#   - CONTESTED is NOT implementable and NOT offered: no setting says "run
+#     at night anyway and fight them" — the refusal names the two honest
+#     paths instead.
+# "Night" always means outside 06:00-20:00 local (DAY_DEFAULT), independent
+# of how these windows are narrowed or widened, so the acknowledgement and
+# the console copy always mean the same thing.
+#
+# The windows are PUBLISH gates, never evaluator gates: a plan already in
+# the store before a config NARROWING still evaluates (the config revision
+# is the operator's act; the NEXT publish is the one refused). The console
+# can never widen the policy — only a config revision plus a restart can.
+#
+# Commissioning gates: `intent_ttl_s` must exceed timing.control_period_s
+# (the runner renews exactly once per fleet cycle) and stay inside
+# (0, 300] seconds — a window may not out-live ordinary intents. Window end
+# is NON-RENEWAL: the held intent lapses by TTL and the ~3.5-4.0 s firmware
+# watchdog returns each pod to its own autonomy (the same hand-back as every
+# other intent source, and the fail-safe if the runner dies mid-window).
+# A schedule intent is the LOWEST-priority source: manual, agent, the
+# emergency stop, and (with excess_charging.yield_to_schedule: true, the
+# default) the solar-surplus adviser outrank it per battery, and a window
+# opening under one simply WAITS.
+#
+# schedule:
+#   # The allowed command windows, local civil time ("HH:MM" pairs; a pair
+#   # may cross midnight). The UNION of the pairs is what a schedule may
+#   # command. OMITTED = the day-only YIELD default shown here.
+#   allowed_windows_local: [["06:00", "20:00"]]
+#   intent_ttl_s: 10.0

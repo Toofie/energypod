@@ -349,6 +349,82 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-25 (schedules backend): THE SCHEDULES SURFACE IMPLEMENTED (B1-B6;
+  3e351f5, 1019640, f4d0eec, bdc592c, c67742c, + this pass) against the
+  accepted contract docs/DESIGN_SCHEDULES.md (18db3ff) and API_CONTRACTS
+  "Schedule" — backend half only; the console agent builds the editor
+  (W1-W3) against the same pinned shapes in parallel. The docs govern every
+  shape; nothing below deviates. (1) DOMAIN (B1): ScheduleEntry gained
+  watts_by_unit under exactly PowerIntent's dual-form rules (scalar fleet
+  total OR one positive int per selected unit summing to it; idle = scalar
+  0, never a mapping; frozen mapping so equality follows the value); the
+  evaluator carries the form verbatim; the SQLite payload round-trips both
+  forms and still decodes pre-extension rows. The pure helpers next_start
+  (8-day horizon, ties by priority then id, effective bounds on the start
+  date) and window_end (midnight-crossing aware) are the single
+  implementation of every countdown. (2) RUNNER (B2): ScheduleRunner in
+  application/scheduling.py maintains EXACTLY ONE live SCHEDULE intent
+  keyed (plan.version, entry_id) — submit on open, remove-then-submit
+  renewal (the adviser's discipline; the held-id invariant is a named
+  test), removal-only close on window end/disable/plan change; the runner
+  never checks claims to decide control (waiting_for_higher_priority is
+  projection honesty only); schedule_window.opened publishes on the first
+  submit per key and schedule_window.closing on the removal tick —
+  transitions, never heartbeats; a dead runner hands back by TTL + the
+  firmware watchdog. (3) FACADE (B3): get_schedule (observe; repository +
+  pure reads only), replace_schedule (whole-plan CAS with the pinned order:
+  422 per-entry domain errors naming entry_id -> 409
+  schedule_window_not_allowed {posture, allowed_windows_local, offending}
+  -> 409 night_posture_acknowledgement_required with the durable-append-
+  FIRST acknowledgement (deterministic audit event id, audit failure
+  refuses, captured once never re-prompted) -> 409 schedule_version_conflict
+  {current_version}); the diff summary rides the audit row and the
+  schedule.replaced bus event; Impl-10 commit-then-audit with a
+  compensating restore (prior plan via the same CAS; the port has no
+  delete, so the inverse of a FIRST publish is an empty plan = off);
+  submit_schedule_intent is the submit_advisory_intent twin (source
+  SCHEDULE, schedule- prefix, per-battery watts native, atomic with its
+  audit and publication, never routed on REST/MCP). (4) REST (B4):
+  GET/PUT /api/v1/schedule — GET observe, PUT dispatch + INTERACTIVE
+  principal + Idempotency-Key, every refusal shape verbatim, 422s name the
+  offending entry; an empty entries list is legal (the plan IS the state).
+  (5) COMPOSITION (B5): the schedule: config block (block-presence
+  doctrine — present composes the surface control + runner + schedule_state
+  projection, absent is byte-identical and both routes answer 409
+  schedule_not_commissioned; allowed_windows_local defaults [["06:00",
+  "20:00"]] = the day-only YIELD posture and "night" always means outside
+  that DAY_DEFAULT; intent_ttl_s > control_period_s and <= 300 s; no
+  enabled key). The runner ticks in _run_fleet AFTER the polls and BEFORE
+  the excess adviser (the ordering is a named test: the schedule's claim is
+  a published fact, the adviser the opportunist, so a yield resolves within
+  one cycle) under the composed principal energypod:schedule-runner
+  (observe + dispatch, non-interactive, site-bound); the night
+  acknowledgement boot-loads via one keyed audit existence check. The
+  adviser's claim check generalizes: excess_charging.yield_to_schedule
+  (default TRUE, per unit) makes a live SCHEDULE intent on the adviser's
+  target a yield trigger exactly like MANUAL/AGENT — without it the adviser
+  outranks schedules by arbiter and starves them invisibly; false is the
+  explicit opt-out. The schedule_state projection is single-writer (the
+  runner's post-tick update; active derives from held_intent_id). (6) B6:
+  the commented schedule: block in config/config.live-write-example.yaml
+  documents the posture semantics and the trial-safe default day windows.
+  VERIFICATION: the scoped families green (test_schedule, test_service_
+  facade, test_facade_audit_content, test_rest_contract,
+  test_boundary_hardening, test_event_contract, test_composition,
+  test_excess_charge, test_config, test_repositories; 1600+ tests across
+  unit+api), ruff + format + MYPYPATH=src mypy strict clean; READ-ONLY live
+  check on the running controller (config block ABSENT): snapshot carries
+  NO schedule_state (byte-identical), GET /api/v1/schedule answers 409
+  schedule_not_commissioned, fleet state unchanged, log clean; then a
+  SIMULATOR demonstration (script outside the repo, run twice
+  deterministic) walked publish -> schedule_state next -> window open ->
+  SCHEDULE intent live with per-battery authorization -> a concurrent
+  MANUAL intent outranking it per unit -> window end non-renewal -> adviser
+  yield on/off. NO live dispatching. NEXT: the console agent's W1-W3 land
+  against these shapes; first night publish needs the operator decisions in
+  DESIGN_SCHEDULES §8 verbatim (the partition grant is a config revision +
+  the one-time acknowledgement).
+
 - 2026-08-25 (excess activation backend): THE OPERATOR-FACING ACTIVATION
   PACKAGE IMPLEMENTED (B1-B4 + the two UI-audit extras; ce0d825, 158679d,
   1bd075c, + this pass) against the accepted contract
