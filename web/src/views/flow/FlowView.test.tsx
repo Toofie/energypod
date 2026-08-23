@@ -665,6 +665,41 @@ describe("FlowView — the pinned diagram structure", () => {
     expect(down.querySelectorAll(".flow-stub-track").length).toBe(0);
   });
 
+  it("puts every arrowhead at the end the direction names (the head IS the direction)", async () => {
+    liveChannel([]);
+    // lhs imports and discharges; rhs exports and charges — each family's
+    // both directions on screen at once.
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("lhs", { grid_power_w: -800, load_power_w: 300, battery_watts: 900 }),
+        unit("rhs", { grid_power_w: 500, load_power_w: 200, battery_watts: -700 }),
+      ]),
+    );
+
+    renderFlow();
+
+    await screen.findByText(/while rhs is charging 700 W/i);
+    const columns = document.body.querySelectorAll(".flow-phase");
+    expect(columns.length).toBe(3);
+    const stubsOf = (column: Element, tone: string): string[] =>
+      [...column.querySelectorAll(`.flow-stub--${tone} .flow-stub-track`)].map(
+        (line) => `${line.getAttribute("y1")}->${line.getAttribute("y2")}`,
+      );
+    // A stub drawn bottom→top (90→14) carries its head INTO the rail; one
+    // drawn top→bottom (14→90) carries its head down to the node. Import and
+    // discharge feed the phase; export, charge, and the house's draw leave it.
+    expect(stubsOf(columns[1]!, "grid")).toEqual(["90->14"]); // lhs importing
+    expect(stubsOf(columns[1]!, "battery")).toEqual(["90->14"]); // lhs discharging
+    expect(stubsOf(columns[1]!, "home")).toEqual(["14->90"]);
+    expect(stubsOf(columns[2]!, "grid")).toEqual(["14->90"]); // rhs exporting
+    expect(stubsOf(columns[2]!, "battery")).toEqual(["14->90"]); // rhs charging
+    // Every active track wears exactly one head (markerEnd), on its drawn end.
+    for (const line of document.body.querySelectorAll(".flow-stub-track")) {
+      expect(line.getAttribute("marker-end")).toMatch(/^url\(#flow-head-(sm|lg)-/);
+      expect(line.getAttribute("marker-start")).toBeNull();
+    }
+  });
+
   it("pulses the battery ring of a phase commanded but not yet moving", async () => {
     liveChannel([]);
     api.client.getSnapshot.mockResolvedValue(
