@@ -755,8 +755,9 @@ describe("ScheduleView — publishing", () => {
     const put = vi.fn(() =>
       Promise.reject(
         refusalError("validation_error", {
+          // The shape the landed REST layer pins (rest.py replace_schedule).
           details: {
-            entries: [
+            errors: [
               { entry_id: "Day charge", field: "end_local", message: "window must outlast its start" },
             ],
           },
