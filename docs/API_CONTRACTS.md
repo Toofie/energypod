@@ -984,6 +984,104 @@ section pins the wire-facing shapes.
   counter deltas survive restarts by design) with memory and SQLite adapters (a
   schema_version migration); MCP gains the read-only `get_energy_days(limit)` tool.
 
+## Plant history (telemetry historian — DESIGN_PLANT_HISTORY)
+
+Accepted design, pending implementation. A durable time-series record of the
+plant: a historian in the fleet loop samples the observation stream at a
+configured cadence into SQLite (schema_version 3), and one observe-scope
+route serves windowed, server-downsampled series for the console's History
+view. Observability only — full contracts, sizing math, and the ordered plan
+live in `docs/DESIGN_PLANT_HISTORY.md`; this section pins the wire-facing
+shapes.
+
+- **Sampler (DESIGN §2):** a `TelemetryHistorian` ticks once per fleet cycle
+  beside the energy accountant (after the polls, before the kernel tick),
+  bounded and suppressed — a failed append is a GAP, never a delay to
+  control. Cadence `sample_interval_s` (default 30.0; > `control_period_s`,
+  ≤ 3600; 2,880 rows/unit/day); `sampled_at` is the tick's wall clock at
+  second precision, one timestamp shared by every unit sampled in the tick.
+  A unit's LATEST observation is sampled only when no older than
+  `max(3 × control_period_s, sample_interval_s)` — a stale latest writes NO
+  row (controller down and unreadable telemetry are absent rows, never
+  interpolated; the API and charts show gaps as gaps). Each row: the 15
+  numeric observables (`system_soc_pct`, `bms_soc_pct`, `soh_pct`,
+  `battery_watts`, `grid_power_w`, `load_power_w`, `pack_voltage_v`,
+  `pack_current_a`, `cell_min_v`, `cell_max_v`, `cell_spread_mv`,
+  `temperature_min_c`, `temperature_max_c`, `dynamic_charge_limit_w`,
+  `dynamic_discharge_limit_w` — all null when absent, never zero-filled),
+  `lifecycle`, `health_state`, the four mode words, a per-row `quality`
+  rollup (worst over `REQUIRED_SAFETY_QUALITY_FIELDS` plus the CT fields when
+  composed; precedence `missing > bad > stale > suspect > good`; the
+  cold-ring `system_soc_pct`/`soh_pct` are excluded — their staleness is the
+  documented advisory doctrine, not degradation), and the commanded triple
+  `commanded_source` (`manual|agent|schedule|excess_adviser|night_adviser|
+optimizer`)/`commanded_direction`/`commanded_w` (the per-unit winner and
+  peeked authority at sample time; all null when no intent claims the unit).
+  NOT recorded: per-cell voltages and the full temperature array (min/max/
+  spread only — the per-cell history question is answered in the design §3.6),
+  any kWh figure (the scorecard's), and any decision fact (the audit trail's).
+- **Persistence (DESIGN §2.2–2.4):** `telemetry_sample` keyed
+  `(unit_id, sampled_at)` WITHOUT ROWID, plus `telemetry_rollup_hourly`
+  (per-field min/max/mean, `sample_count`, `worst_quality`; an empty hour
+  writes no row) — schema_version 3, migration in place, riding the EXISTING
+  database path. Maintenance (one transaction: rollup the hours past the
+  horizon, then prune — prune only inside the committing transaction) runs at
+  boot and on the first tick after each site-local midnight. Defaults:
+  full-resolution 14 days (≈ 24 MB) + hourly rollups forever (≈ 10 MB/year);
+  steady state ≈ 25–40 MB.
+- **Config block `plant_history:`** (block-presence doctrine; no `enabled`
+  key): `sample_interval_s: 30.0`, `retention_full_resolution_days: 14`
+  (1..3650), `retention_rollup_days: 0` (0 = forever). A PRESENT block
+  composes the historian, the route, the MCP tool, and the snapshot's
+  feature-detected `history_state` (`{sample_interval_s,
+  retention_full_resolution_days, last_sample_at: {unit → iso | null}}`);
+  an ABSENT block composes nothing and the route answers 409
+  `plant_history_not_commissioned`. A PRESENT block REQUIRES the `storage`
+  block (durable history is the point; a silently in-memory historian is the
+  invisible-off class); `simulate` composes the in-memory adapter.
+- **`GET /api/v1/history?from&to&unit_ids&fields&points`** (observe scope;
+  read-only, no mutation exists): `from`/`to` REQUIRED ISO-8601 WITH explicit
+  offset, `from < to`, window ≤ 31 days; `unit_ids` comma-separated
+  configured ids (default all); `fields` from the vocabulary above plus the
+  step-encoded `lifecycle`, `health_state`, `commanded` (default
+  `bms_soc_pct,battery_watts,grid_power_w,temperature_min_c,
+temperature_max_c`); `points` 50..2000 (default 600). Errors: 422
+  `validation_error` for every parameter rule (no bare 400 on this surface);
+  409 `plant_history_not_commissioned`; a window before the first sample is
+  a 200 with empty series and `first_sample_at: null`. One resolution per
+  response, chosen by the data horizon: `resolution: "full"` (raw samples)
+  when `from` is at/after the oldest retained full-resolution sample, else
+  `"hourly"` (rollups) for the whole window.
+- **Downsampling is pinned server-side (DESIGN §3.2):** classic LTTB per
+  series to `points`, first/last samples always retained, deterministic
+  (ties to the earlier sample), and every emitted point a REAL stored sample
+  — never a synthesized mean (bucket-mean aggregation was rejected: it
+  fabricates values and flattens charge bursts). Each series additionally
+  carries `window_min`/`window_min_at`/`window_max`/`window_max_at`/
+  `sample_count` over ALL rows in the window, so peaks that downsampling
+  drops are still reported.
+- **Response:** `{"from", "to", "resolution", "points", "fields", "units":
+  {unit → {first_sample_at, last_sample_at, sample_count, quality_worst,
+  "gaps": [{from, to}], "series": {field → {window_min, window_min_at,
+  window_max, window_max_at, "points": [{t, v} | {t, v, min, max, n} at
+  hourly resolution]}}, "lifecycle_changes"/"health_state_changes":
+  [{t, v}], "commanded_changes": [{t, source, direction, watts}]}},
+  "fleet": {"series": {grid_power_w, load_power_w, battery_watts}, "gaps"}}`.
+  Gaps are server-computed (full: row spacing > 3 × `sample_interval_s`;
+  hourly: any missing hour between first and last) and never interpolated.
+  Fleet sums are computed over RAW rows BEFORE downsampling, and a fleet
+  point exists only where EVERY unit in the requested set has a row (one
+  unreadable phase is never zero). Null-valued points are never emitted —
+  an absent datum is not zero. MCP gains the read-only
+  `get_plant_history(from, to, unit_ids?, fields?, points?)` tool.
+- **Standing pins:** history is never safety-authoritative — no kernel,
+  gate, adviser, or toggle reads it; nothing restores from it at boot; it
+  writes no audit facts and publishes no bus events (samples are
+  projections, not acts); the energy scorecard stays the kWh authority
+  (cross-linked in the console, never duplicated); and the audit trail owns
+  decisions — a history row's commanded triple is the sampled 30 s
+  projection, and where the two disagree the audit row is the record.
+
 ## Device-mode telemetry and dispatch gating
 
 - `Observation` gains four more ADVISORY words (2026-08-23 incident 1), same doctrine as the CT
