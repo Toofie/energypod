@@ -513,8 +513,10 @@ class FakeActorHandle:
             return outcome
         raise OSError("mode refresh read failed")
 
-    async def arm(self) -> None:
+    async def arm(self, *, takeover_acknowledged: bool = False) -> None:
         self.history.append(f"arm:{self.unit_id}")
+        if takeover_acknowledged:
+            self.history.append(f"arm-takeover:{self.unit_id}")
         if self.arm_error is not None:
             raise self.arm_error
         # Only an explicit "not qualified" report refuses here: a None

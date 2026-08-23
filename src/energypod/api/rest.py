@@ -136,6 +136,12 @@ class IntentRequest(StrictRequest):
 class ArmRequest(StrictRequest):
     unit_ids: list[str] = Field(min_length=1)
     confirmation: Literal["ARM"]
+    # ADD-1 layer (b) (2026-08-24 live blocker): the operator's explicit
+    # acknowledgement that arming may REPLACE a served PQ objective outside
+    # the pod-autonomy signature band -- a deliberate, audited takeover of
+    # another writer.  Optional; any value other than the literal is refused
+    # by validation, and the acknowledgement is never persisted.
+    takeover: Literal["ACKNOWLEDGE"] | None = None
 
     @field_validator("unit_ids")
     @classmethod
@@ -615,6 +621,7 @@ def create_api_app(
                 principal=identity,
                 idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
                 request_id=request.state.request_id,
+                takeover=payload.get("takeover"),
             ),
         )
         return JSONResponse(status_code=result.status_code, content=dict(result.body))

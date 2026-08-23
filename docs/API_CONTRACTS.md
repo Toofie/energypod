@@ -355,6 +355,28 @@ priority are rejected. Evaluation returns a short-lived schedule intent, never a
   `external_writer` (privileged acknowledgement required, re-latching while
   the foreign objective persists); an unreadable readback refuses the arm
   fail-closed. This makes single-writer authority structural, not assumed.
+- Preflight discrimination — POD AUTONOMY vs foreign writers (2026-08-24 live
+  blocker): the pods' own firmware autonomously self-charges by holding a PQ
+  objective (measured ~-520..-560 W daytime and up to ~-2.27 kW deep
+  self-charge; negative P = charge), and a fresh process has no write
+  provenance, so the strict rule misread the battery's own self-consumption
+  as a foreign writer after every restart — an unwinnable race against the
+  ~1.34 s watchdog zero. Two sanctioned exceptions now exist, both recorded
+  on the actor as `last_arm_classification` and audited on the `unit_armed`
+  row (reason code `arm_pod_autonomy` / `arm_takeover_acknowledged`):
+  - With the commissioned `policy.autonomous_charge_signature_max_w` band
+    set, a nonzero readback this process did not write whose sign and
+    magnitude match the pod's OWN signature — negative P within the band, Q
+    zero — is classified POD AUTONOMY: the arm proceeds and the controller's
+    next renewed objective replaces the pod's own (beat-autonomy doctrine).
+    A discharge (positive) objective, a magnitude beyond the band, or any
+    reactive component still latches `external_writer` exactly as before.
+  - An operator may take over a beyond-band objective deliberately:
+    `POST /api/v1/arm` with `{"confirmation":"ARM","takeover":"ACKNOWLEDGE"}`
+    arms under an explicit, per-request, audited acknowledgement. Without it,
+    the beyond-band objective still latches. No acknowledgement or
+    classification is ever persisted — boot stays observe-only and a fresh
+    process holds no provenance (unchanged).
 - The only writable registers remain `[1, signed P, signed Q]` at `0x0200`
   (negative P = charge, positive P = discharge — live-proven 2026-08-22);
   the transport write gate is unchanged and no other address is writable by

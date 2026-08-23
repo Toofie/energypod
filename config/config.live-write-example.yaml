@@ -176,6 +176,28 @@ policy:
   #   - PCS_Warning0_1
   #   - DCDC_Warning0_1
   blocking_warning_codes: []
+  # ARM-TIME SOLE-WRITER PREFLIGHT — pod-autonomy discrimination band
+  # (2026-08-24 live blocker).  The pods' OWN firmware autonomously self-
+  # charges by holding a PQ objective on the write register: measured
+  # ~-520..-560 W daytime CT-following and up to ~-2.27 kW deep self-charge
+  # (negative P = CHARGE, the live-proven sign convention).  A fresh
+  # controller process has no write provenance, so without this band the
+  # preflight classified the battery's own self-consumption as a FOREIGN
+  # writer and latched external_writer after every restart — an unwinnable
+  # race (the device watchdog reverts a bounded zero in ~1.34 s vs ~5-6 s
+  # re-qualification; ~40 arm attempts failed over 25 min on 2026-08-24
+  # while mid self-charged at -2.2 kW throughout).  With the band set, a
+  # nonzero readback objective this process did not write — negative P
+  # within the band, Q zero — is classified POD AUTONOMY: the arm proceeds
+  # and our renewed objective replaces the pod's own (beat-autonomy).  2500
+  # covers the observed autonomous range while staying inside
+  # max_unit_charge_w; anything else (positive/discharge objectives,
+  # magnitudes beyond the band, any reactive component) still latches
+  # external_writer exactly as before.  An operator may still take over a
+  # beyond-band objective deliberately: POST /api/v1/arm with
+  # {"confirmation":"ARM","takeover":"ACKNOWLEDGE"} (audited, never
+  # persisted).
+  autonomous_charge_signature_max_w: 2500
   debug_modes_enabled: false
 
 authentication:

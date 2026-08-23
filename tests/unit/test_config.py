@@ -426,6 +426,26 @@ def test_blocking_warning_codes_must_be_unique_and_normalized() -> None:
         _validate(payload)
 
 
+def test_the_pod_autonomy_signature_band_is_optional_and_positive() -> None:
+    """ADD-1: the commissioned ceiling the arm preflight attributes to a pod's
+    own autonomous charge objective.  Absent keeps the strict preflight; a
+    non-positive band is a configuration error."""
+    parsed = _validate(_valid_config())
+    assert parsed.policy is not None
+    assert parsed.policy.autonomous_charge_signature_max_w is None
+
+    payload = _valid_config()
+    payload["policy"]["autonomous_charge_signature_max_w"] = 2500
+    parsed = _validate(payload)
+    assert parsed.policy is not None
+    assert parsed.policy.autonomous_charge_signature_max_w == 2500
+
+    payload = _valid_config()
+    payload["policy"]["autonomous_charge_signature_max_w"] = 0
+    with pytest.raises(ValidationError):
+        _validate(payload)
+
+
 # --- excess-solar accelerated charging gates (API_CONTRACTS "Excess-solar
 # --- accelerated charging (advisory)") ----------------------------------------
 #

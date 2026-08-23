@@ -88,6 +88,7 @@ class EnergyPodActor:
         objective_readback_address: int | None = None,
         blocking_fault_codes: frozenset[str] | None = None,
         mode_refresh_window: tuple[int, int] | None = None,
+        autonomous_charge_signature_max_w: int | None = None,
         telemetry: Any | None = None,
     ) -> None:
         if stable_observations_required < 1:
@@ -110,6 +111,11 @@ class EnergyPodActor:
             or mode_refresh_window[1] < 3
         ):
             raise ValueError("mode_refresh_window must be an (address, count>=3) pair")
+        if autonomous_charge_signature_max_w is not None and (
+            type(autonomous_charge_signature_max_w) is not int
+            or autonomous_charge_signature_max_w <= 0
+        ):
+            raise ValueError("autonomous_charge_signature_max_w must be a positive integer")
 
         self.unit_id = unit_id
         self._transport = transport
@@ -141,6 +147,19 @@ class EnergyPodActor:
         # pod that was in Local at some earlier moment could refuse dispatch
         # on stale evidence.  ``None`` keeps the arm path exactly as today.
         self._mode_refresh_window = mode_refresh_window
+        # ADD-1 (2026-08-24 live blocker): the commissioned ceiling on the
+        # magnitude of the pod's OWN autonomous charge objective.  A nonzero
+        # arm-preflight readback this process did not write, whose sign and
+        # magnitude match the pod's evidenced self-consumption signature
+        # (negative P within this band, Q zero), is classified POD AUTONOMY
+        # rather than a foreign writer: the arm proceeds and our renewed
+        # objective replaces the pod's own (beat-autonomy doctrine).
+        # ``None`` keeps today's exact behavior.
+        self._autonomous_charge_signature_max_w = autonomous_charge_signature_max_w
+        # The classification the LAST arm preflight reached (read by the
+        # facade for the audit trail): "sole_writer", "pod_autonomy",
+        # "takeover_acknowledged", "external_writer", or None before any arm.
+        self.last_arm_classification: str | None = None
         # Optional telemetry strategy (structural port): the composition root
         # may inject the poll->decode->deliver strategy so one telemetry cycle
         # reads the selected register-layout plan through this actor's sole
@@ -227,8 +246,18 @@ class EnergyPodActor:
     async def accept_observation(self, observation: Any) -> None:
         await self._submit("observation", observation, _CONTROL_PRIORITY)
 
-    async def arm(self) -> None:
-        await self._submit("arm", None, _CONTROL_PRIORITY)
+    async def arm(self, *, takeover_acknowledged: bool = False) -> None:
+        """Arm, optionally acknowledging a takeover of a foreign objective.
+
+        ADD-1 layer (b) (2026-08-24 live blocker): ``takeover_acknowledged``
+        is the operator's explicit acknowledgement that arming will REPLACE a
+        served PQ objective outside the pod-autonomy signature band -- a
+        deliberate takeover of another writer, audited by the facade through
+        ``last_arm_classification``.  It never bypasses qualification or the
+        latch, and it is never persisted: a fresh process boots observe-only
+        and holds no provenance.
+        """
+        await self._submit("arm", bool(takeover_acknowledged), _CONTROL_PRIORITY)
 
     async def disarm(self) -> None:
         """Disarm through the mailbox; the inhibit latch is never cleared.
@@ -435,7 +464,7 @@ class EnergyPodActor:
         if operation == "observation":
             return await self._accept_observation_owned(argument)
         if operation == "arm":
-            return await self._arm_owned()
+            return await self._arm_owned(takeover_acknowledged=bool(argument))
         if operation == "disarm":
             return await self._disarm_owned()
         if operation == "poll":
@@ -638,7 +667,7 @@ class EnergyPodActor:
             and cell_count_ok
         )
 
-    async def _arm_owned(self) -> None:
+    async def _arm_owned(self, takeover_acknowledged: bool = False) -> None:
         if self._stopping:
             return
         if (
@@ -650,10 +679,10 @@ class EnergyPodActor:
         # The external-writer preflight is arm-gated: it runs exactly once per
         # arm attempt, inside this mailbox dispatch, before ARMED_IDLE — never
         # per heartbeat.
-        await self._verify_sole_writer_owned()
+        await self._verify_sole_writer_owned(takeover_acknowledged=takeover_acknowledged)
         self.lifecycle = UnitLifecycle.ARMED_IDLE
 
-    async def _verify_sole_writer_owned(self) -> None:
+    async def _verify_sole_writer_owned(self, *, takeover_acknowledged: bool = False) -> None:
         """Refuse the arm unless this actor is the sole PQ writer.
 
         API_CONTRACTS "Write-enabled run mode", bullet 3: at arm time the
@@ -674,6 +703,22 @@ class EnergyPodActor:
         pair against the last objective this actor wrote, and a fresh actor
         that has written nothing treats every nonzero readback as foreign
         because it cannot inherit provenance from a previous process.
+
+        ADD-1 (2026-08-24 live blocker) — two sanctioned exceptions, both
+        audited through ``last_arm_classification``:
+
+        - POD AUTONOMY: a nonzero readback this process did not write whose
+          sign and magnitude match the pod's evidenced self-consumption
+          signature — negative P (the charge sign) within the commissioned
+          ``autonomous_charge_signature_max_w`` band, Q zero — is the pod's
+          OWN firmware self-charging (measured ~-520..-560 W daytime and up
+          to ~-2.27 kW deep self-charge).  A fresh process cannot prove
+          provenance, but the battery is readable, healthy, and charging
+          ITSELF; the arm proceeds and our renewed objective replaces the
+          pod's own on the very next heartbeat (beat-autonomy doctrine).
+        - OPERATOR-ACKNOWLEDGED TAKEOVER: an explicit ``takeover_acknowledged``
+          arm replaces a beyond-band foreign objective deliberately.  The
+          acknowledgement is per-request, audited, and never persisted.
         """
         address = self._objective_readback_address
         if address is None:
@@ -690,12 +735,38 @@ class EnergyPodActor:
                 f"{self.unit_id}: arm refused, the served PQ objective readback is unreadable"
             ) from error
         served = (self._signed_objective(readback[0]), self._signed_objective(readback[1]))
-        if served != (0, 0) and served != self._applied_objective:
-            await self._inhibit_owned("external_writer", InhibitCause.LATCHED)
-            raise RuntimeError(
-                f"{self.unit_id}: arm refused, an external writer holds the PQ "
-                f"objective (P={served[0]}, Q={served[1]})"
-            )
+        if served == (0, 0) or served == self._applied_objective:
+            self.last_arm_classification = "sole_writer"
+            return
+        if self._is_pod_autonomy_signature(served):
+            self.last_arm_classification = "pod_autonomy"
+            return
+        if takeover_acknowledged:
+            self.last_arm_classification = "takeover_acknowledged"
+            return
+        self.last_arm_classification = "external_writer"
+        await self._inhibit_owned("external_writer", InhibitCause.LATCHED)
+        raise RuntimeError(
+            f"{self.unit_id}: arm refused, an external writer holds the PQ "
+            f"objective (P={served[0]}, Q={served[1]})"
+        )
+
+    def _is_pod_autonomy_signature(self, served: tuple[int, int]) -> bool:
+        """Whether the served objective matches the pod's own self-charge band.
+
+        The evidenced telemetry convention is negative P = CHARGE
+        (PROTOCOL_EVIDENCE 4b direction trial), and the pods' autonomous
+        self-consumption was measured at ~-520..-560 W (daytime CT-following)
+        up to ~-2.27 kW (deep self-charge).  The commissioned band bounds the
+        magnitude we are willing to attribute to the pod's own firmware; a
+        DISCHARGE objective (positive P), any reactive component, or a charge
+        magnitude beyond the band is somebody else's write and still latches.
+        """
+        band = self._autonomous_charge_signature_max_w
+        if band is None:
+            return False
+        active, reactive = served
+        return reactive == 0 and active < 0 and 0 < -active <= band
 
     @staticmethod
     def _signed_objective(word: int) -> int:

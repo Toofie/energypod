@@ -1395,8 +1395,13 @@ class _ActorCommandHandle:
         """The actor's recorded inhibit cause; ``None`` while never latched."""
         return self._actor.inhibit_cause
 
-    async def arm(self) -> None:
-        await self._actor.arm()
+    @property
+    def last_arm_classification(self) -> str | None:
+        """ADD-1: the last arm preflight's objective classification."""
+        return self._actor.last_arm_classification
+
+    async def arm(self, *, takeover_acknowledged: bool = False) -> None:
+        await self._actor.arm(takeover_acknowledged=takeover_acknowledged)
 
     async def disarm(self) -> None:
         await self._actor.disarm()
@@ -2040,6 +2045,9 @@ def _control_policy(config: ControllerConfig) -> ControlPolicy:
         apparent_power_limit_va_by_unit={unit_id: apparent_limit for unit_id in unit_ids},
         reactive_limit_var=configured.reactive_power_limit_var,
         stable_samples_needed_to_rearm=configured.stable_samples_to_rearm,
+        # ADD-1: the commissioned pod-autonomy band reaches the policy (and
+        # from there the actors' arm preflight) exactly when configured.
+        autonomous_charge_signature_max_w=configured.autonomous_charge_signature_max_w,
         blocking_fault_codes=frozenset(configured.blocking_fault_codes),
         # S1 (SYNC_RESILIENCE_AUDIT): the configured warning-tier blocking
         # set reaches the policy instead of a hard-wired empty set -- the
@@ -2402,6 +2410,12 @@ def _build_runtime(
             # the default None and keep today's arm path exactly.
             objective_readback_address=(
                 _OBJECTIVE_READBACK_ADDRESS if write_enabled and not simulate else None
+            ),
+            # ADD-1 (2026-08-24 live blocker): the commissioned pod-autonomy
+            # band for the arm preflight's discrimination layer -- wired only
+            # where the preflight itself is wired (write-enabled live units).
+            autonomous_charge_signature_max_w=(
+                policy.autonomous_charge_signature_max_w if write_enabled and not simulate else None
             ),
             blocking_fault_codes=frozenset(policy.blocking_fault_codes),
             # B5: the bounded fresh mode-word read behind the dispatch

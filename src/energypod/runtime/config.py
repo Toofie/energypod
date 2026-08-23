@@ -221,6 +221,17 @@ class PolicyConfig(_FrozenModel):
     # operator (both calibration bits are standing-active on this fleet, so
     # enabling them as blocking denies every dispatch).
     blocking_warning_codes: tuple[NonEmpty, ...] = ()
+    # ADD-1 (2026-08-24 live blocker): the commissioned ceiling on the
+    # magnitude the controller attributes to a pod's OWN autonomous charge
+    # objective at the arm-time sole-writer preflight.  The pods'
+    # self-consumption was measured at ~-520..-560 W daytime CT-following and
+    # up to ~-2.27 kW deep self-charge; the band must cover that observed
+    # autonomous range while staying inside the unit's static charge limit,
+    # so a beyond-band (or discharge/positive, or reactive) objective still
+    # latches external_writer exactly as before.  ``None``/absent keeps the
+    # strict preflight: every nonzero objective this process did not write is
+    # foreign.
+    autonomous_charge_signature_max_w: PositiveStrictInt | None = None
     debug_modes_enabled: StrictBool
 
     @field_validator("threshold_provenance")

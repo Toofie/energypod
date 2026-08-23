@@ -321,6 +321,7 @@ def make_actor(
     transport: SpyTransport | None = None,
     authorizations: FakeAuthorizationRepository | None = None,
     objective_readback_address: int | None = OBJECTIVE_READBACK_ADDRESS,
+    autonomous_charge_signature_max_w: int | None = None,
 ) -> tuple[Any, SpyTransport, FakeAuthorizationRepository]:
     """One real actor over fakes; the preflight port defaults to the IoT window."""
     test_transport = transport or SpyTransport()
@@ -342,6 +343,7 @@ def make_actor(
         heartbeat_interval_s=1.0,
         heartbeat_safety_margin_s=0.2,
         objective_readback_address=objective_readback_address,
+        autonomous_charge_signature_max_w=autonomous_charge_signature_max_w,
     )
     return actor, test_transport, authorization_repo
 
@@ -366,7 +368,7 @@ def nonzero_pq_writes(transport: SpyTransport) -> list[EncodedWrite]:
     return [write for write in transport.writes if write.values != (1, 0, 0)]
 
 
-def make_facade(contract: Any, actor: Any) -> Any:
+def make_facade(contract: Any, actor: Any, audit: FakeAuditRepository | None = None) -> Any:
     """The real facade over the real actor; repositories stay fakes."""
     return contract.EnergyServiceFacade(
         site_id=SITE_ID,
@@ -374,7 +376,7 @@ def make_facade(contract: Any, actor: Any) -> Any:
         intents=FakeIntentRepository(),
         observations=FakeObservationRepository(),
         authorizations=FakeAuthorizationRepository(),
-        audit=FakeAuditRepository(),
+        audit=audit or FakeAuditRepository(),
         events=FakeEventBus(),
         coordinator=contract.AuthorityGenerationCoordinator(),
         actors={UNIT_ID: actor},
@@ -437,6 +439,220 @@ async def test_foreign_objective_refuses_arm_and_latches_external_writer(
     assert actor.inhibit_latched is True, "a persisting foreign objective re-latches"
     assert len(objective_reads(transport)) == 2
     assert nonzero_pq_writes(transport) == []
+    await actor.shutdown()
+
+
+# --- ADD-1 (2026-08-24): pod-autonomy discrimination at the arm preflight -----
+#
+# The live blocker: after any restart while a pod AUTONOMOUSLY self-charges,
+# its own firmware holds a nonzero PQ objective (~-2.2 kW measured; the fresh
+# process has no provenance), so the preflight latched external_writer and
+# the watchdog reverted every bounded zero in ~1.34 s vs ~5-6 s
+# re-qualification -- ~40 failed arms over 25 min while the pod charged
+# itself at -2.2 kW throughout.  Two remedy layers:
+#   (a) AUTONOMY-SIGNATURE DISCRIMINATION -- a nonzero readback whose
+#       sign/magnitude matches the pod's evidenced self-consumption signature
+#       (negative P, within the commissioned band, Q zero) that this process
+#       did not write is classified POD AUTONOMY, not foreign: the arm
+#       proceeds and our renewed objective replaces autonomy (beat-autonomy).
+#   (b) OPERATOR-ACKNOWLEDGED TAKEOVER -- arm accepts an explicit takeover
+#       acknowledgement for objectives OUTSIDE the signature band; audited.
+# Anything else still latches external_writer exactly as before, and boot
+# stays observe-only with NO provenance persistence across restarts.
+
+
+def raw_int16(value: int) -> int:
+    """One signed objective word exactly as the firmware serves it."""
+    return value & 0xFFFF
+
+
+async def test_a_pod_autonomy_signature_arms_instead_of_latching(contract: Any) -> None:
+    """The exact live shape: mid self-charging at ~-2.2 kW across a restart."""
+    transport = SpyTransport()
+    transport.objective = (raw_int16(-2275), 0)
+    actor, transport, authorizations = make_actor(
+        contract,
+        transport=transport,
+        authorizations=FakeAuthorizationRepository(AuthorizationRecord()),
+        autonomous_charge_signature_max_w=2500,
+    )
+    await qualify_disarmed(contract, actor)
+
+    await actor.arm()
+
+    assert actor.lifecycle is contract.UnitLifecycle.ARMED_IDLE, (
+        "the pod's own self-charge objective is POD AUTONOMY, not a foreign writer"
+    )
+    assert actor.inhibit_latched is False
+    assert actor.last_arm_classification == "pod_autonomy"
+    assert all(reason != "external_writer" for _, reason in authorizations.revocations)
+    # Beat-autonomy: our first renewed objective replaces the pod's own.
+    await actor.heartbeat_once()
+    assert transport.writes == [EncodedWrite(PQ_WRITE_ADDRESS, (1, 500, 0))]
+    await actor.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("objective", "label"),
+    [
+        ((500, 0), "discharge_objective_is_not_the_self_charge_signature"),
+        ((raw_int16(-3000), 0), "charge_objective_beyond_the_commissioned_band"),
+        ((0, 300), "reactive_objective_is_not_the_signature"),
+        ((raw_int16(-200), 300), "signature_p_with_foreign_q"),
+    ],
+    ids=["discharge_p", "beyond_band_p", "reactive_q", "p_in_band_q_nonzero"],
+)
+async def test_objectives_outside_the_signature_still_latch_external_writer(
+    contract: Any, objective: tuple[int, int], label: str
+) -> None:
+    transport = SpyTransport()
+    transport.objective = objective
+    actor, transport, authorizations = make_actor(
+        contract,
+        transport=transport,
+        autonomous_charge_signature_max_w=2500,
+    )
+    await qualify_disarmed(contract, actor)
+
+    with pytest.raises(RuntimeError):
+        await actor.arm()
+
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED, label
+    assert actor.inhibit_latched is True
+    assert any(reason == "external_writer" for _, reason in authorizations.revocations)
+    assert nonzero_pq_writes(transport) == []
+    await actor.shutdown()
+
+
+async def test_signature_discrimination_needs_the_commissioned_band(contract: Any) -> None:
+    """Without the configured band the preflight keeps today's exact
+    behavior: every nonzero objective this process did not write is foreign."""
+    transport = SpyTransport()
+    transport.objective = (raw_int16(-520), 0)
+    actor, transport, _ = make_actor(contract, transport=transport)
+    await qualify_disarmed(contract, actor)
+
+    with pytest.raises(RuntimeError):
+        await actor.arm()
+
+    assert actor.inhibit_latched is True
+    await actor.shutdown()
+
+
+async def test_an_acknowledged_takeover_arms_and_is_audited(contract: Any) -> None:
+    """Layer (b): a beyond-band objective arms under an explicit operator
+    takeover acknowledgement, and the classification is observable for the
+    audit trail.  Unacknowledged, the same objective still latches."""
+    transport = SpyTransport()
+    transport.objective = (500, 0)  # a foreign discharge objective
+    actor, transport, authorizations = make_actor(
+        contract,
+        transport=transport,
+        authorizations=FakeAuthorizationRepository(AuthorizationRecord(observation_sequence=2)),
+        autonomous_charge_signature_max_w=2500,
+    )
+    del authorizations
+    await qualify_disarmed(contract, actor)
+
+    with pytest.raises(RuntimeError):
+        await actor.arm(takeover_acknowledged=False)
+    assert actor.inhibit_latched is True
+
+    await actor.acknowledge_inhibit()
+    await actor.accept_observation(ObservationRecord(sequence=2))
+    assert actor.lifecycle is contract.UnitLifecycle.DISARMED
+
+    await actor.arm(takeover_acknowledged=True)
+
+    assert actor.lifecycle is contract.UnitLifecycle.ARMED_IDLE
+    assert actor.last_arm_classification == "takeover_acknowledged"
+    # The takeover replaced nothing on its own: only our own renewed
+    # authority ever writes, exactly as any armed unit (the pod-autonomy test
+    # above pins the renewal write itself).
+    assert nonzero_pq_writes(transport) == []
+    await actor.shutdown()
+
+
+async def test_the_facade_requires_the_takeover_acknowledgement_and_audits_it(
+    contract: Any,
+) -> None:
+    """The facade threads the REST acknowledgement and audits the takeover."""
+    transport = SpyTransport()
+    transport.objective = (raw_int16(-3000), 0)  # beyond the band
+    actor, transport, _ = make_actor(
+        contract,
+        transport=transport,
+        authorizations=FakeAuthorizationRepository(AuthorizationRecord()),
+        autonomous_charge_signature_max_w=2500,
+    )
+    audit = FakeAuditRepository()
+    bus = FakeEventBus()
+    facade = contract.EnergyServiceFacade(
+        site_id=SITE_ID,
+        clock=FakeClock(),
+        intents=FakeIntentRepository(),
+        observations=FakeObservationRepository(),
+        authorizations=FakeAuthorizationRepository(),
+        audit=audit,
+        events=bus,
+        coordinator=contract.AuthorityGenerationCoordinator(),
+        actors={UNIT_ID: actor},
+    )
+    await actor.start()
+    await actor.accept_observation(ObservationRecord())
+
+    refused = await facade.arm(
+        unit_ids=[UNIT_ID],
+        principal=OperatorPrincipal(),
+        idempotency_key="takeover-key-1",
+        request_id="takeover-request-1",
+    )
+    assert refused["units"][0]["status"] == "refused"
+    assert refused["units"][0]["reason"] == "inhibit_latched"
+
+    await actor.acknowledge_inhibit()
+    await actor.accept_observation(ObservationRecord(sequence=2))
+    armed = await facade.arm(
+        unit_ids=[UNIT_ID],
+        principal=OperatorPrincipal(),
+        idempotency_key="takeover-key-2",
+        request_id="takeover-request-2",
+        takeover="ACKNOWLEDGE",
+    )
+    assert armed["units"][0]["status"] == "armed", armed
+    assert armed["units"][0]["objective_classification"] == "takeover_acknowledged"
+
+    # The takeover reaches BOTH durable surfaces: the audit row's reason
+    # codes name it, and the published event carries the classification.
+    events = [event for event in audit.events if event.event_type == "unit_armed"]
+    assert events, "the takeover must reach the audit trail"
+    assert any(
+        "arm_takeover_acknowledged" in event.reason_codes
+        for event in events
+        if event.result == "armed"
+    ), [event.reason_codes for event in events]
+    published = [body for body in bus.published if body.get("type") == "unit.armed"]
+    assert any(
+        unit.get("objective_classification") == "takeover_acknowledged"
+        for body in published
+        for unit in body.get("payload", {}).get("units", [])
+    ), published
+    await actor.shutdown()
+
+
+async def test_an_invalid_takeover_spelling_is_refused_before_any_arm(contract: Any) -> None:
+    actor, _, _ = make_actor(contract)
+    await actor.start()
+    await actor.accept_observation(ObservationRecord())
+    facade = make_facade(contract, actor)
+    with pytest.raises(ValueError, match="takeover"):
+        await facade.arm(
+            unit_ids=[UNIT_ID],
+            principal=OperatorPrincipal(),
+            idempotency_key="takeover-key-3",
+            request_id="takeover-request-3",
+            takeover="YES",
+        )
     await actor.shutdown()
 
 

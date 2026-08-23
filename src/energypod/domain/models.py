@@ -141,6 +141,12 @@ class ControlPolicy(BaseModel):
     stable_samples_needed_to_rearm: int
     blocking_fault_codes: frozenset[str]
     blocking_warning_codes: frozenset[str]
+    # ADD-1 (2026-08-24 live blocker): the commissioned ceiling the arm-time
+    # sole-writer preflight attributes to a pod's OWN autonomous charge
+    # objective (negative P within this band, Q zero).  ``None`` keeps the
+    # strict preflight — every nonzero objective this process did not write
+    # is foreign.  Consumed by the unit actor, not by any bound.
+    autonomous_charge_signature_max_w: int | None = None
     debug_mode_enabled: bool = False
     # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the
     # all-or-none export bound triple.  All three None (the default) means

@@ -175,7 +175,7 @@ class ActorHandle(Protocol):
     @property
     def lifecycle(self) -> Any: ...
 
-    async def arm(self) -> None: ...
+    async def arm(self, *, takeover_acknowledged: bool = False) -> None: ...
 
     async def disarm(self) -> None: ...
 
@@ -969,23 +969,44 @@ class EnergyServiceFacade:
         principal: Principal,
         idempotency_key: Any,
         request_id: Any,
+        takeover: Any = None,
     ) -> dict[str, Any]:
-        """Arm exactly the requested qualified, disarmed units; report each outcome."""
+        """Arm exactly the requested qualified, disarmed units; report each outcome.
+
+        ADD-1 layer (b) (2026-08-24 live blocker): ``takeover="ACKNOWLEDGE"``
+        is the operator's explicit acknowledgement that arming may REPLACE a
+        served PQ objective outside the pod-autonomy signature band — a
+        deliberate, audited takeover of another writer.  Any other value is
+        refused before any unit is touched; the acknowledgement is per-request
+        and never persisted (boot stays observe-only, no provenance across
+        restarts).
+        """
         self._admit(principal, "arm", interactive=True)
         units = _validated_units(unit_ids)
         _correlation_key(idempotency_key, "idempotency_key")
         request = _correlation_key(request_id, "request_id")
+        if takeover not in (None, "ACKNOWLEDGE"):
+            raise ValueError("takeover acknowledgement must be the literal 'ACKNOWLEDGE'")
+        takeover_acknowledged = takeover == "ACKNOWLEDGE"
         outcomes: list[dict[str, str]] = []
         for unit_id in units:
-            outcome = await self._arm_one(unit_id)
+            outcome = await self._arm_one(unit_id, takeover_acknowledged=takeover_acknowledged)
             outcomes.append(outcome)
+            # ADD-1: the preflight classification is a first-class audit fact
+            # -- an acknowledged takeover or a pod-autonomy arm must be
+            # visible on the durable row's reason codes, not only its
+            # fingerprint.
+            classification = outcome.get("objective_classification")
+            classification_codes = (
+                (f"arm_{classification}",) if isinstance(classification, str) else ()
+            )
             await self._append_audit(
                 self._mutation_audit(
                     event_type="unit_armed",
                     subject=principal.subject,
                     result=outcome["status"],
                     request_id=request,
-                    reason_codes=(outcome["reason"],),
+                    reason_codes=(outcome["reason"], *classification_codes),
                     unit_id=unit_id,
                     lifecycle=self._handle_lifecycle(unit_id),
                     payload=dict(outcome),
@@ -1595,7 +1616,9 @@ class EnergyServiceFacade:
             reasons.append("no_unit_armed")
         return reasons
 
-    async def _arm_one(self, unit_id: str) -> dict[str, str]:
+    async def _arm_one(
+        self, unit_id: str, *, takeover_acknowledged: bool = False
+    ) -> dict[str, str]:
         handle = self._actors.get(unit_id)
         if handle is None:
             return {"unit_id": unit_id, "status": "refused", "reason": "unknown_unit"}
@@ -1609,7 +1632,7 @@ class EnergyServiceFacade:
             # unknown-state gate refuses it.
             return {"unit_id": unit_id, "status": "refused", "reason": "qualification_unknown"}
         try:
-            await handle.arm()
+            await handle.arm(takeover_acknowledged=takeover_acknowledged)
         except Exception:
             # An actor-side refusal can only be discovered by attempting it.
             # An attempt that left the unit holding a latched inhibit (the
@@ -1620,7 +1643,16 @@ class EnergyServiceFacade:
             if bool(getattr(handle, "inhibit_latched", False)):
                 return {"unit_id": unit_id, "status": "refused", "reason": "inhibit_latched"}
             return {"unit_id": unit_id, "status": "refused", "reason": "actor_failure"}
-        return {"unit_id": unit_id, "status": "armed", "reason": "armed"}
+        outcome: dict[str, str] = {"unit_id": unit_id, "status": "armed", "reason": "armed"}
+        # ADD-1: the preflight's classification rides the outcome (and so the
+        # unit_armed audit payload) whenever the owning actor reports one --
+        # pod_autonomy arms and acknowledged takeovers are auditable facts.
+        classification = getattr(handle, "last_arm_classification", None)
+        if isinstance(classification, str) and classification:
+            outcome["objective_classification"] = classification
+            if classification == "takeover_acknowledged":
+                outcome["takeover"] = "acknowledged"
+        return outcome
 
     async def _disarm_one(self, unit_id: str) -> dict[str, str]:
         handle = self._actors.get(unit_id)

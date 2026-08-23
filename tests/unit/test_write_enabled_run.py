@@ -206,7 +206,9 @@ def _timing_payload(
 
 
 def _policy_payload(
-    *, authorization_lifetime_s: float = _AUTHORIZATION_LIFETIME_S
+    *,
+    authorization_lifetime_s: float = _AUTHORIZATION_LIFETIME_S,
+    autonomous_charge_signature_max_w: int | None = 2500,
 ) -> dict[str, Any]:
     return {
         "version": 4,
@@ -234,6 +236,8 @@ def _policy_payload(
             "PCS_EE_CALIBRATION_OUT_OF_RANGE",
             "DCDC_EE_CALIBRATION_OUT_OF_RANGE",
         ],
+        # ADD-1 (2026-08-24 live blocker): the pod-autonomy signature band.
+        "autonomous_charge_signature_max_w": autonomous_charge_signature_max_w,
         "debug_modes_enabled": False,
     }
 
@@ -1007,6 +1011,56 @@ async def test_external_writer_objective_latches_the_arm_until_acknowledged(
         assert actor.inhibit_latched is True
         assert actor.lifecycle is UnitLifecycle.INHIBITED
         assert len(journal.nonzero_pq_frames(_UNIT_HOST)) == 1
+    finally:
+        await _shutdown_actors(runtime)
+
+    _assert_replay_safety(journal)
+
+
+async def test_a_pod_autonomously_self_charging_arms_as_pod_autonomy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADD-1 (2026-08-24 live blocker): the battery's own autonomy is not a
+    foreign writer.
+
+    After any restart while a pod self-charges, its own firmware holds a
+    nonzero PQ objective (~-2.27 kW measured) and the fresh process has no
+    provenance -- the strict preflight latched external_writer and the race
+    was unwinnable (the watchdog reverted each bounded zero in ~1.34 s vs
+    ~5-6 s re-qualification; ~40 failed arms over 25 min).  With the
+    commissioned signature band wired, the arm CLASSIFIES the objective as
+    POD AUTONOMY and proceeds; our renewed objective replaces the pod's own.
+    """
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, banks = _install_replay_transport(monkeypatch, clock)
+    runtime = _build(_validate(_config_payload(mode="write_enabled")), clock)
+
+    try:
+        actor = runtime.actors[_UNIT_ID]
+        await actor.start()
+        # A fresh process finds the pod's own firmware holding its self-charge.
+        banks[_UNIT_HOST][_OBJECTIVE_READBACK_ADDRESS] = protocol_codec.encode_signed16(-2275)
+        for _ in range(runtime.policy.stable_samples_needed_to_rearm):
+            clock.advance(0.05)
+            await actor.poll_once()
+        assert actor.lifecycle is UnitLifecycle.DISARMED
+
+        armed = await runtime.facade.arm(
+            unit_ids=[_UNIT_ID],
+            principal=OPERATOR,
+            idempotency_key="pod-autonomy-arm",
+            request_id="pod-autonomy-arm-request",
+        )
+
+        assert armed["units"][0]["status"] == "armed", armed
+        assert armed["units"][0]["objective_classification"] == "pod_autonomy"
+        assert actor.lifecycle is UnitLifecycle.ARMED_IDLE
+        assert actor.inhibit_latched is False
+        assert actor.last_arm_classification == "pod_autonomy"
+        assert journal.pq_frames(_UNIT_HOST) == (), (
+            "the arm itself replaces nothing: only our own renewed authority writes"
+        )
     finally:
         await _shutdown_actors(runtime)
 
