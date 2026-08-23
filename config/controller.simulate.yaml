@@ -92,9 +92,21 @@ policy:
   ramp_limit_w_per_s: 750
   stable_samples_to_rearm: 2
   reactive_power_limit_var: 0
-  blocking_fault_codes:
-    - PCS_EE_CALIBRATION_OUT_OF_RANGE
-    - DCDC_EE_CALIBRATION_OUT_OF_RANGE
+  # BLOCKING FAULT/WARNING CODES — READ BEFORE EDITING (S1, 2026-08-24; the
+  # two human-name entries this file used to carry here were SILENTLY INERT).
+  # The decoder generates codes as {prefix}_{bit} over the fault catalog's
+  # word prefixes (adapters/modbus/faults.py; PROTOCOL_EVIDENCE 9): warnings
+  # PCS_Warning0..3 / DCDC_Warning0..3 / Stack_Warning0 / Becu0_Warning0..1,
+  # faults PCS_Fault0..5 / DCDC_Fault0..5 / Stack_Fault0..1 / Becu0_Fault0..3
+  # (e.g. PCS_Fault0_1).  Human names such as
+  # PCS_EE_CALIBRATION_OUT_OF_RANGE can NEVER match a decoded code — any
+  # block intended here must use the generated spelling.  The two EE
+  # calibration signals the old names pointed at are WARNING bits
+  # (PCS_Warning0_1 / DCDC_Warning0_1), deliberately NOT wired: both are
+  # standing-active on the live fleet and severity is unproven (see
+  # config/config.live-write-example.yaml for the full rationale).
+  blocking_fault_codes: []
+  blocking_warning_codes: []
   debug_modes_enabled: false
 
 # Simulate mode ignores this path and stays in-memory; kept for strict-model

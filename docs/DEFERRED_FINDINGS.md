@@ -52,8 +52,12 @@ queued by value:
    words, +40 temperature offsets, RTU-ID value at 0x8106, reserved words
    zero, one-past-block reads raising). One golden full-plan snapshot per
    scenario step computed with literal word arithmetic.
-   Status: SKIPPED (time) — the golden full-plan snapshot program is a
-   dedicated session of work; stays top of the test-gap queue.
+   Status: FIXED d8e6e66 — tests/simulator/test_register_image.py pins the
+   EXACT words of every served block (357 words per snapshot: 12 IoT + 5
+   common) at two scripted moments (objective live under lease; post-watchdog
+   with cell refresh), recomputed from the seed and the documented layout
+   (never production code), plus block-edge reads (last word serves, one past
+   refuses).
 3. **Golden energy/SOC scenario (~28):** a load long enough to cross the
    0.1 kWh integration resolution, asserting exact energy deltas and SOC
    movement; watchdog expiry exactly at the deadline; a second poll after
@@ -121,9 +125,15 @@ From the 32-agent Milestone A implementation review (all P0/P1 were fixed in
    sequence) is delivered and the stream stays open.
 6. Simulator: blanket GOOD quality lets a malformed-injected limit word report
    62,535 W headroom unflagged.
-   Status: SKIPPED (time) — serving-side quality judgment also interacts
-   with the limit-word decode under rework; assess after the decode/excess
-   work lands.
+   Status: FIXED e99c009 — the production decoder was ALREADY fail-closed
+   (signed limit decode, negative domain => BAD; now also pinned for the
+   exact 0xFFFF word). The real gap was the composed SIMULATE decode:
+   unsigned limit decode + blanket GOOD quality. It now derives every
+   quality field with the decoder's own fail-closed helpers (a sentinel
+   limit is BAD with the value absent, never 62,535 W GOOD; a garbage
+   percentage fails its field closed instead of crashing the observation)
+   and the pod gained script_quality/clear_scripted_quality (per-field
+   scripted degradation, served words untouched).
 7. Simulator: system-block battery current served/decoded signed against the
    evidence matrix's unsigned decode.
    Status: DEFERRED-CONFLICT — proper fix is in
@@ -139,15 +149,23 @@ From the 32-agent Milestone A implementation review (all P0/P1 were fixed in
    tests/api/test_rest_contract.py.
 10. Facade: acknowledge/stop/ack-inhibit/arm/disarm still commit-then-raise on
     audit failure (submit_intent is atomic; extend the same pattern).
-    Status: SKIPPED — needs a per-operation atomicity design (arm can roll
-    back to disarm, but acknowledge_inhibit has no inverse), and the facade
-    is under active excess/fence-adjacent rework; revisit as one design
-    pass, not five one-offs.
+    Status: FIXED bdbc5a0 — one doctrine, pinned red-first per mutation:
+    inverse-and-enables-power is atomic with its audit (arm compensates:
+    failed append stops the request, disarms every unit it armed, one
+    unit_armed/rolled_back row per compensation, original error surfaces);
+    no-inverse ops (acknowledge_inhibit, acknowledge_emergency_stop) append
+    durably BEFORE touching state, append failure refuses with the latch
+    intact; safety-positive ops (disarm, cancel_intent) stand and name the
+    failed record in the response degraded list. submit_intent/
+    submit_advisory_intent were already atomic (verified); set_excess_
+    charging verified (P3 append-first landed with the toggle; the
+    participation flip's commit-then-audit row is documented doctrine).
 11. REST: known_stops degraded registration now handled; consider surfacing
     degraded-stop reason codes in the response body.
-    Status: SKIPPED — requires the facade error objects to carry the
-    degraded code set (they currently carry only stop_id); same facade
-    design pass as item 10.
+    Status: FIXED bdbc5a0 — emergency_stop error paths attach the uniform
+    DegradedReport (stop_id + degraded codes); REST surfaces them as 503
+    emergency_stop_degraded with details, keeping the exact-id
+    acknowledgement usable.
 12. Composition: `_UnresolvedCredentialAuthenticator` is fail-closed; a real
     credential store is a Milestone C concern.
     Status: RESOLVED-BY 6e2db92 — live run mode shipped a credential store
@@ -161,8 +179,10 @@ From the 32-agent Milestone A implementation review (all P0/P1 were fixed in
     Status: SKIPPED (time).
 15. Actor: `request_bounded_zero` raises RuntimeError when the mailbox owner is
     dead; facade handles it — consider a uniform degraded-report type.
-    Status: SKIPPED — API-shape design decision spanning actor + facade;
-    bundle with items 10/11.
+    Status: FIXED bdbc5a0 — DegradedReport (energypod.application.service)
+    is the one shape: attached to errors whose safety work landed, and the
+    per-mutation response degraded lists (disarm/cancel/emergency_stop and
+    both acknowledgements) complete the uniform reporting.
 16. main: serving host/port are module constants until a listener config
     contract exists.
     Status: SKIPPED — verified still true (DEFAULT_SERVE_HOST/PORT in
