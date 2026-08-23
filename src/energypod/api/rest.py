@@ -19,7 +19,15 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, Query, Request, WebSocket, WebSocketException
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictFloat,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 from starlette.websockets import WebSocketDisconnect
 
 from .idempotency import IdempotencyConflictError, IdempotencyCoordinator, StoredResult
@@ -72,7 +80,13 @@ class StrictRequest(BaseModel):
 class IntentRequest(StrictRequest):
     unit_ids: list[str] = Field(min_length=1)
     direction: Literal["charge", "discharge"]
-    watts: StrictInt = Field(gt=0)
+    # Exactly one watt form travels the wire (the 2026-08-23 operator ruling:
+    # "I asked for each setting to be one thousand, not a total of 1,000"):
+    # scalar ``watts`` (the fleet total) or ``watts_by_unit`` (one positive
+    # target per selected unit, from which the facade derives the fleet total
+    # as the sum).  Never both, never neither.
+    watts: StrictInt | None = Field(default=None, gt=0)
+    watts_by_unit: dict[str, StrictInt] | None = None
     ttl_s: StrictFloat | StrictInt = Field(gt=0, le=300)
     reason: str | None = Field(default=None, min_length=1, max_length=500)
 
@@ -82,6 +96,27 @@ class IntentRequest(StrictRequest):
         if len(set(value)) != len(value) or any(not _valid_id(item) for item in value):
             raise ValueError("unit identifiers must be unique and canonical")
         return value
+
+    @field_validator("watts_by_unit")
+    @classmethod
+    def validate_watts_by_unit(cls, value: dict[str, int] | None) -> dict[str, int] | None:
+        if value is None:
+            return None
+        if not value:
+            raise ValueError("watts_by_unit must name every selected unit")
+        if any(not _valid_id(unit_id) for unit_id in value):
+            raise ValueError("watts_by_unit keys must be canonical unit identifiers")
+        if any(watts <= 0 for watts in value.values()):
+            raise ValueError("watts_by_unit values must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def exactly_one_watt_form(self) -> IntentRequest:
+        if (self.watts is None) == (self.watts_by_unit is None):
+            raise ValueError("exactly one of watts or watts_by_unit is required")
+        if self.watts_by_unit is not None and set(self.watts_by_unit) != set(self.unit_ids):
+            raise ValueError("watts_by_unit keys must match unit_ids exactly")
+        return self
 
     @field_validator("ttl_s")
     @classmethod

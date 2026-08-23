@@ -438,6 +438,72 @@ def test_intent_schema_uses_direction_and_strictly_positive_watts(
     assert "accepted_at_monotonic" not in call
 
 
+def test_intent_accepts_per_unit_watts_mutually_exclusive_with_scalar(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """The 2026-08-23 operator ruling: one request, one watt target per battery.
+
+    ``watts_by_unit`` carries one positive integer per selected unit and the
+    key set must equal ``unit_ids`` exactly.  On the wire it is mutually
+    exclusive with scalar ``watts``: one or the other, never both, never
+    neither.  The scalar form keeps working unchanged.
+    """
+    per_unit = {
+        "unit_ids": ["pod-a", "pod-b"],
+        "direction": "charge",
+        "ttl_s": 15,
+        "watts_by_unit": {"pod-a": 1200, "pod-b": 300},
+    }
+    scalar = {"unit_ids": ["pod-a"], "direction": "charge", "watts": 500, "ttl_s": 10}
+    with _client(service, authenticator) as client:
+        accepted = client.post(
+            f"{API}/intents", json=per_unit, headers=_mutation_headers("operator-token")
+        )
+        scalar_accepted = client.post(
+            f"{API}/intents",
+            json=scalar,
+            headers=_mutation_headers("operator-token", key="scalar-still-works"),
+        )
+        without_map = {key: value for key, value in per_unit.items() if key != "watts_by_unit"}
+        for index, invalid in enumerate(
+            (
+                {**per_unit, "watts": 1500},  # both forms on the wire
+                without_map,  # neither form
+                {**per_unit, "watts_by_unit": {"pod-a": 1200}},  # a selected unit has no target
+                {  # a target names an unselected unit
+                    **per_unit,
+                    "watts_by_unit": {"pod-a": 1200, "pod-b": 300, "pod-c": 100},
+                },
+                {**per_unit, "watts_by_unit": {"pod-a": 0, "pod-b": 300}},
+                {**per_unit, "watts_by_unit": {"pod-a": -1, "pod-b": 300}},
+                {**per_unit, "watts_by_unit": {"pod-a": 1.5, "pod-b": 300}},
+                {**per_unit, "watts_by_unit": {"pod-a": True, "pod-b": 300}},
+                {**per_unit, "watts_by_unit": {" pod-a": 1200, "pod-b": 300}},
+                {**per_unit, "watts_by_unit": {}},
+                {**per_unit, "watts_by_unit": ["pod-a", "pod-b"]},
+            )
+        ):
+            response = client.post(
+                f"{API}/intents",
+                json=invalid,
+                headers=_mutation_headers("operator-token", key=f"per-unit-bad-{index}"),
+            )
+            _assert_error(response, 422, "validation_error")
+
+    assert accepted.status_code == 202, accepted.text
+    assert accepted.json()["status"] == "accepted"
+    assert scalar_accepted.status_code == 202
+    forwarded = [values for name, values in service.calls if name == "submit_intent"]
+    assert len(forwarded) == 2
+    per_unit_call, scalar_call = forwarded
+    assert per_unit_call["watts"] is None
+    assert per_unit_call["watts_by_unit"] == {"pod-a": 1200, "pod-b": 300}
+    assert per_unit_call["unit_ids"] == ["pod-a", "pod-b"]
+    # The scalar form passes through exactly as before: no per-unit map.
+    assert scalar_call["watts"] == 500
+    assert scalar_call["watts_by_unit"] is None
+
+
 @pytest.mark.parametrize("nonfinite", ["NaN", "Infinity", "-Infinity"])
 def test_nonfinite_json_numbers_are_rejected_before_the_service(
     nonfinite: str,
