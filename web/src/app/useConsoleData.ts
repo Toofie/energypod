@@ -49,6 +49,7 @@ import {
   normalizeSnapshot,
   patchAdviserState,
   patchUnitHealth,
+  patchUnitObjective,
   toActuationIncoherentEvent,
   toHealthChangedEvent,
   type ActuationIncoherentEvent,
@@ -57,7 +58,12 @@ import {
   type Lifecycle,
   type UnitHealth,
 } from "./fleet";
+import {
+  objectiveFromForeignEvent,
+  toForeignObjectiveEvent,
+} from "./objectives";
 import { toEnergyDayRolledEvent } from "./energy";
+import type { UnitObjective } from "./objectives";
 import {
   applyWindowClosing,
   applyWindowOpened,
@@ -181,6 +187,7 @@ type Action =
   | { type: "adviser-state"; state: AdviserState }
   | { type: "schedule-state"; state: ScheduleState }
   | { type: "unit-health"; unitId: string; health: UnitHealth }
+  | { type: "unit-objective"; unitId: string; objective: UnitObjective }
   | {
       type: "actuation-incoherent";
       unitId: string;
@@ -379,6 +386,14 @@ function reducer(state: State, action: Action): State {
         return state;
       }
       return { ...state, snapshot: { ...state.snapshot, scheduleState: action.state } };
+    }
+    case "unit-objective": {
+      // A foreign-objective alert (the night-writer detector): the unit's
+      // summary moves NOW, state-locally, so the quiet line follows the frame
+      // — the periodic snapshot read (which carries the detector's own
+      // summary once composed) is the reconciler.
+      const snapshot = patchUnitObjective(state.snapshot, action.unitId, action.objective);
+      return snapshot === state.snapshot ? state : { ...state, snapshot };
     }
     case "unit-health": {
       // A live recovery transition (unit.health_changed): the unit's health
@@ -815,6 +830,29 @@ function applyEventFrame(
       // subscription; this case exists so the quietness is a pinned decision,
       // not an oversight.
       return false;
+    case "foreign_objective.observed": {
+      // The night-writer detector's ALERT TIER (API_CONTRACTS.md "Night-writer
+      // detector"): something else is writing this battery. Alert tier names
+      // the backend's evidence class, NOT a console shout — the pinned
+      // surfaces are the QUIET per-unit line (Batteries cards, Home unit
+      // entries; it moves NOW, state-locally, from the frame) and the Activity
+      // timeline's entry. Never a shell announcement, never a badge, never a
+      // refetch: the snapshot carries `last_objective_observed` on every unit
+      // once the detector composes, so the periodic read is the reconciler.
+      // The event fires exactly once per (episode, reason) — a sustained
+      // foreign objective never re-fires — so no episode bookkeeping is
+      // needed for the line to stay honest.
+      const event = toForeignObjectiveEvent(payloadOf(frame));
+      if (event === null) {
+        return false;
+      }
+      dispatch({
+        type: "unit-objective",
+        unitId: event.unitId,
+        objective: objectiveFromForeignEvent(event),
+      });
+      return false;
+    }
     case "energy.day_rolled": {
       // The scorecard's rollover TRANSITION (DESIGN_ENERGY_SCORECARD.md §6 —
       // exactly one publication per site-timezone midnight, never a
