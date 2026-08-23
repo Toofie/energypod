@@ -129,6 +129,7 @@ type Action =
   | { type: "frame-received"; at: number }
   | { type: "restart-notice" }
   | { type: "clear-restart-notice" }
+  | { type: "stop-released"; stopId: string }
   | { type: "polite"; text: string }
   | { type: "assertive"; text: string }
   | { type: "clear-assertive" };
@@ -264,6 +265,29 @@ function reducer(state: State, action: Action): State {
       return { ...state, restartNotice: CONTROLLER_RESTART_NOTICE };
     case "clear-restart-notice":
       return state.restartNotice === null ? state : { ...state, restartNotice: null };
+    case "stop-released": {
+      // The acknowledgement came back 200: the latch banner may come down NOW,
+      // optimistically — the next snapshot (whose active_stops no longer name
+      // this stop) is the confirm. A snapshot that still carries the stop
+      // simply brings the banner back, which is the honest answer.
+      if (state.snapshot === null) {
+        return state;
+      }
+      const remaining = state.snapshot.activeStops.filter(
+        (stop) => stop.stopId !== action.stopId,
+      );
+      if (remaining.length === state.snapshot.activeStops.length) {
+        return state;
+      }
+      return {
+        ...state,
+        snapshot: { ...state.snapshot, activeStops: remaining },
+        polite: [
+          ...state.polite,
+          `Emergency stop ${action.stopId} acknowledged — the fleet picture is updating.`,
+        ].slice(-5),
+      };
+    }
     case "polite":
       return { ...state, polite: [...state.polite, action.text].slice(-5) };
     case "assertive":
@@ -561,7 +585,12 @@ export function useConsoleData(
   plane: SharedDataPlane | null,
   onUnauthorized: (error: ApiClientErrorType) => void,
   options: ConsoleDataOptions = {},
-): ConsoleData & { retrySnapshot: () => void; retryStream: () => void } {
+): ConsoleData & {
+  retrySnapshot: () => void;
+  retryStream: () => void;
+  /** An acknowledge 200 landed: clear that latch optimistically, then confirm. */
+  releaseStopLatch: (stopId: string) => void;
+} {
   const retryDelays = options.retryDelaysMs ?? STREAM_RETRY_DELAYS_MS;
   const staleAfterMs = options.staleAfterMs ?? STALE_AFTER_MS;
   const livePollMs = options.livePollMs ?? LIVE_SNAPSHOT_POLL_MS;
@@ -603,6 +632,32 @@ export function useConsoleData(
       },
     );
   }, [plane, dropSession]);
+
+  /**
+   * An acknowledge call returned 200: drop that stop from the on-screen latch
+   * state now (the optimistic half) and immediately re-read the world (the
+   * confirming half — the next snapshot's `active_stops` is the truth; the
+   * interim live-cadence poll would confirm it anyway). A failed read changes
+   * nothing: the next poll retries.
+   */
+  const releaseStopLatch = useCallback(
+    (stopId: string): void => {
+      dispatch({ type: "stop-released", stopId });
+      if (plane !== null) {
+        plane
+          .refresh()
+          .then((raw) => {
+            dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
+          })
+          .catch((error: unknown) => {
+            if (isUnauthorizedError(error)) {
+              dropSession(error);
+            }
+          });
+      }
+    },
+    [plane, dropSession],
+  );
 
   /** A manual stream restart once the automatic budget is spent. */
   const retryStream = useCallback((): void => {
@@ -979,5 +1034,12 @@ export function useConsoleData(
     state.lastEventAtMs === null
       ? null
       : Math.max(0, Math.round((nowMs - state.lastEventAtMs) / 1000));
-  return { ...state, connection, secondsSinceUpdate, retrySnapshot, retryStream };
+  return {
+    ...state,
+    connection,
+    secondsSinceUpdate,
+    retrySnapshot,
+    retryStream,
+    releaseStopLatch,
+  };
 }

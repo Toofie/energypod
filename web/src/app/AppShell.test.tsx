@@ -74,6 +74,15 @@
  *     outcomes patch state only for rows the service accepted (`status`), and
  *     only latched causes (`blocking_fault_active`, `identity_mismatch`) are
  *     announced assertively as inhibit — routine revocations stay polite.
+ * (9) The emergency-stop latch banner (2026-08-23 incident) is shell chrome
+ *     rendered from the snapshot's PENDING `active_stops` field
+ *     ({stop_id, latched_at, principal, reason_codes, unit_ids|null}), never
+ *     from session state or a bus event: a console opened mid-latch sees the
+ *     stop and can release it. Absent field (today's backend) = no banner and
+ *     nothing else changes. The inline release gates on input === stop_id
+ *     (whitespace tolerated) and calls client.postStopAcknowledgement, which
+ *     always sends the Idempotency-Key header; a 200 clears the banner
+ *     optimistically, the next snapshot confirms.
  *
  * TokenEntry, NavBanner, ConnectionIndicator, and EventStreamProvider are
  * internal to AppShell: this suite never imports them, so no stubs are created
@@ -128,6 +137,20 @@ interface FleetView {
   snapshot_sequence: number;
   captured_at: string;
   units: UnitView[];
+  /**
+   * The amended snapshot contract's engaged stops (PENDING backend field).
+   * Absent = today's wire: the latch banner must stay hidden and nothing else
+   * may change (feature detection).
+   */
+  active_stops?: ActiveStopView[];
+}
+
+interface ActiveStopView {
+  stop_id: string;
+  latched_at: string;
+  principal: string;
+  reason_codes: string[];
+  unit_ids: string[] | null;
 }
 
 interface HealthView {
@@ -324,6 +347,10 @@ interface ShellSetup {
     unitIds: string[],
     reason: string,
   ) => Promise<Record<string, unknown>>;
+  postStopAcknowledgement?: (
+    stopId: string,
+    idempotencyKey?: string,
+  ) => Promise<Record<string, unknown>>;
 }
 
 function installClient(setup: ShellSetup = {}): { getSnapshot: ReturnType<typeof vi.fn> } {
@@ -349,7 +376,10 @@ function installClient(setup: ShellSetup = {}): { getSnapshot: ReturnType<typeof
     postEmergencyStop: vi.fn(
       setup.postEmergencyStop ?? (() => Promise.reject(new Error("not used by AppShell"))),
     ),
-    postStopAcknowledgement: vi.fn(() => Promise.reject(new Error("not used by AppShell"))),
+    postStopAcknowledgement: vi.fn(
+      setup.postStopAcknowledgement ??
+        (() => Promise.reject(new Error("not used by AppShell"))),
+    ),
     postInhibitAcknowledgement: vi.fn(() => Promise.reject(new Error("not used by AppShell"))),
     openEvents: vi.fn(
       setup.openEvents ??
@@ -1543,5 +1573,177 @@ describe("AppShell " + "—" + " latch announcements clear", () => {
     await waitFor(() => {
       expect(screen.queryAllByRole("alert")).toHaveLength(0);
     });
+  });
+});
+
+// --- the emergency-stop latch banner (2026-08-23 incident fix) ---------------
+//
+// The defect: the release control rendered only in the session that pressed
+// the stop, and the latch notice only if the console was connected at the
+// latch moment — so a console opened mid-latch showed no way out. The banner
+// is shell chrome rendered from the SNAPSHOT's active_stops (the initial read,
+// every republished refresh, and the live-cadence poll), on every view, with
+// the type-it-back release inline.
+
+describe("AppShell — emergency-stop latch banner", () => {
+  const STOP_ID = "stop-5-3753.297000";
+
+  function stoppedFleet(snapshotSequence = 46): FleetView {
+    return {
+      ...fleet(allUnits("inhibited"), snapshotSequence),
+      active_stops: [
+        {
+          stop_id: STOP_ID,
+          latched_at: "2026-08-22T23:14:24Z",
+          principal: "operator:home",
+          reason_codes: ["operator_requested"],
+          unit_ids: null,
+        },
+      ],
+    };
+  }
+
+  /** The banner region: role=alert, named by its held-power statement. */
+  function latchBanner(): HTMLElement {
+    return screen.getByRole("alert", { name: /emergency stop active/i });
+  }
+
+  it("renders from the snapshot on load — no event, no session state — naming the stop, who, and when", async () => {
+    // THE incident: the console was opened AFTER the stop was engaged. No
+    // emergency_stop.latched frame ever arrives on this stream.
+    const world = stoppedFleet();
+    const channel = streamChannel([snapshotFrame(world)]);
+    installClient({ snapshot: world, openEvents: () => channel.open() });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    const banner = latchBanner();
+    expectVisibleText(banner, /Emergency stop active — all battery power is held at 0 W/);
+    expectVisibleText(banner, new RegExp(STOP_ID));
+    expectVisibleText(banner, /operator:home/);
+    expectVisibleText(banner, /23:14 UTC/);
+    expectVisibleText(banner, /whole fleet/);
+
+    // The release control is inline on the banner itself, not buried in Now.
+    expect(within(banner).getByRole("textbox", { name: /stop id/i })).toBeVisible();
+    expect(within(banner).getByRole("button", { name: /acknowledge/i })).toBeVisible();
+  });
+
+  it("unlocks the acknowledge button only when the typed id matches the stop id exactly", async () => {
+    const world = stoppedFleet();
+    const channel = streamChannel([snapshotFrame(world)]);
+    installClient({ snapshot: world, openEvents: () => channel.open() });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    const banner = latchBanner();
+    const field = within(banner).getByRole("textbox", { name: /stop id/i });
+    const acknowledge = within(banner).getByRole("button", { name: /acknowledge/i });
+    expect(acknowledge).toBeDisabled();
+
+    // Near misses — the deliberate friction stays. Case and content must
+    // match; surrounding whitespace is tolerated (a pasted id often carries
+    // a trailing newline).
+    await user.type(field, STOP_ID.toUpperCase());
+    expect(acknowledge).toBeDisabled();
+    await user.clear(field);
+    await user.type(field, `${STOP_ID}0`);
+    expect(acknowledge).toBeDisabled();
+    await user.clear(field);
+    await user.type(field, ` ${STOP_ID} `);
+    expect(acknowledge).toBeEnabled();
+
+    await user.clear(field);
+    await user.type(field, STOP_ID);
+    expect(acknowledge).toBeEnabled();
+  });
+
+  it("acknowledges through the session client and clears the banner after the 200", async () => {
+    const stopped = stoppedFleet();
+    const released = { ...fleet(allUnits("disarmed"), 47), active_stops: [] };
+    const acknowledge = vi.fn(() =>
+      Promise.resolve({ stop_id: STOP_ID, status: "acknowledged" }),
+    );
+    const channel = streamChannel([snapshotFrame(stopped)]);
+    installClient({
+      snapshots: [stopped, released],
+      openEvents: () => channel.open(),
+      postStopAcknowledgement: acknowledge,
+    });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    await user.type(within(latchBanner()).getByRole("textbox", { name: /stop id/i }), STOP_ID);
+    await user.click(within(latchBanner()).getByRole("button", { name: /acknowledge/i }));
+
+    // The exact stop id, through the shell's client.
+    await waitFor(() => {
+      expect(acknowledge).toHaveBeenCalledWith(STOP_ID);
+    });
+
+    // The banner comes down (optimistically after the 200, confirmed by the
+    // refreshed snapshot whose active_stops no longer name the stop)...
+    await waitFor(() => {
+      expect(screen.queryByRole("alert", { name: /emergency stop active/i })).toBeNull();
+    });
+    // ...and the acknowledgement is announced politely.
+    const announcements = screen.getByRole("status", { name: ANNOUNCEMENTS_NAME });
+    expect(announcements.textContent ?? "").toMatch(
+      new RegExp(`Emergency stop ${STOP_ID} acknowledged`),
+    );
+  });
+
+  it("keeps the banner and surfaces the refusal envelope when the acknowledge fails", async () => {
+    const world = stoppedFleet();
+    const refusal = new ApiClientError({
+      status: 409,
+      code: "stop_not_latched",
+      message: "That stop is no longer latched.",
+      details: null,
+      request_id: "req-ack-1",
+    });
+    const channel = streamChannel([snapshotFrame(world)]);
+    installClient({
+      snapshot: world,
+      openEvents: () => channel.open(),
+      postStopAcknowledgement: () => Promise.reject(refusal),
+    });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    const banner = latchBanner();
+    await user.type(within(banner).getByRole("textbox", { name: /stop id/i }), STOP_ID);
+    await user.click(within(banner).getByRole("button", { name: /acknowledge/i }));
+
+    // The envelope verbatim, inside the banner — and the banner stays: a
+    // failed acknowledgement must never look like a release.
+    await waitFor(() => {
+      expect(within(banner).getByText(/stop_not_latched/)).toBeVisible();
+    });
+    expect(within(banner).getByText(/That stop is no longer latched\./)).toBeVisible();
+    expect(latchBanner()).toBeVisible();
+  });
+
+  it("stays hidden and harmless while the snapshot carries no active_stops (today's backend)", async () => {
+    // Feature detection: the field is absent, so the latch banner must not
+    // render and the shell behaves exactly as before.
+    const world = fleet(allUnits("inhibited"));
+    expect(world.active_stops).toBeUndefined();
+    const channel = streamChannel([snapshotFrame(world)]);
+    installClient({ snapshot: world, openEvents: () => channel.open() });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    expect(screen.queryByRole("alert", { name: /emergency stop active/i })).toBeNull();
+    expect(screen.queryByRole("textbox", { name: /stop id/i })).toBeNull();
+    expect(screen.queryByText(/all battery power is held at 0 W/i)).toBeNull();
+    // The rest of the shell is unaffected.
+    expectVisibleText(banner(), "Inhibited");
+    expect(factItem(/event stream/i).textContent ?? "").toMatch(FACT_YES);
   });
 });

@@ -267,6 +267,66 @@ button:disabled {
   font-weight: 700;
 }
 
+/* The always-visible emergency-stop latch banner: an engaged stop is the one
+ * state that must be impossible to miss or to lose — full width, under the
+ * header, on every view, with the release control inline. */
+.stop-latch-banner {
+  margin: 0.75rem 0 0;
+  border: 2px solid var(--no);
+  border-radius: 12px;
+  background: var(--card);
+  padding: 0.85rem 1.1rem;
+}
+
+.stop-latch-statement {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--no);
+}
+
+.stop-latch-facts {
+  margin: 0.35rem 0 0;
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+}
+
+.stop-latch-release {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.6rem;
+}
+
+.stop-latch-release label {
+  font-size: 0.9rem;
+}
+
+.stop-latch-release input {
+  font: inherit;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 14rem;
+}
+
+.stop-latch-release button {
+  font-weight: 700;
+}
+
+.stop-latch-hint {
+  margin: 0;
+  flex-basis: 100%;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+.stop-latch-banner .refusal {
+  flex-basis: 100%;
+  margin: 0.25rem 0 0;
+}
+
 .stop-dialog {
   position: relative;
   margin-top: 0.75rem;

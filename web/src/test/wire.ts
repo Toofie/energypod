@@ -460,6 +460,13 @@ export interface WireUnitSnapshot {
    */
   readonly telemetry: WireTelemetrySummary | null;
   readonly inhibit?: WireInhibitState | null;
+  /**
+   * The amended snapshot contract's per-unit latch exposure (2026-08-23
+   * incident fix, PENDING like active_stops): `inhibit_latched` bool +
+   * `inhibit_cause` reason code or null. Absent from today's wire.
+   */
+  readonly inhibit_latched?: boolean;
+  readonly inhibit_cause?: string | null;
 }
 
 /** The documented latch exposure: cause class, latched flag, reason code. */
@@ -505,6 +512,47 @@ export interface WireSnapshot {
   readonly snapshot_sequence: number;
   readonly captured_at: string;
   readonly units: WireUnitSnapshot[];
+  /**
+   * The amended snapshot contract's engaged emergency stops (2026-08-23
+   * incident fix): `[{stop_id, latched_at, principal, reason_codes,
+   * unit_ids | null}]`, `null` unit_ids = fleet-wide. PENDING — the backend
+   * field has not landed yet, so the default snapshot omits it entirely (an
+   * absent field is today's wire truth); attach it with `withActiveStops`.
+   */
+  readonly active_stops?: readonly WireActiveStop[];
+}
+
+/**
+ * One engaged (latched, not yet acknowledged) emergency stop, exactly as the
+ * amended snapshot contract spells it. PENDING (see WireSnapshot).
+ */
+export interface WireActiveStop {
+  readonly stop_id: string;
+  readonly latched_at: string;
+  readonly principal: string;
+  readonly reason_codes: readonly string[];
+  /** null = fleet-wide. */
+  readonly unit_ids: readonly string[] | null;
+}
+
+export function activeStop(
+  spec: Partial<WireActiveStop> & { stop_id: string },
+): WireActiveStop {
+  return {
+    stop_id: spec.stop_id,
+    latched_at: spec.latched_at ?? DEFAULT_OCCURRED_AT,
+    principal: spec.principal ?? "operator:home",
+    reason_codes: spec.reason_codes ?? ["operator_requested"],
+    unit_ids: spec.unit_ids === undefined ? null : spec.unit_ids,
+  };
+}
+
+/** Attach the pending engaged-stop exposure to a snapshot world. */
+export function withActiveStops(
+  world: WireSnapshot,
+  stops: readonly WireActiveStop[],
+): WireSnapshot {
+  return { ...world, active_stops: [...stops] };
 }
 
 export function snapshot(

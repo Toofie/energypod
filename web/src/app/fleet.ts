@@ -53,6 +53,29 @@ export interface UnitModel {
   requested: PowerFigure;
   authorized: PowerFigure | null;
   measuredWatts: number | null;
+  /**
+   * The per-unit inhibit latch the amended snapshot contract adds
+   * (`inhibit_latched` / `inhibit_cause`). Null while the backend does not
+   * send the field — never guessed from the lifecycle, which is inhibited for
+   * latched stops and per-unit inhibits alike.
+   */
+  inhibitLatched: boolean | null;
+  inhibitCause: string | null;
+}
+
+/**
+ * One engaged (latched, not yet acknowledged) emergency stop, exactly as the
+ * snapshot's `active_stops` array carries it: the stop id an acknowledgement
+ * must type back, when it latched, who engaged it, why, and the units it
+ * holds (`null` unit ids = the whole fleet).
+ */
+export interface ActiveStop {
+  stopId: string;
+  latchedAt: string;
+  principal: string;
+  reasonCodes: string[];
+  /** null = fleet-wide. */
+  unitIds: string[] | null;
 }
 
 export interface FleetSnapshot {
@@ -60,6 +83,13 @@ export interface FleetSnapshot {
   sequence: number;
   capturedAt: string;
   units: UnitModel[];
+  /**
+   * The snapshot's engaged emergency stops. Empty when the snapshot carries no
+   * `active_stops` (today's backend) — the absence is the feature detection:
+   * the latch banner stays hidden and nothing else changes until the field
+   * lands.
+   */
+  activeStops: ActiveStop[];
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -99,6 +129,28 @@ function toUnit(raw: unknown): UnitModel | null {
     requested: toFigure(raw.requested_power) ?? { direction: "idle", watts: 0 },
     authorized: toFigure(raw.authorized_power),
     measuredWatts: typeof raw.measured_watts === "number" ? raw.measured_watts : null,
+    inhibitLatched: typeof raw.inhibit_latched === "boolean" ? raw.inhibit_latched : null,
+    inhibitCause: typeof raw.inhibit_cause === "string" ? raw.inhibit_cause : null,
+  };
+}
+
+function toActiveStop(raw: unknown): ActiveStop | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  if (typeof raw.stop_id !== "string" || raw.stop_id === "") {
+    return null;
+  }
+  return {
+    stopId: raw.stop_id,
+    latchedAt: typeof raw.latched_at === "string" ? raw.latched_at : "",
+    principal: typeof raw.principal === "string" ? raw.principal : "",
+    reasonCodes: Array.isArray(raw.reason_codes)
+      ? raw.reason_codes.filter((code): code is string => typeof code === "string")
+      : [],
+    unitIds: Array.isArray(raw.unit_ids)
+      ? raw.unit_ids.filter((id): id is string => typeof id === "string")
+      : null,
   };
 }
 
@@ -113,6 +165,11 @@ export function normalizeSnapshot(raw: unknown): FleetSnapshot {
     sequence: typeof record.snapshot_sequence === "number" ? record.snapshot_sequence : 0,
     capturedAt: typeof record.captured_at === "string" ? record.captured_at : "",
     units,
+    // Feature detection: a snapshot with no active_stops (today's backend)
+    // normalizes to "no engaged stops known", never to an error.
+    activeStops: (Array.isArray(record.active_stops) ? record.active_stops : [])
+      .map(toActiveStop)
+      .filter((entry): entry is ActiveStop => entry !== null),
   };
 }
 

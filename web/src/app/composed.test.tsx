@@ -47,6 +47,7 @@ import { HomeView } from "../views/home/HomeView";
 import { NowView } from "../views/now/NowView";
 import type { Health } from "../api/client";
 import {
+  activeStop,
   auditAppended,
   auditEvent,
   auditPage,
@@ -61,6 +62,7 @@ import {
   unitArmed,
   unitDetail,
   unitSnapshot,
+  withActiveStops,
 } from "../test/wire";
 import type { WireAuditEvent, WireSnapshot, WireUnitDetail } from "../test/wire";
 
@@ -306,6 +308,16 @@ class ComposedHarness {
         fenced_generation: 7,
         degraded: [],
       });
+    }
+    if (
+      method === "POST" &&
+      path.startsWith("/api/v1/emergency-stop/") &&
+      path.endsWith("/acknowledge")
+    ) {
+      const stopId = decodeURIComponent(
+        path.slice("/api/v1/emergency-stop/".length, -"/acknowledge".length),
+      );
+      return jsonResponse(200, { stop_id: stopId, status: "acknowledged" });
     }
     return jsonResponse(500, errorBody("route_not_configured", `${method} ${path}`));
   };
@@ -627,6 +639,106 @@ describe("Composed console — a mid-session emergency stop", () => {
     });
     expect(harness.requestsFor("GET", "/api/v1/snapshot").length).toBeGreaterThan(readsBefore);
     expect(harness.sockets).toHaveLength(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3b. The latch banner from the snapshot + the release over the real client
+//     (the 2026-08-23 incident: no event ever arrives for a console opened
+//     mid-latch; the snapshot's active_stops is the only messenger)
+// ---------------------------------------------------------------------------
+
+describe("Composed console — the latch banner and its release", () => {
+  it("shows a stop another session engaged, holds the Now controls with the stop named, and releases through the real client", async () => {
+    const user = userEvent.setup();
+    const worldHeld = withActiveStops(
+      wireSnapshot(
+        [
+          unitSnapshot({ unit_id: "MID", lifecycle: "inhibited", telemetry_age_s: 2, measured_watts: 0 }),
+          unitSnapshot({ unit_id: "RHS", lifecycle: "inhibited", telemetry_age_s: 3, measured_watts: 0 }),
+          unitSnapshot({ unit_id: "LHS", lifecycle: "inhibited", telemetry_age_s: 5, measured_watts: 0 }),
+        ],
+        { snapshot_sequence: 4110, captured_at: OCCURRED_AT },
+      ),
+      [
+        activeStop({
+          stop_id: "stop-9",
+          principal: "operator:home",
+          latched_at: "2026-08-22T23:14:24Z",
+        }),
+      ],
+    );
+    // Once the field exists the backend always carries it: an empty array is
+    // the released world, an absent field is the pre-contract backend.
+    const worldReleased = withActiveStops(
+      wireSnapshot(
+        [
+          unitSnapshot({ unit_id: "MID", lifecycle: "armed_idle", telemetry_age_s: 2, measured_watts: 0 }),
+          unitSnapshot({ unit_id: "RHS", lifecycle: "disarmed", telemetry_age_s: 3 }),
+          unitSnapshot({ unit_id: "LHS", lifecycle: "disarmed", telemetry_age_s: 5 }),
+        ],
+        { snapshot_sequence: 4120, captured_at: OCCURRED_AT },
+      ),
+      [],
+    );
+    const harness = new ComposedHarness(worldHeld);
+    harness.install();
+    render(<AppShell views={views} />);
+    await unlock(user);
+    await waitFor(() => {
+      expect(factText(/event stream/i)).toContain("Yes — live");
+    });
+
+    // No emergency_stop.latched frame ever arrives on this socket: the banner
+    // is there because the snapshot says so — the load-time picture IS the
+    // messenger (the whole incident fix).
+    const banner = await screen.findByRole("alert", { name: /emergency stop active/i });
+    expect(banner.textContent).toContain("all battery power is held at 0 W");
+    expect(banner.textContent).toContain("stop-9");
+    expect(banner.textContent).toContain("operator:home");
+    expect(banner.textContent).toContain("23:14 UTC");
+
+    // The Now view's controls are held with the stop named — visible and
+    // disabled, never silently gone.
+    await user.click(screen.getByRole("link", { name: "Now" }));
+    expect(
+      await screen.findByText("Held by emergency stop stop-9 — acknowledge on the banner to release"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Arm" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Discharge" })).toBeDisabled();
+
+    // The release, from the banner, on the Now view: exact id or nothing.
+    const field = screen.getByRole("textbox", { name: /stop id/i });
+    await user.type(field, "stop-8");
+    expect(screen.getByRole("button", { name: "Acknowledge" })).toBeDisabled();
+    await user.clear(field);
+    await user.type(field, "stop-9");
+    expect(screen.getByRole("button", { name: "Acknowledge" })).toBeEnabled();
+
+    // The world the confirmation reads return: the stop is gone.
+    harness.world = worldReleased;
+    await user.click(screen.getByRole("button", { name: "Acknowledge" }));
+
+    // The exact acknowledge call chain: the stop's own route, the typed
+    // confirmation body, the bearer, and the idempotency key the service
+    // demands (its absence is the documented idempotency_key_required 400).
+    const ackPosts = harness.requestsFor("POST", "/api/v1/emergency-stop/stop-9/acknowledge");
+    await waitFor(() => {
+      expect(ackPosts).toHaveLength(1);
+    });
+    expect(ackPosts[0]!.headers.Authorization).toBe(`Bearer ${OPERATOR_TOKEN}`);
+    expect(ackPosts[0]!.headers["Idempotency-Key"]).toMatch(ID_PATTERN);
+    expect(JSON.parse(ackPosts[0]!.body ?? "{}")).toEqual({ confirmation: "ACKNOWLEDGE" });
+
+    // The banner comes down after the 200, and the refreshed world (no
+    // active_stops) keeps it down; the held controls are released.
+    await waitFor(() => {
+      expect(screen.queryByRole("alert", { name: /emergency stop active/i })).toBeNull();
+    });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Discharge" })).toBeEnabled();
+    });
+    expect(screen.queryByText(/Held by emergency stop/)).toBeNull();
   });
 });
 

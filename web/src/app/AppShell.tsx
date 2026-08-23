@@ -3,13 +3,15 @@
  * "Global shell behavior"): the token gate, the always-visible fleet banner,
  * the one-glance live-data badge, the four-fact connection indicator, ARIA
  * live regions, the controller-restart notice, honest navigation, the
- * emergency-stop control, and view switching by state — no router library,
+ * emergency-stop control, the emergency-stop latch banner (with its inline
+ * release), and view switching by state — no router library,
  * the shell drives views itself.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import { createApiClient } from "../api/client";
 import type { ApiClient, ApiClientError } from "../api/client";
+import { EmergencyStopBanner } from "./EmergencyStopBanner";
 import { SharedDataPlane, sharedClient } from "./SharedDataPlane";
 import {
   ConnectionFacts,
@@ -144,6 +146,19 @@ export function AppShell({ views = {} }: AppShellProps): ReactElement {
           </button>
         </div>
       </header>
+
+      {/* The emergency-stop latch banner: shell chrome, visible on every view.
+          Rendered from the snapshot's engaged stops — not from events or the
+          session that pressed the stop — so a console opened after the latch
+          still sees it (and can release it). Hidden while the snapshot reports
+          no engaged stops, including on today's backend, which sends no
+          active_stops at all. */}
+      <EmergencyStopBanner
+        stops={data.snapshot?.activeStops ?? []}
+        client={client}
+        onUnauthorized={handleUnauthorized}
+        onReleased={data.releaseStopLatch}
+      />
 
       <nav aria-label="Views" className="shell-nav">
         <ul>
