@@ -1523,7 +1523,9 @@ export function excessChargingToggleOk(state: WireAdviserState): Record<string, 
 // snapshot omits `energy_today` entirely; an absent field is today's wire
 // truth). Defaults are the design's own §5 illustrative record (mid's figures
 // verbatim, rhs/lhs filled to the same shape) with the fleet sums computed
-// from the three units exactly as the accountant would roll them up.
+// from the three units exactly as the accountant rolls them up under the
+// 2026-08-26 wire pins: null unit figures are SKIPPED (a unit absent all day
+// never erases a fleet figure) and coverage is the worst NON-NULL unit's.
 // ---------------------------------------------------------------------------
 
 /** One unit's day inside an `EnergyDayRecord`; every figure nullable, never 0-filled. */
@@ -1605,31 +1607,45 @@ export function energyUnitDay(
   };
 }
 
+/**
+ * The fleet rollup's pinned sum semantics (the backend accountant's own,
+ * src/energypod/application/energy.py `_fleet_rollup`; the 2026-08-26 wire
+ * pins): a NULL unit figure is SKIPPED — a unit whose source was absent all
+ * day contributes nothing and never erases the fleet figure. The sum is null
+ * only when NO unit carried the figure at all.
+ */
 function sumOf(
   units: readonly WireEnergyUnitDay[],
   pick: (unit: WireEnergyUnitDay) => number | null,
 ): number | null {
-  let total = 0;
+  let total: number | null = null;
   for (const unit of units) {
     const value = pick(unit);
-    if (value === null) {
-      return null;
+    if (value !== null) {
+      total = (total ?? 0) + value;
     }
-    total += value;
+  }
+  if (total === null) {
+    return null;
   }
   // The backend's own sums are clean decimals (0.1 kWh counter quanta); the
   // fixture rounds away binary-float noise so a pinned figure is exactly the
   // decimal a suite asserts on. The display bound rounds again anyway.
-  return units.length === 0 ? null : Math.round(total * 1e6) / 1e6;
+  return Math.round(total * 1e6) / 1e6;
 }
 
-/** The worst unit's coverage — the evidence-rollup precedence doctrine (§4). */
+/**
+ * The worst NON-NULL unit's coverage — the evidence-rollup precedence doctrine
+ * (§4) under the same pinned skip-nulls semantics: a unit with no coverage
+ * figure has no evidence to contribute, so the fleet figure is the worst
+ * coverage any reporting unit carried, and null only when none did.
+ */
 function worstCoverage(units: readonly WireEnergyUnitDay[]): number | null {
   let worst: number | null = null;
   for (const unit of units) {
     const coverage = unit.coverage_pct;
     if (coverage === null) {
-      return null;
+      continue;
     }
     worst = worst === null ? coverage : Math.min(worst, coverage);
   }
@@ -1654,7 +1670,8 @@ function fleetOf(units: readonly WireEnergyUnitDay[]): WireEnergyFleetDay {
  * topology, the grid source the v1 default (our own CT integration — the
  * unpinned-roles fallback), and the A-1 cross-check block recording both
  * counter deltas. Override `units` wholesale or per unit; the fleet sums are
- * always recomputed from the units given.
+ * always recomputed from the units given with the pinned skip-nulls semantics
+ * (see `sumOf` / `worstCoverage`).
  */
 export function energyDayRecord(
   spec: Partial<Omit<WireEnergyDayRecord, "fleet" | "units">> & {

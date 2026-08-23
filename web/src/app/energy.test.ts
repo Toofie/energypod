@@ -28,6 +28,7 @@ import {
   energyDayRecord,
   energyDayRolled,
   energyToday,
+  energyUnitDay,
   getEnergyDaysOk,
 } from "../test/wire";
 
@@ -140,6 +141,73 @@ describe("energy — the day-record parse (null-safe, absent-tolerant)", () => {
       },
     })!;
     expect(unknown.counterCrossCheck!.consistentWith).toBeNull();
+  });
+
+  it("rolls the fleet up the PINNED way: a null unit is skipped, never erasing the fleet figure", () => {
+    const record = toEnergyDayRecord(
+      energyDayRecord({
+        units: {
+          // mid absent all day (source absent): it contributes nothing — it
+          // must not zero or null the fleet's day.
+          mid: energyUnitDay({
+            grid_import_kwh: null,
+            grid_export_kwh: null,
+            battery_charged_kwh: null,
+            battery_discharged_kwh: null,
+            load_kwh: null,
+            charged_from_surplus_kwh: null,
+            coverage_pct: null,
+          }),
+          rhs: energyUnitDay({
+            grid_import_kwh: 2.1,
+            grid_export_kwh: 4.2,
+            battery_charged_kwh: 2.0,
+            battery_discharged_kwh: 1.6,
+            load_kwh: 4.4,
+            charged_from_surplus_kwh: 0,
+            coverage_pct: 100,
+          }),
+          lhs: energyUnitDay({
+            grid_import_kwh: 5.1,
+            grid_export_kwh: 1.9,
+            battery_charged_kwh: 0.8,
+            battery_discharged_kwh: 1.8,
+            load_kwh: 5.2,
+            charged_from_surplus_kwh: 0,
+            coverage_pct: 98.7,
+          }),
+        },
+      }),
+    )!;
+    // The sums are over the units that carried a figure (2.1 + 5.1 import).
+    expect(record.fleet.gridImportKwh).toBeCloseTo(7.2, 10);
+    expect(record.fleet.gridExportKwh).toBeCloseTo(6.1, 10);
+    expect(record.fleet.batteryChargedKwh).toBeCloseTo(2.8, 10);
+    // Coverage is the worst NON-NULL unit's (100 / 98.7 -> 98.7); the unit
+    // with no coverage figure contributes no evidence.
+    expect(record.fleet.coveragePct).toBeCloseTo(98.7, 10);
+  });
+
+  it("keeps a fleet figure null only when NO unit carried one", () => {
+    const record = toEnergyDayRecord(
+      energyDayRecord({
+        units: {
+          mid: energyUnitDay({
+            grid_import_kwh: null,
+            grid_export_kwh: null,
+            battery_charged_kwh: null,
+            battery_discharged_kwh: null,
+            load_kwh: null,
+            charged_from_surplus_kwh: null,
+            coverage_pct: null,
+          }),
+        },
+      }),
+    )!;
+    expect(record.fleet.gridImportKwh).toBeNull();
+    expect(record.fleet.batteryDischargedKwh).toBeNull();
+    expect(record.fleet.chargedFromSurplusKwh).toBeNull();
+    expect(record.fleet.coveragePct).toBeNull();
   });
 });
 
