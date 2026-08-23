@@ -522,8 +522,10 @@ function gridIdleText(fleet: FleetFlow): string {
 /**
  * The night strategy's story when its projection says a window is running
  * (feature-detected: null projection, an idle phase, or a disabled adviser
- * never claims the story). The demand-hold guarantee is the design's own
- * wording: batteries neither drain nor cycle while the grid meets the spike.
+ * never claims the story). The stand-by story names the honest trade (the
+ * pods answer the house on their own); the fail-closed hold's guarantee is
+ * the design's own wording: batteries neither drain nor cycle while the grid
+ * meets the spike.
  */
 export function nightStory(night: NightChargeState, fleet: FleetFlow): string | null {
   if (!night.enabled || night.phase === "idle") {
@@ -533,6 +535,13 @@ export function nightStory(night: NightChargeState, fleet: FleetFlow): string | 
     case "pacing": {
       const charging = chargingClause(fleet, coversAllReporting(fleet, fleet.chargingPhases));
       return `Night charging is running${charging === "" ? "" : ` — ${charging}`}${houseClause(fleet)}.`;
+    }
+    case "standing_by_on_demand": {
+      const demand =
+        night.demandW === null
+          ? "the demand reading is not available"
+          : `house demand is ${formatWatts(night.demandW)}`;
+      return `Night charging is standing by — ${demand}, so the batteries stand down at zero watts and the pods answer the house on their own until demand falls back.`;
     }
     case "holding_on_demand": {
       const demand =

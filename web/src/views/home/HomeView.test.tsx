@@ -2520,6 +2520,16 @@ describe("HomeView — the night-charge tile", () => {
       sentence: /Charging toward full by 06:00: lhs 2,500 W · mid 2,500 W · rhs full, sitting out\./,
     },
     {
+      phase: "standing_by_on_demand",
+      fixture: {
+        demand_w: 2340,
+        reason_codes: ["demand_above_threshold"],
+        units: [nightUnitState({ phase: "standing_by_on_demand", target_w: 0, reason: "demand_above_threshold" })],
+      } as unknown as Partial<WireNightChargeState>,
+      sentence:
+        /Standing by — house demand 2,340 W: the batteries stand down at zero watts and the pods answer the house on their own until demand falls back\./,
+    },
+    {
       phase: "holding_on_demand",
       fixture: {
         demand_w: 2340,
@@ -2591,7 +2601,7 @@ describe("HomeView — the night-charge tile", () => {
     },
     {
       code: "demand_above_threshold",
-      sentence: /House demand is above the hold line — batteries held, not cycling\./,
+      sentence: /House demand is above the hold line — batteries stood down until it falls back\./,
     },
     {
       code: "demand_below_exit",
@@ -2767,7 +2777,7 @@ describe("HomeView — the night-charge tile", () => {
     });
     expect(
       await screen.findByText(
-        /Night charging is holding — house demand is high; the batteries neither drain nor cycle\./,
+        /Night charging is holding — the demand reading did not hold, so the batteries neither drain nor cycle\./,
       ),
     ).toBeInTheDocument();
 
@@ -2786,6 +2796,43 @@ describe("HomeView — the night-charge tile", () => {
       expect(region).toHaveTextContent(/Holding — house demand 2,510 W/);
     });
     expect(screen.queryAllByText(/Night charging is holding/)).toHaveLength(1);
+  });
+
+  it("renders the stand-by live: measured demand stands the batteries down, and the ear hears it", async () => {
+    const world = nightWorld(nightChargeState({ demand_w: 412 }));
+    const channel = liveChannel([snapshotFrame(world)]);
+    installClient({ snapshot: world, openEvents: channel.openEvents });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent(/Charging toward full by 06:00/);
+
+    // House demand spikes above the threshold: the frame alone stands the
+    // batteries down — zero watts, the pods back on their own — and the phase
+    // change reaches the live region.
+    channel.push(
+      nightChargeStateChanged(43, {
+        phase: "standing_by_on_demand",
+        demand_w: 2340,
+        reason_codes: ["demand_above_threshold"],
+        units: [
+          nightUnitState({ unit_id: "lhs", phase: "standing_by_on_demand", target_w: 0, reason: "demand_above_threshold" }),
+          nightUnitState({ unit_id: "mid", phase: "standing_by_on_demand", soc_pct: 88, target_w: 0, reason: "demand_above_threshold" }),
+        ],
+      }) as unknown as StreamFrame,
+    );
+    await waitFor(() => {
+      expect(region).toHaveTextContent(
+        /Standing by — house demand 2,340 W: the batteries stand down at zero watts and the pods answer the house on their own until demand falls back\./,
+      );
+    });
+    // The per-battery row words the stand-down honestly — never the old
+    // "sitting out (demand hold)" fallback.
+    expect(region).toHaveTextContent(/lhs — 71\.4% charged · lhs standing by \(house demand high\)/);
+    expect(
+      await screen.findByText(
+        /Night charging is standing by — house demand is high; the batteries stand down until it passes\./,
+      ),
+    ).toBeInTheDocument();
   });
 
   it("announces the stand-down when the window hands the batteries back over the stream", async () => {

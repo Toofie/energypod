@@ -457,6 +457,33 @@ describe("FlowView — honesty", () => {
     ).toBeVisible();
   });
 
+  it("renders the night strategy's stand-by story while the house demand runs high", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue({
+      site_id: "site-1",
+      snapshot_sequence: 41,
+      captured_at: "2026-08-22T12:00:00+10:00",
+      night_charge_state: {
+        enabled: true,
+        active: true,
+        phase: "standing_by_on_demand",
+        demand_w: 1900,
+      },
+      units: [
+        unit("mid", { grid_power_w: -1900, load_power_w: 950, battery_watts: 0 }),
+        unit("rhs", { grid_power_w: -1900, load_power_w: 950, battery_watts: 0 }),
+      ],
+    } as unknown as SnapshotEnvelope);
+
+    renderFlow();
+
+    expect(
+      await screen.findByText(
+        "Night charging is standing by — house demand is 1,900 W, so the batteries stand down at zero watts and the pods answer the house on their own until demand falls back.",
+      ),
+    ).toBeVisible();
+  });
+
   it("explains an empty fleet", async () => {
     liveChannel([]);
     api.client.getSnapshot.mockResolvedValue(snapshotEnvelope([]));

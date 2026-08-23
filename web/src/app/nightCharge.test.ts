@@ -183,6 +183,11 @@ describe("nightCharge — the plain-word maps", () => {
     expect(nightPhaseText(held)).toBe(
       "Holding — house demand 2,340 W: batteries neither drain nor cycle while the grid meets the spike.",
     );
+    // The ONE demand code rides both arms; the row's phase names which — the
+    // hold never claims a demand figure the evidence did not supply.
+    expect(nightUnitRowText(held.units[0]!)).toBe(
+      "lhs — 71.4% charged · lhs held at 100 W (the demand reading did not hold)",
+    );
     // Under failed evidence the hold is LOUD, never a silent zero-filled figure.
     const blind = toNightChargeState(
       nightChargeState({
@@ -194,6 +199,25 @@ describe("nightCharge — the plain-word maps", () => {
     )!;
     expect(nightPhaseText(blind)).toBe(
       "Holding — the demand reading is stale: batteries neither drain nor cycle while the grid meets the spike.",
+    );
+  });
+
+  it("words the stand-by story: measured demand stands the batteries down, the honest trade named", () => {
+    const standing = toNightChargeState(
+      nightChargeState({
+        phase: "standing_by_on_demand",
+        demand_w: 2340,
+        reason_codes: ["demand_above_threshold"],
+        units: [nightUnitState({ phase: "standing_by_on_demand", soc_pct: 88, target_w: 0, reason: "demand_above_threshold" })],
+      }),
+    )!;
+    expect(nightPhaseText(standing)).toBe(
+      "Standing by — house demand 2,340 W: the batteries stand down at zero watts and the pods answer the house on their own until demand falls back.",
+    );
+    // The per-unit row words the stand-down as what it is — never the old
+    // "sitting out (demand hold)" fallback spelling.
+    expect(nightUnitRowText(standing.units[0]!)).toBe(
+      "lhs — 88% charged · lhs standing by (house demand high)",
     );
   });
 
@@ -401,8 +425,16 @@ describe("nightCharge — the plain-word maps", () => {
     expect(nightPhaseAnnouncement("holding_on_demand", "pacing")).toBe(
       "Night charging resumed — pacing toward full.",
     );
+    expect(nightPhaseAnnouncement("pacing", "standing_by_on_demand")).toBe(
+      "Night charging is standing by — house demand is high; the batteries stand down until it passes.",
+    );
+    expect(nightPhaseAnnouncement("standing_by_on_demand", "pacing")).toBe(
+      "Night charging resumed — pacing toward full.",
+    );
+    // A hold is the fail-closed fallback: the announcement names the failed
+    // reading, never a demand figure it does not have.
     expect(nightPhaseAnnouncement("pacing", "holding_on_demand")).toBe(
-      "Night charging is holding — house demand is high; the batteries neither drain nor cycle.",
+      "Night charging is holding — the demand reading did not hold, so the batteries neither drain nor cycle.",
     );
     expect(nightPhaseAnnouncement("holding_on_demand", "complete")).toBe(
       "Night charging complete — the batteries are full.",
@@ -418,12 +450,14 @@ describe("nightCharge — the plain-word maps", () => {
       "idle",
       "pacing",
       "holding_on_demand",
+      "standing_by_on_demand",
       "complete",
       "skipped_full",
     ]);
     expect(NIGHT_UNIT_PHASES).toEqual([
       "pacing",
       "holding_on_demand",
+      "standing_by_on_demand",
       "skipped_full",
       "complete",
       "sitting_out",

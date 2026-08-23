@@ -20,8 +20,15 @@
  *   held_intent_id, units[{unit_id, soc_pct, phase, target_w, reason}],
  *   last_action, last_tick_at, reason_codes}` — `active` derives from
  *   `held_intent_id`, never a lifecycle guess.
- * - Fleet `phase`: idle | pacing | holding_on_demand | complete | skipped_full;
- *   per-unit adds `sitting_out` (claimed, disarmed, or no headroom this tick).
+ * - Fleet `phase`: idle | pacing | holding_on_demand | standing_by_on_demand |
+ *   complete | skipped_full; per-unit adds `sitting_out` (claimed, disarmed, or
+ *   no headroom this tick). `standing_by_on_demand` is THE demand response: a
+ *   MEASURED demand above the threshold stands the unit down entirely (zero-
+ *   watt non-participation — excluded from the submission, the pod back on its
+ *   own autonomy until demand falls back or the window ends). `holding_on_demand`
+ *   is the fail-closed FALLBACK ONLY: missing/bad/stale evidence holds at
+ *   `hold_rate_w` (the no-cycling guarantee — standby answers measured demand,
+ *   never missing data). There is no `demand_response` selector on the wire.
  * - `demand_evidence`: good | missing | bad | stale, worst-word-wins; a
  *   non-good rollup FAILS CLOSED TO HOLD (the no-cycling guarantee) and is
  *   loudly visible — never a silent never-charges.
@@ -46,21 +53,34 @@ import { countdownText, localTimeOfInstant, type SchedulePosture } from "./sched
 export const NIGHT_CHARGE_STATE_CHANGED_EVENT = "night_charge.state_changed" as const;
 
 /** The fleet-level phase vocabulary (§5's ONE list, verbatim). */
-export type NightPhase = "idle" | "pacing" | "holding_on_demand" | "complete" | "skipped_full";
+export type NightPhase =
+  | "idle"
+  | "pacing"
+  | "holding_on_demand"
+  | "standing_by_on_demand"
+  | "complete"
+  | "skipped_full";
 
 /** The runtime checklist of the fleet-level list (an unknown phase narrows to idle). */
 export const NIGHT_PHASES: readonly NightPhase[] = [
   "idle",
   "pacing",
   "holding_on_demand",
+  "standing_by_on_demand",
   "complete",
   "skipped_full",
 ];
 
-/** The per-unit phase vocabulary: the fleet list plus `sitting_out`. */
+/**
+ * The per-unit phase vocabulary: the fleet list plus `sitting_out`.
+ * `standing_by_on_demand` is the MEASURED-demand stand-down (zero-watt
+ * non-participation); `holding_on_demand` is the fail-closed hold at
+ * `hold_rate_w` when the evidence word did not hold.
+ */
 export type NightUnitPhase =
   | "pacing"
   | "holding_on_demand"
+  | "standing_by_on_demand"
   | "skipped_full"
   | "complete"
   | "sitting_out";
@@ -69,6 +89,7 @@ export type NightUnitPhase =
 export const NIGHT_UNIT_PHASES: readonly NightUnitPhase[] = [
   "pacing",
   "holding_on_demand",
+  "standing_by_on_demand",
   "skipped_full",
   "complete",
   "sitting_out",
@@ -386,8 +407,10 @@ export function nextWindowInText(state: NightChargeState, nowMs: number): string
 /**
  * One unit's row in the pacing sentence and the per-battery list: its target
  * in plain words keyed on its own phase. A skipped-full battery says "full,
- * sitting out" — the design's own wording — and a claimed/disarmed/headroom
- * sit-out says "sitting out" with its reason named in the row.
+ * sitting out" — the design's own wording — a measured-demand stand-down says
+ * "standing by" (the zero-watt non-participation named as what it is), and a
+ * claimed/disarmed/headroom sit-out says "sitting out" with its reason named
+ * in the row.
  */
 export function nightUnitPhrase(unit: NightUnitState): string {
   switch (unit.phase) {
@@ -395,6 +418,8 @@ export function nightUnitPhrase(unit: NightUnitState): string {
       return `${unit.unitId} ${formatWatts(unit.targetW)}`;
     case "holding_on_demand":
       return `${unit.unitId} held at ${formatWatts(unit.targetW)}`;
+    case "standing_by_on_demand":
+      return `${unit.unitId} standing by`;
     case "skipped_full":
       return `${unit.unitId} full, sitting out`;
     case "complete":
@@ -419,11 +444,26 @@ export function nightUnitReasonText(reason: string): string {
       return "another request has this battery";
     case "target_reached":
       return "target reached";
-    case "demand_above_threshold":
-      return "demand hold";
     default:
       return reason;
   }
+}
+
+/**
+ * One unit's reason in plain words, phase-aware where the wire shares ONE code
+ * across behaviors: `demand_above_threshold` rides BOTH demand arms — a
+ * stand-by answers MEASURED demand ("house demand high"), while the hold at
+ * `hold_rate_w` is the fail-closed fallback a failed evidence word triggered
+ * ("the demand reading did not hold" — never a demand figure the wire does
+ * not have).
+ */
+function unitReasonText(unit: NightUnitState): string {
+  if (unit.reason === "demand_above_threshold") {
+    return unit.phase === "standing_by_on_demand"
+      ? "house demand high"
+      : "the demand reading did not hold";
+  }
+  return nightUnitReasonText(unit.reason);
 }
 
 /** The per-unit evidence row: its own charge figure, target, and reason. */
@@ -431,7 +471,7 @@ export function nightUnitRowText(unit: NightUnitState): string {
   const soc =
     unit.socPct === null ? "charge level not available" : `${formatPercent(unit.socPct)} charged`;
   const plan = nightUnitPhrase(unit);
-  const reason = unit.reason === "" ? "" : ` (${nightUnitReasonText(unit.reason)})`;
+  const reason = unit.reason === "" ? "" : ` (${unitReasonText(unit)})`;
   return `${unit.unitId} — ${soc} · ${plan}${reason}`;
 }
 
@@ -457,8 +497,10 @@ export function nightDemandText(state: NightChargeState): string {
 /**
  * The tile's one-line phase story for an ACTIVE window (the design §7 W2's own
  * wording): pacing names the per-battery targets toward the window's end,
- * holding names the demand rule's guarantee, complete names the moment, and
- * skipped_full states the window had nothing to charge.
+ * standing by names the measured-demand stand-down with its honest trade (the
+ * pods answer the house on their own), holding names the fail-closed
+ * guarantee, complete names the moment, and skipped_full states the window had
+ * nothing to charge.
  */
 export function nightPhaseText(state: NightChargeState): string {
   const endLocal = state.window.endLocal;
@@ -468,6 +510,13 @@ export function nightPhaseText(state: NightChargeState): string {
       return `Charging toward full by ${endLocal}${
         units === "" ? "" : `: ${units}`
       }.`;
+    }
+    case "standing_by_on_demand": {
+      const demand =
+        state.demandW === null
+          ? `the demand reading is ${state.demandEvidence}`
+          : `house demand ${formatWatts(state.demandW)}`;
+      return `Standing by — ${demand}: the batteries stand down at zero watts and the pods answer the house on their own until demand falls back.`;
     }
     case "holding_on_demand": {
       const demand =
@@ -513,7 +562,7 @@ export function nightReasonText(state: NightChargeState): string {
     case "deadline_at_risk":
       return "Behind the plan — charging at the cap to reach full by the window's end.";
     case "demand_above_threshold":
-      return "House demand is above the hold line — batteries held, not cycling.";
+      return "House demand is above the hold line — batteries stood down until it falls back.";
     case "demand_below_exit":
       return "House demand has fallen back below the hold line — charging resumes.";
     case "demand_evidence_missing":
@@ -612,8 +661,12 @@ export function nightPhaseAnnouncement(
       return previous === "idle"
         ? "Night charging started — pacing toward full."
         : "Night charging resumed — pacing toward full.";
+    case "standing_by_on_demand":
+      return "Night charging is standing by — house demand is high; the batteries stand down until it passes.";
     case "holding_on_demand":
-      return "Night charging is holding — house demand is high; the batteries neither drain nor cycle.";
+      // The fail-closed fallback: the evidence word did not hold, so the
+      // announcement never claims a demand figure it does not have.
+      return "Night charging is holding — the demand reading did not hold, so the batteries neither drain nor cycle.";
     case "complete":
       return "Night charging complete — the batteries are full.";
     case "skipped_full":

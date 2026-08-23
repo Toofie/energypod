@@ -12,10 +12,14 @@
  *
  * - ACTIVE phases name their facts in plain words: pacing names the window's
  *   end and every battery's own target ("Charging toward full by 06:00: mid
- *   1,900 W · lhs 1,200 W · rhs full, sitting out"); holding names the demand
- *   rule's guarantee ("batteries neither drain nor cycle while the grid meets
- *   the spike"); complete names the moment ("Batteries full — window complete
- *   at 04:12"); skipped_full states the window had nothing to charge.
+ *   1,900 W · lhs 1,200 W · rhs full, sitting out"); standing by names the
+ *   measured-demand stand-down with its honest trade ("the batteries stand
+ *   down at zero watts and the pods answer the house on their own until
+ *   demand falls back"); holding names the fail-closed guarantee ("batteries
+ *   neither drain nor cycle while the grid meets the spike" — the missing-
+ *   evidence fallback at `hold_rate_w`, never a response to measured demand);
+ *   complete names the moment ("Batteries full — window complete at 04:12");
+ *   skipped_full states the window had nothing to charge.
  * - INACTIVE states are honest one-sentence answers rendered from the FIRST
  *   reason code in the projection's pinned vocabulary (§5; the codes are the
  *   wire, the sentences are the console's). An unknown code is named verbatim,
@@ -271,7 +275,7 @@ function NightToggleDialog({
       </h2>
       <p>
         {action === "enable"
-          ? `Enabling charges the batteries to full inside the off-peak window (${windowText}), dropping to a small steady charge whenever house demand is high so the batteries neither drain nor cycle — the grid meets the spike. It stands down by itself at the window's end.`
+          ? `Enabling charges the batteries to full inside the off-peak window (${windowText}), standing them down entirely whenever house demand is high — each pod answers the house on its own until demand falls back. Night charging stops by itself at the window's end.`
           : "Disabling stops night charging now; a controller restart re-reads the config's own setting either way."}
       </p>
       {showAcknowledgement && (

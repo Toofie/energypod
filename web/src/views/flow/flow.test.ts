@@ -383,6 +383,15 @@ describe("flow model — adviser stories", () => {
     );
   });
 
+  it("composes the night stand-by story: measured demand stands the batteries down", () => {
+    const fleet = fleetFlow(chargingUnits);
+    expect(
+      nightStory(night({ active: true, phase: "standing_by_on_demand", demandW: 1900 }), fleet),
+    ).toBe(
+      "Night charging is standing by — house demand is 1,900 W, so the batteries stand down at zero watts and the pods answer the house on their own until demand falls back.",
+    );
+  });
+
   it("composes the night completion stories", () => {
     const fleet = fleetFlow(chargingUnits);
     expect(nightStory(night({ active: true, phase: "complete" }), fleet)).toBe(
