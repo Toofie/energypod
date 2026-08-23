@@ -15,7 +15,11 @@ This document enumerates EVERY control, threshold, deny reason, and gate in the
 controller, classifies each, and designs the fix for every desync-exposed
 (class-B) instance. The 2026-08-24 BMS-authoritative SOC remediation (already
 landed) is treated as the precedent: remedy pattern R1 below is its
-generalization.
+generalization. A second live confirmation arrived during the audit
+(2026-08-24 ~04:4xZ): the arm-time sole-writer preflight latched
+`external_writer` on `mid` after a restart while the pod was legitimately
+self-charging — the same class-B pattern in the guise of stale PROVENANCE
+rather than stale data (finding B6, §2.6).
 
 ## 0. Method
 
@@ -59,7 +63,7 @@ serves, per telemetry cycle at the commissioned 1.5 s cadence:
 | Probe | 0x5000 (7 w) | every cycle | 0 |
 | Core | 0x5000 BMS live (31 w: SOC +9, SOH +10, dyn limits +13/+14, watts +8), 0x1040/0x2040/0x5040 fault words, 0x523C cell temperatures, 0x8106 identity pair, 0x8100 debug readback (+ 0x1000 PCS live when `excess_charging.enabled`) | every cycle | 0 (one cycle ≤ `max_telemetry_age_s` 3.0 s to the kernel) |
 | Hot ring | 0x5200 cell voltages | every 3rd cycle (`cycle % 3 == 1`) | ≤ 2 cycles ≈ 3 s fresh, bounded by `max_cell_data_age_s` 15.0 s via its own capture clock |
-| Once per process | **0x0100 system overview (61 w: system SOC +17, ctrlMode +1, workMode +2)** | **cycle 1 only** — read once, cached in `_slow_cache` for the process lifetime (it is excluded from the cold ring by `read_plan()`'s cold-set computation) | **UNBOUNDED — hours/days** |
+| Once per process | **0x0100 system overview (61 w: system SOC +17, ctrlMode +1, workMode +2)** | **cycle 1 only** — read once, cached in `_slow_cache` for the process lifetime (it is excluded from the cold ring by `read_plan()`'s cold-set computation) | **UNBOUNDED — hours/days. Proven live 2026-08-24: the boot-resync-then-freeze experiment pinned `mid`'s system SOC at 67 % (its cycle-1 value) with quality GOOD forever while the BMS SOC climbed to 83 % — the definitive reproduction of the soc_disagreement incident's mechanism.** |
 | Cold ring | 0x1060, 0x2000, 0x2060, 0x4101, 0x524E, 0x8139, 0x8102 (+ 0x1000 when the excess feature is off) | one window every 8th cycle (~108 s rotation) | ≤ ~108 s (display/advisory only; the arm-time external-writer preflight reads 0x1060+17 directly, fresh) |
 
 Two merge facts load-bearing for this audit:
@@ -156,9 +160,9 @@ cell tier; "ours" = our own bookkeeping/policy. Class per Q3; remedy per Q4.
 | Qualification `_qualifies` (safety-data completeness, quality, identity, profile, cell count) | core tier + **`safety_data_complete` includes `quality_system_soc_pct` GOOD — the once-per-process tier** | **Yes — B1's second face.** A unit whose single cycle-1 system-SOC decode was BAD/SUSPECT can NEVER qualify: `stable_observations` resets every cycle, arming is impossible, all power blocked until process restart — while the BMS SOC reads GOOD every cycle | **B1** | with B1 |
 | `stable_samples_to_rearm` warmup (3 samples) | our qualification counter over fresh battery observations | The counter itself judges fresh battery truth; the BLOCK arises only after an inhibit cause (genuine write failure / blocking fault / identity) — recovery availability, not desync. One caveat: recovery lands in DISARMED and needs an explicit operator arm | C | — (availability note in §4) |
 | Arm gate (DISARMED + unlatched + stable count) | ours | authority | C | — |
-| External-writer preflight (arm time, 0x1060+17/+18) | **fresh battery read through the owning actor's transport** | None — confirmed battery-truth-based; the readback is served registers, never a cache | A | — |
+| External-writer preflight (arm time, 0x1060+17/+18) | fresh battery readback — but compared against **our per-process write provenance** (`_applied_objective`; a fresh process holds `None`) | **Yes — proven on hardware 2026-08-24 (~04:4xZ).** After any controller restart while `mid` was autonomously self-charging (its own firmware holding a ~-2.27 kW objective), the fresh process has no provenance, so the pod's OWN legitimate autonomy is classified "foreign": `external_writer` latches INHIBITED, and because the preflight re-latches while the objective persists — and daytime autonomy always persists — the privileged-acknowledge → re-qualify → re-arm path latches AGAIN at arm time. The lockout is absolute for the rest of the daylight window. Not stale DATA — stale PROVENANCE: our bookkeeping diverges from the battery's actual (autonomous, legitimate) state. | **B6** | Combined R1-shaped autonomy discrimination + operator-acknowledged takeover. See §2.6. |
 | `objective_readback_unreadable` (arm refused) | fresh read failure | Genuinely unreadable → fail-closed arm refusal is correct (transient, non-latching) | D | Keep |
-| `external_writer` latch | fresh readback ≠ 0 and ≠ our last applied objective | Battery truth — another writer demonstrably holds the objective | A/D | Keep |
+| `external_writer` latch (out-of-band or discharge-signature objectives) | fresh readback ≠ 0, ≠ our applied objective, and NOT matching the autonomy signature | For genuine foreign writers (the night-writer environment fact) the latch is the designed sole-writer protection — kept exactly | D | Keep (narrowed by B6 to the non-autonomy signature) |
 | `identity_mismatch` latch | 0x8106 identity pair — core, fresh every cycle | Structural identity (a different device is speaking); pinned fresh, so no staleness window | C | — |
 | `blocking_fault_active` latch | fault words — core, fresh | battery truth | A | — |
 | `write_failed` inhibit | transport write failure | We genuinely could not command the battery | D | Keep |
@@ -175,8 +179,8 @@ cell tier; "ours" = our own bookkeeping/policy. Class per Q3; remedy per Q4.
 | Absent mode evidence refuses nothing | — | Confirmed: `None` (block unserved / unit unpublished) never blocks — the advisory doctrine holds | A | — |
 | Arbiter selection, cross-site, scopes, idempotency | ours | authority | C | — |
 
-**Counts (by table row): A = 13, B = 5, C = 15, D = 10.**
-Distinct class-B findings: B1, B2, B3, B4, B5 (below).
+**Counts (by table row): A = 12, B = 6, C = 15, D = 10.**
+Distinct class-B findings: B1, B2, B3, B4, B5, B6 (below).
 
 ## 2. Class-B findings, narratives, and fix designs
 
@@ -207,6 +211,29 @@ remain:
 
 In both, the BMS SOC (core, fresh, GOOD) says the battery is readable and fine,
 and our once-per-process tier blocks anyway — the operator's exact complaint.
+
+**Live proof (2026-08-24, the boot-resync-then-freeze experiment).** `mid`'s
+system SOC was pinned at 67 % — its cycle-1 value — with quality GOOD on every
+subsequent cycle while the BMS SOC climbed to 83 % during deep self-charge.
+This is the definitive confirmation of the mechanism: 0x0100 is served
+cycle-1-only and never again, so the word freezes at boot while the battery
+moves on. The already-shipped BMS-authoritative fix (safety.py judges every
+SOC bound on `bms_soc_pct`; divergence is the `soc_disagreement_observed`
+note) is confirmed correct by the same experiment — no bound moved with the
+frozen word.
+
+**Read-plan follow-up (the remaining question).** Two options exist for the
+register itself: promote 0x0100+17 to a fresher tier, or stop decoding system
+SOC as an input entirely (console-provenance only). This audit recommends
+KEEPING the decode and moving the whole 0x0100 block into the cold ring (the
+B5 plan, §2.5 — the same block carries ctrlMode): the divergence signal is
+operationally valuable (it is exactly how the operator caught the original
+incident), so deleting it removes evidence; refreshing it on the ring drops
+the staleness from UNBOUNDED to ≤ ~108 s while B1's remedy keeps it out of
+every blocking set. Post-B1 the system SOC is console provenance and divergence
+telemetry — nothing more — and post-B5 it is honestly timestamped rather than
+boot-frozen. "Stop decoding entirely" is rejected only on that evidentiary
+ground; it would otherwise be safe.
 
 **Remedy — R1 (battery-authoritative precedence).** The system SOC is already
 non-authoritative for every bound; finish the demotion. Move `system_soc_pct`
@@ -362,6 +389,101 @@ and after B1 the refreshed system SOC is advisory-only.
 still refuses nothing (advisory doctrine preserved); two consecutive failed
 refresh reads refuse (genuinely unreadable).
 
+### 2.6 B6 — the arm-time sole-writer preflight misclassifies the pod's OWN autonomy as a foreign writer (stale provenance, proven on hardware)
+
+**Input.** `_verify_sole_writer_owned` (`actor.py`): at arm time the actor
+reads the served PQ objective readback (0x1060+17/+18) — a genuinely FRESH
+battery read — and refuses unless it is (0, 0) or equals `_applied_objective`,
+the last objective THIS PROCESS wrote. A fresh process holds `None`, so any
+nonzero readback is "foreign" by construction. The READ is battery truth; the
+COMPARISON is our per-process bookkeeping. This is the class-B pattern in a new
+guise: not stale data — stale PROVENANCE.
+
+**Live incident (2026-08-24, ~04:4xZ, `mid`).** After a controller restart
+while the pod was autonomously self-charging, the pod's own firmware held a
+nonzero PQ objective (~-2.27 kW, charge direction). The fresh process had no
+write provenance, so the preflight read a nonzero objective "it did not write"
+and latched INHIBITED with cause `external_writer` (privileged acknowledgement
+required). The lockout is ABSOLUTE for the daylight window, because the
+acknowledgement escape hatch cannot escape: the preflight re-latches while the
+foreign objective persists, and daytime autonomy always persists —
+acknowledge → 3 stable samples → arm → preflight sees the (still autonomous,
+still unprovenanced) objective → LATCHED again.
+
+**Timing analysis — why "just retry" is unwinnable.** The direction-trial
+family of measurements plus this incident give the numbers. A bounded
+zero-write `[1,0,0]` is reverted by the device in ~1.34 s: the pod's autonomy
+re-establishes its objective on roughly that timescale. Our re-qualification
+path needs 3 stable observations at the 1.5 s control period (~4.5 s) plus the
+arm itself — ~5-6 s end to end. So any remedy of the form "zero first, let
+provenance go clean, qualify, then arm" loses the race by ~4 s EVERY time: at
+arm time the readback is nonzero again (autonomy) and unprovenanced (fresh
+process) → foreign, forever. The race is structural, not a matter of tuning
+sample counts.
+
+**Doctrine reconciliation.** CONTINUITY (2026-08-23) pins the environment
+facts: "other applications monitor these batteries read-only by day and write
+only at night; daytime the pods self-manage solar charging; night writes will
+trip our arm-time external-writer preflight by design (coordinate, don't
+fight)." The preflight was designed against ANOTHER CONTROL SYSTEM — and for
+that writer the latch is correct and stays. What the doctrine did not
+anticipate is that during the day the nonzero objective is written by the
+battery itself: the pod's CT-following autonomy is not a competing system but
+the battery's own desired behavior, which this controller EXPLICITLY preserves
+by design (the fail-safe of every non-renewal is "the firmware watchdog returns
+the pod to its own CT-following autonomy"; the beat-autonomy doctrine likewise
+treats autonomy as the baseline our objective temporarily REPLACES). For the
+battery's own autonomy, "coordinate, don't fight" resolves to "take over
+cleanly, hand back by non-renewal" — which is precisely the designed interplay.
+The preflight conflated two causes of "nonzero and not ours" — foreign
+controller vs pod autonomy — into one latched refusal. The fix separates them.
+
+**Remedy — (i) autonomy-signature discrimination as the default, combined with
+(ii) operator-acknowledged takeover as the override; (iii) rejected.**
+
+- **(i) AUTONOMY-SIGNATURE DISCRIMINATION (default arm path).** A nonzero
+  readback in a fresh-provenance process is classified `pod_autonomy_objective`
+  — arm proceeds WITHOUT latch — when ALL of: (a) charge direction (P < 0;
+  the evidenced daytime autonomy is self-charge, never discharge); (b) Q == 0;
+  (c) |P| within a commissioned per-unit autonomy band (a new policy key, e.g.
+  `autonomous_charge_band_w`, defaulting to the unit's static charge limit —
+  the incident's -2.27 kW proves the band must cover deep CT surplus, not just
+  the ~-520..-560 W trickle the earlier evidence recorded); and (d) the process
+  wrote nothing (the existing `_applied_objective is None` condition). The
+  classification is audited on the arm (`arm_provenance: pod_autonomy` with the
+  served P/Q) and exposed on the facade snapshot so the console shows WHY arming
+  was allowed over a nonzero objective. Our first renewed heartbeat then
+  replaces the objective exactly as the beat-autonomy doctrine prescribes —
+  that replacement is the designed interplay, not a fight.
+- **(ii) OPERATOR-ACKNOWLEDGED TAKEOVER (override).** `arm` gains an explicit,
+  audited confirmation field (e.g. `takeover_confirmed: true`; `arm` scope +
+  interactive principal already required) for objectives that FAIL the
+  signature — a deeper surge than the commissioned band, or any case where the
+  operator can see (console: battery watts vs objective vs grid CT) that the
+  "writer" is the pod itself. This bounds the harm of a too-narrow band: the
+  operator is never locked out by band tuning; the band only smooths the common
+  case. The existing inhibit-acknowledgement endpoint remains for the latched
+  path.
+- **(iii) PROVENANCE PERSISTENCE — REJECTED.** Persisting `_applied_objective`
+  across restarts would dissolve the ambiguity but is forbidden territory:
+  boot is observe-only and nothing that smells of restored authority may be
+  read back from persistence (API_CONTRACTS "Runtime composition"; the volatile
+  stores start empty on every build). Both (i) and (ii) are provenance-free and
+  sufficient; nothing is gained by crossing that line.
+
+**What stays fail-closed.** Positive (discharge) objectives, Q ≠ 0, and
+out-of-band magnitudes still latch `external_writer` exactly as today — the
+night-writer protection is untouched. An unreadable readback still refuses the
+arm (class D, `objective_readback_unreadable`). The takeover override is
+interactive, scoped, and audited; it cannot be exercised by automation (the
+adviser holds no `arm` scope and is non-interactive). If a genuine foreign
+charge writer happens to sit inside the band by day, the exposure is bounded:
+our first heartbeat replaces the objective, every authorization remains
+short-lived behind the generation fence, and stop/fence/shutdown still dominate
+— the design accepts that residual, on the environment fact that external
+writers write at night, and records the classification in the audit trail for
+after-the-fact detection.
+
 ## 3. Implementation plan (for the successor agent)
 
 Ordered by ascending invasiveness; each step lands contract-first with its red
@@ -456,7 +578,48 @@ OUR-STALE-INPUT veto, never the cannot-read-the-battery veto.
   refresh failures. The cold-ring move adds no per-cycle window (the ring
   serves one window per 8th cycle either way).
 
-**Step 5 — B4 (deny-triggered cell tier promotion).**
+**Step 5 — B6 (autonomy-signature arm path + operator-acknowledged takeover).**
+May be pulled forward ahead of Step 4 given operational severity: it is the
+only finding that produces an ABSOLUTE operator lockout (daylight arming
+impossible after every restart during self-charge).
+- Contract: API_CONTRACTS "Write-enabled run mode (live control)", bullet 3 is
+  amended: the arm-time preflight classifies a fresh-provenance nonzero
+  objective matching the autonomy signature (P < 0, Q == 0, |P| within the
+  commissioned `autonomous_charge_band_w`) as `pod_autonomy_objective` — the
+  arm proceeds, the classification is audited (`arm_provenance: pod_autonomy`
+  with the served P/Q) and snapshot-exposed; `arm` additionally accepts an
+  explicit audited `takeover_confirmed` confirmation (interactive `arm` scope)
+  for out-of-signature objectives; discharge-signature, Q ≠ 0, and
+  out-of-band objectives still latch `external_writer` exactly as today.
+  Provenance persistence across restarts remains forbidden (boot stays
+  observe-only). ControlPolicy/config gain the per-unit autonomy band key.
+- Red tests: `tests/unit/test_actor_external_writer.py` — (a) fresh process,
+  readback (-2270, 0), band covering it: arm SUCCEEDS, lifecycle ARMED_IDLE,
+  audit carries `arm_provenance: pod_autonomy` (today: INHIBITED
+  `external_writer`); (b) readback (+1500, 0): still latches; (c) readback
+  (-2270, 300) (Q ≠ 0): still latches; (d) readback beyond the band: still
+  latches; (e) `takeover_confirmed` on case (d): arm proceeds, audited;
+  non-interactive principals cannot set it; (f) unreadable readback: still a
+  transient arm refusal. `tests/unit/test_write_enabled_run.py` — the composed
+  wiring passes the policy band to the actor. `tests/unit/test_config.py` —
+  the new key validates (positive, ≤ static charge limit).
+- Files: `src/energypod/application/actor.py` (`_verify_sole_writer_owned`
+  signature classification + the confirmation argument; audit + snapshot
+  fields), `src/energypod/application/service.py` (arm passthrough of the
+  confirmation, interactive-principal enforcement), `src/energypod/domain/models.py`
+  (policy key), `src/energypod/runtime/config.py` + `composition.py`
+  (configuration + wiring), `config/config.live-write-example.yaml` (band
+  commissioned from the 2026-08-24 evidence).
+- Risk note: this deliberately narrows the sole-writer latch for charge-direction
+  in-band objectives during fresh provenance. The residual (a foreign in-band
+  charge writer misread as autonomy) is accepted on the pinned environment fact
+  that external writers write at night, bounded by the objective replacement on
+  our first heartbeat, short authorization lifetimes, stop/fence dominance, and
+  the audit trail that records every autonomy classification. The band is a
+  commissioned policy constant — NOT derived from the readback — so it cannot
+  be widened by whatever value happens to be on the wire.
+
+**Step 6 — B4 (deny-triggered cell tier promotion).**
 - Contract: API_CONTRACTS "Safety kernel and arbitration" +
   "Read-plan tier promotion" — a decision carrying a cell-derived deny reason
   for a unit promotes that unit's next telemetry cycle to include 0x5200;
@@ -477,7 +640,7 @@ OUR-STALE-INPUT veto, never the cannot-read-the-battery veto.
   this against the config comments in the PR). The remedy only ever ADDS
   reads of the datum the deny judged; it never bypasses a fresh violation.
 
-**Step 6 — side finding S1 (§5) if the operator confirms intent:** correct the
+**Step 7 — side finding S1 (§5) if the operator confirms intent:** correct the
 configured `blocking_fault_codes` to the decoder's real generated codes
 (`PCS_WARNING0_1`, `DCDC_WARNING0_1` — the EE-calibration bits are WARNING
 bits per PROTOCOL_EVIDENCE §9, and `blocking_warning_codes` is the set the
@@ -491,11 +654,14 @@ unknown codes; out of desync scope but fail-open today.
   limit words, core-rate); ramp limiter (core-rate watts, staleness bounded by
   `max_telemetry_age_s` and re-checked by `telemetry_stale`); temperature
   gates (0x523C core); blocking faults (core fault words); allocator headroom
-  (dynamic limits, core); external-writer arm preflight (a fresh served-register
-  read by construction); `device_debug_mode_active` (core-rate word);
+  (dynamic limits, core); `device_debug_mode_active` (core-rate word);
   `soc_disagreement_observed` (the landed R1); export-evidence trio
   (advisory-only, can only lower power, never blocks operator intents);
-  absent-mode-evidence-refuses-nothing (advisory doctrine confirmed).
+  absent-mode-evidence-refuses-nothing (advisory doctrine confirmed). (The
+  external-writer arm preflight was initially classified here — its READ is
+  fresh battery truth — but the 2026-08-24 restart-while-autonomous incident
+  proved its PROVENANCE comparison is our own per-process bookkeeping: it is
+  finding B6, §2.6.)
 - **C — structural authority, not a sync question:** all proposal-shape
   reasons; intent expiry; lifecycle gating; observation order/sequence/epoch
   coherence (our monotone per-process counters — a delayed poll appends
