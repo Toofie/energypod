@@ -2,8 +2,10 @@
 
 The documentation requires exact totals after clamping, scope containment,
 per-unit headroom, permutation invariance, and unsigned domain magnitudes. It
-does not prescribe max-min fairness, so this suite does not freeze an
-undocumented distribution algorithm.
+does not prescribe max-min fairness; it does freeze the capacity-weighted
+distribution contract (API_CONTRACTS "Safety kernel and arbitration"): a
+request under scarce headroom reaches every participating unit, weighted by
+that unit's remaining direction headroom.
 """
 
 from __future__ import annotations
@@ -506,3 +508,235 @@ def test_generated_allocations_are_input_order_independent(
     expected = allocation.allocate_fleet_power(intent, units)
     assert allocation.allocate_fleet_power(intent, tuple(reversed(units))) == expected
     assert allocation.allocate_fleet_power(intent, units[1:] + units[:1]) == expected
+
+
+# ---------------------------------------------------------------------------
+# Capacity-weighted fleet distribution (the 2026-08-23 operator complaint:
+# "I am powering each device at 1,000 watts and only one is being powered" --
+# a fleet request under scarce headroom must reach every participating unit,
+# weighted by each unit's remaining direction headroom, instead of being
+# absorbed whole by the first sorted unit with headroom).
+# ---------------------------------------------------------------------------
+
+
+def _live_like_headrooms(allocation: ModuleType) -> tuple[object, ...]:
+    """The 2026-08-23 live fleet discharge shape: one static-capped pod, two BMS-rich."""
+    return (
+        _headroom(allocation, "lhs", 2_500, 2_500),
+        _headroom(allocation, "mid", 8_056, 8_056),
+        _headroom(allocation, "rhs", 6_752, 6_752),
+    )
+
+
+def test_fleet_request_powers_every_eligible_unit_instead_of_one() -> None:
+    """The operator scenario: 3000 W over three pods must reach all three.
+
+    The greedy predecessor handed the entire request to the first sorted unit
+    with headroom (lhs, whose 2500 W static cap absorbed it whole) and left mid
+    and rhs at legal zero-watt non-participation -- exactly "only one is being
+    powered at a time".
+    """
+    models = _models()
+    allocation = _allocation()
+    selected = frozenset({"lhs", "mid", "rhs"})
+    result = allocation.allocate_fleet_power(
+        _intent(models, watts=3_000, selected=selected),
+        _live_like_headrooms(allocation),
+    )
+    assert all(result.allocations[unit] > 0 for unit in selected)
+    _assert_exact(
+        result,
+        selected=selected,
+        capacities={"lhs": 2_500, "mid": 8_056, "rhs": 6_752},
+        requested=3_000,
+    )
+    # No unit monopolizes a scarce request: each stays within two watts of its
+    # headroom-weighted share (one for the participation floor, one for the
+    # largest-remainder rounding).
+    total_capacity = 2_500 + 8_056 + 6_752
+    for unit, capacity in (("lhs", 2_500), ("mid", 8_056), ("rhs", 6_752)):
+        assert result.allocations[unit] <= 3_000 * capacity // total_capacity + 2
+
+
+def test_capacity_weighted_shares_are_proportional_and_exact() -> None:
+    """Equal headroom splits a request into equal integer shares, exact sum."""
+    models = _models()
+    allocation = _allocation()
+    selected = frozenset({"a", "b", "c"})
+    equal = tuple(_headroom(allocation, unit, 100, 100) for unit in ("a", "b", "c"))
+    divisible = allocation.allocate_fleet_power(_intent(models, watts=99, selected=selected), equal)
+    assert dict(divisible.allocations) == {"a": 33, "b": 33, "c": 33}
+    indivisible = allocation.allocate_fleet_power(
+        _intent(models, watts=100, selected=selected), equal
+    )
+    # The one unassignable watt goes to the stable tie-break: larger residual
+    # headroom, then unit id.
+    assert dict(indivisible.allocations) == {"a": 34, "b": 33, "c": 33}
+    assert indivisible.allocated_watts == 100
+
+
+def test_participation_floor_keeps_small_headroom_units_off_zero() -> None:
+    """A tiny unit still participates while larger units run below headroom."""
+    models = _models()
+    allocation = _allocation()
+    selected = frozenset({"a", "b", "c"})
+    result = allocation.allocate_fleet_power(
+        _intent(models, watts=300, selected=selected),
+        (
+            _headroom(allocation, "a", 10, 10),
+            _headroom(allocation, "b", 5_000, 5_000),
+            _headroom(allocation, "c", 5_000, 5_000),
+        ),
+    )
+    # One reserved watt for a, then 297 distributed 9/4999/4999 by largest
+    # remainder: the tie at 148 goes to the lower unit id.
+    assert dict(result.allocations) == {"a": 1, "b": 150, "c": 149}
+    assert result.allocated_watts == 300
+
+
+def test_sub_unit_count_request_concentrates_by_capacity_priority() -> None:
+    """The concentration boundary: below one watt per participating unit.
+
+    A request smaller than the number of participating units cannot give every
+    unit its first watt, so it fills by capacity priority (largest headroom
+    first, ties by unit id) and the unfillable tail receives explicit
+    zero-watt proposals.
+    """
+    models = _models()
+    allocation = _allocation()
+    equal = tuple(_headroom(allocation, unit, 100, 100) for unit in ("a", "b", "c"))
+    result = allocation.allocate_fleet_power(
+        _intent(models, watts=2, selected=frozenset({"a", "b", "c"})), equal
+    )
+    assert dict(result.allocations) == {"a": 2, "b": 0, "c": 0}
+    skewed = allocation.allocate_fleet_power(
+        _intent(models, watts=1, selected=frozenset({"a", "b"})),
+        (_headroom(allocation, "a", 5, 5), _headroom(allocation, "b", 100, 100)),
+    )
+    assert dict(skewed.allocations) == {"a": 0, "b": 1}
+
+
+def test_request_equal_to_participating_count_gives_each_unit_one_watt() -> None:
+    """The boundary is inclusive: three watts over three units is one each."""
+    models = _models()
+    allocation = _allocation()
+    result = allocation.allocate_fleet_power(
+        _intent(models, watts=3, selected=frozenset({"a", "b", "c"})),
+        tuple(_headroom(allocation, unit, 100, 100) for unit in ("a", "b", "c")),
+    )
+    assert dict(result.allocations) == {"a": 1, "b": 1, "c": 1}
+
+
+def test_request_above_total_headroom_fills_every_unit_and_reports_shortfall() -> None:
+    """No scarcity: every unit runs at its full direction headroom."""
+    models = _models()
+    allocation = _allocation()
+    result = allocation.allocate_fleet_power(
+        _intent(models, watts=350, selected=frozenset({"a", "b", "c"})),
+        (
+            _headroom(allocation, "a", 100, 100),
+            _headroom(allocation, "b", 100, 100),
+            _headroom(allocation, "c", 100, 100),
+        ),
+    )
+    assert dict(result.allocations) == {"a": 100, "b": 100, "c": 100}
+    assert result.allocated_watts == 300
+    assert result.unallocated_watts == 50
+    assert result.requested_watts == 350
+
+
+def test_weighted_distribution_selects_headroom_by_direction() -> None:
+    """The weighted split uses the charge/discharge headroom the direction names."""
+    models = _models()
+    allocation = _allocation()
+    result = allocation.allocate_fleet_power(
+        _intent(models, direction="CHARGE", watts=150, selected=frozenset({"a", "b"})),
+        (
+            _headroom(allocation, "a", 100, 9_999),
+            _headroom(allocation, "b", 200, 9_999),
+        ),
+    )
+    # 150 over 100/200: one reserved watt each, then 148 across 99/199.
+    assert dict(result.allocations) == {"a": 50, "b": 100}
+
+
+def test_export_cap_bounds_the_distributed_total_and_keeps_exact_sums() -> None:
+    """The measured-export min() term caps demand before distribution."""
+    models = _models()
+    allocation = _allocation()
+    result = allocation.allocate_fleet_power(
+        _intent(models, direction="CHARGE", watts=3_000, selected=frozenset({"a", "b"})),
+        (
+            _headroom(allocation, "a", 1_500, 0),
+            _headroom(allocation, "b", 1_500, 0),
+        ),
+        export_cap_w=1_000,
+    )
+    assert dict(result.allocations) == {"a": 500, "b": 500}
+    assert result.requested_watts == 3_000
+    assert result.allocated_watts == 1_000
+    assert result.unallocated_watts == 2_000
+
+
+def test_ineligible_and_zero_headroom_units_stay_zero_while_eligible_units_share() -> None:
+    """Non-participation is unchanged: ineligible or headroom-less units get 0 W."""
+    models = _models()
+    allocation = _allocation()
+    selected = frozenset({"a", "b", "c"})
+    result = allocation.allocate_fleet_power(
+        _intent(models, watts=60, selected=selected),
+        (
+            _headroom(allocation, "a", 1_000, 1_000, eligible=False),
+            _headroom(allocation, "b", 0, 0),
+            _headroom(allocation, "c", 100, 100),
+        ),
+    )
+    assert result.allocations["a"] == 0
+    assert result.allocations["b"] == 0
+    assert result.allocations["c"] == 60
+    _assert_exact(result, selected=selected, capacities={"a": 0, "b": 0, "c": 100}, requested=60)
+
+
+def test_weighted_distribution_is_permutation_invariant() -> None:
+    models = _models()
+    allocation = _allocation()
+    intent = _intent(models, watts=3_000, selected=frozenset({"lhs", "mid", "rhs"}))
+    units = _live_like_headrooms(allocation)
+    expected = allocation.allocate_fleet_power(intent, units)
+    assert all(expected.allocations[unit] > 0 for unit in ("lhs", "mid", "rhs"))
+    for ordered in (tuple(reversed(units)), units[1:] + units[:1]):
+        assert allocation.allocate_fleet_power(intent, ordered) == expected
+
+
+@given(_fleet_cases(), st.sampled_from(("CHARGE", "DISCHARGE")))
+@settings(max_examples=250)
+def test_generated_requests_reach_every_participating_unit(
+    allocation_api: SimpleNamespace,
+    case: tuple[list[tuple[str, int, int, bool]], frozenset[str], int],
+    direction: str,
+) -> None:
+    """Property: a scarce request at or above the participating count leaves
+    no participating unit at a zero-watt proposal, and no unit exceeds a
+    two-watt band around its headroom-weighted share."""
+    models = allocation_api.models
+    allocation = allocation_api.allocation
+    raw, selected, request = case
+    units = tuple(
+        _headroom(allocation, unit, charge, discharge, eligible=ok)
+        for unit, charge, discharge, ok in raw
+    )
+    result = allocation.allocate_fleet_power(
+        _intent(models, direction=direction, watts=request, selected=selected), units
+    )
+    index = 1 if direction == "CHARGE" else 2
+    capacities: dict[str, int] = {
+        row[0]: int(row[index]) if row[3] else 0 for row in raw if row[0] in selected
+    }
+    total_capacity = sum(capacities.values())
+    participating = {unit for unit, capacity in capacities.items() if capacity > 0}
+    _assert_exact(result, selected=selected, capacities=capacities, requested=request)
+    if 0 < request < total_capacity and request >= len(participating):
+        assert all(result.allocations[unit] > 0 for unit in participating)
+        for unit in participating:
+            ideal = request * capacities[unit] // total_capacity
+            assert result.allocations[unit] <= ideal + 2

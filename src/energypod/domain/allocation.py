@@ -1,4 +1,13 @@
-"""Deterministic, protocol-independent fleet power allocation."""
+"""Deterministic, protocol-independent fleet power allocation.
+
+The allocation contract (API_CONTRACTS "Safety kernel and arbitration") is
+capacity-weighted: a fleet-total request under scarce headroom is distributed
+across every participating unit, proportional to each unit's remaining
+direction headroom, with an exact integer sum after clamping.  A unit never
+monopolizes a request another unit could share, and a unit with no usable
+headroom keeps an explicit zero-watt proposal (the non-participation
+doctrine).
+"""
 
 from __future__ import annotations
 
@@ -73,6 +82,62 @@ class FleetAllocation(BaseModel):
         return self
 
 
+def _distribute_demand(demand: int, capacities: Mapping[str, int]) -> dict[str, int]:
+    """Capacity-weighted integer distribution of one fleet demand.
+
+    Pure and deterministic in ``demand`` and the unit-keyed capacities alone
+    (unit ids are processed in sorted order and every tie-break ends in the
+    unit id, so the result is invariant under input permutation).  Three
+    regimes, from least to most scarce:
+
+    - ``demand >= total capacity``: no scarcity; every unit runs at its full
+      capacity and any shortfall is reported by the caller as unallocated.
+    - ``demand < number of participating units`` (units with capacity > 0):
+      the request cannot give every participating unit its first watt, so it
+      CONCENTRATES by capacity priority — largest capacity first, ties by
+      unit id — and the unfillable tail receives zero.  This is the only
+      regime in which a participating unit may end at zero.
+    - otherwise: every participating unit is reserved one watt (the
+      participation floor: no eligible unit is left at a zero-watt proposal
+      while another runs below its own headroom), and the remainder is split
+      across the REMAINING capacity proportional to it, by exact integer
+      largest-remainder with ties broken by residual capacity then unit id.
+    """
+    selected = sorted(capacities)
+    total_capacity = sum(capacities.values())
+    participating = [unit for unit in selected if capacities[unit] > 0]
+    if demand >= total_capacity:
+        return dict(capacities)
+    if demand < len(participating):
+        concentrated = {unit: 0 for unit in selected}
+        remaining = demand
+        for unit in sorted(participating, key=lambda item: (-capacities[item], item)):
+            concentrated[unit] = min(remaining, capacities[unit])
+            remaining -= concentrated[unit]
+        return concentrated
+    reserved = len(participating)
+    base = {unit: 1 if capacities[unit] > 0 else 0 for unit in selected}
+    remaining = demand - reserved
+    residual = {unit: capacities[unit] - base[unit] for unit in selected}
+    residual_total = total_capacity - reserved
+    floors = {unit: remaining * residual[unit] // residual_total for unit in selected}
+    leftover = remaining - sum(floors.values())
+    # The exact fractional remainder (never a float): the leftover watts go
+    # one each to the largest remainders.  A unit whose residual capacity is
+    # exhausted can never carry a positive remainder, so it is never bumped
+    # past its capacity.
+    bumpable = sorted(
+        (unit for unit in selected if residual[unit] > floors[unit]),
+        key=lambda unit: (
+            -(remaining * residual[unit] - floors[unit] * residual_total),
+            -residual[unit],
+            unit,
+        ),
+    )
+    bumped = set(bumpable[:leftover])
+    return {unit: base[unit] + floors[unit] + (1 if unit in bumped else 0) for unit in selected}
+
+
 def allocate_fleet_power(
     intent: PowerIntent,
     headrooms: tuple[UnitHeadroom, ...],
@@ -109,23 +174,23 @@ def allocate_fleet_power(
     # (every selected unit proposes explicit non-participation), never an
     # error and never a reversal.
     demand = intent.watts if export_cap_w is None else min(intent.watts, export_cap_w)
-    remaining = demand
-    allocations: dict[str, int] = {}
-    for unit_id in selected:
-        headroom = by_id[unit_id]
-        capacity = 0
-        if headroom.eligible:
-            capacity = (
-                headroom.charge_watts
+    capacities = {
+        unit_id: (
+            0
+            if not by_id[unit_id].eligible
+            else (
+                by_id[unit_id].charge_watts
                 if intent.direction is Direction.CHARGE
-                else headroom.discharge_watts
+                else by_id[unit_id].discharge_watts
             )
-        allocations[unit_id] = min(remaining, capacity)
-        remaining -= allocations[unit_id]
+        )
+        for unit_id in selected
+    }
+    allocations = _distribute_demand(demand, capacities)
     # The unallocated remainder keeps absorbing whatever the cap (or headroom)
     # denied, so the exact-sum invariants are unchanged: allocated plus
     # unallocated equals the intent's own request.
-    allocated_watts = demand - remaining
+    allocated_watts = sum(allocations.values())
     return FleetAllocation(
         direction=intent.direction,
         allocations=allocations,
