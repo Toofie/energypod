@@ -499,3 +499,34 @@ energy_scorecard:
   #   currency: "AUD"            # ISO 4217
   #   import_cents_per_kwh: 28.0
   #   export_cents_per_kwh: 9.0
+
+# PLANT HISTORY (the telemetry historian, DESIGN_PLANT_HISTORY) — the
+# durable time-series record behind the console's planned History view.
+# The block is deliberately COMMENTED OUT: history commissions as one
+# explicit operator act (uncomment + restart), never silently.
+#
+# What it does when present: a TelemetryHistorian samples the observation
+#   stream once per sample_interval_s into the EXISTING database (schema
+#   migrates to version 3 in place on boot — nothing to run by hand), the
+#   fleet loop records it beside the energy accountant, hourly rollups
+#   keep the trend forever, and GET /api/v1/history serves windowed,
+#   server-downsampled series (observe scope; the read-only
+#   get_plant_history MCP tool rides along). Absent block: no samples, a
+#   409 on the route, no snapshot key — nothing changes anywhere.
+# Honesty rules it owns: gaps are absent rows, NEVER interpolated; absent
+#   data is null, never zero; degraded periods carry their quality word
+#   (missing > bad > stale > suspect); history is observability only — no
+#   control path reads it and nothing restores from it at boot.
+# Sizing at the defaults: ~200 B/row, 2,880 rows/battery/day, 14 days
+#   full resolution (~24 MB) + ~10.5 MB/year of hourly rollups.
+#
+# plant_history:
+#   # The sampling cadence: must exceed timing.control_period_s, <= 3600.
+#   # 30 s (default) = 2,880 rows/battery/day; 15 s doubles storage and
+#   # catches shorter transients; 60 s halves both.
+#   sample_interval_s: 30.0
+#   # The full-resolution retention window, 1..3650 days.
+#   retention_full_resolution_days: 14
+#   # Hourly rollup retention: 0 (default) = forever; a positive day
+#   # count bounds the rollup tier too.
+#   retention_rollup_days: 0

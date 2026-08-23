@@ -3188,7 +3188,11 @@ async def test_boot_maintenance_rolls_the_durable_store_on_composition(
         repository = SQLiteTelemetryHistoryRepository(
             database, retention_full_resolution_s=86_400.0
         )
-        stale = datetime.now(UTC).replace(microsecond=0) - timedelta(days=3)
+        # Pinned to a whole hour so the seeded pair cannot straddle an hour
+        # boundary when the test runs near the top of an hour.
+        stale = (datetime.now(UTC).replace(microsecond=0) - timedelta(days=3)).replace(
+            minute=0, second=0
+        )
         repository.append_samples(
             tuple(_sample_row(UNIT_IDS[0], stale + timedelta(minutes=m)) for m in range(0, 60, 30))
         )

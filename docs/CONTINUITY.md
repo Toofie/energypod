@@ -349,6 +349,96 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-24 (plant-history backend, H1-H6): THE TELEMETRY HISTORIAN
+  BACKEND IMPLEMENTED against the accepted contract
+  docs/DESIGN_PLANT_HISTORY.md (34f68a8) + API_CONTRACTS "Plant history
+  (telemetry historian)" — backend half only (H1-H6; the console waves
+  W1-W3 belong to the follow-up web agent per the design's own plan).
+  The docs govern every shape; nothing below deviates. Built on an
+  ISOLATED WORKTREE BRANCH for merge review (the night-charge feature
+  was built in parallel in the main tree); commits H1..H6 there.
+  (1) STORE (H1): schema_version 3 migrates in place —
+  `telemetry_sample` (WITHOUT ROWID, clustered (unit_id, sampled_at),
+  the 15 numeric observables + lifecycle/health_state/quality rollup +
+  the commanded triple + the four mode words; every datum NULL when
+  absent, never zero-filled) and `telemetry_rollup_hourly` (per-field
+  min/max/mean, sample_count = the coverage marker, worst_quality; an
+  empty hour writes NO row). SQLiteTelemetryHistoryRepository +
+  InMemoryTelemetryHistoryRepository share one port: batch append (BEGIN
+  IMMEDIATE + executemany, duplicates ignored, busy = the typed gap),
+  inclusive windowed reads, oldest_full_res_at/last_sample_at, and
+  maintain(now) — rollup then prune in ONE transaction so a failed
+  rollup can never delete the only copy.
+  (2) SAMPLER (H2): TelemetryHistorian ticks once per fleet cycle
+  (after the polls + the accountant, before the kernel; bounded,
+  suppressed — a failure is a GAP and one log line, never a delay to
+  control). Cadence per unit with the boot baseline (first tick samples
+  immediately; a failed append leaves the clock so the next tick IS the
+  retry); sampled_at = the tick's wall clock truncated to seconds, ONE
+  timestamp shared by every unit in the tick; staleness guard
+  max(3 x control_period_s, sample_interval_s) — a stale latest writes
+  NO row; quality rollup = worst over REQUIRED_SAFETY_QUALITY_FIELDS
+  minus the cold-ring system_soc/soh plus the CT pair when composed,
+  precedence missing > bad > stale > suspect > good; commanded triple
+  from the per-unit winner set (throwaway arbiter; OPTIMIZER attributed
+  to the claiming adviser — the excess projection today, the night
+  projection joins at merge) plus the cycle's peeked authority; NULL
+  triple when nothing claims (and for an emergency-stop winner — the
+  fence commands nothing). Maintenance cadence: one pass on the first
+  tick after each site-local midnight beside the boot pass.
+  (3) CONFIG + COMPOSITION (H3): `plant_history:` block (three keys, NO
+  enabled key) — present REQUIRES storage, sample_interval_s must
+  exceed control_period_s (both cross-validated on ControllerConfig);
+  present composes the store on the EXISTING database path (simulate =
+  the in-memory adapter), the boot maintenance pass, the historian in
+  the pinned loop slot, PlantHistoryControl, and the snapshot's
+  feature-detected `history_state` ({sample_interval_s,
+  retention_full_resolution_days, last_sample_at per unit}); absent
+  composes nothing (byte-identical snapshot).
+  (4) QUERY (H4): PlantHistoryControl.query_payload — bounds (ISO-8601
+  WITH explicit offset, naive = 422; from < to; <= 31 days; configured
+  units; the 18-field vocabulary; points 50..2000), one resolution per
+  response chosen by the data horizon (full at/after the oldest
+  retained sample, else hourly for the whole window; hourly too when
+  only rollups remain), the PINNED server-side LTTB (first/last kept,
+  every emitted point a REAL stored sample, ties to the earlier sample,
+  deterministic), window_min/max(+at)+sample_count over EVERY row so
+  downsampled peaks survive, nulls skipped never zeroed, server-computed
+  gaps (row spacing > 3 x cadence at full; missing hours between the
+  first/last rollup hours at hourly; edges never gaps), fleet sums over
+  RAW rows first then LTTB with a fleet point only where EVERY unit has
+  a row (hourly fleet n = the weakest per-unit coverage), step
+  encodings for lifecycle/health_state/commanded (first sample always
+  present; the null triple is itself a recorded state; empty at hourly
+  — the tier keeps no words). The validation rule set is ONE public
+  parser (parse_plant_history_query) shared by facade, route, and the
+  boundary fakes.
+  (5) REST + MCP (H5): GET /api/v1/history?from&to&unit_ids&fields&points
+  — observe scope, the reserved-word `from` rides a Query alias, every
+  parameter rule the house 422 envelope (no bare 400 on this surface),
+  409 plant_history_not_commissioned verbatim, no mutation exists; the
+  read-only get_plant_history MCP tool under Field(alias="from") so the
+  wire argument is literally `from`; EnergyServiceFacade.
+  get_plant_history delegates (refusal when the block is absent).
+  (6) SCENARIO + GOLDEN (H6): tests/simulator/test_history_scenario.py
+  walks a 48 h compressed scripted trajectory over the composed simulate
+  runtime (idle; a 2.25 h controller-down outage leaving two dark
+  hours; a degraded STALE stretch; a dual-cadence stretch; an
+  unreachable window producing NO rhs rows; a night-charge-shaped
+  manual charge with the commanded triple beside measured -2500 W and
+  run_mode_w 1) end to end into rollups and both query resolutions,
+  with exact expected series — AND RUNS TWICE with identical digests.
+  tests/golden adds the archaeology strip golden (three ticks: null ->
+  manual/charge/2500 -> null with the watchdog stand-down lag).
+  docs/CONTINUITY.md (this entry); config/config.live-write-example.yaml
+  gains the COMMENTED plant_history block (history commissions as one
+  explicit operator act). Tests: the full suite passes (1,922 at this
+  writing), ruff lint/format and mypy strict pass. SCHEMA NOTE for the
+  merge: schema_version is now 3 — every stored database migrates in
+  place on the next open (v2 -> v3 touches no existing table; test_db_cli
+  re-pinned). REMAINING for the merge round: review + merge the worktree
+  branch, then the web waves W1-W3 (the design's own plan), then the
+  operator decision to commission the block on the live controller.
 - 2026-08-26 (scorecard backend): THE DAILY ENERGY SCORECARD BACKEND
   IMPLEMENTED (E1-E7; 7697aed, 0e8db09, 2fd879f, 89c1925, f7f80f0,
   f3938cb, + this pass) against the accepted contract
