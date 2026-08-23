@@ -864,6 +864,10 @@ export function FlowView({ client }: FlowViewProps) {
       : connection === "lost"
         ? "Connection lost — showing the last known picture; reconnecting automatically."
         : "Connecting to live updates…";
+  // The status word up front (the anchor), the explanation after the dash.
+  const connectionDash = connectionText.indexOf(" — ");
+  const connectionWord = connectionDash === -1 ? connectionText : connectionText.slice(0, connectionDash);
+  const connectionRest = connectionDash === -1 ? "" : connectionText.slice(connectionDash);
 
   // The fleet column's slots. The fleet is the SUMMED picture, so its Grid and
   // Battery slots may legally show both directions at once — and when the
@@ -911,7 +915,10 @@ export function FlowView({ client }: FlowViewProps) {
       <div className="flow-heading-row">
         <h2 id={headingId}>Energy flow</h2>
         <p role="status" className={`flow-connection flow-connection--${connection}`}>
-          {connectionText}
+          {/* The status word is the anchor ("Live", "Connection lost") — set it
+              forward so the glance lands on the state, not the explanation. */}
+          <b className="flow-connection-word">{connectionWord}</b>
+          {connectionRest}
         </p>
       </div>
 
@@ -963,7 +970,12 @@ export function FlowView({ client }: FlowViewProps) {
           <h3 id="flow-commands-heading">Commanded vs delivering</h3>
           <ul>
             {commands.map((row) => (
-              <li key={row.unitId}>{row.text}</li>
+              // The unit id is the row's anchor — the same scan the diagram's
+              // columns train (the wording itself is the pinned row text).
+              <li key={row.unitId}>
+                <b className="flow-cmd-unit">{row.unitId}</b>
+                {row.text.slice(row.unitId.length)}
+              </li>
             ))}
           </ul>
         </section>

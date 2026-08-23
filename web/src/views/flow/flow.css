@@ -82,6 +82,12 @@
   color: var(--no);
 }
 
+/* The status word carries the state ("Live", "Connection lost") — same color
+   as its sentence, set forward in weight so the glance lands on it first. */
+.flow-connection-word {
+  font-weight: 700;
+}
+
 /* THE STORY LINE — the one sentence an operator reads aloud. A full card:
    --active's 4 px left border is the view's accent (the same accent that
    frames the Whole-site lead below), the other three edges the quiet --line. */
@@ -702,11 +708,21 @@
   padding: 0;
   list-style: none;
   display: grid;
-  gap: 0.25rem;
+  gap: 0.25rem 1rem;
+  /* One row per phase up to three across (the diagram's own rhythm); the
+     rows are short sentences, and a full-width stack of three would read as
+     scattered lines of air on the wide band. */
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
 }
 
 .flow-commands li {
   font-size: 0.95rem;
+}
+
+/* The row's unit id — the anchor that names which phase the sentence is
+   about, matching the scan the diagram's columns train. */
+.flow-cmd-unit {
+  font-weight: 700;
 }
 
 /* --- the footnote and the quiet states ----------------------------------------- */
