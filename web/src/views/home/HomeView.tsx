@@ -15,6 +15,23 @@
  * - Requested, allowed, and actual are three separately labeled figures, each
  *   binding its own magnitude, so a limited action is never presented as
  *   delivered.
+ * - Per-battery figures (2026-08-23 live defect): the snapshot's per-unit
+ *   `requested_power` repeats the intent's FLEET TOTAL once per covered unit
+ *   (service.py `_requested_power`), while `authorized_power` is genuinely
+ *   per-unit — so a card may never compare the two as though both were
+ *   per-battery. The exact per-unit truth comes from the shared tracker
+ *   (web/src/app/useUnitIntentFigures.ts): the intent's own `watts_by_unit`
+ *   and the decision's `authorized_watts_by_unit`, captured from the 202
+ *   acceptance view, `intent.accepted` frames, and `control_decision` audit
+ *   summaries, cleared the moment the request ends. When the maps are absent
+ *   (scalar intents, or a fresh page load mid-intent before the next decision
+ *   frame lands), the repeated snapshot figure is shown LABELLED AS THE FLEET
+ *   TOTAL ("fleet total 3,000 W") — never stamped on a per-battery card — and
+ *   no "Limited" state is derived from it. A "Limited" badge exists only when
+ *   the authorized figure falls below the requested figure FOR THAT UNIT, and
+ *   its note names the battery and uses that battery's own numbers. A figure
+ *   no other unit shares is that battery's own even without a map (one
+ *   battery's fleet total IS its per-battery figure).
  * - Fleet reserve derives from the snapshot units' own `telemetry.soc_pct`
  *   (API_CONTRACTS.md "Application service facade"): the fleet figure is the
  *   average of the pods reporting a charge reading — pinned choice, computed
@@ -56,6 +73,8 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health, StreamEvent } from "../../api/client";
+import { toWattsByUnit, type WattsByUnit } from "../../app/fleet";
+import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../../lib/format";
 import "./home.css";
 
@@ -230,15 +249,81 @@ const BADGE_LABELS: Record<string, string> = {
   disconnected: "Offline",
 };
 
-function isLimited(unit: UnitView): boolean {
-  if (unit.lifecycle !== "active" || unit.authorized_power === null) {
-    return false;
-  }
-  return unit.authorized_power.watts < unit.requested_power.watts;
+// --- per-unit request figures (the honest resolution order) ------------------
+//
+// The three sources, in precedence order:
+//   1. the intent's own per-unit targets (the shared tracker's `watts_by_unit`)
+//   2. the decision's per-unit authorized watts (`authorized_watts_by_unit`,
+//      else the snapshot's own per-unit `authorized_power`)
+//   3. the snapshot — whose per-unit `requested_power` repeats the intent's
+//      FLEET TOTAL per covered unit, so it is only ever a per-battery figure
+//      for a battery no other battery shares the request with.
+
+/** A unit carrying a request the kernel could act on (wire truth, not lifecycle). */
+function hasLiveRequest(unit: UnitView): boolean {
+  return unit.requested_power.direction !== "idle" || unit.requested_power.watts > 0;
 }
 
-function unitBadgeLabel(unit: UnitView): string {
-  if (isLimited(unit)) {
+/**
+ * The per-unit figures one battery card renders. `requestedWatts` is the
+ * battery's own target when a per-unit source exists; `fleetTotalWatts` is set
+ * when the snapshot's repeated figure is the best there is (several batteries
+ * share it — each carries the intent's total, not its own share), and it is
+ * rendered labelled as the fleet total, never as this battery's figure.
+ */
+interface UnitRequestFigures {
+  requestedWatts: number | null;
+  fleetTotalWatts: number | null;
+  authorizedWatts: number | null;
+  /** True only when authorizedWatts < requestedWatts FOR THIS UNIT. */
+  limited: boolean;
+}
+
+function resolveUnitFigures(
+  unit: UnitView,
+  units: UnitView[],
+  requestedByUnit: WattsByUnit | null,
+  authorizedByUnit: WattsByUnit | null,
+): UnitRequestFigures {
+  const mappedRequested =
+    requestedByUnit !== null ? requestedByUnit[unit.unit_id] : undefined;
+  let requestedWatts: number | null = null;
+  let fleetTotalWatts: number | null = null;
+  if (mappedRequested !== undefined) {
+    requestedWatts = mappedRequested;
+  } else if (hasLiveRequest(unit)) {
+    // The snapshot repeats the intent's total once per covered unit: a figure
+    // no OTHER battery shares is this battery's own, a shared one is the
+    // fleet total (the backend carries no per-unit split here — see the
+    // header pins).
+    const shared = units.filter(
+      (other) =>
+        hasLiveRequest(other) &&
+        other.requested_power.direction === unit.requested_power.direction &&
+        other.requested_power.watts === unit.requested_power.watts,
+    );
+    if (shared.length > 1) {
+      fleetTotalWatts = unit.requested_power.watts;
+    } else {
+      requestedWatts = unit.requested_power.watts;
+    }
+  }
+  const mappedAuthorized =
+    authorizedByUnit !== null ? authorizedByUnit[unit.unit_id] : undefined;
+  const authorizedWatts = (mappedAuthorized ?? unit.authorized_power?.watts) ?? null;
+  // "Limited" is a per-unit fact only: the fleet total repeated by the
+  // snapshot is never compared against a per-unit allowance (the 3 × 1,000 W
+  // dispatch the safety system authorized in full is NOT limited).
+  const limited =
+    unit.lifecycle === "active" &&
+    requestedWatts !== null &&
+    authorizedWatts !== null &&
+    authorizedWatts < requestedWatts;
+  return { requestedWatts, fleetTotalWatts, authorizedWatts, limited };
+}
+
+function unitBadgeLabel(unit: UnitView, figures: UnitRequestFigures): string {
+  if (figures.limited) {
     return "Limited";
   }
   return BADGE_LABELS[unit.lifecycle] ?? "Unknown";
@@ -248,7 +333,7 @@ function unitBadgeLabel(unit: UnitView): string {
  * The most conservative state wins: observe-only (no control possible at all),
  * then a latched inhibit, then a limited action, then the rest.
  */
-function fleetBadgeLabel(units: UnitView[]): string {
+function fleetBadgeLabel(units: UnitView[], figures: UnitRequestFigures[]): string {
   if (units.length === 0) {
     return "No pods yet";
   }
@@ -259,7 +344,7 @@ function fleetBadgeLabel(units: UnitView[]): string {
   if (lifecycles.has("inhibited")) {
     return "Inhibited";
   }
-  if (units.some(isLimited)) {
+  if (units.some((_unit, index) => figures[index]?.limited === true)) {
     return "Limited";
   }
   if (lifecycles.has("active")) {
@@ -343,15 +428,102 @@ function unitReserveText(unit: UnitView): string {
   return soc === null ? "charge level not available" : `${formatPercent(soc)} charged`;
 }
 
-function allowedText(unit: UnitView): string {
+/** The Allowed figure: the decision's per-unit authorized watts (map first,
+ * snapshot figure second), never the requested magnitude under this label. */
+function allowedText(unit: UnitView, authorizedWatts: number | null): string {
   if (unit.authorized_power !== null) {
-    const authorized = unit.authorized_power;
-    return `${directionWord(authorized.direction)} ${formatWatts(authorized.watts)}`;
+    const direction = unit.authorized_power.direction;
+    return `${directionWord(direction)} ${formatWatts(authorizedWatts ?? unit.authorized_power.watts)}`;
+  }
+  if (authorizedWatts !== null) {
+    // An authorized map with no snapshot figure yet: the direction is the
+    // request's own (the map carries magnitudes only).
+    return `${directionWord(unit.requested_power.direction)} ${formatWatts(authorizedWatts)}`;
   }
   if (unit.requested_power.direction === "idle" && unit.requested_power.watts === 0) {
     return "Not needed while idle";
   }
   return "Not available";
+}
+
+/**
+ * The Requested figure for one battery card. The battery's own target when a
+ * per-unit source exists; the snapshot's repeated figure LABELLED AS THE FLEET
+ * TOTAL when that is all there is — never a per-battery claim the wire does
+ * not make.
+ */
+function requestedText(unit: UnitView, figures: UnitRequestFigures): string {
+  if (figures.requestedWatts !== null) {
+    return `${directionWord(unit.requested_power.direction)} ${formatWatts(figures.requestedWatts)}`;
+  }
+  if (figures.fleetTotalWatts !== null) {
+    return `${directionWord(unit.requested_power.direction)} — fleet total ${formatWatts(figures.fleetTotalWatts)}`;
+  }
+  return `${directionWord(unit.requested_power.direction)} ${formatWatts(unit.requested_power.watts)}`;
+}
+
+/**
+ * The "What happens next?" line for the batteries under an active request.
+ * Per-battery figures whenever the intent's own map covers them (exact, with
+ * the total named); otherwise the snapshot's repeated figure is stated as the
+ * total across the covered batteries — never "per pod" — except for a battery
+ * whose figure no other battery shares (its total IS its own figure).
+ */
+function nextActionText(activeUnits: UnitView[], requestedByUnit: WattsByUnit | null): string {
+  const first = activeUnits[0]!;
+  const direction = directionWord(first.requested_power.direction);
+  const names = activeUnits.map((unit) => unit.unit_id).join(", ");
+  const count = activeUnits.length;
+  const batteryWord = count === 1 ? "battery" : "batteries";
+  if (
+    requestedByUnit !== null &&
+    activeUnits.every((unit) => requestedByUnit[unit.unit_id] !== undefined)
+  ) {
+    const values = activeUnits.map((unit) => requestedByUnit[unit.unit_id]!);
+    const total = values.reduce((sum, watts) => sum + watts, 0);
+    if (values.every((watts) => watts === values[0])) {
+      return count === 1
+        ? `${direction} at ${formatWatts(values[0]!)} (${names}).`
+        : `${direction} at ${formatWatts(values[0]!)} per battery — ${formatWatts(total)} in total across ${count} ${batteryWord} (${names}).`;
+    }
+    const perBattery = activeUnits
+      .map((unit) => `${unit.unit_id} ${formatWatts(requestedByUnit[unit.unit_id]!)}`)
+      .join(", ");
+    return `${direction} — ${perBattery} (${formatWatts(total)} in total).`;
+  }
+  const shared = activeUnits.filter(
+    (unit) =>
+      unit.requested_power.direction === first.requested_power.direction &&
+      unit.requested_power.watts === first.requested_power.watts,
+  );
+  if (shared.length === 1) {
+    return `${direction} at ${formatWatts(first.requested_power.watts)} (${names}).`;
+  }
+  return `${direction} — ${formatWatts(first.requested_power.watts)} requested in total across ${count} ${batteryWord} (${names}).`;
+}
+
+/**
+ * The live announcement's figure wording for an accepted request: per battery
+ * when the wire's own map is on the payload (the operator's per-battery
+ * entry), the plain total otherwise — a total is never announced as though it
+ * were one battery's figure.
+ */
+function acceptedFiguresPhrase(
+  record: Record<string, unknown>,
+  unitIds: string[],
+  watts: number,
+): string {
+  const map = toWattsByUnit(record.watts_by_unit);
+  if (map !== null) {
+    const values = unitIds.map((unitId) => map[unitId]);
+    if (values.every((value) => value !== undefined && value === values[0])) {
+      return `${formatWatts(values[0] ?? watts)} per battery (${formatWatts(watts)} total)`;
+    }
+    return unitIds
+      .map((unitId) => `${unitId} ${formatWatts(map[unitId] ?? watts)}`)
+      .join(", ");
+  }
+  return `${formatWatts(watts)} in total`;
 }
 
 function connectionText(connection: ConnectionState): string {
@@ -487,6 +659,14 @@ export function HomeView({ client }: HomeViewProps) {
   // marker the displayed ages tick from.
   const adoptedSequenceRef = useRef<number | null>(null);
   const capturedAtRef = useRef<number>(monotonicNowMs());
+  /**
+   * The live intent's per-unit watt figures — the ONE shared tracker
+   * (web/src/app/useUnitIntentFigures.ts; Now's request card consumes it too).
+   * The per-battery cards below render the exact per-unit figures from it and
+   * derive "Limited" only from its per-unit comparison; without it the
+   * snapshot's repeated total is labelled AS the fleet total.
+   */
+  const unitFigures = useUnitIntentFigures();
 
   // Heading ids are created up front so hook order is stable across the
   // loading / error / ready branches below.
@@ -623,6 +803,11 @@ export function HomeView({ client }: HomeViewProps) {
 
     /** Status changes arriving over the socket reach non-visual operators. */
     const applyEventFrame = (frame: StreamEvent): void => {
+      // The shared per-unit tracker eats every frame: acceptances and
+      // control-decision audits feed the maps, and the request-ending frames
+      // (expiry / revocation / stop) clear them. Everything below is this
+      // view's own picture of the world.
+      unitFigures.consumeEvent(frame);
       if (frame.type === "unit.armed" || frame.type === "unit.disarmed") {
         const armed = frame.type === "unit.armed";
         const successStatus = armed ? "armed" : "disarmed";
@@ -697,7 +882,10 @@ export function HomeView({ client }: HomeViewProps) {
       if (frame.type === "intent.accepted") {
         // The request landed: the payload names it (direction, watts, units),
         // so the request figures render the moment the frame arrives — the
-        // authorized figures follow with the next refreshed snapshot.
+        // authorized figures follow with the next refreshed snapshot. The
+        // per-unit targets (when the dispatch used the backend's per-unit
+        // form) went to the shared tracker above; the scalar patch below only
+        // carries the total the wire repeats per covered unit.
         const payload: unknown = frame.payload;
         const record = payload !== null && typeof payload === "object" ? payload as Record<string, unknown> : {};
         const unitIds = Array.isArray(record.unit_ids)
@@ -712,7 +900,7 @@ export function HomeView({ client }: HomeViewProps) {
         if (unitIds.length > 0 && watts !== null && direction !== null) {
           patchRequested(unitIds, direction, watts);
           setAnnouncement(
-            `Power request accepted — ${direction} ${formatWatts(watts)} for ${unitIds.join(", ")}.`,
+            `Power request accepted — ${direction} ${acceptedFiguresPhrase(record, unitIds, watts)} for ${unitIds.join(", ")}.`,
           );
         }
         refetchSnapshot();
@@ -1012,10 +1200,16 @@ export function HomeView({ client }: HomeViewProps) {
   }
 
   const units = snapshot.units;
-  const badge = fleetBadgeLabel(units);
   const activeUnits = units.filter(
     (unit) => unit.lifecycle === "active" && unit.requested_power.direction !== "idle",
   );
+  // The per-unit request figures, resolved once for the cards, the badges, and
+  // the next-action line: the shared tracker's maps first, the snapshot's own
+  // figures second — with its repeated fleet total never read per-battery.
+  const resolvedFigures = units.map((unit) =>
+    resolveUnitFigures(unit, units, unitFigures.requestedByUnit, unitFigures.authorizedByUnit),
+  );
+  const badge = fleetBadgeLabel(units, resolvedFigures);
   const nextAction = activeUnits[0] ?? null;
   const factors = collectFactors(units, health);
   const systemHealthy =
@@ -1055,10 +1249,11 @@ export function HomeView({ client }: HomeViewProps) {
           </p>
         ) : (
           <ul className="home-units">
-            {units.map((unit) => (
+            {units.map((unit, index) => (
               <UnitPowerEntry
                 key={unit.unit_id}
                 unit={unit}
+                figures={resolvedFigures[index]!}
                 ageSeconds={unitAgeSeconds(unit)}
                 updatesPaused={dataStale}
               />
@@ -1103,9 +1298,7 @@ export function HomeView({ client }: HomeViewProps) {
           </p>
         ) : (
           <p className="home-next-action">
-            {directionWord(nextAction.requested_power.direction)} at{" "}
-            {formatWatts(nextAction.requested_power.watts)} per pod (
-            {activeUnits.map((unit) => unit.unit_id).join(", ")}).
+            {nextActionText(activeUnits, unitFigures.requestedByUnit)}
           </p>
         )}
       </section>
@@ -1142,23 +1335,27 @@ export function HomeView({ client }: HomeViewProps) {
 /**
  * One unit's three separately labeled figures. Each magnitude lives inside its
  * own named figure, so the allowed amount can never be presented under the
- * requested label. The age line is the unit's own displayed data age, and it
- * renders in the stale style whenever the reading itself is past its freshness
- * bound OR no fresh reading has landed for the paused-updates bound.
+ * requested label. The requested figure is the battery's OWN target whenever a
+ * per-unit source exists (`figures.requestedWatts`); when only the snapshot's
+ * repeated fleet total is known, the figure says so ("fleet total 3,000 W")
+ * and no "Limited" state is derived from it. The age line is the unit's own
+ * displayed data age, and it renders in the stale style whenever the reading
+ * itself is past its freshness bound OR no fresh reading has landed for the
+ * paused-updates bound.
  */
 function UnitPowerEntry({
   unit,
+  figures,
   ageSeconds,
   updatesPaused,
 }: {
   unit: UnitView;
+  figures: UnitRequestFigures;
   ageSeconds: number | null;
   updatesPaused: boolean;
 }) {
-  const limited = isLimited(unit);
-  const badge = unitBadgeLabel(unit);
-  const requested = unit.requested_power;
-  const authorized = unit.authorized_power;
+  const limited = figures.limited;
+  const badge = unitBadgeLabel(unit, figures);
   const stale = isStale(ageSeconds) || updatesPaused;
   return (
     <li className="home-unit" aria-label={`${unit.unit_id} power`}>
@@ -1169,13 +1366,11 @@ function UnitPowerEntry({
       <div className="home-figures">
         <div className="home-figure" role="figure" aria-label="Requested">
           <span className="home-figure-label">Requested</span>
-          <span className="home-figure-value">
-            {directionWord(requested.direction)} {formatWatts(requested.watts)}
-          </span>
+          <span className="home-figure-value">{requestedText(unit, figures)}</span>
         </div>
         <div className="home-figure" role="figure" aria-label="Allowed">
           <span className="home-figure-label">Allowed</span>
-          <span className="home-figure-value">{allowedText(unit)}</span>
+          <span className="home-figure-value">{allowedText(unit, figures.authorizedWatts)}</span>
         </div>
         <div className="home-figure" role="figure" aria-label="Actual">
           <span className="home-figure-label">Actual</span>
@@ -1184,10 +1379,11 @@ function UnitPowerEntry({
           </span>
         </div>
       </div>
-      {limited && authorized !== null ? (
+      {limited && figures.requestedWatts !== null && figures.authorizedWatts !== null ? (
         <p className="home-limit-note">
-          Limited to {formatWatts(authorized.watts)} — the safety system is holding back part of
-          the request.
+          Limited — {unit.unit_id} requested {formatWatts(figures.requestedWatts)} but was
+          allowed {formatWatts(figures.authorizedWatts)}: the safety system is holding back
+          part of the request.
         </p>
       ) : null}
       <p className={stale ? "home-age home-age--stale" : "home-age"}>

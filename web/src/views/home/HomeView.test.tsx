@@ -48,9 +48,12 @@
  * listitems whose accessible name contains the unit id (exactly one per
  * region); reserve breakdown list named /per.?unit|breakdown/i; badge labels
  * exactly "Observe only"/"Disarmed"/"Armed"/"Active"/"Limited"/"Inhibited"
- * ("Limited" = active units with requested 3000 vs authorized 1200;
- * disagreement case: one inhibited among disarmed -> banner "Inhibited" +
- * per-unit labels disambiguate); requested/allowed/actual are three labeled
+ * ("Limited" derives ONLY from per-unit figures — the authorized map below
+ * the battery's own requested target; a snapshot whose per-unit requested
+ * figures repeat the fleet total never yields "Limited" — see the per-unit
+ * watt figures describe below; disagreement case: one inhibited among
+ * disarmed -> banner "Inhibited" + per-unit labels disambiguate);
+ * requested/allowed/actual are three labeled
  * figures, each binding its own magnitude inside its own entry; next-action
  * region shows direction and watts while an intent is active and an explicit
  * none-statement when idle; limiting factors from health reasons AND snapshot
@@ -419,11 +422,14 @@ describe("HomeView", () => {
     expect(labeledFigure(entry, /requested/i).textContent ?? "").toMatch(/3,?000/);
     expect(labeledFigure(entry, /allowed/i).textContent ?? "").toMatch(/1,?200/);
     expect(labeledFigure(entry, /actual/i).textContent ?? "").toMatch(/1,?150/);
-    // The gap itself is named in plain language, bound to the authorized
-    // magnitude — the word "limit" alone is not enough.
+    // The gap itself is named in plain language: the note says "Limited",
+    // names the battery, and binds BOTH magnitudes to it. This fixture's lone
+    // active battery carries its own figure (a lone battery's fleet total IS
+    // its per-battery figure), so the comparison is per-unit here.
     expect(entry.textContent ?? "").toMatch(
-      /(?:limit\w*|reduc\w*|holding back|less than requested)[^\d]{0,40}1,?200/i,
+      /limited — pod-mid requested 3,?000 W but was allowed 1,?200 W/i,
     );
+    expect(entry.textContent ?? "").toMatch(/holding back part of the request/i);
   });
 
   it("derives the fleet reserve from per-unit state of charge: the pinned average over reporting pods", async () => {
@@ -657,7 +663,14 @@ describe("HomeView", () => {
         badge: "Active",
       },
       {
-        description: "limited",
+        // 2026-08-23 defect pin: two batteries share the snapshot's repeated
+        // fleet total (3,000 W each) against per-unit allowances of 1,200 W.
+        // With no per-unit request figures on the wire (a fresh load or a
+        // scalar intent), the repeated total is never compared per-unit, so
+        // the honest badge is Active — never a false "Limited". The genuine
+        // per-unit clamp, maps on the stream, is pinned in "HomeView —
+        // per-unit watt figures from the wire" below.
+        description: "active under a repeated scalar total (limited is not derivable)",
         units: [
           unit({
             unit_id: "pod-mid",
@@ -675,7 +688,7 @@ describe("HomeView", () => {
           }),
           unit({ unit_id: "pod-lhs", lifecycle: "armed_idle" }),
         ],
-        badge: "Limited",
+        badge: "Active",
       },
     ])("shows the $description badge", async ({ units, badge }) => {
       installClient({ snapshot: fleet(units) });
@@ -1364,6 +1377,218 @@ describe("HomeView — live observations and staleness", () => {
       fireEvent(document, new Event("visibilitychange"));
     });
     expectVisibleText(entry, /Data age: 5[0-9] s/);
+  });
+});
+
+// --- per-unit watt figures from the wire --------------------------------------
+//
+// The 2026-08-23 live defect: the operator dispatched 1,000 W per battery over
+// 3 batteries and the audit authorized 3,000/3,000 with safety_checks_passed
+// every cycle — nothing was clamped — yet every Home card read "Requested
+// 3,000 W / Allowed 1,000 W / Limited". The snapshot's per-unit requested
+// figure repeats the intent's FLEET TOTAL once per covered unit (service.py
+// `_requested_power`), and the cards compared that total against the per-unit
+// allowance. The exact per-unit figures come from the shared tracker
+// (web/src/app/useUnitIntentFigures.ts — the same implementation Now's request
+// card consumes): the intent's `watts_by_unit` and the decision's
+// `authorized_watts_by_unit`, live on the stream. Without them, the repeated
+// total is labelled AS the fleet total and no "Limited" state is derived.
+
+describe("HomeView — per-unit watt figures from the wire", () => {
+  /**
+   * The live-incident world: a 3 × 1,000 W dispatch the safety system
+   * authorized in full. The snapshot repeats the 3,000 W total per covered
+   * unit and carries the true per-unit allowance; `authorizedRhs` bends one
+   * battery's allowance for the genuine-clamp test.
+   */
+  function incidentWorld(authorizedRhs = 1000): FleetView {
+    return fleet([
+      unit({
+        unit_id: "pod-mid",
+        lifecycle: "active",
+        requested_power: { direction: "discharge", watts: 3000 },
+        authorized_power: { direction: "discharge", watts: 1000 },
+        measured_watts: 990,
+      }),
+      unit({
+        unit_id: "pod-rhs",
+        lifecycle: "active",
+        requested_power: { direction: "discharge", watts: 3000 },
+        authorized_power: { direction: "discharge", watts: authorizedRhs },
+        measured_watts: authorizedRhs === 1000 ? 990 : 390,
+      }),
+      unit({
+        unit_id: "pod-lhs",
+        lifecycle: "active",
+        requested_power: { direction: "discharge", watts: 3000 },
+        authorized_power: { direction: "discharge", watts: 1000 },
+        measured_watts: 990,
+      }),
+    ]);
+  }
+
+  /** The per-unit acceptance frame the facade publishes for a 3 × 1,000 W dispatch. */
+  function intentAcceptedFrame(): StreamFrame {
+    return {
+      type: "intent.accepted",
+      sequence: 43,
+      occurred_at: "2026-08-22T10:00:05Z",
+      payload: {
+        principal: "operator:home",
+        intent_id: "intent-43-1.000000",
+        direction: "discharge",
+        watts: 3000,
+        watts_by_unit: { "pod-mid": 1000, "pod-rhs": 1000, "pod-lhs": 1000 },
+        unit_ids: ["pod-mid", "pod-rhs", "pod-lhs"],
+      },
+    };
+  }
+
+  /** The kernel's per-tick decision summary riding the audit bus. */
+  function decisionFrame(
+    authorizedByUnit: Record<string, number>,
+    result = "authorized",
+    reasonCodes: string[] = ["safety_checks_passed"],
+  ): StreamFrame {
+    const total = Object.values(authorizedByUnit).reduce((sum, watts) => sum + watts, 0);
+    return {
+      type: "audit.appended",
+      sequence: 44,
+      occurred_at: "2026-08-22T10:00:07Z",
+      payload: {
+        event_id: "facade-44",
+        event_type: "control_decision",
+        unit_id: null,
+        generation: 9,
+        result,
+        reason_codes: reasonCodes,
+        requested_active_w: 3000,
+        authorized_active_w: total,
+        requested_watts_by_unit: { "pod-mid": 1000, "pod-rhs": 1000, "pod-lhs": 1000 },
+        authorized_watts_by_unit: authorizedByUnit,
+      },
+    };
+  }
+
+  it("renders the exact per-battery request (1,000 W, never the 3,000 W fleet total) and no false Limited", async () => {
+    const snapshot = incidentWorld();
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    installClient({ snapshot, openEvents: vi.fn(channel.openEvents) });
+    renderHome();
+    await dataLanded();
+
+    channel.push(intentAcceptedFrame());
+    channel.push(decisionFrame({ "pod-mid": 1000, "pod-rhs": 1000, "pod-lhs": 1000 }));
+
+    for (const unitId of ["pod-mid", "pod-rhs", "pod-lhs"]) {
+      const entry = await findUnitEntry(POWER_REGION, unitId);
+      const requested = labeledFigure(entry, /requested/i);
+      await waitFor(() => {
+        expect(requested.textContent ?? "").toContain("Discharging 1,000 W");
+      });
+      // The fleet total never rides a per-battery card again.
+      expect(requested.textContent ?? "").not.toMatch(/3,?000/);
+      expect(labeledFigure(entry, /allowed/i).textContent ?? "").toContain("1,000 W");
+      // Authorized equals requested FOR THIS BATTERY: not limited, and the
+      // fleet badge stays Active — the audit authorized 3,000/3,000 in full.
+      expect(entry.textContent ?? "").not.toMatch(/limited/i);
+      expectVisibleText(entry, "Active");
+    }
+    expectVisibleText(screen.getByRole("region", { name: SAFE_REGION }), "Active");
+  });
+
+  it("still shows Limited for a genuine per-unit clamp — naming the battery and its own numbers", async () => {
+    // The site headroom only stretched to 400 W for pod-rhs.
+    const snapshot = incidentWorld(400);
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    installClient({ snapshot, openEvents: vi.fn(channel.openEvents) });
+    renderHome();
+    await dataLanded();
+
+    channel.push(intentAcceptedFrame());
+    channel.push(
+      decisionFrame({ "pod-mid": 1000, "pod-rhs": 400, "pod-lhs": 1000 }, "clamped", [
+        "power_clamped",
+      ]),
+    );
+
+    const clamped = await findUnitEntry(POWER_REGION, "pod-rhs");
+    await waitFor(() => {
+      expect(clamped.textContent ?? "").toMatch(
+        /limited — pod-rhs requested 1,?000 W but was allowed 400 W/i,
+      );
+    });
+    expectVisibleText(clamped, "Limited");
+    expect(clamped.textContent ?? "").toMatch(/holding back part of the request/i);
+
+    // The unclamped batteries stay plain: their allowance equals their target.
+    const plain = await findUnitEntry(POWER_REGION, "pod-mid");
+    expect(plain.textContent ?? "").not.toMatch(/limited/i);
+    expectVisibleText(plain, "Active");
+
+    // The conservative fleet badge still names the clamp.
+    expectVisibleText(screen.getByRole("region", { name: SAFE_REGION }), "Limited");
+  });
+
+  it("labels the snapshot's repeated figure as the fleet total when no per-unit figures exist — and derives no Limited from it", async () => {
+    // A fresh page load mid-intent (or a scalar intent): only the snapshot has
+    // landed, so its repeated total is all there is.
+    const snapshot = incidentWorld();
+    installClient({ snapshot });
+    renderHome();
+
+    for (const unitId of ["pod-mid", "pod-rhs", "pod-lhs"]) {
+      const entry = await findUnitEntry(POWER_REGION, unitId);
+      const requested = labeledFigure(entry, /requested/i);
+      // The fleet total is labelled AS the fleet total — never stamped on a
+      // per-battery card as this battery's request.
+      expect(requested.textContent ?? "").toMatch(/fleet total 3,?000 W/i);
+      expect(requested.textContent ?? "").not.toMatch(/per batter/i);
+      // The allowance IS per-unit on the wire and renders as such...
+      expect(labeledFigure(entry, /allowed/i).textContent ?? "").toContain("1,000 W");
+      // ...but the fleet total is never compared against it: no Limited badge,
+      // no note — the audit authorized the request in full.
+      expect(entry.textContent ?? "").not.toMatch(/limited/i);
+      expectVisibleText(entry, "Active");
+    }
+    expectVisibleText(screen.getByRole("region", { name: SAFE_REGION }), "Active");
+
+    // The next-action line states the total across the covered batteries,
+    // never "per pod".
+    const nextRegion = await screen.findByRole("region", { name: NEXT_REGION });
+    expectVisibleText(nextRegion, /3,?000 W requested in total across 3 batteries/i);
+    expect(nextRegion.textContent ?? "").not.toMatch(/per (pod|battery)/i);
+  });
+
+  it("picks the per-unit figures up from the next control_decision after a cold load mid-intent, and drops them when the request ends", async () => {
+    const snapshot = incidentWorld();
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    installClient({ snapshot, openEvents: vi.fn(channel.openEvents) });
+    renderHome();
+    await dataLanded();
+
+    // No intent.accepted was seen (the page opened after acceptance): the
+    // kernel's next per-tick decision carries the maps on its own.
+    channel.push(decisionFrame({ "pod-mid": 1000, "pod-rhs": 1000, "pod-lhs": 1000 }));
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    await waitFor(() => {
+      expect(labeledFigure(entry, /requested/i).textContent ?? "").toContain("1,000 W");
+    });
+
+    // The request ends (routine revocation — expiry, disarm, fence): the maps
+    // must not linger as a ghost of an intent that no longer exists, so the
+    // card falls back to the honest fleet-total labelling.
+    channel.push({
+      type: "authorization.revoked",
+      sequence: 45,
+      occurred_at: "2026-08-22T10:00:20Z",
+      payload: { reason: "intent_expired", unit_ids: ["pod-mid", "pod-rhs", "pod-lhs"] },
+    });
+    await waitFor(() => {
+      expect(labeledFigure(entry, /requested/i).textContent ?? "").toMatch(
+        /fleet total 3,?000 W/i,
+      );
+    });
   });
 });
 
