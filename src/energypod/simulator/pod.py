@@ -182,6 +182,10 @@ class SimulatedEnergyPod:
         self._applied_active_w = 0
         self._applied_reactive_var = 0
         self._lease_deadline_mono: float | None = None
+        # Night-writer scenario hook (API_CONTRACTS "Night-writer detector"):
+        # a FOREIGN served objective -- another writer's words on the detail
+        # block, never latched through our own apply path.
+        self._scripted_objective: tuple[int, int] | None = None
         # Scripted per-pod CT scenario values (PROTOCOL_EVIDENCE 4c words):
         # the deterministic export scenario the excess-solar bound reads.
         self._scripted_grid_power_w = 0
@@ -321,6 +325,34 @@ class SimulatedEnergyPod:
         driven end to end against a deterministic fleet export scenario.
         """
         self._scripted_grid_power_w = self._ct_word(watts, "grid power")
+
+    def script_objective(self, active_w: int, reactive_var: int) -> None:
+        """Scenario hook: place a FOREIGN served PQ objective on the wire.
+
+        API_CONTRACTS "Night-writer detector": the scenario drives another
+        writer's words onto the served detail block (``0x1060+17/+18``, int16
+        unscaled) WITHOUT latching anything through our own apply path — the
+        pod's applied objective, its watchdog lease, and every derived word
+        stay untouched, exactly like an external application writing 0x0200
+        behind this controller's back.  While scripted, the PCS live block's
+        run-mode word reads 1 ("Remote PQ Power", the vendor's written-objective
+        state, GlobalFun.cs:178-188), the discriminator the detector's pattern
+        tier consumes; the pod's own CT-following autonomy reads 0
+        ("Matching Load").  The words persist until cleared — a scheduled
+        nightly writer refreshes continuously, and the scenario decides when
+        it stands down.
+        """
+        self._scripted_objective = (
+            self._ct_word(active_w, "active objective"),
+            self._ct_word(reactive_var, "reactive objective"),
+        )
+        self._rebuild()
+
+    def clear_scripted_objective(self) -> None:
+        """Scenario hook: the foreign writer stands down; the served detail
+        words return to the pod's own applied objective."""
+        self._scripted_objective = None
+        self._rebuild()
 
     def script_load_power_w(self, watts: int) -> None:
         """Scenario hook: script the per-pod CT load power word (+20)."""
@@ -467,7 +499,11 @@ class SimulatedEnergyPod:
         words = [0] * 21
         words[0] = 0x0101  # packed PCS software version
         words[1] = 3  # PCS status: on grid
-        words[2] = 1 if self._lease_deadline_mono is not None else 0  # run mode: remote PQ
+        # Run mode: 1 "Remote PQ Power" while ANY writer's objective holds the
+        # lease -- ours, or the night-writer scenario's foreign words.
+        words[2] = (
+            1 if self._lease_deadline_mono is not None or self._scripted_objective else 0
+        )
         words[3] = pack_voltage_counts  # DC voltage x0.1 V
         words[13] = measured_word  # PCS active power, int16 W
         # Advisory per-pod CT words (PROTOCOL_EVIDENCE 4c), scripted scenario
@@ -491,8 +527,15 @@ class SimulatedEnergyPod:
     ) -> None:
         words = [0] * 32
         words[0] = 0  # debug status readback: normal mode
-        words[17] = applied_active_word  # active power objective, int16 W
-        words[18] = applied_reactive_word  # reactive power objective, int16 var
+        # The served objective words: the night-writer scenario's FOREIGN pair
+        # overrides the applied pair while scripted (the external writer's
+        # words are what the wire serves); otherwise the pod's own.
+        active_word, reactive_word = self._scripted_objective or (
+            applied_active_word,
+            applied_reactive_word,
+        )
+        words[17] = active_word & 0xFFFF  # active power objective, int16 W
+        words[18] = reactive_word & 0xFFFF  # reactive power objective, int16 var
         words[24] = _APPARENT_LIMIT_W
         words[25] = _DISCHARGE_POWER_LIMIT_W
         words[26] = _CHARGE_POWER_LIMIT_W

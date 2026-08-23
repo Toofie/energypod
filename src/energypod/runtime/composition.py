@@ -67,6 +67,7 @@ from energypod.adapters.modbus import (
     encode_pq_registers,
     encode_stop_registers,
     faults,
+    protocol_codec,
     register_layout,
 )
 from energypod.adapters.modbus import decode as wire_decode
@@ -190,6 +191,10 @@ _RUN_MODE_STABLE_SAMPLES_REQUIRED = 2**63 - 1
 # fault/status blocks, and the cell blocks whose counts follow the BIC count.
 _SYSTEM_BLOCK_BASE = 0x0100
 _PCS_LIVE_BLOCK_BASE = 0x1000
+# The PCS detail block carries the served PQ objective at +17/+18 (the night-
+# writer detector's window, PROTOCOL_EVIDENCE 4b); the one-word debug-mode
+# readback rides the common reads.
+_PCS_DETAIL_BLOCK_BASE = 0x1060
 _BMS_BLOCK_BASE = 0x5000
 _PCS_FAULT_BLOCK_BASE = 0x1040
 _DCDC_FAULT_BLOCK_BASE = 0x2040
@@ -1065,6 +1070,8 @@ class _SimulatorTelemetry:
         windows = {address: (address, count) for address, count in self._plan}
         self._system_window = windows[_SYSTEM_BLOCK_BASE]
         self._pcs_live_window = windows[_PCS_LIVE_BLOCK_BASE]
+        self._pcs_detail_window = windows[_PCS_DETAIL_BLOCK_BASE]
+        self._debug_mode_window = windows[_DEBUG_MODE_BLOCK_BASE]
         self._bms_window = windows[_BMS_BLOCK_BASE]
         self._fault_windows = (
             (faults.FaultBlock.IOT_PCS, windows[_PCS_FAULT_BLOCK_BASE]),
@@ -1088,6 +1095,8 @@ class _SimulatorTelemetry:
     ) -> Observation:
         system = blocks[self._system_window]
         pcs_live = blocks[self._pcs_live_window]
+        pcs_detail = blocks[self._pcs_detail_window]
+        debug_mode = blocks[self._debug_mode_window]
         bms = blocks[self._bms_window]
         fault_codes, warning_codes = self._decode_fault_signals(blocks)
         cells = blocks[self._cell_voltage_window]
@@ -1151,6 +1160,20 @@ class _SimulatorTelemetry:
             "dynamic_discharge_limit_w": dynamic_discharge_limit_w,
             "grid_power_w": grid_power_w,
             "load_power_w": load_power_w,
+            # Advisory device-mode words (the production decoder's exact
+            # offsets): the simulated pod is Remote/running by construction,
+            # and the run-mode word flips to Remote PQ under any writer's
+            # objective -- the night-writer detector's discriminator.
+            "debug_mode_w": int(debug_mode[0]) & 0xFFFF,
+            "ctrl_mode_w": int(system[1]) & 0xFFFF,
+            "work_mode_w": int(system[2]) & 0xFFFF,
+            "run_mode_w": int(pcs_live[2]) & 0xFFFF,
+            # The served PQ objective (PROTOCOL_EVIDENCE 4b), fresh every
+            # simulated poll: the pod's applied pair, or the scenario's
+            # scripted FOREIGN pair while one holds the wire.
+            "served_active_objective_w": protocol_codec.decode_signed16(pcs_detail[17]),
+            "served_reactive_objective_var": protocol_codec.decode_signed16(pcs_detail[18]),
+            "objective_captured_at_mono": self._pod.telemetry_captured_at_mono,
             **(
                 {
                     "energy_grid_a_kwh": energy_grid_a_kwh,
@@ -1524,6 +1547,14 @@ class _LiveDecodeTelemetry:
         cell_sequence: int | None = None
         if self._cell_meta is not None:
             cell_captured, cell_sequence = self._cell_meta
+        # The served PQ objective rides the cold ring (the night-writer
+        # detector's window): between rotations the merged decode carries the
+        # CACHED words with their ORIGINAL capture clock (the cell-meta
+        # pattern), so a consumer can tell a fresh serving from a stale one.
+        objective_captured: float | None = None
+        if _PCS_DETAIL_BLOCK_BASE in self._slow_cache:
+            _detail_words, detail_at = self._slow_cache[_PCS_DETAIL_BLOCK_BASE]
+            objective_captured = detail_at
         # The actor keys blocks by read window; the wire decoder keys them by
         # base address.  Where two windows share a base (the seven-word
         # essential probe inside the 31-word BMS block), the fuller block is
@@ -1553,6 +1584,7 @@ class _LiveDecodeTelemetry:
             cell_sequence=cell_sequence,
             lifecycle=lifecycle,
             decode_energy_totals=self._decode_energy_totals,
+            objective_captured_at_mono=objective_captured,
         )
 
     def _probe_require(self) -> register_layout.LayoutProbe:

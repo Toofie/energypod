@@ -904,6 +904,6 @@ async def test_clearing_the_scripted_objective_restores_the_served_words(simulat
 
 async def test_the_scenario_hook_validates_its_words_like_the_wire(simulator: Any) -> None:
     pod, transport, clock = build_unit(simulator)
-    for bad in (24000, -24000, 1.5, "2400"):
-        with pytest.raises((TypeError, ValueError), match="int16"):
+    for bad in (32768, -32769, 1.5, "2400"):
+        with pytest.raises((TypeError, ValueError), match="int16|integer"):
             pod.script_objective(bad, 0)  # type: ignore[arg-type]

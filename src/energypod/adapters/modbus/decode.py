@@ -52,6 +52,7 @@ from energypod.domain.observations import DataQuality, Observation, UnitLifecycl
 # Block base addresses of the deployed IoT plan (field-mapping S2 per block).
 _SYSTEM_BLOCK_BASE = 0x0100
 _PCS_LIVE_BLOCK_BASE = 0x1000
+_PCS_DETAIL_BLOCK_BASE = 0x1060
 _PCS_FAULT_BLOCK_BASE = 0x1040
 _DCDC_FAULT_BLOCK_BASE = 0x2040
 _BMS_BLOCK_BASE = 0x5000
@@ -77,6 +78,17 @@ _KWH_PER_COUNT = 0.1
 # value.
 _PCS_GRID_POWER_OFFSET = 17
 _PCS_LOAD_POWER_OFFSET = 20
+
+# Served PQ objective readback, PROTOCOL_EVIDENCE 4b (API_CONTRACTS "Night-
+# writer detector"): the PCS detail block carries the active and reactive
+# power objectives the device is actually serving at +17/+18, int16 unscaled
+# -- the same window the arm-time sole-writer preflight reads, decoded here
+# so the night-writer detector consumes it from the ordinary poll with ZERO
+# extra frames.  Mode-word-class advisory fields: present only when the
+# block was served (or rides from the telemetry cache with its original
+# capture clock), never quality-map keys.
+_PCS_ACTIVE_OBJECTIVE_OFFSET = 17
+_PCS_REACTIVE_OBJECTIVE_OFFSET = 18
 
 # BMS live block offsets, field-mapping S2.8 (SysControl.cs:731-739).
 _BMS_VOLTAGE_OFFSET = 6
@@ -270,6 +282,7 @@ def decode_observation(
     cell_sequence: int | None = None,
     lifecycle: UnitLifecycle = UnitLifecycle.OBSERVE_ONLY,
     decode_energy_totals: bool = True,
+    objective_captured_at_mono: float | None = None,
 ) -> Observation:
     """Decode one polled set of holding-register blocks into an observation.
 
@@ -359,6 +372,27 @@ def decode_observation(
     ctrl_mode_w = _served_word(system, _CTRL_MODE_OFFSET)
     work_mode_w = _served_word(system, _WORK_MODE_OFFSET)
     run_mode_w = _served_word(pcs_live, _PCS_RUN_MODE_OFFSET)
+
+    # Served PQ objective (PROTOCOL_EVIDENCE 4b, the night-writer detector's
+    # window): SIGNED unscaled words, present only when the detail block was
+    # served (or rides from the telemetry cache).  A block too short to serve
+    # both words sources neither -- never a half-served pair.
+    pcs_detail = blocks.get(_PCS_DETAIL_BLOCK_BASE)
+    active_objective_word = _served_word(pcs_detail, _PCS_ACTIVE_OBJECTIVE_OFFSET)
+    reactive_objective_word = _served_word(pcs_detail, _PCS_REACTIVE_OBJECTIVE_OFFSET)
+    served_active_objective_w = (
+        None
+        if active_objective_word is None
+        else protocol_codec.decode_signed16(active_objective_word)
+    )
+    served_reactive_objective_var = (
+        None
+        if reactive_objective_word is None
+        else protocol_codec.decode_signed16(reactive_objective_word)
+    )
+    if served_active_objective_w is None or served_reactive_objective_var is None:
+        # No words means no serving to timestamp either.
+        objective_captured_at_mono = None
 
     # Advisory cumulative energy (DESIGN_ENERGY_SCORECARD section 5): the
     # cold-ring totals block.  All six quality keys are ALWAYS emitted --
@@ -451,6 +485,9 @@ def decode_observation(
         ctrl_mode_w=ctrl_mode_w,
         work_mode_w=work_mode_w,
         run_mode_w=run_mode_w,
+        served_active_objective_w=served_active_objective_w,
+        served_reactive_objective_var=served_reactive_objective_var,
+        objective_captured_at_mono=objective_captured_at_mono,
         energy_grid_a_kwh=energy_grid_a_kwh,
         energy_grid_b_kwh=energy_grid_b_kwh,
         energy_load_kwh=energy_load_kwh,

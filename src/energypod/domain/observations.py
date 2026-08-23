@@ -145,6 +145,17 @@ class Observation(BaseModel):
     ctrl_mode_w: int | None = None
     work_mode_w: int | None = None
     run_mode_w: int | None = None
+    # Night-writer detector (API_CONTRACTS "Night-writer detector"): the
+    # served PQ objective readback -- PCS detail block 0x1060+17/+18,
+    # PROTOCOL_EVIDENCE 4b, the same window the arm preflight reads -- as
+    # SIGNED unscaled words, plus the capture time of the serving they came
+    # from.  Mode-word-class advisory fields: never quality-map keys, null
+    # until the plan serves the block, and the live tiered plan's cached
+    # ride-along keeps its ORIGINAL capture clock so a consumer can tell a
+    # fresh serving from a stale one.
+    served_active_objective_w: int | None = None
+    served_reactive_objective_var: int | None = None
+    objective_captured_at_mono: float | None = None
     # Advisory cumulative energy (DESIGN_ENERGY_SCORECARD section 5): the six
     # low-word-first uint32 x 0.1 kWh counters of the totals block 0x4101, in
     # vendor pair order.  The GRID PAIR names are deliberately NEUTRAL (A/B):
@@ -266,6 +277,20 @@ class Observation(BaseModel):
     def _mode_word(cls, value: int | None) -> int | None:
         if value is not None and (type(value) is not int or not 0 <= value <= 0xFFFF):
             raise ValueError("a mode word must be an unsigned 16-bit register value")
+        return value
+
+    @field_validator("served_active_objective_w", "served_reactive_objective_var")
+    @classmethod
+    def _objective_word(cls, value: int | None) -> int | None:
+        if value is not None and (type(value) is not int or not -0x8000 <= value <= 0x7FFF):
+            raise ValueError("a served objective word must be a signed 16-bit register value")
+        return value
+
+    @field_validator("objective_captured_at_mono")
+    @classmethod
+    def _objective_timestamp(cls, value: float | None) -> float | None:
+        if value is not None and (not isinstance(value, int | float) or not math.isfinite(value)):
+            raise ValueError("the objective capture time must be finite")
         return value
 
     @field_validator("cell_voltages_v", "temperatures_c")
