@@ -930,6 +930,29 @@ direction, freshness, and watchdog timing per physical unit.
   outranked per-unit by the newer verification intents — per-unit
   revision precedence working as designed.
 
+- 2026-08-24 (matrix): COMBINATION MATRIX — DEFINITIVE LIVE RECORD: PASS
+  11/11 (13 runs, 15 intents, 02:49-03:00Z, ~10.5 min, zero hazards/
+  restarts/faults/inhibits; all cancels clean, watchdog return 4-8 s).
+  Every 1000/1500/2000 W charge/discharge combination across 0/1/2/3
+  units verified: baseline idle; single charge (mid) and single discharge
+  x3 permutations; 2- and 3-unit charge (mid delivers, rhs/lhs honest
+  per-unit soc_above_charge_ceiling refusals WITHOUT blocking mid —
+  EXPECTED-REFUSED-PARTIAL, correct physics); 2- and 3-unit concurrent
+  discharge; MIXED 1C+1D+1I and 2D+1C (opposite directions
+  simultaneously in one decision row with per-unit directions);
+  2000 W rate boundary; per-intent cancellation granularity (cancel one
+  of two concurrent discharges -> that battery stops in ~4-8 s while the
+  other continues untouched). Ramp limiter honestly audited as
+  first-cycle power_clamped on large step-ups (resolves full within one
+  cycle). Known-benign observations re-confirmed: discharge runs
+  +150-250 W over command (firmware serving local load); mid charge
+  magnitude 75-87% of command (solar self-charge offsetting within its
+  uncommanded band); arm-while-armed returns the conflated actor_failure
+  reason (pending item); snapshot requested_power still showed intent
+  aggregate during the run — the per-unit snapshot figures build was
+  held for this run and is now LIVE (controller restarted writemode22).
+  Live SOC at run: mid 67 (both directions eligible), rhs/lhs 98.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
