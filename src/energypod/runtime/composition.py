@@ -921,6 +921,7 @@ class _FleetAllocatorAdapter:
         if (
             getattr(intent, "source", None) is IntentSource.OPTIMIZER
             and intent.direction is Direction.CHARGE
+            and not str(getattr(intent, "id", "")).startswith("night-")
         ):
             # API_CONTRACTS "Excess-solar accelerated charging (advisory)":
             # for an OPTIMIZER charge intent the measured-export bound is one
@@ -930,6 +931,17 @@ class _FleetAllocatorAdapter:
             # a legitimate representation) on any missing/bad/stale grid
             # evidence or an unarmed policy triple.  No other source or
             # direction is ever export-bounded.
+            #
+            # DESIGN_NIGHT_CHARGE §2.1/§6 — the one carve-out, pinned by the
+            # night twin's own ``night-`` intent-id prefix: the night
+            # strategy's OPTIMIZER charges are PAID off-peak import inside
+            # the commissioned window, so the export bound (whose whole point
+            # is that an advisory charge may flow only from measured FREE
+            # surplus) must never apply to them — at night the bound is
+            # structurally 0 and the window could never charge.  The excess
+            # adviser itself is unchanged: its intents stay export-bounded,
+            # and the dawn-corner precedence stays one-sided exactly as
+            # pinned (§4.2).
             export_cap_w = eligible_export_charge_w(observations, policy, now_mono)
             export_bounded = True
         # Concurrent per-unit arbitration (2026-08-24): the kernel passes the

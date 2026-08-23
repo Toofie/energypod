@@ -3465,6 +3465,59 @@ async def test_the_night_block_promotes_the_pcs_live_block_without_excess(
         assert getattr(telemetry, "_promote_pcs_live_block", None) is False
 
 
+async def test_a_night_charge_allocates_without_export_evidence_but_the_excess_class_stays_bounded(
+    tmp_path: Path,
+) -> None:
+    """DESIGN_NIGHT_CHARGE §2.1/§6 (the allocator carve-out, pinned): the
+    night strategy's OPTIMIZER charges are PAID off-peak import, so the
+    measured-export bound — whose whole point is that an advisory charge may
+    flow only from measured FREE surplus — must never apply to them (at night
+    the bound is structurally 0 and the window could never charge).  The
+    excess adviser's own class stays export-bounded exactly as before."""
+    from energypod.domain import Direction, IntentSource, PowerIntent
+
+    runtime = compose_write_enabled(tmp_path / "night-alloc.sqlite3", simulate=True)
+    adapter = _load("energypod.runtime.composition")._FleetAllocatorAdapter()
+    policy = runtime.policy
+    observations = {
+        "mid": SimpleNamespace(dynamic_charge_limit_w=3_000.0, dynamic_discharge_limit_w=3_000.0),
+        "rhs": SimpleNamespace(dynamic_charge_limit_w=3_000.0, dynamic_discharge_limit_w=3_000.0),
+    }
+    night = PowerIntent(
+        id="night-1-100.000000",
+        source=IntentSource.OPTIMIZER,
+        selected_unit_ids=frozenset({"mid", "rhs"}),
+        direction=Direction.CHARGE,
+        watts=5_000,
+        watts_by_unit={"mid": 2_500, "rhs": 2_500},
+        duration_s=10.0,
+        accepted_at_mono=100.0,
+        acceptance_revision=1,
+        actor_identity="energypod:night-adviser",
+    )
+    proposals = adapter.allocate(night, observations, policy, 100.0)
+    by_unit = {p.unit_id: p.watts for p in proposals}
+    assert by_unit == {"mid": 2_500, "rhs": 2_500}, "paid import flows at night"
+    assert all(not p.export_bounded for p in proposals)
+
+    # The excess adviser's class (no night- prefix) stays export-bounded and
+    # collapses to zero without export evidence — unchanged behavior.
+    excess = PowerIntent(
+        id="excess-1-100.000000",
+        source=IntentSource.OPTIMIZER,
+        selected_unit_ids=frozenset({"mid"}),
+        direction=Direction.CHARGE,
+        watts=1_500,
+        duration_s=10.0,
+        accepted_at_mono=100.0,
+        acceptance_revision=2,
+        actor_identity="energypod:excess-adviser",
+    )
+    bounded = adapter.allocate(excess, observations, policy, 100.0)
+    assert {p.unit_id: p.watts for p in bounded} == {"mid": 0}
+    assert all(p.export_bounded for p in bounded)
+
+
 async def test_supervision_drives_the_night_projection_and_publishes_state_events(
     tmp_path: Path,
 ) -> None:
