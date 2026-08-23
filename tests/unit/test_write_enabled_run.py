@@ -1463,3 +1463,149 @@ async def test_mode_words_gate_dispatch_on_replayed_live_hardware(
         await _shutdown_actors(runtime)
 
     _assert_replay_safety(journal)
+
+
+# --- concurrent per-unit operation over the replayed live fleet (2026-08-24) ----
+#
+# The operator's exact requirement: "I instructed MID to charge at 2,000 watts
+# and RHS to discharge at 1,000 watts.  Only one operation functions at a
+# time.  I require both to function concurrently."  Over BOTH authorized
+# capture gateways, two disjoint intents must reach their OWN batteries in
+# the SAME cycle -- MID written a negative P objective while RHS is written a
+# positive one, one cycle's audit row carrying both directions.
+
+_MID_HOST = _UNIT_HOST
+_RHS_UNIT_ID = "rhs"
+_RHS_HOST = "192.168.1.12"
+_RHS_IDENTITY = "byd-2c225097"  # replaced from the capture below
+_MID_CHARGE_W = 250
+_RHS_DISCHARGE_W = 300
+
+
+def _rhs_identity() -> str:
+    capture = _load_captures()["main"]["RHS"]
+    for block in capture["blocks"]:
+        if int(block["address"]) == 0x8106:
+            low, high = block["registers"][0], block["registers"][1]
+            return f"byd-{((high << 16) | low):08x}"
+    raise AssertionError("the RHS capture serves no identity block")
+
+
+async def test_concurrent_intents_reach_both_batteries_in_one_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MID charges while RHS discharges, simultaneously, on the replayed live
+    fleet: each gateway receives its own signed objective in the same renewal
+    window, and one composed decision row names both directions."""
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, _banks = _install_replay_transport(monkeypatch, clock)
+    payload = _config_payload(mode="write_enabled")
+    payload["site"]["expected_unit_count"] = 2
+    payload["units"].append(
+        {
+            "unit_id": _RHS_UNIT_ID,
+            "display_name": "RHS",
+            "endpoint": {"host": _RHS_HOST, "port": _UNIT_PORT},
+            "transport_profile": "waveshare_rtu_over_tcp",
+            "protocol_profile": "iot",
+            "device_id": _UNIT_DEVICE_ID,
+            "expected_identity": _rhs_identity(),
+            # The 2026-08-22 captures pin a mixed 6/5-BIC fleet: RHS serves
+            # five BICs (50 cells) where MID serves six.
+            "expected_cell_count": 50,
+        }
+    )
+    runtime = _build(_validate(payload), clock)
+
+    try:
+        for unit_id in (_UNIT_ID, _RHS_UNIT_ID):
+            actor = runtime.actors[unit_id]
+            await actor.start()
+            for _ in range(runtime.policy.stable_samples_needed_to_rearm):
+                clock.advance(0.05)
+                await actor.poll_once()
+            assert actor.qualified is True
+        arm = await runtime.facade.arm(
+            unit_ids=[_UNIT_ID, _RHS_UNIT_ID],
+            principal=OPERATOR,
+            idempotency_key="concurrent-replay-arm",
+            request_id="concurrent-replay-arm-request",
+        )
+        assert {unit["unit_id"]: unit["status"] for unit in arm["units"]} == {
+            _UNIT_ID: "armed",
+            _RHS_UNIT_ID: "armed",
+        }, arm
+        clock.advance(_CONTROL_PERIOD_S)
+        for unit_id in (_UNIT_ID, _RHS_UNIT_ID):
+            await runtime.actors[unit_id].poll_once()
+
+        for unit_id, direction, watts in (
+            (_UNIT_ID, "charge", _MID_CHARGE_W),
+            (_RHS_UNIT_ID, "discharge", _RHS_DISCHARGE_W),
+        ):
+            view = await runtime.facade.submit_intent(
+                unit_ids=[unit_id],
+                direction=direction,
+                watts=watts,
+                ttl_s=30.0,
+                reason="concurrent replay verification",
+                principal=OPERATOR,
+                idempotency_key=f"concurrent-replay-{unit_id}",
+                request_id=f"concurrent-replay-{unit_id}-request",
+            )
+            assert view["status"] == "accepted", view
+
+        # Two supervised renewal cycles: the first mints, the second writes.
+        for _ in range(2):
+            clock.advance(_CONTROL_PERIOD_S)
+            for unit_id in (_UNIT_ID, _RHS_UNIT_ID):
+                await runtime.actors[unit_id].heartbeat_once()
+                await runtime.actors[unit_id].poll_once()
+            await runtime.kernel.tick()
+
+        mid_frames = journal.nonzero_pq_frames(_MID_HOST)
+        rhs_frames = journal.nonzero_pq_frames(_RHS_HOST)
+        assert mid_frames and rhs_frames, (
+            "BOTH batteries must receive their objective in the same concurrent cycle: "
+            f"mid={mid_frames!r} rhs={rhs_frames!r}"
+        )
+        assert mid_frames[-1] == (_PQ_ADDRESS, encode_pq_registers(-_MID_CHARGE_W, 0)), mid_frames
+        assert rhs_frames[-1] == (_PQ_ADDRESS, encode_pq_registers(_RHS_DISCHARGE_W, 0)), rhs_frames
+        # The two writes happened within one renewal window of each other.
+        mid_times = journal.write_times(_MID_HOST)
+        rhs_times = journal.write_times(_RHS_HOST)
+        assert abs(mid_times[-1] - rhs_times[-1]) <= _CONTROL_PERIOD_S + 1e-9
+
+        decisions = [
+            event
+            for event in runtime.audit.recent(limit=8)
+            if getattr(event, "event_type", None) == "control_decision"
+        ]
+        assert decisions
+        latest = decisions[0]
+        assert dict(latest.directions_by_unit) == {
+            _UNIT_ID: "charge",
+            _RHS_UNIT_ID: "discharge",
+        }
+        assert dict(latest.authorized_watts_by_unit) == {
+            _UNIT_ID: _MID_CHARGE_W,
+            _RHS_UNIT_ID: _RHS_DISCHARGE_W,
+        }
+        assert latest.intent_id is None
+        assert latest.correlation_id == f"cycle:{latest.cycle_id}"
+
+        snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+        units = {view["unit_id"]: view for view in snapshot["units"]}
+        assert units[_UNIT_ID]["authorized_power"] == {
+            "direction": "charge",
+            "watts": _MID_CHARGE_W,
+        }
+        assert units[_RHS_UNIT_ID]["authorized_power"] == {
+            "direction": "discharge",
+            "watts": _RHS_DISCHARGE_W,
+        }
+    finally:
+        await _shutdown_actors(runtime)
+
+    _assert_replay_safety(journal)

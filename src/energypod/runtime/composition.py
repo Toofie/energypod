@@ -586,11 +586,14 @@ class _AsyncAuditRepository:
                     # request card's requested/authorized power.  The per-unit
                     # breakdowns ride the same payload (the 2026-08-23
                     # fleet-row opacity fix) so a multi-battery card can name
-                    # each battery's own figures.
+                    # each battery's own figures, and -- since a concurrent
+                    # cycle may run different directions on different units
+                    # (2026-08-24) -- each unit's own direction rides too.
                     "requested_active_w": getattr(event, "requested_active_w", None),
                     "authorized_active_w": getattr(event, "authorized_active_w", None),
                     "requested_watts_by_unit": getattr(event, "requested_watts_by_unit", None),
                     "authorized_watts_by_unit": getattr(event, "authorized_watts_by_unit", None),
+                    "directions_by_unit": getattr(event, "directions_by_unit", None),
                 },
             }
         )
@@ -643,9 +646,13 @@ class _AsyncAuthorizationRepository:
         # Symmetry with ``authorization.revoked`` (2026-08-23): a batch that
         # lands in the store is announced as ``authorization.granted`` with
         # the cycle, generation, and units it carries authority for -- grants
-        # were store-only, so the console never saw authority arrive.  The
-        # store hold precedes the announcement and a failed announcement is
-        # suppressed: observability never gates the grant.
+        # were store-only, so the console never saw authority arrive.  A
+        # concurrent cycle may run different directions on different units
+        # (2026-08-24), so each unit's own authorized watts and direction ride
+        # the announcement.  The store hold precedes the announcement and a
+        # failed announcement is suppressed: observability never gates the
+        # grant.
+        authorizations = tuple(getattr(batch, "authorizations", ()))
         with contextlib.suppress(Exception):
             await self._bus.publish(
                 {
@@ -654,9 +661,18 @@ class _AsyncAuthorizationRepository:
                         "cycle_id": getattr(batch, "cycle_id", None),
                         "generation": getattr(batch, "generation", None),
                         "unit_ids": sorted(
-                            getattr(item, "unit_id", None)
-                            for item in getattr(batch, "authorizations", ())
+                            getattr(item, "unit_id", None) for item in authorizations
                         ),
+                        "watts_by_unit": {
+                            getattr(item, "unit_id", None): getattr(item, "watts", None)
+                            for item in sorted(authorizations, key=lambda item: item.unit_id)
+                        },
+                        "directions_by_unit": {
+                            getattr(item, "unit_id", None): _payload_enum(
+                                getattr(item, "direction", None)
+                            )
+                            for item in sorted(authorizations, key=lambda item: item.unit_id)
+                        },
                     },
                 }
             )
@@ -779,6 +795,7 @@ class _FleetAllocatorAdapter:
         observations: Mapping[str, Any],
         policy: ControlPolicy,
         now_mono: float,
+        unit_ids: frozenset[str] | None = None,
     ) -> tuple[_FleetProposal, ...]:
         export_cap_w: int | None = None
         export_bounded = False
@@ -796,11 +813,16 @@ class _FleetAllocatorAdapter:
             # direction is ever export-bounded.
             export_cap_w = eligible_export_charge_w(observations, policy, now_mono)
             export_bounded = True
-        selected = sorted(intent.selected_unit_ids)
+        # Concurrent per-unit arbitration (2026-08-24): the kernel passes the
+        # intent's SURVIVING scope; the domain allocator narrows the selection
+        # and re-sums per-unit targets over it.
+        selected = sorted(intent.selected_unit_ids if unit_ids is None else frozenset(unit_ids))
         headrooms = tuple(
             self._headroom(unit_id, observations.get(unit_id), policy) for unit_id in selected
         )
-        allocation = allocate_fleet_power(intent, headrooms, export_cap_w=export_cap_w)
+        allocation = allocate_fleet_power(
+            intent, headrooms, export_cap_w=export_cap_w, unit_ids=unit_ids
+        )
         return tuple(
             _FleetProposal(
                 unit_id=unit_id,

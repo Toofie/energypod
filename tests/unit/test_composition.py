@@ -253,8 +253,12 @@ def compose_write_enabled(
     simulate: bool = False,
     clock: Any | None = None,
     announce: Callable[[str], None] | None = None,
+    policy_overrides: dict[str, Any] | None = None,
 ) -> Any:
-    config = _validate(_write_enabled_payload(database))
+    payload = _write_enabled_payload(database)
+    if policy_overrides:
+        payload["policy"] = {**payload["policy"], **policy_overrides}
+    config = _validate(payload)
     return _compose_with(config, simulate=simulate, clock=clock, announce=announce)
 
 
@@ -929,8 +933,9 @@ async def test_published_authorizations_announce_the_grant_on_the_bus(
     tmp_path: Path,
 ) -> None:
     """Symmetry with authorization.revoked: a batch that lands in the store is
-    announced as authorization.granted with the cycle, generation, and units
-    it carries authority for."""
+    announced as authorization.granted with the cycle, generation, units, and
+    -- since concurrent cycles may mix directions per unit -- each unit's own
+    authorized watts and direction."""
     runtime = compose_write_enabled(
         tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock()
     )
@@ -945,6 +950,8 @@ async def test_published_authorizations_announce_the_grant_on_the_bus(
         "cycle_id": batch.cycle_id,
         "generation": epoch,
         "unit_ids": sorted(UNIT_IDS),
+        "watts_by_unit": {unit_id: 750 for unit_id in sorted(UNIT_IDS)},
+        "directions_by_unit": {unit_id: "discharge" for unit_id in sorted(UNIT_IDS)},
     }
 
 
@@ -2014,3 +2021,165 @@ async def test_suppressed_heartbeat_failures_are_audited_and_logged(
     assert "HEARTBEAT FAILURE" in captured.out and UNIT_IDS[0] in captured.out, (
         "the process log must name the unit whose heartbeat was suppressed"
     )
+
+
+# --- concurrent per-unit operation over the composed simulated fleet ------------
+#
+# The operator's exact requirement (2026-08-24): two accepted intents on
+# DISJOINT batteries must run in the SAME control cycle -- MID charging while
+# RHS discharges, both authorized and measured simultaneously, one cycle's
+# decision row carrying both units' directions and watts.
+
+_PCS_APPLIED_ACTIVE_ADDRESS = 0x1060 + 17
+_SYSTEM_MEASURED_ACTIVE_ADDRESS = 0x0100 + 20
+
+
+class ManualClock:
+    """Deterministic clock that moves only through explicit ``advance`` calls.
+
+    Unlike ``ScriptedClock`` (whose every sleep advances scripted time), a
+    heartbeat's preemption timer sleeps without moving time, so the mint-to-
+    renewal gap of a manually driven fleet cycle is exactly the scripted
+    control period -- the same cadence the supervised loop holds.
+    """
+
+    def __init__(self) -> None:
+        self.elapsed_s = 0.0
+
+    def wall_now(self) -> datetime:
+        return _SCRIPT_START + timedelta(seconds=self.elapsed_s)
+
+    def monotonic(self) -> float:
+        return self.elapsed_s
+
+    async def sleep(self, seconds: float) -> None:
+        await asyncio.sleep(0)
+
+
+def _applied_active_w(pod: Any) -> int:
+    from energypod.adapters.modbus.protocol_codec import decode_signed16
+
+    return decode_signed16(pod.read(_PCS_APPLIED_ACTIVE_ADDRESS, 1)[0])
+
+
+def _measured_active_w(pod: Any) -> int:
+    from energypod.adapters.modbus.protocol_codec import decode_signed16
+
+    return decode_signed16(pod.read(_SYSTEM_MEASURED_ACTIVE_ADDRESS, 1)[0])
+
+
+async def _drive_one_fleet_cycle(runtime: Any) -> None:
+    """The supervision loop's own ordering: heartbeats, then polls, then tick."""
+    runtime.clock.elapsed_s += 0.4
+    for actor in runtime.actors.values():
+        await actor.heartbeat_once()
+    for actor in runtime.actors.values():
+        await actor.poll_once()
+    await runtime.kernel.tick()
+
+
+async def test_disjoint_intents_run_concurrently_over_the_simulated_fleet(
+    tmp_path: Path,
+) -> None:
+    """MID charges 800 W while RHS discharges 400 W in ONE cycle: one audit
+    row carries both directions, one batch carries both capabilities, both
+    devices serve their own signed objective at the same moment."""
+    runtime = compose_write_enabled(
+        tmp_path / "fleet.sqlite3",
+        simulate=True,
+        clock=ManualClock(),
+        # The simulator's seeded cells spread wider than the live fleet's
+        # 50 mV commissioning bound (the golden scenarios commission the same
+        # 0.50 V spread); everything else stays the write-enabled policy.
+        policy_overrides={"maximum_cell_imbalance_v": 0.50},
+    )
+    assert runtime.simulators is not None
+    for actor in runtime.actors.values():
+        await actor.start()
+    try:
+        for _ in range(runtime.policy.stable_samples_needed_to_rearm):
+            runtime.clock.elapsed_s += 0.05
+            for actor in runtime.actors.values():
+                await actor.poll_once()
+        for actor in runtime.actors.values():
+            assert actor.lifecycle is UnitLifecycle.DISARMED
+        await runtime.facade.arm(
+            unit_ids=list(UNIT_IDS),
+            principal=OPERATOR,
+            idempotency_key="concurrent-arm-0001",
+            request_id="concurrent-arm-0001-request",
+        )
+        runtime.clock.elapsed_s += 0.4
+        for actor in runtime.actors.values():
+            await actor.poll_once()
+
+        # The operator's two dispatches, in quick succession.
+        mid_view = await runtime.facade.submit_intent(
+            unit_ids=["mid"],
+            direction="charge",
+            watts=800,
+            ttl_s=30.0,
+            reason="concurrent: mid charge",
+            principal=OPERATOR,
+            idempotency_key="concurrent-mid-0001",
+            request_id="concurrent-mid-0001-request",
+        )
+        rhs_view = await runtime.facade.submit_intent(
+            unit_ids=["rhs"],
+            direction="discharge",
+            watts=400,
+            ttl_s=30.0,
+            reason="concurrent: rhs discharge",
+            principal=OPERATOR,
+            idempotency_key="concurrent-rhs-0001",
+            request_id="concurrent-rhs-0001-request",
+        )
+        assert mid_view["status"] == rhs_view["status"] == "accepted"
+
+        # Ramp allowance (1000 W/s x 0.4 s) means the charge reaches its full
+        # 800 W on the second renewal; drive four supervised cycles.
+        for _ in range(4):
+            await _drive_one_fleet_cycle(runtime)
+
+        decisions = [
+            event
+            for event in await _settle(runtime.audit.recent(limit=12))
+            if getattr(event, "event_type", None) == "control_decision"
+        ]
+        assert decisions, "the concurrent cycle must be audited"
+        latest = decisions[0]
+        assert dict(latest.directions_by_unit) == {"mid": "charge", "rhs": "discharge"}
+        assert dict(latest.authorized_watts_by_unit) == {"mid": 800, "rhs": 400}
+        assert latest.intent_id is None, "a composed row names its cycle, not one intent"
+        assert latest.correlation_id == f"cycle:{latest.cycle_id}"
+        # EVERY supervised cycle composed both intents, not just the newest.
+        for event in decisions:
+            assert dict(event.directions_by_unit) == {"mid": "charge", "rhs": "discharge"}
+
+        grants = [
+            event
+            for event in await _bus_events(runtime, limit=256)
+            if event["type"] == "authorization.granted"
+        ]
+        assert grants, "each concurrent cycle must announce its grant"
+        latest_grant = grants[-1]["payload"]
+        assert latest_grant["unit_ids"] == ["mid", "rhs"]
+        assert latest_grant["watts_by_unit"] == {"mid": 800, "rhs": 400}
+        assert latest_grant["directions_by_unit"] == {"mid": "charge", "rhs": "discharge"}
+
+        # BOTH devices serve their own signed objective at the same moment:
+        # negative = charge, positive = discharge (live-proven convention).
+        mid_pod, rhs_pod = runtime.simulators["mid"], runtime.simulators["rhs"]
+        assert _applied_active_w(mid_pod) == -800
+        assert _applied_active_w(rhs_pod) == 400
+        assert _measured_active_w(mid_pod) == -800
+        assert _measured_active_w(rhs_pod) == 400
+
+        snapshot = await _settle(runtime.facade.snapshot(principal=OPERATOR))
+        units = {view["unit_id"]: view for view in snapshot["units"]}
+        assert units["mid"]["lifecycle"] == "active"
+        assert units["rhs"]["lifecycle"] == "active"
+    finally:
+        for actor in runtime.actors.values():
+            with contextlib.suppress(Exception):
+                await actor.shutdown()
