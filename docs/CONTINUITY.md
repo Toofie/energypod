@@ -663,6 +663,28 @@ direction, freshness, and watchdog timing per physical unit.
   only, underlying data untouched; shared formatter helper + per-view sweep
   + vitest pins.
 
+- 2026-08-23 (P2 pass): DEFERRED-FINDINGS BACKLOG WORKED (branch
+  worktree-agent-a1fdd73fb81836d8a, 9 commits, MERGE PENDING until the
+  backend wave lands to avoid interleaving). FIXED: facade audit/publish
+  content pins (~86 mutation survivors), EventBus payload aliasing,
+  future/negative cursor handling, abandoned-subscription reclamation
+  (weakrefs), non-mapping payload rejection, resync_required vocabulary
+  collision, types-PyYAML pin, ControlPolicy zero SOC tolerances,
+  sqlite set determinism. RESOLVED-BY: audit REST cursor, credential
+  store, entry point, snapshot telemetry fields. DEFERRED-CONFLICT
+  (deliberately untouched — overlap with main-tree rework): battery
+  current signed decode + PCS status coherence (decode.py, excess CT
+  rework), allocator signature drift, auth-repo revoke reason,
+  kernel revoke masking. PROMOTED to P1 (adopt into the next contract
+  cycle): (1) Impl-10 commit-then-raise — an arm that mutates the actor
+  but fails audit leaves an armed unit with the caller told it failed
+  and nothing published (unaudited state change in an audit-first
+  system; fix with the facade rework); (2) simulator literal register
+  image (~90 survivors — the simulator is now the reference model and a
+  misplaced word would pass silently); (3) simulator blanket GOOD
+  quality masking sentinel-decode gaps (62,535 W headroom artifact).
+  docs/DEFERRED_FINDINGS.md is now a live status ledger per entry.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
