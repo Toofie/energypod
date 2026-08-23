@@ -57,7 +57,7 @@
 #     `energypod db backup`/`restore` see one durable store, and is distinct
 #     from the observe-only deployment's database.
 schema_version: 1
-revision: 4
+revision: 5
 mode: write_enabled
 
 site:
@@ -109,7 +109,7 @@ timing:
   inter_request_delay_s: 0.10
 
 policy:
-  version: 4
+  version: 5
   threshold_provenance: live-commissioning-2026-08-22
   max_fleet_charge_w: 6000
   max_fleet_discharge_w: 6000
@@ -225,13 +225,31 @@ policy:
   actuation_coherence_min_movement_w: 150
   # The commissioned EXPECTED autonomous battery-power envelope: negative
   # self-charge (measured ~-520..-560 W daytime CT-following, up to ~-2.27 kW
-  # deep self-charge) to a small positive float.  Measured power OUTSIDE this
-  # band while no intent claims the unit is timestamped evidence
-  # (unexpected_autonomy audit, at most one per unit per 60 s, carrying the
-  # measured watts + SOC + mode words) — turning mid's standing unexplained
-  # ±1.2 kW oscillation into diagnosable evidence.  NEVER a block, never an
-  # alarm-tier state: health stays healthy/self_healing.
-  expected_autonomy_band_w: [-2600, 300]
+  # deep self-charge) to POSITIVE evening CT-following discharge.  Measured
+  # power OUTSIDE this band while no intent claims the unit is timestamped
+  # evidence (unexpected_autonomy audit, at most one per unit per 60 s,
+  # carrying the measured watts + SOC + mode words) — turning mid's standing
+  # unexplained ±1.2 kW oscillation into diagnosable evidence.  NEVER a
+  # block, never an alarm-tier state: health stays healthy/self_healing.
+  #
+  # POSITIVE EDGE RECALIBRATED +300 -> +1000 (2026-08-23 evening, config
+  # rev 5): the +300 edge was commissioned from DAYTIME evidence only
+  # (+40..+160 W float), before the fleet's evening behavior had ever been
+  # observed.  Live evidence 2026-08-23 16:40-19:50 local (recorder
+  # deployed, then a continuous 1/min unexpected_autonomy stream on lhs):
+  # after two days pinned at 98-99% SOC with the 54 mV top-of-charge
+  # imbalance (the B6 class), lhs's own firmware held a STEADY uncommanded
+  # discharge — run_mode_w 0 "Matching Load" CT-following, 695-914 W over
+  # 20 samples (mean 780, stdev 51; pack V×I corroborates), SOC 99 -> 76%
+  # at exactly the matching rate, imbalance closing 54 -> 5 mV — benign
+  # firmware autonomy (operator precedent: trust the battery, capture
+  # evidence).  mid/rhs floated +16..+279 W (in band); mid's episodic
+  # excursions are the oscillation class and remain OUTSIDE the band at
+  # their ±1.2 kW peaks, so the recorder still catches them.  +1000 keeps
+  # ~10-17% margin above the observed legitimate hold while staying below
+  # the 1.2 kW anomaly class, mirroring the -2600 negative edge's
+  # commissioning margin over the observed -2.27 kW deep self-charge.
+  expected_autonomy_band_w: [-2600, 1000]
   debug_modes_enabled: false
 
 authentication:
