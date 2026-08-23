@@ -1497,6 +1497,9 @@ class _Supervision:
         actors: tuple[EnergyPodActor, ...],
         authorizations: _AsyncAuthorizationRepository,
         coordinator: AuthorityGenerationCoordinator,
+        audit: _AsyncAuditRepository,
+        process_instance_id: str,
+        process_origin_mono: float,
         adviser: ExcessChargeAdviser | None = None,
     ) -> None:
         if interval_s <= 0:
@@ -1507,6 +1510,9 @@ class _Supervision:
         self._actors = actors
         self._authorizations = authorizations
         self._coordinator = coordinator
+        self._audit = audit
+        self._process_instance_id = process_instance_id
+        self._process_origin_mono = process_origin_mono
         self._adviser = adviser
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
@@ -1621,16 +1627,15 @@ class _Supervision:
         while True:
             await self._clock.sleep(self._interval_s)
             for actor in self._actors:
+                failure: BaseException | None = None
                 try:
-                    with contextlib.suppress(Exception):
-                        # Structural bound (2026-08-23 silent-wedge hardening):
-                        # a transport write that never resolves must not wedge
-                        # the whole fleet loop with a clean log. An abandoned
-                        # renewal is fail-closed exactly like an unreadable
-                        # poll — authority lapses and the device watchdog
-                        # stops power. TimeoutError is an Exception, so the
-                        # suppress above already swallows it.
-                        await asyncio.wait_for(actor.heartbeat_once(), timeout=self._interval_s)
+                    # Structural bound (2026-08-23 silent-wedge hardening):
+                    # a transport write that never resolves must not wedge
+                    # the whole fleet loop with a clean log. An abandoned
+                    # renewal is fail-closed exactly like an unreadable
+                    # poll — authority lapses and the device watchdog
+                    # stops power.
+                    await asyncio.wait_for(actor.heartbeat_once(), timeout=self._interval_s)
                 except asyncio.CancelledError:
                     # A facade fence (emergency stop) cancels in-flight
                     # authority work; that borrowed cancellation must not end
@@ -1639,6 +1644,14 @@ class _Supervision:
                     task = asyncio.current_task()
                     if task is None or task.cancelling():
                         raise
+                except Exception as error:
+                    # Survived per cycle, but never invisible (2026-08-23
+                    # incident class): a suppressed heartbeat failure is
+                    # total actuation loss for this unit until the next
+                    # renewal, so it is audited and logged, every cycle.
+                    failure = error
+                if failure is not None:
+                    await self._record_suppressed_heartbeat(actor, failure)
             # API_CONTRACTS "Unit actor": an overdue read is abandoned
             # rather than delaying a heartbeat past its safety margin. In the
             # fleet cycle the bound is structural — a poll that overruns the
@@ -1671,6 +1684,51 @@ class _Supervision:
     async def _bounded_poll(self, actor: EnergyPodActor) -> None:
         with contextlib.suppress(Exception, asyncio.TimeoutError):
             await asyncio.wait_for(_poll_once(actor), timeout=self._interval_s)
+
+    async def _record_suppressed_heartbeat(
+        self, actor: EnergyPodActor, error: BaseException
+    ) -> None:
+        """Audit and log one suppressed heartbeat failure (never fatal).
+
+        The fleet loop survives the failure per cycle, but silence here once
+        hid total actuation loss: the durable heartbeat_failed row plus the
+        process log line make every suppressed renewal visible to both the
+        console stream and the operator reading the log.  Observability must
+        never break the loop, so a failing record is itself suppressed.
+        """
+        print(f"SUPERVISED HEARTBEAT FAILURE ({actor.unit_id}): {error!r}", flush=True)
+        try:
+            await self._audit.append(
+                AuditEvent(
+                    event_id=f"heartbeat-failed-{uuid.uuid4().hex}",
+                    occurred_at=self._clock.wall_now().astimezone(UTC),
+                    monotonic_offset_s=float(self._clock.monotonic()) - self._process_origin_mono,
+                    process_instance_id=self._process_instance_id,
+                    event_type="heartbeat_failed",
+                    unit_id=actor.unit_id,
+                    connection_epoch=None,
+                    generation=None,
+                    cycle_id=None,
+                    principal=_RUNTIME_PRINCIPAL,
+                    source=None,
+                    correlation_id="fleet-heartbeat",
+                    intent_id=None,
+                    policy_version=_COMPOSITION_POLICY_VERSION,
+                    configuration_version=0,
+                    observation_sequences={},
+                    reason_codes=("suppressed_exception",),
+                    requested_active_w=0,
+                    authorized_active_w=0,
+                    request_fingerprint=_fingerprint(
+                        {"unit_id": actor.unit_id, "error": type(error).__name__}
+                    ),
+                    response_fingerprint=_fingerprint({"result": "suppressed"}),
+                    result="suppressed",
+                    lifecycle=getattr(actor, "lifecycle", UnitLifecycle.INHIBITED),
+                )
+            )
+        except Exception:
+            return
 
     async def _watch_for_failure(self) -> None:
         if not self._tasks:
@@ -2348,6 +2406,9 @@ def _build_runtime(
         actors=tuple(actors.values()),
         authorizations=authorization_port,
         coordinator=coordinator,
+        audit=audit_port,
+        process_instance_id=process_instance_id,
+        process_origin_mono=process_origin_mono,
         adviser=excess_adviser,
     )
     global _LAST_SUPERVISION

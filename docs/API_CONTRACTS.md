@@ -496,6 +496,9 @@ eligible_charge_w = min(max_charge_from_export_w,
   `correlation_id = "emergency_stop:{stop_id}"` (other decisions keep
   `intent:{intent_id}:revision:{revision}`), so the Activity view names the stop on the row itself
   instead of inferring it from the newest latch event.
+- A heartbeat renewal the fleet loop suppresses (2026-08-23 actuation-loss visibility) is audited as
+  `heartbeat_failed` for its unit (`result: suppressed`) and named in the process log
+  (`SUPERVISED HEARTBEAT FAILURE (<unit>)`), every suppressed cycle; supervision keeps running.
 
 ### Read-plan tier promotion
 
