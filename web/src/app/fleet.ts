@@ -60,6 +60,14 @@ export interface PowerFigure {
 export type WattsByUnit = Record<string, number>;
 
 /**
+ * The wire's per-unit direction map (`directions_by_unit` on a composed
+ * control-decision audit row — a concurrent cycle may run opposite directions
+ * on different units — and on the snapshot's `intent` block). One lowercase
+ * wire direction per unit id.
+ */
+export type DirectionsByUnit = Record<string, string>;
+
+/**
  * Narrow a wire per-unit watt map. Absent, non-object, or empty values narrow
  * to null; any non-finite or negative figure rejects the whole map (a map the
  * console cannot trust is rendered not at all, never partially).
@@ -74,6 +82,21 @@ export function toWattsByUnit(value: unknown): WattsByUnit | null {
       return null;
     }
     map[unitId] = watts;
+  }
+  return Object.keys(map).length > 0 ? map : null;
+}
+
+/** Narrow a wire per-unit direction map (same rule as the watt maps). */
+export function toDirectionsByUnit(value: unknown): DirectionsByUnit | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const map: DirectionsByUnit = {};
+  for (const [unitId, direction] of Object.entries(value)) {
+    if (typeof direction !== "string") {
+      return null;
+    }
+    map[unitId] = direction;
   }
   return Object.keys(map).length > 0 ? map : null;
 }
@@ -132,6 +155,37 @@ export function toAuditUnitWatts(value: unknown): AuditUnitWatts {
   };
 }
 
+// --- the snapshot's intent block (cold-load exactness, feature-detected) ------
+
+/**
+ * The snapshot-level `intent` block the backend contract adds: the live
+ * request's own per-unit figures, so a console opened mid-intent holds the
+ * exact per-battery truth instead of the snapshot's repeated fleet total. The
+ * field is ABSENT on today's wire — absence is the feature detection and every
+ * consumer keeps its current fallbacks; `null` means "no active request".
+ */
+export interface SnapshotIntentFigures {
+  requestedByUnit: WattsByUnit | null;
+  authorizedByUnit: WattsByUnit | null;
+  directionsByUnit: DirectionsByUnit | null;
+}
+
+/**
+ * Narrow the block's OBJECT form (the `intent` value once it is known to be a
+ * record). Every map is nullable inside the block — a scalar intent carries no
+ * requested map, a not-yet-decided request no authorized map.
+ */
+export function toSnapshotIntentFigures(value: unknown): SnapshotIntentFigures {
+  if (!isRecord(value)) {
+    return { requestedByUnit: null, authorizedByUnit: null, directionsByUnit: null };
+  }
+  return {
+    requestedByUnit: toWattsByUnit(value.requested_watts_by_unit),
+    authorizedByUnit: toWattsByUnit(value.authorized_watts_by_unit),
+    directionsByUnit: toDirectionsByUnit(value.directions_by_unit),
+  };
+}
+
 export interface UnitModel {
   unitId: string;
   lifecycle: Lifecycle;
@@ -177,6 +231,14 @@ export interface FleetSnapshot {
    * lands.
    */
   activeStops: ActiveStop[];
+  /**
+   * The snapshot `intent` block's per-unit figures when the field is present
+   * and names an active request; null when absent (today's backend) or null
+   * (no active request). Null NEVER means "no request is active" on its own —
+   * the units' own figures still speak — it means "this snapshot carries no
+   * per-unit truth for it".
+   */
+  intentFigures: SnapshotIntentFigures | null;
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -257,16 +319,72 @@ export function normalizeSnapshot(raw: unknown): FleetSnapshot {
     activeStops: (Array.isArray(record.active_stops) ? record.active_stops : [])
       .map(toActiveStop)
       .filter((entry): entry is ActiveStop => entry !== null),
+    // Feature detection: an absent or null `intent` field normalizes to "no
+    // per-unit figures from this snapshot"; the units' own figures and the
+    // bus-fed maps stay the truth either way.
+    intentFigures: isRecord(record.intent) ? toSnapshotIntentFigures(record.intent) : null,
   };
 }
 
-/** A unit whose allowance is smaller than its request: never "fully delivered". */
-export function isLimited(unit: UnitModel): boolean {
+/**
+ * The unit's OWN requested target, never the fleet total the snapshot repeats
+ * per covered unit (service.py `_requested_power` projects the intent's own
+ * figure). Three sources, in order: the live per-unit maps (the shared
+ * tracker's `watts_by_unit` — the exact truth), the snapshot `intent` block's
+ * requested map (cold-load exactness, feature-detected), and a snapshot figure
+ * no OTHER unit shares (one battery's fleet total IS its own figure). A figure
+ * shared by several units is their intent's total, not any one battery's
+ * request: null, so no surface may compare it against a per-unit allowance.
+ */
+export function perUnitRequestedWatts(
+  unit: UnitModel,
+  units: UnitModel[],
+  requestedByUnit: WattsByUnit | null,
+): number | null {
+  const mapped = requestedByUnit !== null ? requestedByUnit[unit.unitId] : undefined;
+  if (mapped !== undefined) {
+    return mapped;
+  }
+  if (unit.requested.direction === "idle" && unit.requested.watts <= 0) {
+    return null;
+  }
+  const shared = units.filter(
+    (other) =>
+      other.requested.direction === unit.requested.direction &&
+      other.requested.watts === unit.requested.watts,
+  );
+  return shared.length === 1 ? unit.requested.watts : null;
+}
+
+/**
+ * A unit whose allowance is smaller than its OWN request: never "fully
+ * delivered", and never "Limited" from a fleet-vs-unit comparison. The
+ * requested side of the comparison must be the battery's own target (see
+ * `perUnitRequestedWatts`); a shared fleet total with no per-unit truth
+ * derives no Limited state at all — the 3 × 1,000 W dispatch authorized in
+ * full is Active, not Limited. An authorized direction opposite the request is
+ * a limit regardless of the maps.
+ */
+export function isLimited(
+  unit: UnitModel,
+  units: UnitModel[] = [unit],
+  requestedByUnit: WattsByUnit | null = null,
+  authorizedByUnit: WattsByUnit | null = null,
+): boolean {
   if (unit.authorized === null) {
     return true;
   }
-  return unit.authorized.direction !== unit.requested.direction ||
-    unit.authorized.watts !== unit.requested.watts;
+  if (unit.authorized.direction !== unit.requested.direction) {
+    return true;
+  }
+  const requestedWatts = perUnitRequestedWatts(unit, units, requestedByUnit);
+  if (requestedWatts === null) {
+    return false;
+  }
+  const authorizedWatts =
+    (authorizedByUnit !== null ? authorizedByUnit[unit.unitId] : undefined) ??
+    unit.authorized.watts;
+  return authorizedWatts < requestedWatts;
 }
 
 /**
@@ -303,7 +421,11 @@ export interface BannerModel {
   contactLost: UnitModel[];
 }
 
-export function fleetBanner(units: UnitModel[]): BannerModel {
+export function fleetBanner(
+  units: UnitModel[],
+  requestedByUnit: WattsByUnit | null = null,
+  authorizedByUnit: WattsByUnit | null = null,
+): BannerModel {
   const contactLost = units.filter((unit) => unit.lifecycle === "disconnected");
   const known = units.filter(
     (unit) => unit.lifecycle !== "disconnected" && unit.lifecycle !== "boot",
@@ -328,7 +450,13 @@ export function fleetBanner(units: UnitModel[]): BannerModel {
       return { badge: "Observe only", contactLost };
     case "active":
       return {
-        badge: known.some((unit) => unit.lifecycle === "active" && isLimited(unit))
+        // "Limited" is a per-unit truth only: the requested side of every
+        // comparison is the battery's own target, never the fleet total the
+        // snapshot repeats per covered unit (see isLimited).
+        badge: known.some(
+          (unit) =>
+            unit.lifecycle === "active" && isLimited(unit, units, requestedByUnit, authorizedByUnit),
+        )
           ? "Limited"
           : "Active",
         contactLost,

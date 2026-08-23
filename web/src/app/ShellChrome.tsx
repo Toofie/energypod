@@ -6,7 +6,7 @@
  */
 import type { ReactElement } from "react";
 import { formatSeconds } from "../lib/format";
-import type { UnitModel } from "./fleet";
+import type { UnitModel, WattsByUnit } from "./fleet";
 import { fleetBanner, UNIT_LABELS } from "./fleet";
 import type { ConnectionHealth, ConsoleData, RefusalEnvelope } from "./useConsoleData";
 
@@ -25,8 +25,22 @@ function ageText(unit: UnitModel): string {
   return unit.telemetryAgeS === null ? "" : ` · ${formatSeconds(unit.telemetryAgeS)} old`;
 }
 
-export function FleetBanner({ units }: { units: UnitModel[] }): ReactElement {
-  const banner = fleetBanner(units);
+/**
+ * The always-visible fleet banner. The per-unit figure maps (the shared
+ * tracker's, feature-detected) ride along so a "Limited" badge is only ever a
+ * battery's own target versus its own allowance — the snapshot's repeated
+ * fleet total never derives Limited here (2026-08-23 defect family).
+ */
+export function FleetBanner({
+  units,
+  requestedByUnit = null,
+  authorizedByUnit = null,
+}: {
+  units: UnitModel[];
+  requestedByUnit?: WattsByUnit | null;
+  authorizedByUnit?: WattsByUnit | null;
+}): ReactElement {
+  const banner = fleetBanner(units, requestedByUnit, authorizedByUnit);
   return (
     <section aria-label="Fleet status" className="banner">
       {banner.badge !== null && (

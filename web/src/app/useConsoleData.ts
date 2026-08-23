@@ -46,6 +46,8 @@ import type { ApiClientError as ApiClientErrorType, Health, StreamEvent } from "
 import { formatWatts } from "../lib/format";
 import { isRecord, normalizeSnapshot, type FleetSnapshot, type Lifecycle } from "./fleet";
 import type { RealStream, SharedDataPlane } from "./SharedDataPlane";
+import { useUnitIntentFigures } from "./useUnitIntentFigures";
+import type { DirectionsByUnit, WattsByUnit } from "./fleet";
 
 export type StreamStatus = "connecting" | "live" | "down";
 
@@ -79,6 +81,19 @@ export interface RefusalEnvelope {
 export interface ConsoleData {
   snapshot: FleetSnapshot | null;
   health: Health | null;
+  /**
+   * The live request's per-unit figures — the shared tracker's maps
+   * (web/src/app/useUnitIntentFigures.ts), fed by the shell's one stream and
+   * seeded by the snapshot's `intent` block when the backend sends one. The
+   * banner (and any shell-level per-battery claim) derives "Limited" only
+   * from a battery's OWN target in these maps, never from the snapshot's
+   * repeated fleet total.
+   */
+  unitFigures: {
+    requestedByUnit: WattsByUnit | null;
+    authorizedByUnit: WattsByUnit | null;
+    directionsByUnit: DirectionsByUnit | null;
+  };
   /** null = still checking; false = the API could not be reached. */
   apiReachable: boolean | null;
   snapshotError: RefusalEnvelope | null;
@@ -524,6 +539,11 @@ function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void)
       // authorization.revoked instead).
       dispatch({ type: "polite", text: "The power request ended." });
       return true;
+    case "intent.cancelled":
+      // A cancelled request (this session or another operator's): the live
+      // end of a power request is authority changing, so the world re-reads.
+      dispatch({ type: "polite", text: "The power request was cancelled." });
+      return true;
     case "authorization.granted":
       // Feature-detected: an authority grant publishes nothing today (the
       // grant is only visible in the next snapshot); when the backend adds
@@ -599,6 +619,13 @@ export function useConsoleData(
   const staleAfterMs = options.staleAfterMs ?? STALE_AFTER_MS;
   const livePollMs = options.livePollMs ?? LIVE_SNAPSHOT_POLL_MS;
   const [state, dispatch] = useReducer(reducer, INITIAL);
+  // The shared per-unit figure tracker (one instance per session, fed by the
+  // shell's one stream): every frame passes through it, and every snapshot
+  // read seeds it from the snapshot's own `intent` block when the backend
+  // sends one. The banner consumes its maps through the returned ConsoleData.
+  const unitFigures = useUnitIntentFigures();
+  const adoptFigures = unitFigures.adoptSnapshot;
+  const consumeFigures = unitFigures.consumeEvent;
   const [streamEpoch, setStreamEpoch] = useState(0);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const onUnauthorizedRef = useRef(onUnauthorized);
@@ -625,6 +652,7 @@ export function useConsoleData(
     }
     plane.refresh().then(
       (raw) => {
+        adoptFigures(raw);
         dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
       },
       (error: unknown) => {
@@ -635,7 +663,7 @@ export function useConsoleData(
         dispatch({ type: "snapshot-failed", refusal: asRefusal(error) });
       },
     );
-  }, [plane, dropSession]);
+  }, [plane, dropSession, adoptFigures]);
 
   /**
    * An acknowledge call returned 200: drop that stop from the on-screen latch
@@ -651,6 +679,7 @@ export function useConsoleData(
         plane
           .refresh()
           .then((raw) => {
+            adoptFigures(raw);
             dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
           })
           .catch((error: unknown) => {
@@ -660,7 +689,7 @@ export function useConsoleData(
           });
       }
     },
-    [plane, dropSession],
+    [plane, dropSession, adoptFigures],
   );
 
   /** A manual stream restart once the automatic budget is spent. */
@@ -709,6 +738,7 @@ export function useConsoleData(
         .then(
           (raw) => {
             if (stateRef.current.snapshot === null || raw.snapshot_sequence >= stateRef.current.snapshot.sequence) {
+              adoptFigures(raw);
               dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
             }
           },
@@ -727,7 +757,7 @@ export function useConsoleData(
     return () => {
       clearInterval(timer);
     };
-  }, [plane, livePollMs, dropSession]);
+  }, [plane, livePollMs, dropSession, adoptFigures]);
 
   /**
    * Background-tab recovery: a browser throttles a hidden tab's timers to
@@ -805,6 +835,7 @@ export function useConsoleData(
     plane.snapshot().then(
       (raw) => {
         if (!cancelled) {
+          adoptFigures(raw);
           dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
         }
       },
@@ -823,7 +854,7 @@ export function useConsoleData(
       cancelled = true;
       clearInterval(healthTimer);
     };
-  }, [plane, dropSession]);
+  }, [plane, dropSession, adoptFigures]);
 
   // --- the one real event-stream connection ---------------------------------
   useEffect(() => {
@@ -853,6 +884,7 @@ export function useConsoleData(
         .then(
           (raw) => {
             if (!cancelled) {
+              adoptFigures(raw);
               dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
             }
           },
@@ -937,6 +969,10 @@ export function useConsoleData(
               }
             }
             dispatch({ type: "frame-received", at: Date.now() });
+            // Every frame feeds the shared per-unit figure tracker (its own
+            // no-ops carry most kinds), and a snapshot frame seeds it from the
+            // snapshot's own `intent` block when the backend sends one.
+            consumeFigures(frame);
             if (frame.type === "resync_required") {
               resync = {
                 cursor: typeof frame.snapshot_sequence === "number" ? frame.snapshot_sequence : null,
@@ -946,6 +982,7 @@ export function useConsoleData(
             lastSequence = Math.max(lastSequence ?? frame.sequence, frame.sequence);
             lastSequenceRef.current = lastSequence;
             if (frame.type === "snapshot") {
+              adoptFigures(frame.data);
               plane.publishSnapshot(frame.sequence, frame.data);
             } else {
               plane.publishEvent(frame);
@@ -983,6 +1020,7 @@ export function useConsoleData(
             if (cancelled) {
               return;
             }
+            adoptFigures(fresh);
             dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(fresh) });
             dispatch({ type: "polite", text: "Resynchronized — the fleet picture is current." });
           } catch (error) {
@@ -1031,7 +1069,7 @@ export function useConsoleData(
       active?.close();
       plane.streamLost();
     };
-  }, [plane, streamEpoch, dropSession]);
+  }, [plane, streamEpoch, dropSession, adoptFigures, consumeFigures]);
 
   const connection = connectionHealth(state, nowMs, staleAfterMs);
   const secondsSinceUpdate =
@@ -1040,6 +1078,11 @@ export function useConsoleData(
       : Math.max(0, Math.round((nowMs - state.lastEventAtMs) / 1000));
   return {
     ...state,
+    unitFigures: {
+      requestedByUnit: unitFigures.requestedByUnit,
+      authorizedByUnit: unitFigures.authorizedByUnit,
+      directionsByUnit: unitFigures.directionsByUnit,
+    },
     connection,
     secondsSinceUpdate,
     retrySnapshot,

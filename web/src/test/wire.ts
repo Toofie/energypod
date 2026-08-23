@@ -59,6 +59,20 @@ export const AUTHORIZATION_REVOKED = "authorization.revoked" as const;
 /** The facade accepted one dispatch intent; it grants nothing by itself. */
 export const INTENT_ACCEPTED = "intent.accepted" as const;
 
+/**
+ * A stored intent lapsed (its ttl ran out): the intent repository's tracking
+ * wrapper announces each newly lapsed intent exactly once (composition.py
+ * `_TrackingIntentRepository`), naming the intent, its units, and its figures.
+ */
+export const INTENT_EXPIRED = "intent.expired" as const;
+
+/**
+ * One intent was cancelled through the live cancel endpoint (service.py
+ * `cancel_intent`): `{principal, intent_id, unit_ids}`. Removal (cancel, stop
+ * acknowledgement) never announces an expiry — the two endings are disjoint.
+ */
+export const INTENT_CANCELLED = "intent.cancelled" as const;
+
 export const UNIT_ARMED = "unit.armed" as const;
 export const UNIT_DISARMED = "unit.disarmed" as const;
 export const EMERGENCY_STOP_LATCHED = "emergency_stop.latched" as const;
@@ -71,6 +85,8 @@ export const PUBLISHED_EVENT_TYPES: readonly string[] = [
   AUDIT_APPENDED,
   AUTHORIZATION_REVOKED,
   INTENT_ACCEPTED,
+  INTENT_EXPIRED,
+  INTENT_CANCELLED,
   UNIT_ARMED,
   UNIT_DISARMED,
   EMERGENCY_STOP_LATCHED,
@@ -234,9 +250,12 @@ export function observationPublished(
  * The summary the audit port publishes for every durable append
  * (composition.py `_AsyncAuditRepository.append`): the watt figures render
  * straight off the stream, and the per-unit breakdowns ride the same payload —
- * `requested_watts_by_unit` is the intent's own target map (null for scalar
- * intents), `authorized_watts_by_unit` the decision's per-unit authorized
- * watts (null when no batch was minted).
+ * `requested_watts_by_unit` is each unit's WINNING intent's own target over
+ * its surviving scope (null for scalar intents, cycle-level across the
+ * concurrent intents a composed cycle represented), `authorized_watts_by_unit`
+ * the decision's per-unit authorized watts (null when no batch was minted),
+ * and `directions_by_unit` each unit's winning direction (a concurrent cycle
+ * may run opposite directions on different units; null off composed rows).
  */
 export interface AuditAppendedPayload {
   readonly event_id: string;
@@ -249,6 +268,7 @@ export interface AuditAppendedPayload {
   readonly authorized_active_w: number;
   readonly requested_watts_by_unit: Record<string, number> | null;
   readonly authorized_watts_by_unit: Record<string, number> | null;
+  readonly directions_by_unit: Record<string, string> | null;
 }
 
 export function auditAppended(
@@ -264,6 +284,7 @@ export function auditAppended(
     authorized_active_w?: number;
     requested_watts_by_unit?: Record<string, number> | null;
     authorized_watts_by_unit?: Record<string, number> | null;
+    directions_by_unit?: Record<string, string> | null;
   } = {},
   occurredAt: string = DEFAULT_OCCURRED_AT,
 ): EventFrame<AuditAppendedPayload> {
@@ -281,6 +302,7 @@ export function auditAppended(
       authorized_active_w: summary.authorized_active_w ?? 0,
       requested_watts_by_unit: summary.requested_watts_by_unit ?? null,
       authorized_watts_by_unit: summary.authorized_watts_by_unit ?? null,
+      directions_by_unit: summary.directions_by_unit ?? null,
     },
     occurredAt,
   );
@@ -329,6 +351,63 @@ export function intentAccepted(
       direction: intent.direction ?? "discharge",
       watts: intent.watts ?? 1000,
       ...(intent.watts_by_unit === undefined ? {} : { watts_by_unit: intent.watts_by_unit }),
+      unit_ids: [...(intent.unit_ids ?? ["MID"])],
+    },
+    occurredAt,
+  );
+}
+
+/**
+ * A lapsed intent's announcement (composition.py `_TrackingIntentRepository`):
+ * the intent's own id, source, direction, fleet total, and units.
+ */
+export function intentExpired(
+  sequence: number,
+  intent: {
+    intent_id?: string;
+    source?: string;
+    direction?: string;
+    watts?: number | null;
+    unit_ids?: readonly string[];
+  } = {},
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<{
+  intent_id: string | null;
+  source: string | null;
+  direction: string | null;
+  watts: number | null;
+  unit_ids: string[];
+}> {
+  return frame(
+    INTENT_EXPIRED,
+    sequence,
+    {
+      intent_id: intent.intent_id ?? `intent-${sequence}`,
+      source: intent.source ?? "manual",
+      direction: intent.direction ?? "discharge",
+      watts: intent.watts ?? 1000,
+      unit_ids: [...(intent.unit_ids ?? ["MID"])],
+    },
+    occurredAt,
+  );
+}
+
+/** A cancellation's announcement (service.py `cancel_intent`). */
+export function intentCancelled(
+  sequence: number,
+  intent: {
+    principal?: string;
+    intent_id?: string;
+    unit_ids?: readonly string[];
+  } = {},
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<{ principal: string; intent_id: string; unit_ids: string[] }> {
+  return frame(
+    INTENT_CANCELLED,
+    sequence,
+    {
+      principal: intent.principal ?? "operator:home",
+      intent_id: intent.intent_id ?? `intent-${sequence}`,
       unit_ids: [...(intent.unit_ids ?? ["MID"])],
     },
     occurredAt,
@@ -548,6 +627,35 @@ export interface WireSnapshot {
    * absent field is today's wire truth); attach it with `withActiveStops`.
    */
   readonly active_stops?: readonly WireActiveStop[];
+  /**
+   * The snapshot-level intent block (PENDING, feature-detected): the live
+   * request's own per-unit figures for cold-load exactness —
+   * `requested_watts_by_unit` (the intent's own `watts_by_unit`; null for a
+   * scalar intent), `authorized_watts_by_unit` (the decision's per-unit
+   * authorized watts), `directions_by_unit` (each unit's winning direction —
+   * a concurrent cycle may run opposite directions). `null` = no active
+   * request; ABSENT (the default, today's wire) = the field has not landed,
+   * and every consumer keeps its current fallbacks.
+   */
+  readonly intent?: WireSnapshotIntent | null;
+}
+
+/** The snapshot `intent` block's object form; every map nullable inside. */
+export interface WireSnapshotIntent {
+  readonly requested_watts_by_unit: Record<string, number> | null;
+  readonly authorized_watts_by_unit: Record<string, number> | null;
+  readonly directions_by_unit: Record<string, string> | null;
+}
+
+/**
+ * Attach the pending intent block to a snapshot world. `null` (no active
+ * request) is a real wire answer, distinct from the field being absent.
+ */
+export function withSnapshotIntent(
+  world: WireSnapshot,
+  intent: WireSnapshotIntent | null,
+): WireSnapshot {
+  return { ...world, intent };
 }
 
 /**
@@ -986,10 +1094,14 @@ export interface WireAuditEvent {
    * own target map (null for scalar intents) and the decision's per-unit
    * authorized watts (null when no batch was minted). Pydantic always
    * serializes both — with null defaults for durable rows written before the
-   * fields existed.
+   * fields existed. A row composed from several concurrent intents (2026-08-24)
+   * correlates to its cycle (`correlation_id: "cycle:..."`) and carries
+   * `intent_id: null` — no single intent can honestly be named — plus each
+   * unit's winning direction in `directions_by_unit`.
    */
   readonly requested_watts_by_unit: Record<string, number> | null;
   readonly authorized_watts_by_unit: Record<string, number> | null;
+  readonly directions_by_unit: Record<string, string> | null;
   readonly request_fingerprint: string;
   readonly response_fingerprint: string;
   readonly result: string;
@@ -1026,6 +1138,7 @@ export function auditEvent(
     authorized_active_w: spec.authorized_active_w ?? 0,
     requested_watts_by_unit: spec.requested_watts_by_unit ?? null,
     authorized_watts_by_unit: spec.authorized_watts_by_unit ?? null,
+    directions_by_unit: spec.directions_by_unit ?? null,
     request_fingerprint: spec.request_fingerprint ?? "a1b2c3d4",
     response_fingerprint: spec.response_fingerprint ?? "e5f6a7b8",
     result: spec.result ?? defaultResultFor(type),

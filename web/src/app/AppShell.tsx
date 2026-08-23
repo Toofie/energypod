@@ -124,7 +124,11 @@ export function AppShell({ views = {} }: AppShellProps): ReactElement {
     >
       <header className="shell-header">
         <p className="brand">EnergyPod</p>
-        <FleetBanner units={data.snapshot?.units ?? []} />
+        <FleetBanner
+          units={data.snapshot?.units ?? []}
+          requestedByUnit={data.unitFigures.requestedByUnit}
+          authorizedByUnit={data.unitFigures.authorizedByUnit}
+        />
         <ConnectionStatusBadge
           health={data.connection}
           secondsSinceUpdate={data.secondsSinceUpdate}

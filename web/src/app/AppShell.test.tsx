@@ -143,6 +143,18 @@ interface FleetView {
    * may change (feature detection).
    */
   active_stops?: ActiveStopView[];
+  /**
+   * The snapshot-level intent block (PENDING backend field): the live
+   * request's own per-unit figures for cold-load exactness. Absent = today's
+   * wire (feature detection); null = no active request.
+   */
+  intent?: SnapshotIntentView | null;
+}
+
+interface SnapshotIntentView {
+  requested_watts_by_unit: Record<string, number> | null;
+  authorized_watts_by_unit: Record<string, number> | null;
+  directions_by_unit: Record<string, string> | null;
 }
 
 interface ActiveStopView {
@@ -735,6 +747,9 @@ describe("AppShell — fleet banner", () => {
       badge: "Active",
     },
     {
+      // One battery carrying a request no other battery shares: the 3,000 W
+      // figure IS that battery's own target (a lone battery's fleet total is
+      // its per-battery figure), and its 1,200 W allowance genuinely limits it.
       description: "limited",
       units: [
         unit({
@@ -744,13 +759,7 @@ describe("AppShell — fleet banner", () => {
           authorized_power: { direction: "discharge", watts: 1200 },
           measured_watts: 1150,
         }),
-        unit({
-          unit_id: "RHS",
-          lifecycle: "active",
-          requested_power: { direction: "discharge", watts: 3000 },
-          authorized_power: { direction: "discharge", watts: 1200 },
-          measured_watts: 1120,
-        }),
+        unit({ unit_id: "RHS", lifecycle: "armed_idle" }),
         unit({ unit_id: "LHS", lifecycle: "armed_idle" }),
       ],
       badge: "Limited",
@@ -823,6 +832,154 @@ describe("AppShell — fleet banner", () => {
     expect(shellBanner.textContent ?? "").not.toMatch(/\b(armed|active)\b/i);
     // The unit list disambiguates: another unit really is disarmed.
     expectVisibleText(document.body, "Disarmed");
+  });
+
+  // --- per-unit truth: the 2026-08-23 false-Limited defect family -------------
+  //
+  // The snapshot's per-unit `requested_power` repeats the intent's FLEET TOTAL
+  // once per covered unit while `authorized_power` is genuinely per-unit, so a
+  // banner that compares the two per battery stamps "Limited" on a dispatch
+  // the safety system authorized in full. "Limited" may only ever be a
+  // battery's OWN target versus its own allowance — from the shared per-unit
+  // maps (bus-fed or, once it lands, the snapshot's `intent` block).
+
+  /** Three active batteries repeating one intent's 3,000 W total, each
+   * authorized its own 1,000 W: authorized in full, NOT limited. */
+  function fleetTotalWorld(): FleetView {
+    return fleet([
+      unit({
+        unit_id: "MID",
+        lifecycle: "active",
+        requested_power: { direction: "discharge", watts: 3000 },
+        authorized_power: { direction: "discharge", watts: 1000 },
+        measured_watts: 990,
+      }),
+      unit({
+        unit_id: "RHS",
+        lifecycle: "active",
+        requested_power: { direction: "discharge", watts: 3000 },
+        authorized_power: { direction: "discharge", watts: 1000 },
+        measured_watts: 980,
+      }),
+      unit({
+        unit_id: "LHS",
+        lifecycle: "active",
+        requested_power: { direction: "discharge", watts: 3000 },
+        authorized_power: { direction: "discharge", watts: 1000 },
+        measured_watts: 970,
+      }),
+    ]);
+  }
+
+  it("never derives Limited from the snapshot's repeated fleet total: a 3 × 1,000 W dispatch authorized in full is Active", async () => {
+    installClient({ snapshot: fleetTotalWorld() });
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+
+    // The shared figure is the intent's total, not any battery's request: no
+    // per-unit comparison exists, so the banner stays at the honest state.
+    expectVisibleText(banner(), "Active");
+    expect(within(banner()).queryByText("Limited")).toBeNull();
+  });
+
+  it("derives Limited from the decision's per-unit maps on the bus — the battery's own target versus its own allowance", async () => {
+    const world = fleetTotalWorld();
+    const channel = streamChannel([snapshotFrame(world)]);
+    const client = {
+      getSnapshot: vi.fn(() => Promise.resolve(world)),
+      getHealth: vi.fn(() => Promise.resolve(HEALTHY)),
+      getAudit: vi.fn(() => Promise.resolve({ events: [], next_cursor: null })),
+      postIntent: vi.fn(),
+      postArm: vi.fn(),
+      postDisarm: vi.fn(),
+      postEmergencyStop: vi.fn(),
+      postStopAcknowledgement: vi.fn(),
+      postInhibitAcknowledgement: vi.fn(),
+      openEvents: vi.fn(() => channel.open()),
+    };
+    createClientMock.mockReturnValue(client as unknown as ApiClient);
+    const user = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(user);
+    expectVisibleText(banner(), "Active");
+
+    // The kernel's cycle summary: each battery's own 1,000 W target, with the
+    // site headroom clamping RHS to 400 W. The banner follows the bus-fed maps.
+    channel.push({
+      type: "audit.appended",
+      sequence: 42,
+      payload: {
+        event_id: "facade-42",
+        event_type: "control_decision",
+        unit_id: null,
+        generation: 9,
+        result: "clamped",
+        reason_codes: ["power_clamped"],
+        requested_active_w: 3000,
+        authorized_active_w: 2400,
+        requested_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        authorized_watts_by_unit: { MID: 1000, RHS: 400, LHS: 1000 },
+        directions_by_unit: { MID: "discharge", RHS: "discharge", LHS: "discharge" },
+      },
+    });
+
+    await waitFor(() => {
+      expectVisibleText(banner(), "Limited");
+    });
+  });
+
+  it("feature-detects the snapshot intent block: exact per-unit figures at cold load, Limited only from a genuine per-unit clamp", async () => {
+    // The block's own figures are the truth at cold load: an authorized-in-full
+    // request stays Active even though the snapshot's repeated total reads 3,000 W.
+    const authorizedInFull: FleetView = {
+      ...fleetTotalWorld(),
+      intent: {
+        requested_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        authorized_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        directions_by_unit: { MID: "discharge", RHS: "discharge", LHS: "discharge" },
+      },
+    };
+    installClient({ snapshot: authorizedInFull });
+    const user = userEvent.setup();
+    const first = render(<AppShell />);
+    await unlockAndLand(user);
+    expectVisibleText(banner(), "Active");
+    first.unmount();
+
+    // A genuine clamp named per battery by the block: RHS's own 1,000 W target
+    // against its own 400 W allowance — that IS Limited, from per-unit truth.
+    const clamped: FleetView = {
+      ...authorizedInFull,
+      units: authorizedInFull.units.map((entry) =>
+        entry.unit_id === "RHS"
+          ? { ...entry, authorized_power: { direction: "discharge", watts: 400 } }
+          : entry,
+      ),
+      intent: {
+        requested_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        authorized_watts_by_unit: { MID: 1000, RHS: 400, LHS: 1000 },
+        directions_by_unit: { MID: "discharge", RHS: "discharge", LHS: "discharge" },
+      },
+    };
+    const channel = streamChannel([snapshotFrame(clamped)]);
+    const client = {
+      getSnapshot: vi.fn(() => Promise.resolve(clamped)),
+      getHealth: vi.fn(() => Promise.resolve(HEALTHY)),
+      getAudit: vi.fn(() => Promise.resolve({ events: [], next_cursor: null })),
+      postIntent: vi.fn(),
+      postArm: vi.fn(),
+      postDisarm: vi.fn(),
+      postEmergencyStop: vi.fn(),
+      postStopAcknowledgement: vi.fn(),
+      postInhibitAcknowledgement: vi.fn(),
+      openEvents: vi.fn(() => channel.open()),
+    };
+    createClientMock.mockReturnValue(client as unknown as ApiClient);
+    const second = userEvent.setup();
+    render(<AppShell />);
+    await unlockAndLand(second);
+    expectVisibleText(banner(), "Limited");
   });
 });
 

@@ -185,6 +185,7 @@ const makeClient = (): ApiClient => ({
   getUnitDetail: vi.fn(),
   getAudit: vi.fn(),
   postIntent: vi.fn(),
+  postIntentCancel: vi.fn(),
   postArm: vi.fn(),
   postDisarm: vi.fn(),
   postEmergencyStop: vi.fn(),

@@ -183,6 +183,13 @@ export interface ApiClient {
     body: Record<string, unknown>,
     idempotencyKey?: string,
   ): Promise<Record<string, unknown>>;
+  /**
+   * Cancel one active intent by its exact id (POST /api/v1/intents/cancel,
+   * body `{intent_id}`): the safety-positive live end of a request. Resolves
+   * with `{intent_id, status, unit_ids}`; a refusal rejects with the envelope
+   * (404 `intent_not_found`, 409 `intent_not_cancelable`).
+   */
+  postIntentCancel(intentId: string, idempotencyKey?: string): Promise<Record<string, unknown>>;
   postArm(unitIds: string[], idempotencyKey?: string): Promise<Record<string, unknown>>;
   postDisarm(unitIds: string[], idempotencyKey?: string): Promise<Record<string, unknown>>;
   postEmergencyStop(
@@ -450,6 +457,12 @@ export function createApiClient(token: string): ApiClient {
       request<Record<string, unknown>>("/api/v1/intents", {
         method: "POST",
         body,
+        idempotencyKey: withKey(idempotencyKey),
+      }),
+    postIntentCancel: (intentId: string, idempotencyKey?: string) =>
+      request<Record<string, unknown>>("/api/v1/intents/cancel", {
+        method: "POST",
+        body: { intent_id: intentId },
         idempotencyKey: withKey(idempotencyKey),
       }),
     postArm: (unitIds: string[], idempotencyKey?: string) =>

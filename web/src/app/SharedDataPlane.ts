@@ -313,6 +313,8 @@ export function sharedClient(plane: SharedDataPlane, real: ApiClient): ApiClient
     getUnitDetail: (unitId) => real.getUnitDetail(unitId),
     getAudit: (limit, afterSequence) => real.getAudit(limit, afterSequence),
     postIntent: (body, idempotencyKey) => real.postIntent(body, idempotencyKey),
+    postIntentCancel: (intentId, idempotencyKey) =>
+      real.postIntentCancel(intentId, idempotencyKey),
     postArm: (unitIds, idempotencyKey) => real.postArm(unitIds, idempotencyKey),
     postDisarm: (unitIds, idempotencyKey) => real.postDisarm(unitIds, idempotencyKey),
     postEmergencyStop: (unitIds, reason, idempotencyKey) =>
