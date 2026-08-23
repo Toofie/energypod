@@ -140,8 +140,14 @@ def _json_value(value: Any) -> Any:
         if any(type(key) is not str for key in value):
             raise TypeError("JSON object keys must be strings")
         return {key: _json_value(item) for key, item in value.items()}
-    if isinstance(value, tuple | list | set | frozenset):
+    if isinstance(value, tuple | list):
         return [_json_value(item) for item in value]
+    if isinstance(value, set | frozenset):
+        # A set's iteration order is process-randomized (string hashing), so
+        # an unordered encode would persist different bytes for the same
+        # event in different processes.  Order by repr: deterministic for
+        # any mix of stored types without requiring comparability.
+        return [_json_value(item) for item in sorted(value, key=repr)]
     return value
 
 

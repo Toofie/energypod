@@ -424,6 +424,19 @@ def test_sqlite_audit_append_query_is_durable_ordered_and_filterable(tmp_path: P
         reopened.close()
 
 
+def test_sqlite_json_encoding_of_sets_is_deterministic() -> None:
+    # CONTINUITY deferred P2: a set's iteration order is process-randomized
+    # (string hash randomization), so an unordered encode persisted different
+    # bytes for the same event value in different processes.  Sets encode in
+    # sorted (repr) order; sequences keep the caller's order.
+    from energypod.adapters.persistence.sqlite import _json_value
+
+    codes = frozenset({"PCS_Warning0_1", "DCDC_Warning0_1", "BMS_CRITICAL"})
+    assert _json_value(codes) == ["BMS_CRITICAL", "DCDC_Warning0_1", "PCS_Warning0_1"]
+    assert _json_value(set(codes)) == _json_value(frozenset(codes))
+    assert _json_value((3, 1, 2)) == [3, 1, 2]
+
+
 def test_audit_event_ids_are_append_only_and_unique(tmp_path: Path) -> None:
     """T-UNIT-REPO-011 / INV-AUDIT-001 / S1."""
     database = _open_database(tmp_path / "audit.sqlite3")
