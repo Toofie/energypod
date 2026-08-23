@@ -501,9 +501,7 @@ class SimulatedEnergyPod:
         words[1] = 3  # PCS status: on grid
         # Run mode: 1 "Remote PQ Power" while ANY writer's objective holds the
         # lease -- ours, or the night-writer scenario's foreign words.
-        words[2] = (
-            1 if self._lease_deadline_mono is not None or self._scripted_objective else 0
-        )
+        words[2] = 1 if self._lease_deadline_mono is not None or self._scripted_objective else 0
         words[3] = pack_voltage_counts  # DC voltage x0.1 V
         words[13] = measured_word  # PCS active power, int16 W
         # Advisory per-pod CT words (PROTOCOL_EVIDENCE 4c), scripted scenario

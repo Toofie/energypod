@@ -1368,5 +1368,6 @@ async def test_quiet_tiers_publish_nothing_at_all() -> None:
             now_mono=now,
         )
 
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(drain(subscription, 1), timeout=0.05)
+    # The drain helper settles without hanging on an idle stream: an empty
+    # list IS the "nothing was published" verdict.
+    assert await drain(subscription, 1) == []

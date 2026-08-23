@@ -50,6 +50,7 @@ from energypod.domain.audit import AuditEvent
 from .arbiter import IntentArbiter
 from .energy import EnergyScorecardRefusal
 from .excess_charge import ExcessChargingRefusal
+from .foreign_objective import empty_objective_entry
 from .scheduling import (
     SchedulePolicy,
     SchedulePublishValidationError,
@@ -147,6 +148,40 @@ _TELEMETRY_SUMMARY_FIELDS: Final[tuple[str, ...]] = (
     "run_mode_w",
 )
 
+# API_CONTRACTS "Night-writer detector": the COMPACT per-unit summary the
+# snapshot and health views carry (the full evidence record is the
+# observed-objectives route's shape).  The window spelling the route accepts:
+# ``Nh``/``Nd``, 1..168 hours inclusive.
+_OBJECTIVE_SUMMARY_FIELDS: Final[tuple[str, ...]] = (
+    "observed_at",
+    "active_w",
+    "reactive_var",
+    "classification",
+    "reason",
+)
+_OBJECTIVE_WINDOW_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^(?P<count>[0-9]{1,3})(?P<unit>h|d)$"
+)
+_OBJECTIVE_WINDOW_MIN_HOURS: Final[int] = 1
+_OBJECTIVE_WINDOW_MAX_HOURS: Final[int] = 168
+
+
+def parse_objective_window_hours(last: str) -> int:
+    """Parse the observed-objectives window spelling into hours.
+
+    ``24h`` -> 24, ``7d`` -> 168; anything outside ``1..168`` hours or the
+    ``Nh``/``Nd`` shape is a validation error naming the ``last`` field.
+    """
+    match = _OBJECTIVE_WINDOW_PATTERN.fullmatch(str(last))
+    if match is None:
+        raise ValueError(f"last must be an Nh/Nd window spelling, got {last!r}")
+    count = int(match.group("count"))
+    hours = count * 24 if match.group("unit") == "d" else count
+    if not _OBJECTIVE_WINDOW_MIN_HOURS <= hours <= _OBJECTIVE_WINDOW_MAX_HOURS:
+        raise ValueError(f"last must be between 1h and 168h, got {last!r}")
+    return hours
+
+
 # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the advisory
 # CT power words stay OUTSIDE every ordinary quality judgment.  The fleet
 # view's aggregate quality therefore judges only the safety-critical fields;
@@ -229,6 +264,23 @@ class RecoveryView(Protocol):
     """
 
     async def unit_health_states(self) -> Mapping[str, Any]: ...
+
+
+class ForeignObjectiveView(Protocol):
+    """The night-writer detector's read projection (API_CONTRACTS
+    "Night-writer detector").
+
+    ``energypod.application.foreign_objective.ForeignObjectiveMonitor`` is
+    the composed implementation.  Pure in-memory projection reads: the
+    facade adds the per-unit snapshot/health summary and serves the window
+    characterization route, and NOTHING on this surface mutates anything.  An
+    unavailable or failing view degrades to explicit nulls -- evidence must
+    never gate a read.
+    """
+
+    def unit_last_observed(self, unit_id: str) -> Mapping[str, Any] | None: ...
+
+    def window_payload(self, *, last_hours: int) -> dict[str, Any]: ...
 
 
 class ExcessChargingControl(Protocol):
@@ -928,6 +980,7 @@ class EnergyServiceFacade:
         coordinator: GenerationCoordinator,
         actors: Mapping[str, ActorHandle],
         recovery: RecoveryView | None = None,
+        objectives: ForeignObjectiveView | None = None,
         excess: ExcessChargingControl | None = None,
         schedules: ScheduleSurface | None = None,
         energy: EnergyScorecardSurface | None = None,
@@ -950,6 +1003,7 @@ class EnergyServiceFacade:
         self._coordinator = coordinator
         self._actors = handles
         self._recovery = recovery
+        self._objectives = objectives
         self._excess = excess
         self._schedules = schedules
         self._energy = energy
@@ -1089,6 +1143,9 @@ class EnergyServiceFacade:
                 {
                     "unit_id": unit_id,
                     **_health_projection(recovery_states, unit_id, summary_field="reasons"),
+                    # API_CONTRACTS "Night-writer detector": the same compact
+                    # per-unit summary rides the health view.
+                    "last_objective_observed": self._last_objective_summary(unit_id),
                 }
                 for unit_id in self._actors
             ],
@@ -1168,6 +1225,33 @@ class EnergyServiceFacade:
                 "the energy scorecard is not composed on this site",
             )
         return surface.days_payload(limit)
+
+    async def get_observed_objectives(
+        self, *, principal: Principal, last: str = "24h"
+    ) -> dict[str, Any]:
+        """API_CONTRACTS "Night-writer detector": the observed-objectives read.
+
+        Observe scope; ``last`` is the ``Nh``/``Nd`` window spelling (1..168
+        hours, default ``24h``) -- anything else is a ValueError the boundary
+        maps to 422.  The detector composes ALWAYS, so an unwired view (never
+        the case in production) still answers the per-unit shape with
+        explicit nulls, never a refusal.  Pure read: no mutation exists on
+        this surface.
+        """
+        self._admit(principal, "observe")
+        hours = parse_objective_window_hours(last)
+        view = self._objectives
+        if view is None:
+            return {
+                "as_of": self._clock.wall_now().isoformat(),
+                "last": last,
+                "window_s": hours * 3600,
+                "units": [empty_objective_entry(unit_id) for unit_id in self._actors],
+            }
+        payload = dict(view.window_payload(last_hours=hours))
+        payload["last"] = last
+        payload["window_s"] = hours * 3600
+        return payload
 
     # --- mutations ----------------------------------------------------------
 
@@ -2577,6 +2661,11 @@ class EnergyServiceFacade:
             # reasons, and -- only where a wedge is proven -- the honest
             # terminal remediation hint.
             **_health_projection(recovery_states, unit_id, summary_field="health_reasons"),
+            # Night-writer detector: the per-unit COMPACT last-objective
+            # summary (the full evidence record lives on the
+            # observed-objectives route).  Null before any recorded sample --
+            # never fabricated, never a gate.
+            "last_objective_observed": self._last_objective_summary(unit_id),
         }
 
     async def _intent_projection(
@@ -2703,6 +2792,26 @@ class EnergyServiceFacade:
             return await self._recovery.unit_health_states()
         except Exception:
             return None
+
+    def _last_objective_summary(self, unit_id: str) -> dict[str, Any] | None:
+        """The detector's COMPACT five-key per-unit summary, null on absence.
+
+        An unwired or failing view is the explicit unknown -- evidence never
+        gates a read, and nothing is fabricated.
+        """
+        view = self._objectives
+        if view is None:
+            return None
+        try:
+            record = view.unit_last_observed(unit_id)
+        except Exception:
+            return None
+        if not isinstance(record, Mapping):
+            return None
+        summary = {key: record.get(key) for key in _OBJECTIVE_SUMMARY_FIELDS}
+        if any(summary[key] is None and key != "reason" for key in _OBJECTIVE_SUMMARY_FIELDS):
+            return None
+        return summary
 
     async def _control_readiness_reasons(
         self, recovery_states: Mapping[str, Any] | None = None

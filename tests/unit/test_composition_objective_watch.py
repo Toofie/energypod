@@ -215,9 +215,14 @@ async def test_the_commissioned_nightly_writer_stays_quiet_and_characterized(
             assert entry["sample_count"] >= 3, entry
             assert entry["min_active_w"] == -2500
             assert entry["foreign_active"] is False, entry
+            # The very first sample of the first-sampled unit cannot
+            # corroborate a fleet pattern yet (nobody else has sampled); from
+            # the first synchronized round on, every sample is the writer.
             assert (
-                entry["classification_counts"]["expected_nightly_charge"] == entry["sample_count"]
+                entry["classification_counts"]["expected_nightly_charge"]
+                >= entry["sample_count"] - 1
             ), entry
+            assert entry["classification_counts"]["foreign_objective_observed"] == 0, entry
         assert _detector_events(runtime) == []
         alerts = [
             body
@@ -282,8 +287,9 @@ async def test_a_unit_claimed_by_our_own_intent_is_never_sampled(tmp_path: Path)
             lambda: runtime.actors["mid"].lifecycle.value == "active",
             message="mid never went active under the claim",
         )
-        # Hold the claim for well past several sample intervals.
-        for _ in range(200):
+        # Hold the claim for several sample intervals, well inside the 8 s
+        # TTL (the 0.40 s control period advances ~1 cycle per pump yield).
+        for _ in range(12):
             await asyncio.sleep(0)
 
         view = runtime.foreign_objective.window_payload(last_hours=24)

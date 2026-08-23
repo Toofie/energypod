@@ -103,6 +103,10 @@ from energypod.application.excess_charge import (
     ExcessChargeSettings,
     eligible_export_charge_w,
 )
+from energypod.application.foreign_objective import (
+    ForeignObjectiveMonitor,
+    ForeignObjectiveSettings,
+)
 from energypod.application.generation import AuthorityGenerationCoordinator
 from energypod.application.recovery import (
     CONNECT_FAILED,
@@ -1837,6 +1841,7 @@ class _Supervision:
         intents: _AsyncIntentRepository | None = None,
         observations: _AsyncObservationRepository | None = None,
         recovery: RecoveryMonitor | None = None,
+        foreign_objective: ForeignObjectiveMonitor | None = None,
         schedule_runner: ScheduleRunner | None = None,
         energy_accountant: EnergyAccountant | None = None,
     ) -> None:
@@ -1868,6 +1873,10 @@ class _Supervision:
         self._intents_port = intents
         self._observations_port = observations
         self._recovery = recovery
+        # Night-writer detector (API_CONTRACTS "Night-writer detector"): the
+        # passive foreign-objective watch, driven by the same bounded pass
+        # shape one step after the recovery pass.
+        self._foreign_objective = foreign_objective
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
@@ -2027,6 +2036,16 @@ class _Supervision:
                     self._observe_recovery(authorized, tuple(outcomes)),
                     timeout=self._interval_s,
                 )
+            # Night-writer detector: one bounded, fully suppressed observation
+            # pass after the polls and the recovery pass (API_CONTRACTS
+            # "Supervision driving") -- zero extra frames, a failed sample a
+            # gap, never an alarm.
+            if self._foreign_objective is not None:
+                with contextlib.suppress(Exception, asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        self._observe_foreign_objectives(authorized, tuple(outcomes)),
+                        timeout=self._interval_s,
+                    )
             if self._schedule_runner is not None:
                 # DESIGN_SCHEDULES §2 (ordering pinned): one bounded schedule
                 # tick per fleet cycle, AFTER the polls and recovery pass and
@@ -2233,6 +2252,50 @@ class _Supervision:
         except Exception:
             return ECHO_UNREADABLE, None, None
 
+    async def _observe_foreign_objectives(
+        self,
+        authorized: Mapping[str, tuple[int, str | None] | None],
+        outcomes: Sequence[str],
+    ) -> None:
+        """The night-writer detector's one pass: fresh words in, evidence out.
+
+        Exactly the recovery pass's shape (per-unit, fully suppressed, driven
+        by the loop alone): a unit whose poll failed contributes no
+        observation, and the claim set comes from the same intents port --
+        a read failure treats every unit as claimed so nothing is recorded
+        as uncommanded (fail-safe for evidence).
+        """
+        monitor = self._foreign_objective
+        if monitor is None or self._intents_port is None or self._observations_port is None:
+            return
+        now_mono = float(self._clock.monotonic())
+        try:
+            active = await self._intents_port.active(now_mono)
+            claimed = frozenset(
+                unit_id
+                for intent in active
+                for unit_id in (getattr(intent, "selected_unit_ids", ()) or ())
+            )
+        except Exception:
+            claimed = None
+        for index, actor in enumerate(self._actors):
+            unit_id = actor.unit_id
+            held = authorized.get(unit_id)
+            observation = None
+            if outcomes[index] == READ_OK:
+                with contextlib.suppress(Exception):
+                    observation = await self._observations_port.latest(unit_id)
+            is_claimed = True if claimed is None else unit_id in claimed
+            with contextlib.suppress(Exception):
+                await monitor.observe_cycle(
+                    unit_id,
+                    lifecycle=actor.lifecycle,
+                    claimed=is_claimed,
+                    authorized_watts=0 if held is None else held[0],
+                    observation=observation,
+                    now_mono=now_mono,
+                )
+
     async def _record_suppressed_heartbeat(
         self, actor: EnergyPodActor, error: BaseException
     ) -> None:
@@ -2398,6 +2461,28 @@ def _recovery_settings(config: ControllerConfig) -> RecoverySettings:
     )
 
 
+def _foreign_objective_settings(config: ControllerConfig) -> ForeignObjectiveSettings:
+    """The night-writer detector's knobs, the recovery-settings pattern: the
+    policy keys when a policy is configured, the pinned defaults (including
+    the STRICT no-expected-writer posture) otherwise.  The autonomy band is
+    the same commissioned envelope the recovery layer consumes.
+
+    Detection only: no control path consumes these values.
+    """
+    configured = config.policy
+    if configured is None:
+        return ForeignObjectiveSettings()
+    band_low, band_high = configured.expected_autonomy_band_w
+    return ForeignObjectiveSettings(
+        sample_interval_s=float(configured.foreign_objective_sample_interval_s),
+        sustained_samples=configured.foreign_objective_sustained_samples,
+        self_charge_class_w=configured.foreign_objective_self_charge_class_w,
+        handback_grace_s=float(configured.foreign_objective_handback_grace_s),
+        expected_charge_w=configured.foreign_objective_expected_charge_w,
+        expected_autonomy_band_w=(band_low, band_high),
+    )
+
+
 def _control_policy(config: ControllerConfig) -> ControlPolicy:
     """Derive the strict domain policy; heartbeat follows ``control_period_s``.
 
@@ -2559,6 +2644,11 @@ class ComposedRuntime:
     # monitor (detection only — audit facts, bus events, and the derived
     # per-unit health view the facade projects).
     recovery: RecoveryMonitor | None = None
+    # API_CONTRACTS "Night-writer detector": the composed foreign-objective
+    # monitor (detection only — always composed, evidence records, the alert
+    # tier's one audit fact and bus event, and the window characterization
+    # the facade serves through GET /api/v1/objectives/observed).
+    foreign_objective: ForeignObjectiveMonitor | None = None
     # API_CONTRACTS "Excess-solar accelerated charging (advisory)": composed
     # only when the configuration enables the feature; None otherwise.
     excess_adviser: ExcessChargeAdviser | None = None
@@ -2949,6 +3039,21 @@ def _build_runtime(
         process_origin_mono=process_origin_mono,
         configuration_version=config.revision,
     )
+    # --- night-writer detector (API_CONTRACTS "Night-writer detector") ---
+    # Composed ALWAYS -- observe-only, write-enabled, and simulate alike: it
+    # is read-only evidence machinery over words the read plan already
+    # serves, and no config block exists for it (only the defaulted policy
+    # keys above).  Passive like the recovery monitor.
+    foreign_objective_monitor = ForeignObjectiveMonitor(
+        unit_ids=unit_ids,
+        settings=_foreign_objective_settings(config),
+        clock=resolved_clock,
+        audit=audit_port,
+        bus=bus,
+        process_instance_id=process_instance_id,
+        process_origin_mono=process_origin_mono,
+        configuration_version=config.revision,
+    )
     # --- excess-solar projection controller (P6: block PRESENT composes) ---
     # Built BEFORE the facade (the facade projects and toggles through it)
     # and BEFORE the adviser (the adviser consumes its participation verdict
@@ -3046,6 +3151,7 @@ def _build_runtime(
         coordinator=coordinator,
         actors={unit_id: _ActorCommandHandle(actor) for unit_id, actor in actors.items()},
         recovery=recovery_monitor,
+        objectives=foreign_objective_monitor,
         excess=excess_controller,
         schedules=schedule_surface,
         energy=energy_surface,
@@ -3206,6 +3312,7 @@ def _build_runtime(
         observations=observation_port,
         schedule_runner=schedule_runner,
         recovery=recovery_monitor,
+        foreign_objective=foreign_objective_monitor,
         energy_accountant=energy_accountant,
     )
     global _LAST_SUPERVISION
@@ -3231,6 +3338,7 @@ def _build_runtime(
         mcp_server_factory=mcp_server_factory,
         simulators=simulators,
         recovery=recovery_monitor,
+        foreign_objective=foreign_objective_monitor,
         excess_adviser=excess_adviser,
         excess_controller=excess_controller,
         schedule_surface=schedule_surface,

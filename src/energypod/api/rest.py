@@ -76,6 +76,7 @@ class EnergyService(Protocol):
     async def get_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
     async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_energy_days(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_observed_objectives(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
 class EventSource(Protocol):
@@ -1011,6 +1012,26 @@ def create_api_app(
             return await service.get_energy_days(principal=identity, limit=limit)
         except EnergyScorecardRefusal as exc:
             raise BoundaryError(409, exc.code, exc.message) from exc
+
+    @app.get(f"{API_PREFIX}/objectives/observed")
+    async def get_observed_objectives(
+        last: str = Query(default="24h", pattern=r"^[0-9]{1,3}(h|d)$"),
+        identity: Principal = observe_dependency,
+    ) -> Any:
+        """API_CONTRACTS "Night-writer detector": the observed-objectives read.
+
+        Observe scope; ``last`` is the ``Nh``/``Nd`` window spelling
+        (1..168 hours inclusive, default ``24h``) -- a malformed spelling is
+        a 422 here, a well-formed but out-of-bounds one a 422 from the
+        facade's parser.  The night window's characterization (per-unit
+        first/last seen, min/typ/max, sign and classification counts,
+        foreign episodes).  Read-only evidence machinery: no mutation exists
+        on this surface.
+        """
+        try:
+            return await service.get_observed_objectives(principal=identity, last=last)
+        except ValueError as exc:
+            raise BoundaryError(422, "validation_error", str(exc)) from exc
 
     @app.post(f"{API_PREFIX}/events/session")
     async def create_events_session(

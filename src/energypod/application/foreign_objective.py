@@ -92,6 +92,36 @@ _PRINCIPAL = "energypod:foreign-objective"
 _POLICY_VERSION = "foreign_objective"
 
 
+def empty_objective_entry(unit_id: str) -> dict[str, Any]:
+    """The per-unit characterization shape with nothing recorded yet.
+
+    One implementation shared by the monitor's window payload and the
+    facade's uncomposed degradation path, so the route's shape never depends
+    on whether a detector is wired behind it.
+    """
+    return {
+        "unit_id": unit_id,
+        "first_seen_at": None,
+        "last_seen_at": None,
+        "sample_count": 0,
+        "charge_sample_count": 0,
+        "discharge_sample_count": 0,
+        "min_active_w": None,
+        "typical_active_w": None,
+        "max_active_w": None,
+        "classification_counts": {
+            CLASS_POD_AUTONOMY: 0,
+            CLASS_EXPECTED_NIGHTLY: 0,
+            CLASS_HANDBACK: 0,
+            CLASS_FOREIGN: 0,
+        },
+        "foreign_episode_count": 0,
+        "foreign_active": False,
+        "foreign_reason": None,
+        "last_objective_observed": None,
+    }
+
+
 def _fingerprint(facts: Mapping[str, Any]) -> str:
     encoded = json.dumps(
         dict(facts), sort_keys=True, separators=(",", ":"), allow_nan=False
@@ -530,27 +560,7 @@ class ForeignObjectiveMonitor:
 
     @staticmethod
     def _empty_entry(unit_id: str) -> dict[str, Any]:
-        return {
-            "unit_id": unit_id,
-            "first_seen_at": None,
-            "last_seen_at": None,
-            "sample_count": 0,
-            "charge_sample_count": 0,
-            "discharge_sample_count": 0,
-            "min_active_w": None,
-            "typical_active_w": None,
-            "max_active_w": None,
-            "classification_counts": {
-                CLASS_POD_AUTONOMY: 0,
-                CLASS_EXPECTED_NIGHTLY: 0,
-                CLASS_HANDBACK: 0,
-                CLASS_FOREIGN: 0,
-            },
-            "foreign_episode_count": 0,
-            "foreign_active": False,
-            "foreign_reason": None,
-            "last_objective_observed": None,
-        }
+        return empty_objective_entry(unit_id)
 
     def _advance_streaks(
         self, record: _UnitRecord, sample: ObjectiveSample, pv_evidence: bool
@@ -631,7 +641,7 @@ class ForeignObjectiveMonitor:
         record.episode_open = True
         record.episode_reason = reason
         sample = record.samples[-1]
-        facts = sample.payload() | {"pv_evidence": pv_evidence}
+        facts = {"unit_id": record.unit_id} | sample.payload() | {"pv_evidence": pv_evidence}
         del reopened  # ordering in the audit trail distinguishes a re-alert
         with contextlib.suppress(Exception):
             await self._audit.append(

@@ -403,7 +403,16 @@ class RecordingEnergyService:
         self.calls.append(("get_observed_objectives", {"principal": principal, "last": last}))
         if self.observed_objectives_error is not None:
             raise self.observed_objectives_error
-        return dict(self.observed_objectives_view)
+        # The production facade parses the window before reading; the fake
+        # applies the same parser so the boundary's 422 mapping is exercised
+        # against the real rule (one implementation, zero drift).
+        from energypod.application.service import parse_objective_window_hours
+
+        hours = parse_objective_window_hours(last)
+        payload = dict(self.observed_objectives_view)
+        payload["last"] = last
+        payload["window_s"] = hours * 3600
+        return payload
 
     async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("replace_schedule", kwargs))
