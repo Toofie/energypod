@@ -55,6 +55,7 @@ import {
   auditEvent,
   auditPage,
   emptyUnitDetail,
+  energyToday,
   observationPublished,
   snapshot,
   snapshotFrame,
@@ -63,9 +64,11 @@ import {
   unitHealthChanged,
   unitSnapshot,
   unitUnexpectedAutonomy,
+  withEnergyToday,
   withHealth,
   withInhibit,
   withSnapshotIntent,
+  type WireEnergyToday,
   type WireSnapshot,
   type WireUnitDetail,
   type WireUnitSnapshot,
@@ -1761,5 +1764,142 @@ describe("BatteriesView — the per-unit recovery health badge", () => {
     });
     expect(container.querySelectorAll(".unit-health")).toHaveLength(0);
     expect(container.textContent).not.toContain("Uncommanded activity");
+  });
+});
+
+describe("BatteriesView — the energy scorecard's per-unit figures (DESIGN_ENERGY_SCORECARD §8 W-C)", () => {
+  /** The healthy world carrying the pending energy_today block. */
+  function energyWorld(today: WireEnergyToday): WireSnapshot {
+    return withEnergyToday(HEALTHY_SNAPSHOT, today);
+  }
+
+  it("renders no per-card energy row at all while the snapshot carries no energy_today", async () => {
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
+    client.openEvents.mockReturnValue(openStream(fleetEvents(HEALTHY_SNAPSHOT)));
+    renderView(client);
+    const mid = await screen.findByRole("group", { name: "MID" });
+    expect(mid.textContent).not.toMatch(/today \(so far\)/i);
+  });
+
+  it("carries each battery's charged/discharged TODAY on its card, honestly labeled", async () => {
+    const client = makeClient();
+    const world = energyWorld(
+      energyToday({
+        date: "2026-08-26",
+        units: {
+          MID: {
+            grid_import_kwh: 1.2,
+            grid_export_kwh: 6.8,
+            battery_charged_kwh: 3.4,
+            battery_discharged_kwh: 0.7,
+            load_kwh: 5.1,
+            charged_from_surplus_kwh: 3.1,
+            coverage_pct: 99.4,
+            metric_flags: [],
+          },
+          RHS: {
+            grid_import_kwh: 2,
+            grid_export_kwh: 3,
+            battery_charged_kwh: null,
+            battery_discharged_kwh: 1.5,
+            load_kwh: 4,
+            charged_from_surplus_kwh: null,
+            coverage_pct: null,
+            metric_flags: ["counter_reset_observed"],
+          },
+        },
+      }),
+    );
+    // The stream's opening snapshot frame carries the same world: it would
+    // otherwise overwrite the REST read's energy block moments later.
+    client.getSnapshot.mockResolvedValue(world);
+    client.openEvents.mockReturnValue(openStream(fleetEvents(world)));
+    renderView(client);
+
+    const mid = await screen.findByRole("group", { name: "MID" });
+    expect(mid.textContent).toContain("Today (so far): charged 3.4 kWh, discharged 0.7 kWh");
+    const rhs = screen.getByRole("group", { name: "RHS" });
+    // A null figure names the gap — never 0 — and the reset marker rides it.
+    expect(rhs.textContent).toContain("Today (so far): charged not available, discharged 1.5 kWh");
+    expect(rhs.textContent).toContain("a counter was reset during the day");
+    // A unit the record does not carry yet says so (LHS is absent above).
+    const lhs = screen.getByRole("group", { name: "LHS" });
+    expect(lhs.textContent).toContain("Today (so far): no figures for this battery yet today");
+  });
+
+  it("carries charged-from-surplus on the summary when the day attributes it to this battery", async () => {
+    const client = makeClient();
+    const world = energyWorld(
+      energyToday({
+        units: {
+          MID: {
+            grid_import_kwh: 1.2,
+            grid_export_kwh: 6.8,
+            battery_charged_kwh: 3.4,
+            battery_discharged_kwh: 0.7,
+            load_kwh: 5.1,
+            charged_from_surplus_kwh: 3.1,
+            coverage_pct: 99.4,
+            metric_flags: [],
+          },
+        },
+      }),
+    );
+    client.getSnapshot.mockResolvedValue(world);
+    client.getUnitDetail.mockResolvedValue(unitDetail("MID"));
+    client.openEvents.mockReturnValue(openStream(fleetEvents(world)));
+    renderView(client);
+
+    await userEvent.click((await screen.findByRole("group", { name: "MID" })).querySelector("button")!);
+    const summary = await screen.findByRole("tabpanel");
+    expect(summary.textContent).toContain("Charged from solar surplus today: 3.1 kWh");
+    expect(summary.textContent).toContain("would have been exported");
+  });
+
+  it("renders the six lifetime readthroughs with the NEUTRAL grid A/B naming and the PV note", async () => {
+    const client = makeClient();
+    const world = energyWorld(energyToday({ units: {} }));
+    client.getSnapshot.mockResolvedValue(world);
+    client.getUnitDetail.mockResolvedValue(unitDetail("MID"));
+    client.openEvents.mockReturnValue(openStream(fleetEvents(world)));
+    renderView(client);
+
+    await userEvent.click((await screen.findByRole("group", { name: "MID" })).querySelector("button")!);
+    const summary = await screen.findByRole("tabpanel");
+    // The 2026-08-22 capture's decoded counters, verbatim (field-mapping §2.7).
+    expect(summary.textContent).toContain("Grid counter A: 9,709.2 kWh");
+    expect(summary.textContent).toContain("Grid counter B: 3,187.7 kWh");
+    expect(summary.textContent).toContain("House load: 3,789.4 kWh");
+    expect(summary.textContent).toContain("Solar (PV) counter: 0 kWh");
+    expect(summary.textContent).toContain("not a measurement of the site's panels");
+    expect(summary.textContent).toContain("Battery charged: 3,567.2 kWh");
+    expect(summary.textContent).toContain("Battery discharged: 5,678.9 kWh");
+    // THE PIN: the A/B pair is never labeled bought/sold here.
+    expect(summary.textContent).toContain('which one is "bought" is not labeled here');
+    expect(summary.textContent ?? "").not.toMatch(/counter [AB] (is|=) (bought|sold)/i);
+  });
+
+  it("names an unserved energy block honestly — not available, never 0", async () => {
+    const client = makeClient();
+    const world = energyWorld(energyToday({ units: {} }));
+    client.getSnapshot.mockResolvedValue(world);
+    client.getUnitDetail.mockResolvedValue(
+      unitDetail("MID", {
+        energy_grid_a_kwh: null,
+        energy_grid_b_kwh: null,
+        energy_load_kwh: null,
+        energy_pv_kwh: null,
+        energy_charge_kwh: null,
+        energy_discharge_kwh: null,
+      }),
+    );
+    client.openEvents.mockReturnValue(openStream(fleetEvents(world)));
+    renderView(client);
+
+    await userEvent.click((await screen.findByRole("group", { name: "MID" })).querySelector("button")!);
+    const summary = await screen.findByRole("tabpanel");
+    expect(summary.textContent).toContain("Grid counter A: not available");
+    expect(summary.textContent).toContain("Battery discharged: not available");
   });
 });

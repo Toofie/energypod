@@ -194,3 +194,26 @@ button:focus-visible {
   background: #fdf8ee;
   font-weight: 600;
 }
+
+/* --- the energy scorecard's per-card figures (DESIGN_ENERGY_SCORECARD §8 W-C) --- */
+
+.today-energy {
+  font-variant-numeric: tabular-nums;
+}
+
+.surplus-energy {
+  font-variant-numeric: tabular-nums;
+}
+
+.lifetime-energy ul {
+  margin: 0.25rem 0;
+  padding-left: 1.1rem;
+  font-variant-numeric: tabular-nums;
+  color: #57534e;
+}
+
+.lifetime-energy-note {
+  margin: 0.2rem 0 0;
+  font-size: 0.85rem;
+  color: #78716c;
+}

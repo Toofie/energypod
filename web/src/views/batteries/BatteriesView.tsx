@@ -72,8 +72,18 @@ import {
   type UnitHealth,
   type WattsByUnit,
 } from "../../app/fleet";
+import {
+  GRID_COUNTER_A_LABEL,
+  GRID_COUNTER_B_LABEL,
+  PV_READTHROUGH_NOTE,
+  kwhText,
+  toEnergyToday,
+  type EnergyToday,
+  type EnergyUnitDay,
+} from "../../app/energy";
 import { UnitHealthTag } from "../../app/unitHealth";
 import {
+  formatKilowattHours,
   formatMillivolts,
   formatPercent,
   formatTemp,
@@ -172,6 +182,18 @@ interface UnitDetailView {
   readonly cellVoltages: readonly number[];
   readonly temperatures: readonly number[];
   readonly quality: Readonly<Record<string, string>>;
+  /**
+   * The six cumulative-energy readthroughs (PENDING on the wire): lifetime
+   * kWh counters, null when the `0x4101` energy block was not served —
+   * never zero-filled. The grid pair keeps its NEUTRAL A/B names: which
+   * counter is "bought" is evidence-open (A-1), so the rows never say.
+   */
+  readonly energyGridAKwh: number | null;
+  readonly energyGridBKwh: number | null;
+  readonly energyLoadKwh: number | null;
+  readonly energyPvKwh: number | null;
+  readonly energyChargeKwh: number | null;
+  readonly energyDischargeKwh: number | null;
 }
 
 type DetailPhase = "loading" | "ready" | "error";
@@ -181,6 +203,12 @@ interface FleetState {
   sequence: number;
   capturedAt: string;
   units: ViewUnit[];
+  /**
+   * The snapshot's top-level `energy_today` block (PENDING, feature-detected):
+   * null when the field is absent — the scorecard is not composed here and no
+   * per-card energy row renders at all.
+   */
+  energyToday: EnergyToday | null;
 }
 
 /** What one `observation.published` frame proves about a unit. */
@@ -588,6 +616,12 @@ function parseUnitDetail(raw: unknown): UnitDetailView | null {
     cellVoltages: parseNumberArray(raw.cell_voltages_v),
     temperatures: parseNumberArray(raw.temperatures_c),
     quality: parseQualityMap(raw.quality),
+    energyGridAKwh: parseNumber(raw.energy_grid_a_kwh),
+    energyGridBKwh: parseNumber(raw.energy_grid_b_kwh),
+    energyLoadKwh: parseNumber(raw.energy_load_kwh),
+    energyPvKwh: parseNumber(raw.energy_pv_kwh),
+    energyChargeKwh: parseNumber(raw.energy_charge_kwh),
+    energyDischargeKwh: parseNumber(raw.energy_discharge_kwh),
   };
 }
 
@@ -635,6 +669,9 @@ function parseSnapshot(raw: unknown): FleetState | null {
     sequence: parseNumber(raw.snapshot_sequence) ?? 0,
     capturedAt: typeof raw.captured_at === "string" ? raw.captured_at : "",
     units,
+    // Feature detection: an absent `energy_today` (today's backend) is null —
+    // no per-card energy row renders at all.
+    energyToday: isRecord(raw.energy_today) ? toEnergyToday(raw.energy_today) : null,
   };
 }
 
@@ -718,8 +755,34 @@ function toErrorView(error: unknown): ErrorView {
 interface FleetCardProps {
   unit: ViewUnit;
   observation: ObservationTrack | undefined;
+  /**
+   * The snapshot's `energy_today` block (PENDING, feature-detected): null
+   * when the scorecard is not composed — the card's today row renders
+   * nothing at all.
+   */
+  today: EnergyToday | null;
   onOpenDetail: (unitId: string) => void;
   onAcknowledge: (unitId: string, opener: HTMLElement) => void;
+}
+
+/**
+ * The card's today row (DESIGN_ENERGY_SCORECARD.md §8 W-C): charged and
+ * discharged TODAY for THIS battery, from the day record's own per-unit
+ * figures — null figures read "not available", never 0, and a unit the record
+ * does not carry yet says so.
+ */
+function cardTodayText(today: EnergyToday, unitId: string): string {
+  const unitDay: EnergyUnitDay | undefined = today.units[unitId];
+  if (unitDay === undefined) {
+    return "no figures for this battery yet today";
+  }
+  const resets =
+    unitDay.metricFlags.length === 0
+      ? ""
+      : ` (a counter was reset during the day — the figures restart from the new baseline)`;
+  return `charged ${kwhText(unitDay.batteryChargedKwh)}, discharged ${kwhText(
+    unitDay.batteryDischargedKwh,
+  )}${resets}`;
 }
 
 /** The acknowledge control is offered exactly when a latch is established:
@@ -736,6 +799,7 @@ function acknowledgeOffered(unit: ViewUnit): boolean {
 function FleetCard({
   unit,
   observation,
+  today,
   onOpenDetail,
   onAcknowledge,
 }: FleetCardProps): JSX.Element {
@@ -785,6 +849,11 @@ function FleetCard({
       <p>
         <b>Grid and load:</b> {cardGridLoadText(unit)}
       </p>
+      {today !== null && (
+        <p className="today-energy">
+          <b>Today (so far):</b> {cardTodayText(today, unit.unit_id)}
+        </p>
+      )}
       {imbalanceWarning !== null && (
         <p role="note" className="cell-imbalance-warning">
           {imbalanceWarning}
@@ -838,6 +907,8 @@ interface UnitDetailProps {
   requestedByUnit: WattsByUnit | null;
   authorizedByUnit: WattsByUnit | null;
   observation: ObservationTrack | undefined;
+  /** The snapshot's `energy_today` block; null = not composed. */
+  today: EnergyToday | null;
   siteId: string;
   capturedAt: string;
   tab: TabKey;
@@ -859,6 +930,7 @@ function SummaryPanel({
   requestedByUnit,
   authorizedByUnit,
   observation,
+  today,
   detailData,
   detailPhase,
 }: {
@@ -867,6 +939,8 @@ function SummaryPanel({
   requestedByUnit: WattsByUnit | null;
   authorizedByUnit: WattsByUnit | null;
   observation: ObservationTrack | undefined;
+  /** The snapshot's `energy_today` block; null = not composed (no surplus row). */
+  today: EnergyToday | null;
   detailData: UnitDetailView | null;
   detailPhase: DetailPhase;
 }): JSX.Element {
@@ -955,6 +1029,13 @@ function SummaryPanel({
               dischargeLimit === null ? "no data" : formatWatts(dischargeLimit)
             }`}
       </p>
+      {today?.units[unit.unit_id]?.chargedFromSurplusKwh != null && (
+        <p className="surplus-energy">
+          <b>Charged from solar surplus today:</b>{" "}
+          {formatKilowattHours(today.units[unit.unit_id]!.chargedFromSurplusKwh!)} — energy that
+          would have been exported, captured while solar-surplus charging was active.
+        </p>
+      )}
       <p>
         <b>Identity:</b> {identity}
       </p>
@@ -964,6 +1045,64 @@ function SummaryPanel({
       </p>
       <p>
         <b>Recent trend:</b> no trend history is available from the API yet
+      </p>
+      <LifetimeEnergyReadthroughs detailData={detailData} detailPhase={detailPhase} />
+    </div>
+  );
+}
+
+/**
+ * The six cumulative counter readthroughs on the unit's detail rows
+ * (DESIGN_ENERGY_SCORECARD.md §8 W-C): "lifetime through this pod", raw and
+ * readthrough-style. The grid pair keeps its NEUTRAL A/B names — which
+ * counter is "bought" is never labeled here (the wire's own naming; the
+ * site's counter-role confirmation lives on Insights) — and the PV counter
+ * carries its unwired-inputs note so it can never read as the site's solar
+ * production. Nulls read "not available", never 0.
+ */
+function LifetimeEnergyReadthroughs({
+  detailData,
+  detailPhase,
+}: {
+  detailData: UnitDetailView | null;
+  detailPhase: DetailPhase;
+}): JSX.Element | null {
+  if (detailPhase === "loading") {
+    return (
+      <p className="lifetime-energy">
+        <b>Lifetime energy through this pod:</b> loading…
+      </p>
+    );
+  }
+  if (detailData === null) {
+    return (
+      <p className="lifetime-energy">
+        <b>Lifetime energy through this pod:</b> not available from this read
+      </p>
+    );
+  }
+  return (
+    <div className="lifetime-energy">
+      <p>
+        <b>Lifetime energy through this pod</b> (raw device counters, readthrough):
+      </p>
+      <ul>
+        <li>
+          {GRID_COUNTER_A_LABEL}: {kwhText(detailData.energyGridAKwh)}
+        </li>
+        <li>
+          {GRID_COUNTER_B_LABEL}: {kwhText(detailData.energyGridBKwh)}
+        </li>
+        <li>House load: {kwhText(detailData.energyLoadKwh)}</li>
+        <li>
+          Solar (PV) counter: {kwhText(detailData.energyPvKwh)} — {PV_READTHROUGH_NOTE}
+        </li>
+        <li>Battery charged: {kwhText(detailData.energyChargeKwh)}</li>
+        <li>Battery discharged: {kwhText(detailData.energyDischargeKwh)}</li>
+      </ul>
+      <p className="lifetime-energy-note">
+        The two grid counters are shown as counter A and counter B — which one is &quot;bought&quot;
+        is not labeled here; see Insights for the site&apos;s counter-role confirmation.
       </p>
     </div>
   );
@@ -1282,6 +1421,7 @@ function UnitDetail({
   requestedByUnit,
   authorizedByUnit,
   observation,
+  today,
   siteId,
   capturedAt,
   tab,
@@ -1363,6 +1503,7 @@ function UnitDetail({
             requestedByUnit={requestedByUnit}
             authorizedByUnit={authorizedByUnit}
             observation={observation}
+            today={today}
             detailData={detailData}
             detailPhase={detailPhase}
           />
@@ -1999,6 +2140,7 @@ export function BatteriesView({
             key={unit.unit_id}
             unit={unit}
             observation={observations[unit.unit_id]}
+            today={fleet?.energyToday ?? null}
             onOpenDetail={(unitId) => setDetail({ unitId, tab: "summary" })}
             onAcknowledge={openAcknowledge}
           />
@@ -2015,6 +2157,7 @@ export function BatteriesView({
             requestedByUnit={unitFigures.requestedByUnit}
             authorizedByUnit={unitFigures.authorizedByUnit}
             observation={observations[detailUnit.unit_id]}
+            today={fleet?.energyToday ?? null}
             siteId={fleet?.siteId ?? ""}
             capturedAt={fleet?.capturedAt ?? ""}
             tab={detail.tab}
