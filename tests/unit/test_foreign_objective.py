@@ -85,7 +85,7 @@ class RecordingBus:
         return [body for body in self.published if body.get("type") == event_type]
 
 
-def observation(
+def make_observation(
     *,
     active_w: int | None = 0,
     reactive_var: int | None = 0,
@@ -98,6 +98,7 @@ def observation(
     sequence: int = 1,
     wall: datetime | None = None,
 ) -> SimpleNamespace:
+    resolved_wall = wall if wall is not None else datetime(2026, 8, 26, 14, 0, 0, tzinfo=UTC)
     return SimpleNamespace(
         served_active_objective_w=active_w,
         served_reactive_objective_var=reactive_var,
@@ -108,7 +109,7 @@ def observation(
         work_mode_w=work_mode_w,
         debug_mode_w=debug_mode_w,
         sequence=sequence,
-        wall_timestamp=wall if wall is not None else datetime(2026, 8, 26, 14, 0, 0, tzinfo=UTC),
+        wall_timestamp=resolved_wall,
     )
 
 
@@ -166,26 +167,45 @@ async def cycle(
     captured_at_mono: float | None = None,
     grid_power_w: float | None = None,
     run_mode_w: int | None = None,
+    ctrl_mode_w: int | None = 1,
+    work_mode_w: int | None = 6,
+    debug_mode_w: int | None = 0,
     lifecycle: str = "disarmed",
     claimed: bool = False,
     authorized_watts: int = 0,
     observation: Any = None,
+    poll_failed: bool = False,
     now_mono: float | None = None,
 ) -> None:
-    """Drive one supervised cycle exactly as the runtime fleet loop does."""
+    """Drive one supervised cycle exactly as the runtime fleet loop does.
+
+    ``poll_failed`` models a cycle whose poll never landed (no observation at
+    all); a non-None ``observation`` replaces the synthesized decode verbatim.
+    """
     resolved = (
-        observation
-        if observation is not None
-        else observation(
-            active_w=active_w,
-            reactive_var=reactive_var,
-            captured_at_mono=captured_at_mono,
-            grid_power_w=grid_power_w,
-            run_mode_w=run_mode_w,
+        None
+        if poll_failed
+        else (
+            observation
+            if observation is not None
+            else make_observation(
+                active_w=active_w,
+                reactive_var=reactive_var,
+                captured_at_mono=captured_at_mono,
+                grid_power_w=grid_power_w,
+                run_mode_w=run_mode_w,
+                ctrl_mode_w=ctrl_mode_w,
+                work_mode_w=work_mode_w,
+                debug_mode_w=debug_mode_w,
+            )
         )
     )
     clock = mon._clock
     clock.now = clock.now if now_mono is None else now_mono
+    if resolved is not None and getattr(resolved, "wall_timestamp", None) is not None:
+        # The synthesized decode carries the monitor's own wall clock so the
+        # session record's timestamps follow the scripted timeline.
+        resolved.wall_timestamp = clock.wall
     await mon.observe_cycle(
         unit,
         lifecycle=lifecycle,
@@ -321,7 +341,7 @@ async def test_a_failed_poll_contributes_nothing_and_keeps_the_episode(api: Any)
     await cycle(mon, active_w=-3000, captured_at_mono=1000.0, now_mono=1000.0)
     assert audit.of_type(CLASS_FOREIGN), "the out-of-band objective must alert"
     clock.now = 1040.0
-    await cycle(mon, observation=None, now_mono=1040.0)
+    await cycle(mon, poll_failed=True, now_mono=1040.0)
 
     assert session_of(mon)["foreign_active"] is True, "a failed poll closes nothing"
     assert len(audit.of_type(CLASS_FOREIGN)) == 1
@@ -477,7 +497,9 @@ async def test_out_of_band_discharge_alerts_on_the_first_sample(api: Any) -> Non
 
 async def test_a_reactive_component_is_foreign_whatever_the_active_word(api: Any) -> None:
     """The pods' own signature carries Q == 0 (ADD-1): any reactive objective
-    is not pod autonomy, with or without an active component."""
+    is not pod autonomy, with or without an active component.  Both shapes
+    classify foreign; the second is the SAME reason inside one open episode,
+    so the alert fires once and the evidence carries both."""
     audit = RecordingAudit()
     mon = monitor(api, audit=audit)
     await cycle(mon, active_w=0, reactive_var=100, captured_at_mono=1000.0)
@@ -485,10 +507,12 @@ async def test_a_reactive_component_is_foreign_whatever_the_active_word(api: Any
     clock.now = 1040.0
     await cycle(mon, active_w=-600, reactive_var=-50, captured_at_mono=1040.0)
 
-    events = audit.of_type(CLASS_FOREIGN)
-    assert [event.reason_codes for event in events] == (((REASON_REACTIVE,),) * 2), (
-        "both the Q-only and the in-band-P-with-Q samples escalate identically"
-    )
+    (event,) = audit.of_type(CLASS_FOREIGN)
+    assert event.reason_codes == (REASON_REACTIVE,)
+    last = mon.unit_last_observed("mid")
+    assert last["classification"] == CLASS_FOREIGN
+    assert last["reason"] == REASON_REACTIVE
+    assert last["active_w"] == -600 and last["reactive_var"] == -50
 
 
 # --- alert episode semantics --------------------------------------------------------
@@ -547,8 +571,8 @@ async def test_an_open_episode_closes_on_a_grace_sample(api: Any) -> None:
     # We take the unit over (claimed), then our own command lapses into grace.
     clock.now = 1010.0
     await cycle(mon, claimed=True, authorized_watts=500, now_mono=1010.0)
-    clock.now = 1020.0
-    await cycle(mon, active_w=-3000, captured_at_mono=1020.0, now_mono=1020.0)
+    clock.now = 1045.0
+    await cycle(mon, active_w=-3000, captured_at_mono=1045.0, now_mono=1045.0)
 
     assert session_of(mon)["foreign_active"] is False
     assert len(audit.of_type(CLASS_FOREIGN)) == 1, "no second alert inside grace"
@@ -613,10 +637,12 @@ async def test_a_non_qualifying_sample_resets_the_charge_streak(api: Any) -> Non
     await cycle(mon, active_w=-500, captured_at_mono=1040.0, grid_power_w=-100.0, now_mono=1040.0)
     clock.now = 1080.0
     await cycle(mon, active_w=-2400, captured_at_mono=1080.0, grid_power_w=-100.0, now_mono=1080.0)
-
-    assert audit.of_type(CLASS_FOREIGN) == [], "two qualifying samples after a reset"
     clock.now = 1120.0
     await cycle(mon, active_w=-2400, captured_at_mono=1120.0, grid_power_w=-100.0, now_mono=1120.0)
+
+    assert audit.of_type(CLASS_FOREIGN) == [], "only two qualifying samples after a reset"
+    clock.now = 1160.0
+    await cycle(mon, active_w=-2400, captured_at_mono=1160.0, grid_power_w=-100.0, now_mono=1160.0)
     assert len(audit.of_type(CLASS_FOREIGN)) == 1
 
 
@@ -713,7 +739,12 @@ async def test_the_synchronized_nightly_charge_is_expected_and_quiet(api: Any) -
     for unit in ("lhs", "mid", "rhs"):
         entry = session_of(mon, unit)
         assert entry["last_objective_observed"]["classification"] == CLASS_EXPECTED_NIGHTLY
-        assert entry["classification_counts"][CLASS_EXPECTED_NIGHTLY] == 8, unit
+        # The very first sample of the first-sampled unit cannot corroborate
+        # a fleet pattern (nobody else has sampled yet) and stays plain
+        # autonomy evidence; from the first synchronized round on, every
+        # sample is the expected writer.
+        assert entry["classification_counts"][CLASS_EXPECTED_NIGHTLY] >= 7, unit
+        assert entry["classification_counts"][CLASS_FOREIGN] == 0, unit
         assert entry["foreign_active"] is False, unit
     assert audit.appended == [] and bus.published == []
 

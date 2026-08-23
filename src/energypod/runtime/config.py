@@ -246,6 +246,20 @@ class PolicyConfig(_FrozenModel):
     # a small positive float.  Measured power outside this band while no
     # intent claims the unit is timestamped evidence, never a block.
     expected_autonomy_band_w: tuple[StrictInt, StrictInt] = (-2600, 300)
+    # Night-writer detector (API_CONTRACTS "Night-writer detector"): the
+    # zero-extra-frames foreign-objective watch's knobs, all defaulted so an
+    # unchanged policy keeps the pinned posture.  Detection only: no control
+    # path consumes them.
+    foreign_objective_sample_interval_s: Annotated[StrictFloat, Field(ge=1.0, le=3600.0)] = 30.0
+    foreign_objective_sustained_samples: Annotated[StrictInt, Field(ge=1, le=100)] = 3
+    foreign_objective_self_charge_class_w: Annotated[StrictInt, Field(ge=1, le=50000)] = 1000
+    foreign_objective_handback_grace_s: Annotated[StrictFloat, Field(ge=1.0, le=300.0)] = 12.0
+    # The site's own scheduled night writer, commissioned as the EXPECTED
+    # nightly charge (all batteries at -<figure> W for its nightly window):
+    # None is the strict default -- nothing is expected until the operator
+    # says so, and every sustained beyond-class charge without PV evidence
+    # escalates.
+    foreign_objective_expected_charge_w: Annotated[StrictInt, Field(ge=1, le=50000)] | None = None
     debug_modes_enabled: StrictBool
 
     @field_validator("threshold_provenance")
