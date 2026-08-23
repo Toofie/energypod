@@ -44,6 +44,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, StreamEvent } from "../../api/client";
+import { formatPercent } from "../../lib/format";
 import { isPlaneSnapshot } from "../../app/SharedDataPlane";
 import { usePrefersReducedMotion } from "../../app/usePrefersReducedMotion";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
@@ -112,21 +113,24 @@ const REFETCH_FRAME_TYPES: readonly string[] = [
 // the decorative bus (pure SVG; every fact it draws also exists as text)
 // ---------------------------------------------------------------------------
 //
-// Geometry (the design brief's pins): one horizontal rail — the phase
-// conductor, 3 px, --line, rounded caps — across the top of a `0 0 240 96`
-// viewBox at y = 12; three stub slots dropping to the node cards at the
-// viewBox's thirds (x = 40 / 120 / 200), each landing on the center of the
-// node card docked immediately beneath the SVG. Direction is carried by THREE
-// redundant channels — the word beside the node, the arrowhead, and the
+// Geometry (the design brief's pins, round 2's flatter aspect): one horizontal
+// rail — the phase conductor, 3 px, --line, rounded caps — across the top of a
+// `0 0 240 84` viewBox at y = 12; three stub slots dropping to the node cards
+// at the viewBox's thirds (x = 40 / 120 / 200), each landing on the center of
+// the node card docked immediately beneath the SVG. Direction is carried by
+// THREE redundant channels — the word beside the node, the arrowhead, and the
 // proportional width — while color only ever names the NODE FAMILY (grid
 // --active, battery --armed, home --ink-soft; heads all --ink).
 
 /** The bus geometry, in viewBox units (the brief's pinned numbers). */
 const RAIL_Y = 12;
 const STUB_TOP = 14;
-const STUB_BOTTOM = 90;
+const STUB_BOTTOM = 78;
 /** The idle ring's center — just below the rail, centered in the slot. */
 const RING_Y = 21;
+/** The rim stops this far short of either end, so its caps tuck under the ink
+ *  head and stop shy of the rail (the edge shades the ribbon, never the tips). */
+const RIM_INSET = 4;
 /** The fleet's two-sided slots render two half-slot stubs, offset ±14 px. */
 const SPLIT_OFFSET = 14;
 /** Strokes at 4 px and above wear the large head; thinner wear the small. */
@@ -221,6 +225,20 @@ function StubMark({
     // fresh stub) while a magnitude change keeps it (the 400 ms stroke-width
     // transition breathes the new width instead).
     <g className={`flow-stub flow-stub--${tone}`} key={spec.aim}>
+      {/* The rim: the family's own hue, deepened, full opacity, 2.6 units
+          wider than the ribbon and drawn a few units short of either end —
+          the darker edge that keeps a thin gold ribbon reading GOLD at a
+          glance instead of beige-on-white (the track alone at partial alpha
+          was the round-1 failure the review caught). */}
+      <line
+        className="flow-stub-rim"
+        x1={cx}
+        y1={intoBus ? STUB_BOTTOM - RIM_INSET : STUB_TOP + RIM_INSET}
+        x2={cx}
+        y2={intoBus ? STUB_TOP + RIM_INSET : STUB_BOTTOM - RIM_INSET}
+        strokeLinecap="round"
+        style={{ strokeWidth: spec.widthPx + 2.6 }}
+      />
       <line
         className="flow-stub-track"
         x1={cx}
@@ -295,7 +313,7 @@ function FlowBus({
   const smallHead = `flow-head-sm-${uid}`;
   const largeHead = `flow-head-lg-${uid}`;
   return (
-    <svg className="flow-bus" viewBox="0 0 240 96" aria-hidden="true" focusable="false">
+    <svg className="flow-bus" viewBox="0 0 240 84" aria-hidden="true" focusable="false">
       <defs>
         {/* Two heads, one shape: small (8×7) under 4 px of stroke, large
             (12×10) at 4 px and above — a constant single size would put a
@@ -439,7 +457,28 @@ function FlowFigure({ parts }: { parts: readonly FlowFigurePart[] }): string {
   return figurePartsText(shown);
 }
 
-/** One node card: the node's name, its worded figure, and any extra line. */
+/**
+ * The battery card's SoC band — real hierarchy for the one per-phase figure
+ * the homeowner scans: the percentage large and weight-forward in the battery
+ * family's gold, the "charged" word quiet beside it, and a slim honest meter
+ * of the same datum beneath (drawn once, never animated). The wording is the
+ * pinned "…% charged" string, verbatim.
+ */
+function SocBand({ socPct }: { socPct: number }): ReactNode {
+  return (
+    <span className="flow-node-extra flow-node-extra--soc">
+      <span className="flow-soc">
+        <b className="flow-soc-pct">{formatPercent(socPct)}</b>{" "}
+        <span className="flow-soc-word">charged</span>
+      </span>
+      <span className="flow-soc-meter" aria-hidden="true">
+        <span className="flow-soc-fill" style={{ width: `${socPct}%` }} />
+      </span>
+    </span>
+  );
+}
+
+/** One node card: the node's name, its worded figure, and the reserved SoC band. */
 function FlowNode({
   name,
   parts,
@@ -450,7 +489,7 @@ function FlowNode({
   name: string;
   parts: readonly FlowFigurePart[];
   suffix?: string;
-  extra?: string | null;
+  extra?: ReactNode;
   tone: "grid" | "battery" | "home";
 }): ReactNode {
   return (
@@ -460,7 +499,10 @@ function FlowNode({
         <FlowFigure parts={parts} />
         {suffix !== "" ? suffix : null}
       </span>
-      {extra !== null && extra !== "" ? <span className="flow-node-extra">{extra}</span> : null}
+      {/* The SoC band is RESERVED in every card — empty for Grid and Home —
+          so the same rows land at the same y across all four columns whether
+          or not a card carries a second datum (the aligned visual grid). */}
+      {extra ?? <span className="flow-node-extra flow-node-extra--reserved" aria-hidden="true" />}
     </div>
   );
 }
@@ -955,15 +997,22 @@ function PhaseColumn({
       }; house: ${houseText}`}
     >
       <h3 className="flow-phase-name">{unit.unitId}</h3>
-      {note !== null ? <p className="flow-phase-note">{note}</p> : null}
       <div className="flow-dock">
         <FlowBus grid={gridSlot} battery={batterySlot} house={houseSlot} batteryPulse={batteryPulse} />
         <div className="flow-nodes">
           <FlowNode name="Grid" parts={gridFigureParts(gridW)} tone="grid" />
-          <FlowNode name="Battery" parts={batteryFigureParts(batteryW)} extra={soc} tone="battery" />
+          <FlowNode
+            name="Battery"
+            parts={batteryFigureParts(batteryW)}
+            extra={unit.socPct === null ? null : <SocBand socPct={unit.socPct} />}
+            tone="battery"
+          />
           <FlowNode name="Home" parts={houseFigureParts(loadW)} tone="home" />
         </div>
       </div>
+      {/* The lifecycle note anchors the column's foot — under the figures it
+          vouches for — so its presence never shifts any other column's rows. */}
+      {note !== null ? <p className="flow-phase-note">{note}</p> : null}
     </section>
   );
 }

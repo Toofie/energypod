@@ -1,14 +1,42 @@
 /*
  * Energy Flow view styling — the console's most legible view, per the
- * accepted design brief (docs/FLOW_DESIGN_BRIEF.md). The diagram is the
- * centerpiece: the Whole-site fleet column first, then one column per phase,
- * each a rail (the phase conductor) with three stub slots dropping to docked
- * node cards.
+ * accepted design brief (docs/FLOW_DESIGN_BRIEF.md) and the round-2 polish.
+ * The diagram is the centerpiece: the Whole-site fleet column FIRST and
+ * unmistakably the lead, then one column per phase, each a rail (the phase
+ * conductor) with three stub slots dropping to docked node cards.
  *
  * DIRECTION IS NEVER COLOR-ALONE: the word + the arrowhead + the proportional
  * width carry it on three redundant channels (the colorblind-safe
  * construction); color only names the NODE FAMILY — grid --active, battery
  * --armed, home --ink-soft — and every arrowhead is one neutral --ink.
+ *
+ * THE RIBBON (round 2's fix for the muted gold): the round-1 track rendered
+ * the family color at 0.45 alpha over a white card, which bleached the
+ * battery's #8a6d1a into a muted beige (0.45 × #8a6d1a + 0.55 × #fff ≈
+ * #c0b299 — barely a hue at all). The ribbon is now three layers, all inside
+ * the validated family:
+ *   1. the RIM — a same-hue deepened edge variant (≈ base × 0.78), full
+ *      opacity, width + 2.6 units, drawn first and shortened at both ends —
+ *      the "subtle darker edge / stronger stroke weight" the brief's doctrine
+ *      allows ("color only names the family; tune the ribbon rendering");
+ *   2. the TRACK — the family's validated token at FULL opacity, so the
+ *      categorical identity is exactly the color that passed the six-checks
+ *      gates (re-run for round 2: worst CVD ΔE 21.5 protan, normal 23.4 —
+ *      unchanged, because the identity colors are unchanged);
+ *   3. the MARCH — light dashes (white at 0.55 alpha) running along the
+ *      saturated ribbon, so the aliveness cue is contrast ON the family color
+ *      instead of a paler copy of it.
+ * The rim variants are edge shading, not series slots: they darken every
+ * family by the same factor, keep ≥3:1 against the card, and stay mutually
+ * ≥8 ΔE apart, so the categorical reading still rides on the validated pair.
+ *
+ * THE ALIGNED GRID: every column and every node card reserves the same rows
+ * (name band, two-line figure band, SoC band; the lifecycle note anchors the
+ * card's foot), so the same rows land at the same y across all four columns —
+ * figure baselines and SoC lines align whether or not a column carries a
+ * note, a SoC, or a wrapped figure. The fleet card's second frame pixel is an
+ * inset shadow, not a border, precisely so its 1px of layout stays identical
+ * to the phase cards' and the rows cannot drift by the border difference.
  *
  * MOTION: exactly four things move (the march, the stroke-width transition,
  * the number tick's 300 ms tween, the commanded-not-moving pulse), each
@@ -20,10 +48,10 @@
 
 .flow-view {
   display: grid;
-  gap: 1rem;
-  max-width: 64rem;
+  gap: 0.9rem;
+  max-width: 68rem;
   margin: 0 auto;
-  padding: 1rem;
+  padding: 1rem 1rem 1.25rem;
 }
 
 .flow-heading-row {
@@ -31,7 +59,7 @@
   flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
-  gap: 0.5rem 1rem;
+  gap: 0.35rem 1rem;
 }
 
 .flow-view h2 {
@@ -54,38 +82,97 @@
   color: var(--no);
 }
 
-/* THE STORY LINE — the one sentence an operator reads aloud. */
+/* THE STORY LINE — the one sentence an operator reads aloud. A full card:
+   --active's 4 px left border is the view's accent (the same accent that
+   frames the Whole-site lead below), the other three edges the quiet --line. */
 .flow-story {
   margin: 0;
-  padding: 0.65rem 0.9rem;
+  padding: 0.7rem 1rem;
+  border: 1px solid var(--line);
   border-left: 4px solid var(--active);
   background: var(--card);
-  border-radius: 0 10px 10px 0;
+  border-radius: 0 12px 12px 0;
   font-size: 1.05rem;
   line-height: 1.45;
 }
 
 /* --- the diagram ------------------------------------------------------------ */
-
+/*
+ * The column rhythm: one column per phase plus the Whole-site lead, gutters
+ * 0.75 rem everywhere. The lead is unmistakable at EVERY width:
+ * - phones (<40 rem) stack it first — the only sane order one column wide;
+ * - in between (40–64 rem) it spans the full first row as a lead band, its
+ *   dock capped and centered so the bus never over-stretches, with the phases
+ *   gridded two-up (three-up once they fit) beneath it;
+ * - desktops (≥64 rem) lay all four out in ONE row — fleet first at ~1.26fr —
+ *   never the wrapped 3+1 the round-1 max-width produced.
+ */
 .flow-diagram {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.75rem;
   align-items: stretch;
 }
 
-.flow-phase {
-  display: grid;
-  gap: 0.4rem;
-  padding: 0.85rem 0.9rem 0.95rem;
-  border: 1px solid var(--line);
-  border-radius: 0.9rem;
-  background: var(--card);
+@media (min-width: 40rem) {
+  .flow-diagram {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  /* The lead band: full-width framing above the phases, its content centered
+     and capped at a comfortable bus width (a stretched bus would balloon its
+     240×84 geometry — the ribbon scale must stay comparable across columns). */
+  .flow-phase--fleet {
+    grid-column: 1 / -1;
+    justify-items: center;
+  }
+
+  .flow-phase--fleet .flow-dock {
+    width: 100%;
+    max-width: 24rem;
+  }
 }
 
+@media (min-width: 48rem) {
+  .flow-diagram {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+@media (min-width: 64rem) {
+  .flow-diagram {
+    grid-template-columns: minmax(15.5rem, 1.26fr) repeat(3, minmax(12.5rem, 1fr));
+  }
+
+  /* Back to the four-column row: the lead is the wider first column again. */
+  .flow-phase--fleet {
+    grid-column: auto;
+    justify-items: stretch;
+  }
+
+  .flow-phase--fleet .flow-dock {
+    max-width: none;
+  }
+}
+
+.flow-phase {
+  display: grid;
+  grid-template-rows: auto auto 1fr;
+  gap: 0.5rem;
+  padding: 0.9rem 0.95rem 0.85rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--card);
+  min-width: 0;
+}
+
+/* THE WHOLE-SITE LEAD — first, wider, and framed: --active's 2 px frame
+   (1 px border + 1 px inset ring, so the layout border matches the phases'
+   exactly), the brief's #f4f8ff tint, a larger name and larger figures. The
+   phases stay recessive: 1 px --line on white. */
 .flow-phase--fleet {
   border-color: var(--active);
-  border-width: 2px;
+  box-shadow: inset 0 0 0 1px var(--active);
   background: #f4f8ff;
 }
 
@@ -95,8 +182,14 @@
   opacity: 0.6;
 }
 
+/* The name band is RESERVED at one height in every column and bottom-aligned,
+   so the bus below starts at the same y whether the name is the fleet's
+   larger lead or a phase's smaller one. */
 .flow-phase-name {
   margin: 0;
+  min-height: 1.3rem;
+  display: flex;
+  align-items: flex-end;
   font-size: 0.8rem;
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -105,12 +198,19 @@
 }
 
 .flow-phase--fleet .flow-phase-name {
+  font-size: 0.95rem;
+  font-weight: 800;
   color: var(--active);
 }
 
+/* The lifecycle note anchors the column's foot — under the figures it vouches
+   for, never between the name and the bus (where it would shove every other
+   row out of alignment). */
 .flow-phase-note {
   margin: 0;
+  align-self: end;
   font-size: 0.8rem;
+  line-height: 1.35;
   color: var(--warn);
 }
 
@@ -135,6 +235,13 @@
   stroke-linecap: round;
 }
 
+/* The site's own conductor carries a whisper of the view's accent — the one
+   rail in the picture that is the whole site, not one phase. */
+.flow-phase--fleet .flow-bus-rail {
+  stroke: var(--active);
+  opacity: 0.28;
+}
+
 /* --- the stubs (the three-channel direction discipline) ---------------------- */
 
 /* Every stub rests at 0.92 and enters with a 150 ms fade — a fresh stub on a
@@ -151,11 +258,16 @@
   }
 }
 
-/* The ribbon's track: the node family's color at a dimmed rest, so the march
-   overlay — the same color, bright, 55% of the width — reads as a texture
-   moving along it. */
+/* The ribbon's three layers (see the header note): the same-hue rim first —
+   full opacity, width + 2.6 units, drawn a few units short of either end so
+   its caps tuck under the ink head and stop shy of the rail — then the
+   saturated track, then the light march on top. All width-bearing layers
+   share the 400 ms stroke-width breath (motion #2). */
+.flow-stub-rim {
+  transition: stroke-width 400ms cubic-bezier(0.2, 0, 0, 1);
+}
+
 .flow-stub-track {
-  opacity: 0.45;
   transition: stroke-width 400ms cubic-bezier(0.2, 0, 0, 1);
 }
 
@@ -163,8 +275,11 @@
    runs source → target, so one negative-offset keyframe marches every stub in
    its arrowhead's direction; the inline animation-duration maps speed to
    magnitude (3200 − 1600 × share ms: the largest flow on screen cycles in
-   1.6 s, the smallest in 3.2 s). */
+   1.6 s, the smallest in 3.2 s). Light dashes on the saturated ribbon: the
+   cue is contrast along the family's color, never a paler copy of it. */
 .flow-stub-march {
+  stroke: #fff;
+  opacity: 0.55;
   stroke-dasharray: 8 12;
   stroke-linecap: round;
   transition: stroke-width 400ms cubic-bezier(0.2, 0, 0, 1);
@@ -177,19 +292,31 @@
   }
 }
 
-/* Color names the node family — never the direction. */
-.flow-stub--grid .flow-stub-track,
-.flow-stub--grid .flow-stub-march {
+/* Color names the node family — never the direction. The track wears the
+   validated token at full strength; the rim is its same-hue deepened edge;
+   the march is one light dash color for every family (contrast ON the family
+   color, never a paler copy of it). */
+.flow-stub--grid .flow-stub-rim {
+  stroke: #174a7d;
+}
+
+.flow-stub--grid .flow-stub-track {
   stroke: var(--active);
 }
 
-.flow-stub--battery .flow-stub-track,
-.flow-stub--battery .flow-stub-march {
+.flow-stub--battery .flow-stub-rim {
+  stroke: #6c5514;
+}
+
+.flow-stub--battery .flow-stub-track {
   stroke: var(--armed);
 }
 
-.flow-stub--home .flow-stub-track,
-.flow-stub--home .flow-stub-march {
+.flow-stub--home .flow-stub-rim {
+  stroke: #434d5f;
+}
+
+.flow-stub--home .flow-stub-track {
   stroke: var(--ink-soft);
 }
 
@@ -259,14 +386,22 @@
   gap: 0.4rem;
 }
 
+/*
+ * Every card reserves the same three bands — name, a two-line figure zone,
+ * the SoC zone — so the figure's first line and the SoC line land at the same
+ * y in every column, present or absent. The figure zone is top-aligned (a
+ * one-line figure keeps its baseline where a two-line figure's first line
+ * sits); the SoC zone is reserved even for Grid and Home, whose figures have
+ * no second datum (the alignment is the point, not an accident of content).
+ */
 .flow-node {
   display: grid;
-  gap: 0.15rem;
+  gap: 0.2rem;
   justify-items: center;
   text-align: center;
-  padding: 0.45rem 0.3rem;
+  padding: 0.5rem 0.35rem 0.55rem;
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--surface);
   min-width: 0;
 }
@@ -275,29 +410,10 @@
   background: #fffaf0;
 }
 
-/* The cards are the hit surfaces: hovering or keyboard-focusing one raises its
-   stub to full opacity and tints the card's border with the node family's
-   color — the one linkage cue between card and stroke. No tooltips: every
-   number is already on screen as text. */
-.flow-node--grid:hover,
-.flow-node--grid:focus-visible {
-  border-color: var(--active);
-}
-
-.flow-node--battery:hover,
-.flow-node--battery:focus-visible {
-  border-color: var(--armed);
-}
-
-.flow-node--home:hover,
-.flow-node--home:focus-visible {
-  border-color: var(--ink-soft);
-}
-
-.flow-phase:has(.flow-node--grid:hover, .flow-node--grid:focus-visible) .flow-stub--grid,
-.flow-phase:has(.flow-node--battery:hover, .flow-node--battery:focus-visible) .flow-stub--battery,
-.flow-phase:has(.flow-node--home:hover, .flow-node--home:focus-visible) .flow-stub--home {
-  opacity: 1;
+/* The lead's instruments sit on white — they pop off the fleet card's tint
+   the way the phases' quiet --surface cards recede on theirs. */
+.flow-phase--fleet .flow-node {
+  background: var(--card);
 }
 
 .flow-node-name {
@@ -306,6 +422,7 @@
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--ink-soft);
+  line-height: 1.25;
 }
 
 .flow-node--grid .flow-node-name {
@@ -319,13 +436,92 @@
 .flow-node-figure {
   font-size: 0.95rem;
   font-weight: 600;
-  line-height: 1.25;
+  line-height: 1.3;
+  min-height: 2.75rem;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: break-word;
+}
+
+/* The lead's figures are one step up in size and weight — the whole-site
+ * picture is what the homeowner scans first. */
+.flow-phase--fleet .flow-node-figure {
+  font-size: 1.05rem;
+  font-weight: 700;
+}
+
+/* The SoC zone: a real hierarchy for the figure the homeowner actually scans
+   — the percentage large and weight-forward in the battery family's gold, the
+   "charged" word small and quiet beside it, a slim honest meter underneath
+   (the same SOC datum, drawn once, no animation). Grid and Home reserve the
+   band empty. Never italic. */
+.flow-node-extra {
+  min-height: 1.9rem;
+  display: grid;
+  gap: 0.28rem;
+  align-content: start;
+  justify-items: center;
+  font-style: normal;
+}
+
+.flow-soc {
+  line-height: 1.3;
+  white-space: nowrap;
+}
+
+.flow-soc-pct {
+  font-size: 1.02rem;
+  font-weight: 700;
+  color: var(--armed);
   font-variant-numeric: tabular-nums;
 }
 
-.flow-node-extra {
-  font-size: 0.8rem;
+.flow-soc-word {
+  font-size: 0.78rem;
+  font-weight: 500;
   color: var(--ink-soft);
+}
+
+.flow-soc-meter {
+  width: 100%;
+  height: 5px;
+  border-radius: 999px;
+  background: rgba(138, 109, 26, 0.16);
+  overflow: hidden;
+}
+
+.flow-soc-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--armed);
+}
+
+/* The cards are the hit surfaces: hovering or keyboard-focusing one raises its
+   stub to full opacity, tints the card's border with the node family's color,
+   and lifts the card a shade — the one linkage cue between card and stroke.
+   No tooltips: every number is already on screen as text. */
+.flow-node--grid:hover,
+.flow-node--grid:focus-visible {
+  border-color: var(--active);
+  background: var(--card);
+}
+
+.flow-node--battery:hover,
+.flow-node--battery:focus-visible {
+  border-color: var(--armed);
+  background: #fffdf7;
+}
+
+.flow-node--home:hover,
+.flow-node--home:focus-visible {
+  border-color: var(--ink-soft);
+  background: var(--card);
+}
+
+.flow-phase:has(.flow-node--grid:hover, .flow-node--grid:focus-visible) .flow-stub--grid,
+.flow-phase:has(.flow-node--battery:hover, .flow-node--battery:focus-visible) .flow-stub--battery,
+.flow-phase:has(.flow-node--home:hover, .flow-node--home:focus-visible) .flow-stub--home {
+  opacity: 1;
 }
 
 /* --- the command overlay ------------------------------------------------------ */
@@ -333,7 +529,7 @@
 .flow-commands {
   padding: 0.75rem 1rem;
   border: 1px solid var(--line);
-  border-radius: 0.9rem;
+  border-radius: 12px;
   background: var(--card);
 }
 
@@ -367,7 +563,7 @@
   margin: 0;
   padding: 0.75rem 0.9rem;
   border: 1px dashed var(--line);
-  border-radius: 0.9rem;
+  border-radius: 12px;
   color: var(--ink-soft);
   background: var(--card);
 }

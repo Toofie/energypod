@@ -190,7 +190,11 @@ describe("FlowView — rendering per state", () => {
     // figures across the three phases plus the fleet column.
     expect((await screen.findAllByText("Idle")).length).toBe(8);
     expect(screen.getAllByText("Using 0 W").length).toBe(4);
-    expect(screen.getByText("100% charged")).toBeVisible();
+    // The SoC wording renders verbatim (the percentage is its own styled run,
+    // so the pin matches the composed line, not one text node).
+    const socLine = (_: string, element: Element | null): boolean =>
+      (element?.textContent ?? "") === "100% charged";
+    expect(screen.getAllByText(socLine).length).toBeGreaterThan(0);
   });
 
   it("renders the charging fleet: per-phase words, fleet sums, and the story", async () => {
@@ -663,6 +667,11 @@ describe("FlowView — the pinned diagram structure", () => {
     // The arrows stop claiming a live flow they cannot vouch for; the words stay.
     expect(down.querySelectorAll(".flow-stub-unknown").length).toBe(3);
     expect(down.querySelectorAll(".flow-stub-track").length).toBe(0);
+    // The note anchors the column's FOOT — under the figures it vouches for —
+    // so a phase that needs a word never shifts any other column's rows.
+    const note = down.querySelector(".flow-phase-note");
+    expect(note).not.toBeNull();
+    expect(note === down.lastElementChild).toBe(true);
   });
 
   it("puts every arrowhead at the end the direction names (the head IS the direction)", async () => {
@@ -685,19 +694,75 @@ describe("FlowView — the pinned diagram structure", () => {
       [...column.querySelectorAll(`.flow-stub--${tone} .flow-stub-track`)].map(
         (line) => `${line.getAttribute("y1")}->${line.getAttribute("y2")}`,
       );
-    // A stub drawn bottom→top (90→14) carries its head INTO the rail; one
-    // drawn top→bottom (14→90) carries its head down to the node. Import and
+    // A stub drawn bottom→top (78→14) carries its head INTO the rail; one
+    // drawn top→bottom (14→78) carries its head down to the node. Import and
     // discharge feed the phase; export, charge, and the house's draw leave it.
-    expect(stubsOf(columns[1]!, "grid")).toEqual(["90->14"]); // lhs importing
-    expect(stubsOf(columns[1]!, "battery")).toEqual(["90->14"]); // lhs discharging
-    expect(stubsOf(columns[1]!, "home")).toEqual(["14->90"]);
-    expect(stubsOf(columns[2]!, "grid")).toEqual(["14->90"]); // rhs exporting
-    expect(stubsOf(columns[2]!, "battery")).toEqual(["14->90"]); // rhs charging
+    expect(stubsOf(columns[1]!, "grid")).toEqual(["78->14"]); // lhs importing
+    expect(stubsOf(columns[1]!, "battery")).toEqual(["78->14"]); // lhs discharging
+    expect(stubsOf(columns[1]!, "home")).toEqual(["14->78"]);
+    expect(stubsOf(columns[2]!, "grid")).toEqual(["14->78"]); // rhs exporting
+    expect(stubsOf(columns[2]!, "battery")).toEqual(["14->78"]); // rhs charging
     // Every active track wears exactly one head (markerEnd), on its drawn end.
     for (const line of document.body.querySelectorAll(".flow-stub-track")) {
       expect(line.getAttribute("marker-end")).toMatch(/^url\(#flow-head-(sm|lg)-/);
       expect(line.getAttribute("marker-start")).toBeNull();
     }
+  });
+
+  it("edges every ribbon with its family's own deepened hue (the gold stays gold)", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("lhs", { soc_pct: 40, grid_power_w: -2000, load_power_w: 270, battery_watts: -1900 }),
+      ]),
+    );
+
+    renderFlow();
+
+    await screen.findByText(/All the batteries are charging 1,900 W/i);
+    // Every track carries a rim beneath it: the same hue deepened, full
+    // opacity, 2.6 units wider — the darker edge that keeps a thin battery
+    // ribbon reading gold on white instead of beige (round 2's finding 1).
+    const tracks = document.body.querySelectorAll(".flow-stub-track");
+    expect(tracks.length).toBeGreaterThan(0);
+    for (const track of tracks) {
+      const rim = track.previousElementSibling;
+      expect(rim?.classList.contains("flow-stub-rim")).toBe(true);
+      const trackWidth = Number((track as SVGElement).style.strokeWidth);
+      const rimWidth = Number((rim as SVGElement).style.strokeWidth);
+      expect(rimWidth).toBeCloseTo(trackWidth + 2.6, 5);
+    }
+  });
+
+  it("reserves the SoC band in every node card and meters the battery's reading", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("lhs", { soc_pct: 40, grid_power_w: -2000, load_power_w: 270, battery_watts: -1900 }),
+      ]),
+    );
+
+    renderFlow();
+
+    await screen.findByText(/All the batteries are charging 1,900 W/i);
+    // Every card — Grid and Home included — carries exactly one SoC band, so
+    // the same rows land at the same y across all four columns; only the
+    // battery's carries the reading, worded and metered.
+    const nodes = document.body.querySelectorAll(".flow-node");
+    expect(nodes.length).toBe(6); // the fleet's three + the phase's three
+    for (const node of nodes) {
+      const bands = node.querySelectorAll(":scope > .flow-node-extra");
+      expect(bands.length).toBe(1);
+    }
+    const reserved = document.body.querySelectorAll(".flow-node-extra--reserved");
+    // Grid + Home in both columns (the fleet's battery has no summed SoC, so
+    // its band is reserved too): 5 reserved, 1 worded.
+    expect(reserved.length).toBe(5);
+    const socBand = document.body.querySelector(".flow-node-extra--soc");
+    expect(socBand).not.toBeNull();
+    expect(socBand?.textContent).toBe("40% charged");
+    const fill = socBand?.querySelector<HTMLElement>(".flow-soc-fill");
+    expect(fill?.style.width).toBe("40%");
   });
 
   it("pulses the battery ring of a phase commanded but not yet moving", async () => {
