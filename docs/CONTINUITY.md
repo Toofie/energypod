@@ -349,6 +349,38 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-24 (flow wow-loop, round-1 gate): ROUND 1 REVIEWED AND DECLINED
+  AGAINST THE WOW BAR; ROUND 2 DISPATCHED WITH THE FINDINGS LIST. The
+  round-1 build (c6c8fdc, 73b9b2d, 93e51d4; 714/714 web tests; 20-PNG
+  gallery in web/.design-shots/flow/) was visually reviewed via the vision
+  model over the actual PNGs (fleet-charging desktop + narrow, mixed-
+  directions desktop, one-phase-not-reporting desktop). Verdict:
+  "functional but utilitarian" — structurally honest (stories correct,
+  degenerate columns honest, color language consistent) but not polished.
+  Confirmed findings fed to the round-2 builder: (1) battery gold reads
+  muted-beige against white, weak contrast vs the neutral gray; (2) the
+  "% charged" text ~10px italic, blends away — SOC needs real hierarchy;
+  (3) per-pod figures not visually aligned across columns (reserve rows so
+  baselines never shift); (4) inter-column gutters too wide, whole-site
+  card cramped against the pods; (5) on desktop the WHOLE SITE column
+  renders RIGHTMOST/LAST while narrow leads with it — fleet must lead on
+  BOTH viewports (reviewer initially perceived this as "bottom"; the PNG
+  confirms rightmost-on-desktop); (6) narrow-390 degrades to a plain
+  label/value table with ~8px triple-bar glyphs — the bus-diagram metaphor
+  vanishes on the homeowner's primary viewport; needs a compact real flow
+  depiction (horizontal 3-node mini-bus) in the same color language;
+  (7) keep the degenerate-phase pattern (dashed card, waiting copy, "—"
+  placeholders, "2 of 3 phases reporting" fleet badge) — honest, just
+  make it elegant. Worded-truth contracts and the four-motion doctrine
+  stay pinned; structure pins may move where the visual grid legitimately
+  changes. Loop continues: round 2 rebuilds, regenerates the gallery, and
+  the gate re-judges the PNGs; final approval stays with the operator.
+  Overnight board at this entry: night-charge backend agent in src/
+  (B1–B6 per DESIGN_NIGHT_CHARGE.md, end-state config enabled:false),
+  historian backend agent in its worktree (merge to master on completion,
+  then commission + restart), flow round 2 in web/. Detector live and
+  quiet-classified on the real Docker writer (expected_nightly_charge).
+
 - 2026-08-26 (night-writer detector): THE NIGHT-WRITER DETECTOR IMPLEMENTED,
   COMMISSIONED, AND LIVE-PROVEN ON THE REAL NIGHTLY WRITER (46c828a
   contract, bc7e95f red, b72935e the known-writer amendment, b6d693e
