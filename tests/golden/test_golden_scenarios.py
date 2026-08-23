@@ -752,7 +752,10 @@ async def test_healthy_dispatch_applies_exactly_the_authorized_setpoint(
     assert event.reason_codes == ("safety_checks_passed",)
     assert event.result == "authorized"
     assert event.lifecycle is UnitLifecycle.ACTIVE
-    assert event.unit_id is None, "the fleet decision is one correlated record"
+    # 2026-08-23 attribution wave (API_CONTRACTS, control-decision audit
+    # attribution): a cycle that selected exactly one unit attributes that row
+    # to the unit; only genuinely multi-unit decisions stay fleet-level null.
+    assert event.unit_id == UNIT_ID, "a single-unit dispatch decision carries that unit's id"
     assert event.cycle_id and event.generation == capture["generation"]
     assert dict(event.observation_sequences) == {UNIT_ID: capture["evidence"].sequence}
     assert event.principal == OPERATOR.subject
