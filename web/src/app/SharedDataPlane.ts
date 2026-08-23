@@ -325,6 +325,9 @@ export function sharedClient(plane: SharedDataPlane, real: ApiClient): ApiClient
     // The energy ledger read passes straight through: it is a plain observe
     // read with no coalescing value (the ledger is slow-moving and per-view).
     getEnergyDays: (limit) => real.getEnergyDays(limit),
+    // The night-writer session view passes through the same way: a plain
+    // observe read, per-view, no coalescing value.
+    getObservedObjectives: (last) => real.getObservedObjectives(last),
     postIntent: (body, idempotencyKey) => real.postIntent(body, idempotencyKey),
     postIntentCancel: (intentId, idempotencyKey) =>
       real.postIntentCancel(intentId, idempotencyKey),

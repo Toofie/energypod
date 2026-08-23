@@ -9,6 +9,7 @@
  */
 import { formatWatts } from "../lib/format";
 import { toEnergyToday, type EnergyToday } from "./energy";
+import { toUnitObjective, type UnitObjective } from "./objectives";
 import { toScheduleState, type ScheduleState } from "./schedule";
 export type Lifecycle =
   | "boot"
@@ -598,6 +599,15 @@ export interface UnitModel {
    * by design.
    */
   health: UnitHealth | null;
+  /**
+   * The night-writer detector's per-unit `last_objective_observed` summary
+   * (the most recent recorded sample of the served PQ objective); null when
+   * the field is absent or null — no recorded sample, which is not evidence
+   * of a writer. Once the detector composes the key is never absent, only
+   * null; the quiet per-unit line renders ONLY on the detector's own
+   * foreign classification (see objectives.isForeignObjective).
+   */
+  objective: UnitObjective | null;
 }
 
 /**
@@ -688,6 +698,33 @@ export function patchUnitHealth(
   return changed ? { ...snapshot, units } : snapshot;
 }
 
+/**
+ * Apply one event-derived objective patch to a whole snapshot (the
+ * state-local move a `foreign_objective.observed` frame makes, so the quiet
+ * per-unit line appears the moment the alert lands — never waiting for a
+ * poll). Unknown unit ids change nothing; the periodic snapshot read stays
+ * the reconciler (it carries `last_objective_observed` on every unit once
+ * the detector composes).
+ */
+export function patchUnitObjective(
+  snapshot: FleetSnapshot | null,
+  unitId: string,
+  objective: UnitObjective,
+): FleetSnapshot | null {
+  if (snapshot === null) {
+    return null;
+  }
+  let changed = false;
+  const units = snapshot.units.map((unit) => {
+    if (unit.unitId !== unitId) {
+      return unit;
+    }
+    changed = true;
+    return { ...unit, objective };
+  });
+  return changed ? { ...snapshot, units } : snapshot;
+}
+
 function toLifecycle(value: unknown): Lifecycle {
   // An unrecognized lifecycle is never presented optimistically: a unit whose
   // state we cannot name is treated as having no contact.
@@ -724,6 +761,7 @@ function toUnit(raw: unknown): UnitModel | null {
     inhibitLatched: typeof raw.inhibit_latched === "boolean" ? raw.inhibit_latched : null,
     inhibitCause: typeof raw.inhibit_cause === "string" ? raw.inhibit_cause : null,
     health: toUnitHealth(raw),
+    objective: toUnitObjective(raw.last_objective_observed),
   };
 }
 

@@ -288,6 +288,19 @@ export interface ApiClient {
    * surface, so no idempotency key exists either.
    */
   getEnergyDays(limit?: number): Promise<Record<string, unknown>>;
+  /**
+   * The night-writer detector's session view (GET
+   * /api/v1/objectives/observed?last=Nh|Nd, observe scope; API_CONTRACTS.md
+   * "Night-writer detector"): the window's characterization per unit —
+   * first/last seen, sample counts split by the active word's sign, the
+   * per-classification counts (the expected-nightly-charge count is the
+   * known writer's own signature), min/typical/max watts, foreign episodes
+   * and their standing state, plus the per-unit `last_objective_observed`
+   * evidence record. `last` must be `Nh`/`Nd` within 1 h..168 h (default 24h
+   * on the service); anything else rejects with 422 `validation_error`.
+   * Pure read — no mutation exists on this surface.
+   */
+  getObservedObjectives(last?: string): Promise<Record<string, unknown>>;
   openEvents(afterSequence?: number): AsyncIterable<StreamEvent>;
 }
 
@@ -615,5 +628,9 @@ export function createApiClient(token: string): ApiClient {
         `/api/v1/energy/days${query === "" ? "" : `?${query}`}`,
       );
     },
+    getObservedObjectives: (last?: string) =>
+      request<Record<string, unknown>>(
+        `/api/v1/objectives/observed${last === undefined ? "" : `?last=${encodeURIComponent(last)}`}`,
+      ),
   };
 }

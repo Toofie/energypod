@@ -119,6 +119,53 @@ export const EXCESS_ADVISER_STATE_CHANGED = "excess_adviser.state_changed" as co
  */
 export const ENERGY_DAY_ROLLED = "energy.day_rolled" as const;
 
+/**
+ * The night-writer detector's ALERT-TIER bus event (API_CONTRACTS.md
+ * "Night-writer detector", note the DOT): exactly one publication per
+ * (episode, reason) — a served PQ objective whose pattern fits no sanctioned
+ * signature, something else writing the battery (the site's night writers;
+ * the 7.3 h overnight audit blind spot's whole reason this detector exists).
+ * QUIET-TIER EVIDENCE IS NEVER PUBLISHED (the contract's own pin): in-band
+ * pod-autonomy and handback-grace samples accumulate server-side behind
+ * `GET /api/v1/objectives/observed` — `pod_autonomy_objective_observed` and
+ * `handback_grace` are CLASSIFICATION words on the session record, not event
+ * types. PENDING-BACKEND — the detector is not composed yet, so this type is
+ * not in PUBLISHED_EVENT_TYPES; suites attach it with
+ * `foreignObjectiveObserved`.
+ */
+export const FOREIGN_OBJECTIVE_OBSERVED_EVENT = "foreign_objective.observed" as const;
+
+/**
+ * The audit fact the same episode writes: `event_type
+ * foreign_objective_observed` (the underscore spelling; the bus type is the
+ * dotted word above). PENDING-BACKEND.
+ */
+export const FOREIGN_OBJECTIVE_AUDIT_TYPE = "foreign_objective_observed" as const;
+
+/**
+ * The detector's classification vocabulary (the contract's rule list, first
+ * match wins): quiet in-band evidence, our own lapsed command's residue, and
+ * the alert tier. PENDING-BACKEND.
+ */
+export const OBJECTIVE_CLASSIFICATION_VALUES: readonly string[] = [
+  "pod_autonomy_objective_observed",
+  "expected_nightly_charge",
+  "handback_grace",
+  "foreign_objective_observed",
+];
+
+/**
+ * The detector's one-word pattern reasons (the alert rules): reactive power,
+ * an out-of-band magnitude, or one of the two sustained in-band escalations.
+ * PENDING-BACKEND.
+ */
+export const OBJECTIVE_REASON_VALUES: readonly string[] = [
+  "reactive_objective_observed",
+  "outside_autonomy_band",
+  "sustained_remote_mode_objective",
+  "sustained_charge_without_pv_evidence",
+];
+
 /** Every event type the composed service publishes, as a runtime checklist. */
 export const PUBLISHED_EVENT_TYPES: readonly string[] = [
   OBSERVATION_PUBLISHED,
@@ -780,6 +827,64 @@ export function unitUnexpectedAutonomy(
   );
 }
 
+/**
+ * One `foreign_objective.observed` frame (the night-writer detector's alert
+ * tier), exactly as the contract pins the payload: the objective's words, the
+ * classification and one-word reason, our lifecycle and claim state at the
+ * sample, the four mode words, the grid word, and the per-sample PV-evidence
+ * verdict. Defaults are the detector's own illustrative night case — mid
+ * held at a sustained -2,400 W charge at 23:40 local, disarmed and unclaimed,
+ * in remote-power mode, the site importing (no PV evidence): the
+ * sustained-charge escalation. PENDING-BACKEND.
+ */
+export interface ForeignObjectiveObservedPayload {
+  readonly unit_id: string;
+  readonly observed_at: string;
+  readonly active_w: number | null;
+  readonly reactive_var: number | null;
+  readonly classification: string;
+  readonly reason: string | null;
+  readonly lifecycle: string | null;
+  readonly claimed: boolean;
+  readonly run_mode_w: number | null;
+  readonly ctrl_mode_w: number | null;
+  readonly work_mode_w: number | null;
+  readonly debug_mode_w: number | null;
+  readonly grid_power_w: number | null;
+  readonly pv_evidence: boolean;
+}
+
+export function foreignObjectiveObserved(
+  sequence: number,
+  payload: Partial<ForeignObjectiveObservedPayload> = {},
+  occurredAt: string = "2026-08-23T23:40:12Z",
+): EventFrame<ForeignObjectiveObservedPayload> {
+  return frame(
+    FOREIGN_OBJECTIVE_OBSERVED_EVENT,
+    sequence,
+    {
+      unit_id: payload.unit_id ?? "mid",
+      observed_at: payload.observed_at ?? "2026-08-23T23:40:00+10:00",
+      active_w: payload.active_w === undefined ? -2400 : payload.active_w,
+      reactive_var: payload.reactive_var === undefined ? 0 : payload.reactive_var,
+      classification: payload.classification ?? "foreign_objective_observed",
+      reason:
+        payload.reason === undefined
+          ? "sustained_charge_without_pv_evidence"
+          : payload.reason,
+      lifecycle: payload.lifecycle === undefined ? "disarmed" : payload.lifecycle,
+      claimed: payload.claimed ?? false,
+      run_mode_w: payload.run_mode_w === undefined ? 1 : payload.run_mode_w,
+      ctrl_mode_w: payload.ctrl_mode_w === undefined ? 1 : payload.ctrl_mode_w,
+      work_mode_w: payload.work_mode_w === undefined ? 6 : payload.work_mode_w,
+      debug_mode_w: payload.debug_mode_w === undefined ? 0 : payload.debug_mode_w,
+      grid_power_w: payload.grid_power_w === undefined ? -180 : payload.grid_power_w,
+      pv_evidence: payload.pv_evidence ?? false,
+    },
+    occurredAt,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Stream frames the REST relay builds (rest.py)
 // ---------------------------------------------------------------------------
@@ -869,6 +974,59 @@ export interface WireUnitSnapshot {
   readonly health_state?: string | null;
   readonly health_reasons?: readonly string[] | null;
   readonly remediation_hint?: string | null;
+  /**
+   * The night-writer detector's per-unit summary (API_CONTRACTS.md
+   * "Night-writer detector", PENDING): the most recent RECORDED sample of the
+   * served PQ objective — null before any recorded sample. Once the detector
+   * composes (always — no config block exists) the key is never absent, only
+   * null; the default snapshot omits it entirely (an absent field is today's
+   * wire truth). Attach it with `withObjective`.
+   */
+  readonly last_objective_observed?: WireLastObjective | null;
+}
+
+/**
+ * The per-unit `last_objective_observed` summary, exactly as the contract
+ * spells it: `{observed_at, active_w, reactive_var, classification, reason}`.
+ * `active_w` is signed (negative = charge, the served-objective convention);
+ * `reason` is one word from the vocabulary above, null on quiet
+ * classifications.
+ */
+export interface WireLastObjective {
+  readonly observed_at: string;
+  readonly active_w: number | null;
+  readonly reactive_var: number | null;
+  readonly classification: string;
+  readonly reason: string | null;
+}
+
+/**
+ * A `last_objective_observed` fixture. Defaults are the detector's
+ * illustrative foreign night case (mid at a sustained -2,400 W charge,
+ * observed 23:40 local — the same episode `foreignObjectiveObserved` opens);
+ * explicit nulls are preserved.
+ */
+export function lastObjectiveObserved(
+  spec: Partial<WireLastObjective> = {},
+): WireLastObjective {
+  return {
+    observed_at: spec.observed_at ?? "2026-08-23T23:40:00+10:00",
+    active_w: spec.active_w === undefined ? -2400 : spec.active_w,
+    reactive_var: spec.reactive_var === undefined ? 0 : spec.reactive_var,
+    classification: spec.classification ?? "foreign_objective_observed",
+    reason:
+      spec.reason === undefined
+        ? "sustained_charge_without_pv_evidence"
+        : spec.reason,
+  };
+}
+
+/** Attach the pending detector summary to a snapshot unit (null = no sample). */
+export function withObjective(
+  unit: WireUnitSnapshot,
+  objective: WireLastObjective | null,
+): WireUnitSnapshot {
+  return { ...unit, last_objective_observed: objective };
 }
 
 /** The documented latch exposure: cause class, latched flag, reason code. */
@@ -1791,6 +1949,122 @@ export function energyNotCommissionedEnvelope(options: {
       "The energy scorecard is not commissioned in this deployment's config.",
     details: null,
     request_id: "req-energy-scorecard",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Night-writer detector — the session view (API_CONTRACTS.md "Night-writer
+// detector", the read surface `GET /api/v1/objectives/observed?last=24h`) —
+// PENDING-BACKEND like the rest of the family: the route is not live yet, so
+// these shapes are not served by today's wire; suites mock the client with
+// them. Defaults draw the detector's own illustrative night: mid held by an
+// external writer at a sustained -2,400 W charge across a foreign episode,
+// rhs quietly self-charging in band, lhs idle with no recorded samples.
+// ---------------------------------------------------------------------------
+
+/** One unit's window characterization (the contract's rollup shape verbatim). */
+export interface WireObservedObjectivesUnit {
+  readonly unit_id: string;
+  readonly first_seen_at: string | null;
+  readonly last_seen_at: string | null;
+  readonly sample_count: number;
+  readonly charge_sample_count: number;
+  readonly discharge_sample_count: number;
+  readonly min_active_w: number | null;
+  readonly typical_active_w: number | null;
+  readonly max_active_w: number | null;
+  /** In-window counts per classification word (the four pinned words). */
+  readonly classification_counts: Readonly<Record<string, number>>;
+  readonly foreign_episode_count: number;
+  readonly foreign_active: boolean;
+  readonly foreign_reason: string | null;
+  readonly last_objective_observed: WireLastObjective | null;
+}
+
+/** A per-unit window fixture; explicit nulls are preserved (never zero-filled). */
+export function observedObjectivesUnit(
+  spec: Partial<WireObservedObjectivesUnit> = {},
+): WireObservedObjectivesUnit {
+  return {
+    unit_id: spec.unit_id ?? "mid",
+    first_seen_at: spec.first_seen_at === undefined ? "2026-08-23T23:31:00+10:00" : spec.first_seen_at,
+    last_seen_at: spec.last_seen_at === undefined ? "2026-08-24T05:12:00+10:00" : spec.last_seen_at,
+    sample_count: spec.sample_count === undefined ? 442 : spec.sample_count,
+    charge_sample_count: spec.charge_sample_count === undefined ? 442 : spec.charge_sample_count,
+    discharge_sample_count: spec.discharge_sample_count === undefined ? 0 : spec.discharge_sample_count,
+    min_active_w: spec.min_active_w === undefined ? -2400 : spec.min_active_w,
+    typical_active_w: spec.typical_active_w === undefined ? -2270 : spec.typical_active_w,
+    max_active_w: spec.max_active_w === undefined ? -1980 : spec.max_active_w,
+    classification_counts:
+      spec.classification_counts === undefined
+        ? { foreign_objective_observed: 442 }
+        : spec.classification_counts,
+    foreign_episode_count: spec.foreign_episode_count === undefined ? 1 : spec.foreign_episode_count,
+    foreign_active: spec.foreign_active === undefined ? true : spec.foreign_active,
+    foreign_reason:
+      spec.foreign_reason === undefined
+        ? "sustained_charge_without_pv_evidence"
+        : spec.foreign_reason,
+    last_objective_observed:
+      spec.last_objective_observed === undefined
+        ? lastObjectiveObserved()
+        : spec.last_objective_observed,
+  };
+}
+
+/** The GET /api/v1/objectives/observed 200 body (the whole answer). PENDING-BACKEND. */
+export function getObservedObjectivesOk(view: {
+  as_of?: string;
+  last?: string;
+  window_s?: number;
+  units?: readonly WireObservedObjectivesUnit[];
+}): Record<string, unknown> {
+  return {
+    as_of: view.as_of ?? "2026-08-24T06:00:00+10:00",
+    last: view.last ?? "24h",
+    window_s: view.window_s ?? 86_400,
+    units: [
+      ...(view.units ?? [
+        observedObjectivesUnit(),
+        observedObjectivesUnit({
+          unit_id: "rhs",
+          first_seen_at: "2026-08-24T00:00:00+10:00",
+          last_seen_at: "2026-08-24T05:58:00+10:00",
+          sample_count: 718,
+          charge_sample_count: 718,
+          discharge_sample_count: 0,
+          min_active_w: -2554,
+          typical_active_w: -2500,
+          max_active_w: -2441,
+          classification_counts: { expected_nightly_charge: 717, handback_grace: 1 },
+          foreign_episode_count: 0,
+          foreign_active: false,
+          foreign_reason: null,
+          last_objective_observed: lastObjectiveObserved({
+            observed_at: "2026-08-24T05:58:00+10:00",
+            active_w: -2500,
+            classification: "expected_nightly_charge",
+            reason: null,
+          }),
+        }),
+        observedObjectivesUnit({
+          unit_id: "lhs",
+          first_seen_at: null,
+          last_seen_at: null,
+          sample_count: 0,
+          charge_sample_count: 0,
+          discharge_sample_count: 0,
+          min_active_w: null,
+          typical_active_w: null,
+          max_active_w: null,
+          classification_counts: {},
+          foreign_episode_count: 0,
+          foreign_active: false,
+          foreign_reason: null,
+          last_objective_observed: null,
+        }),
+      ]),
+    ],
   };
 }
 
