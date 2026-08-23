@@ -37,6 +37,7 @@ import { Fragment } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, AuditEvent, StreamEvent } from "../../api/client";
+import { toUnexpectedAutonomyEvent } from "../../app/fleet";
 import { formatWatts } from "../../lib/format";
 import "./activity.css";
 
@@ -259,6 +260,28 @@ function observationEntryFromFrame(frame: StreamEvent): AuditEvent | null {
   } as unknown as AuditEvent;
 }
 
+/**
+ * A `unit.unexpected_autonomy` frame as a QUIET timeline entry (the
+ * self-healing awareness layer's evidence recorder): the measured watts the
+ * backend pinned while NO request claimed the battery — mid's standing
+ * uncommanded oscillation class. It is deliberately informational: no banner,
+ * no badge, no alarm wording, exactly the recorded evidence the backend is
+ * collecting, throttled to one frame per unit per 60 s by the backend itself.
+ */
+function autonomyEntryFromFrame(frame: StreamEvent): AuditEvent | null {
+  const evidence = toUnexpectedAutonomyEvent(frame.payload);
+  if (evidence === null) {
+    return null;
+  }
+  return {
+    event_type: "unexpected_autonomy",
+    unit_id: evidence.unitId,
+    occurred_at: typeof frame.occurred_at === "string" ? frame.occurred_at : "",
+    sequence: typeof frame.sequence === "number" ? frame.sequence : 0,
+    measured_watts: evidence.measuredWatts,
+  } as unknown as AuditEvent;
+}
+
 /** A raw wire code as calm words: telemetry_stale -> "Telemetry stale". */
 function humanize(code: string): string {
   const words = code.toLowerCase().split(/[_\s]+/).filter((word) => word !== "");
@@ -344,6 +367,10 @@ function headlineFor(eventType: string): string {
       return "Dispatch request accepted";
     case "observation":
       return "Observation";
+    case "unexpected_autonomy":
+      // Quiet-tier evidence (the awareness layer's recorder): the headline is
+      // the whole alarm budget this entry ever gets.
+      return "Uncommanded activity";
     case "unit_armed":
       return "Arm request";
     case "unit_disarmed":
@@ -469,6 +496,15 @@ function happenedLine(event: AuditEvent, stopId: string | null): string | null {
     return telemetrySequence !== undefined
       ? `Latest reading received (telemetry sequence ${telemetrySequence})`
       : "Latest reading received";
+  }
+  if (eventType === "unexpected_autonomy") {
+    // The recorded evidence itself, in household words: the measured figure
+    // while nothing claimed the battery. Informational wording only — this
+    // entry exists so the operator can SEE the evidence the backend collects.
+    const measured = numberField(event, "measured_watts");
+    return measured !== undefined
+      ? `Measured ${formatWatts(measured)} with no request claiming this battery`
+      : "Measured with no request claiming this battery";
   }
   if (isStopHeldDecision(event)) {
     return stopHeldLine(stopId);
@@ -637,6 +673,13 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
               }
             } else if (frame.type === "observation.published") {
               const entry = observationEntryFromFrame(frame);
+              if (entry !== null) {
+                appendLiveEntry(entry);
+              }
+            } else if (frame.type === "unit.unexpected_autonomy") {
+              // Quiet-tier evidence, never an alarm: the timeline entry is
+              // the whole console surface for this frame.
+              const entry = autonomyEntryFromFrame(frame);
               if (entry !== null) {
                 appendLiveEntry(entry);
               }

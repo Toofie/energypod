@@ -50,6 +50,7 @@ import {
   type StreamEvent,
 } from "../../api/client";
 import {
+  actuationIncoherent,
   auditAppended,
   auditEvent,
   auditPage,
@@ -59,7 +60,10 @@ import {
   snapshotFrame,
   telemetrySummary,
   unitDetail,
+  unitHealthChanged,
   unitSnapshot,
+  unitUnexpectedAutonomy,
+  withHealth,
   withInhibit,
   withSnapshotIntent,
   type WireSnapshot,
@@ -1474,5 +1478,269 @@ describe("BatteriesView — open panels stay live", () => {
       expect(list?.textContent ?? "").not.toContain("event-live-2");
       expect(list?.textContent ?? "").not.toMatch(/refused/i);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The self-healing awareness layer (API_CONTRACTS.md "Self-healing awareness
+// layer (recovery detection)" — live on the controller since b20058d..7b491b3).
+//
+// WIRE TRUTH (service.py `_health_projection` + recovery.py, fixtures from
+// wire.ts — `withHealth`, `unitHealthChanged`, `actuationIncoherent`,
+// `unitUnexpectedAutonomy`, never hand-built here): every snapshot unit
+// carries `health_state` / `health_reasons` / `remediation_hint` once the
+// layer is composed (nulls when its projection is absent), the keys are
+// ABSENT on the older wire (the feature detection), and the bus carries the
+// layer's own three events. The badge's per-state wording is pinned in
+// web/src/app/unitHealth.test.tsx; this suite pins the CARDS' adoption.
+// ---------------------------------------------------------------------------
+
+describe("BatteriesView — the per-unit recovery health badge", () => {
+  /** A snapshot whose MID carries the given derived health (and optionally
+   * its own authorized figure, for the incoherence story's commanded watts). */
+  function healthSnapshot(
+    health: {
+      state?: string | null;
+      reasons?: readonly string[] | null;
+      remediation_hint?: string | null;
+    },
+    authorized?: { direction: string; watts: number },
+  ): WireSnapshot {
+    return {
+      ...HEALTHY_SNAPSHOT,
+      units: HEALTHY_SNAPSHOT.units.map((unit) =>
+        unit.unit_id === "MID"
+          ? withHealth(
+              {
+                ...unit,
+                ...(authorized === undefined
+                  ? {}
+                  : { authorized_power: authorized, requested_power: authorized }),
+              },
+              health,
+            )
+          : unit,
+      ),
+    };
+  }
+
+  function cardFor(unitId: string): HTMLElement {
+    return screen.getByRole("group", { name: unitId });
+  }
+
+  /** A pushable stream: the snapshot's opening burst, then test-pushed frames. */
+  function liveChannel(initial: readonly StreamEvent[]): {
+    stream: AsyncIterable<StreamEvent>;
+    push(frame: StreamEvent): void;
+  } {
+    const queue: StreamEvent[] = [...initial];
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    return {
+      stream: {
+        async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent, void, unknown> {
+          while (true) {
+            while (queue.length > 0) {
+              const next = queue.shift();
+              if (next !== undefined) {
+                yield next;
+              }
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        },
+      },
+      push: (frame) => {
+        queue.push(frame);
+        notify();
+      },
+    };
+  }
+
+  it.each([
+    [
+      "self_healing on solar self-charge",
+      { state: "self_healing", reasons: ["autonomous_self_charge"] },
+      "Managing itself — solar self-charge",
+    ],
+    [
+      "self_healing re-qualifying after an inhibit",
+      { state: "self_healing", reasons: ["requalifying_after_inhibit"] },
+      "Re-qualifying",
+    ],
+    [
+      "self_healing while cell balancing",
+      { state: "self_healing", reasons: ["cell_balancing"] },
+      "Cell balancing",
+    ],
+    [
+      "an unreachable gateway path",
+      { state: "unreachable", reasons: ["gateway_unreachable"] },
+      "Gateway unreachable",
+    ],
+  ] as const)("renders the badge on the card for %s", async (_name, health, words) => {
+    const state = healthSnapshot(health);
+    renderView(healthyClient(state, fleetEvents(state)));
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    expect(within(midCard).getByRole("note").textContent).toBe(words);
+    // The other cards, whose units carry no health fields, stay silent.
+    const rhsCard = await screen.findByRole("group", { name: "RHS" });
+    expect(within(rhsCard).queryByRole("note")).toBeNull();
+  });
+
+  it("tells the plain incoherence story with the battery's own commanded figure", async () => {
+    const state = healthSnapshot(
+      { state: "actuation_incoherent", reasons: ["authorized_not_actuating"] },
+      { direction: "discharge", watts: 1000 },
+    );
+    renderView(healthyClient(state, fleetEvents(state)));
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    expect(within(midCard).getByRole("note").textContent).toBe(
+      "Commanded 1,000 W but the battery isn't moving — investigating",
+    );
+  });
+
+  it("renders the prominent honest terminal for not_responding with the hint VERBATIM", async () => {
+    const hint =
+      "pod not responding — remote recovery exhausted; physical restart required (power-cycle the pod, then verify telemetry resumes, Debug Mode reads Normal Mode and SysControlMode reads Remote in the vendor MiniES app — see docs/POD_RECOVERY_RESEARCH.md R5)";
+    const state = healthSnapshot({
+      state: "not_responding",
+      reasons: ["reads_timing_out"],
+      remediation_hint: hint,
+    });
+    const { container } = renderView(healthyClient(state, fleetEvents(state)));
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    expect(within(midCard).getByRole("note").textContent).toContain(
+      "Not responding — remote recovery exhausted",
+    );
+    // The backend's own remediation words, whole and un-reworded.
+    expect(container.querySelector(".unit-health-hint")?.textContent).toBe(hint);
+  });
+
+  it.each([
+    ["no health fields at all (the older wire)", (unit: WireUnitSnapshot) => unit],
+    [
+      "null fields (the layer composed, the projection absent)",
+      (unit: WireUnitSnapshot) =>
+        withHealth(unit, { state: null, reasons: null, remediation_hint: null }),
+    ],
+    [
+      "a healthy state (silence is the design)",
+      (unit: WireUnitSnapshot) => withHealth(unit, { state: "healthy", reasons: [] }),
+    ],
+    [
+      "a foreign writer (the inhibit latch surface already tells it)",
+      (unit: WireUnitSnapshot) =>
+        withHealth(unit, { state: "foreign_writer", reasons: ["external_writer_latched"] }),
+    ],
+    [
+      "an inhibited unit (the same existing surface)",
+      (unit: WireUnitSnapshot) => withHealth(unit, { state: "inhibited", reasons: ["inhibited"] }),
+    ],
+  ] as const)("renders NO health badge for %s", async (_name, attach) => {
+    const state: WireSnapshot = {
+      ...HEALTHY_SNAPSHOT,
+      units: HEALTHY_SNAPSHOT.units.map((unit) => (unit.unit_id === "MID" ? attach(unit) : unit)),
+    };
+    const { container } = renderView(healthyClient(state, fleetEvents(state)));
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    // The card still renders every ordinary field; only the badge is absent.
+    expect(within(midCard).getByText(/Availability:/i)).toBeInTheDocument();
+    expect(container.querySelectorAll(".unit-health")).toHaveLength(0);
+  });
+
+  it("applies a live unit.health_changed transition without waiting for a snapshot re-read", async () => {
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
+    const channel = liveChannel(fleetEvents(HEALTHY_SNAPSHOT));
+    client.openEvents.mockReturnValue(channel.stream);
+    renderView(client);
+    await waitFor(() => {
+      expect(screen.getByRole("group", { name: "RHS" })).toBeInTheDocument();
+    });
+    expect(client.getSnapshot).toHaveBeenCalledTimes(1);
+
+    // rhs quietly starts managing itself (today's live rhs/lhs story): the
+    // badge moves from the frame alone — no refetch, no reconnect.
+    channel.push(
+      unitHealthChanged(4201, {
+        unit_id: "RHS",
+        from: "healthy",
+        to: "self_healing",
+        reasons: ["autonomous_self_charge"],
+      }),
+    );
+    await waitFor(() => {
+      expect(within(cardFor("RHS")).getByRole("note").textContent).toBe(
+        "Managing itself — solar self-charge",
+      );
+    });
+    expect(client.getSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it("moves the badge to the warning on an actuation.incoherent detection and its echo follow-up", async () => {
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
+    const channel = liveChannel(fleetEvents(HEALTHY_SNAPSHOT));
+    client.openEvents.mockReturnValue(channel.stream);
+    renderView(client);
+    await waitFor(() => {
+      expect(screen.getByRole("group", { name: "MID" })).toBeInTheDocument();
+    });
+
+    channel.push(
+      actuationIncoherent(4201, {
+        unit_id: "MID",
+        authorized_watts: 1000,
+        cycles: 4,
+        measured_watts: 12,
+        baseline_watts: 8,
+        movement_watts: 4,
+      }),
+    );
+    // MID's own snapshot authorization is 2,400 W: the story names THAT
+    // battery's own figure, never the event's fleet-level number alone.
+    await waitFor(() => {
+      expect(within(cardFor("MID")).getByRole("note").textContent).toBe(
+        "Commanded 2,400 W but the battery isn't moving — investigating",
+      );
+    });
+
+    // The echo-classified follow-up frame of the same episode keeps the badge
+    // (the discriminator is the shell's announcement, not a second badge).
+    channel.push(
+      actuationIncoherent(4202, {
+        unit_id: "MID",
+        authorized_watts: 1000,
+        echo: { classification: "echo_matches_write", served_active_w: 1000 },
+      }),
+    );
+    await waitFor(() => {
+      expect(within(cardFor("MID")).getAllByRole("note")).toHaveLength(1);
+    });
+  });
+
+  it("keeps unexpected_autonomy evidence off the cards entirely (Activity owns its quiet story)", async () => {
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
+    const channel = liveChannel(fleetEvents(HEALTHY_SNAPSHOT));
+    client.openEvents.mockReturnValue(channel.stream);
+    const { container } = renderView(client);
+    await waitFor(() => {
+      expect(screen.getByRole("group", { name: "MID" })).toBeInTheDocument();
+    });
+
+    channel.push(unitUnexpectedAutonomy(4201, { unit_id: "MID", measured_watts: 1411.2 }));
+    await waitFor(() => {
+      expect(client.openEvents).toHaveBeenCalled();
+    });
+    expect(container.querySelectorAll(".unit-health")).toHaveLength(0);
+    expect(container.textContent).not.toContain("Uncommanded activity");
   });
 });

@@ -78,10 +78,13 @@ import { ApiClientError, createApiClient } from "../../api/client";
 import type { ApiClient } from "../../api/client";
 import { ADVISER_REASON_CODES } from "../../app/fleet";
 import {
+  actuationIncoherent,
   adviserState,
   excessAdviserStateChanged,
   excessChargingToggleOk,
   telemetrySummary,
+  unitHealthChanged,
+  unitUnexpectedAutonomy,
   type WireAdviserState,
   type WireTelemetrySummary,
 } from "../../test/wire";
@@ -121,6 +124,14 @@ interface UnitView {
   measured_watts: number | null;
   /** The amended snapshot contract's nullable telemetry block (wire.ts). */
   telemetry?: WireTelemetrySummary | null;
+  /**
+   * The self-healing awareness layer's derived per-unit fields (wire.ts
+   * `withHealth`): absent from the older wire — the feature detection the
+   * unit line's health badge keys on.
+   */
+  health_state?: string | null;
+  health_reasons?: readonly string[] | null;
+  remediation_hint?: string | null;
 }
 
 interface FleetView {
@@ -2266,5 +2277,182 @@ describe("HomeView — the excess-charging toggle", () => {
     expect(alert).toHaveTextContent(/excess_enable_refused/);
     // The refused enable leaves the toggle exactly where it was.
     expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The self-healing awareness layer (API_CONTRACTS.md "Self-healing awareness
+// layer (recovery detection)" — live on the controller since b20058d..7b491b3):
+// the per-unit health badge on the "What is powering the home?" unit lines.
+// Wire truth: the snapshot units carry health_state / health_reasons /
+// remediation_hint once the layer is composed (nulls when its projection is
+// absent, keys absent on the older wire), and the bus carries
+// unit.health_changed / actuation.incoherent / unit.unexpected_autonomy
+// (fixtures from wire.ts). The badge's own per-state wording is pinned in
+// web/src/app/unitHealth.test.tsx; this suite pins the Home lines' adoption.
+// ---------------------------------------------------------------------------
+
+describe("HomeView — the per-unit recovery health badge", () => {
+  function healingFleet(
+    health: { state: string; reasons?: readonly string[]; remediation_hint?: string | null },
+    authorized?: { direction: "charge" | "discharge"; watts: number },
+  ): FleetView {
+    return fleet([
+      {
+        ...unit({
+          unit_id: "pod-mid",
+          lifecycle: "active",
+          ...(authorized === undefined
+            ? {}
+            : {
+                requested_power: { direction: authorized.direction, watts: authorized.watts },
+                authorized_power: { direction: authorized.direction, watts: authorized.watts },
+              }),
+        }),
+        health_state: health.state,
+        health_reasons: health.reasons ?? [],
+        remediation_hint: health.remediation_hint ?? null,
+      },
+      unit({ unit_id: "pod-rhs" }),
+      unit({ unit_id: "pod-lhs" }),
+    ]);
+  }
+
+  it.each([
+    ["self_healing on solar self-charge", "self_healing", ["autonomous_self_charge"], "Managing itself — solar self-charge"],
+    ["self_healing re-qualifying", "self_healing", ["requalifying_after_inhibit"], "Re-qualifying"],
+    ["self_healing cell balancing", "self_healing", ["cell_balancing"], "Cell balancing"],
+    ["an unreachable gateway path", "unreachable", ["gateway_unreachable"], "Gateway unreachable"],
+  ] as const)("shows %s on the unit line", async (_name, state, reasons, words) => {
+    installClient({ snapshot: healingFleet({ state, reasons }) });
+    renderHome();
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    await waitFor(() => {
+      expectVisibleText(entry, words);
+    });
+    // The units without health fields stay silent.
+    const quiet = await findUnitEntry(POWER_REGION, "pod-rhs");
+    expect(within(quiet).queryByRole("note")).toBeNull();
+  });
+
+  it("tells the plain incoherence story with the battery's own allowed figure", async () => {
+    installClient({
+      snapshot: healingFleet(
+        { state: "actuation_incoherent", reasons: ["authorized_not_actuating"] },
+        { direction: "discharge", watts: 1000 },
+      ),
+    });
+    renderHome();
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    await waitFor(() => {
+      expectVisibleText(entry, "Commanded 1,000 W but the battery isn't moving — investigating");
+    });
+  });
+
+  it("shows the prominent honest terminal with the hint VERBATIM", async () => {
+    const hint =
+      "pod not responding — remote recovery exhausted; physical restart required (power-cycle the pod, then verify telemetry resumes, Debug Mode reads Normal Mode and SysControlMode reads Remote in the vendor MiniES app — see docs/POD_RECOVERY_RESEARCH.md R5)";
+    installClient({
+      snapshot: healingFleet({ state: "not_responding", reasons: ["reads_timing_out"], remediation_hint: hint }),
+    });
+    renderHome();
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    await waitFor(() => {
+      expectVisibleText(entry, "Not responding — remote recovery exhausted");
+    });
+    // The backend's own remediation words, whole and un-reworded.
+    const hintNode = within(entry).getAllByText(hint).at(0);
+    expect(hintNode).toBeDefined();
+  });
+
+  it.each([
+    ["a healthy unit (silence is the design)", "healthy"],
+    ["a foreign writer (the Inhibited badge and latch surfaces tell it)", "foreign_writer"],
+    ["an inhibited unit (same existing surfaces)", "inhibited"],
+  ] as const)("renders NO health badge for %s", async (_name, state) => {
+    installClient({ snapshot: healingFleet({ state, reasons: [] }) });
+    renderHome();
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    expect(within(entry).queryByRole("note")).toBeNull();
+    expect(document.querySelectorAll(".unit-health")).toHaveLength(0);
+  });
+
+  it("renders NO health badge when the snapshot carries no health fields at all (the older wire)", async () => {
+    installClient({ snapshot: fleet(allUnits("armed_idle")) });
+    renderHome();
+    await dataLanded();
+    expect(document.querySelectorAll(".unit-health")).toHaveLength(0);
+  });
+
+  it("applies a live unit.health_changed transition on the unit line without a refetch", async () => {
+    const snapshot = fleet(allUnits("disarmed"));
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    const getSnapshot = vi.fn(() => Promise.resolve(snapshot));
+    installClient({ snapshot, getSnapshot, openEvents: channel.openEvents });
+    renderHome();
+    await dataLanded();
+
+    channel.push(
+      unitHealthChanged(43, {
+        unit_id: "pod-rhs",
+        from: "healthy",
+        to: "self_healing",
+        reasons: ["autonomous_self_charge"],
+      }),
+    );
+    const entry = await findUnitEntry(POWER_REGION, "pod-rhs");
+    await waitFor(() => {
+      expectVisibleText(entry, "Managing itself — solar self-charge");
+    });
+    // The frame alone moved the badge — no event-driven snapshot read.
+    expect(getSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it("moves the unit line to the warning on an actuation.incoherent detection", async () => {
+    // The snapshot carries NO health fields: the badge appears only because
+    // the detection frame itself moved the state.
+    const snapshot = fleet([
+      unit({
+        unit_id: "pod-mid",
+        lifecycle: "active",
+        requested_power: { direction: "discharge", watts: 2400 },
+        authorized_power: { direction: "discharge", watts: 2400 },
+      }),
+      unit({ unit_id: "pod-rhs" }),
+      unit({ unit_id: "pod-lhs" }),
+    ]);
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    installClient({ snapshot, openEvents: channel.openEvents });
+    renderHome();
+    await dataLanded();
+
+    channel.push(
+      actuationIncoherent(43, {
+        unit_id: "pod-mid",
+        authorized_watts: 1000,
+        cycles: 4,
+      }),
+    );
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    await waitFor(() => {
+      expectVisibleText(entry, "Commanded 2,400 W but the battery isn't moving — investigating");
+    });
+  });
+
+  it("keeps unexpected_autonomy evidence off the Home lines entirely", async () => {
+    const snapshot = fleet(allUnits("disarmed"));
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    installClient({ snapshot, openEvents: channel.openEvents });
+    renderHome();
+    await dataLanded();
+
+    channel.push(unitUnexpectedAutonomy(43, { unit_id: "pod-mid", measured_watts: 1411.2 }));
+    await waitFor(() => {
+      expect(channel).toBeDefined();
+    });
+    expect(document.querySelectorAll(".unit-health")).toHaveLength(0);
+    expect(screen.queryByText(/uncommanded activity/i)).toBeNull();
+    // And no announcement was spent on it: the polite region stays as it was.
+    expect(screen.queryByText(/uncommanded/i)).toBeNull();
   });
 });

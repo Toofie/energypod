@@ -74,13 +74,19 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health, StreamEvent } from "../../api/client";
 import {
+  applyHealthPatch,
   isRecord,
   patchAdviserState,
+  toActuationIncoherentEvent,
   toAdviserState,
+  toHealthChangedEvent,
+  toUnitHealth,
   toWattsByUnit,
   type AdviserState,
+  type UnitHealth,
   type WattsByUnit,
 } from "../../app/fleet";
+import { UnitHealthTag } from "../../app/unitHealth";
 import { isPlaneSnapshot } from "../../app/SharedDataPlane";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../../lib/format";
@@ -175,6 +181,12 @@ interface UnitView {
   authorized_power: PowerFigureView | null;
   measured_watts: number | null;
   telemetry: TelemetrySummaryView | null;
+  /**
+   * The self-healing awareness layer's derived recovery view; null when the
+   * snapshot carries no usable health fields (the feature detection — the
+   * unit line's health badge renders nothing at all).
+   */
+  health: UnitHealth | null;
 }
 
 interface SnapshotView {
@@ -238,6 +250,7 @@ function readUnit(value: unknown): UnitView | null {
     authorized_power: readPowerFigure(record.authorized_power),
     measured_watts: typeof record.measured_watts === "number" ? record.measured_watts : null,
     telemetry: readTelemetrySoc(record.telemetry),
+    health: toUnitHealth(record),
   };
 }
 
@@ -818,6 +831,29 @@ export function HomeView({ client }: HomeViewProps) {
       });
     };
 
+    /**
+     * A live recovery transition (unit.health_changed, or the badge state the
+     * watchdog's detection implies): the unit line's health badge moves from
+     * the frame, state-locally — no refetch, with the periodic snapshot read
+     * as the reconciler. A same-state patch keeps the snapshot's remediation
+     * hint; a state change resets it (bus transitions carry none).
+     */
+    const patchHealth = (unitId: string, patch: UnitHealth): void => {
+      setSnapshot((previous) => {
+        if (previous === null) {
+          return previous;
+        }
+        return {
+          ...previous,
+          units: previous.units.map((unit) =>
+            unit.unit_id === unitId
+              ? { ...unit, health: applyHealthPatch(unit.health, patch) }
+              : unit,
+          ),
+        };
+      });
+    };
+
     /** Patch the requested figure for the units an intent names. */
     const patchRequested = (
       unitIds: string[],
@@ -968,6 +1004,42 @@ export function HomeView({ client }: HomeViewProps) {
           );
         }
         refetchSnapshot();
+      }
+      if (frame.type === "unit.health_changed") {
+        // The awareness layer's live transition: the unit line's badge moves
+        // now, with no refetch — the periodic snapshot read reconciles.
+        const transition = toHealthChangedEvent(frame.payload);
+        if (transition !== null) {
+          patchHealth(transition.unitId, {
+            state: transition.to,
+            reasons: transition.reasons,
+            remediationHint: null,
+          });
+        }
+        return;
+      }
+      if (frame.type === "actuation.incoherent") {
+        // The watchdog verdict (and its echo-classified follow-up frame of
+        // the same type): the badge state moves to the warning immediately;
+        // the shell owns the one-per-episode polite announcement.
+        const detection = toActuationIncoherentEvent(frame.payload);
+        if (detection !== null) {
+          patchHealth(detection.unitId, {
+            state: "actuation_incoherent",
+            reasons:
+              detection.echoClassification === null
+                ? ["authorized_not_actuating"]
+                : ["authorized_not_actuating", detection.echoClassification],
+            remediationHint: null,
+          });
+        }
+        return;
+      }
+      if (frame.type === "unit.unexpected_autonomy") {
+        // QUIET-TIER EVIDENCE: never a badge, never an announcement here —
+        // the Activity timeline renders the recorded evidence. This branch
+        // exists so the quietness is explicit.
+        return;
       }
       if (frame.type === "excess_adviser.state_changed") {
         // The adviser's own frame (feature-detected): the payload patches the
@@ -1468,6 +1540,11 @@ function UnitPowerEntry({
         <h3 className="home-unit-name">{unit.unit_id}</h3>
         <span className={`home-badge home-badge--${badgeKey(badge)}`}>{badge}</span>
       </div>
+      {/* The self-healing awareness badge on the unit line: silent while
+          healthy (and for the states the Inhibited badge above already
+          tells), quiet-positive while the battery manages itself, the honest
+          terminal when recovery fails. */}
+      <UnitHealthTag health={unit.health} authorizedWatts={figures.authorizedWatts} />
       <div className="home-figures">
         <div className="home-figure" role="figure" aria-label="Requested">
           <span className="home-figure-label">Requested</span>

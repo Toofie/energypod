@@ -63,7 +63,16 @@ import type {
   StreamEvent,
 } from "../../api/client";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
-import { gridLoadText, type WattsByUnit } from "../../app/fleet";
+import {
+  applyHealthPatch,
+  gridLoadText,
+  toActuationIncoherentEvent,
+  toHealthChangedEvent,
+  toUnitHealth,
+  type UnitHealth,
+  type WattsByUnit,
+} from "../../app/fleet";
+import { UnitHealthTag } from "../../app/unitHealth";
 import {
   formatMillivolts,
   formatPercent,
@@ -143,6 +152,12 @@ interface ViewUnit {
   measured_watts: number | null;
   telemetry: TelemetryView | null;
   inhibit: LatchState | null;
+  /**
+   * The self-healing awareness layer's derived recovery view; null when the
+   * snapshot carries no usable health fields (the feature detection — the
+   * card's health badge renders nothing at all).
+   */
+  health: UnitHealth | null;
 }
 
 /** The GET /api/v1/units/{id} projection, parsed just as defensively. */
@@ -602,6 +617,7 @@ function parseUnit(record: Record<string, unknown>): ViewUnit | null {
     measured_watts: parseNumber(record.measured_watts),
     telemetry: parseTelemetry(record.telemetry),
     inhibit,
+    health: toUnitHealth(record),
   };
 }
 
@@ -737,6 +753,13 @@ function FleetCard({
           {unit.unit_id}
         </button>
       </div>
+      {/* The self-healing awareness badge: silent while healthy (and for the
+          states the inhibit surfaces already tell), quiet-positive while the
+          battery manages itself, the honest terminal when recovery fails. */}
+      <UnitHealthTag
+        health={unit.health}
+        authorizedWatts={unit.authorized_power?.watts ?? null}
+      />
       <p>
         <b>Availability:</b> {availabilityWord(unit.lifecycle)}
       </p>
@@ -1580,6 +1603,28 @@ export function BatteriesView({
     loadSnapshotRef.current = loadSnapshot;
   }, [loadSnapshot]);
 
+  /**
+   * A live recovery transition (unit.health_changed, or the badge state a
+   * watchdog detection implies): patch the one unit's health state-locally —
+   * the badge moves without waiting for a poll, and the periodic snapshot
+   * read stays the reconciler. The merge keeps the snapshot's remediation
+   * hint while the state is unchanged (bus transitions carry no hint).
+   */
+  const patchHealth = useCallback((unitId: string, patch: UnitHealth): void => {
+    setFleet((previous) =>
+      previous === null
+        ? previous
+        : {
+            ...previous,
+            units: previous.units.map((unit) =>
+              unit.unit_id === unitId
+                ? { ...unit, health: applyHealthPatch(unit.health, patch) }
+                : unit,
+            ),
+          },
+    );
+  }, []);
+
   useEffect(() => {
     if (fleet === null || fleetReady) {
       return;
@@ -1742,6 +1787,33 @@ export function BatteriesView({
               if (parsed !== null) {
                 setObservations((previous) => ({ ...previous, [parsed.unitId]: parsed.track }));
               }
+            } else if (frame.type === "unit.health_changed") {
+              // A live recovery transition: the card's health badge moves
+              // now, from the frame — the snapshot read stays the reconciler.
+              const transition = toHealthChangedEvent(frame.payload);
+              if (transition !== null) {
+                patchHealth(transition.unitId, {
+                  state: transition.to,
+                  reasons: transition.reasons,
+                  remediationHint: null,
+                });
+              }
+            } else if (frame.type === "actuation.incoherent") {
+              // The watchdog verdict: the badge state moves to the warning
+              // even before the backend's own health_changed arrives, and the
+              // echo classification (on the follow-up frame of the same type)
+              // rides the reasons exactly as the backend derives them.
+              const detection = toActuationIncoherentEvent(frame.payload);
+              if (detection !== null) {
+                patchHealth(detection.unitId, {
+                  state: "actuation_incoherent",
+                  reasons:
+                    detection.echoClassification === null
+                      ? ["authorized_not_actuating"]
+                      : ["authorized_not_actuating", detection.echoClassification],
+                  remediationHint: null,
+                });
+              }
             } else if (frame.type === "audit.appended") {
               // The Events tab is a LIVE surface: a durable fact the backend
               // just appended lands on the timeline now, not at the next
@@ -1785,7 +1857,7 @@ export function BatteriesView({
     return () => {
       cancelled = true;
     };
-  }, [applySnapshot, client, streamOn, consumeFigures]);
+  }, [applySnapshot, client, streamOn, consumeFigures, patchHealth]);
 
   const retrySnapshot = (): void => {
     setPhase("loading");

@@ -77,6 +77,7 @@ import {
   auditPage,
   observationPublished,
   resyncRequired,
+  unitUnexpectedAutonomy,
   type WireAuditEvent,
 } from "../../test/wire";
 import { ActivityView } from "./ActivityView";
@@ -1030,5 +1031,141 @@ describe("Activity view — live updates from the event stream", () => {
     await waitFor(() => {
       expect(screen.getAllByRole("listitem")).toHaveLength(1);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The self-healing awareness layer's QUIET evidence (API_CONTRACTS.md
+// "Self-healing awareness layer (recovery detection)" — live on the
+// controller since b20058d..7b491b3): a unit.unexpected_autonomy bus frame
+// (one per unit per 60 s, carrying the pinned figures) becomes exactly one
+// informational timeline entry — never a banner, never a badge, never an
+// alarm tier. It exists so the operator can SEE the recorded evidence the
+// backend is collecting on mid's standing uncommanded oscillation.
+// ---------------------------------------------------------------------------
+
+describe("Activity view — unexpected-autonomy evidence (quiet tier)", () => {
+  /** A controllable shared stream, as the live-update suite builds one. */
+  function streamChannel(): {
+    openEvents: () => AsyncGenerator<Record<string, unknown>, void, unknown>;
+    push(frame: Record<string, unknown>): void;
+  } {
+    const queue: Record<string, unknown>[] = [];
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    return {
+      openEvents: () =>
+        (async function* channel(): AsyncGenerator<Record<string, unknown>, void, unknown> {
+          while (true) {
+            while (queue.length > 0) {
+              const next = queue.shift();
+              if (next !== undefined) {
+                yield next;
+                if (next.type === "resync_required") {
+                  return;
+                }
+              }
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        })(),
+      push: (frame) => {
+        queue.push(frame);
+        notify();
+      },
+    };
+  }
+
+  it("appends one quiet informational entry per evidence frame, never an alarm", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push(
+      unitUnexpectedAutonomy(93, { unit_id: "mid", measured_watts: 1411.2 }) as unknown as Record<
+        string,
+        unknown
+      >,
+    );
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("Uncommanded activity");
+    expect(items[0]!.textContent).toContain("mid");
+    expect(items[0]!.textContent).toContain("Measured 1,411.2 W with no request claiming this battery");
+
+    // Quiet by construction: no alert role anywhere on the page, no reason
+    // codes to disclose, and a second throttled frame (the backend sends one
+    // per unit per 60 s) is its own entry — never an escalation.
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+    expect(within(items[0]!).queryByRole("button", { name: /show technical detail/i })).toBeNull();
+    channel.push(
+      unitUnexpectedAutonomy(94, { unit_id: "mid", measured_watts: -1204.5 }) as unknown as Record<
+        string,
+        unknown
+      >,
+    );
+    await waitFor(() => {
+      expect(screen.getAllByRole("listitem")).toHaveLength(2);
+    });
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
+  });
+
+  it("never fabricates a figure when the frame's measurement is absent", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push(
+      unitUnexpectedAutonomy(93, { unit_id: "mid", measured_watts: null }) as unknown as Record<
+        string,
+        unknown
+      >,
+    );
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("Measured with no request claiming this battery");
+  });
+
+  it("carries the unit id honestly: the unit filter selects it, and no kind chip claims it", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push(
+      unitUnexpectedAutonomy(93, { unit_id: "mid", measured_watts: 1411.2 }) as unknown as Record<
+        string,
+        unknown
+      >,
+    );
+    await waitFor(() => {
+      expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    });
+
+    // Evidence is not any of the five contracted kinds: every kind chip that
+    // narrows the timeline hides it (it lives in the "other" bucket, quiet).
+    const user = userEvent.setup();
+    for (const chip of ["Observations", "Decisions", "Arming", "Stops", "Acknowledgements"]) {
+      await user.click(screen.getByRole("button", { name: chip }));
+      expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+      await user.click(screen.getByRole("button", { name: chip }));
+    }
+
+    // The unit filter still owns it exactly like any per-unit fact.
+    await user.click(screen.getByRole("button", { name: "MID" }));
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "RHS" }));
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
   });
 });
