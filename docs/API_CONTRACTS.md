@@ -638,6 +638,12 @@ coordinator, the event bus, and per-unit actor handles.
   store (payload: `cycle_id`, `generation`, `unit_ids`), symmetric with `authorization.revoked`.
   `audit.appended` payloads additionally carry the event's `requested_active_w` and
   `authorized_active_w` so consoles render watt figures straight off the stream.
+- Night-writer detector (2026-08-23 census follow-up): `foreign_objective.observed` publishes
+  on the alert tier only — one event per foreign episode (or per reason change inside one),
+  payload `{unit_id, observed_at, active_w, reactive_var, classification, reason, lifecycle,
+  claimed, run_mode_w, ctrl_mode_w, work_mode_w, debug_mode_w, grid_power_w, pv_evidence}`.
+  Quiet-tier evidence (in-band autonomy samples, handback-grace samples) is NEVER published;
+  it accumulates in the session record behind `GET /api/v1/objectives/observed`.
 
 ## Runtime composition and entry point
 
@@ -1093,6 +1099,127 @@ authorization per the research.
   bounded, fully suppressed detection pass per unit after the polls and before the kernel
   tick — detection can never delay renewal or control, and every audit/bus failure inside
   the monitor is itself suppressed.
+
+## Night-writer detector (foreign-objective observation)
+
+`energypod.application.foreign_objective` (2026-08-23 census queue item, PRODUCT_NEXT §2 S2).
+Zero-extra-frames periodic sampling of the served PQ objective while the controller commands
+nothing, honestly classifying and recording what — if anything — commands the batteries
+overnight. It closes the census's 7.3 h overnight audit blind spot with timestamped evidence
+and gives the pending night-partition operator decision (DESIGN_SCHEDULES §8) its
+night-window characterization. PASSIVE by construction, exactly like the awareness layer:
+audit facts, bus events, and in-memory evidence records only — no write path, no latch, no
+block, no refusal originates here.
+
+**Honest limits of the signature (stated up front, B6/ADD-1 doctrine).** The served-objective
+words alone CANNOT distinguish an external charge command from the pod's own self-charge:
+the night writers historically CHARGE (negative objectives), and negative objectives sit
+INSIDE the commissioned autonomy band — the pods' own firmware holds ~-520..-700 W daytime
+CT-following self-charge and up to ~-2.27 kW deep self-charge on the same register. So the
+detector records EVERY nonzero sample as timestamped evidence (unit, active/reactive words,
+mode words, our lifecycle/claim state) and drives the ALERT tier from pattern rules on top;
+plain in-band float/self-charge never alerts. EVIDENCE first, alert second, and never a false
+alarm on the pods' normal autonomy (the operator's consistent direction).
+
+- **Sampling (zero extra frames).** The served objective (PCS detail block `0x1060+17/+18`,
+  PROTOCOL_EVIDENCE 4b — the same window the arm preflight reads; already in the shipped read
+  plan) decodes into every observation as three advisory fields following the device-mode-word
+  doctrine (never quality-map keys — the 10/12/18-key legal map set is unchanged):
+  `served_active_objective_w` and `served_reactive_objective_var` (signed int16, unscaled
+  watts/var; null until the block has been served once) and `objective_captured_at_mono`
+  (the capture time of the serving the words came from — the live tiered plan serves the block
+  on the cold ring, so between rotations the words ride from cache with their ORIGINAL capture
+  time). The detector issues no reads of its own: a sample's cadence is bounded below by
+  `foreign_objective_sample_interval_s` and above by the read plan's serving period of the
+  detail block (~96–108 s live at the 1.5 s control period; every telemetry cycle in
+  simulate). Every read still runs through the owning actor's serialized mailbox — the
+  awareness layer's bounded-read pattern, on the poll path.
+- **Sample eligibility (all must hold).** The observation's objective words are FRESH (their
+  capture time advanced since this unit's last recorded sample); the interval floor elapsed;
+  the unit's lifecycle is one of `observe_only`, `disarmed`, `armed_idle`, `inhibited` (never
+  `boot`, `active`, `stopping`, `disconnected` — an inhibited unit is by definition
+  uncommanded and its evidence matters most); NO live intent claims the unit; and the
+  handback grace elapsed since the unit was last claimed, authorized, or `active`.
+- **A failed sample is a gap, never an alarm.** A failed poll means no fresh observation and
+  therefore no sample; a decode without the words is not a sample; every failure inside the
+  detector (audit append, bus publish, repository read) is fully suppressed and leaves the
+  session record and any open episode untouched.
+- **Classification, per recorded sample, first match wins.** With `P` the active word, `Q`
+  the reactive word, and the band the commissioned `expected_autonomy_band_w`:
+  1. `P == 0 and Q == 0`: NOTHING is recorded ("zero = nothing"); any open foreign episode
+     closes silently; the pattern streaks reset.
+  2. **Within handback grace** (our own claim/authority ended less than
+     `foreign_objective_handback_grace_s` ago — the observed watchdog hand-back is 4–8 s, the
+     residue of our own lapsed objective): recorded quiet with classification
+     `handback_grace`; the streaks reset; an open episode closes. Our own intent serving then
+     lapsing is thereby self-observed and never foreign.
+  3. `Q != 0`: `foreign_objective_observed`, reason `reactive_objective_observed` — the pods'
+     own signature carries `Q == 0` (ADD-1), so any reactive component is not pod autonomy.
+  4. `P` outside the commissioned band: `foreign_objective_observed`, reason
+     `outside_autonomy_band` — the same envelope the unexpected-autonomy recorder and the
+     arm-time preflight consume, on the FIRST qualifying sample.
+  5. In-band nonzero: quiet evidence `pod_autonomy_objective_observed`, UNLESS a pattern rule
+     escalates (both require `foreign_objective_sustained_samples` CONSECUTIVE qualifying
+     samples; any non-qualifying sample resets the streak):
+     - `sustained_remote_mode_objective` — every one of the last N consecutive samples held a
+       nonzero in-band objective while the advisory run-mode word read `1` ("Remote PQ Power",
+       the vendor's written-objective state, GlobalFun.cs:178-188). The pod's own CT-following
+       autonomy reads `0` ("Matching Load" — live-observed 2026-08-23: lhs held +695..914 W
+       uncommanded after dark in exactly that mode).
+     - `sustained_charge_without_pv_evidence` — every one of the last N consecutive samples
+       held `P <= -foreign_objective_self_charge_class_w` (default 1000 W, above the observed
+       ~-520..-700 W typical self-charge, below the -2.27 kW deep class) with NO PV evidence.
+       PV evidence per sample is the SAME observation's advisory `grid_power_w > 0` (the site
+       is exporting — surplus PV plausible); import or absent means no evidence. Site PV is
+       never presented as measured (DESIGN_ENERGY_SCORECARD doctrine).
+  6. **Deliberate refinement, recorded:** the blanket "any positive-discharge objective at an
+     hour with no PV evidence" rule was considered and REFUSED — the 2026-08-23 lhs evidence
+     (a steady uncommanded +695..914 W hold after dark in Matching Load mode; config rev 5
+     widened the band's positive edge to +1000 for exactly that behavior) proves in-band
+     positive objectives at no-PV hours are normal pod autonomy. In-band positives stay quiet
+     evidence; the remote-mode rule is the discriminator that separates a foreign writer's
+     discharge from the pod's own load-following, and out-of-band positives already alert
+     under rule 4.
+- **Alert semantics.** Exactly ONE `foreign_objective_observed` audit fact plus ONE
+  `foreign_objective.observed` bus event per (episode, reason): opening a foreign episode, or
+  a reason CHANGE while an episode is open (a materially different signature re-alerts). A
+  sustained foreign objective never re-alerts on every sample — the session record carries
+  the continuous evidence. A quiet, grace, or zero sample closes the episode silently (the
+  closing is visible on the surfaces as `foreign_active: false`).
+- **Session record.** Every recorded sample (`unit_id`, `observed_at` wall time, active and
+  reactive words, classification and reason, our lifecycle and claim state, the four mode
+  words, `grid_power_w`) accumulates into a per-unit rolling session: in-memory only,
+  retained 7 days or 4096 samples per unit (whichever binds first), reset by a restart — the
+  durable audit trail keeps the alerts, and gaps between samples are inferable from the
+  cadence, never fabricated.
+- **Read surface.** `GET /api/v1/objectives/observed?last=24h` (observe scope; `last` is
+  `Nh`/`Nd`, 1 h..168 h inclusive, default `24h`; anything else is 422 `validation_error`)
+  answers the window characterization:
+  `{as_of, last, window_s, units: [{unit_id, first_seen_at|null, last_seen_at|null,
+  sample_count, charge_sample_count, discharge_sample_count, min_active_w|nul,
+  typical_active_w|null (the LOWER median of the in-window recorded samples),
+  max_active_w|null, foreign_episode_count, foreign_active, foreign_reason|null,
+  last_objective_observed|nul}]}`. `sample_count` counts NONZERO recorded samples only
+  (zeros are not samples); the sign counts split them by the active word's sign. Pure read:
+  no mutation exists on this surface.
+- **Snapshot and health.** Every snapshot unit and every `health()` units entry carries
+  `last_objective_observed`: null before any recorded sample, else
+  `{observed_at, active_w, reactive_var, classification, reason}`. The detector composes
+  ALWAYS — no config block exists for it, observe-only included — so the key is never absent,
+  only null. `health_state` and `control_readiness` gain NO vocabulary from this feature.
+- **Discrimination note.** The arm-time sole-writer preflight and its `external_writer` LATCH
+  are untouched: this detector observes and reports; the latch remains the enforcement point.
+- **Config keys** (`policy` block, all defaulted — an absent policy block uses the pinned
+  defaults so observe-only deployments detect with the same eyes; detection only, no control
+  path consumes them):
+  `foreign_objective_sample_interval_s: 30.0` (1..3600, the MINIMUM spacing between recorded
+  samples), `foreign_objective_sustained_samples: 3` (1..100),
+  `foreign_objective_self_charge_class_w: 1000` (1..50000),
+  `foreign_objective_handback_grace_s: 12.0` (1..300).
+- **Supervision driving.** One bounded, fully suppressed observation pass per fleet cycle,
+  after the polls and the recovery pass and before the schedule runner: the pass reads each
+  unit's fresh observation (poll-failed units contribute nothing), the live claim set, and
+  the peeked authority; a failure anywhere inside it can never delay renewal or control.
 
 ## Control-decision audit attribution
 

@@ -250,6 +250,38 @@ policy:
   # the 1.2 kW anomaly class, mirroring the -2600 negative edge's
   # commissioning margin over the observed -2.27 kW deep self-charge.
   expected_autonomy_band_w: [-2600, 1000]
+  # ---------------------------------------------------------------------------
+  # NIGHT-WRITER DETECTOR (2026-08-23 census queue; PRODUCT_NEXT §2 S2) —
+  # ZERO-EXTRA-FRAMES evidence machinery, composed ALWAYS (no config block;
+  # these defaulted keys are its only knobs, and detection is all they do).
+  # The served PQ objective (0x1060+17/+18 — already in the read plan) is
+  # sampled while the controller commands nothing, recorded as timestamped
+  # evidence, and escalated to foreign_objective_observed ONLY by the pinned
+  # rules (API_CONTRACTS "Night-writer detector").  The signature alone
+  # cannot distinguish an external night CHARGE from the pod's own
+  # self-charge — both are negative, both sit inside the band above — so
+  # evidence comes first and the alert tier rides pattern rules on top.
+  # ---------------------------------------------------------------------------
+  # Minimum spacing between recorded samples (the effective live cadence is
+  # this floor AND the cold ring's ~96-108 s serving period of the detail
+  # block, whichever is slower — the detector issues no reads of its own).
+  foreign_objective_sample_interval_s: 30.0
+  # Consecutive qualifying samples both pattern rules require before an
+  # in-band objective escalates (remote-PQ-mode corroboration, or sustained
+  # charge beyond the class below without PV evidence).  At the live cadence
+  # 3 samples ≈ 5 minutes of continuous evidence.
+  foreign_objective_sustained_samples: 3
+  # The observed self-charge magnitude class: sustained charge objectives at
+  # or beyond this magnitude WITH no PV evidence (grid importing) escalate.
+  # 1000 W sits above the observed typical ~-520..-700 W CT-following
+  # self-charge and below the once-observed -2.27 kW deep class (which
+  # occurred by day, WITH export evidence, and so stays quiet).
+  foreign_objective_self_charge_class_w: 1000
+  # Quiet window after our own claim/authority ends: our lapsed objective's
+  # residue (the watchdog clears it in 4-8 s) records as handback_grace
+  # evidence and can never classify foreign.  12 s covers the observed
+  # hand-back with margin.
+  foreign_objective_handback_grace_s: 12.0
   debug_modes_enabled: false
 
 authentication:
