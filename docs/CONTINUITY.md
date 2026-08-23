@@ -349,6 +349,30 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-24 (flow wow-loop, round-3 gate — LOOP CLOSED): ROUND 3
+  REVIEWED AND APPROVED; THE WOW-LOOP CLOSES AT THREE ROUNDS (9567a9d,
+  eb85675, 8e07e31, 18a4a4b; 716/716 web tests; gallery regenerated
+  post-final-commit, mtimes 02:07 > last web commit 02:06:33). Round 3's
+  decisive find, pixel-proven: the round-2 worded figures stamped over
+  their card borders at every viewport ≥768px ("Importing"/"Discharging"
+  at max-content vs 58.8px card content; the SoC band rode nowrap with its
+  meter painting up to 30px into neighbours) — fixed by the fit ladder
+  (stack <45rem; band/pair/band at tablet; three-across 70–81rem;
+  four-equal-across ≥81rem) with STRUCTURED two-register figures (label
+  word + larger number, lead a step larger) and stacked SoC with the
+  meter contained in-card. Gate verified by direct render (tablet
+  band/pair/band: contained, rhythmic, lead unmistakable, no gutter ink)
+  + the agent's DOM geometry at 10 widths × 10 states + pixel scans.
+  Frozen qualities held: zero color changes, four-motion doctrine, all
+  worded-truth pins byte-identical (flow.test.ts untouched), rows-same-y
+  at ten widths. Verdict trail for the operator's breakfast review:
+  round 1 declined (utilitarian; and its gallery was stale pre-round-1
+  renders), round 2 approved baseline (lead framing, gold-that-reads-
+  gold, SOC hierarchy, phone bus), round 3 approved (overflow-proofed
+  fit ladder, two-register figures). Final approval is the operator's
+  with the full 30-PNG gallery. web/ released to the history console
+  build (W1–W3) immediately after this gate.
+
 - 2026-08-24 (plant-history COMMISSIONED): THE TELEMETRY HISTORIAN IS LIVE
   on the real controller. One deliberate revision (5 → 6) uncommented the
   `plant_history` block at commissioned defaults (30 s cadence, 14 d

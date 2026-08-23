@@ -376,7 +376,10 @@ this section is the wire contract.
   `held_intent_id`): `{version, active, entry_id, held_intent_id, ends_at, ends_in_s, next,
   posture, last_action: idle|submit|renew|remove, last_tick_at, reason_codes}` with the pinned
   vocabulary `no_plan | no_window_open | window_open | waiting_for_higher_priority |
-  window_ended | plan_changed`.
+  window_ended | plan_changed | units_disarmed` (`units_disarmed`: a window is open and the
+  plan holds, but no unit is controllable — the fleet sits disarmed, so the runner still
+  publishes its claim yet nothing can act on it; joins the list additively, outranks
+  `waiting_for_higher_priority`).
 
 ## API and MCP
 

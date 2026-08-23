@@ -505,7 +505,10 @@ there is no pre-existing tick vocabulary to preserve here): `no_plan`,
 `no_window_open`, `window_open` (submitting/renewing),
 `waiting_for_higher_priority` (a window holds and every one of its units is
 claimed by a higher-priority live intent — the honest "waiting" sentence on
-Home), `window_ended`, `plan_changed`. `last_action` is the runner's action
+Home), `window_ended`, `plan_changed`, `units_disarmed` (a window holds and
+the plan submits, but no unit is controllable — the fleet sits disarmed; the
+claim is still a published fact, the code says why nothing acts on it;
+outranks `waiting_for_higher_priority`). `last_action` is the runner's action
 vocabulary: `idle | submit | renew | remove`.
 
 ### 5.4 The pure next-occurrence helpers
