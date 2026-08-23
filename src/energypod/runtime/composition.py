@@ -1905,7 +1905,15 @@ def _control_policy(config: ControllerConfig) -> ControlPolicy:
             max_soc_disagreement_pct=5.0,
             min_cell_voltage_v=2.80,
             max_cell_voltage_v=3.65,
-            max_cell_imbalance_v=0.050,
+            # Operator-directed 2026-08-23 (a7297bf, live config rev 4): the
+            # 0.050 V commissioning gate is demoted to an early-warning tier,
+            # with the ABSOLUTE per-cell bounds above left as the hard
+            # over/under-charge protection.  The observe-only default matches
+            # the commissioned 0.500 V so simulated and observe-only
+            # compositions judge spread like the deployed policy instead of
+            # vetoing on the real top-of-charge balancing drift (LHS 54 mV at
+            # 99% SOC) the operator relaxed the gate for.
+            max_cell_imbalance_v=0.500,
             expected_cell_count_by_unit=cell_counts,
             min_temperature_c=0.0,
             max_temperature_c=45.0,

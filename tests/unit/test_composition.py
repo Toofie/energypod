@@ -546,6 +546,23 @@ async def test_minimal_observe_only_config_builds_the_whole_graph(tmp_path: Path
     assert other.audit_event_factory is not runtime.audit_event_factory
 
 
+async def test_observe_only_default_policy_matches_the_commissioned_imbalance_tier(
+    tmp_path: Path,
+) -> None:
+    """The observe-only compose default follows the operator's 2026-08-23
+    direction (a7297bf, live config rev 4): cell imbalance is an early-warning
+    tier at 0.500 V, so a simulated or observe-only composition judges spread
+    with the deployed policy's gate, not the retired 0.050 V commissioning
+    one.  The absolute per-cell bounds stay the hard protection."""
+    config = _validate(_config_payload(tmp_path / "fleet.sqlite3", unit_count=1))
+    runtime = _build_runtime(config)
+
+    assert runtime.policy.version == "observe-only-default"
+    assert runtime.policy.min_cell_voltage_v == 2.80
+    assert runtime.policy.max_cell_voltage_v == 3.65
+    assert runtime.policy.max_cell_imbalance_v == 0.500
+
+
 async def test_composed_app_serves_the_versioned_guarded_api(tmp_path: Path) -> None:
     runtime = compose(tmp_path / "fleet.sqlite3")
     app = runtime.app
