@@ -102,6 +102,8 @@ _SYSTEM_BASE = 0x0100
 _TOTALS_BASE = 0x4101
 _RTU_ID_BASE = 0x8106
 _DEVICE_PARAMETERS_BASE = 0x8102
+_PCS_LIVE_BASE = 0x1000
+_DEBUG_MODE_BASE = 0x8100
 
 _REQUIRED_BLOCKS: tuple[int, ...] = (
     0x1040,
@@ -341,8 +343,7 @@ def test_all_high_confidence_fields_decode_on_every_captured_unit(
         Observation.ADVISORY_QUALITY_FIELDS
     )
     assert all(
-        observation.quality[field] is DataQuality.GOOD
-        for field in Observation.QUALITY_FIELDS
+        observation.quality[field] is DataQuality.GOOD for field in Observation.QUALITY_FIELDS
     )
     assert observation.safety_data_complete is True
 
@@ -892,3 +893,79 @@ def test_quality_map_carries_the_advisory_field_set(wire_decode: Any, capture: A
         "load_power_w",
     }
     assert hasattr(Observation, "ADVISORY_QUALITY_FIELDS")
+
+
+# --- mode words: advisory device-mode telemetry (2026-08-23 incident 1) --------
+#
+# The already-polled mode words become ADVISORY observation fields, never
+# quality-map keys (the CT-field doctrine): the debug-mode readback 0x8100+0
+# (vendor PQ-dispatch precondition, MiniESapp.cs:2180 refuses when nonzero),
+# the system overview's ctrlMode 0x0100+1 (enum 1 Remote / 2 Local,
+# GlobalFun.cs:204-211) and workMode +2 (raw: MID's 7 is deliberately
+# unmapped, field-mapping A-17), and the PCS live runMode 0x1000+2 (enum 0
+# Matching Load / 1 Remote PQ Power, GlobalFun.cs:178-188).
+
+
+@pytest.mark.parametrize("unit_key", _UNIT_KEYS)
+def test_mode_words_decode_as_advisory_fields(
+    wire_decode: Any, capture: Any, followup: Any, unit_key: str
+) -> None:
+    """T-UNIT-WIRE-029 / field-mapping S2.13-S2.14, S2 / S1."""
+    blocks = _merged_blocks(capture, followup, unit_key)
+    observation = _decode_unit(wire_decode, capture, unit_key, blocks=blocks)
+
+    assert observation.debug_mode_w == blocks[_DEBUG_MODE_BASE][0]
+    assert observation.debug_mode_w == 0, "the captured fleet is in Normal Mode"
+    assert observation.debug_mode_active is False
+    assert observation.ctrl_mode_w == blocks[_SYSTEM_BASE][1]
+    assert observation.ctrl_mode_w == 1, "the captured fleet is in Remote control"
+    assert observation.ctrl_mode_remote is True
+    assert observation.work_mode_w == blocks[_SYSTEM_BASE][2]
+    assert observation.run_mode_w == blocks[_PCS_LIVE_BASE][2]
+    # Advisory doctrine: the mode words never join the quality map, whose
+    # twelve-key shape is unchanged.
+    assert set(observation.quality) == set(Observation.QUALITY_FIELDS) | {
+        "grid_power_w",
+        "load_power_w",
+    }
+
+
+def test_nonzero_debug_mode_word_marks_the_vendor_dispatch_precondition_failed(
+    wire_decode: Any, capture: Any, followup: Any
+) -> None:
+    """MiniESapp.cs:2180-2184 refuses PQ sends unless debugMode == 0."""
+    blocks = _merged_blocks(capture, followup, "MID")
+    debugging = {**blocks, _DEBUG_MODE_BASE: (3,)}
+    observation = _decode_unit(wire_decode, capture, "MID", blocks=debugging)
+    assert observation.debug_mode_w == 3
+    assert observation.debug_mode_active is True
+    assert observation.ctrl_mode_remote is True
+
+
+def test_ctrl_mode_two_local_marks_remote_dispatch_unavailable(
+    wire_decode: Any, capture: Any, followup: Any
+) -> None:
+    blocks = _merged_blocks(capture, followup, "MID")
+    system = blocks[_SYSTEM_BASE]
+    local = {**blocks, _SYSTEM_BASE: (system[0], 2, *system[2:])}
+    observation = _decode_unit(wire_decode, capture, "MID", blocks=local)
+    assert observation.ctrl_mode_w == 2
+    assert observation.ctrl_mode_remote is False
+    assert observation.debug_mode_active is False
+
+
+def test_mode_words_absent_blocks_stay_none_and_change_nothing(
+    wire_decode: Any, capture: Any
+) -> None:
+    """A poll without the mode blocks (the primary IoT plan alone) keeps the
+    words None -- absent evidence is never a refusal and never degrades the
+    observation's quality or qualification."""
+    observation = _decode_unit(wire_decode, capture, "MID")
+    assert observation.debug_mode_w is None
+    assert observation.ctrl_mode_w is None
+    assert observation.work_mode_w is None
+    assert observation.debug_mode_active is None
+    assert observation.ctrl_mode_remote is None
+    # The PCS live block IS part of the primary plan: its runMode still reads.
+    assert observation.run_mode_w == _blocks_of(capture, "MID")[_PCS_LIVE_BASE][2]
+    assert observation.safety_data_complete is True

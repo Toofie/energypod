@@ -96,6 +96,20 @@ class Telemetry:
     captured_at_mono: float
     battery_watts: float
     quality: Mapping[str, str]
+    # Advisory mode words (2026-08-23 incident 1): decoded device-mode
+    # evidence; absent on telemetry a deployment never served.
+    debug_mode_w: int | None = None
+    ctrl_mode_w: int | None = None
+    work_mode_w: int | None = None
+    run_mode_w: int | None = None
+
+    @property
+    def debug_mode_active(self) -> bool | None:
+        return None if self.debug_mode_w is None else self.debug_mode_w != 0
+
+    @property
+    def ctrl_mode_remote(self) -> bool | None:
+        return None if self.ctrl_mode_w is None else self.ctrl_mode_w == 1
 
 
 @dataclass(frozen=True)
@@ -130,6 +144,10 @@ TELEMETRY_SUMMARY_FIELDS = (
     "active_warnings",
     "grid_power_w",
     "load_power_w",
+    "debug_mode_w",
+    "ctrl_mode_w",
+    "work_mode_w",
+    "run_mode_w",
 )
 
 # Live-decoded reference values from the first hardware capture
@@ -891,6 +909,12 @@ async def test_snapshot_exposes_latched_stops_and_unit_inhibit_state(api: Any) -
         "reason_codes": ["latched"],
         "unit_ids": None,
     }
+    # Console contract (web side, live): the stamp must be JavaScript-Date
+    # parseable ISO-8601 -- an explicit UTC offset, never a naive local time.
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)",
+        entry["latched_at"],
+    )
 
     # Acknowledgement empties the list (the bus already publishes
     # emergency_stop.acknowledged for the transition itself).
@@ -1083,6 +1107,10 @@ async def test_snapshot_telemetry_summary_projects_the_decoded_fleet(api: Any) -
         "active_warnings": ["DCDC_Warning0_1", "PCS_Warning0_1"],
         "grid_power_w": -1736.0,
         "load_power_w": 1701.0,
+        "debug_mode_w": None,
+        "ctrl_mode_w": None,
+        "work_mode_w": None,
+        "run_mode_w": None,
     }
     assert units["RHS"]["telemetry"] == {
         "soc_pct": 68.0,
@@ -1103,6 +1131,10 @@ async def test_snapshot_telemetry_summary_projects_the_decoded_fleet(api: Any) -
         "active_warnings": ["DCDC_Warning0_1", "PCS_Warning0_1"],
         "grid_power_w": -37.0,
         "load_power_w": 1063.0,
+        "debug_mode_w": None,
+        "ctrl_mode_w": None,
+        "work_mode_w": None,
+        "run_mode_w": None,
     }
     assert units["LHS"]["telemetry"] == {
         "soc_pct": 48.0,
@@ -1125,6 +1157,10 @@ async def test_snapshot_telemetry_summary_projects_the_decoded_fleet(api: Any) -
         # block projects null readthrough, never a fabricated zero.
         "grid_power_w": None,
         "load_power_w": None,
+        "debug_mode_w": None,
+        "ctrl_mode_w": None,
+        "work_mode_w": None,
+        "run_mode_w": None,
     }
     # A genuinely measured zero stays zero; it is never promoted to a value.
     assert units["LHS"]["measured_watts"] == 0.0
@@ -2433,3 +2469,71 @@ async def test_cancel_intent_is_available_to_automation(api: Any) -> None:
         request_id="cancel-automation-request",
     )
     assert cancelled["status"] == "cancelled"
+
+
+# --- device-mode dispatch gating (2026-08-23 incident 1) -----------------------
+#
+# The vendor app refuses PQ sends unless debugMode == 0 and the fleet is in
+# Remote control (MiniESapp.cs:2180; ctrlMode enum 1 Remote / 2 Local).  When
+# the decoded mode words say the pod will ignore external objectives, intent
+# submission is refused with the explicit reason -- absent evidence (a read
+# plan without the mode blocks) changes nothing.
+
+
+async def test_submit_intent_is_refused_while_a_unit_reports_debug_mode(api: Any) -> None:
+    rig = make_rig(
+        api,
+        telemetry={"pod-a": Telemetry("pod-a", 99.5, 100.0, good_quality(), debug_mode_w=3)},
+    )
+    with pytest.raises(ValueError, match="device_debug_mode_active"):
+        await _invoke(rig.facade, "submit_intent", OPERATOR)
+    assert rig.intents.added == []
+
+
+async def test_submit_intent_is_refused_while_a_unit_is_not_remote(api: Any) -> None:
+    rig = make_rig(
+        api,
+        telemetry={"pod-a": Telemetry("pod-a", 99.5, 100.0, good_quality(), ctrl_mode_w=2)},
+    )
+    with pytest.raises(ValueError, match="device_mode_not_remote"):
+        await _invoke(rig.facade, "submit_intent", OPERATOR)
+    assert rig.intents.added == []
+
+
+async def test_submit_intent_dispatchable_modes_and_absent_evidence_both_accept(
+    api: Any,
+) -> None:
+    remote = make_rig(
+        api,
+        telemetry={
+            "pod-a": Telemetry("pod-a", 99.5, 100.0, good_quality(), debug_mode_w=0, ctrl_mode_w=1)
+        },
+    )
+    accepted = await _invoke(remote.facade, "submit_intent", OPERATOR)
+    assert accepted["status"] == "accepted"
+
+    unaware = make_rig(api, telemetry={"pod-a": Telemetry("pod-a", 99.5, 100.0, good_quality())})
+    accepted_without_words = await _invoke(unaware.facade, "submit_intent", OPERATOR)
+    assert accepted_without_words["status"] == "accepted"
+
+
+async def test_snapshot_telemetry_summary_exposes_the_mode_words(api: Any) -> None:
+    rig = make_rig(
+        api,
+        telemetry={
+            "pod-a": Telemetry(
+                "pod-a", 99.5, 100.0, good_quality(), debug_mode_w=0, ctrl_mode_w=1, work_mode_w=7
+            )
+        },
+    )
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["telemetry"]["debug_mode_w"] == 0
+    assert units["pod-a"]["telemetry"]["ctrl_mode_w"] == 1
+    assert units["pod-a"]["telemetry"]["work_mode_w"] == 7
+    assert units["pod-a"]["telemetry"]["run_mode_w"] is None
+    assert units["pod-b"]["telemetry"] is None
+
+    detail = await rig.facade.unit_detail(principal=OPERATOR, unit_id="pod-a")
+    assert detail["debug_mode_w"] == 0
+    assert detail["ctrl_mode_w"] == 1

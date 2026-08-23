@@ -1390,3 +1390,76 @@ async def _drain_bus(runtime: Any) -> list[dict[str, Any]]:
         return await drain(iterator, 256)
     finally:
         await close_subscription(iterator)
+
+
+async def test_mode_words_gate_dispatch_on_replayed_live_hardware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W3 (2026-08-23 incident 1): the already-polled mode words must be
+    visible and must refuse dispatch when the pod says it will ignore
+    external objectives -- the vendor app refuses PQ sends unless debugMode
+    is zero (MiniESapp.cs:2180) and the fleet is under Remote control
+    (ctrlMode 1, GlobalFun.cs:204).  The debug readback rides the control
+    rate, so a mode flip is judged on the very next poll.  Read-only: no
+    test here writes any mode register; the not-remote refusal reason is
+    pinned at the facade contract level."""
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, banks = _install_replay_transport(monkeypatch, clock)
+    runtime = _build(_validate(_config_payload(mode="write_enabled")), clock)
+
+    try:
+        actor = runtime.actors[_UNIT_ID]
+        await actor.start()
+        clock.advance(0.05)
+        await actor.poll_once()
+
+        # The captured fleet is dispatchable, and the words are visible: the
+        # debug readback from the core window, ctrlMode/workMode from the
+        # cycle-1 system block.
+        observation = await runtime.observations.latest(_UNIT_ID)
+        assert observation is not None
+        assert observation.debug_mode_w == 0
+        assert observation.debug_mode_active is False
+        assert observation.ctrl_mode_w == 1
+        assert observation.ctrl_mode_remote is True
+        snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+        telemetry = _unit_view(snapshot)["telemetry"]
+        assert telemetry["debug_mode_w"] == 0
+        assert telemetry["ctrl_mode_w"] == 1
+
+        # A nonzero debug-mode readback refuses the intent on the very next
+        # poll, explicitly, and acceptance returns once it clears.
+        banks[_UNIT_HOST][0x8100] = 3
+        clock.advance(0.05)
+        await actor.poll_once()
+        with pytest.raises(ValueError, match="device_debug_mode_active"):
+            await runtime.facade.submit_intent(
+                unit_ids=[_UNIT_ID],
+                direction="charge",
+                watts=_CHARGE_W,
+                ttl_s=30.0,
+                reason="mode gate regression",
+                principal=OPERATOR,
+                idempotency_key="mode-gate-debug",
+                request_id="mode-gate-debug-request",
+            )
+
+        banks[_UNIT_HOST][0x8100] = 0
+        clock.advance(0.05)
+        await actor.poll_once()
+        view = await runtime.facade.submit_intent(
+            unit_ids=[_UNIT_ID],
+            direction="charge",
+            watts=_CHARGE_W,
+            ttl_s=30.0,
+            reason="mode gate regression",
+            principal=OPERATOR,
+            idempotency_key="mode-gate-restored",
+            request_id="mode-gate-restored-request",
+        )
+        assert view["status"] == "accepted", view
+    finally:
+        await _shutdown_actors(runtime)
+
+    _assert_replay_safety(journal)
