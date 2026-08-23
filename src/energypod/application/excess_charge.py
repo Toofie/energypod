@@ -264,7 +264,11 @@ class ExcessChargeAdviser:
             lifecycle = getattr(observation, "lifecycle", None)
             if lifecycle not in _CONTROLLABLE_LIFECYCLES:
                 continue
-            soc_pct = getattr(observation, "system_soc_pct", None)
+            # The BMS SOC is the authoritative SOC (2026-08-24 operator
+            # ruling): neediness and the ceiling skip follow the battery's
+            # own figure, never the system word the tiered read plan serves
+            # once per connection and may hold stale for hours.
+            soc_pct = getattr(observation, "authoritative_soc_pct", None)
             if not _finite_number(soc_pct):
                 continue
             if soc_pct >= self._policy.max_soc_pct:

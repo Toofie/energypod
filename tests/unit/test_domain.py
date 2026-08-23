@@ -410,6 +410,30 @@ def test_observation_derives_statistics_and_completeness() -> None:
     assert observation.safety_data_complete
 
 
+def test_observation_authoritative_soc_is_the_bms_figure() -> None:
+    """2026-08-24 operator ruling: the battery's own BMS SOC is the
+    authoritative SOC for every policy bound.  The derived property spells
+    that figure for advisory consumers, and a system-vs-BMS divergence --
+    however large -- never displaces it."""
+    models = _models()
+    observation = models.Observation(**_observation_kwargs(models))
+    assert observation.authoritative_soc_pct == pytest.approx(54.0)
+
+    divergent = models.Observation(
+        **_observation_kwargs(models, system_soc_pct=95.0, bms_soc_pct=41.5)
+    )
+    assert divergent.authoritative_soc_pct == pytest.approx(41.5)
+
+    unserved = models.Observation(
+        **_observation_kwargs(
+            models,
+            bms_soc_pct=None,
+            quality=_quality(models) | {"bms_soc_pct": models.DataQuality.MISSING},
+        )
+    )
+    assert unserved.authoritative_soc_pct is None
+
+
 def test_observation_age_uses_only_monotonic_time() -> None:
     models = _models()
     first = models.Observation(**_observation_kwargs(models, captured_at_mono=-2.0))

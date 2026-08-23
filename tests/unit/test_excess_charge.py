@@ -196,6 +196,7 @@ def make_observation(
     unit_id: str,
     grid_power_w: float | None,
     system_soc_pct: float = 50.0,
+    bms_soc_pct: float | None = None,
     dynamic_charge_limit_w: float = 2_500.0,
     lifecycle: Any = None,
     captured_at_mono: float = NOW,
@@ -212,7 +213,7 @@ def make_observation(
         lifecycle=lifecycle or api.UnitLifecycle.ARMED_IDLE,
         protocol_profile="iot",
         system_soc_pct=system_soc_pct,
-        bms_soc_pct=system_soc_pct,
+        bms_soc_pct=system_soc_pct if bms_soc_pct is None else bms_soc_pct,
         soh_pct=98.0,
         battery_watts=0.0,
         pack_voltage_v=400.0,
@@ -521,6 +522,40 @@ async def test_adviser_targets_the_neediest_eligible_unit_one_at_a_time(
 
     for submission in (*submit.submissions, *submit2.submissions):
         assert len(submission["unit_ids"]) == 1, "one unit at a time, never a fleet dispatch"
+
+
+async def test_adviser_neediness_follows_the_authoritative_bms_soc(excess: Any, api: Any) -> None:
+    """2026-08-24 operator ruling: the battery's own BMS SOC is the
+    authoritative SOC.  Neediness and the charge-ceiling skip are judged on
+    it, never on the system word -- which the tiered read plan serves once
+    per connection and may hold stale for hours on a cycled unit."""
+    grids = {"lhs": 0.0, "mid": 0.0, "rhs": 1_500.0}
+
+    # mid LOOKS neediest on the stale system word (12) but is nearly full by
+    # its own figure (80); lhs looks replete on the system word (70) but is
+    # the neediest battery (30).  The adviser must pick lhs.
+    fleet = make_fleet(api, grids)
+    fleet["mid"] = make_observation(
+        api, unit_id="mid", grid_power_w=0.0, system_soc_pct=12.0, bms_soc_pct=80.0
+    )
+    fleet["lhs"] = make_observation(
+        api, unit_id="lhs", grid_power_w=0.0, system_soc_pct=70.0, bms_soc_pct=30.0
+    )
+    adviser, _intents, submit, _clock = make_adviser(excess, api, fleet)
+    decision = await adviser.tick()
+    assert decision.target_unit_id == "lhs"
+    assert submit.submissions[0]["unit_ids"] == ["lhs"]
+
+    # The charge-ceiling skip follows the BMS figure too: a unit whose BMS
+    # SOC is at the ceiling (96 > 95) is skipped even when its stale system
+    # word still shows headroom.
+    fleet = make_fleet(api, grids)
+    fleet["mid"] = make_observation(
+        api, unit_id="mid", grid_power_w=0.0, system_soc_pct=12.0, bms_soc_pct=96.0
+    )
+    adviser, _intents2, _submit2, _clock2 = make_adviser(excess, api, fleet)
+    decision = await adviser.tick()
+    assert decision.target_unit_id == "lhs"
 
 
 # --- operator precedence and renewal --------------------------------------------

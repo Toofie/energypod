@@ -306,6 +306,22 @@ class Observation(BaseModel):
         return None if self.ctrl_mode_w is None else self.ctrl_mode_w == 1
 
     @property
+    def authoritative_soc_pct(self) -> float | None:
+        """The battery's own BMS SOC is the authoritative SOC (2026-08-24).
+
+        The operator's ruling: "If there's a disagreement, re-sync based on
+        whatever the battery says."  Every SOC-based policy bound -- the
+        discharge floor, the charge ceiling, the SOC-jump check -- is judged
+        on this figure, and the system controller's SOC word (0x0100+17,
+        served once per connection by the tiered read plan and therefore
+        potentially hours stale on a cycled unit) is never a second safety
+        opinion.  With the system block absent the wire decoder already
+        stands the BMS SOC in for both views with honest quality, so this
+        property is that doctrine made explicit for advisory consumers.
+        """
+        return self.bms_soc_pct
+
+    @property
     def safety_data_complete(self) -> bool:
         required = (
             self.system_soc_pct,

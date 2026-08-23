@@ -79,6 +79,7 @@ class SafetyKernel:
         denied: dict[str, set[str]] = {}
         limits: dict[str, int] = {}
         expiries: dict[str, float] = {}
+        divergence_observed = False
         for proposal in proposals:
             observation = current_observations.get(proposal.unit_id)
             previous = previous_observations.get(proposal.unit_id)
@@ -94,6 +95,13 @@ class SafetyKernel:
                 limits[proposal.unit_id] = 0
                 expiries[proposal.unit_id] = now_mono
                 continue
+            if observation is not None and self._soc_divergence_observed(observation, policy):
+                # 2026-08-24 operator ruling: the system-vs-BMS SOC
+                # divergence is a WARNING, never a denial.  The stale system
+                # word must not block power the battery's own figure says is
+                # safe; the note below rides the decision's reason codes so
+                # the audit trail and console keep seeing the disagreement.
+                divergence_observed = True
             unit_reasons = self._deny_reasons(proposal, observation, previous, policy, now_mono)
             if not unit_reasons and getattr(proposal, "export_bounded", False):
                 # API_CONTRACTS "Excess-solar accelerated charging
@@ -166,6 +174,12 @@ class SafetyKernel:
             outcome_reasons.update(unit_reasons)
         if clamped:
             outcome_reasons.add("power_clamped")
+        if divergence_observed:
+            # Informational only (2026-08-24): the note rides an AUTHORITATIVE
+            # decision -- this path is unreachable for a whole-cycle rejection
+            # -- so ``soc_disagreement_observed`` can never be mistaken for a
+            # blocking reason on the rejecting path.
+            outcome_reasons.add("soc_disagreement_observed")
         status = DecisionStatus.CLAMPED if clamped else DecisionStatus.AUTHORIZED
         reason_codes = tuple(sorted(outcome_reasons)) or ("safety_checks_passed",)
         setpoints = tuple(
@@ -299,27 +313,30 @@ class SafetyKernel:
                 or previous_cell_sequence > current_cell_sequence
             ):
                 reasons.add("cell_sequence_invalid")
-        if self._finite(observation.system_soc_pct) and self._finite(observation.bms_soc_pct):
-            if (
-                abs(observation.system_soc_pct - observation.bms_soc_pct)
-                > policy.max_soc_disagreement_pct
-            ):
-                reasons.add("soc_disagreement")
+        # The BMS SOC is the AUTHORITATIVE SOC for every policy bound
+        # (2026-08-24 operator ruling: "If there's a disagreement, re-sync
+        # based on whatever the battery says").  The system controller's SOC
+        # word -- served once per connection by the tiered read plan -- is
+        # not a second safety opinion: it may be hours stale on a cycled
+        # unit, and the divergence it manufactures is informational only
+        # (see ``_soc_divergence_observed``; the domain's
+        # ``authoritative_soc_pct`` property spells the same figure).
+        if self._finite(observation.bms_soc_pct):
             if (
                 proposal.direction is Direction.DISCHARGE
-                and observation.system_soc_pct <= policy.min_soc_pct
+                and observation.bms_soc_pct <= policy.min_soc_pct
             ):
                 reasons.add("soc_below_discharge_floor")
             if (
                 proposal.direction is Direction.CHARGE
-                and observation.system_soc_pct >= policy.max_soc_pct
+                and observation.bms_soc_pct >= policy.max_soc_pct
             ):
                 reasons.add("soc_above_charge_ceiling")
         if (
-            self._finite(observation.system_soc_pct)
+            self._finite(observation.bms_soc_pct)
             and previous is not None
-            and self._finite(previous.system_soc_pct)
-            and abs(observation.system_soc_pct - previous.system_soc_pct) > policy.max_soc_jump_pct
+            and self._finite(previous.bms_soc_pct)
+            and abs(observation.bms_soc_pct - previous.bms_soc_pct) > policy.max_soc_jump_pct
         ):
             reasons.add("soc_jump")
 
@@ -359,6 +376,29 @@ class SafetyKernel:
         if observation.active_warnings & policy.blocking_warning_codes:
             reasons.add("blocking_warning")
         return reasons
+
+    @staticmethod
+    def _soc_divergence_observed(observation: Any, policy: Any) -> bool:
+        """Whether the system and BMS SOC figures disagree beyond tolerance.
+
+        The old ``soc_disagreement`` deny reason is gone (2026-08-24 operator
+        ruling: the battery's own BMS SOC is authoritative and a disagreement
+        must not block power -- the system word the tiered read plan serves
+        once per connection may be hours stale on a cycled unit, so the
+        "disagreement" was mostly staleness).  The same inclusive boundary
+        now thresholds an informational ``soc_disagreement_observed`` note on
+        authorizing decisions: an audit/console warning, never a denial.
+        """
+        system = getattr(observation, "system_soc_pct", None)
+        bms = getattr(observation, "bms_soc_pct", None)
+        return (
+            SafetyKernel._finite(system)
+            and SafetyKernel._finite(bms)
+            and (
+                abs(float(cast(int | float, system)) - float(cast(int | float, bms)))
+                > policy.max_soc_disagreement_pct
+            )
+        )
 
     def _export_evidence_reasons(
         self, current_observations: dict[str, Any], policy: Any, now_mono: float

@@ -479,10 +479,16 @@ def test_soc_jump_threshold_is_inclusive_and_direction_independent(
         assert_rejected(decision, api)
 
 
-@pytest.mark.parametrize("difference, permitted", [(5.0, True), (5.001, False), (-5.001, False)])
-def test_system_and_bms_soc_disagreement_boundary(
-    api: SimpleNamespace, difference: float, permitted: bool
+@pytest.mark.parametrize("difference", [5.0, 5.001, -5.001, -40.0, 44.0])
+def test_system_and_bms_soc_divergence_never_denies_power(
+    api: SimpleNamespace, difference: float
 ) -> None:
+    """2026-08-24 operator ruling: "If there's a disagreement, re-sync based
+    on whatever the battery says."  The BMS SOC is the authoritative SOC, so
+    a system-vs-BMS divergence -- however large, in either direction -- is
+    never a deny reason.  The stale system word (the tiered read plan serves
+    the system block once per connection) must not veto power the battery's
+    own figure says is safe."""
     observation = make_observation(
         api,
         system_soc_pct=50.0 + difference,
@@ -502,10 +508,188 @@ def test_system_and_bms_soc_disagreement_boundary(
         previous_observations={"mid": previous},
     )
 
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert "soc_disagreement" not in reasons(decision)
+    assert all(setpoint.watts > 0 for setpoint in decision.setpoints)
+
+
+@pytest.mark.parametrize(
+    ("difference", "carries_note"), [(5.0, False), (5.001, True), (-5.001, True)]
+)
+def test_soc_divergence_note_boundary_is_inclusive_and_informational(
+    api: SimpleNamespace, difference: float, carries_note: bool
+) -> None:
+    """The old ``soc_disagreement`` deny boundary survives as the threshold
+    of an INFORMATIONAL signal: beyond it the decision carries
+    ``soc_disagreement_observed`` -- an audit/console warning only, never a
+    rejection -- and at or under it the divergence is not even worth a note."""
+    observation = make_observation(
+        api,
+        system_soc_pct=50.0 + difference,
+        bms_soc_pct=50.0,
+    )
+    previous = make_observation(
+        api,
+        captured_at_mono=99.0,
+        sequence=6,
+        cell_captured_at_mono=99.0,
+        system_soc_pct=50.0 + difference,
+        bms_soc_pct=50.0,
+    )
+    decision = evaluate(
+        api,
+        current_observations={"mid": observation},
+        previous_observations={"mid": previous},
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert ("soc_disagreement_observed" in reasons(decision)) is carries_note
+    assert "soc_disagreement" not in reasons(decision)
+
+
+def test_soc_divergence_note_never_appears_on_a_rejected_decision(
+    api: SimpleNamespace,
+) -> None:
+    """The note is warning-tier: a decision rejected for an unrelated cause
+    carries only deny reasons, so the informational code can never be
+    confused with a blocking one on the rejecting path."""
+    observation = make_observation(
+        api,
+        system_soc_pct=56.0,
+        bms_soc_pct=50.0,
+        temperatures_c=(25.0, 45.001),
+    )
+    decision = evaluate(api, current_observations={"mid": observation})
+
+    assert_rejected(decision, api)
+    assert "temperature_high" in reasons(decision)
+    assert "soc_disagreement" not in reasons(decision)
+    assert "soc_disagreement_observed" not in reasons(decision)
+
+
+def test_zero_watt_and_stop_proposals_are_unaffected_by_soc_divergence(
+    api: SimpleNamespace,
+) -> None:
+    """Zero is always permitted: a stop stays ``stop_authorized`` and a
+    zero-watt non-participant with wildly divergent SOCs neither vetoes the
+    participating unit nor accrues a denial of its own."""
+    stop = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, direction=api.Direction.IDLE, watts=0),
+        current_observations={"mid": make_observation(api, system_soc_pct=95.0, bms_soc_pct=5.0)},
+    )
+    assert stop.status is api.DecisionStatus.AUTHORIZED
+    assert reasons(stop) == ("stop_authorized",)
+
+    divergent_mid = make_observation(api, unit_id="mid", system_soc_pct=95.0, bms_soc_pct=5.0)
+    clean_lhs = make_observation(api, unit_id="lhs")
+    mixed = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, watts_by_unit={"mid": 0, "lhs": 1_000}),
+        current_observations={"mid": divergent_mid, "lhs": clean_lhs},
+        previous_observations=make_previous_observations(
+            api, {"mid": divergent_mid, "lhs": clean_lhs}
+        ),
+    )
+    assert mixed.status is api.DecisionStatus.AUTHORIZED
+    assert setpoints_by_unit(mixed)["mid"].watts == 0
+    assert setpoints_by_unit(mixed)["lhs"].watts == 1_000
+    assert "soc_disagreement" not in reasons(mixed)
+
+
+@pytest.mark.parametrize(
+    ("direction", "system_soc", "bms_soc", "permitted"),
+    [
+        # The BMS figure is authoritative for every SOC bound: the old
+        # kernel judged the system word and denied these first two rows.
+        ("DISCHARGE", 9.5, 50.0, True),
+        ("CHARGE", 95.0, 50.0, True),
+        # ... while the floor and ceiling still block exactly as before,
+        # now evaluated against the battery's own figure.
+        ("DISCHARGE", 50.0, 10.0, False),
+        ("DISCHARGE", 50.0, 9.999, False),
+        ("CHARGE", 50.0, 90.0, False),
+        ("CHARGE", 50.0, 90.001, False),
+    ],
+)
+def test_soc_bounds_are_judged_on_the_authoritative_bms_soc(
+    api: SimpleNamespace,
+    direction: str,
+    system_soc: float,
+    bms_soc: float,
+    permitted: bool,
+) -> None:
+    observation = make_observation(
+        api,
+        system_soc_pct=system_soc,
+        bms_soc_pct=bms_soc,
+    )
+    previous = make_observation(
+        api,
+        captured_at_mono=99.0,
+        sequence=6,
+        cell_captured_at_mono=99.0,
+        system_soc_pct=system_soc,
+        bms_soc_pct=bms_soc,
+    )
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(
+            api, direction=getattr(api.Direction, direction)
+        ),
+        current_observations={"mid": observation},
+        previous_observations={"mid": previous},
+    )
+
     if permitted:
         assert decision.status is api.DecisionStatus.AUTHORIZED
     else:
         assert_rejected(decision, api)
+        expected = (
+            "soc_above_charge_ceiling" if direction == "CHARGE" else "soc_below_discharge_floor"
+        )
+        assert expected in reasons(decision)
+
+
+@pytest.mark.parametrize(
+    ("system_now", "bms_now", "permitted"),
+    [
+        # A jumping system word with a steady BMS figure is not a jump: the
+        # stale system SOC (frozen at its one-per-connection read) must not
+        # trip the protection when the battery's own figure is coherent.
+        (61.0, 50.0, True),
+        # The BMS figure jumping beyond the tolerance still denies.
+        (50.0, 61.0, False),
+        (50.0, 39.999, False),
+    ],
+)
+def test_soc_jump_is_judged_on_the_authoritative_bms_soc(
+    api: SimpleNamespace, system_now: float, bms_now: float, permitted: bool
+) -> None:
+    observation = make_observation(
+        api,
+        system_soc_pct=system_now,
+        bms_soc_pct=bms_now,
+    )
+    previous = make_observation(
+        api,
+        captured_at_mono=99.0,
+        sequence=6,
+        cell_captured_at_mono=99.0,
+        system_soc_pct=50.0,
+        bms_soc_pct=50.0,
+    )
+    decision = evaluate(
+        api,
+        current_observations={"mid": observation},
+        previous_observations={"mid": previous},
+    )
+
+    if permitted:
+        assert decision.status is api.DecisionStatus.AUTHORIZED
+    else:
+        assert_rejected(decision, api)
+        assert "soc_jump" in reasons(decision)
 
 
 @pytest.mark.parametrize(
@@ -1222,21 +1406,14 @@ REASON_CODE_CASES: tuple[pytest.Param, ...] = (
         id="observation_epoch_changed",
     ),
     pytest.param(
-        "soc_disagreement",
-        lambda api: evaluate(
-            api,
-            current_observations={
-                "mid": make_observation(api, system_soc_pct=56.0, bms_soc_pct=50.0)
-            },
-        ),
-        id="soc_disagreement",
-    ),
-    pytest.param(
         "soc_below_discharge_floor",
         lambda api: evaluate(
             api,
+            # The BMS SOC is authoritative for the floor (2026-08-24): the
+            # system word sits comfortably above it while the battery's own
+            # figure is below -- and the protection still denies.
             current_observations={
-                "mid": make_observation(api, system_soc_pct=9.5, bms_soc_pct=9.5)
+                "mid": make_observation(api, system_soc_pct=50.0, bms_soc_pct=9.5)
             },
         ),
         id="soc_below_discharge_floor",
@@ -1247,7 +1424,7 @@ REASON_CODE_CASES: tuple[pytest.Param, ...] = (
             api,
             proposed_setpoints=make_proposed_setpoints(api, direction=api.Direction.CHARGE),
             current_observations={
-                "mid": make_observation(api, system_soc_pct=95.0, bms_soc_pct=95.0)
+                "mid": make_observation(api, system_soc_pct=50.0, bms_soc_pct=95.0)
             },
         ),
         id="soc_above_charge_ceiling",
@@ -1257,7 +1434,7 @@ REASON_CODE_CASES: tuple[pytest.Param, ...] = (
         lambda api: evaluate(
             api,
             current_observations={
-                "mid": make_observation(api, system_soc_pct=61.0, bms_soc_pct=61.0)
+                "mid": make_observation(api, system_soc_pct=50.0, bms_soc_pct=61.0)
             },
             previous_observations={
                 "mid": make_observation(
@@ -1430,8 +1607,8 @@ def test_simultaneous_denials_retain_every_independently_observed_cause(
     combined_observation = make_observation(
         api,
         captured_at_mono=90.0,
-        system_soc_pct=95.0,
-        bms_soc_pct=50.0,
+        system_soc_pct=50.0,
+        bms_soc_pct=95.0,
         active_faults=frozenset({"BMS_CRITICAL"}),
     )
     combined_previous = make_observation(
@@ -1453,7 +1630,7 @@ def test_simultaneous_denials_retain_every_independently_observed_cause(
             make_observation(api, captured_at_mono=99.0, sequence=6),
         ),
         (
-            make_observation(api, system_soc_pct=61.0, bms_soc_pct=61.0),
+            make_observation(api, system_soc_pct=50.0, bms_soc_pct=61.0),
             make_observation(
                 api,
                 captured_at_mono=99.0,
@@ -1463,22 +1640,12 @@ def test_simultaneous_denials_retain_every_independently_observed_cause(
             ),
         ),
         (
-            make_observation(api, system_soc_pct=56.0, bms_soc_pct=50.0),
+            make_observation(api, system_soc_pct=50.0, bms_soc_pct=95.0),
             make_observation(
                 api,
                 captured_at_mono=99.0,
                 sequence=6,
-                system_soc_pct=56.0,
-                bms_soc_pct=50.0,
-            ),
-        ),
-        (
-            make_observation(api, system_soc_pct=95.0, bms_soc_pct=95.0),
-            make_observation(
-                api,
-                captured_at_mono=99.0,
-                sequence=6,
-                system_soc_pct=95.0,
+                system_soc_pct=50.0,
                 bms_soc_pct=95.0,
             ),
         ),
