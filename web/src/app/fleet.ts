@@ -45,6 +45,93 @@ export interface PowerFigure {
   watts: number;
 }
 
+// --- per-unit watt figures (the wire's native `watts_by_unit` form) -----------
+
+/**
+ * The wire's per-unit watt map: `watts_by_unit` on intents, and
+ * `requested_watts_by_unit` / `authorized_watts_by_unit` on control-decision
+ * audit rows and their `audit.appended` bus summaries. One non-negative
+ * figure per unit id; the map's key set equals the intent's selected units
+ * exactly (rest.py refuses a missing or extra key before the service runs).
+ * A null map on the wire is a real fact — the intent was scalar (a fleet
+ * total) or the decision minted no batch — never an empty object standing in
+ * for "nothing".
+ */
+export type WattsByUnit = Record<string, number>;
+
+/**
+ * Narrow a wire per-unit watt map. Absent, non-object, or empty values narrow
+ * to null; any non-finite or negative figure rejects the whole map (a map the
+ * console cannot trust is rendered not at all, never partially).
+ */
+export function toWattsByUnit(value: unknown): WattsByUnit | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const map: WattsByUnit = {};
+  for (const [unitId, watts] of Object.entries(value)) {
+    if (typeof watts !== "number" || !Number.isFinite(watts) || watts < 0) {
+      return null;
+    }
+    map[unitId] = watts;
+  }
+  return Object.keys(map).length > 0 ? map : null;
+}
+
+/**
+ * The request figures the wire attaches to one accepted intent: the fleet
+ * total (always present — the facade derives it from the per-unit targets as
+ * their sum) plus the per-unit targets when the intent used the per-unit form.
+ * `wattsByUnit` is null for scalar intents: the two watt forms are mutually
+ * exclusive on the wire, so "no map" is the scalar intent's own shape.
+ */
+export interface IntentFigures {
+  direction: string;
+  watts: number;
+  wattsByUnit: WattsByUnit | null;
+}
+
+/**
+ * Narrow the figures an `intent.accepted` payload or the 202 acceptance view's
+ * `requested` projection carries (service.py `submit_intent`: `direction` and
+ * `watts` always, `watts_by_unit` only when the per-unit form was submitted).
+ */
+export function toIntentFigures(value: unknown): IntentFigures | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (typeof value.direction !== "string" || typeof value.watts !== "number") {
+    return null;
+  }
+  return {
+    direction: value.direction,
+    watts: value.watts,
+    wattsByUnit: toWattsByUnit(value.watts_by_unit),
+  };
+}
+
+/**
+ * The per-unit breakdowns a `control_decision` audit row (or its
+ * `audit.appended` bus summary) carries: the intent's own targets
+ * (`requested`, null for scalar intents) and the decision's per-unit
+ * authorized watts (`authorized`, null when no batch was minted).
+ */
+export interface AuditUnitWatts {
+  requested: WattsByUnit | null;
+  authorized: WattsByUnit | null;
+}
+
+/** Narrow both per-unit maps off one audit payload or row. */
+export function toAuditUnitWatts(value: unknown): AuditUnitWatts {
+  if (!isRecord(value)) {
+    return { requested: null, authorized: null };
+  }
+  return {
+    requested: toWattsByUnit(value.requested_watts_by_unit),
+    authorized: toWattsByUnit(value.authorized_watts_by_unit),
+  };
+}
+
 export interface UnitModel {
   unitId: string;
   lifecycle: Lifecycle;

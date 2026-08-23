@@ -230,7 +230,14 @@ export function observationPublished(
   );
 }
 
-/** The summary the audit port publishes for every durable append. */
+/**
+ * The summary the audit port publishes for every durable append
+ * (composition.py `_AsyncAuditRepository.append`): the watt figures render
+ * straight off the stream, and the per-unit breakdowns ride the same payload —
+ * `requested_watts_by_unit` is the intent's own target map (null for scalar
+ * intents), `authorized_watts_by_unit` the decision's per-unit authorized
+ * watts (null when no batch was minted).
+ */
 export interface AuditAppendedPayload {
   readonly event_id: string;
   readonly event_type: string;
@@ -238,6 +245,10 @@ export interface AuditAppendedPayload {
   readonly generation: number | null;
   readonly result: string;
   readonly reason_codes: string[];
+  readonly requested_active_w: number;
+  readonly authorized_active_w: number;
+  readonly requested_watts_by_unit: Record<string, number> | null;
+  readonly authorized_watts_by_unit: Record<string, number> | null;
 }
 
 export function auditAppended(
@@ -249,6 +260,10 @@ export function auditAppended(
     generation?: number | null;
     result?: string;
     reason_codes?: string[];
+    requested_active_w?: number;
+    authorized_active_w?: number;
+    requested_watts_by_unit?: Record<string, number> | null;
+    authorized_watts_by_unit?: Record<string, number> | null;
   } = {},
   occurredAt: string = DEFAULT_OCCURRED_AT,
 ): EventFrame<AuditAppendedPayload> {
@@ -262,6 +277,10 @@ export function auditAppended(
       generation: summary.generation ?? null,
       result: summary.result ?? "authorized",
       reason_codes: summary.reason_codes ?? ["safety_checks_passed"],
+      requested_active_w: summary.requested_active_w ?? 0,
+      authorized_active_w: summary.authorized_active_w ?? 0,
+      requested_watts_by_unit: summary.requested_watts_by_unit ?? null,
+      authorized_watts_by_unit: summary.authorized_watts_by_unit ?? null,
     },
     occurredAt,
   );
@@ -276,6 +295,12 @@ export function authorizationRevoked(
   return frame(AUTHORIZATION_REVOKED, sequence, { reason, unit_ids: [...unitIds] }, occurredAt);
 }
 
+/**
+ * The intent acceptance frame. `watts` is always the derived fleet total;
+ * `watts_by_unit` rides the payload only when the intent used the per-unit
+ * form (service.py `submit_intent` spreads it in exactly then — the two watt
+ * forms are mutually exclusive on the wire).
+ */
 export function intentAccepted(
   sequence: number,
   intent: {
@@ -283,6 +308,7 @@ export function intentAccepted(
     intent_id?: string;
     direction?: string;
     watts?: number;
+    watts_by_unit?: Record<string, number>;
     unit_ids?: readonly string[];
   } = {},
   occurredAt: string = DEFAULT_OCCURRED_AT,
@@ -291,6 +317,7 @@ export function intentAccepted(
   intent_id: string;
   direction: string;
   watts: number;
+  watts_by_unit?: Record<string, number>;
   unit_ids: string[];
 }> {
   return frame(
@@ -301,6 +328,7 @@ export function intentAccepted(
       intent_id: intent.intent_id ?? `intent-${sequence}`,
       direction: intent.direction ?? "discharge",
       watts: intent.watts ?? 1000,
+      ...(intent.watts_by_unit === undefined ? {} : { watts_by_unit: intent.watts_by_unit }),
       unit_ids: [...(intent.unit_ids ?? ["MID"])],
     },
     occurredAt,
@@ -953,6 +981,15 @@ export interface WireAuditEvent {
   readonly reason_codes: string[];
   readonly requested_active_w: number;
   readonly authorized_active_w: number;
+  /**
+   * Per-unit watt breakdowns (2026-08-23 fleet-row opacity fix): the intent's
+   * own target map (null for scalar intents) and the decision's per-unit
+   * authorized watts (null when no batch was minted). Pydantic always
+   * serializes both — with null defaults for durable rows written before the
+   * fields existed.
+   */
+  readonly requested_watts_by_unit: Record<string, number> | null;
+  readonly authorized_watts_by_unit: Record<string, number> | null;
   readonly request_fingerprint: string;
   readonly response_fingerprint: string;
   readonly result: string;
@@ -987,6 +1024,8 @@ export function auditEvent(
     reason_codes: spec.reason_codes ?? [],
     requested_active_w: spec.requested_active_w ?? 0,
     authorized_active_w: spec.authorized_active_w ?? 0,
+    requested_watts_by_unit: spec.requested_watts_by_unit ?? null,
+    authorized_watts_by_unit: spec.authorized_watts_by_unit ?? null,
     request_fingerprint: spec.request_fingerprint ?? "a1b2c3d4",
     response_fingerprint: spec.response_fingerprint ?? "e5f6a7b8",
     result: spec.result ?? defaultResultFor(type),
