@@ -2445,3 +2445,65 @@ describe("NowView — live observations keep the actual age current", () => {
     );
   });
 });
+
+// --- the authority-grant bus frame (live on the wire since 2026-08-23) -------
+//
+// Live capture (2026-08-23, discharge intent-3): the composition publishes
+// one `authorization.granted` frame per control cycle, carrying the batch's
+// per-unit authorized watts and directions. It is the FRESHEST bus source for
+// the Allowed figure — it lands at the moment of the grant, before any
+// snapshot or decision summary — so the shared tracker must eat it.
+
+describe("NowView — allowed figures from the bus's authorization.granted", () => {
+  it("moves the Allowed fact the moment a grant lands, and again when a later grant clamps it", async () => {
+    // An accepted request with NO authorization yet: the snapshot carries the
+    // request, authorized_power is null, and no intent-block map exists.
+    const snap = snapshotEnvelope([
+      { ...ACTIVE_MID, authorized_power: null, measured_watts: null },
+    ]);
+    const channel = liveChannel([{ type: "snapshot", sequence: 41, data: snap }]);
+    api.client.getSnapshot.mockResolvedValue(snap);
+    api.client.openEvents.mockImplementation(() => channel.openEvents());
+
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+    expect(fact("Allowed").textContent ?? "").toMatch(/none yet/i);
+
+    // The kernel grants authority: the per-unit figure renders immediately,
+    // from the frame alone — no snapshot adoption in between.
+    channel.push({
+      type: "authorization.granted",
+      sequence: 42,
+      occurred_at: "2026-08-22T12:00:05+10:00",
+      payload: {
+        cycle_id: "cycle-00000000000000000141",
+        generation: 2,
+        unit_ids: ["MID"],
+        watts_by_unit: { MID: 1000 },
+        directions_by_unit: { MID: "charge" },
+      },
+    });
+    await waitFor(() => {
+      expect(fact("Allowed").textContent ?? "").toMatch(/1,?000\s*W/);
+    });
+
+    // A later cycle clamps the same battery: the figure moves again (a
+    // mount-time or once-only binding would freeze at the first grant).
+    channel.push({
+      type: "authorization.granted",
+      sequence: 43,
+      occurred_at: "2026-08-22T12:00:08+10:00",
+      payload: {
+        cycle_id: "cycle-00000000000000000142",
+        generation: 2,
+        unit_ids: ["MID"],
+        watts_by_unit: { MID: 600 },
+        directions_by_unit: { MID: "charge" },
+      },
+    });
+    await waitFor(() => {
+      expect(fact("Allowed").textContent ?? "").toMatch(/600\s*W/);
+    });
+    expect(fact("Allowed").textContent ?? "").not.toMatch(/1,?000/);
+  });
+});

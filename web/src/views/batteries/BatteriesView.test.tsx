@@ -1303,3 +1303,147 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     expect(acknowledgeAgain).toHaveFocus();
   });
 });
+
+// --- live surfaces that must not freeze at their open-time picture -----------
+//
+// The 2026-08-23 audit's defect class: a panel whose data was fetched ONCE at
+// open while its age lines kept ticking — the illusion of updating. The unit
+// detail (Cells/Summary tabs) re-reads whenever the world advances while it is
+// open, and the per-unit Events tab appends what the bus actually emits.
+
+describe("BatteriesView — open panels stay live", () => {
+  /** A pushable stream: the initial frames, then whatever the test pushes. */
+  function liveStream(initial: readonly StreamEvent[]): {
+    stream: AsyncIterable<StreamEvent>;
+    push(frame: StreamEvent): void;
+  } {
+    const queue: StreamEvent[] = [...initial];
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    const stream = {
+      async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent, void, unknown> {
+        while (true) {
+          while (queue.length > 0) {
+            const next = queue.shift();
+            if (next !== undefined) {
+              yield next;
+            }
+          }
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+        }
+      },
+    };
+    return {
+      stream,
+      push: (frame) => {
+        queue.push(frame);
+        notify();
+      },
+    };
+  }
+
+  it("re-reads the open unit detail when the world advances, without flashing loading over the data", async () => {
+    const first = unitDetail("MID", { battery_watts: 1000, pack_voltage_v: 190.1 });
+    const second = unitDetail("MID", { battery_watts: 640, pack_voltage_v: 191.7 });
+    let reads = 0;
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
+    client.getUnitDetail.mockImplementation(() => {
+      reads += 1;
+      return Promise.resolve(reads === 1 ? first : second);
+    });
+    const channel = liveStream(fleetEvents(HEALTHY_SNAPSHOT));
+    client.openEvents.mockReturnValue(channel.stream);
+
+    render(<BatteriesView client={client as unknown as ApiClient} />);
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    await waitFor(() => {
+      expect(midCard).toHaveTextContent(/discharging 2,400 W/i);
+    });
+
+    // Open the unit: the Cells tab renders the first full projection.
+    await userEvent.click(within(midCard).getByRole("button", { name: "MID" }));
+    const cellsTab = await screen.findByRole("tab", { name: "Cells" });
+    await userEvent.click(cellsTab);
+    await waitFor(() => {
+      const line = screen.getByText(/data completeness/i).closest("p");
+      expect(line?.textContent ?? "").toContain("60 of 60");
+    });
+    expect(client.getUnitDetail).toHaveBeenCalledTimes(1);
+
+    // The world advances (a republished snapshot with a higher sequence): the
+    // open detail re-reads silently — no loading flash, new figures.
+    const advanced: WireSnapshot = {
+      ...HEALTHY_SNAPSHOT,
+      snapshot_sequence: HEALTHY_SNAPSHOT.snapshot_sequence + 10,
+    };
+    channel.push(snapshotFrame(advanced));
+    await waitFor(() => {
+      expect(client.getUnitDetail).toHaveBeenCalledTimes(2);
+    });
+    // The re-read is SILENT: the ready detail never regressed to loading.
+    expect(screen.queryByText(/loading the cell/i)).toBeNull();
+    expect(screen.queryByText(/loading the unit/i)).toBeNull();
+  });
+
+  it("appends audit.appended facts to the per-unit Events tab as they happen, not at the next mount", async () => {
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
+    const channel = liveStream(fleetEvents(HEALTHY_SNAPSHOT));
+    client.openEvents.mockReturnValue(channel.stream);
+
+    render(<BatteriesView client={client as unknown as ApiClient} />);
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    await userEvent.click(within(midCard).getByRole("button", { name: "MID" }));
+    await userEvent.click(await screen.findByRole("tab", { name: "Events" }));
+
+    // The loaded history is empty; the bus delivers a decision for MID now.
+    expect(await screen.findByText(/no audit events recorded for this unit yet/i)).toBeVisible();
+
+    channel.push({
+      type: "audit.appended",
+      sequence: HEALTHY_SNAPSHOT.snapshot_sequence + 7,
+      occurred_at: "2026-08-22T12:00:05+10:00",
+      payload: {
+        event_id: "event-live-1",
+        event_type: "control_decision",
+        unit_id: "MID",
+        generation: 2,
+        result: "authorized",
+        reason_codes: ["safety_checks_passed"],
+      },
+    } as unknown as StreamEvent);
+
+    await waitFor(() => {
+      const list = document.querySelector(".event-list");
+      expect(list?.textContent ?? "").toContain("Power decision");
+      expect(list?.textContent ?? "").toContain("Allowed");
+      expect(list?.textContent ?? "").toMatch(/safety checks passed/i);
+    });
+    // A second fact for ANOTHER unit does not leak into this unit's tab.
+    channel.push({
+      type: "audit.appended",
+      sequence: HEALTHY_SNAPSHOT.snapshot_sequence + 8,
+      occurred_at: "2026-08-22T12:00:08+10:00",
+      payload: {
+        event_id: "event-live-2",
+        event_type: "control_decision",
+        unit_id: "RHS",
+        generation: 2,
+        result: "rejected",
+        reason_codes: ["no_setpoints"],
+      },
+    } as unknown as StreamEvent);
+    await waitFor(() => {
+      const list = document.querySelector(".event-list");
+      expect(list?.textContent ?? "").not.toContain("event-live-2");
+      expect(list?.textContent ?? "").not.toMatch(/refused/i);
+    });
+  });
+});

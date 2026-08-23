@@ -384,11 +384,11 @@ const LATCHED_INHIBIT_REASONS: readonly string[] = ["blocking_fault_active", "id
  *
  * `audit.appended` frames of an authorizing kind also count: the kernel audits
  * a control_decision on every tick it grants or clamps power (control_kernel),
- * and those summaries are the only per-cycle bus signal that the
- * requested/allowed figures moved — without them every view's request panel
- * freezes at the connect-time snapshot for the whole session (the snapshot
- * frame arrives exactly once per connection and no bus frame carries watt
- * figures). Idle refusals (no_setpoints and friends) do not trigger a read.
+ * and those summaries plus the `authorization.granted` announcements are the
+ * per-cycle bus signals that the requested/allowed figures moved — without
+ * them every view's request panel freezes at the connect-time snapshot for
+ * the whole session (the snapshot frame arrives exactly once per connection).
+ * Idle refusals (no_setpoints and friends) do not trigger a read.
  */
 function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void): boolean {
   switch (frame.type) {
@@ -559,15 +559,23 @@ function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void)
 
 const HEALTH_POLL_MS = 15000;
 /**
- * Interim live cadence: while the stream is live and the tab visible, the
- * shell re-reads and republishes the snapshot every few seconds. Authority
- * GRANTS publish nothing on the bus today (the grant is only visible in the
- * next snapshot) and intent expiry is silent, so without this cadence a
- * console that misses an audit summary still freezes its request panels until
- * the next reconnect. When the backend's queued intent/authority events land,
- * this becomes a safety net rather than the primary source.
+ * The measured-data heartbeat: while the tab is visible, the shell re-reads
+ * and republishes the snapshot every few seconds — regardless of the event
+ * stream's health. Measured figures live ONLY in REST snapshots (the bus
+ * frames carry no readings), so a console whose stream is down, connecting,
+ * or exhausted would otherwise freeze every figure on screen while its local
+ * timers keep ticking — the exact "looks live, shows stale numbers" trap.
+ * The stream makes figures arrive SOONER; it is never what makes them arrive.
  */
 export const LIVE_SNAPSHOT_POLL_MS = 2500;
+/**
+ * How many consecutive cadence-read failures (each ~LIVE_SNAPSHOT_POLL_MS
+ * apart) before the failure is surfaced. One missed read is a transient; two
+ * in a row (~5 s without any fresh data) means the figures on screen have
+ * stopped moving and the operator must be told instead of left staring at a
+ * live-looking badge over frozen numbers.
+ */
+export const SNAPSHOT_POLL_FAILURES_BEFORE_ERROR = 2;
 /** How often the staleness clock re-renders: the badge's "last update N s ago"
  * must move once a second while it is showing, and never at all while live. */
 const HEALTH_TICK_MS = 1000;
@@ -713,20 +721,24 @@ export function useConsoleData(
     };
   }, []);
 
-  // --- the interim live cadence ------------------------------------------------
+  // --- the measured-data heartbeat ---------------------------------------------
   //
-  // While the stream is live and the tab visible, re-read the snapshot on a
-  // steady cadence and let the plane republish it: authority grants publish
-  // nothing on the bus today, so this is what keeps every element on screen
-  // moving between bus events. A hidden tab does not poll (its timers are
-  // throttled anyway and the visibility re-check resynchronizes on return).
+  // While the tab is visible, re-read the snapshot on a steady cadence and
+  // let the plane republish it — independent of the event stream's health:
+  // the stream being down must never stop REST from refreshing the picture
+  // (the figures are REST-only on the wire), and the stream being live must
+  // never be assumed to carry them. A hidden tab does not poll (its timers
+  // are throttled anyway and the visibility re-check resynchronizes on
+  // return). A read that fails is counted; two in a row surface the error so
+  // a dead REST path can never look like a quiet-but-live console.
   useEffect(() => {
     if (plane === null) {
       return undefined;
     }
     let inFlight = false;
+    let failures = 0;
     const timer = setInterval(() => {
-      if (inFlight || stateRef.current.streamStatus !== "live") {
+      if (inFlight) {
         return;
       }
       if (document.visibilityState !== "visible") {
@@ -737,6 +749,7 @@ export function useConsoleData(
         .refresh()
         .then(
           (raw) => {
+            failures = 0;
             if (stateRef.current.snapshot === null || raw.snapshot_sequence >= stateRef.current.snapshot.sequence) {
               adoptFigures(raw);
               dispatch({ type: "snapshot-rest", snapshot: normalizeSnapshot(raw) });
@@ -745,9 +758,15 @@ export function useConsoleData(
           (error: unknown) => {
             if (isUnauthorizedError(error)) {
               dropSession(error);
+              return;
             }
-            // A failed poll is not reported on its own: the stream's own
-            // loss path owns the disconnected story.
+            // The figures on screen stop moving exactly when reads fail, so
+            // a persistent failure is the operator's business; a single
+            // missed read stays quiet (transient).
+            failures += 1;
+            if (failures >= SNAPSHOT_POLL_FAILURES_BEFORE_ERROR) {
+              dispatch({ type: "snapshot-failed", refusal: asRefusal(error) });
+            }
           },
         )
         .finally(() => {
@@ -983,6 +1002,7 @@ export function useConsoleData(
             lastSequenceRef.current = lastSequence;
             if (frame.type === "snapshot") {
               adoptFigures(frame.data);
+              plane.markStreamLive();
               plane.publishSnapshot(frame.sequence, frame.data);
             } else {
               plane.publishEvent(frame);

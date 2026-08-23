@@ -622,6 +622,34 @@ function parseObservationPublished(
   };
 }
 
+/**
+ * An `audit.appended` frame as an Events-tab entry: the payload IS the audit
+ * summary (event_id, event_type, unit_id, result, reason_codes), and the bus
+ * envelope contributes the ordering `sequence` and the `occurred_at` stamp.
+ * A live entry lands at the TOP (it is newer than every loaded REST row by
+ * construction); a later REST refresh that carries the same `event_id`
+ * dedupes against it.
+ */
+function auditEntryFromFrame(frame: StreamEvent): AuditEvent | null {
+  const payload = frame.payload;
+  if (!isRecord(payload)) {
+    return null;
+  }
+  const entry: Record<string, unknown> = { ...payload };
+  if (typeof frame.sequence === "number") {
+    entry.sequence = frame.sequence;
+  }
+  if (typeof frame.occurred_at === "string") {
+    entry.occurred_at = frame.occurred_at;
+  }
+  return entry as unknown as AuditEvent;
+}
+
+/** An audit row's `event_id`, the identity a live frame and a REST row share. */
+function auditEventId(event: AuditEvent): string | null {
+  return typeof event.event_id === "string" && event.event_id !== "" ? event.event_id : null;
+}
+
 function parseAuditEntry(event: AuditEvent): AuditEntryView {
   return {
     sequence: typeof event.sequence === "number" ? event.sequence : 0,
@@ -1475,6 +1503,15 @@ export function BatteriesView({
   const streamStartedRef = useRef(false);
   const openerRef = useRef<HTMLElement | null>(null);
   /**
+   * The open detail, by reference: the stream effect below re-reads the
+   * unit's full projection whenever the world advances while its detail is
+   * open, without re-subscribing per open/close.
+   */
+  const detailRef = useRef<{ unitId: string; tab: TabKey } | null>(null);
+  detailRef.current = detail;
+  /** One detail read in flight at a time (the cadence can outrun a slow read). */
+  const detailReadInFlightRef = useRef(false);
+  /**
    * The live request's per-unit figures — the ONE shared tracker
    * (web/src/app/useUnitIntentFigures.ts): the intent's own `watts_by_unit`
    * and the decision's `authorized_watts_by_unit` from the stream, seeded for
@@ -1567,34 +1604,57 @@ export function BatteriesView({
     void fetchAudit();
   }, [fetchAudit]);
 
-  /** The on-demand unit-detail read; the server alone says what it carries. */
+  /**
+   * The on-demand unit-detail read; the server alone says what it carries.
+   * A SILENT read (the live refresh while the detail is open) never flashes
+   * a loading phase over data that is already on screen and never replaces
+   * it with an error on a transient failure — the next world advance retries.
+   */
   const fetchUnitDetail = useCallback(
-    async (unitId: string): Promise<void> => {
-      setDetailPhase("loading");
-      setDetailError(null);
+    async (unitId: string, options: { silent?: boolean } = {}): Promise<void> => {
+      const silent = options.silent === true;
+      if (!silent) {
+        setDetailPhase("loading");
+        setDetailError(null);
+      }
       try {
         const raw = await client.getUnitDetail(unitId);
         const parsed = parseUnitDetail(raw);
         if (parsed === null) {
-          setDetailPhase("error");
-          setDetailError({
-            code: "unreadable_unit_detail",
-            message: "The unit detail response could not be read.",
-            request_id: null,
-          });
+          if (!silent) {
+            setDetailPhase("error");
+            setDetailError({
+              code: "unreadable_unit_detail",
+              message: "The unit detail response could not be read.",
+              request_id: null,
+            });
+          }
           return;
         }
         setDetailData(parsed);
         setDetailPhase("ready");
       } catch (error) {
-        setDetailPhase("error");
-        setDetailError(toErrorView(error));
+        if (!silent) {
+          setDetailPhase("error");
+          setDetailError(toErrorView(error));
+        }
       }
     },
     [client],
   );
 
-  // Opening a unit fetches its full projection once; the retry path re-runs it.
+  /**
+   * The detail reader by reference: the stream effect re-reads the open
+   * unit's full projection whenever the world advances, without depending on
+   * (and re-subscribing for) the reader or the open detail.
+   */
+  const fetchUnitDetailRef = useRef(fetchUnitDetail);
+  useEffect(() => {
+    fetchUnitDetailRef.current = fetchUnitDetail;
+  }, [fetchUnitDetail]);
+
+  // Opening a unit fetches its full projection; the live path below keeps it
+  // current while it stays open, and the retry path re-runs it.
   const openUnitId = detail === null ? null : detail.unitId;
   useEffect(() => {
     if (openUnitId === null) {
@@ -1621,8 +1681,9 @@ export function BatteriesView({
             }
             setStreamLost(false);
             // Every frame feeds the shared per-unit figure tracker (its own
-            // no-ops carry most kinds): acceptances and control-decision
-            // audits move the maps, request-ending frames clear their units.
+            // no-ops carry most kinds): acceptances, control-decision audits,
+            // and authority grants move the maps, request-ending frames clear
+            // their units.
             consumeFigures(frame);
             if (frame.type === "resync_required") {
               const recovery = frame.snapshot_sequence;
@@ -1637,10 +1698,46 @@ export function BatteriesView({
             }
             if (frame.type === "snapshot") {
               applySnapshot(frame.data);
+              // The world advanced: a detail that is open re-reads its full
+              // projection, so the Cells tab's arrays and the Summary tab's
+              // identity never sit frozen at the open-time picture while the
+              // unit keeps publishing (its age line alone would tick — the
+              // classic illusion of updating).
+              const open = detailRef.current;
+              if (open !== null && !detailReadInFlightRef.current) {
+                detailReadInFlightRef.current = true;
+                void fetchUnitDetailRef
+                  .current(open.unitId, { silent: true })
+                  .catch(() => undefined)
+                  .finally(() => {
+                    detailReadInFlightRef.current = false;
+                  });
+              }
             } else if (frame.type === "observation.published") {
               const parsed = parseObservationPublished(frame);
               if (parsed !== null) {
                 setObservations((previous) => ({ ...previous, [parsed.unitId]: parsed.track }));
+              }
+            } else if (frame.type === "audit.appended") {
+              // The Events tab is a LIVE surface: a durable fact the backend
+              // just appended lands on the timeline now, not at the next
+              // mount. Deduped by the event_id a later REST page shares.
+              const entry = auditEntryFromFrame(frame);
+              const id = entry !== null ? auditEventId(entry) : null;
+              if (entry !== null) {
+                setAuditPage((previous) => {
+                  if (
+                    previous !== null &&
+                    id !== null &&
+                    previous.events.some((event) => auditEventId(event) === id)
+                  ) {
+                    return previous;
+                  }
+                  return {
+                    events: previous === null ? [entry] : [entry, ...previous.events],
+                    next_cursor: previous === null ? null : previous.next_cursor,
+                  };
+                });
               }
             }
           }

@@ -27,6 +27,10 @@
  *    headroom clamp hit), plus `directions_by_unit` (a concurrent cycle may
  *    run opposite directions on different units). Other audit kinds carry no
  *    maps and never disturb the live request's.
+ * 3b. every `authorization.granted` announcement (live on the bus): the
+ *    granted batch's per-unit watts (`watts_by_unit`) and directions
+ *    (`directions_by_unit`) — the freshest authorized figure, landing at the
+ *    moment of the grant itself.
  *
  * CONCURRENT REQUESTS (2026-08-24 backend contract): several intents coexist,
  * each driving its own batteries. The maps are therefore CYCLE-LEVEL — they
@@ -69,6 +73,7 @@ import {
   toDirectionsByUnit,
   toIntentFigures,
   toSnapshotIntentFigures,
+  toWattsByUnit,
   type DirectionsByUnit,
   type WattsByUnit,
 } from "./fleet";
@@ -189,6 +194,24 @@ export function useUnitIntentFigures(): UnitIntentFigures {
         }
         if (unitWatts.authorized !== null) {
           setAuthorizedByUnit(unitWatts.authorized);
+        }
+        const directions = toDirectionsByUnit(payload.directions_by_unit);
+        if (directions !== null) {
+          setDirectionsByUnit(directions);
+        }
+      }
+    } else if (type === "authorization.granted") {
+      // The authority-grant announcement (composition.py `_AsyncAuthorization
+      // Repository.publish`, live on the bus since 2026-08-23): the cycle's
+      // per-unit authorized watts (`watts_by_unit`) and each unit's own
+      // direction (`directions_by_unit`). It is the freshest bus source for
+      // the authorized map — it lands at the moment of the grant, not with
+      // the next decision summary or snapshot — and its maps cover exactly
+      // the batch the cycle minted, so a present map replaces wholesale.
+      if (payload !== null) {
+        const authorized = toWattsByUnit(payload.watts_by_unit);
+        if (authorized !== null) {
+          setAuthorizedByUnit(authorized);
         }
         const directions = toDirectionsByUnit(payload.directions_by_unit);
         if (directions !== null) {

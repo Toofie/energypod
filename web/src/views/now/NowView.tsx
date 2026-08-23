@@ -87,6 +87,7 @@ import type { ReactNode } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health } from "../../api/client";
 import { toIntentFigures, toWattsByUnit, type WattsByUnit } from "../../app/fleet";
+import { isPlaneSnapshot } from "../../app/SharedDataPlane";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import { formatSeconds, formatWatts } from "../../lib/format";
 import "./now.css";
@@ -875,8 +876,12 @@ export function NowView({ client }: NowViewProps) {
 
   useEffect(() => {
     let cancelled = false;
-    client
-      .getSnapshot()
+    // The nonce-driven read is always a FRESH question (initial load, a
+    // mutation's re-read, the arm gate): it bypasses the shell's short-lived
+    // snapshot cache when the shared client allows it.
+    const read =
+      typeof client.refreshSnapshot === "function" ? client.refreshSnapshot() : client.getSnapshot();
+    read
       .then((value: unknown) => {
         if (cancelled) return;
         const wire = asSnapshot(value);
@@ -947,8 +952,14 @@ export function NowView({ client }: NowViewProps) {
     let lastSequence: number | undefined;
 
     const refetchSnapshot = (): void => {
-      client
-        .getSnapshot()
+      // A frame just proved the world moved, so the read bypasses the shell's
+      // short-lived snapshot cache when the shared client allows it — a cached
+      // picture must never answer (see HomeView's identical rule).
+      const read =
+        typeof client.refreshSnapshot === "function"
+          ? client.refreshSnapshot()
+          : client.getSnapshot();
+      read
         .then((value: unknown) => {
           if (cancelled) return;
           const wire = asSnapshot(value);
@@ -1212,7 +1223,13 @@ export function NowView({ client }: NowViewProps) {
                 adoptSnapshot(wire, wire.snapshot_sequence, resumed && firstSnapshot);
               }
               firstSnapshot = false;
-              setConnection("live");
+              // A snapshot the shell's plane REPUBLISHED from a REST read is
+              // data; it is proof of liveness only when it is not the marked
+              // replay of a stream that is down (a stale plane frame must
+              // never flip a lost connection back to "live").
+              if (!(isPlaneSnapshot(frame) && frame.stale)) {
+                setConnection("live");
+              }
             } else if (frame.type === "observation.published") {
               // The per-cycle liveness frame: it carries no readings, but it
               // proves this unit just published, resetting that unit's

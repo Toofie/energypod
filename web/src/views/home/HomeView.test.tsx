@@ -77,7 +77,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
 import type { ApiClient } from "../../api/client";
 import { telemetrySummary, type WireTelemetrySummary } from "../../test/wire";
-import { HomeView } from "./HomeView";
+import { HomeView, HEALTH_POLL_MS } from "./HomeView";
 
 vi.mock("../../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../api/client")>();
@@ -1153,7 +1153,13 @@ describe("HomeView — live outcomes and ages in the composed app", () => {
         .getAllByText(/Data age:/)
         .map((node) => node.textContent ?? "")
         .join(" ");
-      expect(aged).toMatch(/2[45] s/);
+      // The age ADVANCED (>= 24 s) rather than freezing at the captured 20 s.
+      // Under parallel suite load the fake clock can bleed a little real time
+      // (shouldAdvanceTime), so the bound is "advanced past 5 s", never an
+      // exact second.
+      const seconds = aged.match(/Data age: (\d+) s/);
+      expect(seconds).not.toBeNull();
+      expect(Number(seconds?.[1] ?? 0)).toBeGreaterThanOrEqual(24);
     });
   });
 });
@@ -1592,3 +1598,62 @@ describe("HomeView — per-unit watt figures from the wire", () => {
   });
 });
 
+
+// --- health is a live question, not a mount-time one --------------------------
+//
+// The limiting-factors card names the system's CURRENT readiness reasons;
+// those change as units arm, act, and stand down. A mount-time-only health
+// read froze the card at the unlock-time answer for the whole session — the
+// same defect class as a figure bound to a mount-time fetch.
+
+describe("HomeView — the limiting factors follow the live health envelope", () => {
+  it("re-reads health on its poll cadence: a reason that appears mid-session shows up without a reload", async () => {
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+    });
+    const snapshot = fleet([unit({ unit_id: "pod-mid" }), unit({ unit_id: "pod-rhs" })]);
+    let healthy = true;
+    const client = installClient({
+      snapshot,
+      getHealth: () =>
+        Promise.resolve(
+          healthy
+            ? healthyHealth
+            : {
+                ...healthyHealth,
+                control_readiness: { ready: false, reasons: ["pod-mid:inhibit_latched"] },
+              },
+        ),
+    });
+    void client;
+    renderHome();
+
+    // At unlock nothing is limiting: the calm line renders.
+    const calm = await screen.findByText(/nothing is limiting operation/i);
+    expect(calm).toBeInTheDocument();
+
+    // Mid-session the health envelope changes (a latch appears). The view's
+    // poll re-reads it and the card names the new limiting reason — no
+    // reload, no remount.
+    healthy = false;
+    act(() => {
+      vi.advanceTimersByTime(HEALTH_POLL_MS + 1000);
+    });
+    await waitFor(() => {
+      // The plain-language factor line (the raw code sits behind "Show
+      // detail"); the unit the latch holds is named.
+      expect(screen.getByText(/held by a safety latch/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/nothing is limiting operation/i)).toBeNull();
+
+    // And it clears again when the system recovers.
+    healthy = true;
+    act(() => {
+      vi.advanceTimersByTime(HEALTH_POLL_MS + 1000);
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/nothing is limiting operation/i)).toBeInTheDocument();
+    });
+  });
+});

@@ -97,6 +97,10 @@ describe("SharedDataPlane — cached snapshots are never served as fresh", () =>
 
       // A live stream with a published picture makes the cache servable, and
       // the published picture is itself the cache: no REST read happens.
+      // (Liveness is the SHELL's declaration — it marks the stream live when
+      // the real connection delivers its snapshot frame; publication alone is
+      // data, never liveness.)
+      plane.markStreamLive();
       plane.publishSnapshot(first.snapshot_sequence, first);
       expect(await plane.snapshot()).toBe(first);
       expect(await plane.snapshot()).toBe(first); // served from the current cache
@@ -124,6 +128,7 @@ describe("SharedDataPlane — cached snapshots are never served as fresh", () =>
     const plane = new SharedDataPlane(client);
     await plane.snapshot();
     plane.publishSnapshot(first.snapshot_sequence, first);
+    plane.markStreamLive();
     plane.streamLost();
 
     await expect(plane.snapshot()).resolves.toBe(second);
@@ -154,6 +159,9 @@ describe("SharedDataPlane — fan-out subscriptions can tell cached from current
     const plane = new SharedDataPlane(mockClient());
     plane.publishSnapshot(41, wireSnapshot(41, "2026-08-22T10:00:00Z"));
     plane.streamLost();
+    // The shell's sequence on a recovered connection: the wire snapshot frame
+    // marks the stream live again, then the picture is published.
+    plane.markStreamLive();
     plane.publishSnapshot(42, wireSnapshot(42, "2026-08-22T10:00:05Z"));
 
     const frames = await readAll(plane.subscribe());
@@ -185,6 +193,44 @@ describe("SharedDataPlane — fan-out subscriptions can tell cached from current
     const plane = new SharedDataPlane(mockClient());
     const frames = await readAll(plane.subscribe());
     expect(frames).toEqual([]);
+  });
+
+  it("republishes a REST refresh even while the stream is down, marked stale (data, never liveness)", async () => {
+    // The freeze defect this pins: a refresh that only updated the cache (or
+    // only republished while the connection was live) left every figure on
+    // screen frozen whenever the stream went down, while local timers kept
+    // ticking. A forced read is data for the views in EVERY stream state:
+    // a subscriber that re-subscribes after the loss (the views' reconnect
+    // path) receives the refreshed picture immediately, marked stale.
+    const first = wireSnapshot(41, "2026-08-22T10:00:00Z");
+    const second = wireSnapshot(45, "2026-08-22T10:00:07Z");
+    let reads = 0;
+    const client = mockClient({
+      getSnapshot: vi.fn(() => {
+        reads += 1;
+        return Promise.resolve(reads === 1 ? first : second);
+      }),
+    });
+    const plane = new SharedDataPlane(client);
+    await plane.snapshot();
+    plane.publishSnapshot(first.snapshot_sequence, first);
+    plane.markStreamLive();
+    plane.streamLost();
+
+    // The cadence poll re-reads with the stream down: the refresh must still
+    // publish (the cache alone would freeze every view).
+    await plane.refresh();
+
+    const view = sharedClient(plane, mockClient());
+    const delivered = await readAll(view.openEvents()[Symbol.asyncIterator]());
+    expect(delivered).toHaveLength(1);
+    const frame = delivered[0];
+    if (frame === undefined || !isPlaneSnapshot(frame)) {
+      throw new Error("the refreshed picture must arrive as a plane snapshot frame");
+    }
+    expect(frame.stale).toBe(true); // the stream is down: data, not liveness
+    expect(frame.sequence).toBe(45);
+    expect(frame.data).toEqual(second);
   });
 });
 

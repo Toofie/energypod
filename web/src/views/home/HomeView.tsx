@@ -74,6 +74,7 @@ import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health, StreamEvent } from "../../api/client";
 import { toWattsByUnit, type WattsByUnit } from "../../app/fleet";
+import { isPlaneSnapshot } from "../../app/SharedDataPlane";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../../lib/format";
 import "./home.css";
@@ -90,6 +91,8 @@ const FRESHNESS_BOUND_S = 60;
 const RECONNECT_BASE_DELAY_MS = 400;
 const RECONNECT_MAX_DELAY_MS = 5000;
 const AGE_TICK_MS = 1000;
+/** The health envelope re-read cadence (matches the shell's HEALTH_POLL_MS). */
+export const HEALTH_POLL_MS = 15000;
 /**
  * Past this long without any fresh reading (no observation, no new snapshot)
  * while the connection claims to be live, the picture is flagged stale: a
@@ -1021,7 +1024,11 @@ export function HomeView({ client }: HomeViewProps) {
               resumed && firstSnapshot,
             );
             firstSnapshot = false;
-            setConnection("live");
+            // A plane-republished REST read is data, not liveness: a frame
+            // marked stale (the stream is down) must never claim "live".
+            if (!(isPlaneSnapshot(frame) && frame.stale)) {
+              setConnection("live");
+            }
             continue;
           }
           setConnection("live");
@@ -1083,11 +1090,31 @@ export function HomeView({ client }: HomeViewProps) {
 
     void load();
 
+    // Health is a LIVE question, not a mount-time one: the limiting-factors
+    // card and the service line name the system's CURRENT readiness reasons,
+    // and those change as units arm, act, and stand down. Without this
+    // refresh the card would freeze at the mount-time answer for the whole
+    // session — the same trap as a figure bound to a mount-time fetch.
+    const pollHealth = (): void => {
+      client
+        .getHealth()
+        .then((value) => {
+          if (!cancelled) {
+            setHealth(value);
+          }
+        })
+        .catch(() => {
+          // The last known health stays; the next interval retries.
+        });
+    };
+    const healthTimer = setInterval(pollHealth, HEALTH_POLL_MS);
+
     return () => {
       cancelled = true;
       if (reconnectTimer !== null) {
         clearTimeout(reconnectTimer);
       }
+      clearInterval(healthTimer);
     };
   }, [client, reloadNonce]);
 

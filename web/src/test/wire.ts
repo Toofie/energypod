@@ -56,6 +56,16 @@ export const AUDIT_APPENDED = "audit.appended" as const;
 /** Every outstanding authorization was revoked (a fence, stop, or shutdown). */
 export const AUTHORIZATION_REVOKED = "authorization.revoked" as const;
 
+/**
+ * A batch of authority landed in the store (composition.py
+ * `_AsyncAuthorizationRepository.publish`, live on the bus since 2026-08-23 —
+ * live-captured 2026-08-23: one frame per control cycle while a request runs):
+ * `{cycle_id, generation, unit_ids, watts_by_unit, directions_by_unit}` —
+ * each unit's OWN authorized watts and direction for the cycle that granted
+ * them.
+ */
+export const AUTHORIZATION_GRANTED = "authorization.granted" as const;
+
 /** The facade accepted one dispatch intent; it grants nothing by itself. */
 export const INTENT_ACCEPTED = "intent.accepted" as const;
 
@@ -84,6 +94,7 @@ export const PUBLISHED_EVENT_TYPES: readonly string[] = [
   OBSERVATION_PUBLISHED,
   AUDIT_APPENDED,
   AUTHORIZATION_REVOKED,
+  AUTHORIZATION_GRANTED,
   INTENT_ACCEPTED,
   INTENT_EXPIRED,
   INTENT_CANCELLED,
@@ -315,6 +326,50 @@ export function authorizationRevoked(
   occurredAt: string = DEFAULT_OCCURRED_AT,
 ): EventFrame<{ reason: string | null; unit_ids: string[] }> {
   return frame(AUTHORIZATION_REVOKED, sequence, { reason, unit_ids: [...unitIds] }, occurredAt);
+}
+
+/**
+ * An authority grant, exactly as the composition's authorization repository
+ * announces it (live-captured 2026-08-23): the cycle, the generation, the
+ * units the batch carries, and each unit's OWN authorized watts and
+ * direction. `watts_by_unit` is the authorized figure per unit (NOT the
+ * request) — the freshest bus source for the allowed map.
+ */
+export interface AuthorizationGrantedPayload {
+  readonly cycle_id: string | null;
+  readonly generation: number | null;
+  readonly unit_ids: readonly string[];
+  readonly watts_by_unit: Record<string, number>;
+  readonly directions_by_unit: Record<string, string>;
+}
+
+export function authorizationGranted(
+  sequence: number,
+  grant: {
+    cycle_id?: string | null;
+    generation?: number | null;
+    unit_ids?: readonly string[];
+    watts_by_unit?: Record<string, number>;
+    directions_by_unit?: Record<string, string>;
+  } = {},
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<AuthorizationGrantedPayload> {
+  const unitIds = [...(grant.unit_ids ?? ["MID"])];
+  const watts = grant.watts_by_unit ?? Object.fromEntries(unitIds.map((id) => [id, 1000]));
+  const directions =
+    grant.directions_by_unit ?? Object.fromEntries(unitIds.map((id) => [id, "discharge"]));
+  return frame(
+    AUTHORIZATION_GRANTED,
+    sequence,
+    {
+      cycle_id: grant.cycle_id ?? `cycle-${sequence}`,
+      generation: grant.generation ?? 2,
+      unit_ids: unitIds,
+      watts_by_unit: watts,
+      directions_by_unit: directions,
+    },
+    occurredAt,
+  );
 }
 
 /**

@@ -63,6 +63,7 @@ import {
   unitDetail,
   unitSnapshot,
   withActiveStops,
+  withSnapshotIntent,
 } from "../test/wire";
 import type { WireAuditEvent, WireSnapshot, WireUnitDetail } from "../test/wire";
 
@@ -188,6 +189,16 @@ class ComposedHarness {
   };
   /** While false, the ticket handshake is refused: the service is down. */
   up = true;
+  /**
+   * While false, an accepted socket never delivers its authoritative first
+   * frame — the connection half-opens exactly like a stream whose snapshot
+   * frame is lost in flight. The console must not depend on that frame to
+   * keep its figures moving (the shell's live marker and the stream status
+   * are earned by the wire, the data comes from REST).
+   */
+  deliverSnapshotFrame = true;
+  /** While set, GET /api/v1/snapshot refuses with this status/body. */
+  snapshotRefusal: { status: number; body: Record<string, unknown> } | null = null;
   armRows: WireOutcomeRow[] | null = null;
   intentResponse: Record<string, unknown> | null = null;
   requests: RecordedRequest[] = [];
@@ -212,6 +223,9 @@ class ComposedHarness {
       queueMicrotask(() => {
         socket.emitClose(1006);
       });
+      return;
+    }
+    if (!this.deliverSnapshotFrame) {
       return;
     }
     queueMicrotask(() => {
@@ -257,6 +271,9 @@ class ComposedHarness {
     this.requests.push({ path, method, headers, body });
 
     if (method === "GET" && path === "/api/v1/snapshot") {
+      if (this.snapshotRefusal !== null) {
+        return jsonResponse(this.snapshotRefusal.status, this.snapshotRefusal.body);
+      }
       return jsonResponse(200, this.world);
     }
     if (method === "GET" && path === "/api/v1/health") {
@@ -1322,4 +1339,198 @@ describe("Composed console — request panels live-update during an intent", () 
     );
     expect(harness.sockets).toHaveLength(1);
   });
+});
+
+// ---------------------------------------------------------------------------
+// The measured-data heartbeat (2026-08-23 live-capture audit): measured
+// figures live ONLY in REST snapshots — the bus frames carry no readings — so
+// the shell re-reads and republishes the snapshot on a steady cadence in
+// EVERY stream state. The stream makes figures arrive sooner; it is never
+// what makes them arrive. These pins are the reported defect class: a console
+// whose figures froze while its local timers kept ticking.
+// ---------------------------------------------------------------------------
+
+/** MID actively discharging with a fresh per-unit intent block, at a sequence. */
+function worldIntentAt(
+  sequence: number,
+  figures: { requested: number; authorized: number; measured: number },
+): WireSnapshot {
+  const world = wireSnapshot(
+    [
+      unitSnapshot({
+        unit_id: "MID",
+        lifecycle: "active",
+        telemetry_age_s: 2,
+        quality: "good",
+        requested_power: { direction: "discharge", watts: figures.requested },
+        authorized_power: { direction: "discharge", watts: figures.authorized },
+        measured_watts: figures.measured,
+      }),
+      unitSnapshot({ unit_id: "RHS", lifecycle: "armed_idle", telemetry_age_s: 3, measured_watts: 0 }),
+      unitSnapshot({ unit_id: "LHS", lifecycle: "disarmed", telemetry_age_s: 5, measured_watts: null }),
+    ],
+    { snapshot_sequence: sequence, captured_at: OCCURRED_AT },
+  );
+  return withSnapshotIntent(world, {
+    requested_watts_by_unit: { MID: figures.requested },
+    authorized_watts_by_unit: { MID: figures.authorized },
+    directions_by_unit: { MID: "discharge" },
+  });
+}
+
+describe("Composed console — the measured-data heartbeat", () => {
+  it("moves Now's Actual and the request figures under an active command through successive snapshots, with a quiet bus", async () => {
+    // THE reported case: a discharge is running, the countdown ticks (a local
+    // marker), and the Actual measurement must move with the world. The bus
+    // here is perfectly quiet after the connection's first frame — no audit
+    // summaries, no grants — so ONLY the cadence re-read can move the
+    // figures. If the heartbeat is dropped or conditioned away, this fails.
+    const user = userEvent.setup();
+    const harness = new ComposedHarness(
+      worldIntentAt(4100, { requested: 1200, authorized: 1200, measured: 1200 }),
+    );
+    harness.install();
+    render(<AppShell views={views} />);
+    await unlock(user);
+    await user.click(screen.getByRole("link", { name: "Now" }));
+    await screen.findByText("Current request");
+
+    // The connect-time picture: the honest fallback row carries the measured
+    // figure (no card exists — no acceptance was seen this session).
+    await waitFor(() => {
+      expect(screen.getByRole("group", { name: "Actual" }).textContent ?? "").toContain("1,200 W");
+    });
+
+    // The world moves twice with no bus frames at all: a clamp plus a new
+    // measurement, then a further drift (the live house-load pattern).
+    harness.world = worldIntentAt(4130, { requested: 1500, authorized: 900, measured: 880 });
+    await waitFor(
+      () => {
+        const actual = screen.getByRole("group", { name: "Actual" });
+        expect(actual.textContent ?? "").toContain("880 W");
+      },
+      { timeout: 8000 },
+    );
+    // The requested/allowed figures moved with the same re-read (the
+    // snapshot intent block's per-unit maps).
+    expect(screen.getByRole("group", { name: "Requested" }).textContent ?? "").toContain("1,500 W");
+    expect(screen.getByRole("group", { name: "Allowed" }).textContent ?? "").toContain("900 W");
+
+    harness.world = worldIntentAt(4160, { requested: 1500, authorized: 1500, measured: 1460 });
+    await waitFor(
+      () => {
+        expect(screen.getByRole("group", { name: "Actual" }).textContent ?? "").toContain("1,460 W");
+      },
+      { timeout: 8000 },
+    );
+    // One connection the whole time: this is a cadence re-read, not a
+    // reconnect-driven refetch.
+    expect(harness.sockets).toHaveLength(1);
+  }, 30_000);
+
+  it("keeps Home's figures moving when the event stream never delivers its snapshot frame (REST alone refreshes)", async () => {
+    // The defect this pins: every data path was gated on the stream being
+    // fully live, so a half-open connection (or a down one) froze every
+    // figure while the ages and countdowns kept ticking. Measured figures are
+    // REST-only, so the heartbeat must run in every stream state.
+    const user = userEvent.setup();
+    const harness = new ComposedHarness(
+      worldIntentAt(4100, { requested: 1200, authorized: 1200, measured: 1200 }),
+    );
+    harness.deliverSnapshotFrame = false; // the socket opens; the first frame never arrives
+    harness.install();
+    render(<AppShell views={views} />);
+    await unlock(user);
+
+    // Home lands through REST even though the stream never delivered: the
+    // connection fact stays honest about the stream itself.
+    await screen.findAllByText("Discharging 1,200 W");
+    await waitFor(() => {
+      expect(factText(/event stream/i)).toContain("Connecting");
+    });
+
+    // The world moves with no bus frames: only the heartbeat can carry it.
+    harness.world = worldIntentAt(4140, { requested: 1500, authorized: 900, measured: 880 });
+    await waitFor(
+      () => {
+        expect(screen.getByText("880 W")).toBeInTheDocument();
+      },
+      { timeout: 8000 },
+    );
+    expect(screen.getAllByText(/1,500 W/).length).toBeGreaterThanOrEqual(1);
+    expect(within(banner()).getByText("Limited")).toBeInTheDocument();
+  }, 30_000);
+
+  it("keeps the Batteries cards' measured power moving when the stream never delivers its snapshot frame", async () => {
+    const user = userEvent.setup();
+    const harness = new ComposedHarness(
+      worldIntentAt(4100, { requested: 1200, authorized: 1200, measured: 1200 }),
+    );
+    harness.deliverSnapshotFrame = false;
+    harness.install();
+    render(<AppShell views={views} />);
+    await unlock(user);
+    await user.click(screen.getByRole("link", { name: "Batteries" }));
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    await waitFor(() => {
+      expect(midCard).toHaveTextContent(/discharging 1,200 W/i);
+    });
+
+    // The measured figure on the card follows the re-read world — a card
+    // that freezes its watts while its data-age line keeps ticking is the
+    // illusion this heartbeat exists to prevent.
+    harness.world = worldIntentAt(4150, { requested: 1200, authorized: 1200, measured: 770 });
+    await waitFor(
+      () => {
+        expect(midCard).toHaveTextContent(/discharging 770 W/i);
+      },
+      { timeout: 8000 },
+    );
+  }, 30_000);
+
+  it("surfaces a persistently failing snapshot read instead of a quietly live badge over frozen figures, and recovers", async () => {
+    // A dead REST path (the vite-proxy 502 family) previously failed
+    // silently: the stream stayed live, the badge said LIVE, and every
+    // measured figure froze. Two consecutive failed heartbeat reads surface
+    // the error; the next successful read clears it.
+    const user = userEvent.setup();
+    const harness = new ComposedHarness(
+      worldIntentAt(4100, { requested: 1200, authorized: 1200, measured: 1200 }),
+    );
+    harness.install();
+    render(<AppShell views={views} />);
+    await unlock(user);
+    await waitFor(() => {
+      expect(factText(/event stream/i)).toContain("Yes — live");
+    });
+
+    harness.snapshotRefusal = {
+      status: 502,
+      body: errorBody("network_error", "The EnergyPod service could not be reached"),
+    };
+    await waitFor(
+      () => {
+        expect(screen.getByText("network_error")).toBeInTheDocument();
+      },
+      { timeout: 12_000 },
+    );
+    // The failure is surfaced beside the last known data, with the manual
+    // retry affordance — not by freezing silently.
+    const failureAlert = screen.getByText("network_error").closest('[role="alert"]');
+    expect(failureAlert).not.toBeNull();
+    expect(failureAlert?.textContent ?? "").toContain("The EnergyPod service could not be reached");
+    expect(within(failureAlert as HTMLElement).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+
+    harness.snapshotRefusal = null;
+    harness.world = worldIntentAt(4180, { requested: 1200, authorized: 1200, measured: 640 });
+    await waitFor(
+      () => {
+        expect(screen.queryByText("network_error")).toBeNull();
+      },
+      { timeout: 8000 },
+    );
+    await waitFor(() => {
+      expect(screen.getByText("640 W")).toBeInTheDocument();
+    });
+  }, 40_000);
 });

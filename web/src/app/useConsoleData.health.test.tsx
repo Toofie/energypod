@@ -142,6 +142,8 @@ function Probe({
         {data.secondsSinceUpdate === null ? "none" : `${data.secondsSinceUpdate}`}
       </output>
       <output data-testid="restart-notice">{data.restartNotice ?? "none"}</output>
+      <output data-testid="sequence">{data.snapshot?.sequence ?? 0}</output>
+      <output data-testid="snapshot-error">{data.snapshotError?.code ?? "none"}</output>
       <button type="button" onClick={data.retryStream}>
         retry stream
       </button>
@@ -451,5 +453,106 @@ describe("useConsoleData — the interim live cadence", () => {
       },
       { timeout: 4000 },
     );
+  });
+
+  it("keeps the measured-data heartbeat running while the stream is down or connecting — REST alone must refresh the picture", async () => {
+    // The reported defect family: every figure on screen froze whenever the
+    // event stream was not fully live (down, connecting, or exhausted) while
+    // local timers kept ticking — the console looked alive and showed stale
+    // numbers. Measured figures live ONLY in REST snapshots, so the heartbeat
+    // must run in every stream state; the stream makes figures arrive sooner,
+    // it never makes them arrive.
+    const worlds = [
+      SNAPSHOT,
+      { ...SNAPSHOT, snapshot_sequence: 42 },
+      { ...SNAPSHOT, snapshot_sequence: 43 },
+      { ...SNAPSHOT, snapshot_sequence: 44 },
+    ];
+    let reads = 0;
+    let streamAttempts = 0;
+    const client = mockClient({
+      getSnapshot: vi.fn(() => {
+        const world = worlds[Math.min(reads, worlds.length - 1)]!;
+        reads += 1;
+        return Promise.resolve(world);
+      }) as unknown as ApiClient["getSnapshot"],
+      openEvents: vi.fn(() => {
+        streamAttempts += 1;
+        // The stream never yields anything and never errors: it parks, the
+        // shape of a half-open connection whose first frame never arrives.
+        return {
+          [Symbol.asyncIterator]: () =>
+            ({ next: () => new Promise<IteratorResult<StreamEvent>>(() => undefined) }) as AsyncIterator<StreamEvent>,
+        } as unknown as AsyncIterable<StreamEvent>;
+      }) as unknown as ApiClient["openEvents"],
+    });
+    render(
+      <Probe
+        client={client}
+        onUnauthorized={vi.fn()}
+        retryDelaysMs={[60_000]}
+        staleAfterMs={60_000}
+        livePollMs={120}
+      />,
+    );
+    // The stream never became live (its first frame never arrived)...
+    await waitFor(() => {
+      expect(screen.getByTestId("status").textContent).toBe("connecting");
+    });
+
+    // ...yet the heartbeat keeps re-reading and the picture keeps advancing.
+    await waitFor(
+      () => {
+        expect(reads).toBeGreaterThanOrEqual(3);
+      },
+      { timeout: 4000 },
+    );
+    expect(screen.getByTestId("sequence").textContent).not.toBe("0");
+
+    // And a connection that closes without delivering lands as down: the
+    // heartbeat must STILL keep the picture moving (see the next pin for the
+    // failure surfacing).
+    expect(streamAttempts).toBeGreaterThanOrEqual(1);
+  });
+
+  it("surfaces a persistently failing heartbeat read instead of looking quietly live over frozen numbers", async () => {
+    let reads = 0;
+    const client = mockClient({
+      getSnapshot: vi.fn(() => {
+        reads += 1;
+        if (reads <= 2) {
+          return Promise.resolve(SNAPSHOT);
+        }
+        return Promise.reject(
+          new ApiClientError({
+            status: 502,
+            code: "network_error",
+            message: "The EnergyPod service could not be reached",
+            details: null,
+            request_id: "",
+          }),
+        );
+      }) as unknown as ApiClient["getSnapshot"],
+    });
+    render(
+      <Probe
+        client={client}
+        onUnauthorized={vi.fn()}
+        retryDelaysMs={[60_000]}
+        staleAfterMs={60_000}
+        livePollMs={60}
+      />,
+    );
+    // Two consecutive failures surface the read failure: the figures on
+    // screen have stopped moving, so the operator must be told instead of
+    // left staring at a live-looking badge over frozen numbers. One missed
+    // read stays quiet (a transient is not a story).
+    await waitFor(
+      () => {
+        expect(screen.getByTestId("snapshot-error").textContent).toBe("network_error");
+      },
+      { timeout: 4000 },
+    );
+    expect(reads).toBeGreaterThanOrEqual(4);
   });
 });

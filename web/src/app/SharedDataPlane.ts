@@ -8,9 +8,10 @@
  * The shell absorbs `resync_required` discontinuities itself (it refetches the
  * snapshot and reconnects with the recovery cursor) and simply republishes the
  * fresh authoritative snapshot to subscribers — and every forced refresh
- * (`refresh()`) republishes the same way while the connection is live, so a
- * re-read anywhere in the session updates every mounted view, never just the
- * cache.
+ * (`refresh()`) republishes the same way REGARDLESS of the stream's health
+ * (marked `stale` while the connection is down: fresh data, never proof of
+ * liveness), so a re-read anywhere in the session updates every mounted view,
+ * never just the cache — and a lost stream can never freeze the figures.
  *
  * Honesty rules the plane enforces:
  * - A cached snapshot is never handed over as a fresh read. It is servable
@@ -107,6 +108,15 @@ export class SharedDataPlane {
   }
 
   /**
+   * The one real connection delivered its authoritative snapshot frame: the
+   * stream is live. Only the shell calls this — a REST read (however fresh)
+   * is data, never liveness.
+   */
+  markStreamLive(): void {
+    this.live = true;
+  }
+
+  /**
    * The snapshot read consumers of this session share. Concurrent callers
    * coalesce into one wire read; a cached picture is served only while it is
    * still current (live stream, inside the cache window), so a later mount
@@ -136,14 +146,15 @@ export class SharedDataPlane {
       (value) => {
         this.snapshotCache = value;
         this.snapshotCachedAt = Date.now();
-        // A forced read is a fresh authoritative picture: while the one real
-        // connection is live it is republished to every subscriber exactly
-        // like a wire snapshot frame, so a refresh updates the views, not just
-        // the shell's own cache (silently updating the cache is what let every
-        // view's request panel freeze at its connect-time picture).
-        if (this.live) {
-          this.publishSnapshot(value.snapshot_sequence, value);
-        }
+        // A forced read is a fresh authoritative picture: it is republished to
+        // every subscriber exactly like a wire snapshot frame — REGARDLESS of
+        // the stream's health, because a refresh that only updated the cache
+        // is what let every view freeze at its connect-time picture, and a
+        // refresh that stops republishing when the stream is down is what
+        // froze every figure on screen while the shell kept polling. The
+        // frame is marked `stale` while the real connection is down: fresh
+        // DATA, never evidence of liveness.
+        this.publishSnapshot(value.snapshot_sequence, value, !this.live);
         if (this.snapshotInFlight === read) {
           this.snapshotInFlight = null;
         }
@@ -228,11 +239,10 @@ export class SharedDataPlane {
     };
   }
 
-  publishSnapshot(sequence: number, data: unknown): void {
-    this.live = true;
+  publishSnapshot(sequence: number, data: unknown, stale = false): void {
     const capturedAt =
       isRecord(data) && typeof data.captured_at === "string" ? data.captured_at : "";
-    this.replayFrame = { type: "snapshot", sequence, data, captured_at: capturedAt, stale: false };
+    this.replayFrame = { type: "snapshot", sequence, data, captured_at: capturedAt, stale };
     const cached = asSnapshot(data);
     if (cached !== null) {
       this.snapshotCache = cached;
