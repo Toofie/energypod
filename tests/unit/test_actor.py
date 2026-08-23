@@ -254,6 +254,7 @@ def contract() -> Any:
             (),
             {
                 "EnergyPodActor": actor_module.EnergyPodActor,
+                "ArmRefused": actor_module.ArmRefused,
                 "InhibitCause": actor_module.InhibitCause,
                 "UnitLifecycle": domain_module.UnitLifecycle,
             },
@@ -332,6 +333,49 @@ async def test_boot_is_observe_only_and_requires_qualification_then_explicit_arm
     assert transport.writes == []
 
     await actor.shutdown()
+
+
+async def test_arm_refusals_name_their_distinct_conditions(contract: Any) -> None:
+    """Arm-refusal de-conflation: the one conflated "not qualified" refusal is
+    three named root causes, so the operator can tell WHICH condition to clear
+    — acknowledge a latch, wait out the qualification window, or disarm a unit
+    that is mid-autonomy/handback."""
+    # Mid-autonomy/handback: an armed unit is qualified and unlatched but is
+    # not DISARMED — re-arming it is a lifecycle refusal, not a qualification
+    # one.
+    armed, _, _, _, _ = make_actor(contract)
+    await ready_actor(armed)
+    with pytest.raises(contract.ArmRefused) as armed_refusal:
+        await armed.arm()
+    assert armed_refusal.value.reason == "unit_not_disarmed"
+    await armed.shutdown()
+
+    # Safety qualification window: observe-only with nothing stable yet keeps
+    # the long-pinned refusal message, now with its own reason word.
+    fresh, _, _, _, _ = make_actor(contract)
+    await fresh.start()
+    with pytest.raises(contract.ArmRefused) as unqualified:
+        await fresh.arm()
+    assert unqualified.value.reason == "insufficient_stable_observations"
+    assert "not qualified for arming" in str(unqualified.value)
+    await fresh.shutdown()
+
+    # The latch dominates: a latched unit is refused for the latch (the
+    # privileged acknowledgement is the only exit), never folded into the
+    # qualification or lifecycle words.
+    latched, _, _, _, _ = make_actor(
+        contract, blocking_fault_codes=frozenset({"Stack_Fault0_3"})
+    )
+    await ready_actor(latched)
+    await latched.accept_observation(
+        ObservationRecord(sequence=2, active_faults=("Stack_Fault0_3",))
+    )
+    assert latched.inhibit_latched is True
+    with pytest.raises(contract.ArmRefused) as latched_refusal:
+        await latched.arm()
+    assert latched_refusal.value.reason == "inhibit_latched"
+    assert "blocking_fault_active" in str(latched_refusal.value)
+    await latched.shutdown()
 
 
 async def test_mode_word_refresh_reads_one_bounded_window_through_the_transport(

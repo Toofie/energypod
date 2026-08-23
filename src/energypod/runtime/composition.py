@@ -1657,6 +1657,17 @@ class _ActorCommandHandle:
         return self._actor.inhibit_cause
 
     @property
+    def inhibit_reason(self) -> str | None:
+        """The actor's operator-visible inhibit reason word.
+
+        Arm-refusal de-conflation: the facade surfaces this beside the pinned
+        ``inhibit_latched`` refusal so the console can name WHICH condition to
+        clear (``external_writer`` vs ``identity_mismatch`` vs
+        ``blocking_fault_active``) instead of a bare latch.
+        """
+        return self._actor.inhibit_reason
+
+    @property
     def last_arm_classification(self) -> str | None:
         """ADD-1: the last arm preflight's objective classification."""
         return self._actor.last_arm_classification

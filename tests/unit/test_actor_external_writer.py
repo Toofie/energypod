@@ -301,6 +301,7 @@ def contract() -> Any:
             (),
             {
                 "EnergyPodActor": actor_module.EnergyPodActor,
+                "ArmRefused": actor_module.ArmRefused,
                 "InhibitCause": actor_module.InhibitCause,
                 "UnitLifecycle": domain_module.UnitLifecycle,
                 "EnergyServiceFacade": service_module.EnergyServiceFacade,
@@ -404,9 +405,12 @@ async def test_foreign_objective_refuses_arm_and_latches_external_writer(
     await qualify_disarmed(contract, actor)
     generation_before = actor.generation
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(contract.ArmRefused) as refused:
         await actor.arm()
 
+    assert refused.value.reason == "external_writer", (
+        f"{label}: the refusal must name the foreign writer as its own condition"
+    )
     assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
     assert actor.inhibit_cause is contract.InhibitCause.LATCHED
     assert actor.inhibit_latched is True, f"{label}: the external writer must be latched"
@@ -733,9 +737,13 @@ async def test_unreadable_objective_readback_refuses_arm_fail_closed(
     await qualify_disarmed(contract, actor)
     generation_before = actor.generation
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError) as refused:
         await actor.arm()
 
+    # De-conflation: the unreadable readback is its own fail-closed condition —
+    # a retryable transient with its own reason word, never an actor_failure.
+    assert isinstance(refused.value, contract.ArmRefused)
+    assert refused.value.reason == "objective_readback_unreadable"
     assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
     # Pinned: the unreadable-readback refusal is non-latched (TRANSIENT), so a
     # readable-again readback recovers through stable samples without a

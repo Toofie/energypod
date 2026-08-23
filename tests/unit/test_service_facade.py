@@ -523,6 +523,7 @@ class FakeActorHandle:
         qualified: bool | None = True,
         inhibit_latched: bool = False,
         inhibit_cause: str | None = None,
+        inhibit_reason: str | None = None,
         arm_error: BaseException | None = None,
         disarm_error: BaseException | None = None,
         zero_error: BaseException | None = None,
@@ -535,6 +536,7 @@ class FakeActorHandle:
         self.qualified = qualified
         self.inhibit_latched = inhibit_latched
         self.inhibit_cause = inhibit_cause if inhibit_latched else None
+        self.inhibit_reason = inhibit_reason if inhibit_latched else None
         self.arm_error = arm_error
         self.disarm_error = disarm_error
         self.zero_error = zero_error
@@ -740,6 +742,7 @@ def make_rig(
             qualified=spec.get("qualified", True),
             inhibit_latched=spec.get("inhibit_latched", False),
             inhibit_cause=spec.get("inhibit_cause"),
+            inhibit_reason=spec.get("inhibit_reason"),
             arm_error=spec.get("arm_error"),
             disarm_error=spec.get("disarm_error"),
             zero_error=spec.get("zero_error"),
@@ -2353,6 +2356,118 @@ async def test_arm_refusals_are_visible_per_unit_and_never_silent(api: Any) -> N
     for unit_id in ("pod-b", "pod-c", "pod-d"):
         assert rig.handles[unit_id].lifecycle is not api.UnitLifecycle.ARMED_IDLE
     assert_audited_and_published(rig, OPERATOR.subject)
+
+
+async def test_a_latched_arm_refusal_names_which_condition_holds_the_unit(api: Any) -> None:
+    """Arm-refusal de-conflation: the pinned ``inhibit_latched`` reason keeps
+    its string, and the additive ``inhibit_reason`` key names WHICH latch —
+    the operator's next act differs for a foreign PQ writer (takeover or stand
+    the writer down), an identity mismatch, and a blocking fault."""
+    rig = make_rig(
+        api,
+        units={
+            "pod-a": {"inhibit_latched": True, "inhibit_reason": "external_writer"},
+            "pod-b": {"inhibit_latched": True, "inhibit_reason": "identity_mismatch"},
+        },
+    )
+
+    result = await rig.facade.arm(
+        unit_ids=["pod-a", "pod-b"],
+        principal=OPERATOR,
+        idempotency_key="arm-key-latch",
+        request_id="request-latch",
+    )
+
+    outcomes = {unit["unit_id"]: unit for unit in result["units"]}
+    assert outcomes["pod-a"]["reason"] == "inhibit_latched", "the pinned word is stable"
+    assert outcomes["pod-a"]["inhibit_reason"] == "external_writer"
+    assert outcomes["pod-b"]["reason"] == "inhibit_latched"
+    assert outcomes["pod-b"]["inhibit_reason"] == "identity_mismatch"
+    assert "arm:pod-a" not in rig.history and "arm:pod-b" not in rig.history
+    # The distinguishing cause reaches BOTH durable surfaces: the audit row's
+    # reason codes name it beside the pinned refusal word, and the published
+    # event carries each unit's outcome verbatim.
+    latched_rows = [
+        event
+        for event in rig.audit.appended
+        if field_of(event, "event_type") == "unit_armed"
+        and field_of(event, "unit_id") in {"pod-a", "pod-b"}
+    ]
+    assert {row.reason_codes for row in latched_rows} == {
+        ("inhibit_latched", "external_writer"),
+        ("inhibit_latched", "identity_mismatch"),
+    }
+    published = [body for body in rig.bus.published if body.get("type") == "unit.armed"]
+    assert published, "the refusal must be published"
+    published_reasons = {
+        unit["inhibit_reason"]
+        for unit in published[0]["payload"]["units"]
+        if unit["unit_id"] in {"pod-a", "pod-b"}
+    }
+    assert published_reasons == {"external_writer", "identity_mismatch"}
+
+
+async def test_arm_refuses_a_mid_autonomy_unit_without_contacting_the_actor(api: Any) -> None:
+    """A qualified, unlatched unit that is not DISARMED (armed/active under an
+    armed epoch, or mid-recovery) is its own refusal word — the operator
+    disarms or waits, and never sees a bare actor_failure for it."""
+    rig = make_rig(
+        api,
+        units={
+            "pod-a": {"lifecycle": api.UnitLifecycle.ARMED_IDLE},
+            "pod-b": {"lifecycle": api.UnitLifecycle.ACTIVE},
+        },
+    )
+
+    result = await rig.facade.arm(
+        unit_ids=["pod-a", "pod-b"],
+        principal=OPERATOR,
+        idempotency_key="arm-key-not-disarmed",
+        request_id="request-not-disarmed",
+    )
+
+    outcomes = {unit["unit_id"]: unit for unit in result["units"]}
+    assert [outcomes["pod-a"]["reason"], outcomes["pod-b"]["reason"]] == [
+        "unit_not_disarmed",
+        "unit_not_disarmed",
+    ]
+    assert "arm:pod-a" not in rig.history and "arm:pod-b" not in rig.history, (
+        "the facade-level gate refuses before the actor handle is contacted"
+    )
+
+
+async def test_an_actor_named_refusal_is_not_an_actor_failure(api: Any) -> None:
+    """The actor's own named arm refusals surface as their reason word; only an
+    unexpected actor-side failure stays ``actor_failure``."""
+    from energypod.application.actor import ArmRefused
+
+    rig = make_rig(
+        api,
+        units={
+            "pod-a": {
+                "arm_error": ArmRefused(
+                    "objective_readback_unreadable",
+                    "pod-a: arm refused, the served PQ objective readback is unreadable",
+                )
+            },
+            "pod-b": {"arm_error": ArmRefused("unit_not_disarmed", "pod-b: mid-handback")},
+            "pod-c": {"arm_error": RuntimeError("mailbox wedged")},
+        },
+    )
+
+    result = await rig.facade.arm(
+        unit_ids=["pod-a", "pod-b", "pod-c"],
+        principal=OPERATOR,
+        idempotency_key="arm-key-named",
+        request_id="request-named",
+    )
+
+    outcomes = {unit["unit_id"]: unit for unit in result["units"]}
+    assert outcomes["pod-a"]["reason"] == "objective_readback_unreadable"
+    assert outcomes["pod-b"]["reason"] == "unit_not_disarmed"
+    assert outcomes["pod-c"]["reason"] == "actor_failure"
+    for unit_id in ("pod-a", "pod-b", "pod-c"):
+        assert "arm:" + unit_id in rig.history, "only an attempt can discover these"
 
 
 async def test_arm_refuses_unknown_qualification_without_actor_contact(api: Any) -> None:

@@ -56,6 +56,27 @@ class InhibitCause(StrEnum):
     LATCHED = "latched"
 
 
+class ArmRefused(RuntimeError):
+    """One refused arm attempt carrying its operator reason word.
+
+    De-conflation (the 2026-08-22 arm-path audit): a refused arm previously
+    raised one conflated message for three distinct root causes, so the
+    operator could not tell WHICH condition to clear.  ``reason`` names it:
+    ``inhibit_latched`` (a privileged acknowledgement is the only exit),
+    ``insufficient_stable_observations`` (the safety qualification window is
+    still accumulating), ``unit_not_disarmed`` (the unit is mid-autonomy or
+    handback — armed, active, or still recovering — so disarm or wait, never
+    re-acknowledge), ``external_writer`` (a foreign writer holds the served PQ
+    objective; latched), or ``objective_readback_unreadable`` (fail-closed
+    transient, retry once the readback is readable).  A plain RuntimeError
+    from ``arm`` remains an unexpected actor failure, a sixth, distinct class.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 @dataclass(slots=True)
 class _Message:
     operation: str
@@ -740,12 +761,30 @@ class EnergyPodActor:
     async def _arm_owned(self, takeover_acknowledged: bool = False) -> None:
         if self._stopping:
             return
-        if (
-            self.lifecycle is not UnitLifecycle.DISARMED
-            or self.inhibit_latched
-            or self._stable_observations < self._stable_required
-        ):
-            raise RuntimeError("unit is not qualified for arming")
+        # De-conflated refusal ordering (dominant condition first, mirroring
+        # the facade's own gate order): the latch dominates because only a
+        # privileged acknowledgement clears it, the qualification window is
+        # the safety policy's own gate, and the lifecycle gate names the
+        # mid-autonomy/handback family last.  Every branch refuses exactly as
+        # the single conflated check did; only the reason word is new.
+        if self.inhibit_latched:
+            raise ArmRefused(
+                "inhibit_latched",
+                f"{self.unit_id}: arm refused, the latched inhibit "
+                f"({self.inhibit_reason}) requires a privileged acknowledgement",
+            )
+        if self._stable_observations < self._stable_required:
+            raise ArmRefused(
+                "insufficient_stable_observations",
+                f"{self.unit_id}: arm refused, unit is not qualified for arming "
+                f"({self._stable_observations}/{self._stable_required} stable observations)",
+            )
+        if self.lifecycle is not UnitLifecycle.DISARMED:
+            raise ArmRefused(
+                "unit_not_disarmed",
+                f"{self.unit_id}: arm refused, the unit is {self.lifecycle.value}, "
+                "not DISARMED (disarm it first or let recovery finish)",
+            )
         # The external-writer preflight is arm-gated: it runs exactly once per
         # arm attempt, inside this mailbox dispatch, before ARMED_IDLE — never
         # per heartbeat.
@@ -801,8 +840,9 @@ class EnergyPodActor:
             raise
         except Exception as error:
             await self._inhibit_owned("objective_readback_unreadable", InhibitCause.TRANSIENT)
-            raise RuntimeError(
-                f"{self.unit_id}: arm refused, the served PQ objective readback is unreadable"
+            raise ArmRefused(
+                "objective_readback_unreadable",
+                f"{self.unit_id}: arm refused, the served PQ objective readback is unreadable",
             ) from error
         served = (self._signed_objective(readback[0]), self._signed_objective(readback[1]))
         if served == (0, 0) or served == self._applied_objective:
@@ -816,9 +856,10 @@ class EnergyPodActor:
             return
         self.last_arm_classification = "external_writer"
         await self._inhibit_owned("external_writer", InhibitCause.LATCHED)
-        raise RuntimeError(
+        raise ArmRefused(
+            "external_writer",
             f"{self.unit_id}: arm refused, an external writer holds the PQ "
-            f"objective (P={served[0]}, Q={served[1]})"
+            f"objective (P={served[0]}, Q={served[1]})",
         )
 
     def _is_pod_autonomy_signature(self, served: tuple[int, int]) -> bool:

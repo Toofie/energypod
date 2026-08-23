@@ -47,6 +47,7 @@ from typing import Any, Final, Protocol
 from energypod.domain import Direction, IntentSource, Observation, PowerIntent, UnitLifecycle
 from energypod.domain.audit import AuditEvent
 
+from .actor import ArmRefused
 from .arbiter import IntentArbiter
 from .energy import EnergyScorecardRefusal
 from .excess_charge import ExcessChargingRefusal
@@ -1979,6 +1980,12 @@ class EnergyServiceFacade:
             classification_codes = (
                 (f"arm_{classification}",) if isinstance(classification, str) else ()
             )
+            # Arm-refusal de-conflation: a latched refusal carries the latch's
+            # own cause as a second durable reason code (the classification
+            # precedent), so the audit trail names WHICH condition held the
+            # unit, not only that a latch did.
+            latch_cause = outcome.get("inhibit_reason")
+            latch_cause_codes = (latch_cause,) if isinstance(latch_cause, str) else ()
             try:
                 await self._append_audit(
                     self._mutation_audit(
@@ -1986,7 +1993,11 @@ class EnergyServiceFacade:
                         subject=principal.subject,
                         result=outcome["status"],
                         request_id=request,
-                        reason_codes=(outcome["reason"], *classification_codes),
+                        reason_codes=(
+                            outcome["reason"],
+                            *latch_cause_codes,
+                            *classification_codes,
+                        ),
                         unit_id=unit_id,
                         lifecycle=self._handle_lifecycle(unit_id),
                         payload=dict(outcome),
@@ -3211,6 +3222,23 @@ class EnergyServiceFacade:
             reasons.append("no_unit_armed")
         return reasons
 
+    def _latched_arm_refusal(self, unit_id: str, handle: Any) -> dict[str, str]:
+        """The pinned latched refusal, with the latch's own cause named beside.
+
+        The ``reason`` string is pinned (API_CONTRACTS arm surface); the
+        additive ``inhibit_reason`` key de-conflates WHICH latch holds the
+        unit — ``external_writer`` (re-arm with a takeover acknowledgement or
+        stand the foreign writer down) vs ``identity_mismatch`` (another
+        device is on the transport) vs ``blocking_fault_active`` (clear the
+        fault) — so the console can tell the operator which condition to
+        clear.  The key appears only when the owning handle reports one.
+        """
+        outcome = {"unit_id": unit_id, "status": "refused", "reason": "inhibit_latched"}
+        inhibit_reason = getattr(handle, "inhibit_reason", None)
+        if isinstance(inhibit_reason, str) and inhibit_reason:
+            outcome["inhibit_reason"] = inhibit_reason
+        return outcome
+
     async def _arm_one(
         self, unit_id: str, *, takeover_acknowledged: bool = False
     ) -> dict[str, str]:
@@ -3218,7 +3246,7 @@ class EnergyServiceFacade:
         if handle is None:
             return {"unit_id": unit_id, "status": "refused", "reason": "unknown_unit"}
         if bool(getattr(handle, "inhibit_latched", False)):
-            return {"unit_id": unit_id, "status": "refused", "reason": "inhibit_latched"}
+            return self._latched_arm_refusal(unit_id, handle)
         qualified = getattr(handle, "qualified", None)
         if qualified is False:
             return {"unit_id": unit_id, "status": "refused", "reason": "not_qualified"}
@@ -3226,17 +3254,32 @@ class EnergyServiceFacade:
             # The owning handle would accept this unit; only the facade's own
             # unknown-state gate refuses it.
             return {"unit_id": unit_id, "status": "refused", "reason": "qualification_unknown"}
+        # Mid-autonomy/handback de-conflation: a qualified, unlatched unit can
+        # still be ARMED_IDLE/ACTIVE (already under an armed epoch — our own
+        # or a handback in progress) or mid-recovery (observe-only/inhibited).
+        # The owning actor would refuse exactly these arms; naming the state
+        # here keeps the actor uncontacted and the operator's next act clear
+        # (disarm first, or let recovery finish) instead of a bare
+        # ``actor_failure``.
+        if _enum_value(getattr(handle, "lifecycle", None)) != "disarmed":
+            return {"unit_id": unit_id, "status": "refused", "reason": "unit_not_disarmed"}
         try:
             await handle.arm(takeover_acknowledged=takeover_acknowledged)
-        except Exception:
-            # An actor-side refusal can only be discovered by attempting it.
-            # An attempt that left the unit holding a latched inhibit (the
-            # arm-time external-writer preflight refusing a foreign PQ
-            # objective, API_CONTRACTS "Write-enabled run mode") reports the
-            # standing latch as the operator reason: the refusal cause is the
-            # latch, and the privileged acknowledgement is the documented exit.
+        except ArmRefused as refusal:
+            # The actor's own named refusal.  One that latched on the way out
+            # (the arm-time external-writer preflight refusing a foreign PQ
+            # objective, API_CONTRACTS "Write-enabled run mode") keeps the
+            # pinned ``inhibit_latched`` operator reason — the latch is the
+            # condition and the privileged acknowledgement is the exit — with
+            # the latch's own cause named beside it.
             if bool(getattr(handle, "inhibit_latched", False)):
-                return {"unit_id": unit_id, "status": "refused", "reason": "inhibit_latched"}
+                return self._latched_arm_refusal(unit_id, handle)
+            return {"unit_id": unit_id, "status": "refused", "reason": refusal.reason}
+        except Exception:
+            # An unexpected actor-side failure can only be discovered by
+            # attempting it; everything the actor names is handled above.
+            if bool(getattr(handle, "inhibit_latched", False)):
+                return self._latched_arm_refusal(unit_id, handle)
             return {"unit_id": unit_id, "status": "refused", "reason": "actor_failure"}
         outcome: dict[str, str] = {"unit_id": unit_id, "status": "armed", "reason": "armed"}
         # ADD-1: the preflight's classification rides the outcome (and so the
