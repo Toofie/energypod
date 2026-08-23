@@ -32,6 +32,12 @@ queued by value:
    requested/authorized watts) nor published-body payloads beyond type
    presence. One compact exact-dict test per happy-path operation kills the
    cluster.
+   Status: FIXED 2026-08-23 — `tests/unit/test_facade_audit_content.py` pins
+   the full AuditEvent dict (fingerprints re-derived independently from the
+   pinned fact sets) and the exact published body for submit_intent, arm,
+   disarm, emergency_stop, acknowledge_emergency_stop, and
+   acknowledge_inhibit. submit_advisory_intent deliberately not pinned here:
+   it is excess-charging surface under active rework.
 2. **Simulator literal register image (~90 survivors):** served words are
    pinned by range/coherence, never literal word values (status/SOC/SOH
    placement, limit words, energy word pairing, extrema triples + index
