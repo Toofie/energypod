@@ -16,6 +16,7 @@ consumers fall back, they never retry-storm.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
 from energypod.adapters.providers.model import ForecastSeries, TariffInterval
@@ -39,10 +40,16 @@ class TariffProvider(Protocol):
 
 @runtime_checkable
 class WeatherProvider(Protocol):
-    """Irradiance, cloud, and temperature by interval."""
+    """Irradiance, cloud, and temperature by interval.
 
-    async def weather_forecast(self) -> ForecastSeries:
-        """The site weather forecast as normalized interval values."""
+    Weather is inherently multi-variable, so one fetch returns a mapping
+    keyed by the :class:`~energypod.adapters.providers.model.ForecastVariable`
+    names present -- every member a fully normalized series sharing the same
+    fetch stamp.
+    """
+
+    async def weather_forecast(self) -> Mapping[str, ForecastSeries]:
+        """The site weather forecast, one series per served variable."""
         ...
 
 

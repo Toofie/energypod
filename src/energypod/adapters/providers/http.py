@@ -35,8 +35,6 @@ from typing import Any, ClassVar, Protocol
 
 import httpx
 
-from energypod.adapters.providers.model import ForecastSeries
-
 __all__ = [
     "ForecastHttpTransport",
     "HttpForecastProvider",
@@ -159,16 +157,22 @@ class HttpxForecastTransport:
         return self._client
 
 
-class HttpForecastProvider:
+#: The fetch-result parameter is the normalized data one provider serves:
+#: a single :class:`~energypod.adapters.providers.model.ForecastSeries` for
+#: the single-variable families, or a mapping of series for the multi-variable
+#: weather family.
+class HttpForecastProvider[FetchResult]:
     """The caching/staleness base every HTTP forecast adapter composes.
 
     Subclasses declare their ``source`` name and implement :meth:`_request`
-    (build the URL/params, call :meth:`_get_json`, parse and normalize).  The
-    base owns everything else: the refresh gate, the single-flight lock, the
-    fail-soft cache, and the staleness stamps.  ``refresh_interval_s`` is both
-    the cache lifetime and the minimum spacing between wire legs -- the
-    rate-limit budget -- and ``stale_after_s`` (>= the refresh interval) is
-    when the report calls the data stale.
+    (build the URL/params, call :meth:`_get_json`, parse and normalize into
+    the subclass's result type -- one series, or a bundle of series for the
+    multi-variable weather family).  The base owns everything else: the
+    refresh gate, the single-flight lock, the fail-soft cache, and the
+    staleness stamps.  ``refresh_interval_s`` is both the cache lifetime and
+    the minimum spacing between wire legs -- the rate-limit budget -- and
+    ``stale_after_s`` (>= the refresh interval) is when the report calls the
+    data stale.
     """
 
     source: ClassVar[str] = ""
@@ -192,15 +196,16 @@ class HttpForecastProvider:
         self._clock = clock
         self._refresh_interval_s = float(refresh_interval_s)
         self._stale_after_s = float(stale_after_s)
-        self._cached: ForecastSeries | None = None
+        self._cached: FetchResult | None = None
         self._fetched_mono: float | None = None
+        self._fetched_wall: datetime | None = None
         self._last_error: str | None = None
         self._fetch_count = 0
         self._error_count = 0
         self._flight: asyncio.Lock = asyncio.Lock()
 
-    async def fetch(self) -> ForecastSeries:
-        """The provider's current series, refreshing only when the gate opens.
+    async def fetch(self) -> FetchResult:
+        """The provider's current data, refreshing only when the gate opens.
 
         Raises :class:`ProviderUnavailableError` only when there is no cache
         and the wire failed; a cached series survives failed refreshes with
@@ -214,12 +219,13 @@ class HttpForecastProvider:
                 assert self._cached is not None
                 return self._cached
             try:
-                series = await self._request()
+                result = await self._request()
             except ProviderTransportError as exc:
                 self._error_count += 1
                 self._last_error = str(exc)
                 if self._cached is None:
                     raise ProviderUnavailableError(str(exc)) from exc
+                assert self._cached is not None
                 return self._cached
             except (KeyError, TypeError, ValueError) as exc:
                 # A malformed provider body is a provider failure, never a
@@ -228,12 +234,14 @@ class HttpForecastProvider:
                 self._last_error = f"malformed provider payload: {exc}"
                 if self._cached is None:
                     raise ProviderUnavailableError(self._last_error) from exc
+                assert self._cached is not None
                 return self._cached
             self._fetch_count += 1
-            self._cached = series
+            self._cached = result
             self._fetched_mono = self._clock.monotonic()
+            self._fetched_wall = self._clock.wall_now()
             self._last_error = None
-            return series
+            return result
 
     def staleness(self) -> ProviderStaleness:
         """The honest age report for the latest data."""
@@ -244,7 +252,7 @@ class HttpForecastProvider:
         )
         return ProviderStaleness(
             source=self.source,
-            fetched_at=None if self._cached is None else self._cached.fetched_at,
+            fetched_at=self._fetched_wall,
             age_s=age,
             stale=age is not None and age > self._stale_after_s,
             last_error=self._last_error,
@@ -252,7 +260,7 @@ class HttpForecastProvider:
             error_count=self._error_count,
         )
 
-    async def _request(self) -> ForecastSeries:
+    async def _request(self) -> FetchResult:
         """One wire leg, parsed and normalized (the subclass's whole job)."""
         raise NotImplementedError("every HTTP provider implements _request")
 
