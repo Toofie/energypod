@@ -1261,6 +1261,113 @@ alarm on the pods' normal autonomy (the operator's consistent direction).
   unit's fresh observation (poll-failed units contribute nothing), the live claim set, and
   the peeked authority; a failure anywhere inside it can never delay renewal or control.
 
+## Off-peak night charge (the night strategy adviser — DESIGN_NIGHT_CHARGE, 2026-08-26)
+
+The operator-confirmed replacement for the site's Docker solution (all three batteries at
+2,500 W per unit, 00:00–06:00 nightly, dropping to a very low rate when demand is high). A
+`NightChargeAdviser` (`energypod.application.night_charge`) submits ordinary short-TTL
+`OPTIMIZER` CHARGE intents — a strategy layer in the excess-adviser pattern, NOT schedule
+conditionals — computing per unit, inside the commissioned window and while enabled: reach the
+SOC ceiling (`policy.max_soc_pct`, the BMS-authoritative figure) by window end at ≤
+`rate_cap_w`, under the pinned pacing rule (`cap_first` — the default, Docker parity — or
+`even`, deadline-paced from measured SOC each tick, self-correcting toward cap when behind).
+Batteries at/above the ceiling (or with zero dynamic charge headroom) sit out as zero-watt
+non-participants. Full design and rationale: `docs/DESIGN_NIGHT_CHARGE.md`.
+
+- **Source pin.** `OPTIMIZER` (dynamic, evidence-reactive strategy — the arbiter's adviser
+  class), submitted through the composition-internal facade twin `submit_night_intent` (the
+  `submit_advisory_intent` pattern: source pinned, intent-id prefix `night-`, same
+  audit/publication contract, never routed on REST or MCP) under the principal
+  `energypod:night-adviser` (observe + dispatch, non-interactive, site-bound). The night
+  adviser ALWAYS yields per unit to a live SCHEDULE claim (no opt-out flag; the published fact
+  beats the opportunist — the schedules-stay-day recommendation, which this feature is the
+  night half of).
+- **The demand rule — LOAD words, never grid words (the pinned correctness catch).** While
+  `demand_w` exceeds `demand_threshold_w` (default 1000 W), every participating unit drops to
+  `hold_rate_w` (default 100 W — a small POSITIVE charge; config refuses zero): the renewed
+  objective replaces pod load-matching autonomy, so batteries neither drain into the EV nor
+  cycle; spikes are met by the grid. The measurement is the per-pod CT `load_power_w`
+  (`demand_scope: fleet` default = max(0, Σ); `per_phase` the option) — the grid word includes
+  the adviser's OWN charging draw and would self-hold forever at cap rates. Evidence quality
+  is the scorecard's family (per-field quality, worst-word-wins `demand_evidence`
+  `good|missing|bad|stale`, freshness `demand_telemetry_max_age_s`); a non-good rollup
+  FAILS CLOSED TO HOLD (preserving the no-cycling guarantee) and is loudly visible. Resume
+  pacing only below `demand_threshold_w − demand_exit_hysteresis_w` (default 200); the hold
+  latch resets at window boundaries.
+- **Composition (block-presence doctrine).** A PRESENT `night_charging:` block composes the
+  adviser, the `night_charge_state` projection, the `night_charge.state_changed` events, the
+  guarded toggle route, and the PCS live-block promotion (the promotion predicate widens to
+  either-block — `0x1000` at control rate is load-bearing for the demand freshness bound; the
+  budgeted plan is unchanged). An ABSENT block composes nothing — byte-identical snapshot,
+  and the toggle answers 409 `night_charging_not_commissioned`. Keys: `timezone` (REQUIRED,
+  IANA), `window_local` (default `[["00:00","06:00"]]`, cross-midnight allowed), `enabled`
+  (default `false`; the excess activation doctrine verbatim — runtime state never persists,
+  `enabled_origin: config|runtime`, the toggle flips participation only), `rate_cap_w` 2500
+  (≤ `policy.max_unit_charge_w`), `demand_threshold_w` 1000, `demand_exit_hysteresis_w` 200
+  (< threshold), `hold_rate_w` 100 (0 < hold < cap), `demand_scope` fleet, `pacing`
+  `cap_first` (`even` requires the `assumed_capacity_wh` per-unit map, key set exactly the
+  fleet), `demand_telemetry_max_age_s` 3.0 (> `control_period_s +
+  essential_read_timeout_s`), `intent_ttl_s` 10.0 (> `control_period_s`, ≤ 300 s) — all
+  validated on block-PRESENCE with `mode: write_enabled` + `policy` present.
+- **The PARTITION grant (required; the two existing mechanisms, no new ones).** (1) The union
+  of `schedule.allowed_windows_local` (a PRESENT schedule block) must cover
+  `night_charging.window_local` ENTIRELY — a config-time cross-validation, so commissioning
+  night charge and granting the partition are ONE config revision + restart; the refusal
+  names the widening path. (2) The durable night acknowledgement
+  `schedule_night_windows_acknowledged` (one site fact) gains a SECOND capture path: the
+  first enable (boot-config or toggle) carries `"night_posture":
+  "PARTITION_ACKNOWLEDGED"` unless the fact already exists (either surface's capture counts;
+  durable-append-FIRST, keyed boot load, never re-prompted); otherwise 409
+  `night_acknowledgement_required` (`details: {"acknowledgement": "PARTITION_ACKNOWLEDGED"}`)
+  and an unacknowledged site composes SUSPENDED with reason `night_acknowledgement_required`.
+  The arm-time sole-writer preflight is unchanged and remains the structural enforcement.
+- **Tick and precedence.** One bounded, suppressed tick per fleet cycle AFTER the excess
+  adviser and BEFORE the energy accountant (published facts first, then opportunists in
+  economics order — free surplus before paid import): the excess adviser is deliberately
+  UNCHANGED; the night adviser excludes, at submission time, every unit claimed by a live
+  EMERGENCY_STOP (any claim — withdraw entirely), MANUAL, AGENT, SCHEDULE, or not-own
+  OPTIMIZER intent (the dawn-corner rule, one-sided by economics; exclusion keeps the
+  equal-priority tie deterministic). Exactly ONE held intent (remove-then-submit renewal,
+  `watts_by_unit` per participating unit, TTL `intent_ttl_s`); hand-back at window end is
+  NON-RENEWAL (TTL + the ~3.5–4.0 s watchdog); no stop triples, no idle/zero-watt intents,
+  ever. The runner cannot self-arm: participation requires ARMED_IDLE/ACTIVE per unit, and a
+  disarmed fleet renders reason `units_disarmed` (the S3 lesson, designed in) — arm persists
+  across windows and falls on every restart (the standing re-arm ritual, honestly surfaced).
+- **Activation surface.** `POST /api/v1/night-charging` mirrors the excess toggle: `arm`
+  scope (an enable additionally requires an INTERACTIVE principal), Idempotency-Key, body
+  `{"action": "enable"|"disable", "confirmation": "NIGHT", "night_posture"?}`, audited
+  `night_charging_toggled` on the Impl-10 pattern; 200 `{"feature", "enabled",
+  "enabled_origin", "persisted": false, "acknowledged_partition", "night_charge_state"}`.
+  Refusals: 422 `validation_error`; 409 `night_charging_not_commissioned`; 409
+  `night_acknowledgement_required`; 409 `night_enable_refused` (details: reasons +
+  unit_ids/stop_ids — manual/agent/schedule claims and latched stops refuse, latched INHIBITS
+  do not; `disable` is never refused).
+- **Projection and events.** Feature-detected top-level `night_charge_state` (absent when
+  the block is absent; single writer = the fleet loop's post-tick update; `active` derives
+  from `held_intent_id`): `{enabled, enabled_origin, acknowledged_partition, posture, active,
+  phase, window{start_local,end_local,timezone}, window_ends_at, window_ends_in_s,
+  next_window_at, pacing, rate_cap_w, hold_rate_w, demand_scope, demand_threshold_w,
+  demand_w, demand_evidence, held_intent_id, units[{unit_id, soc_pct, phase, target_w,
+  reason}], last_action, last_tick_at, reason_codes}`. Fleet `phase`: `idle | pacing |
+  holding_on_demand | complete | skipped_full`; per-unit adds `sitting_out`. Reason
+  vocabulary (ONE): `outside_window, window_open, on_plan, deadline_at_risk,
+  demand_above_threshold, demand_below_exit, demand_evidence_missing, demand_evidence_bad,
+  demand_evidence_stale, at_ceiling, no_charge_headroom, target_reached,
+  no_eligible_units, units_disarmed, yielding_to_higher_priority, disabled_by_config,
+  disabled_by_runtime, night_acknowledgement_required`. Bus
+  `night_charge.state_changed`: published on the semantic tuple `(enabled, enabled_origin,
+  acknowledged_partition, active, phase, active_unit_ids, demand_evidence, reason_codes)`
+  — watts/SOC ride but never trigger — with the 30 s heartbeat while enabled and NOTHING
+  while disabled (the excess `excess_adviser.state_changed` mechanics verbatim).
+- **Honesty pins.** Charge-only window — the strategy never discharges, and the no-cycling
+  guarantee is bounded by the TTL/watchdog hand-back gap, stated as such. The off-peak
+  import cost is the operator's tariff question (`energy_scorecard.tariff`); the scorecard
+  measures the kWh from day one. Hold rates sit inside the coherence watchdog's dead zone —
+  no false alarms and no protection there; the scorecard is the hold's verifier. The
+  cutover sequence (grant → arm → stand Docker down → enable → one supervised night →
+  decommission, verified by the night-writer detector's quiet window) and the verbatim
+  operator decisions: DESIGN_NIGHT_CHARGE §3.4 and §8.
+
 ## Control-decision audit attribution
 
 - A `control_decision` audit row whose cycle selected exactly ONE unit carries that unit's `unit_id`
