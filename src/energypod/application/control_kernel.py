@@ -134,20 +134,23 @@ class ControlKernel:
             intents = await self._intents.active(issued_at)
             current = await self._observations.all_latest()
             previous = await self._observations.all_previous()
-            winner = self._arbiter.select(intents, issued_at)
-            if winner is None:
+            selection = self._arbiter.arbitrate(intents, issued_at)
+            selected = selection.units
+            if not selection.ranked:
                 await self._revoke("no_active_intent")
                 return None
 
+            # Concurrent per-unit composition (2026-08-24): the allocator runs
+            # ONCE PER REPRESENTED INTENT, over that intent's SURVIVING scope.
             # API_CONTRACTS "Excess-solar accelerated charging (advisory)":
-            # the allocator receives the tick's own monotonic time so the
+            # each allocation receives the tick's own monotonic time so the
             # export bound judges grid-evidence freshness at the moment of
             # allocation, exactly as the kernel's staleness checks do.
-            proposals = tuple(self._allocator.allocate(winner, current, self._policy, issued_at))
-            if not self._proposals_match_intent(winner, proposals):
-                raise ValueError("allocator output does not match the selected intent")
+            proposals = self._compose_proposals(selection, current, issued_at)
+            if not self._proposals_match_selection(selection, proposals):
+                raise ValueError("allocator output does not match the selected intents")
             decision = self._safety.evaluate(proposals, current, previous, self._policy, issued_at)
-            emergency = winner.source is IntentSource.EMERGENCY_STOP
+            emergency = selection.emergency is not None
             if emergency:
                 # Revocation must never wait behind durable audit I/O.
                 await self._revoke("emergency_stop")
@@ -158,7 +161,6 @@ class ControlKernel:
             # rejected by the publish CAS forever.  Reconcile the epoch the
             # kernel consults past the repository's permanent fence BEFORE
             # minting, so a fresh intent publishes on its first cycle.
-            selected = self._selected_units(winner)
             if selected <= self._unit_ids:
                 await self._reconcile_generation(selected, "authority_generation_reconciled")
             generation_before_mint = (await self._generation_coordinator.snapshot()).epoch
@@ -169,7 +171,7 @@ class ControlKernel:
             cycle_id = f"cycle-{next(self._cycle_numbers):020d}"
             decision_id = f"decision-{next(self._decision_numbers):020d}"
             batch = self._mint_batch(
-                winner,
+                selection,
                 decision,
                 current,
                 previous,
@@ -185,7 +187,7 @@ class ControlKernel:
                 # as never granted (authorized watts zero).
                 await self._revoke("authority_generation_changed")
                 fenced_event = self._create_audit_event(
-                    intent=winner,
+                    selection=selection,
                     decision=decision,
                     batch=None,
                     observations=current,
@@ -197,7 +199,7 @@ class ControlKernel:
                 await self._audit.append(fenced_event)
                 return decision
             audit_event = self._create_audit_event(
-                intent=winner,
+                selection=selection,
                 decision=decision,
                 batch=batch,
                 observations=current,
@@ -233,7 +235,7 @@ class ControlKernel:
                 # supervision.
                 await self._revoke("authority_generation_changed")
                 fenced_event = self._create_audit_event(
-                    intent=winner,
+                    selection=selection,
                     decision=decision,
                     batch=None,
                     observations=current,
@@ -249,9 +251,21 @@ class ControlKernel:
             await self._revoke_after_failure("control_cycle_failed")
             raise
 
+    def _compose_proposals(
+        self, selection: Any, current: dict[str, Any], issued_at: float
+    ) -> tuple[Any, ...]:
+        """Every per-unit winner's allocation, composed in arbitration order."""
+        proposals: list[Any] = []
+        for intent in selection.ranked:
+            scope = selection.scopes.get(intent.id, frozenset())
+            proposals.extend(
+                self._allocator.allocate(intent, current, self._policy, issued_at, unit_ids=scope)
+            )
+        return tuple(proposals)
+
     def _mint_batch(
         self,
-        intent: Any,
+        selection: Any,
         decision: Any,
         current: dict[str, Any],
         previous: dict[str, Any],
@@ -260,9 +274,11 @@ class ControlKernel:
         cycle_id: str,
         decision_id: str,
     ) -> AuthorizationBatch | None:
-        selected = self._selected_units(intent)
+        selected = selection.units
         setpoints = tuple(getattr(decision, "setpoints", ()))
-        if not self._eligible(intent, decision, selected, setpoints, current, previous, issued_at):
+        if not self._eligible(
+            selection, decision, selected, setpoints, current, previous, issued_at
+        ):
             return None
 
         capabilities = tuple(
@@ -271,8 +287,10 @@ class ControlKernel:
                 connection_epoch=current[setpoint.unit_id].connection_epoch,
                 generation=generation,
                 cycle_id=cycle_id,
-                intent_id=intent.id,
-                intent_revision=intent.acceptance_revision,
+                # Each capability carries ITS OWN unit's winning intent: a
+                # composed batch may mix intents, directions, and revisions.
+                intent_id=selection.winners[setpoint.unit_id].id,
+                intent_revision=selection.winners[setpoint.unit_id].acceptance_revision,
                 direction=setpoint.direction,
                 watts=setpoint.watts,
                 reactive_vars=getattr(setpoint, "reactive_vars", 0),
@@ -299,7 +317,7 @@ class ControlKernel:
     def _create_audit_event(
         self,
         *,
-        intent: Any,
+        selection: Any,
         decision: Any,
         batch: AuthorizationBatch | None,
         observations: dict[str, Any],
@@ -312,17 +330,19 @@ class ControlKernel:
         # that selected exactly one unit carries that unit's id on its audit
         # row; a genuinely multi-unit decision stays fleet-level -- one row
         # cannot honestly name one of several units.
-        selected = self._selected_units(intent)
+        selected = selection.units
         attributed_unit: str | None = next(iter(selected)) if len(selected) == 1 else None
+        dominant = selection.ranked[0]
         event = self._audit_event_factory.create(
             authorization_batch=batch,
+            composition=selection,
             configuration_version=self._configuration_version,
             cycle_id=cycle_id,
             decided_at_mono=decided_at_mono,
             decision=decision,
             decision_id=decision_id,
             generation=generation,
-            intent=intent,
+            intent=dominant,
             observations=observations,
             policy_version=self._policy.version,
             unit_id=attributed_unit,
@@ -351,35 +371,41 @@ class ControlKernel:
             if batch is not None
             else 0
         )
-        expected_requested = (
-            (-intent.watts if intent.direction is Direction.CHARGE else intent.watts)
-            if intent.direction is not Direction.IDLE
-            else 0
-        )
-        expected_requested_map = getattr(intent, "watts_by_unit", None)
+        expected_requested = self._composed_requested_active_w(selection)
+        expected_requested_map = self._composed_requested_map(selection)
+        expected_directions = self._composed_directions(selection)
         expected_authorized_map = (
             {item.unit_id: item.watts for item in sorted(setpoints, key=lambda item: item.unit_id)}
             if batch is not None
             else None
         )
-        expected_lifecycle = (
-            UnitLifecycle.INHIBITED
-            if intent.source is IntentSource.EMERGENCY_STOP
-            else UnitLifecycle.ARMED_IDLE
-            if intent.direction is Direction.IDLE or decision.status is DecisionStatus.REJECTED
-            else UnitLifecycle.ACTIVE
-            if decision.status in {DecisionStatus.AUTHORIZED, DecisionStatus.CLAMPED}
-            else UnitLifecycle.INHIBITED
+        composed = len(selection.ranked) > 1
+        expected_principal = (
+            ",".join(sorted({intent.actor_identity for intent in selection.ranked}))
+            if composed
+            else dominant.actor_identity
         )
+        expected_intent_id = None if composed else dominant.id
+        expected_correlation = (
+            f"cycle:{cycle_id}"
+            if composed
+            else (
+                f"emergency_stop:{dominant.id}"
+                if dominant.source is IntentSource.EMERGENCY_STOP
+                else f"intent:{dominant.id}:revision:{dominant.acceptance_revision}"
+            )
+        )
+        expected_lifecycle = self._composed_lifecycle(selection, decision)
         if (
             event.event_type != "control_decision"
             or event.unit_id != attributed_unit
             or event.connection_epoch is not None
             or event.generation != generation
             or event.cycle_id != cycle_id
-            or event.principal != intent.actor_identity
-            or event.source is not intent.source
-            or event.intent_id != intent.id
+            or event.principal != expected_principal
+            or event.source is not dominant.source
+            or event.intent_id != expected_intent_id
+            or event.correlation_id != expected_correlation
             or event.policy_version != self._policy.version
             or event.configuration_version != self._configuration_version
             or dict(event.observation_sequences) != expected_sequences
@@ -390,15 +416,75 @@ class ControlKernel:
             != (None if expected_requested_map is None else dict(expected_requested_map))
             or event.authorized_watts_by_unit
             != (None if expected_authorized_map is None else dict(expected_authorized_map))
+            or event.directions_by_unit
+            != (None if expected_directions is None else dict(expected_directions))
             or event.result != decision.status.value
             or event.lifecycle is not expected_lifecycle
         ):
             raise ValueError("audit event does not match control cycle facts")
         return event
 
+    @staticmethod
+    def _composed_requested_active_w(selection: Any) -> int:
+        """The signed net request of the cycle: each represented intent's own
+        request over its SURVIVING scope (per-unit targets re-summed over the
+        survivors), charge negative, discharge positive."""
+        total = 0
+        for intent in selection.ranked:
+            scope = selection.scopes.get(intent.id, frozenset())
+            targets = getattr(intent, "watts_by_unit", None)
+            request = (
+                intent.watts
+                if targets is None
+                else sum(targets[unit_id] for unit_id in scope if unit_id in targets)
+            )
+            if intent.direction is Direction.CHARGE:
+                total -= request
+            elif intent.direction is Direction.DISCHARGE:
+                total += request
+        return total
+
+    @staticmethod
+    def _composed_requested_map(selection: Any) -> dict[str, int] | None:
+        """Per-unit requested watts: each unit's winner's own target, when any
+        represented intent carries per-unit targets."""
+        merged: dict[str, int] = {}
+        for intent in selection.ranked:
+            targets = getattr(intent, "watts_by_unit", None)
+            if targets is None:
+                continue
+            for unit_id in selection.scopes.get(intent.id, frozenset()):
+                if unit_id in targets:
+                    merged[unit_id] = targets[unit_id]
+        return merged or None
+
+    @staticmethod
+    def _composed_directions(selection: Any) -> dict[str, str] | None:
+        """Per-unit direction of each unit's winning intent; None while the
+        cycle holds exactly one intent (its direction already says it)."""
+        if len(selection.ranked) < 2:
+            return None
+        return {
+            unit_id: selection.winners[unit_id].direction.value
+            for unit_id in sorted(selection.winners)
+        }
+
+    @staticmethod
+    def _composed_lifecycle(selection: Any, decision: Any) -> Any:
+        if selection.emergency is not None:
+            return UnitLifecycle.INHIBITED
+        all_idle = all(
+            getattr(intent, "direction", None) is Direction.IDLE for intent in selection.ranked
+        )
+        if all_idle or decision.status is DecisionStatus.REJECTED:
+            return UnitLifecycle.ARMED_IDLE
+        if decision.status in {DecisionStatus.AUTHORIZED, DecisionStatus.CLAMPED}:
+            return UnitLifecycle.ACTIVE
+        return UnitLifecycle.INHIBITED
+
     def _eligible(
         self,
-        intent: Any,
+        selection: Any,
         decision: Any,
         selected: frozenset[str],
         setpoints: tuple[Any, ...],
@@ -407,7 +493,7 @@ class ControlKernel:
         issued_at: float,
     ) -> bool:
         if (
-            intent.source is IntentSource.EMERGENCY_STOP
+            selection.emergency is not None
             or not selected
             or not selected <= self._unit_ids
             or not selected <= current.keys()
@@ -419,10 +505,11 @@ class ControlKernel:
             return False
 
         seen: set[str] = set()
-        total_watts = 0
+        totals: dict[str, int] = {}
         participating = 0
         for setpoint in setpoints:
             unit_id = getattr(setpoint, "unit_id", None)
+            winner = selection.winners.get(unit_id) if isinstance(unit_id, str) else None
             expiry = getattr(setpoint, "authorization_expires_at_mono", None)
             watts = getattr(setpoint, "watts", None)
             reactive_vars = getattr(setpoint, "reactive_vars", 0)
@@ -433,39 +520,42 @@ class ControlKernel:
             )
             if (
                 not isinstance(unit_id, str)
+                or winner is None
                 or unit_id in seen
-                or getattr(setpoint, "intent_id", None) != intent.id
-                or getattr(setpoint, "direction", None) is not intent.direction
-                or intent.direction is Direction.IDLE
+                or getattr(setpoint, "intent_id", None) != winner.id
+                or getattr(setpoint, "direction", None) is not winner.direction
                 or type(watts) is not int
                 or watts < 0
                 or type(reactive_vars) is not int
             ):
                 return False
-            if watts == 0:
-                # Zero watts with an active direction is explicit
+            if winner.direction is Direction.IDLE or watts == 0:
+                # Zero watts -- held idle by its winner or explicit
                 # NON-participation (a selected unit with no usable headroom —
                 # 2026-08-23 live rejections). No authority is minted for it,
                 # so the authority-granting checks below do not apply; the
                 # unit's observations still join the evidence-coherence gate.
+                if winner.direction is Direction.IDLE and watts != 0:
+                    return False
                 seen.add(unit_id)
                 continue
             if (
                 not self._finite(expiry)
                 or expiry_value <= issued_at
-                or expiry_value > intent.expires_at_mono
+                or expiry_value > winner.expires_at_mono
             ):
                 return False
             seen.add(unit_id)
             participating += 1
-            total_watts += watts
-        # An active intent that participates nowhere mints no authority at
+            totals[winner.id] = totals.get(winner.id, 0) + watts
+        # A cycle that participates nowhere mints no authority at
         # all: fail-closed, never an empty capability batch.
         if participating == 0:
             return False
-        return total_watts <= intent.watts and self._evidence_is_coherent(
-            selected, current, previous
+        within_intents = all(
+            totals.get(intent.id, 0) <= intent.watts for intent in selection.ranked
         )
+        return bool(within_intents) and self._evidence_is_coherent(selected, current, previous)
 
     @staticmethod
     def _evidence_is_coherent(
@@ -494,33 +584,35 @@ class ControlKernel:
                 return False
         return True
 
-    def _proposals_match_intent(self, intent: Any, proposals: Any) -> bool:
-        """Reject confused or malicious allocator output before safety evaluation."""
+    def _proposals_match_selection(self, selection: Any, proposals: Any) -> bool:
+        """Reject confused or malicious allocator output before safety
+        evaluation: every proposal must bind to ITS unit's winning intent --
+        identity and direction included (per-unit coherence, 2026-08-24)."""
         try:
             items = tuple(proposals)
-            selected = self._selected_units(intent)
-            per_unit_targets = getattr(intent, "watts_by_unit", None)
+            winners = dict(selection.winners)
+            selected = selection.units
         except (AttributeError, TypeError, ValueError):
             return False
         if not selected or len(items) != len(selected):
             return False
-        if per_unit_targets is not None and set(per_unit_targets) != selected:
-            return False
         seen: set[str] = set()
-        total_watts = 0
+        totals: dict[str, int] = {}
         for item in items:
             unit_id = getattr(item, "unit_id", None)
+            winner = winners.get(unit_id) if isinstance(unit_id, str) else None
             watts = getattr(item, "watts", None)
             if (
                 not isinstance(unit_id, str)
-                or unit_id not in selected
+                or winner is None
                 or unit_id in seen
-                or getattr(item, "intent_id", None) != intent.id
-                or getattr(item, "direction", None) is not intent.direction
+                or getattr(item, "intent_id", None) != winner.id
+                or getattr(item, "direction", None) is not winner.direction
                 or type(watts) is not int
                 or watts < 0
             ):
                 return False
+            per_unit_targets = getattr(winner, "watts_by_unit", None)
             if per_unit_targets is not None:
                 # A per-unit intent makes every unit's target that unit's own
                 # cap (the 2026-08-23 operator ruling): a proposal may never
@@ -542,17 +634,14 @@ class ControlKernel:
             # so the matcher enforces only unit-set, identity, direction,
             # per-target, and total bounds.
             seen.add(unit_id)
-            total_watts += watts
-        if intent.direction is Direction.IDLE and total_watts != 0:
-            return False
-        return seen == selected and total_watts <= intent.watts
-
-    @staticmethod
-    def _selected_units(intent: Any) -> frozenset[str]:
-        selected = getattr(intent, "selected_unit_ids", None)
-        if selected is None:
-            selected = intent.unit_ids
-        return frozenset(selected)
+            totals[winner.id] = totals.get(winner.id, 0) + watts
+        for intent in selection.ranked:
+            total = totals.get(intent.id, 0)
+            if intent.direction is Direction.IDLE and total != 0:
+                return False
+            if total > intent.watts:
+                return False
+        return seen == set(selected)
 
     @staticmethod
     def _finite(value: Any) -> bool:

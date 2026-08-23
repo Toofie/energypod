@@ -306,6 +306,7 @@ async def test_factory_is_synchronous_and_receives_complete_explicit_facts(api: 
     assert not asyncio.iscoroutinefunction(factory.create)
     assert set(factory.calls[0]) == {
         "authorization_batch",
+        "composition",
         "configuration_version",
         "cycle_id",
         "decided_at_mono",

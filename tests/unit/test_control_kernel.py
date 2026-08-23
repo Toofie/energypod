@@ -43,6 +43,12 @@ class Intent:
     actor_identity: str = "operator-1"
     # Per-unit watt targets (2026-08-23 operator ruling): each unit's own cap.
     watts_by_unit: dict[str, int] | None = None
+    # The production arbiter reads the domain spelling; the fake mirrors it.
+    duration_s: float = 20.0
+
+    @property
+    def selected_unit_ids(self) -> frozenset[str]:
+        return self.unit_ids
 
 
 @dataclass(frozen=True)
@@ -80,13 +86,14 @@ class Decision:
 
 
 class Intents:
-    def __init__(self, intent: Intent, history: list[str]) -> None:
-        self.intent, self.history = intent, history
+    def __init__(self, intent: Intent | tuple[Intent, ...], history: list[str]) -> None:
+        self.intents: tuple[Intent, ...] = intent if isinstance(intent, tuple) else (intent,)
+        self.history = history
 
     async def active(self, now: float) -> tuple[Intent, ...]:
         assert now == 100.0
         self.history.append("intents")
-        return (self.intent,)
+        return self.intents
 
 
 class Observations:
@@ -141,27 +148,76 @@ class Audit:
             self.after()
 
 
+def single_intent_selection(intent_value: Intent, emergency: bool = False) -> Any:
+    """One intent claiming its whole selection -- the arbitration the kernel
+    composes for a cycle held by exactly one intent."""
+    from energypod.application.arbiter import CycleArbitration
+
+    units = frozenset(intent_value.unit_ids)
+    return CycleArbitration(
+        ranked=(intent_value,),
+        scopes={intent_value.id: units},
+        winners={unit_id: intent_value for unit_id in units},
+        emergency=intent_value if emergency else None,
+    )
+
+
+def empty_selection() -> Any:
+    from energypod.application.arbiter import CycleArbitration
+
+    return CycleArbitration()
+
+
 class Arbiter:
     def __init__(self, intent: Intent, history: list[str]):
         self.intent, self.history = intent, history
 
-    def select(self, intents: tuple[Intent, ...], now: float) -> Intent:
+    def arbitrate(self, intents: tuple[Intent, ...], now: float) -> Any:
         assert intents == (self.intent,) and now == 100.0
         self.history.append("select")
-        return self.intent
+        source = getattr(self.intent.source, "value", self.intent.source)
+        return single_intent_selection(self.intent, source == "emergency_stop")
 
 
 class Allocator:
     def __init__(self, output: tuple[Proposal, ...], history: list[str]):
         self.output, self.history, self.calls = output, history, []
 
-    def allocate(self, intent: Any, observations: Any, policy: Any, now_mono: Any = None) -> Any:
+    def allocate(
+        self,
+        intent: Any,
+        observations: Any,
+        policy: Any,
+        now_mono: Any = None,
+        unit_ids: Any = None,
+    ) -> Any:
         # The allocator port carries the tick's monotonic time (the
-        # export bound's freshness input); the fake records it without
-        # asserting on it.
+        # export bound's freshness input) and the intent's SURVIVING scope
+        # (per-unit arbitration); the fake records both without asserting.
         self.history.append("allocate")
-        self.calls.append((intent, observations, policy, now_mono))
+        self.calls.append((intent, observations, policy, now_mono, unit_ids))
         return self.output
+
+
+class MultiIntentAllocator:
+    """One allocator call per represented intent, each scoped to its survivors."""
+
+    def __init__(self, proposals_by_intent: dict[str, tuple[Proposal, ...]], history: list[str]):
+        self._by_intent = proposals_by_intent
+        self.history = history
+        self.calls: list[tuple[Any, Any, Any, Any, Any]] = []
+
+    def allocate(
+        self,
+        intent: Any,
+        observations: Any,
+        policy: Any,
+        now_mono: Any = None,
+        unit_ids: Any = None,
+    ) -> Any:
+        self.history.append("allocate")
+        self.calls.append((intent, observations, policy, now_mono, unit_ids))
+        return self._by_intent.get(getattr(intent, "id", None), ())
 
 
 class Safety:
@@ -683,17 +739,18 @@ class SwappableIntents:
 
 
 class SelectingArbiter:
-    """The arbiter port that maps an empty active set to no winner."""
+    """The arbiter port that maps an empty active set to no selection."""
 
     def __init__(self, intent: Intent, history: list[str]) -> None:
         self.intent, self.history = intent, history
 
-    def select(self, intents: tuple[Intent, ...], now: float) -> Intent | None:
+    def arbitrate(self, intents: tuple[Intent, ...], now: float) -> Any:
         del now
         self.history.append("select")
         if not intents:
-            return None
-        return self.intent
+            return empty_selection()
+        source = getattr(self.intent.source, "value", self.intent.source)
+        return single_intent_selection(self.intent, source == "emergency_stop")
 
 
 class StoreBackedAuthorizations:
@@ -874,3 +931,502 @@ async def test_every_kernel_revocation_reconciles_the_epoch_past_the_repository_
         f"{scenario} left the coordinator epoch {epoch} at or below the repository fence "
         f"{fence}: the next tick would mint at a fenced generation forever"
     )
+
+
+# --- concurrent per-unit composition (2026-08-24 operator requirement) --------
+#
+# One tick now composes EVERY per-unit winner into ONE cycle: the allocator
+# runs once per represented intent over its SURVIVING scope, the matcher binds
+# each proposal to its unit's winning intent (identity AND direction), one
+# cycle_id/decision_id and one audit row carry the per-unit breakdown with
+# each unit's own direction, and one AuthorizationBatch carries per-unit
+# capabilities whose intent/direction are their own unit's winner's.
+
+
+def _charge_intent(api: Any, intent_id: str, units: frozenset[str], watts: int) -> Intent:
+    return Intent(intent_id, api.IntentSource.MANUAL, units, api.Direction.CHARGE, watts)
+
+
+def _discharge_intent(api: Any, intent_id: str, units: frozenset[str], watts: int) -> Intent:
+    return Intent(
+        intent_id,
+        api.IntentSource.AGENT,
+        units,
+        api.Direction.DISCHARGE,
+        watts,
+        actor_identity="agent:automation",
+    )
+
+
+def _make_composed_kernel(
+    api: Any,
+    *,
+    intents_in_cycle: tuple[Intent, ...],
+    arbiter_value: Any,
+    allocator: Any,
+    output: Decision | BaseException,
+    **kwargs: Any,
+) -> tuple[Any, list[str], Authorizations, Audit]:
+    history: list[str] = []
+    clock = kwargs.pop("clock", None) or Clock()
+    selected = frozenset(arbiter_value.winners)
+    current, previous = observation_pairs(selected)
+    for key in ("current", "previous"):
+        if key in kwargs:
+            current = kwargs.pop("current")
+        if key in kwargs:
+            previous = kwargs.pop("previous")
+    allocator.history = history
+    authorizations = Authorizations(history)
+    audit = Audit(history)
+    kernel = api.ControlKernel(
+        clock=clock,
+        unit_ids=UNITS,
+        intents=Intents(intents_in_cycle, history),
+        observations=Observations(current, previous, history),
+        authorizations=authorizations,
+        audit=audit,
+        arbiter=_StaticArbiter(arbiter_value, history),
+        allocator=allocator,
+        safety=Safety(output, history),
+        policy=SimpleNamespace(version="policy-5", max_telemetry_age_s=2.0),
+        generation_coordinator=api.AuthorityGenerationCoordinator(),
+        configuration_version=12,
+        audit_event_factory=deterministic_audit_factory(api, clock),
+    )
+    return kernel, history, authorizations, audit
+
+
+class _StaticArbiter:
+    """The arbiter port returning one pre-composed selection."""
+
+    def __init__(self, selection: Any, history: list[str]) -> None:
+        self.selection, self.history = selection, history
+
+    def arbitrate(self, intents: tuple[Intent, ...], now: float) -> Any:
+        del intents, now
+        self.history.append("select")
+        return self.selection
+
+
+def _real_selection(intents_in_cycle: tuple[Intent, ...]) -> Any:
+    """The production arbiter's composition over the scripted intents."""
+    from energypod.application.arbiter import IntentArbiter
+
+    return IntentArbiter().arbitrate(intents_in_cycle, 100.0)
+
+
+async def test_two_disjoint_intents_compose_into_one_cycle_and_batch(api: Any) -> None:
+    """The operator's exact scenario: MID charge 2,000 W (manual) and RHS
+    discharge 1,000 W (agent) run in ONE cycle -- one batch, one cycle id, one
+    decision id, per-unit directions and per-intent attribution."""
+    mid = _charge_intent(api, "mid-charge", frozenset({"mid"}), 2_000)
+    rhs = _discharge_intent(api, "rhs-discharge", frozenset({"rhs"}), 1_000)
+    selection = _real_selection((mid, rhs))
+    assert selection.emergency is None and len(selection.ranked) == 2
+    allocator = MultiIntentAllocator(
+        {
+            "mid-charge": (Proposal("mid", api.Direction.CHARGE, 2_000, "mid-charge", 110.0),),
+            "rhs-discharge": (
+                Proposal("rhs", api.Direction.DISCHARGE, 1_000, "rhs-discharge", 110.0),
+            ),
+        },
+        [],
+    )
+    outcome = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        (
+            Setpoint("mid", api.Direction.CHARGE, 2_000, "mid-charge"),
+            Setpoint("rhs", api.Direction.DISCHARGE, 1_000, "rhs-discharge"),
+        ),
+    )
+    kernel, history, auth, audit = _make_composed_kernel(
+        api,
+        intents_in_cycle=(mid, rhs),
+        arbiter_value=selection,
+        allocator=allocator,
+        output=outcome,
+    )
+
+    decision = await kernel.tick()
+
+    assert decision is outcome
+    assert history == [
+        "intents",
+        "current",
+        "previous",
+        "select",
+        "allocate",
+        "allocate",
+        "safety",
+        "audit",
+        "publish",
+    ]
+    # The allocator ran ONCE PER REPRESENTED INTENT, each scoped to its own
+    # surviving units.
+    assert [call[0].id for call in allocator.calls] == ["mid-charge", "rhs-discharge"]
+    assert [call[4] for call in allocator.calls] == [frozenset({"mid"}), frozenset({"rhs"})]
+    (batch,) = auth.published
+    by_unit = {cap.unit_id: cap for cap in batch.authorizations}
+    assert set(by_unit) == {"mid", "rhs"}
+    assert by_unit["mid"].direction is api.Direction.CHARGE
+    assert by_unit["mid"].watts == 2_000
+    assert (by_unit["mid"].intent_id, by_unit["mid"].intent_revision) == (
+        "mid-charge",
+        17,
+    )
+    assert by_unit["rhs"].direction is api.Direction.DISCHARGE
+    assert by_unit["rhs"].watts == 1_000
+    assert by_unit["rhs"].intent_id == "rhs-discharge"
+    assert {cap.cycle_id for cap in batch.authorizations} == {batch.cycle_id}
+    assert len({cap.decision_id for cap in batch.authorizations}) == 1
+    # One audit row carries BOTH units with their own directions and watts.
+    (event,) = audit.events
+    assert dict(event.directions_by_unit) == {"mid": "charge", "rhs": "discharge"}
+    assert dict(event.authorized_watts_by_unit) == {"mid": 2_000, "rhs": 1_000}
+    assert event.requested_active_w == -2_000 + 1_000
+    assert event.authorized_active_w == -2_000 + 1_000
+    assert event.event_type == "control_decision"
+
+
+async def test_composed_row_stays_cycle_level_and_joins_its_principals(api: Any) -> None:
+    """A row composed from several intents cannot honestly name one intent:
+    it correlates to its cycle and joins the represented principals, while a
+    single-intent row keeps today's exact attribution."""
+    mid = _charge_intent(api, "mid-charge", frozenset({"mid"}), 2_000)
+    rhs = _discharge_intent(api, "rhs-discharge", frozenset({"rhs"}), 1_000)
+    selection = _real_selection((mid, rhs))
+    allocator = MultiIntentAllocator(
+        {
+            "mid-charge": (Proposal("mid", api.Direction.CHARGE, 2_000, "mid-charge", 110.0),),
+            "rhs-discharge": (
+                Proposal("rhs", api.Direction.DISCHARGE, 1_000, "rhs-discharge", 110.0),
+            ),
+        },
+        [],
+    )
+    outcome = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        (
+            Setpoint("mid", api.Direction.CHARGE, 2_000, "mid-charge"),
+            Setpoint("rhs", api.Direction.DISCHARGE, 1_000, "rhs-discharge"),
+        ),
+    )
+    kernel, _history, _auth, audit = _make_composed_kernel(
+        api,
+        intents_in_cycle=(mid, rhs),
+        arbiter_value=selection,
+        allocator=allocator,
+        output=outcome,
+    )
+    await kernel.tick()
+    (event,) = audit.events
+    assert event.intent_id is None
+    assert event.unit_id is None
+    assert event.correlation_id == f"cycle:{event.cycle_id}"
+    assert event.principal == ",".join(sorted({mid.actor_identity, rhs.actor_identity}))
+    assert event.source is mid.source
+
+    # The single-intent twin keeps today's attribution byte-for-byte.
+    solo = _charge_intent(api, "solo", frozenset({"mid"}), 2_000)
+    solo_selection = _real_selection((solo,))
+    solo_allocator = MultiIntentAllocator(
+        {"solo": (Proposal("mid", api.Direction.CHARGE, 2_000, "solo", 110.0),)}, []
+    )
+    solo_outcome = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        (Setpoint("mid", api.Direction.CHARGE, 2_000, "solo"),),
+    )
+    kernel2, _h2, _a2, audit2 = _make_composed_kernel(
+        api,
+        intents_in_cycle=(solo,),
+        arbiter_value=solo_selection,
+        allocator=solo_allocator,
+        output=solo_outcome,
+    )
+    await kernel2.tick()
+    (solo_event,) = audit2.events
+    assert solo_event.intent_id == "solo"
+    assert solo_event.unit_id == "mid"
+    assert solo_event.correlation_id == "intent:solo:revision:17"
+    assert solo_event.principal == solo.actor_identity
+    assert solo_event.directions_by_unit is None
+
+
+async def test_matcher_binds_each_proposal_to_its_units_winning_intent(api: Any) -> None:
+    """A proposal whose direction or intent id contradicts its unit's winner
+    is rejected before safety evaluation -- per-unit coherence is enforced at
+    the kernel boundary, whatever the allocator produced."""
+    mid = _charge_intent(api, "mid-charge", frozenset({"mid"}), 2_000)
+    rhs = _discharge_intent(api, "rhs-discharge", frozenset({"rhs"}), 1_000)
+    selection = _real_selection((mid, rhs))
+    wrong_direction = MultiIntentAllocator(
+        {
+            "mid-charge": (Proposal("mid", api.Direction.CHARGE, 2_000, "mid-charge", 110.0),),
+            "rhs-discharge": (
+                # rhs's winner is DISCHARGE; a charge proposal for it is
+                # incoherent with the arbitration.
+                Proposal("rhs", api.Direction.CHARGE, 1_000, "rhs-discharge", 110.0),
+            ),
+        },
+        [],
+    )
+    wrong_intent = MultiIntentAllocator(
+        {
+            "mid-charge": (Proposal("mid", api.Direction.CHARGE, 2_000, "rhs-discharge", 110.0),),
+            "rhs-discharge": (
+                Proposal("rhs", api.Direction.DISCHARGE, 1_000, "rhs-discharge", 110.0),
+            ),
+        },
+        [],
+    )
+    outcome = Decision(api.DecisionStatus.AUTHORIZED, ())
+    for allocator in (wrong_direction, wrong_intent):
+        kernel, _history, auth, audit = _make_composed_kernel(
+            api,
+            intents_in_cycle=(mid, rhs),
+            arbiter_value=selection,
+            allocator=allocator,
+            output=outcome,
+        )
+        with pytest.raises(ValueError, match="allocator output does not match"):
+            await kernel.tick()
+        assert auth.published == []
+        assert audit.events == []
+        assert auth.revocations
+
+
+async def test_scope_erosion_allocates_each_intent_over_its_survivors(api: Any) -> None:
+    """A manual intent claiming lhs+mid erodes an agent intent claiming mid+rhs
+    to just rhs: the kernel allocates each over its OWN surviving scope and
+    composes both into one cycle."""
+    manual = Intent(
+        "manual-wide",
+        api.IntentSource.MANUAL,
+        frozenset({"lhs", "mid"}),
+        api.Direction.CHARGE,
+        900,
+        watts_by_unit={"lhs": 600, "mid": 300},
+    )
+    agent = Intent(
+        "agent-eroded",
+        api.IntentSource.AGENT,
+        frozenset({"mid", "rhs"}),
+        api.Direction.DISCHARGE,
+        500,
+    )
+    selection = _real_selection((agent, manual))
+    assert dict(selection.scopes) == {
+        "manual-wide": frozenset({"lhs", "mid"}),
+        "agent-eroded": frozenset({"rhs"}),
+    }
+    allocator = MultiIntentAllocator(
+        {
+            "manual-wide": (
+                Proposal("lhs", api.Direction.CHARGE, 600, "manual-wide", 110.0),
+                Proposal("mid", api.Direction.CHARGE, 300, "manual-wide", 110.0),
+            ),
+            "agent-eroded": (Proposal("rhs", api.Direction.DISCHARGE, 500, "agent-eroded", 110.0),),
+        },
+        [],
+    )
+    outcome = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        (
+            Setpoint("lhs", api.Direction.CHARGE, 600, "manual-wide"),
+            Setpoint("mid", api.Direction.CHARGE, 300, "manual-wide"),
+            Setpoint("rhs", api.Direction.DISCHARGE, 500, "agent-eroded"),
+        ),
+    )
+    kernel, _history, auth, audit = _make_composed_kernel(
+        api,
+        intents_in_cycle=(manual, agent),
+        arbiter_value=selection,
+        allocator=allocator,
+        output=outcome,
+    )
+    await kernel.tick()
+    assert [call[4] for call in allocator.calls] == [
+        frozenset({"lhs", "mid"}),
+        frozenset({"rhs"}),
+    ]
+    (batch,) = auth.published
+    by_unit = {cap.unit_id: cap for cap in batch.authorizations}
+    assert set(by_unit) == {"lhs", "mid", "rhs"}
+    assert by_unit["rhs"].intent_id == "agent-eroded"
+    assert by_unit["rhs"].direction is api.Direction.DISCHARGE
+    (event,) = audit.events
+    assert dict(event.requested_watts_by_unit) == {"lhs": 600, "mid": 300}
+    assert dict(event.authorized_watts_by_unit) == {"lhs": 600, "mid": 300, "rhs": 500}
+    assert event.requested_active_w == -900 + 500
+
+
+async def test_idle_winner_rides_along_an_active_composed_cycle(api: Any) -> None:
+    """A manual idle intent holding mid to zero while an agent discharges rhs:
+    one authorized cycle, mid at zero watts with no capability minted for it."""
+    idle = Intent(
+        "manual-idle",
+        api.IntentSource.MANUAL,
+        frozenset({"mid"}),
+        api.Direction.IDLE,
+        0,
+    )
+    agent = Intent(
+        "agent-discharge",
+        api.IntentSource.AGENT,
+        frozenset({"mid", "rhs"}),
+        api.Direction.DISCHARGE,
+        400,
+    )
+    selection = _real_selection((agent, idle))
+    allocator = MultiIntentAllocator(
+        {
+            "manual-idle": (Proposal("mid", api.Direction.IDLE, 0, "manual-idle", 110.0),),
+            "agent-discharge": (
+                Proposal("rhs", api.Direction.DISCHARGE, 400, "agent-discharge", 110.0),
+            ),
+        },
+        [],
+    )
+    outcome = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        (
+            Setpoint("mid", api.Direction.IDLE, 0, "manual-idle"),
+            Setpoint("rhs", api.Direction.DISCHARGE, 400, "agent-discharge"),
+        ),
+        ("safety_checks_passed",),
+    )
+    kernel, _history, auth, audit = _make_composed_kernel(
+        api,
+        intents_in_cycle=(idle, agent),
+        arbiter_value=selection,
+        allocator=allocator,
+        output=outcome,
+    )
+    decision = await kernel.tick()
+    assert decision is outcome
+    (batch,) = auth.published
+    assert {cap.unit_id: cap.watts for cap in batch.authorizations} == {"rhs": 400}
+    (event,) = audit.events
+    assert dict(event.directions_by_unit) == {"mid": "idle", "rhs": "discharge"}
+
+
+async def test_a_units_denial_mints_authority_only_for_the_running_units(api: Any) -> None:
+    """One unit's safety denial in a composed cycle zeroes that unit only:
+    the capability batch carries the other unit's authority."""
+    mid = _charge_intent(api, "mid-charge", frozenset({"mid"}), 2_000)
+    rhs = _discharge_intent(api, "rhs-discharge", frozenset({"rhs"}), 1_000)
+    selection = _real_selection((mid, rhs))
+    allocator = MultiIntentAllocator(
+        {
+            "mid-charge": (Proposal("mid", api.Direction.CHARGE, 2_000, "mid-charge", 110.0),),
+            "rhs-discharge": (
+                Proposal("rhs", api.Direction.DISCHARGE, 1_000, "rhs-discharge", 110.0),
+            ),
+        },
+        [],
+    )
+    outcome = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        (
+            Setpoint("mid", api.Direction.CHARGE, 0, "mid-charge"),
+            Setpoint("rhs", api.Direction.DISCHARGE, 1_000, "rhs-discharge"),
+        ),
+        ("soc_above_charge_ceiling",),
+    )
+    kernel, _history, auth, audit = _make_composed_kernel(
+        api,
+        intents_in_cycle=(mid, rhs),
+        arbiter_value=selection,
+        allocator=allocator,
+        output=outcome,
+    )
+    await kernel.tick()
+    (batch,) = auth.published
+    assert {cap.unit_id: cap.watts for cap in batch.authorizations} == {"rhs": 1_000}
+    (event,) = audit.events
+    assert dict(event.authorized_watts_by_unit) == {"mid": 0, "rhs": 1_000}
+    assert event.authorized_active_w == 1_000
+    assert event.reason_codes == ("soc_above_charge_ceiling",)
+
+
+async def test_emergency_stop_dominates_the_composed_cycle(api: Any) -> None:
+    """A live stop is the whole cycle even while two active intents are live:
+    revocation precedes audit, nothing is minted, and the row is the stop's."""
+    mid = _charge_intent(api, "mid-charge", frozenset({"mid"}), 2_000)
+    rhs = _discharge_intent(api, "rhs-discharge", frozenset({"rhs"}), 1_000)
+    stop = Intent(
+        "stop-1",
+        api.IntentSource.EMERGENCY_STOP,
+        frozenset({"mid", "rhs"}),
+        api.Direction.IDLE,
+        0,
+    )
+    selection = _real_selection((mid, rhs, stop))
+    assert selection.emergency is stop
+    assert selection.ranked == (stop,)
+    allocator = MultiIntentAllocator(
+        {
+            "stop-1": (
+                Proposal("mid", api.Direction.IDLE, 0, "stop-1", 110.0),
+                Proposal("rhs", api.Direction.IDLE, 0, "stop-1", 110.0),
+            ),
+        },
+        [],
+    )
+    outcome = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        (
+            Setpoint("mid", api.Direction.IDLE, 0, "stop-1"),
+            Setpoint("rhs", api.Direction.IDLE, 0, "stop-1"),
+        ),
+        ("stop_authorized",),
+    )
+    kernel, history, auth, audit = _make_composed_kernel(
+        api,
+        intents_in_cycle=(mid, rhs, stop),
+        arbiter_value=selection,
+        allocator=allocator,
+        output=outcome,
+    )
+    await kernel.tick()
+    assert history.index("revoke") < history.index("audit")
+    assert auth.published == []
+    (event,) = audit.events
+    assert event.intent_id == "stop-1"
+    assert event.source is api.IntentSource.EMERGENCY_STOP
+    assert event.correlation_id == "emergency_stop:stop-1"
+    assert event.directions_by_unit is None
+
+
+async def test_per_intent_total_bound_is_enforced_by_the_matcher(api: Any) -> None:
+    """Each intent's proposals may never exceed ITS OWN fleet watts: the
+    matcher groups proposals per winning intent and bounds each group."""
+    mid = _charge_intent(api, "mid-charge", frozenset({"mid"}), 2_000)
+    rhs = _discharge_intent(api, "rhs-discharge", frozenset({"rhs"}), 1_000)
+    selection = _real_selection((mid, rhs))
+    allocator = MultiIntentAllocator(
+        {
+            "mid-charge": (Proposal("mid", api.Direction.CHARGE, 2_000, "mid-charge", 110.0),),
+            "rhs-discharge": (
+                # rhs's intent asked 1,000 W; 1,500 W for rhs alone breaks the
+                # per-intent bound even though the fleet total is plausible.
+                Proposal("rhs", api.Direction.DISCHARGE, 1_500, "rhs-discharge", 110.0),
+            ),
+        },
+        [],
+    )
+    outcome = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        (Setpoint("rhs", api.Direction.DISCHARGE, 1_500, "rhs-discharge"),),
+    )
+    kernel, _history, auth, audit = _make_composed_kernel(
+        api,
+        intents_in_cycle=(mid, rhs),
+        arbiter_value=selection,
+        allocator=allocator,
+        output=outcome,
+    )
+    with pytest.raises(ValueError, match="allocator output does not match"):
+        await kernel.tick()
+    assert auth.published == [] and audit.events == [] and auth.revocations
