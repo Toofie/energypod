@@ -32,8 +32,9 @@ protocol adapter; out-of-range commands are rejected, never wrapped.
 sequence, lifecycle, protocol profile, system SOC, BMS SOC, SOH, signed battery watts, pack voltage
 and current, dynamic charge/discharge limits, cells, temperatures, active faults/warnings, and a
 quality map. Cell data carries its own monotonic capture time and sequence because it is polled less
-frequently. Derived properties expose age, cell age, cell min/max/imbalance, and safety-data
-completeness. Optional advisory fields (`grid_power_w`, `load_power_w`) carry per-field quality but
+frequently. Derived properties expose age, cell age, cell min/max/imbalance, safety-data
+completeness, and the authoritative SOC (`authoritative_soc_pct` — the BMS figure, 2026-08-24).
+Optional advisory fields (`grid_power_w`, `load_power_w`) carry per-field quality but
 stay outside the safety-critical completeness set ("Excess-solar accelerated charging (advisory)").
 
 `ControlPolicy` is immutable, strict, and versioned. It contains static per-unit/fleet limits,
@@ -97,6 +98,25 @@ Fleet limits apply PER DIRECTION across that direction's subtotal in the proposa
 sequence monotonicity is non-decreasing: an unchanged cell sequence between consecutive
 observations is permitted because cell blocks poll less frequently than the control rate, with
 freshness enforced by the maximum cell age; a regressed cell sequence rejects.
+
+#### BMS-authoritative SOC (2026-08-24)
+
+The operator's ruling (2026-08-24): "I don't think it should get blocked like this. If there's a
+disagreement, re-sync based on whatever the battery says." The battery's own BMS SOC is the
+AUTHORITATIVE SOC for every SOC-based policy bound — `min_soc_pct` (the discharge floor),
+`max_soc_pct` (the charge ceiling), and the SOC-jump check are all evaluated against
+`bms_soc_pct` (the domain's `authoritative_soc_pct` derived property spells the same figure for
+advisory consumers, including the excess-solar adviser's neediness and ceiling skip). A
+system-vs-BMS divergence NEVER denies power on its own: the old `soc_disagreement` deny reason is
+removed from the blocking set, because the system controller's SOC word (0x0100+17) is served once
+per connection by the tiered read plan and may be hours stale on a cycled unit — the
+"disagreement" it manufactures is mostly staleness, and staleness must not masquerade as a safety
+objection from the battery. Divergence beyond `max_soc_disagreement_pct` (inclusive boundary
+unchanged) surfaces as the informational reason code `soc_disagreement_observed`, carried ONLY on
+authorizing decisions — the audit row and console see the warning; a rejected decision carries
+deny reasons only, so the note can never be confused with a blocking code. Zero-watt and positive
+proposals alike are unaffected by divergence, and every other SOC protection still blocks exactly
+as before, now via the battery's own figure.
 
 `IntentArbiter.arbitrate(intents, now_mono) -> CycleArbitration` removes expired intents and
 selects a PER-UNIT WINNER SET: for each unit, the highest-priority live intent claiming it wins
@@ -657,8 +677,9 @@ first authorized tick already meets or exceeds autonomy once entry qualifies.
 
 ### Target selection
 
-Exactly one unit at a time, never a fleet-wide dispatch: the neediest — lowest `system_soc_pct`
-among units whose latest observation is controllable (lifecycle `ARMED_IDLE`/`ACTIVE`), below the
+Exactly one unit at a time, never a fleet-wide dispatch: the neediest — lowest authoritative SOC
+(`authoritative_soc_pct`, the BMS figure per the 2026-08-24 ruling) among units whose latest
+observation is controllable (lifecycle `ARMED_IDLE`/`ACTIVE`), below the
 SOC charge ceiling, and with positive charge headroom; ties break by unit id. Non-controllable,
 inhibited, or ceiling-blocked units are skipped, and the kernel's existing deny reasons remain
 the backstop.
