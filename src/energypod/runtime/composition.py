@@ -106,7 +106,10 @@ from energypod.application.recovery import (
     RecoverySettings,
 )
 from energypod.application.safety import SafetyKernel
-from energypod.application.service import EnergyServiceFacade
+from energypod.application.service import (
+    EXCESS_ECONOMICS_ACK_EVENT_ID,
+    EnergyServiceFacade,
+)
 from energypod.domain import (
     ControlPolicy,
     DataQuality,
@@ -376,6 +379,13 @@ class _InMemoryAuditRepository:
             _with_sequence(event, sequence) for sequence, event in reversed(selected[-limit:])
         )
 
+    def contains_event(self, event_id: str) -> bool:
+        if not isinstance(event_id, str) or not event_id or event_id != event_id.strip():
+            raise ValueError("event_id must be non-empty and normalized")
+        # The retained window is bounded; an evicted fact is gone from this
+        # process's memory (the durable SQLite store is the boot-load path).
+        return event_id in self._seen_event_ids
+
 
 class _SequencedSQLiteAuditRepository(SQLiteAuditRepository):
     """Composition-owned audit read path over the durable audit rows.
@@ -418,6 +428,26 @@ class _SequencedSQLiteAuditRepository(SQLiteAuditRepository):
                 raise PersistenceBusyError("audit database is busy") from exc
             raise
         return tuple(_with_sequence(self._decode(row[1]), row[0]) for row in rows)
+
+    def contains_event(self, event_id: str) -> bool:
+        """One keyed existence check over the durable rows (never a scan).
+
+        The once-ever net-billing acknowledgement carries a deterministic
+        event id, so the boot-time gate is an indexed lookup against the
+        store's own UNIQUE constraint.
+        """
+        if not isinstance(event_id, str) or not event_id or event_id != event_id.strip():
+            raise ValueError("event_id must be non-empty and normalized")
+        try:
+            with self._database.lock:
+                row = self._database.connection.execute(
+                    "SELECT 1 FROM audit_events WHERE event_id = ? LIMIT 1", (event_id,)
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _sqlite_busy(exc):
+                raise PersistenceBusyError("audit database is busy") from exc
+            raise
+        return row is not None
 
 
 class _InMemoryScheduleRepository:
@@ -591,6 +621,8 @@ class _AuditStore(Protocol):
         unit_id: str | None = None,
         after_sequence: int | None = None,
     ) -> tuple[Any, ...]: ...
+
+    def contains_event(self, event_id: str) -> bool: ...
 
 
 class _AsyncAuditRepository:
@@ -1188,13 +1220,15 @@ class _LiveDecodeTelemetry:
         self._expected_profile = expected_profile
         self._expected_cell_count = expected_cell_count
         self._probe_window = (probe_address, probe_count)
-        # API_CONTRACTS "Excess-solar accelerated charging (advisory)": with
-        # the feature enabled the PCS live block (grid at +17, load at +20,
-        # PROTOCOL_EVIDENCE 4c) is promoted from the cold ring into the
-        # control-rate core so grid_power_w refreshes every telemetry cycle
-        # inside export_telemetry_max_age_s.  The plan stays inside the
-        # commissioned cadence budget (steady state <= 8 windows plus the
-        # probe, bootstrap <= 10).
+        # API_CONTRACTS "Excess-solar accelerated charging (advisory)" +
+        # DESIGN_EXCESS_ACTIVATION P6: with the excess_charging block
+        # PRESENT (participating or suspended) the PCS live block (grid at
+        # +17, load at +20, PROTOCOL_EVIDENCE 4c) is promoted from the cold
+        # ring into the control-rate core so grid_power_w refreshes every
+        # telemetry cycle inside export_telemetry_max_age_s — the live
+        # per-phase figures stay on the console whether or not the adviser
+        # participates.  The plan stays inside the commissioned cadence
+        # budget (steady state <= 8 windows plus the probe, bootstrap <= 10).
         self._promote_pcs_live_block = bool(promote_pcs_live_block)
         self._catalog = register_layout.RegisterCatalog()
         self._sequence = itertools.count(1)
@@ -2124,14 +2158,15 @@ def _control_policy(config: ControllerConfig) -> ControlPolicy:
     heartbeat_interval_s = float(config.timing.control_period_s)
     cell_counts = {unit.unit_id: unit.expected_cell_count for unit in config.units}
     excess = config.excess_charging
-    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": an
-    # enabled block arms the all-or-none export triple so the allocator's
-    # optimizer-charge bound has a cap, margin, and freshness bound to work
-    # with; a disabled or absent block arms nothing and the bound is 0.
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)" +
+    # DESIGN_EXCESS_ACTIVATION P6: a PRESENT block arms the all-or-none
+    # export triple (the allocator's optimizer-charge bound gets its cap,
+    # margin, and freshness bound) — `enabled` gates PARTICIPATION, not
+    # composition; an absent block arms nothing and the bound is 0.
     export_limit_w: int | None = None
     export_margin_w: int | None = None
     export_age_s: float | None = None
-    if excess is not None and excess.enabled:
+    if excess is not None:
         export_limit_w = excess.max_charge_from_export_w
         export_margin_w = excess.export_headroom_margin_w
         export_age_s = excess.export_telemetry_max_age_s
@@ -2468,12 +2503,13 @@ def _build_runtime(
 
     # --- control authority -------------------------------------------------
     policy = _control_policy(config)
-    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": an
-    # enabled block arms the policy's export triple, promotes the PCS live
-    # block into the control-rate read plan, and composes the adviser below;
-    # a disabled or absent block changes nothing anywhere (the default).
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)" +
+    # DESIGN_EXCESS_ACTIVATION P6: a PRESENT block arms the policy's export
+    # triple, promotes the PCS live block into the control-rate read plan,
+    # and composes the adviser below (suspended at boot unless enabled AND
+    # acknowledged); an absent block changes nothing anywhere (the default).
     excess_config = config.excess_charging
-    excess_enabled = excess_config is not None and excess_config.enabled
+    excess_present = excess_config is not None
     audit_event_factory = AuditEventFactory(
         process_instance_id=process_instance_id,
         process_origin_mono=process_origin_mono,
@@ -2556,7 +2592,7 @@ def _build_runtime(
                 expected_cell_count=unit.expected_cell_count,
                 probe_address=probe.address,
                 probe_count=probe.count,
-                promote_pcs_live_block=excess_enabled,
+                promote_pcs_live_block=excess_present,
             )
         actors[unit.unit_id] = EnergyPodActor(
             unit_id=unit.unit_id,
@@ -2624,6 +2660,21 @@ def _build_runtime(
         process_origin_mono=process_origin_mono,
         configuration_version=config.revision,
     )
+    # --- excess-solar projection controller (P6: block PRESENT composes) ---
+    # Built BEFORE the facade (the facade projects and toggles through it)
+    # and BEFORE the adviser (the adviser consumes its participation verdict
+    # at tick start; the controller binds the adviser for the live held
+    # read).  P3: the once-ever net-billing acknowledgement boot-loads from
+    # the durable store — one keyed existence check, never an audit scan.
+    excess_controller: ExcessAdviserController | None = None
+    if excess_config is not None:
+        excess_controller = ExcessAdviserController(
+            charge_cap_w=int(excess_config.max_charge_from_export_w),
+            clock=resolved_clock,
+            acknowledged_economics=audit_store.contains_event(EXCESS_ECONOMICS_ACK_EVENT_ID),
+            config_enabled=excess_config.enabled,
+            bus=bus,
+        )
     facade = _ComposedFacade(
         site_id=config.site.site_id,
         clock=resolved_clock,
@@ -2635,31 +2686,18 @@ def _build_runtime(
         coordinator=coordinator,
         actors={unit_id: _ActorCommandHandle(actor) for unit_id, actor in actors.items()},
         recovery=recovery_monitor,
+        excess=excess_controller,
     )
 
     # --- excess-solar advisory composition ---------------------------------
     excess_adviser: ExcessChargeAdviser | None = None
-    excess_controller: ExcessAdviserController | None = None
-    if excess_enabled and excess_config is not None:
-        # The adviser is composed exactly when the feature is enabled, under
-        # the composed automation principal, driving the facade's internal
-        # advisory submission (never REST/MCP).  Everything downstream is the
-        # existing arbiter -> allocator -> SafetyKernel -> per-unit authority
-        # path; the adviser holds no special authority anywhere.
-        #
-        # DESIGN_EXCESS_ACTIVATION §1/§2: the projection controller is built
-        # FIRST (it owns the participation flag the guarded toggle flips),
-        # the adviser consumes its verdict at tick start, and the controller
-        # binds the adviser for the live held-intent read.  The
-        # acknowledgement latch is step B3 (the durable boot-load); until
-        # then the composed gate starts acknowledged.
-        excess_controller = ExcessAdviserController(
-            charge_cap_w=int(excess_config.max_charge_from_export_w),
-            clock=resolved_clock,
-            acknowledged_economics=True,
-            config_enabled=True,
-            bus=bus,
-        )
+    if excess_config is not None and excess_controller is not None:
+        # The adviser is composed exactly when the block is PRESENT (P6) —
+        # participating only while enabled AND acknowledged — under the
+        # composed automation principal, driving the facade's internal
+        # advisory submission (never REST/MCP).  Everything downstream is
+        # the existing arbiter -> allocator -> SafetyKernel -> per-unit
+        # authority path; the adviser holds no special authority anywhere.
         adviser_principal = _AdvisoryPrincipal(
             subject=_EXCESS_ADVISER_PRINCIPAL_SUBJECT,
             scopes=_EXCESS_ADVISER_PRINCIPAL_SCOPES,

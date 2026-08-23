@@ -30,6 +30,8 @@ from pydantic import (
 )
 from starlette.websockets import WebSocketDisconnect
 
+from energypod.application.excess_charge import ExcessChargingRefusal
+
 from .idempotency import IdempotencyConflictError, IdempotencyCoordinator, StoredResult
 
 API_PREFIX = "/api/v1"
@@ -67,6 +69,7 @@ class EnergyService(Protocol):
     async def emergency_stop(self, **kwargs: Any) -> dict[str, Any]: ...
     async def acknowledge_emergency_stop(self, **kwargs: Any) -> dict[str, Any]: ...
     async def acknowledge_inhibit(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def set_excess_charging(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
 class EventSource(Protocol):
@@ -191,6 +194,20 @@ class StopRequest(StrictRequest):
 
 class AcknowledgeRequest(StrictRequest):
     confirmation: Literal["ACKNOWLEDGE"]
+
+
+class ExcessChargingRequest(StrictRequest):
+    """DESIGN_EXCESS_ACTIVATION §3: the guarded activation toggle.
+
+    A typed confirmation is ALWAYS required (the inhibit-acknowledgement
+    pattern applied to a feature gate); the optional ``economics`` field is
+    consulted only on the first enable ever, and only the literal
+    ``"NET_BILLED"`` is valid — anything else is a 422, not a silent ignore.
+    """
+
+    action: Literal["enable", "disable"]
+    confirmation: Literal["EXCESS"]
+    economics: Literal["NET_BILLED"] | None = None
 
 
 class BoundaryError(Exception):
@@ -781,6 +798,44 @@ def create_api_app(
             request=request,
             identity=identity,
             operation_name="acknowledge_inhibit",
+            payload=payload,
+            status_code=200,
+            invoke=invoke,
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.post(f"{API_PREFIX}/excess-charging")
+    async def set_excess_charging(
+        body: ExcessChargingRequest,
+        request: Request,
+        identity: Principal = arm_dependency,
+    ) -> JSONResponse:
+        # P4: enabling grants participation — a control-adjacent act that
+        # needs an interactive human; disabling is safety-positive and stays
+        # open to any arm-scoped principal, exactly like disarm.
+        if body.action == "enable" and not identity.interactive:
+            raise BoundaryError(
+                403,
+                "interactive_operator_required",
+                "Interactive operator required",
+            )
+        payload = body.model_dump(mode="json")
+
+        async def invoke() -> dict[str, Any]:
+            try:
+                return await service.set_excess_charging(
+                    **payload,
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
+            except ExcessChargingRefusal as exc:
+                raise BoundaryError(409, exc.code, exc.message, exc.details) from exc
+
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="set_excess_charging",
             payload=payload,
             status_code=200,
             invoke=invoke,

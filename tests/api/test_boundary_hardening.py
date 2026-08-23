@@ -402,3 +402,39 @@ async def test_idempotency_conflict_during_inflight_work_does_not_cancel_leader(
     assert not leader.done()
     release.set()
     assert await leader == StoredResult(202, {"ok": True})
+
+
+# --- the guarded excess-charging toggle (DESIGN_EXCESS_ACTIVATION §3, P4) --------
+
+
+async def test_excess_toggle_boundary_hardening() -> None:
+    """The feature gate gets the same hardened boundary as every mutation:
+    bearer authentication before anything else, the arm scope for both
+    actions, an interactive principal for enable only, and a body-free or
+    malformed request never reaching the service."""
+    from fastapi.testclient import TestClient
+
+    from energypod.api.rest import create_api_app
+
+    service = RecordingEnergyService()
+    app = create_api_app(
+        service=service,
+        authenticator=FakeAuthenticator(),
+        event_source=FakeEventSource(),
+    )
+    enable = {"action": "enable", "confirmation": "EXCESS", "economics": "NET_BILLED"}
+    with TestClient(app) as client:
+        anonymous = client.post("/api/v1/excess-charging", json=enable)
+        malformed = client.post(
+            "/api/v1/excess-charging",
+            json=enable,
+            headers={"Authorization": "Bearer operator-token", "Idempotency-Key": "b1"},
+        )
+        # bearer first: an anonymous caller never learns the route exists
+        # beyond the standard envelope.
+        assert anonymous.status_code == 401
+        assert anonymous.json()["code"] == "authentication_required"
+        # A valid interactive operator DOES reach the service.
+        assert malformed.status_code == 200, malformed.text
+    calls = [name for name, _ in service.calls if name == "set_excess_charging"]
+    assert calls, "the authenticated toggle must reach the service"

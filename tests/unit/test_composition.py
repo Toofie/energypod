@@ -1909,6 +1909,151 @@ async def test_enabled_excess_charging_composes_the_adviser_and_armed_policy(
     await _shutdown_actors(runtime)
 
 
+# --- P6 composition rescope + the P3 boot-loaded gate (DESIGN_EXCESS_ACTIVATION) --
+#
+# A PRESENT block composes the machinery and `enabled` gates participation:
+# export triple armed, PCS block promoted, adviser + controller + projection
+# composed -- suspended at boot when `enabled: false` or the acknowledgement
+# is missing, which is what makes the console's first enable possible without
+# a config edit.  An ABSENT block composes nothing, byte-identical to today.
+
+
+async def test_present_but_disabled_excess_charging_composes_suspended_machinery(
+    tmp_path: Path,
+) -> None:
+    """P6: `enabled: false` (explicit) composes but suspends at boot."""
+    payload = _write_enabled_payload(tmp_path / "adviser-suspended.sqlite3")
+    payload["excess_charging"] = {"enabled": False}
+    runtime = _compose_with(_validate(payload), simulate=True)
+
+    assert runtime.excess_adviser is not None, "a present block composes the adviser"
+    assert runtime.excess_controller is not None
+    assert runtime.policy.export_charge_limit_w == 2_500, "the triple arms on block presence"
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert "adviser_state" in snapshot
+    state = snapshot["adviser_state"]
+    assert state["enabled"] is False
+    assert state["enabled_origin"] == "config"
+    assert state["hysteresis_state"] == "inactive"
+    assert state["charge_cap_w"] == 2_500
+    assert "disabled_by_config" in state["reason_codes"]
+    # The toggle is commissioned on a present block: disable answers (noop
+    # semantics land with the facade family; here it must not be refused as
+    # not-commissioned).
+    result = await runtime.facade.set_excess_charging(
+        action="disable",
+        confirmation="EXCESS",
+        principal=OPERATOR,
+        idempotency_key="excess-composed-disable",
+        request_id="excess-composed-disable-request",
+    )
+    assert result["enabled"] is False
+    await _shutdown_actors(runtime)
+
+
+async def test_absent_excess_block_composes_nothing_and_refuses_the_toggle(
+    tmp_path: Path,
+) -> None:
+    """P6: an ABSENT block composes nothing -- no adviser, no controller, no
+    triple, no projection key, and the toggle answers not-commissioned.
+    Byte-identical to today's absent-block behavior."""
+    runtime = compose_write_enabled(tmp_path / "no-adviser.sqlite3")
+
+    assert runtime.excess_adviser is None
+    assert runtime.excess_controller is None
+    assert runtime.policy.export_charge_limit_w is None
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert "adviser_state" not in snapshot
+    with pytest.raises(Exception) as caught:
+        await runtime.facade.set_excess_charging(
+            action="enable",
+            confirmation="EXCESS",
+            economics="NET_BILLED",
+            principal=OPERATOR,
+            idempotency_key="excess-absent",
+            request_id="excess-absent-request",
+        )
+    assert getattr(caught.value, "code", "") == "excess_charging_not_commissioned"
+
+
+async def test_an_enabled_block_without_the_acknowledgement_composes_suspended(
+    tmp_path: Path,
+) -> None:
+    """P3's fail-closed gate at the composition level: even a config
+    `enabled: true` cannot silently participate without the captured fact --
+    the site composes suspended with `economics_acknowledgement_required`."""
+    payload = _write_enabled_payload(tmp_path / "adviser-unacked.sqlite3")
+    payload["excess_charging"] = {"enabled": True}
+    runtime = _compose_with(_validate(payload), simulate=True)
+
+    assert runtime.excess_adviser is not None
+    controller = runtime.excess_controller
+    assert controller is not None
+    assert controller.enabled is True, "the desired participation reads enabled"
+    assert controller.acknowledged_economics is False
+    assert controller.participation_verdict() == "economics_acknowledgement_required"
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    state = snapshot["adviser_state"]
+    assert state["enabled"] is True
+    assert state["acknowledged_economics"] is False
+    assert state["hysteresis_state"] == "inactive"
+    assert "economics_acknowledgement_required" in state["reason_codes"]
+    # The gate holds at the surface too: the first enable without the
+    # acknowledgement is refused with exactly what to send.
+    with pytest.raises(Exception) as caught:
+        await runtime.facade.set_excess_charging(
+            action="enable",
+            confirmation="EXCESS",
+            principal=OPERATOR,
+            idempotency_key="excess-unacked",
+            request_id="excess-unacked-request",
+        )
+    assert getattr(caught.value, "code", "") == "economics_acknowledgement_required"
+    await _shutdown_actors(runtime)
+
+
+async def test_the_acknowledgement_is_durable_and_boot_loads_into_the_gate(
+    tmp_path: Path,
+) -> None:
+    """P3: the once-ever fact is a durable audit row (deterministic event id)
+    loaded at boot into the gate -- the first enable of the NEXT process needs
+    no economics field.  Simulator persistence is in-memory by design; this
+    pins the durable run-mode path."""
+    database = tmp_path / "adviser-ack.sqlite3"
+    payload = _write_enabled_payload(database)
+    payload["excess_charging"] = {"enabled": False}
+    first = _compose_with(_validate(payload), simulate=False)
+    captured = await first.facade.set_excess_charging(
+        action="enable",
+        confirmation="EXCESS",
+        economics="NET_BILLED",
+        principal=OPERATOR,
+        idempotency_key="excess-ack-capture",
+        request_id="excess-ack-capture-request",
+    )
+    assert captured["acknowledged_economics"] is True
+    await _shutdown_actors(first)
+
+    second = _compose_with(_validate(payload), simulate=False)
+    controller = second.excess_controller
+    assert controller is not None
+    assert controller.acknowledged_economics is True, "boot loads the durable fact"
+    # P1: the participation toggle itself never persisted -- boot recomposes
+    # from the config default (disabled), acknowledged.
+    assert controller.enabled is False
+    assert controller.enabled_origin == "config"
+    result = await second.facade.set_excess_charging(
+        action="enable",
+        confirmation="EXCESS",
+        principal=OPERATOR,
+        idempotency_key="excess-ack-restart",
+        request_id="excess-ack-restart-request",
+    )
+    assert result["enabled"] is True, "no economics field needed ever again"
+    assert result["acknowledged_economics"] is True
+    await _shutdown_actors(second)
+
+
 async def test_supervision_drives_the_adviser_projection_and_publishes_state_events(
     tmp_path: Path,
 ) -> None:

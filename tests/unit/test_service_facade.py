@@ -636,6 +636,7 @@ class Rig:
     handles: dict[str, FakeActorHandle]
     history: list[str]
     recovery: FakeRecoveryView | None = None
+    excess: Any = None
 
     def reset_recorders(self) -> None:
         self.intents.added.clear()
@@ -703,6 +704,7 @@ def make_rig(
     audit_events: tuple[Any, ...] = (),
     bus_sequence: int = 0,
     recovery: FakeRecoveryView | None = None,
+    excess: Any = None,
 ) -> Rig:
     clock = FakeClock()
     history: list[str] = []
@@ -740,6 +742,7 @@ def make_rig(
         coordinator=coordinator,
         actors=handles,
         recovery=recovery,
+        excess=excess,
     )
     return Rig(
         api=api,
@@ -754,6 +757,7 @@ def make_rig(
         handles=handles,
         history=history,
         recovery=recovery,
+        excess=excess,
     )
 
 
@@ -3070,3 +3074,352 @@ async def test_snapshot_telemetry_summary_exposes_the_mode_words(api: Any) -> No
     detail = await rig.facade.unit_detail(principal=OPERATOR, unit_id="pod-a")
     assert detail["debug_mode_w"] == 0
     assert detail["ctrl_mode_w"] == 1
+
+
+# --- the guarded excess-charging toggle (DESIGN_EXCESS_ACTIVATION §3) ------------
+#
+# POST /api/v1/excess-charging's facade half: the inhibit-acknowledgement
+# guarded-confirmation pattern applied to a feature gate.  P1 non-persistence
+# (runtime toggles never survive restart), P2 enable refusals (units ACTIVE
+# under another intent, latched stops -- never latched inhibits), P3 the
+# once-ever durable net-billing acknowledgement (durable-append-first, latch
+# flip second, an append failure refuses), P4 scopes (arm + interactive to
+# enable, arm alone to disable), P5 participation-only (the toggle flips no
+# commissioned envelope), P6 composition rescope (the facade port is wired
+# exactly when the block is present).
+
+
+EXCESS_ECONOMICS_ACK_EVENT_ID = "excess-charging-economics-acknowledged"
+
+
+class FakeExcessControl:
+    """Inline stand-in for the composed ExcessAdviserController port."""
+
+    def __init__(
+        self,
+        *,
+        acknowledged: bool = False,
+        enabled: bool = False,
+        origin: str = "config",
+    ) -> None:
+        self.acknowledged_economics = acknowledged
+        self.enabled = enabled
+        self.enabled_origin = origin
+        self.flips: list[bool] = []
+        self.acknowledged_at = 0
+
+    def set_participation(self, *, enabled: bool) -> None:
+        self.flips.append(bool(enabled))
+        self.enabled = bool(enabled)
+        self.enabled_origin = "runtime"
+
+    def mark_acknowledged(self) -> None:
+        self.acknowledged_at += 1
+        self.acknowledged_economics = True
+
+    def state_payload(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "enabled_origin": self.enabled_origin,
+            "acknowledged_economics": self.acknowledged_economics,
+            "active": False,
+            "hysteresis_state": "inactive",
+            "target_unit_id": None,
+            "commanded_charge_w": 0,
+            "eligible_export_charge_w": 0,
+            "fleet_export_w": None,
+            "export_evidence": "missing",
+            "charge_cap_w": 2_500,
+            "held_intent_id": None,
+            "last_action": "idle",
+            "last_tick_at": "2026-08-25T11:04:31+00:00",
+            "reason_codes": ["disabled_by_config"],
+        }
+
+
+def toggle_kwargs(**overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "action": "disable",
+        "confirmation": "EXCESS",
+        "principal": OPERATOR,
+        "idempotency_key": "excess-key-1",
+        "request_id": "excess-request-1",
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def make_excess_rig(
+    api: Any,
+    *,
+    acknowledged: bool = False,
+    config_enabled: bool = False,
+    **rig_kwargs: Any,
+) -> Rig:
+    control = FakeExcessControl(
+        acknowledged=acknowledged,
+        enabled=config_enabled,
+        origin="config",
+    )
+    rig_kwargs.setdefault("units", {"pod-a": {}, "pod-b": {}})
+    return make_rig(api, excess=control, **rig_kwargs)
+
+
+def _refusal_code(error: BaseException) -> str:
+    return str(getattr(error, "code", ""))
+
+
+async def test_toggle_without_a_composed_block_is_not_commissioned(api: Any) -> None:
+    rig = make_rig(api)
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.set_excess_charging(**toggle_kwargs())
+
+    assert _refusal_code(caught.value) == "excess_charging_not_commissioned"
+    assert getattr(caught.value, "details", {}) == {}
+
+
+async def test_disable_flips_participation_audits_and_answers_the_contract_body(
+    api: Any,
+) -> None:
+    rig = make_excess_rig(api, acknowledged=True, config_enabled=True)
+
+    result = await rig.facade.set_excess_charging(**toggle_kwargs(action="disable"))
+
+    assert result["feature"] == "excess_charging"
+    assert result["enabled"] is False
+    assert result["enabled_origin"] == "runtime"
+    assert result["persisted"] is False, "P1: the non-persistence policy rides every response"
+    assert result["acknowledged_economics"] is True
+    assert result["adviser_state"]["enabled"] is False
+    assert result["adviser_state"]["enabled_origin"] == "runtime"
+    assert rig.excess.flips == [False] if rig.excess else []
+    toggled = [
+        event for event in rig.audit.appended if event.event_type == "excess_charging_toggled"
+    ]
+    assert len(toggled) == 1
+    assert toggled[0].result == "disabled"
+    assert toggled[0].principal == OPERATOR.subject
+    assert toggled[0].reason_codes == ("disabled",)
+
+
+async def test_enable_requires_the_arm_scope_and_an_interactive_principal(api: Any) -> None:
+    rig = make_excess_rig(api, acknowledged=True, config_enabled=False)
+    automation = Principal(
+        subject="service:automation",
+        scopes=frozenset({"observe", "dispatch", "arm"}),
+        interactive=False,
+    )
+
+    with pytest.raises(PermissionError, match="interactive"):
+        await rig.facade.set_excess_charging(
+            **toggle_kwargs(action="enable", principal=automation, economics="NET_BILLED")
+        )
+    viewer = Principal(subject="person:viewer", scopes=frozenset({"observe"}))
+    with pytest.raises(PermissionError, match="arm"):
+        await rig.facade.set_excess_charging(**toggle_kwargs(action="enable", principal=viewer))
+    # P4: disable is safety-positive -- arm scope alone, no interactivity.
+    await rig.facade.set_excess_charging(**toggle_kwargs(action="disable", principal=automation))
+
+
+async def test_the_first_enable_needs_the_net_billing_acknowledgement(api: Any) -> None:
+    """P3: an unacknowledged site is refused with exactly what to send."""
+    rig = make_excess_rig(api, acknowledged=False, config_enabled=False)
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.set_excess_charging(**toggle_kwargs(action="enable"))
+
+    assert _refusal_code(caught.value) == "economics_acknowledgement_required"
+    assert getattr(caught.value, "details", {}) == {"acknowledgement": "NET_BILLED"}
+    assert not rig.audit.appended, "a refusal appends nothing"
+    if rig.excess:
+        assert rig.excess.flips == []
+
+
+async def test_the_first_enable_captures_the_acknowledgement_durably_first(api: Any) -> None:
+    """Durable-append FIRST, latch flip second: the ack row is the
+    once-ever fact (deterministic event id), and only after it lands does
+    the participation flip and its own audit row."""
+    rig = make_excess_rig(api, acknowledged=False, config_enabled=False)
+
+    result = await rig.facade.set_excess_charging(
+        **toggle_kwargs(action="enable", economics="NET_BILLED")
+    )
+
+    assert [event.event_type for event in rig.audit.appended] == [
+        "excess_charging_economics_acknowledged",
+        "excess_charging_toggled",
+    ]
+    ack = rig.audit.appended[0]
+    assert ack.event_id == EXCESS_ECONOMICS_ACK_EVENT_ID
+    assert ack.principal == OPERATOR.subject
+    assert ack.result == "acknowledged"
+    assert rig.audit.appended[1].result == "enabled"
+    assert rig.excess is not None and rig.excess.flips == [True]
+    assert rig.excess.acknowledged_economics is True
+    assert result["enabled"] is True
+    assert result["enabled_origin"] == "runtime"
+    assert result["acknowledged_economics"] is True
+
+    # Once ever: a later enable needs no economics field and appends no ack row.
+    rig.audit.appended.clear()
+    await rig.facade.set_excess_charging(
+        **toggle_kwargs(action="disable", idempotency_key="excess-key-2")
+    )
+    rig.excess.flips.clear()
+    result = await rig.facade.set_excess_charging(
+        **toggle_kwargs(action="enable", idempotency_key="excess-key-3")
+    )
+    assert [event.event_type for event in rig.audit.appended] == [
+        "excess_charging_toggled",
+        "excess_charging_toggled",
+    ]
+    assert result["acknowledged_economics"] is True
+
+
+async def test_an_acknowledgement_append_failure_refuses_the_enable(api: Any) -> None:
+    """P3's fail-closed gate: no durable audit append means no latch and no
+    enable -- never a silent pass."""
+    rig = make_excess_rig(api, acknowledged=False, config_enabled=False)
+    rig.audit.failing = True
+
+    with pytest.raises(OSError, match="audit store unavailable"):
+        await rig.facade.set_excess_charging(
+            **toggle_kwargs(action="enable", economics="NET_BILLED")
+        )
+
+    assert rig.excess is not None
+    assert rig.excess.flips == [], "the participation flag never moved"
+    assert rig.excess.acknowledged_economics is False, "the latch never flipped"
+
+
+async def test_enable_is_refused_while_a_unit_runs_under_another_intent(api: Any) -> None:
+    """P2: enabling under an active manual/agent request would be 'on doing
+    nothing' -- the exact invisibility this package removes.  The refusal
+    names the units so the operator finishes or cancels first."""
+    rig = make_excess_rig(
+        api,
+        acknowledged=True,
+        config_enabled=False,
+        seeded_intents=(manual_intent(api, revision=5, watts=900, unit_ids=frozenset({"pod-a"})),),
+    )
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.set_excess_charging(**toggle_kwargs(action="enable"))
+
+    assert _refusal_code(caught.value) == "excess_enable_refused"
+    details = getattr(caught.value, "details", {})
+    assert details["reasons"] == ["unit_active_under_intent"]
+    assert details["unit_ids"] == ["pod-a"]
+    assert details["stop_ids"] == []
+    assert rig.excess is not None and rig.excess.flips == []
+
+
+async def test_enable_is_refused_while_a_latched_stop_holds(api: Any) -> None:
+    rig = make_excess_rig(api, acknowledged=True, config_enabled=False)
+    stop = await rig.facade.emergency_stop(
+        unit_ids=["pod-a", "pod-b"],
+        reason="latched for the refusal scenario",
+        principal=OPERATOR,
+        idempotency_key="stop-key-1",
+        request_id="stop-request-1",
+    )
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.set_excess_charging(**toggle_kwargs(action="enable"))
+
+    assert _refusal_code(caught.value) == "excess_enable_refused"
+    details = getattr(caught.value, "details", {})
+    assert details["reasons"] == ["latched_stop_holds"]
+    assert details["stop_ids"] == [stop["stop_id"]]
+    assert details["unit_ids"] == []
+
+    # P2: disable is never refused -- stopping is the safety-positive direction.
+    rig.audit.appended.clear()
+    result = await rig.facade.set_excess_charging(**toggle_kwargs(action="disable"))
+    assert result["enabled"] is False
+
+
+async def test_a_latched_inhibit_does_not_refuse_the_enable(api: Any) -> None:
+    """P2's carve-out: the selector skips inhibited units honestly
+    (no_eligible_target) and the projection says so -- an inhibit is not a
+    fence on the whole feature."""
+    rig = make_excess_rig(
+        api,
+        acknowledged=True,
+        config_enabled=False,
+        units={"pod-a": {"inhibit_latched": True, "inhibit_cause": "external_writer"}, "pod-b": {}},
+    )
+
+    result = await rig.facade.set_excess_charging(**toggle_kwargs(action="enable"))
+
+    assert result["enabled"] is True
+
+
+async def test_a_repeated_toggle_is_an_audited_noop(api: Any) -> None:
+    rig = make_excess_rig(api, acknowledged=True, config_enabled=False)
+
+    await rig.facade.set_excess_charging(
+        **toggle_kwargs(action="enable", economics="NET_BILLED", idempotency_key="k1")
+    )
+    rig.audit.appended.clear()
+    result = await rig.facade.set_excess_charging(
+        **toggle_kwargs(action="enable", idempotency_key="k2")
+    )
+
+    assert result["enabled"] is True
+    assert result["enabled_origin"] == "runtime"
+    noop = [event for event in rig.audit.appended if event.event_type == "excess_charging_toggled"]
+    assert len(noop) == 1
+    assert noop[0].result == "noop"
+
+    rig.audit.appended.clear()
+    again = await rig.facade.set_excess_charging(
+        **toggle_kwargs(action="disable", idempotency_key="k3")
+    )
+    again = await rig.facade.set_excess_charging(
+        **toggle_kwargs(action="disable", idempotency_key="k4")
+    )
+    assert again["enabled"] is False
+    noop2 = [event for event in rig.audit.appended if event.event_type == "excess_charging_toggled"]
+    assert [event.result for event in noop2][-1] == "noop"
+
+
+async def test_the_toggle_validates_its_literals_at_the_facade_too(api: Any) -> None:
+    """Defense in depth behind the guarded boundary's 422s: a direct drive
+    with a wrong literal is a plain validation error, never a mutation."""
+    rig = make_excess_rig(api, acknowledged=True, config_enabled=True)
+    with pytest.raises(ValueError, match="action"):
+        await rig.facade.set_excess_charging(**toggle_kwargs(action="pause"))
+    with pytest.raises(ValueError, match="confirmation"):
+        await rig.facade.set_excess_charging(**toggle_kwargs(confirmation="ARM"))
+    with pytest.raises(ValueError, match="economics"):
+        await rig.facade.set_excess_charging(**toggle_kwargs(action="disable", economics="GROSS"))
+    assert rig.excess is not None and rig.excess.flips == []
+
+
+async def test_the_snapshot_carries_the_projection_exactly_when_composed(api: Any) -> None:
+    """§1: top level beside intent, present while composed (even suspended),
+    ABSENT when the config block is absent -- feature detection, byte-identical
+    absent-block behavior."""
+    rig = make_excess_rig(api, acknowledged=False, config_enabled=False)
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    assert "adviser_state" in snapshot
+    assert snapshot["adviser_state"]["acknowledged_economics"] is False
+
+    bare = make_rig(api)
+    absent = await bare.facade.snapshot(principal=OPERATOR)
+    assert "adviser_state" not in absent
+
+
+async def test_intent_acceptance_events_carry_the_remaining_lifetime(api: Any) -> None:
+    """The UI audit's filed backend request: `intent.accepted` bus payloads
+    carry `expires_in_s` so every operator's console card can state its
+    remaining time, not only the 202's caller."""
+    rig = make_rig(api)
+
+    await rig.facade.submit_intent(**submit_kwargs(ttl_s=42.0))
+
+    accepted = [body for body in rig.bus.published if body["type"] == "intent.accepted"]
+    assert len(accepted) == 1
+    assert accepted[0]["payload"]["expires_in_s"] == 42.0

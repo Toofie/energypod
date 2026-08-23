@@ -251,6 +251,25 @@ class RecordingEnergyService:
             "latch_cleared": True,
         }
 
+    async def set_excess_charging(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("set_excess_charging", kwargs))
+        enabled = kwargs["action"] == "enable"
+        return {
+            "feature": "excess_charging",
+            "enabled": enabled,
+            "enabled_origin": "runtime",
+            "persisted": False,
+            "acknowledged_economics": True,
+            "adviser_state": {
+                "enabled": enabled,
+                "enabled_origin": "runtime",
+                "acknowledged_economics": True,
+                "active": False,
+                "hysteresis_state": "inactive",
+                "reason_codes": ["export_headroom_available"],
+            },
+        }
+
 
 class MutableMonotonicClock:
     """Injectable ticket clock: tests advance time deterministically."""

@@ -9,6 +9,8 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from energypod.application.excess_charge import ExcessChargingRefusal
+
 from .conftest import (
     MID_TELEMETRY_SUMMARY,
     UNIT_DETAIL_PROJECTIONS,
@@ -1177,3 +1179,189 @@ def test_every_route_except_healthz_still_requires_bearer_authentication(
         response = client.request(method, API + path, json=payload)
     _assert_error(response, 401, "authentication_required")
     assert service.calls == []
+
+
+# --- the guarded excess-charging toggle (DESIGN_EXCESS_ACTIVATION §3) ------------
+#
+# POST /api/v1/excess-charging: the inhibit-acknowledgement
+# guarded-confirmation pattern applied to a feature gate.  The boundary owns
+# the 422 validation envelope (unknown action, missing/incorrect
+# confirmation, an economics field that is not exactly "NET_BILLED"), the
+# 403 scope/interactivity rules (P4: arm + interactive to enable, arm alone
+# to disable), and the 409 mapping of the facade's three refusal shapes.
+
+
+class _RefusingExcessService(RecordingEnergyService):
+    """Raises one ExcessChargingRefusal shaped by the test."""
+
+    def __init__(self, refusal: object) -> None:
+        super().__init__()
+        self.refusal = refusal
+
+    async def set_excess_charging(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("set_excess_charging", kwargs))
+        raise self.refusal  # type: ignore[misc]
+
+
+def test_excess_charging_toggle_answers_the_200_contract_body(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    payload = {"action": "enable", "confirmation": "EXCESS", "economics": "NET_BILLED"}
+    with _client(service, authenticator) as client:
+        missing_key = client.post(
+            f"{API}/excess-charging", json=payload, headers=_auth("operator-token")
+        )
+        accepted = client.post(
+            f"{API}/excess-charging",
+            json=payload,
+            headers=_mutation_headers("operator-token", key="excess-enable-1"),
+        )
+        replay = client.post(
+            f"{API}/excess-charging",
+            json=payload,
+            headers=_mutation_headers("operator-token", key="excess-enable-1"),
+        )
+        disable = client.post(
+            f"{API}/excess-charging",
+            json={"action": "disable", "confirmation": "EXCESS"},
+            headers=_mutation_headers("operator-token", key="excess-disable-1"),
+        )
+
+    _assert_error(missing_key, 400, "idempotency_key_required")
+    assert accepted.status_code == 200, accepted.text
+    body = accepted.json()
+    assert body["feature"] == "excess_charging"
+    assert body["enabled"] is True
+    assert body["enabled_origin"] == "runtime"
+    assert body["persisted"] is False, "P1 rides every response"
+    assert body["acknowledged_economics"] is True
+    assert body["adviser_state"]["enabled"] is True
+    assert replay.status_code == 200 and replay.json() == body
+    assert disable.status_code == 200 and disable.json()["enabled"] is False
+    calls = [values for name, values in service.calls if name == "set_excess_charging"]
+    assert len(calls) == 2, "one call per distinct key; the replay never re-reaches the service"
+    assert calls[0]["action"] == "enable"
+    assert calls[0]["confirmation"] == "EXCESS"
+    assert calls[0]["economics"] == "NET_BILLED"
+    assert calls[0]["principal"].interactive is True
+    assert calls[1]["economics"] is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"action": "pause", "confirmation": "EXCESS"},
+        {"action": "enable"},
+        {"action": "enable", "confirmation": "ARM"},
+        {"action": "enable", "confirmation": "EXCESS", "economics": "GROSS_BILLED"},
+        {"action": "disable", "confirmation": "excess"},
+    ],
+)
+def test_excess_charging_toggle_validates_its_literals(
+    service: RecordingEnergyService,
+    authenticator: FakeAuthenticator,
+    payload: dict[str, object],
+) -> None:
+    with _client(service, authenticator) as client:
+        response = client.post(
+            f"{API}/excess-charging",
+            json=payload,
+            headers=_mutation_headers("operator-token", key="excess-invalid"),
+        )
+
+    _assert_error(response, 422, "validation_error")
+    details = response.json()["details"]
+    assert details["errors"], "field errors ride the validation envelope"
+    assert not [values for name, values in service.calls if name == "set_excess_charging"]
+
+
+def test_excess_charging_toggle_requires_the_arm_scope(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    payload = {"action": "disable", "confirmation": "EXCESS"}
+    with _client(service, authenticator) as client:
+        viewer = client.post(
+            f"{API}/excess-charging",
+            json=payload,
+            headers=_mutation_headers("viewer-token", key="v1"),
+        )
+        dispatcher = client.post(
+            f"{API}/excess-charging",
+            json=payload,
+            headers=_mutation_headers("service-token", key="s1"),
+        )
+    _assert_error(viewer, 403, "insufficient_scope")
+    _assert_error(dispatcher, 403, "insufficient_scope")
+
+
+def test_excess_charging_enable_demands_an_interactive_principal(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """P4: disable is safety-positive and stays open to arm-scoped automation;
+    enabling grants participation and needs the human."""
+    enable = {"action": "enable", "confirmation": "EXCESS", "economics": "NET_BILLED"}
+    disable = {"action": "disable", "confirmation": "EXCESS"}
+    with _client(service, authenticator) as client:
+        denied = client.post(
+            f"{API}/excess-charging",
+            json=enable,
+            headers=_mutation_headers("noninteractive-operator-token", key="ni1"),
+        )
+        allowed = client.post(
+            f"{API}/excess-charging",
+            json=disable,
+            headers=_mutation_headers("noninteractive-operator-token", key="ni2"),
+        )
+    _assert_error(denied, 403, "interactive_operator_required")
+    assert allowed.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("refusal", "expected_details"),
+    [
+        (
+            ExcessChargingRefusal(
+                "excess_charging_not_commissioned",
+                "the excess_charging feature is not composed on this site",
+            ),
+            {},
+        ),
+        (
+            ExcessChargingRefusal(
+                "economics_acknowledgement_required",
+                "the one-time net-billing acknowledgement is required",
+                {"acknowledgement": "NET_BILLED"},
+            ),
+            {"acknowledgement": "NET_BILLED"},
+        ),
+        (
+            ExcessChargingRefusal(
+                "excess_enable_refused",
+                "enabling requires a quiet fleet",
+                {
+                    "reasons": ["unit_active_under_intent", "latched_stop_holds"],
+                    "unit_ids": ["pod-a"],
+                    "stop_ids": ["stop-1-1"],
+                },
+            ),
+            {
+                "reasons": ["unit_active_under_intent", "latched_stop_holds"],
+                "unit_ids": ["pod-a"],
+                "stop_ids": ["stop-1-1"],
+            },
+        ),
+    ],
+)
+def test_excess_charging_refusals_map_to_their_structured_envelopes(
+    authenticator: FakeAuthenticator, refusal: ExcessChargingRefusal, expected_details: dict
+) -> None:
+    service = _RefusingExcessService(refusal)
+    with _client(service, authenticator) as client:
+        response = client.post(
+            f"{API}/excess-charging",
+            json={"action": "enable", "confirmation": "EXCESS"},
+            headers=_mutation_headers("operator-token", key="refuse-1"),
+        )
+
+    _assert_error(response, 409, refusal.code)
+    assert response.json()["details"] == expected_details

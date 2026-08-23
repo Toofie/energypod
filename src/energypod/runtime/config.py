@@ -363,15 +363,20 @@ class StorageConfig(_FrozenModel):
 
 
 class ExcessChargingConfig(_FrozenModel):
-    """API_CONTRACTS "Excess-solar accelerated charging (advisory)".
+    """API_CONTRACTS "Excess-solar accelerated charging (advisory)" +
+    DESIGN_EXCESS_ACTIVATION P6.
 
-    An absent block is identical to ``enabled: false`` — the feature is
-    inert by default.  Every key carries its commissioned default so an
-    enabled block states only what commissioning chose to override; the
-    cross-fleet relations (cap inside the static unit charge limit, a
-    freshness bound the polling loop can actually satisfy, a hysteresis
-    band below the entry margin, a bounded renewable TTL) are validated on
-    ``ControllerConfig``, where the policy and timing they relate to live.
+    An ABSENT block composes nothing (no adviser, no export triple, no
+    projection, no toggle); a PRESENT block composes the machinery with
+    ``enabled`` gating PARTICIPATION — an explicit ``enabled: false``
+    composes suspended and is enableable at runtime, which is what makes
+    the console's first enable possible without a config edit.  Every key
+    carries its commissioned default so a present block states only what
+    commissioning chose to override; the cross-fleet relations (cap inside
+    the static unit charge limit, a freshness bound the polling loop can
+    actually satisfy, a hysteresis band below the entry margin, a bounded
+    renewable TTL) are validated on ``ControllerConfig``, where the policy
+    and timing they relate to live.
     """
 
     enabled: StrictBool = False
@@ -487,24 +492,28 @@ class ControllerConfig(_FrozenModel):
     def validate_excess_charging(
         cls, excess: ExcessChargingConfig | None, info: ValidationInfo
     ) -> ExcessChargingConfig | None:
-        """The commissioning gates for an ENABLED advisory block (API_CONTRACTS
-        "Excess-solar accelerated charging (advisory)").
+        """The commissioning gates for a PRESENT advisory block (API_CONTRACTS
+        "Excess-solar accelerated charging (advisory)" + DESIGN_EXCESS_ACTIVATION
+        P6).
 
-        Every gate is scoped to ``enabled=True``: a disabled or absent block
+        Every gate applies whenever the block is PRESENT, not only when
+        ``enabled: true``: an explicit disabled block that could never be
+        enabled SAFELY (a toggle can raise participation but never a cap,
+        bound, or mode — P5) is refused at validation time.  An ABSENT block
         changes nothing anywhere.  This is a field validator on the block —
         not a mode="after" model validator — so the refusal stays attributed
         to ``excess_charging`` itself even when a sibling field has already
         failed (a write-enabled deployment missing its policy block), which
         pydantic would otherwise never reach.
         """
-        if excess is None or not excess.enabled:
+        if excess is None:
             return excess
         values = info.data
         if values.get("mode") is not ControllerMode.WRITE_ENABLED:
             raise ValueError(
                 "excess_charging requires mode write_enabled: an observe-only "
-                "composition can never actuate, so an enabled advisory block is "
-                "refused at validation time"
+                "composition can never actuate, so an advisory block is refused "
+                "at validation time whether enabled or explicitly disabled"
             )
         policy = values.get("policy")
         if policy is None:

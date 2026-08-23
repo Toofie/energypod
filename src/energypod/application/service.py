@@ -35,6 +35,14 @@ from energypod.domain import Direction, IntentSource, Observation, PowerIntent, 
 from energypod.domain.audit import AuditEvent
 
 from .arbiter import IntentArbiter
+from .excess_charge import ExcessChargingRefusal
+
+# DESIGN_EXCESS_ACTIVATION §3 P3: the once-ever net-billing acknowledgement
+# is ONE durable audit fact with a deterministic event id — the store's own
+# uniqueness enforces once-ever, and the boot-time gate is a single keyed
+# existence check instead of an unbounded audit scan.
+EXCESS_ECONOMICS_ACK_EVENT_ID: Final[str] = "excess-charging-economics-acknowledged"
+EXCESS_ECONOMICS_ASSERTION: Final[str] = "This site's billing nets across phases"
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -169,6 +177,32 @@ class RecoveryView(Protocol):
     """
 
     async def unit_health_states(self) -> Mapping[str, Any]: ...
+
+
+class ExcessChargingControl(Protocol):
+    """The composed excess-adviser controller's facade-facing surface.
+
+    ``energypod.application.excess_charge.ExcessAdviserController`` is the
+    composed implementation.  The facade PROJECTS from it and flips only the
+    participation flag (P5): every commissioned envelope — the cap, the
+    export triple, the read plan, the hysteresis keys, the TTL — is a
+    composition fact this port cannot touch.
+    """
+
+    @property
+    def enabled(self) -> bool: ...
+
+    @property
+    def enabled_origin(self) -> str: ...
+
+    @property
+    def acknowledged_economics(self) -> bool: ...
+
+    def set_participation(self, *, enabled: bool) -> None: ...
+
+    def mark_acknowledged(self) -> None: ...
+
+    def state_payload(self) -> dict[str, Any]: ...
 
 
 class ActorHandle(Protocol):
@@ -547,6 +581,7 @@ class EnergyServiceFacade:
         coordinator: GenerationCoordinator,
         actors: Mapping[str, ActorHandle],
         recovery: RecoveryView | None = None,
+        excess: ExcessChargingControl | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -566,6 +601,7 @@ class EnergyServiceFacade:
         self._coordinator = coordinator
         self._actors = handles
         self._recovery = recovery
+        self._excess = excess
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._latched_stops: dict[str, _LatchedStop] = {}
@@ -589,7 +625,7 @@ class EnergyServiceFacade:
             units.append(
                 await self._unit_view(unit_id, handle, telemetry, active, now_mono, recovery_states)
             )
-        return {
+        view: dict[str, Any] = {
             "site_id": self._site_id,
             "snapshot_sequence": sequence,
             "captured_at": self._clock.wall_now().isoformat(),
@@ -597,25 +633,30 @@ class EnergyServiceFacade:
             # Per-unit intent figures (2026-08-24 cold-load fix): null when no
             # live intent claims any unit.
             "intent": await self._intent_projection(active, now_mono),
-            # Console truth (2026-08-23): a latched emergency stop must be
-            # visible in a snapshot taken after the latch event, not only on
-            # the event stream.  Only non-acknowledged latches appear -- an
-            # acknowledged stop leaves the list, exactly as it leaves the
-            # registry -- and a null unit_ids means the stop fenced the whole
-            # fleet this facade serves.
-            "active_stops": [
-                {
-                    "stop_id": stop.stop_id,
-                    "latched_at": stop.latched_at_wall.isoformat(),
-                    "principal": stop.principal,
-                    "reason_codes": list(stop.reason_codes),
-                    "unit_ids": (
-                        None if self._is_fleet_wide(stop.unit_ids) else sorted(stop.unit_ids)
-                    ),
-                }
-                for stop in self._latched_stops.values()
-            ],
         }
+        if self._excess is not None:
+            # DESIGN_EXCESS_ACTIVATION §1: the projection rides TOP LEVEL
+            # beside ``intent``, present whenever the excess_charging block
+            # is composed (including while suspended), ABSENT when the block
+            # is absent — the same feature-detected addition pattern.
+            view["adviser_state"] = self._excess.state_payload()
+        # Console truth (2026-08-23): a latched emergency stop must be
+        # visible in a snapshot taken after the latch event, not only on
+        # the event stream.  Only non-acknowledged latches appear -- an
+        # acknowledged stop leaves the list, exactly as it leaves the
+        # registry -- and a null unit_ids means the stop fenced the whole
+        # fleet this facade serves.
+        view["active_stops"] = [
+            {
+                "stop_id": stop.stop_id,
+                "latched_at": stop.latched_at_wall.isoformat(),
+                "principal": stop.principal,
+                "reason_codes": list(stop.reason_codes),
+                "unit_ids": (None if self._is_fleet_wide(stop.unit_ids) else sorted(stop.unit_ids)),
+            }
+            for stop in self._latched_stops.values()
+        ]
+        return view
 
     async def unit_detail(self, *, principal: Principal, unit_id: Any) -> dict[str, Any]:
         """Project one unit's latest observation; a read-only repository view.
@@ -804,6 +845,10 @@ class EnergyServiceFacade:
                         else {}
                     ),
                     "unit_ids": sorted(units),
+                    # The acceptance's remaining lifetime rides the event so
+                    # every consumer (not only the 202's caller) can state
+                    # the request's remaining time.
+                    "expires_in_s": duration_s,
                 },
             )
         except Exception:
@@ -917,6 +962,7 @@ class EnergyServiceFacade:
                     "direction": resolved_direction.value,
                     "watts": resolved_watts,
                     "unit_ids": sorted(units),
+                    "expires_in_s": duration_s,
                 },
             )
         except Exception:
@@ -1383,7 +1429,162 @@ class EnergyServiceFacade:
             "latch_cleared": latch_cleared,
         }
 
+    async def set_excess_charging(
+        self,
+        *,
+        action: Any,
+        confirmation: Any,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+        economics: Any = None,
+    ) -> dict[str, Any]:
+        """The guarded activation toggle (DESIGN_EXCESS_ACTIVATION §3).
+
+        The inhibit-acknowledgement guarded-confirmation pattern applied to
+        a feature gate: a typed confirmation always, the arm scope always,
+        an interactive principal to enable (P4), the P2 refusal set on
+        enable, and the once-ever durable net-billing acknowledgement (P3 —
+        durable-append FIRST, latch flip second, an append failure refuses).
+        The mutation adopts the Impl-10 commit-then-audit pattern: the
+        participation flip commits and stands, the audit row follows, and no
+        runtime state ever persists past restart (P1 — the response spells
+        ``persisted: false`` every time).
+        """
+        if action not in ("enable", "disable"):
+            raise ValueError("action must be 'enable' or 'disable'")
+        if confirmation != "EXCESS":
+            raise ValueError("confirmation must be the literal 'EXCESS'")
+        if economics is not None and economics != "NET_BILLED":
+            raise ValueError("economics must be the literal 'NET_BILLED' when present")
+        self._admit(principal, "arm", interactive=(action == "enable"))
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        control = self._excess
+        if control is None:
+            # P6: an ABSENT block composes nothing — no adviser, no
+            # projection, no tile, and nothing to toggle.
+            raise ExcessChargingRefusal(
+                "excess_charging_not_commissioned",
+                "the excess_charging feature is not composed on this site",
+            )
+        acknowledged_now = False
+        if action == "enable":
+            await self._refuse_conflicted_enable()
+            if not control.acknowledged_economics:
+                if economics is None:
+                    raise ExcessChargingRefusal(
+                        "economics_acknowledgement_required",
+                        "the one-time net-billing acknowledgement is required before the "
+                        "first enable",
+                        {"acknowledgement": "NET_BILLED"},
+                    )
+                # P3 ordering, pinned: the durable fact lands BEFORE the
+                # latch flips, and a failing append refuses the enable — no
+                # enable without the durable fact, never a silent pass.
+                await self._append_audit(
+                    self._mutation_audit(
+                        event_id=EXCESS_ECONOMICS_ACK_EVENT_ID,
+                        event_type="excess_charging_economics_acknowledged",
+                        subject=principal.subject,
+                        result="acknowledged",
+                        request_id=request,
+                        reason_codes=("net_billed_acknowledged",),
+                        lifecycle=self._fleet_lifecycle(),
+                        payload={
+                            "assertion": EXCESS_ECONOMICS_ASSERTION,
+                            "economics": "NET_BILLED",
+                        },
+                    )
+                )
+                control.mark_acknowledged()
+                acknowledged_now = True
+        result = "noop"
+        if action == "enable":
+            if not control.enabled:
+                control.set_participation(enabled=True)
+                result = "enabled"
+            elif acknowledged_now:
+                # A config-enabled-but-suspended site: the toggle's act — the
+                # captured acknowledgement — is what put it into
+                # participation; that is an enable, not a no-op.
+                result = "enabled"
+        elif control.enabled:
+            control.set_participation(enabled=False)
+            result = "disabled"
+        # Impl-10 commit-then-audit: the flip above has committed; the audit
+        # failure surfaces after it and never rolls participation back.
+        await self._append_audit(
+            self._mutation_audit(
+                event_type="excess_charging_toggled",
+                subject=principal.subject,
+                result=result,
+                request_id=request,
+                reason_codes=(result,),
+                lifecycle=self._fleet_lifecycle(),
+                payload={
+                    "action": action,
+                    "enabled": control.enabled,
+                    "enabled_origin": control.enabled_origin,
+                    "economics_captured": economics == "NET_BILLED",
+                },
+            )
+        )
+        return {
+            "feature": "excess_charging",
+            "enabled": control.enabled,
+            "enabled_origin": control.enabled_origin,
+            "persisted": False,
+            "acknowledged_economics": control.acknowledged_economics,
+            "adviser_state": control.state_payload(),
+        }
+
     # --- internal helpers ---------------------------------------------------
+
+    async def _refuse_conflicted_enable(self) -> None:
+        """P2: refuse an enable while any unit runs under another intent or
+        any latched stop holds.
+
+        Enabling under an active manual/agent/schedule request is legal (the
+        adviser would simply yield per unit) but opaque — the operator would
+        see "on" doing nothing, the exact invisibility this package exists
+        to remove — so the refusal names the conflicted units and forces a
+        deliberate finish-or-cancel first.  A latched stop fences the whole
+        fleet; enabling under it is dead state.  Latched INHIBITS (e.g.
+        ``external_writer``) do NOT refuse: the selector skips those units
+        honestly (``no_eligible_target``) and the projection says so.
+        ``disable`` is never refused — stopping is safety-positive.
+        """
+        unit_ids: set[str] = set()
+        stop_ids: list[str] = []
+        reasons: list[str] = []
+        try:
+            active = await self._intents.active(float(self._clock.monotonic()))
+        except Exception:
+            # An unreadable intent store fails safe for the refusal: treat
+            # every unit as potentially claimed rather than guess.
+            unit_ids = set(self._actors)
+            active = ()
+        for intent in active:
+            source = _enum_value(getattr(intent, "source", None))
+            if source in ("manual", "agent", "schedule"):
+                unit_ids.update(getattr(intent, "selected_unit_ids", ()) or ())
+        if unit_ids:
+            reasons.append("unit_active_under_intent")
+        if self._latched_stops:
+            stop_ids = sorted(self._latched_stops)
+            reasons.append("latched_stop_holds")
+        if reasons:
+            raise ExcessChargingRefusal(
+                "excess_enable_refused",
+                "enabling requires a fleet with no request running and no latched stop",
+                {"reasons": reasons, "unit_ids": sorted(unit_ids), "stop_ids": stop_ids},
+            )
+
+    def _fleet_lifecycle(self) -> UnitLifecycle:
+        """The aggregate lifecycle for a fleet-wide facade mutation row."""
+        first = next(iter(self._actors), None)
+        return self._handle_lifecycle(first) if first is not None else UnitLifecycle.DISARMED
 
     async def _refuse_undispatchable_modes(self, units: Sequence[str]) -> None:
         """Refuse dispatch onto units whose mode words say it would be ignored.
@@ -1766,6 +1967,7 @@ class EnergyServiceFacade:
         intent_id: str | None = None,
         generation: int | None = None,
         payload: Mapping[str, Any] | None = None,
+        event_id: str | None = None,
     ) -> AuditEvent:
         now_mono = float(self._clock.monotonic())
         wall = self._clock.wall_now()
@@ -1778,7 +1980,7 @@ class EnergyServiceFacade:
             **dict(payload or {}),
         }
         return AuditEvent(
-            event_id=f"facade-{uuid.uuid4().hex}",
+            event_id=(f"facade-{uuid.uuid4().hex}" if event_id is None else event_id),
             occurred_at=wall.astimezone(UTC),
             monotonic_offset_s=now_mono - self._process_origin_mono,
             process_instance_id=self._process_instance_id,

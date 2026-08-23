@@ -449,10 +449,11 @@ def test_the_pod_autonomy_signature_band_is_optional_and_positive() -> None:
 # --- excess-solar accelerated charging gates (API_CONTRACTS "Excess-solar
 # --- accelerated charging (advisory)") ----------------------------------------
 #
-# The feature is OFF by default (an absent block is identical to disabled),
-# and an enabled block is commissioned only for a write-enabled deployment
-# with a policy, coherent hysteresis, a cap inside the static unit charge
-# limit, a satisfiable freshness bound, and a bounded intent TTL.
+# The feature is OFF by default (an absent block composes nothing), and a
+# PRESENT block — enabled or explicitly disabled (P6) — is commissioned only
+# for a write-enabled deployment with a policy, coherent hysteresis, a cap
+# inside the static unit charge limit, a satisfiable freshness bound, and a
+# bounded intent TTL.
 
 
 def _excess_payload(**overrides: Any) -> dict[str, Any]:
@@ -496,6 +497,35 @@ def test_excess_charging_is_disabled_by_default() -> None:
     explicit_off["excess_charging"] = {"enabled": False}
     parsed_off = _validate(explicit_off)
     assert parsed_off.excess_charging.enabled is False
+
+
+# --- P6 rescope (DESIGN_EXCESS_ACTIVATION): the commissioning gates bind to
+# --- block-PRESENT, not enabled — an explicit disabled block that could
+# --- never be enabled safely is refused at validation time; an absent block
+# --- still changes nothing anywhere.
+
+
+def test_a_disabled_excess_block_still_requires_write_enabled_mode() -> None:
+    payload = _valid_config(mode="observe_only")
+    payload["excess_charging"] = {"enabled": False}
+    _assert_excess_rule(payload, message_contains="write_enabled")
+
+
+def test_a_disabled_excess_block_still_carries_every_commissioning_gate() -> None:
+    """The runtime toggle flips participation only (P5) — it can never raise
+    the cap or relax a gate — so a disabled block with an unsatisfiable cap
+    or incoherent hysteresis must be refused BEFORE it could be enabled."""
+    bad_cap = _valid_config()
+    bad_cap["excess_charging"] = {"enabled": False, "max_charge_from_export_w": 2501}
+    _assert_excess_rule(bad_cap, message_contains="max_unit_charge_w")
+
+    bad_hysteresis = _valid_config()
+    bad_hysteresis["excess_charging"] = {"enabled": False, "exit_hysteresis_w": 100}
+    _assert_excess_rule(bad_hysteresis, message_contains="hysteresis")
+
+    bad_freshness = _valid_config()
+    bad_freshness["excess_charging"] = {"enabled": False, "export_telemetry_max_age_s": 0.50}
+    _assert_excess_rule(bad_freshness, message_contains="control_period_s")
 
 
 def test_excess_charging_enabled_validates_and_carries_pinned_defaults() -> None:

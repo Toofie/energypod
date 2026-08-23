@@ -142,6 +142,7 @@ async def test_submit_intent_audit_and_publication_content(facade_api: Any) -> N
                 "direction": "discharge",
                 "watts": 900,
                 "unit_ids": ["pod-a"],
+                "expires_in_s": 30.0,
             },
         },
     )
@@ -191,6 +192,7 @@ async def test_submit_intent_per_unit_audit_and_publication_content(
                 "watts": 1_500,
                 "watts_by_unit": {"pod-a": 900, "pod-b": 600},
                 "unit_ids": ["pod-a", "pod-b"],
+                "expires_in_s": 30.0,
             },
         },
     )
