@@ -654,6 +654,7 @@ class Rig:
     objectives: FakeForeignObjectiveView | None = None
     excess: Any = None
     schedules: Any = None
+    night: Any = None
 
     def reset_recorders(self) -> None:
         self.intents.added.clear()
@@ -724,6 +725,7 @@ def make_rig(
     objectives: FakeForeignObjectiveView | None = None,
     excess: Any = None,
     schedules: Any = None,
+    night: Any = None,
 ) -> Rig:
     clock = FakeClock()
     history: list[str] = []
@@ -768,6 +770,7 @@ def make_rig(
         recovery=recovery,
         excess=excess,
         schedules=schedules,
+        night=night,
         **objective_kwargs,
     )
     return Rig(
@@ -785,6 +788,7 @@ def make_rig(
         recovery=recovery,
         objectives=objectives,
         excess=excess,
+        night=night,
     )
 
 
@@ -3872,6 +3876,367 @@ async def test_intent_acceptance_events_carry_the_remaining_lifetime(api: Any) -
     accepted = [body for body in rig.bus.published if body["type"] == "intent.accepted"]
     assert len(accepted) == 1
     assert accepted[0]["payload"]["expires_in_s"] == 42.0
+
+
+# --- DESIGN_NIGHT_CHARGE §2.1/§3.2 B3: the night facade surface ------------------
+#
+# POST /api/v1/night-charging's facade half: the excess toggle's pattern with
+# the night feature's own codes — the shared durable-once PARTITION
+# acknowledgement (either surface's capture counts; durable-append-FIRST, an
+# audit failure refuses), the P2 refusal set on enable, the snapshot's
+# feature-detected `night_charge_state`, and the composition-internal
+# `submit_night_intent` twin (source pinned OPTIMIZER, `night-` prefix,
+# per-battery watts native, never routed on REST or MCP).
+
+
+NIGHT_SHARED_ACK_EVENT_ID = "schedule-night-windows-acknowledged"
+NIGHT_PARTITION_ASSERTION = (
+    "the external writer applications stand down for the granted window; the controller owns it"
+)
+
+
+class FakeNightControl:
+    """Inline stand-in for the composed NightChargeController port."""
+
+    def __init__(
+        self,
+        *,
+        acknowledged: bool = False,
+        enabled: bool = False,
+        origin: str = "config",
+    ) -> None:
+        self.acknowledged_partition = acknowledged
+        self.enabled = enabled
+        self.enabled_origin = origin
+        self.flips: list[bool] = []
+        self.acknowledged_at = 0
+
+    def set_participation(self, *, enabled: bool) -> None:
+        self.flips.append(bool(enabled))
+        self.enabled = bool(enabled)
+        self.enabled_origin = "runtime"
+
+    def mark_acknowledged(self) -> None:
+        self.acknowledged_at += 1
+        self.acknowledged_partition = True
+
+    def state_payload(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "enabled_origin": self.enabled_origin,
+            "acknowledged_partition": self.acknowledged_partition,
+            "posture": "partition",
+            "active": False,
+            "phase": "idle",
+            "window": {
+                "start_local": "00:00",
+                "end_local": "06:00",
+                "timezone": "Australia/Brisbane",
+            },
+            "window_ends_at": None,
+            "window_ends_in_s": None,
+            "next_window_at": None,
+            "pacing": "cap_first",
+            "rate_cap_w": 2_500,
+            "hold_rate_w": 100,
+            "demand_scope": "fleet",
+            "demand_threshold_w": 1_000,
+            "demand_w": None,
+            "demand_evidence": "missing",
+            "held_intent_id": None,
+            "units": [],
+            "last_action": "idle",
+            "last_tick_at": "2026-08-27T01:02:03+00:00",
+            "reason_codes": ["disabled_by_config"],
+        }
+
+
+def night_toggle_kwargs(**overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "action": "disable",
+        "confirmation": "NIGHT",
+        "principal": OPERATOR,
+        "idempotency_key": "night-key-1",
+        "request_id": "night-request-1",
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def make_night_rig(
+    api: Any,
+    *,
+    acknowledged: bool = False,
+    config_enabled: bool = False,
+    **rig_kwargs: Any,
+) -> Rig:
+    control = FakeNightControl(acknowledged=acknowledged, enabled=config_enabled, origin="config")
+    rig_kwargs.setdefault("units", {"pod-a": {}, "pod-b": {}})
+    return make_rig(api, night=control, **rig_kwargs)
+
+
+async def test_night_toggle_without_a_composed_block_is_not_commissioned(api: Any) -> None:
+    rig = make_rig(api)
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.set_night_charging(**night_toggle_kwargs())
+
+    assert _refusal_code(caught.value) == "night_charging_not_commissioned"
+    assert getattr(caught.value, "details", {}) == {}
+
+
+async def test_night_disable_flips_participation_audits_and_answers_the_contract_body(
+    api: Any,
+) -> None:
+    rig = make_night_rig(api, acknowledged=True, config_enabled=True)
+
+    result = await rig.facade.set_night_charging(**night_toggle_kwargs(action="disable"))
+
+    assert result["feature"] == "night_charging"
+    assert result["enabled"] is False
+    assert result["enabled_origin"] == "runtime"
+    assert result["persisted"] is False, "the non-persistence policy rides every response"
+    assert result["acknowledged_partition"] is True
+    assert result["night_charge_state"]["enabled"] is False
+    assert result["night_charge_state"]["enabled_origin"] == "runtime"
+    if rig.night:
+        assert rig.night.flips == [False]
+    toggled = [
+        event for event in rig.audit.appended if event.event_type == "night_charging_toggled"
+    ]
+    assert len(toggled) == 1
+    assert toggled[0].result == "disabled"
+    assert toggled[0].principal == OPERATOR.subject
+    assert toggled[0].reason_codes == ("disabled",)
+
+
+async def test_night_enable_requires_the_arm_scope_and_an_interactive_principal(api: Any) -> None:
+    rig = make_night_rig(api, acknowledged=True, config_enabled=False)
+    automation = Principal(
+        subject="service:automation",
+        scopes=frozenset({"observe", "dispatch", "arm"}),
+        interactive=False,
+    )
+
+    with pytest.raises(PermissionError, match="interactive"):
+        await rig.facade.set_night_charging(
+            **night_toggle_kwargs(
+                action="enable", principal=automation, night_posture="PARTITION_ACKNOWLEDGED"
+            )
+        )
+    viewer = Principal(subject="person:viewer", scopes=frozenset({"observe"}))
+    with pytest.raises(PermissionError, match="arm"):
+        await rig.facade.set_night_charging(
+            **night_toggle_kwargs(action="enable", principal=viewer)
+        )
+    # The arm/disarm asymmetry: disable is safety-positive, arm scope alone.
+    await rig.facade.set_night_charging(
+        **night_toggle_kwargs(action="disable", principal=automation)
+    )
+
+
+async def test_the_first_night_enable_needs_the_partition_acknowledgement(api: Any) -> None:
+    rig = make_night_rig(api, acknowledged=False, config_enabled=False)
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.set_night_charging(**night_toggle_kwargs(action="enable"))
+
+    assert _refusal_code(caught.value) == "night_acknowledgement_required"
+    assert getattr(caught.value, "details", {}) == {"acknowledgement": "PARTITION_ACKNOWLEDGED"}
+    assert not rig.audit.appended, "a refusal appends nothing"
+    if rig.night:
+        assert rig.night.flips == []
+
+
+async def test_the_first_night_enable_captures_the_shared_acknowledgement_durably_first(
+    api: Any,
+) -> None:
+    """§3.2: the SECOND capture path — the first enable carries
+    PARTITION_ACKNOWLEDGED, the durable fact lands FIRST under the schedule
+    surface's own historical event id (one site fact, either surface's
+    capture counts), then the latch flips and the toggle's own row follows."""
+    rig = make_night_rig(api, acknowledged=False, config_enabled=False)
+
+    result = await rig.facade.set_night_charging(
+        **night_toggle_kwargs(action="enable", night_posture="PARTITION_ACKNOWLEDGED")
+    )
+
+    assert [event.event_type for event in rig.audit.appended] == [
+        "schedule_night_windows_acknowledged",
+        "night_charging_toggled",
+    ]
+    ack = rig.audit.appended[0]
+    assert ack.event_id == NIGHT_SHARED_ACK_EVENT_ID
+    assert ack.principal == OPERATOR.subject
+    assert ack.result == "acknowledged"
+    assert rig.audit.appended[1].result == "enabled"
+    assert rig.night is not None and rig.night.flips == [True]
+    assert rig.night.acknowledged_partition is True
+    assert result["enabled"] is True
+    assert result["enabled_origin"] == "runtime"
+    assert result["acknowledged_partition"] is True
+
+    # Once ever: a later enable needs no posture field and appends no ack row.
+    rig.audit.appended.clear()
+    await rig.facade.set_night_charging(
+        **night_toggle_kwargs(action="disable", idempotency_key="night-key-2")
+    )
+    if rig.night:
+        rig.night.flips.clear()
+    result = await rig.facade.set_night_charging(
+        **night_toggle_kwargs(action="enable", idempotency_key="night-key-3")
+    )
+    assert [event.event_type for event in rig.audit.appended] == [
+        "night_charging_toggled",
+        "night_charging_toggled",
+    ]
+    assert result["acknowledged_partition"] is True
+
+
+async def test_a_night_acknowledgement_append_failure_refuses_the_enable(api: Any) -> None:
+    rig = make_night_rig(api, acknowledged=False, config_enabled=False)
+    rig.audit.failing = True
+
+    with pytest.raises(OSError, match="audit store unavailable"):
+        await rig.facade.set_night_charging(
+            **night_toggle_kwargs(action="enable", night_posture="PARTITION_ACKNOWLEDGED")
+        )
+
+    assert rig.night is not None
+    assert rig.night.flips == [], "the participation flag never moved"
+    assert rig.night.acknowledged_partition is False, "the latch never flipped"
+
+
+async def test_the_schedules_surface_capture_counts_as_the_night_acknowledgement(
+    api: Any,
+) -> None:
+    """The one-site-fact invariant, live in-process: a night capture marks
+    the schedule surface's latch too, and a schedule capture (an already-
+    acknowledged surface) means the night toggle never re-prompts."""
+    schedule = FakeScheduleSurface(acknowledged=False, windows=(("00:00", "20:00"),))
+    rig = make_night_rig(api, acknowledged=False, config_enabled=False, schedules=schedule)
+
+    await rig.facade.set_night_charging(
+        **night_toggle_kwargs(action="enable", night_posture="PARTITION_ACKNOWLEDGED")
+    )
+
+    assert schedule.acknowledged_night_windows is True, "one site fact, both latches"
+
+    # The inverse direction: a pre-acknowledged schedule surface means the
+    # night controller's own boot-loaded latch is the same fact.
+    acknowledged_schedule = FakeScheduleSurface(acknowledged=True, windows=(("00:00", "20:00"),))
+    other = make_night_rig(
+        api, acknowledged=True, config_enabled=False, schedules=acknowledged_schedule
+    )
+    result = await other.facade.set_night_charging(
+        **night_toggle_kwargs(action="enable", idempotency_key="night-key-4")
+    )
+    assert result["enabled"] is True, "no posture field needed — the fact already exists"
+
+
+async def test_night_enable_is_refused_while_a_unit_runs_under_another_intent(api: Any) -> None:
+    rig = make_night_rig(
+        api,
+        acknowledged=True,
+        config_enabled=False,
+        seeded_intents=(manual_intent(api, revision=5, watts=900, unit_ids=frozenset({"pod-a"})),),
+    )
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.set_night_charging(**night_toggle_kwargs(action="enable"))
+
+    assert _refusal_code(caught.value) == "night_enable_refused"
+    details = getattr(caught.value, "details", {})
+    assert details["reasons"] == ["unit_active_under_intent"]
+    assert details["unit_ids"] == ["pod-a"]
+    assert details["stop_ids"] == []
+    assert rig.night is not None and rig.night.flips == []
+
+
+async def test_night_enable_is_refused_while_a_latched_stop_holds_and_disable_never_is(
+    api: Any,
+) -> None:
+    rig = make_night_rig(api, acknowledged=True, config_enabled=False)
+    stop = await rig.facade.emergency_stop(
+        unit_ids=["pod-a", "pod-b"],
+        reason="latched for the night refusal scenario",
+        principal=OPERATOR,
+        idempotency_key="night-stop-key-1",
+        request_id="night-stop-request-1",
+    )
+
+    with pytest.raises(Exception) as caught:
+        await rig.facade.set_night_charging(**night_toggle_kwargs(action="enable"))
+
+    assert _refusal_code(caught.value) == "night_enable_refused"
+    details = getattr(caught.value, "details", {})
+    assert details["reasons"] == ["latched_stop_holds"]
+    assert details["stop_ids"] == [stop["stop_id"]]
+
+    # Disable is never refused — stopping is the safety-positive direction.
+    rig.audit.appended.clear()
+    result = await rig.facade.set_night_charging(**night_toggle_kwargs(action="disable"))
+    assert result["enabled"] is False
+
+
+async def test_the_night_toggle_validates_its_literals_at_the_facade_too(api: Any) -> None:
+    rig = make_night_rig(api, acknowledged=True, config_enabled=True)
+    with pytest.raises(ValueError, match="action"):
+        await rig.facade.set_night_charging(**night_toggle_kwargs(action="pause"))
+    with pytest.raises(ValueError, match="confirmation"):
+        await rig.facade.set_night_charging(**night_toggle_kwargs(confirmation="EXCESS"))
+    with pytest.raises(ValueError, match="night_posture"):
+        await rig.facade.set_night_charging(
+            **night_toggle_kwargs(action="disable", night_posture="YIELDED")
+        )
+    assert rig.night is not None and rig.night.flips == []
+
+
+async def test_the_snapshot_carries_night_charge_state_exactly_when_composed(api: Any) -> None:
+    rig = make_night_rig(api, acknowledged=False, config_enabled=False)
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    assert "night_charge_state" in snapshot
+    assert snapshot["night_charge_state"]["enabled"] is False
+    assert snapshot["night_charge_state"]["reason_codes"] == ["disabled_by_config"]
+
+    bare = make_rig(api)
+    absent = await bare.facade.snapshot(principal=OPERATOR)
+    assert "night_charge_state" not in absent, "absent block = byte-identical snapshot"
+
+
+async def test_submit_night_intent_pins_source_prefix_and_per_unit_watts(api: Any) -> None:
+    """The `submit_advisory_intent` twin (§2.1): source pinned OPTIMIZER,
+    intent-id prefix `night-`, the per-battery watt form native, and the same
+    audit/publication contract — a night charge is an ordinary intent."""
+    from types import SimpleNamespace
+
+    rig = make_rig(api)
+
+    principal = SimpleNamespace(
+        subject="energypod:night-adviser",
+        scopes=frozenset({"observe", "dispatch"}),
+        interactive=False,
+        site_id=SITE_ID,
+    )
+    result = await rig.facade.submit_night_intent(
+        unit_ids=["pod-a", "pod-b"],
+        direction="charge",
+        watts=None,
+        watts_by_unit={"pod-a": 2_500, "pod-b": 100},
+        ttl_s=10.0,
+        principal=principal,
+    )
+
+    assert result["intent_id"].startswith("night-")
+    stored = rig.intents.added[0]
+    assert stored.source.value == "optimizer"
+    assert stored.watts_by_unit == {"pod-a": 2_500, "pod-b": 100}
+    assert stored.watts == 2_600
+    assert stored.actor_identity == "energypod:night-adviser"
+    accepted = [event for event in rig.audit.appended if event.event_type == "intent_accepted"]
+    assert accepted[0].source.value == "optimizer"
+    published = [body for body in rig.bus.published if body["type"] == "intent.accepted"]
+    assert published[0]["payload"]["watts_by_unit"] == {"pod-a": 2_500, "pod-b": 100}
 
 
 # --- DESIGN_SCHEDULES §5 B3: the schedule facade surface ------------------------

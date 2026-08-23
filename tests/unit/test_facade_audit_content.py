@@ -472,3 +472,58 @@ async def test_schedule_replaced_audit_and_publication_content(facade_api: Any) 
             },
         },
     )
+
+
+async def test_night_charging_toggled_and_the_shared_ack_content(facade_api: Any) -> None:
+    """DESIGN_NIGHT_CHARGE §3.2/§5 (B3): the first enable appends the SHARED
+    durable-once partition fact under the schedules surface's own historical
+    event id (either surface's capture counts — one site fact), with §8 item
+    2's assertion verbatim inside the fingerprint fact set, then the
+    toggle's own Impl-10 row."""
+    from tests.unit.test_service_facade import make_night_rig, night_toggle_kwargs
+
+    rig = make_night_rig(facade_api, acknowledged=False, config_enabled=False)
+    await rig.facade.set_night_charging(
+        **night_toggle_kwargs(action="enable", night_posture="PARTITION_ACKNOWLEDGED")
+    )
+
+    assert len(rig.audit.appended) == 2
+    ack, toggled = rig.audit.appended
+    # The ack row carries the DETERMINISTIC shared event id (not a facade
+    # uuid), so it is projected by hand for the fingerprint check.
+    ack_dumped = ack.model_dump()
+    assert ack_dumped["event_type"] == "schedule_night_windows_acknowledged"
+    assert ack_dumped["event_id"] == "schedule-night-windows-acknowledged"
+    assert ack_dumped["result"] == "acknowledged"
+    assert ack_dumped["principal"] == OPERATOR.subject
+    assert ack_dumped["correlation_id"] == (
+        "facade:schedule_night_windows_acknowledged:night-request-1"
+    )
+    assert ack_dumped["request_fingerprint"] == fingerprint(
+        {
+            "event_type": "schedule_night_windows_acknowledged",
+            "principal": OPERATOR.subject,
+            "result": "acknowledged",
+            "assertion": (
+                "the external writer applications stand down for the granted "
+                "window; the controller owns it"
+            ),
+            "captured_via": "night_charging",
+        }
+    )
+    toggled_dumped = audit_facts(toggled)
+    assert toggled_dumped["event_type"] == "night_charging_toggled"
+    assert toggled_dumped["result"] == "enabled"
+    assert toggled_dumped["reason_codes"] == ("enabled",)
+    assert toggled_dumped["request_fingerprint"] == fingerprint(
+        {
+            "event_type": "night_charging_toggled",
+            "principal": OPERATOR.subject,
+            "result": "enabled",
+            "action": "enable",
+            "enabled": True,
+            "enabled_origin": "runtime",
+            "partition_acknowledged": True,
+        }
+    )
+    assert rig.bus.published == [], "the toggle publishes no dedicated bus event"

@@ -52,6 +52,7 @@ from .energy import EnergyScorecardRefusal
 from .excess_charge import ExcessChargingRefusal
 from .foreign_objective import empty_objective_entry
 from .history import PLANT_HISTORY_NOT_COMMISSIONED, PlantHistoryRefusal
+from .night_charge import NightChargingRefusal
 from .scheduling import (
     SchedulePolicy,
     SchedulePublishValidationError,
@@ -331,6 +332,33 @@ class ScheduleSurface(Protocol):
     async def get_plan(self) -> Any | None: ...
 
     async def replace_plan(self, *, expected_version: int, replacement: Any) -> None: ...
+
+    def state_payload(self) -> dict[str, Any]: ...
+
+
+class NightChargingControl(Protocol):
+    """The composed night-charge controller's facade-facing surface.
+
+    ``energypod.application.night_charge.NightChargeController`` is the
+    composed implementation.  The facade PROJECTS from it and flips only the
+    participation flag: every commissioned envelope — the window, the caps,
+    the pacing choice, the PARTITION grant, the TTL — is a composition fact
+    this port cannot touch.  The acknowledgement latch is the SHARED
+    night-partition site fact: either surface's audited capture flips it.
+    """
+
+    @property
+    def enabled(self) -> bool: ...
+
+    @property
+    def enabled_origin(self) -> str: ...
+
+    @property
+    def acknowledged_partition(self) -> bool: ...
+
+    def set_participation(self, *, enabled: bool) -> None: ...
+
+    def mark_acknowledged(self) -> None: ...
 
     def state_payload(self) -> dict[str, Any]: ...
 
@@ -1008,6 +1036,7 @@ class EnergyServiceFacade:
         schedules: ScheduleSurface | None = None,
         energy: EnergyScorecardSurface | None = None,
         history: PlantHistorySurface | None = None,
+        night: NightChargingControl | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -1032,9 +1061,11 @@ class EnergyServiceFacade:
         self._schedules = schedules
         self._energy = energy
         self._history = history
+        self._night = night
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._schedule_correlations = itertools.count(1)
+        self._night_correlations = itertools.count(1)
         self._latched_stops: dict[str, _LatchedStop] = {}
         self._acknowledged_stops: set[str] = set()
         self._process_instance_id = f"facade-{uuid.uuid4().hex}"
@@ -1091,6 +1122,14 @@ class EnergyServiceFacade:
             # composed, ABSENT when it is not -- the live "history is
             # recording" hint the console keys on.
             view["history_state"] = self._history.state_payload()
+        if self._night is not None:
+            # DESIGN_NIGHT_CHARGE §5: the ``night_charge_state`` projection
+            # rides TOP LEVEL beside its siblings, present whenever the
+            # ``night_charging`` block is composed (including while
+            # suspended), ABSENT when the block is absent — the same
+            # feature-detected addition pattern, single writer the fleet
+            # loop's post-tick update.
+            view["night_charge_state"] = self._night.state_payload()
         # Console truth (2026-08-23): a latched emergency stop must be
         # visible in a snapshot taken after the latch event, not only on
         # the event stream.  Only non-acknowledged latches appear -- an
@@ -1653,6 +1692,131 @@ class EnergyServiceFacade:
             # Atomic with its audit and publication exactly like submit_intent
             # and submit_advisory_intent: a schedule drive that failed here
             # must leave nothing stored for the kernel to arbitrate on.
+            with contextlib.suppress(Exception):
+                await self._intents.remove(intent_id)
+            raise
+        return {
+            "intent_id": intent_id,
+            "acceptance_revision": revision,
+            "accepted_at_monotonic": now_mono,
+            "status": "accepted",
+            "requested": {
+                "direction": resolved_direction.value,
+                "watts": resolved_watts,
+                **(
+                    {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                    if resolved_per_unit is not None
+                    else {}
+                ),
+            },
+            "authorized": None,
+            "measured": None,
+            "expires_in_s": duration_s,
+        }
+
+    async def submit_night_intent(
+        self,
+        *,
+        unit_ids: Any,
+        direction: Any,
+        watts: Any,
+        ttl_s: Any,
+        reason: Any = None,
+        principal: Principal,
+        idempotency_key: Any = None,
+        request_id: Any = None,
+        watts_by_unit: Any = None,
+    ) -> dict[str, Any]:
+        """Accept one internal night OPTIMIZER intent; the adviser's twin.
+
+        DESIGN_NIGHT_CHARGE §2.1: the exact ``submit_advisory_intent`` /
+        ``submit_schedule_intent`` pattern — same validation, audit event
+        type, idempotency/correlation contract, and publication — with the
+        mintage source pinned to ``OPTIMIZER`` (a night charge is an ordinary
+        intent judged by everything exactly as a manual request is) and its
+        own intent-id prefix (``night-``), so audit attribution separates the
+        automation principal plus ``optimizer`` tag from every console,
+        agent, schedule-runner, and excess-adviser row.  Composition-only
+        wiring: never routed on REST or MCP, and only the composed
+        ``energypod:night-adviser`` principal ever reaches it.  The
+        per-battery watt form is native (the 2026-08-23 operator ruling).
+        """
+        self._admit(principal, "dispatch")
+        units = _validated_units(unit_ids)
+        unknown = [unit_id for unit_id in units if unit_id not in self._actors]
+        if unknown:
+            raise ValueError(f"unknown units requested: {unknown}")
+        await self._refuse_undispatchable_modes(units)
+        resolved_direction = _dispatch_direction(direction)
+        resolved_watts, resolved_per_unit = _dispatch_watts(watts, watts_by_unit, units)
+        duration_s = _positive_duration(ttl_s)
+        _reason_text(reason, required=False)
+        resolved_idempotency = (
+            self._night_key("idempotency") if idempotency_key is None else idempotency_key
+        )
+        _correlation_key(resolved_idempotency, "idempotency_key")
+        request_source = self._night_key("request") if request_id is None else request_id
+        request = _correlation_key(request_source, "request_id")
+
+        now_mono = float(self._clock.monotonic())
+        revision = self._next_revision()
+        intent_id = f"night-{revision}-{now_mono:.6f}"
+        intent = PowerIntent(
+            id=intent_id,
+            source=IntentSource.OPTIMIZER,
+            selected_unit_ids=frozenset(units),
+            direction=resolved_direction,
+            watts=resolved_watts,
+            watts_by_unit=resolved_per_unit,
+            duration_s=duration_s,
+            accepted_at_mono=now_mono,
+            acceptance_revision=revision,
+            actor_identity=principal.subject,
+        )
+        await self._intents.add(intent)
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="intent_accepted",
+                    subject=principal.subject,
+                    result="accepted",
+                    request_id=request,
+                    source=IntentSource.OPTIMIZER,
+                    intent_id=intent_id,
+                    reason_codes=("accepted",),
+                    lifecycle=UnitLifecycle.DISARMED,
+                    payload={
+                        "direction": resolved_direction.value,
+                        "unit_ids": sorted(units),
+                        "watts": resolved_watts,
+                        **(
+                            {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                            if resolved_per_unit is not None
+                            else {}
+                        ),
+                    },
+                )
+            )
+            await self._publish(
+                "intent.accepted",
+                {
+                    "principal": principal.subject,
+                    "intent_id": intent_id,
+                    "direction": resolved_direction.value,
+                    "watts": resolved_watts,
+                    **(
+                        {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                        if resolved_per_unit is not None
+                        else {}
+                    ),
+                    "unit_ids": sorted(units),
+                    "expires_in_s": duration_s,
+                },
+            )
+        except Exception:
+            # Atomic with its audit and publication exactly like its twins: a
+            # night drive that failed here must leave nothing stored for the
+            # kernel to arbitrate on.
             with contextlib.suppress(Exception):
                 await self._intents.remove(intent_id)
             raise
@@ -2309,6 +2473,131 @@ class EnergyServiceFacade:
             "adviser_state": control.state_payload(),
         }
 
+    async def set_night_charging(
+        self,
+        *,
+        action: Any,
+        confirmation: Any,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+        night_posture: Any = None,
+    ) -> dict[str, Any]:
+        """The guarded night activation toggle (DESIGN_NIGHT_CHARGE §3.4-4).
+
+        The excess toggle's exact pattern with the night feature's own codes:
+        a typed ``NIGHT`` confirmation always, the arm scope always, an
+        interactive principal to enable, the refusal set on enable, and the
+        SHARED durable-once night-partition acknowledgement (§3.2 — the
+        schedules surface's own historical event id, either surface's capture
+        counts; durable-append FIRST, latch flip second, an append failure
+        refuses).  Impl-10 commit-then-audit: the participation flip commits
+        and stands, the audit row follows, and no runtime state ever
+        persists past restart (``persisted: false`` rides every response).
+        """
+        if action not in ("enable", "disable"):
+            raise ValueError("action must be 'enable' or 'disable'")
+        if confirmation != "NIGHT":
+            raise ValueError("confirmation must be the literal 'NIGHT'")
+        if night_posture is not None and night_posture != "PARTITION_ACKNOWLEDGED":
+            raise ValueError(
+                "night_posture must be the literal 'PARTITION_ACKNOWLEDGED' when present"
+            )
+        self._admit(principal, "arm", interactive=(action == "enable"))
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        control = self._night
+        if control is None:
+            # Block-presence doctrine: an ABSENT block composes nothing — no
+            # adviser, no projection, no tile, and nothing to toggle.
+            raise NightChargingRefusal(
+                "night_charging_not_commissioned",
+                "the night_charging feature is not composed on this site",
+            )
+        acknowledged_now = False
+        if action == "enable":
+            conflicts = await self._enable_conflicts()
+            if conflicts is not None:
+                reasons, unit_ids, stop_ids = conflicts
+                raise NightChargingRefusal(
+                    "night_enable_refused",
+                    "enabling requires a fleet with no request running and no latched stop",
+                    {"reasons": reasons, "unit_ids": unit_ids, "stop_ids": stop_ids},
+                )
+            if not control.acknowledged_partition:
+                if night_posture is None:
+                    raise NightChargingRefusal(
+                        "night_acknowledgement_required",
+                        "the one-time night-partition acknowledgement is required before "
+                        "the first enable",
+                        {"acknowledgement": "PARTITION_ACKNOWLEDGED"},
+                    )
+                # §3.2 ordering, pinned: the durable fact lands BEFORE the
+                # latch flips, and a failing append refuses the enable — no
+                # enable without the durable fact, never a silent pass.  The
+                # event id is the schedules surface's own historical one: it
+                # is ONE site fact, and either surface's capture counts.
+                await self._append_audit(
+                    self._mutation_audit(
+                        event_id=SCHEDULE_NIGHT_ACK_EVENT_ID,
+                        event_type="schedule_night_windows_acknowledged",
+                        subject=principal.subject,
+                        result="acknowledged",
+                        request_id=request,
+                        reason_codes=("partition_acknowledged",),
+                        lifecycle=self._fleet_lifecycle(),
+                        payload={
+                            "assertion": SCHEDULE_NIGHT_ASSERTION,
+                            "captured_via": "night_charging",
+                        },
+                    )
+                )
+                control.mark_acknowledged()
+                # One site fact, both latches: the schedules surface never
+                # re-prompts a night-acknowledged site either.
+                if self._schedules is not None:
+                    self._schedules.mark_night_acknowledged()
+                acknowledged_now = True
+        result = "noop"
+        if action == "enable":
+            if not control.enabled:
+                control.set_participation(enabled=True)
+                result = "enabled"
+            elif acknowledged_now:
+                # A config-enabled-but-suspended site: the toggle's act — the
+                # captured acknowledgement — is what put it into
+                # participation; that is an enable, not a no-op.
+                result = "enabled"
+        elif control.enabled:
+            control.set_participation(enabled=False)
+            result = "disabled"
+        # Impl-10 commit-then-audit: the flip above has committed; the audit
+        # failure surfaces after it and never rolls participation back.
+        await self._append_audit(
+            self._mutation_audit(
+                event_type="night_charging_toggled",
+                subject=principal.subject,
+                result=result,
+                request_id=request,
+                reason_codes=(result,),
+                lifecycle=self._fleet_lifecycle(),
+                payload={
+                    "action": action,
+                    "enabled": control.enabled,
+                    "enabled_origin": control.enabled_origin,
+                    "partition_acknowledged": control.acknowledged_partition,
+                },
+            )
+        )
+        return {
+            "feature": "night_charging",
+            "enabled": control.enabled,
+            "enabled_origin": control.enabled_origin,
+            "persisted": False,
+            "acknowledged_partition": control.acknowledged_partition,
+            "night_charge_state": control.state_payload(),
+        }
+
     async def replace_schedule(
         self,
         *,
@@ -2440,6 +2729,10 @@ class EnergyServiceFacade:
                 )
             )
             surface.mark_night_acknowledged()
+            # One site fact, both latches (§3.2): a site the schedules
+            # surface acknowledged never re-prompts on the night toggle.
+            if self._night is not None:
+                self._night.mark_acknowledged()
         # (4) 409 schedule_version_conflict — the CAS itself.
         current = await surface.get_plan()
         current_version = 0 if current is None else current.version
@@ -2523,19 +2816,19 @@ class EnergyServiceFacade:
 
     # --- internal helpers ---------------------------------------------------
 
-    async def _refuse_conflicted_enable(self) -> None:
-        """P2: refuse an enable while any unit runs under another intent or
-        any latched stop holds.
+    async def _enable_conflicts(self) -> tuple[list[str], list[str], list[str]] | None:
+        """The P2 conflict facts both activation toggles refuse an enable on:
+        ``(reasons, unit_ids, stop_ids)`` or ``None`` when the fleet is quiet.
 
         Enabling under an active manual/agent/schedule request is legal (the
         adviser would simply yield per unit) but opaque — the operator would
-        see "on" doing nothing, the exact invisibility this package exists
+        see "on" doing nothing, the exact invisibility these packages exist
         to remove — so the refusal names the conflicted units and forces a
         deliberate finish-or-cancel first.  A latched stop fences the whole
         fleet; enabling under it is dead state.  Latched INHIBITS (e.g.
-        ``external_writer``) do NOT refuse: the selector skips those units
-        honestly (``no_eligible_target``) and the projection says so.
-        ``disable`` is never refused — stopping is safety-positive.
+        ``external_writer``) do NOT refuse: the selectors skip those units
+        honestly and the projections say so.  ``disable`` is never refused —
+        stopping is safety-positive.
         """
         unit_ids: set[str] = set()
         stop_ids: list[str] = []
@@ -2557,10 +2850,19 @@ class EnergyServiceFacade:
             stop_ids = sorted(self._latched_stops)
             reasons.append("latched_stop_holds")
         if reasons:
+            return reasons, sorted(unit_ids), stop_ids
+        return None
+
+    async def _refuse_conflicted_enable(self) -> None:
+        """P2 (the excess toggle's shape): refuse an enable while any unit
+        runs under another intent or any latched stop holds."""
+        conflicts = await self._enable_conflicts()
+        if conflicts is not None:
+            reasons, unit_ids, stop_ids = conflicts
             raise ExcessChargingRefusal(
                 "excess_enable_refused",
                 "enabling requires a fleet with no request running and no latched stop",
-                {"reasons": reasons, "unit_ids": sorted(unit_ids), "stop_ids": stop_ids},
+                {"reasons": reasons, "unit_ids": unit_ids, "stop_ids": stop_ids},
             )
 
     def _fleet_lifecycle(self) -> UnitLifecycle:
@@ -2681,6 +2983,10 @@ class EnergyServiceFacade:
     def _schedule_key(self, prefix: str) -> str:
         """Deterministic facade-owned correlation for an internal schedule drive."""
         return f"schedule-{prefix}-{next(self._schedule_correlations):08d}"
+
+    def _night_key(self, prefix: str) -> str:
+        """Deterministic facade-owned correlation for an internal night drive."""
+        return f"night-{prefix}-{next(self._night_correlations):08d}"
 
     async def _unit_view(
         self,
