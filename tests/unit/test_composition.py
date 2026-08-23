@@ -67,6 +67,7 @@ API_ROUTE_PATHS = frozenset(
         "/api/v1/health",
         "/api/v1/audit",
         "/api/v1/intents",
+        "/api/v1/intents/cancel",
         "/api/v1/arm",
         "/api/v1/emergency-stop",
         "/api/v1/emergency-stop/{stop_id}/acknowledge",
@@ -1846,3 +1847,77 @@ async def test_enabled_excess_charging_composes_the_adviser_and_armed_policy(
     assert runtime.policy.export_headroom_margin_w == 200
     assert runtime.policy.export_telemetry_max_age_s == 3.0
     await _shutdown_actors(runtime)
+
+
+async def test_cancel_intent_endpoint_cancels_the_active_intent(tmp_path: Path) -> None:
+    """API_CONTRACTS "Cancel intent" (2026-08-23): POST /api/v1/intents/cancel
+    is dispatch-scoped with no interactive requirement, demands an
+    Idempotency-Key, cancels by exact id or "current", and answers with the
+    structured envelope for unknown ids and empty fleets."""
+    announced: list[str] = []
+    runtime = compose(tmp_path / "cancel.sqlite3", simulate=True, announce=announced.append)
+    bearer = {"Authorization": f"Bearer {announced[0]}"}
+
+    # No key: the structured refusal, never a silent pass-through.
+    status, body = await _asgi_request(
+        runtime.app,
+        "POST",
+        "/api/v1/intents/cancel",
+        headers=bearer,
+        json_body={"intent_id": "current"},
+    )
+    assert status == 400, body
+    assert body["code"] == "idempotency_key_required"
+
+    # Nothing active: the precise conflict, not a fabricated success.
+    status, body = await _asgi_request(
+        runtime.app,
+        "POST",
+        "/api/v1/intents/cancel",
+        headers={**bearer, "Idempotency-Key": "cancel-empty"},
+        json_body={"intent_id": "current"},
+    )
+    assert status == 409, body
+
+    status, accepted = await _asgi_request(
+        runtime.app,
+        "POST",
+        "/api/v1/intents",
+        headers={**bearer, "Idempotency-Key": "cancel-source-dispatch"},
+        json_body={"unit_ids": ["mid"], "direction": "charge", "watts": 500, "ttl_s": 30},
+    )
+    assert status == 202, accepted
+    intent_id = accepted["intent_id"]
+
+    status, cancelled = await _asgi_request(
+        runtime.app,
+        "POST",
+        "/api/v1/intents/cancel",
+        headers={**bearer, "Idempotency-Key": "cancel-current-1"},
+        json_body={"intent_id": "current"},
+    )
+    assert status == 200, cancelled
+    assert cancelled == {"intent_id": intent_id, "status": "cancelled", "unit_ids": ["mid"]}
+    assert not await _settle(runtime.intents.active(runtime.clock.monotonic()))
+
+    # Idempotent replay of the same key returns the same result.
+    status, replay = await _asgi_request(
+        runtime.app,
+        "POST",
+        "/api/v1/intents/cancel",
+        headers={**bearer, "Idempotency-Key": "cancel-current-1"},
+        json_body={"intent_id": "current"},
+    )
+    assert status == 200
+    assert replay == cancelled
+
+    # An exact id that is no longer active is the structured 404.
+    status, body = await _asgi_request(
+        runtime.app,
+        "POST",
+        "/api/v1/intents/cancel",
+        headers={**bearer, "Idempotency-Key": "cancel-gone"},
+        json_body={"intent_id": intent_id},
+    )
+    assert status == 404, body
+    assert body["code"] == "intent_not_found"

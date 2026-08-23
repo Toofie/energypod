@@ -2315,3 +2315,121 @@ async def test_malformed_principals_are_rejected_before_any_port_work(
         await _invoke(rig.facade, operation, broken)
 
     assert rig.recorder_activity() == []
+
+
+# --- cancel intent (2026-08-23 operator feature) -------------------------------
+#
+# API_CONTRACTS: cancelling the active intent is safety-positive -- repository
+# removal, the kernel's next no-winner tick revokes, and the device watchdog
+# hands power back.  Scope is dispatch with NO interactive requirement, the
+# mutation is audited as intent_cancelled, and the bus carries intent.cancelled
+# so the console's request card clears the same way it does on expiry.
+
+
+async def test_cancel_intent_by_id_and_by_current_removes_audits_and_publishes(
+    api: Any,
+) -> None:
+    rig = make_rig(api, seeded_intents=(manual_intent(api, revision=3, watts=900),))
+    cancelled = await rig.facade.cancel_intent(
+        intent_id="intent-3",
+        principal=OPERATOR,
+        idempotency_key="cancel-key-1",
+        request_id="cancel-request-1",
+    )
+    assert cancelled == {
+        "intent_id": "intent-3",
+        "status": "cancelled",
+        "unit_ids": ["pod-a"],
+    }
+    assert rig.intents.removed == ["intent-3"]
+    (event,) = [event for event in rig.audit.appended if event.event_type == "intent_cancelled"]
+    assert event.intent_id == "intent-3"
+    assert event.result == "cancelled"
+    assert event.principal == OPERATOR.subject
+    (published,) = [body for body in rig.bus.published if body["type"] == "intent.cancelled"]
+    assert published["payload"] == {
+        "principal": OPERATOR.subject,
+        "intent_id": "intent-3",
+        "unit_ids": ["pod-a"],
+    }
+
+    # "current" resolves the newest active intent.
+    rig.intents.added.append(manual_intent(api, revision=7, watts=400))
+    rig.intents.removed.clear()
+    current = await rig.facade.cancel_intent(
+        intent_id="current",
+        principal=OPERATOR,
+        idempotency_key="cancel-key-2",
+        request_id="cancel-request-2",
+    )
+    assert current["intent_id"] == "intent-7"
+    assert rig.intents.removed == ["intent-7"]
+
+
+async def test_cancel_intent_never_touches_a_latched_emergency_stop(api: Any) -> None:
+    """A latched stop leaves only through its privileged acknowledgement."""
+    latched_stop = api.PowerIntent(
+        id="stop-1",
+        source=api.IntentSource.EMERGENCY_STOP,
+        selected_unit_ids=frozenset({"pod-a"}),
+        direction=api.Direction.IDLE,
+        watts=0,
+        duration_s=86_400.0,
+        accepted_at_mono=90.0,
+        acceptance_revision=9,
+        actor_identity="person:operator",
+    )
+    rig = make_rig(api, seeded_intents=(latched_stop,))
+    with pytest.raises(ValueError, match="emergency stop"):
+        await rig.facade.cancel_intent(
+            intent_id="stop-1",
+            principal=OPERATOR,
+            idempotency_key="cancel-stop-key",
+            request_id="cancel-stop-request",
+        )
+    assert rig.intents.removed == []
+    assert not [event for event in rig.audit.appended if event.event_type == "intent_cancelled"]
+
+
+async def test_cancel_intent_refusals_are_loud_and_precise(api: Any) -> None:
+    rig = make_rig(api, seeded_intents=(manual_intent(api, revision=3, watts=900),))
+    with pytest.raises(LookupError):
+        await rig.facade.cancel_intent(
+            intent_id="intent-404",
+            principal=OPERATOR,
+            idempotency_key="cancel-unknown-key",
+            request_id="cancel-unknown-request",
+        )
+    empty = make_rig(api)
+    with pytest.raises(ValueError, match="no active intent"):
+        await empty.facade.cancel_intent(
+            intent_id="current",
+            principal=OPERATOR,
+            idempotency_key="cancel-empty-key",
+            request_id="cancel-empty-request",
+        )
+    without_dispatch = replace(OPERATOR, scopes=frozenset({"observe"}))
+    with pytest.raises(PermissionError):
+        await rig.facade.cancel_intent(
+            intent_id="intent-3",
+            principal=without_dispatch,
+            idempotency_key="cancel-scope-key",
+            request_id="cancel-scope-request",
+        )
+
+
+async def test_cancel_intent_is_available_to_automation(api: Any) -> None:
+    """Cancelling stops power: a non-interactive dispatch principal may drive it."""
+    automation = Principal(
+        subject="service:automation",
+        scopes=frozenset({"observe", "dispatch"}),
+        interactive=False,
+    )
+    rig = make_rig(api, seeded_intents=(manual_intent(api, revision=3, watts=900),))
+    cancelled = await rig.facade.cancel_intent(
+        intent_id="current",
+        principal=automation,
+        idempotency_key="cancel-automation-key",
+        request_id="cancel-automation-request",
+    )
+    assert cancelled["status"] == "cancelled"
