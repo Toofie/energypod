@@ -241,6 +241,44 @@ describe("ScheduleView — the entry list", () => {
     expect(toggle).toHaveTextContent(/paused/i);
   });
 
+  it("renders the effective dates as optional: a null echo stays EMPTY, a bounded range fills in", async () => {
+    // DESIGN_SCHEDULES §1: the date range is OPTIONAL; an open bound echoes as
+    // null on GET (commit 85d016c) and must reload as an EMPTY input — never
+    // the text "null", never a sentinel date — while a bounded range fills in.
+    const harness = installHarness({
+      get: vi.fn(() =>
+        Promise.resolve(
+          getScheduleOk({
+            plan: planWith([
+              scheduleEntry({ entry_id: "Open-ended", effective_from: null, effective_until: null }),
+              scheduleEntry({
+                entry_id: "Bounded",
+                effective_from: "2026-08-25",
+                effective_until: "2035-12-31",
+              }),
+            ]),
+          }),
+        ),
+      ),
+    });
+    renderView(harness);
+    await waitFor(() => expect(entryCards()).toHaveLength(2));
+
+    const open = entryCards().find((card) => within(card).queryByDisplayValue("Open-ended"))!;
+    await userEvent.click(within(open).getByRole("button", { name: /^Advanced$/i }));
+    expect(within(open).getByLabelText(/Effective from \(optional\)/i)).toHaveValue("");
+    expect(within(open).getByLabelText(/Effective until \(optional\)/i)).toHaveValue("");
+
+    const bounded = entryCards().find((card) => within(card).queryByDisplayValue("Bounded"))!;
+    await userEvent.click(within(bounded).getByRole("button", { name: /^Advanced$/i }));
+    expect(within(bounded).getByLabelText(/Effective from \(optional\)/i)).toHaveValue("2026-08-25");
+    expect(within(bounded).getByLabelText(/Effective until \(optional\)/i)).toHaveValue("2035-12-31");
+
+    // The null echo is not a phantom change: blank fields omit the keys on
+    // publish, so the reloaded draft is exactly the published plan.
+    expect(await screen.findByText(/No unsent changes/i)).toBeVisible();
+  });
+
   it("keeps a wire-carried idle entry idle — the v1 picker never flips it silently", async () => {
     const harness = installHarness({
       get: vi.fn(() =>
