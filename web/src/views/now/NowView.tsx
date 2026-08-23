@@ -66,17 +66,17 @@
  * `watts_by_unit` exactly (no "≈" — the allocator honors each unit's target
  * as its own cap), Allowed renders the decision's `authorized_watts_by_unit`
  * per unit so a clamped battery is NAMED, and only scalar intents (in-flight
- * or older) fall back to the total ÷ count derivation marked "≈".
+ * or older) fall back to the total ÷ count derivation marked "≈". Those maps
+ * are tracked by the ONE shared implementation
+ * (web/src/app/useUnitIntentFigures.ts) so Home's power cards and this card
+ * can never drift apart.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health } from "../../api/client";
-import {
-  toAuditUnitWatts,
-  toIntentFigures,
-  type WattsByUnit,
-} from "../../app/fleet";
+import type { WattsByUnit } from "../../app/fleet";
+import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import { formatSeconds, formatWatts } from "../../lib/format";
 import "./now.css";
 
@@ -706,19 +706,15 @@ export function NowView({ client }: NowViewProps) {
   const [dispatchMinutes, setDispatchMinutes] = useState("5");
   const [selectedUnitIds, setSelectedUnitIds] = useState<string[]>([]);
   /**
-   * The live intent's own per-unit watt targets (`watts_by_unit`), captured
-   * from the 202 acceptance view, the `intent.accepted` frame, or the
-   * `control_decision` audit summaries — the wire's native per-battery
-   * figures the Requested fact prefers over any derivation. Null while no
-   * per-unit intent is known (scalar intents and pre-intent states).
+   * The live intent's per-unit figures — the wire's native per-battery
+   * targets (`watts_by_unit`) and the decision's per-unit authorized watts
+   * (`authorized_watts_by_unit`) — tracked by the ONE shared implementation
+   * (web/src/app/useUnitIntentFigures.ts) Home's power cards consume too. The
+   * Requested fact prefers the requested map over any derivation; the Allowed
+   * fact prefers the authorized map because it names WHICH battery a headroom
+   * clamp hit.
    */
-  const [requestedByUnit, setRequestedByUnit] = useState<WattsByUnit | null>(null);
-  /**
-   * The decision's per-unit authorized watts (`authorized_watts_by_unit`),
-   * captured from `control_decision` audit summaries: the map that names
-   * WHICH battery a headroom clamp hit. Null until a minted batch is seen.
-   */
-  const [authorizedByUnit, setAuthorizedByUnit] = useState<WattsByUnit | null>(null);
+  const unitFigures = useUnitIntentFigures();
   const [fieldErrors, setFieldErrors] = useState<FieldErrors | null>(null);
   const [dispatchApiError, setDispatchApiError] = useState<DispatchApiError | null>(null);
   const dispatchKeyRef = useRef<string | null>(null);
@@ -880,6 +876,11 @@ export function NowView({ client }: NowViewProps) {
     const applyEvent = (frame: Record<string, unknown>): void => {
       const type = typeof frame.type === "string" ? frame.type : "";
       const payload = isRecord(frame.payload) ? frame.payload : null;
+      // The per-unit figure maps are fed by the shared tracker: acceptance
+      // and control-decision frames carry them, and the request-ending frames
+      // (expiry / revocation / stop) clear them. Everything below is this
+      // view's own picture of the world.
+      unitFigures.consumeEvent(frame);
       if (type === "intent.accepted" && payload !== null) {
         const direction = typeof payload.direction === "string" ? payload.direction : null;
         const watts = typeof payload.watts === "number" ? payload.watts : null;
@@ -899,36 +900,11 @@ export function NowView({ client }: NowViewProps) {
                   ),
                 },
           );
-          // The newest intent's own per-unit targets — the exact per-battery
-          // figures when the per-unit form was submitted, null when it was
-          // scalar (the two forms are mutually exclusive on the wire). A new
-          // request also resets the authorized map: nothing is authorized for
-          // it until the kernel's next decision.
-          const figures = toIntentFigures(payload);
-          setRequestedByUnit(figures?.wattsByUnit ?? null);
-          setAuthorizedByUnit(null);
           // The published payload carries no expiry; the accepted response's
           // expires_in_s is the countdown source. Kept defensive for a future
           // wire addition.
           if (typeof payload.expires_in_s === "number") {
             setExpiry({ remainingS: payload.expires_in_s, atMs: monotonicNowMs() });
-          }
-        }
-      } else if (type === "audit.appended") {
-        // The kernel's per-tick decision summaries ride the audit bus
-        // (composition.py `_AsyncAuditRepository`): a `control_decision` row
-        // carries the intent's own per-unit targets and the decision's
-        // per-unit authorized watts, so the request card can speak in
-        // per-battery figures the moment the decision lands — before any
-        // snapshot refetch answers. Other audit kinds carry no maps and never
-        // disturb the live request's.
-        if (payload !== null && payload.event_type === "control_decision") {
-          const unitWatts = toAuditUnitWatts(payload);
-          if (unitWatts.requested !== null) {
-            setRequestedByUnit(unitWatts.requested);
-          }
-          if (unitWatts.authorized !== null) {
-            setAuthorizedByUnit(unitWatts.authorized);
           }
         }
       } else if (type === "unit.armed" || type === "unit.disarmed") {
@@ -958,10 +934,9 @@ export function NowView({ client }: NowViewProps) {
           );
         }
         setExpiry(null);
-        // The stop ends the request outright: the per-unit figures must not
-        // linger as a ghost of an intent that no longer exists.
-        setRequestedByUnit(null);
-        setAuthorizedByUnit(null);
+        // The stop ends the request outright: the shared tracker (fed above)
+        // has already dropped the per-unit figures so they cannot linger as a
+        // ghost of an intent that no longer exists.
         const frameStopId =
           payload !== null && typeof payload.stop_id === "string" ? payload.stop_id : "";
         setLatchedStop({
@@ -998,10 +973,9 @@ export function NowView({ client }: NowViewProps) {
         // never "this unit latched": the view re-reads the snapshot and says
         // exactly that, without inventing a lifecycle the frame does not carry.
         // The request itself is over: the countdown must not linger on screen
-        // as a ghost of an intent that no longer exists.
+        // as a ghost of an intent that no longer exists (the shared tracker
+        // has already dropped the per-unit figures).
         setExpiry(null);
-        setRequestedByUnit(null);
-        setAuthorizedByUnit(null);
         const unitIds = unitIdsFromPayload(payload);
         const reason =
           payload !== null && typeof payload.reason === "string" && payload.reason !== ""
@@ -1016,10 +990,9 @@ export function NowView({ client }: NowViewProps) {
       } else if (type === "intent.expired") {
         // Feature-detected: the backend publishes the end of a request this
         // way once its intent-lifecycle event lands. The request card must not
-        // linger as a ghost: the countdown goes and the world is re-read.
+        // linger as a ghost: the countdown goes, the shared tracker has
+        // already dropped the per-unit figures, and the world is re-read.
         setExpiry(null);
-        setRequestedByUnit(null);
-        setAuthorizedByUnit(null);
         setRevokedNotice("The power request ended.");
         refetchSnapshot();
       } else if (type === "authorization.granted") {
@@ -1190,12 +1163,16 @@ export function NowView({ client }: NowViewProps) {
   // to the scalar split derivation (see requestedFactText); "None" is the
   // honest no-request state.
   const requestedText =
-    activeUnits.length > 0 ? requestedFactText(activeUnits, requestedByUnit) : "None";
+    activeUnits.length > 0
+      ? requestedFactText(activeUnits, unitFigures.requestedByUnit)
+      : "None";
   // The Allowed fact prefers the decision's per-unit authorized map — the one
   // source that names which battery a headroom clamp hit — and falls back to
   // the snapshot's own per-unit authorized figures.
   const allowedFromWire =
-    authorizedByUnit !== null ? allowedFactText(units, authorizedByUnit, requestedByUnit) : null;
+    unitFigures.authorizedByUnit !== null
+      ? allowedFactText(units, unitFigures.authorizedByUnit, unitFigures.requestedByUnit)
+      : null;
   const allowedText =
     allowedFromWire !== null
       ? allowedFromWire
@@ -1398,11 +1375,7 @@ export function NowView({ client }: NowViewProps) {
         // per-unit targets: the card's exact per-battery figures start from
         // the response itself, before any frame or refetch lands. Nothing is
         // authorized for the new request yet.
-        const figures = toIntentFigures(result.requested);
-        if (figures !== null) {
-          setRequestedByUnit(figures.wattsByUnit);
-          setAuthorizedByUnit(null);
-        }
+        unitFigures.adoptAcceptance(result.requested);
         closeDialog();
         // Allowed and Actual are the two facts the API alone can answer after a
         // dispatch; without this read they stay frozen at connect time.
