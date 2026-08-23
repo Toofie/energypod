@@ -51,7 +51,7 @@
 #     `energypod db backup`/`restore` see one durable store, and is distinct
 #     from the observe-only deployment's database.
 schema_version: 1
-revision: 3
+revision: 4
 mode: write_enabled
 
 site:
@@ -111,9 +111,17 @@ policy:
   max_unit_discharge_w: 2500
   minimum_soc_pct: 10.0
   maximum_soc_pct: 95.0
+  # ABSOLUTE per-cell voltage bounds — these remain HARD GATES and are the
+  # actual over/under-charge protection; they are never relaxed by the
+  # imbalance tier below.  The imbalance bound is an EARLY-WARNING tier only:
+  # operator-relaxed 2026-08-23 from 0.050 to 0.500 (10x) after the live
+  # fleet discharge block (LHS measured a genuine but marginal 54 mV spread
+  # at 99% SOC against the old 50 mV bound, vetoing the whole fleet intent).
+  # Crossing it no longer blocks dispatch; the console surfaces any spread
+  # above the old 0.050 V early-warning line as a per-unit warning.
   minimum_cell_v: 2.80
   maximum_cell_v: 3.65
-  maximum_cell_imbalance_v: 0.050
+  maximum_cell_imbalance_v: 0.500
   minimum_temperature_c: 0.0
   maximum_temperature_c: 45.0
   maximum_soc_difference_pct: 5.0
