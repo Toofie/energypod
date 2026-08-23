@@ -319,16 +319,21 @@ def _no_temporary_files(directory: Path) -> list[str]:
 
 def test_schema_version_is_stamped_from_day_one(tmp_path: Path) -> None:
     """Opening a fresh database stamps the latest known version before
-    anything else runs (version 2 added the energy-ledger tables, E3)."""
+    anything else runs (version 3 added the telemetry-history tables)."""
     _require_contract()
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
     database = SQLiteDatabase(tmp_path / "controller.sqlite3")
     database.open()
     try:
         connection = database.connection
         row = connection.execute("SELECT singleton, version FROM schema_version").fetchone()
         assert row == (1, SCHEMA_VERSION)
-        for table in ("energy_day", "energy_baseline"):
+        for table in (
+            "energy_day",
+            "energy_baseline",
+            "telemetry_sample",
+            "telemetry_rollup_hourly",
+        ):
             present = connection.execute(
                 "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
             ).fetchone()
@@ -405,7 +410,7 @@ def test_db_migrate_applies_pending_migrations_to_a_legacy_database(
 
     first = run_cli(main_module, ["db", "migrate", str(config)], capsys)
     assert first.exit_code == 0, first.report()
-    assert "2" in first.stdout, first.report()
+    assert str(SCHEMA_VERSION) in first.stdout, first.report()
     assert _stored_version(database) == SCHEMA_VERSION
     assert _audit_rows(database) == 1
 
@@ -457,9 +462,9 @@ def test_db_migration_failure_rolls_back_transactionally(
 
     broken = (
         *MIGRATIONS,
-        Migration(version=2, statements=("CREATE TABLE rollback_probe (id INTEGER)",)),
+        Migration(version=3, statements=("CREATE TABLE rollback_probe (id INTEGER)",)),
         Migration(
-            version=3,
+            version=4,
             statements=(
                 "CREATE TABLE partial_probe (id INTEGER)",
                 "DROP TABLE must_not_exist_anywhere",
@@ -472,7 +477,7 @@ def test_db_migration_failure_rolls_back_transactionally(
 
     assert result.exit_code == 1, result.report()
     assert "database error" in result.stderr, result.report()
-    assert _stored_version(database) == 2, "migration 2 committed before 3 failed"
+    assert _stored_version(database) == 3, "migration 3 committed before 4 failed"
     assert not _has_table(database, "partial_probe"), "the failed migration rolled back"
     assert _no_temporary_files(tmp_path) == []
 
@@ -666,7 +671,7 @@ def test_db_restore_validates_and_swaps_atomically(
         result = run_cli(main_module, ["db", "restore", "--in", str(backup), str(config)], capsys)
     assert result.exit_code == 0, result.report()
     assert "restored" in result.stdout, result.report()
-    assert "2" in result.stdout, result.report()
+    assert str(SCHEMA_VERSION) in result.stdout, result.report()
     assert window.seen == []
 
     assert _audit_rows(database) == 2, "the backup content replaced the live database"

@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import fields, is_dataclass
-from datetime import date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, NoReturn
@@ -20,6 +21,15 @@ from energypod.domain.energy import (
     EnergyUnitBaseline,
     FleetEnergyDay,
     UnitEnergyDay,
+)
+from energypod.domain.history import (
+    HISTORY_NUMERIC_FIELDS,
+    MaintenanceResult,
+    TelemetryRollupHour,
+    TelemetrySampleRow,
+    format_history_timestamp,
+    hour_start_of,
+    parse_history_timestamp,
 )
 from energypod.domain.intents import Direction, IntentSource
 from energypod.domain.observations import UnitLifecycle
@@ -713,4 +723,293 @@ class SQLiteEnergyLedgerRepository:
             charged_from_surplus_kwh=metrics["charged_from_surplus_kwh"],
             coverage_pct=metrics["coverage_pct"],
             metric_flags=frozenset(str(flag) for flag in metrics["metric_flags"]),
+        )
+
+
+class SQLiteTelemetryHistoryRepository:
+    """The durable plant-history store (DESIGN_PLANT_HISTORY sections 2.2-2.4).
+
+    ``telemetry_sample`` holds the append-only sample rows keyed
+    ``(unit_id, sampled_at)``; ``telemetry_rollup_hourly`` holds the hourly
+    projections keyed ``(unit_id, hour_start)``.  Both tables are created by
+    the schema-v3 migration, so this repository opens nothing and owns only
+    its statements.  Samples are projections, not acts: no audit store is
+    touched and no control path reads these rows.
+    """
+
+    _SAMPLE_COLUMNS: tuple[str, ...] = (
+        "unit_id",
+        "sampled_at",
+        *HISTORY_NUMERIC_FIELDS,
+        "lifecycle",
+        "health_state",
+        "quality",
+        "commanded_source",
+        "commanded_direction",
+        "commanded_w",
+        "debug_mode_w",
+        "ctrl_mode_w",
+        "work_mode_w",
+        "run_mode_w",
+    )
+    # The interpolated fragments are this class's own frozen column tuples,
+    # never caller input; every value rides a bound parameter.
+    _INSERT_SAMPLE: str = (
+        f"INSERT INTO telemetry_sample({', '.join(_SAMPLE_COLUMNS)}) "  # noqa: S608
+        f"VALUES ({', '.join('?' * len(_SAMPLE_COLUMNS))}) ON CONFLICT DO NOTHING"
+    )
+    _ROLLUP_COLUMNS: tuple[str, ...] = (
+        "unit_id",
+        "hour_start",
+        *(
+            f"{field}_{suffix}"
+            for field in HISTORY_NUMERIC_FIELDS
+            for suffix in ("min", "max", "mean")
+        ),
+        "sample_count",
+        "worst_quality",
+    )
+    # One statement rolls every not-yet-rolled hour older than the horizon:
+    # min/max/avg ignore NULLs (an all-NULL field rolls to NULL -- never a
+    # zero), count(*) counts ROWS (the coverage marker), and the worst
+    # quality is computed in-pass with the pinned precedence ranking.
+    _QUALITY_RANK: str = (
+        "CASE quality WHEN 'missing' THEN 5 WHEN 'bad' THEN 4 WHEN 'stale' THEN 3"
+        " WHEN 'suspect' THEN 2 ELSE 1 END"
+    )
+    _ROLLUP_SELECT: str = (
+        "INSERT INTO telemetry_rollup_hourly("  # noqa: S608 -- frozen column tuples
+        + ", ".join(_ROLLUP_COLUMNS)
+        + ") SELECT unit_id, substr(sampled_at, 1, 13) || ':00:00+00:00', "
+        + ", ".join(
+            f"{aggregate}({field})"
+            for field in HISTORY_NUMERIC_FIELDS
+            for aggregate in ("min", "max", "avg")
+        )
+        + f", count(*), CASE max({_QUALITY_RANK}) WHEN 5 THEN 'missing' WHEN 4 THEN 'bad'"
+        " WHEN 3 THEN 'stale' WHEN 2 THEN 'suspect' ELSE 'good' END"
+        " FROM telemetry_sample WHERE substr(sampled_at, 1, 13) < ?"
+        " GROUP BY unit_id, substr(sampled_at, 1, 13) ON CONFLICT DO NOTHING"
+    )
+
+    def __init__(
+        self,
+        database: SQLiteDatabase,
+        *,
+        retention_full_resolution_s: float = 14 * 86_400.0,
+        retention_rollup_s: float | None = None,
+    ) -> None:
+        if not isinstance(retention_full_resolution_s, int | float) or (
+            not math.isfinite(float(retention_full_resolution_s))
+            or retention_full_resolution_s <= 0
+        ):
+            raise ValueError("retention_full_resolution_s must be a positive finite number")
+        if retention_rollup_s is not None and (
+            not isinstance(retention_rollup_s, int | float)
+            or not math.isfinite(float(retention_rollup_s))
+            or retention_rollup_s <= 0
+        ):
+            raise ValueError("retention_rollup_s must be a positive finite number or None")
+        self._database = database
+        self._retention_full_resolution_s = float(retention_full_resolution_s)
+        self._retention_rollup_s = None if retention_rollup_s is None else float(retention_rollup_s)
+
+    # --- append ---------------------------------------------------------------
+
+    def append_samples(self, rows: Sequence[TelemetrySampleRow]) -> None:
+        """One transaction per tick: ``BEGIN IMMEDIATE`` + ``executemany``.
+
+        Duplicate primary keys are ignored (a retried tick after a suppressed
+        failure can never corrupt the store), and busy surfaces as
+        ``PersistenceBusyError`` -- a gap the caller survives, never a crash.
+        """
+        if any(type(row) is not TelemetrySampleRow for row in rows):
+            raise TypeError("rows must be TelemetrySampleRow values")
+        if not rows:
+            return
+        payload = [
+            (
+                row.unit_id,
+                format_history_timestamp(row.sampled_at),
+                *(getattr(row, field) for field in HISTORY_NUMERIC_FIELDS),
+                row.lifecycle,
+                row.health_state,
+                row.quality,
+                row.commanded_source,
+                row.commanded_direction,
+                row.commanded_w,
+                row.debug_mode_w,
+                row.ctrl_mode_w,
+                row.work_mode_w,
+                row.run_mode_w,
+            )
+            for row in rows
+        ]
+        try:
+            with self._database.lock:
+                connection = self._database.connection
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.executemany(self._INSERT_SAMPLE, payload)
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("telemetry history is busy") from exc
+            raise
+
+    # --- reads ----------------------------------------------------------------
+
+    def samples(
+        self, unit_ids: Sequence[str], from_at: datetime, to_at: datetime
+    ) -> tuple[TelemetrySampleRow, ...]:
+        """The full-resolution rows in the inclusive window, unit-major."""
+        normalized = self._require_units(unit_ids)
+        start, end = format_history_timestamp(from_at), format_history_timestamp(to_at)
+        placeholders = ", ".join("?" * len(normalized))
+        query = (
+            f"SELECT {', '.join(self._SAMPLE_COLUMNS)} FROM telemetry_sample"  # noqa: S608
+            f" WHERE unit_id IN ({placeholders}) AND sampled_at >= ? AND sampled_at <= ?"
+            " ORDER BY unit_id, sampled_at"
+        )
+        rows = self._fetch(query, (*normalized, start, end))
+        return tuple(self._decode_sample(row) for row in rows)
+
+    def rollup_hours(
+        self, unit_ids: Sequence[str], from_at: datetime, to_at: datetime
+    ) -> tuple[TelemetryRollupHour, ...]:
+        """The hourly rollups whose hour starts fall in the inclusive window."""
+        normalized = self._require_units(unit_ids)
+        start = format_history_timestamp(hour_start_of(from_at))
+        end = format_history_timestamp(to_at)
+        placeholders = ", ".join("?" * len(normalized))
+        query = (
+            f"SELECT {', '.join(self._ROLLUP_COLUMNS)} FROM telemetry_rollup_hourly"  # noqa: S608
+            f" WHERE unit_id IN ({placeholders}) AND hour_start >= ? AND hour_start <= ?"
+            " ORDER BY unit_id, hour_start"
+        )
+        rows = self._fetch(query, (*normalized, start, end))
+        return tuple(self._decode_rollup(row) for row in rows)
+
+    def oldest_full_res_at(self) -> datetime | None:
+        """The oldest retained full-resolution sample (the data horizon)."""
+        row = self._fetch("SELECT min(sampled_at) FROM telemetry_sample", ())
+        return None if row[0][0] is None else parse_history_timestamp(row[0][0])
+
+    def last_sample_at(self, unit_ids: Sequence[str]) -> dict[str, datetime | None]:
+        """Each unit's newest sample (one indexed read per unit; None = unsampled)."""
+        normalized = self._require_units(unit_ids)
+        latest: dict[str, datetime | None] = dict.fromkeys(normalized)
+        for unit_id in normalized:
+            row = self._fetch(
+                "SELECT max(sampled_at) FROM telemetry_sample WHERE unit_id = ?", (unit_id,)
+            )
+            if row[0][0] is not None:
+                latest[unit_id] = parse_history_timestamp(row[0][0])
+        return latest
+
+    # --- maintenance ----------------------------------------------------------
+
+    def maintain(self, now: datetime) -> MaintenanceResult:
+        """Rollup then prune, in ONE transaction (DESIGN section 2.4).
+
+        Rollup covers every hour whose UTC hour start precedes the retention
+        horizon's hour bucket; prune then deletes only rows strictly inside
+        those rolled hours, so a failed rollup (the whole transaction rolls
+        back) can never delete the only copy.  ``retention_rollup_s`` of
+        ``None`` keeps hourly rollups forever.
+        """
+        horizon = format_history_timestamp(
+            hour_start_of(
+                now.astimezone(UTC) - timedelta(seconds=self._retention_full_resolution_s)
+            )
+        )
+        rolled = pruned = pruned_rollups = 0
+        try:
+            with self._database.lock:
+                connection = self._database.connection
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    before = connection.total_changes
+                    connection.execute(self._ROLLUP_SELECT, (horizon[:13],))
+                    rolled = connection.total_changes - before
+                    pruned = connection.execute(
+                        "DELETE FROM telemetry_sample WHERE sampled_at < ?", (horizon,)
+                    ).rowcount
+                    if self._retention_rollup_s is not None:
+                        rollup_horizon = format_history_timestamp(
+                            hour_start_of(
+                                now.astimezone(UTC) - timedelta(seconds=self._retention_rollup_s)
+                            )
+                        )
+                        pruned_rollups = connection.execute(
+                            "DELETE FROM telemetry_rollup_hourly WHERE hour_start < ?",
+                            (rollup_horizon,),
+                        ).rowcount
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("telemetry history is busy") from exc
+            raise
+        return MaintenanceResult(
+            rolled_hours=rolled,
+            pruned_samples=max(pruned, 0),
+            pruned_rollups=max(pruned_rollups, 0),
+        )
+
+    # --- internals ------------------------------------------------------------
+
+    def _fetch(self, query: str, parameters: tuple[Any, ...]) -> Sequence[Sequence[Any]]:
+        try:
+            with self._database.lock:
+                return self._database.connection.execute(query, parameters).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("telemetry history is busy") from exc
+            raise
+
+    @staticmethod
+    def _require_units(unit_ids: Sequence[str]) -> tuple[str, ...]:
+        normalized = tuple(unit_ids)
+        if not normalized or any(
+            not isinstance(unit, str) or not unit or unit != unit.strip() for unit in normalized
+        ):
+            raise ValueError("unit_ids must be non-empty normalized identifiers")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("unit_ids must be unique")
+        return normalized
+
+    @classmethod
+    def _decode_sample(cls, row: Sequence[Any]) -> TelemetrySampleRow:
+        values = dict(zip(cls._SAMPLE_COLUMNS, row, strict=True))
+        values["sampled_at"] = parse_history_timestamp(values["sampled_at"])
+        for name in HISTORY_NUMERIC_FIELDS:
+            values[name] = None if values[name] is None else float(values[name])
+        return TelemetrySampleRow(**values)
+
+    @classmethod
+    def _decode_rollup(cls, row: Sequence[Any]) -> TelemetryRollupHour:
+        values = dict(zip(cls._ROLLUP_COLUMNS, row, strict=True))
+        metrics: dict[str, tuple[float | None, float | None, float | None]] = {}
+        for field in HISTORY_NUMERIC_FIELDS:
+            low, high, mean = (
+                (
+                    None
+                    if values[f"{field}_{suffix}"] is None
+                    else float(values[f"{field}_{suffix}"])
+                )
+                for suffix in ("min", "max", "mean")
+            )
+            metrics[field] = (low, high, mean)
+        return TelemetryRollupHour(
+            unit_id=values["unit_id"],
+            hour_start=parse_history_timestamp(values["hour_start"]),
+            metrics=metrics,
+            sample_count=int(values["sample_count"]),
+            worst_quality=str(values["worst_quality"]),
         )

@@ -77,6 +77,7 @@ from energypod.adapters.persistence.memory import (
     InMemoryEnergyLedgerRepository,
     InMemoryIntentRepository,
     InMemoryObservationRepository,
+    InMemoryTelemetryHistoryRepository,
 )
 from energypod.adapters.persistence.sqlite import (
     PersistenceBusyError,
@@ -84,6 +85,7 @@ from energypod.adapters.persistence.sqlite import (
     SQLiteDatabase,
     SQLiteEnergyLedgerRepository,
     SQLiteScheduleRepository,
+    SQLiteTelemetryHistoryRepository,
 )
 from energypod.api.mcp import create_mcp_server
 from energypod.api.rest import create_api_app
@@ -108,6 +110,7 @@ from energypod.application.foreign_objective import (
     ForeignObjectiveSettings,
 )
 from energypod.application.generation import AuthorityGenerationCoordinator
+from energypod.application.history import PlantHistoryControl, TelemetryHistorian
 from energypod.application.recovery import (
     CONNECT_FAILED,
     ECHO_UNREADABLE,
@@ -1844,6 +1847,7 @@ class _Supervision:
         foreign_objective: ForeignObjectiveMonitor | None = None,
         schedule_runner: ScheduleRunner | None = None,
         energy_accountant: EnergyAccountant | None = None,
+        historian: TelemetryHistorian | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -1868,6 +1872,11 @@ class _Supervision:
         # projection update (it consumes the fresh observations and reads --
         # never writes -- the adviser state for the attribution predicate).
         self._energy_accountant = energy_accountant
+        # DESIGN_PLANT_HISTORY section 2.1: the telemetry historian, ticked
+        # once per fleet cycle AFTER the polls and the energy-accountant step
+        # and BEFORE the kernel tick (the pinned ordering -- observability
+        # can never delay renewal or control).
+        self._historian = historian
         # Self-healing awareness layer (R4): the passive detection monitor
         # driven once per fleet cycle, plus the two ports it reads through.
         self._intents_port = intents
@@ -2082,6 +2091,15 @@ class _Supervision:
                 # like an advisory failure; the durable ledger retries).
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(self._energy_step(), timeout=self._interval_s)
+            if self._historian is not None:
+                # DESIGN_PLANT_HISTORY section 2.1: one bounded, fully
+                # suppressed historian tick per fleet cycle, AFTER the polls
+                # and the energy-accountant step and BEFORE the kernel tick.
+                # A failure anywhere inside it is a GAP, never a delay to
+                # control; the historian receives this cycle's peeked
+                # authority (the same dict the heartbeats consumed).
+                with contextlib.suppress(Exception, asyncio.TimeoutError):
+                    await asyncio.wait_for(self._history_step(authorized), timeout=self._interval_s)
             # A kernel tick that overruns the interval is a component failure,
             # not a survivable per-unit fault. Cancelling it is safe — the
             # kernel's BaseException path revokes authority first (shielded)
@@ -2109,6 +2127,12 @@ class _Supervision:
         decision = await self._adviser.tick()
         if self._excess_controller is not None:
             await self._excess_controller.observe_tick(decision)
+
+    async def _history_step(self, authorized: Mapping[str, Any]) -> None:
+        """One suppressed historian tick with the cycle's peeked authority."""
+        historian = self._historian
+        assert historian is not None
+        await historian.tick(authorized=authorized)
 
     async def _energy_step(self) -> None:
         """One accounting tick over the fleet's latest observations.
@@ -2672,6 +2696,17 @@ class ComposedRuntime:
     energy_accountant: EnergyAccountant | None = None
     energy_ledger: SQLiteEnergyLedgerRepository | InMemoryEnergyLedgerRepository | None = None
     energy_surface: EnergyScorecardControl | None = None
+    # DESIGN_PLANT_HISTORY sections 2.1+2.5: composed only when the
+    # ``plant_history`` block is PRESENT -- the historian the fleet loop
+    # ticks (post-accountant, pre-kernel, bounded, suppressed), the durable
+    # (or, in simulate mode, explicitly non-durable in-memory) repository it
+    # records through, and the facade-facing surface (``history_state`` +
+    # the query route).  None otherwise (block-absent doctrine).
+    historian: TelemetryHistorian | None = None
+    history_repository: (
+        SQLiteTelemetryHistoryRepository | InMemoryTelemetryHistoryRepository | None
+    ) = None
+    history_surface: PlantHistoryControl | None = None
 
 
 def _simulator_pod(
@@ -2816,6 +2851,41 @@ def _build_runtime(
     audit_store: _AuditStore
     schedule_store: SQLiteScheduleRepository | _InMemoryScheduleRepository
     energy_store: SQLiteEnergyLedgerRepository | InMemoryEnergyLedgerRepository
+    history_config = config.plant_history
+    history_present = history_config is not None
+    history_store: SQLiteTelemetryHistoryRepository | InMemoryTelemetryHistoryRepository | None
+    if history_present:
+        assert history_config is not None
+        # DESIGN_PLANT_HISTORY section 2.5: storage rides the EXISTING
+        # database path; simulate mode composes the in-memory adapter
+        # instead (explicitly non-durable, for scenario tests).
+        retention_rollup_s = (
+            None
+            if history_config.retention_rollup_days == 0
+            else float(history_config.retention_rollup_days) * 86_400.0
+        )
+        if database is not None and not simulate:
+            history_store = SQLiteTelemetryHistoryRepository(
+                database,
+                retention_full_resolution_s=(
+                    float(history_config.retention_full_resolution_days) * 86_400.0
+                ),
+                retention_rollup_s=retention_rollup_s,
+            )
+        else:
+            history_store = InMemoryTelemetryHistoryRepository(
+                retention_full_resolution_s=(
+                    float(history_config.retention_full_resolution_days) * 86_400.0
+                ),
+                retention_rollup_s=retention_rollup_s,
+            )
+        # DESIGN_PLANT_HISTORY section 2.4: the boot maintenance pass, once,
+        # after the store opens (rollup then prune, one transaction,
+        # suppressed -- a failure leaves the rows for the midnight pass).
+        with contextlib.suppress(Exception):
+            history_store.maintain(resolved_clock.wall_now().astimezone(UTC))
+    else:
+        history_store = None
     if database is not None:
         # The audit read path projects the durable row sequence so the facade
         # cursor pages the same way in every deployment mode.
@@ -3141,6 +3211,47 @@ def _build_runtime(
                 }
             ),
         )
+    # --- telemetry historian composition (DESIGN_PLANT_HISTORY sections 2.1+2.5) ---
+    # Composed exactly when the ``plant_history`` block is PRESENT, reading
+    # the observation port and the injected recovery view (health_state),
+    # attributing OPTIMIZER winners through the advisers' own single-writer
+    # projections.  Observability only: nothing in control reads it back.
+    historian: TelemetryHistorian | None = None
+    history_surface: PlantHistoryControl | None = None
+    if history_present and history_config is not None and history_store is not None:
+        configured_units = tuple(unit.unit_id for unit in config.units)
+
+        def _adviser_claims() -> dict[str, str]:
+            # The adviser attribution the commanded triple reads: each
+            # single-writer fleet-loop projection names the unit it claims.
+            # The excess projection composes today; the night-charge
+            # projection joins this map when its surface composes (the
+            # DESIGN_PLANT_HISTORY section 6 archaeology pin).
+            claims: dict[str, str] = {}
+            if excess_controller is not None:
+                state = excess_controller.state()
+                if state.active and state.target_unit_id is not None:
+                    claims[state.target_unit_id] = "excess_adviser"
+            return claims
+
+        historian = TelemetryHistorian(
+            unit_ids=configured_units,
+            sample_interval_s=float(history_config.sample_interval_s),
+            control_period_s=float(config.timing.control_period_s),
+            clock=resolved_clock,
+            history=history_store,
+            observations=observation_port,
+            timezone=config.site.timezone,
+            intents=intent_port,
+            health_states=recovery_monitor.unit_health_states,
+            adviser_claims=_adviser_claims,
+        )
+        history_surface = PlantHistoryControl(
+            unit_ids=configured_units,
+            sample_interval_s=float(history_config.sample_interval_s),
+            retention_full_resolution_days=int(history_config.retention_full_resolution_days),
+            repository=history_store,
+        )
     facade = _ComposedFacade(
         site_id=config.site.site_id,
         clock=resolved_clock,
@@ -3156,6 +3267,7 @@ def _build_runtime(
         excess=excess_controller,
         schedules=schedule_surface,
         energy=energy_surface,
+        history=history_surface,
     )
 
     # --- excess-solar advisory composition ---------------------------------
@@ -3315,6 +3427,7 @@ def _build_runtime(
         recovery=recovery_monitor,
         foreign_objective=foreign_objective_monitor,
         energy_accountant=energy_accountant,
+        historian=historian,
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision
@@ -3347,6 +3460,9 @@ def _build_runtime(
         energy_accountant=energy_accountant,
         energy_ledger=energy_store,
         energy_surface=energy_surface,
+        historian=historian,
+        history_repository=history_store,
+        history_surface=history_surface,
     )
 
 

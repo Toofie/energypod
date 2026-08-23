@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Annotated, Any, Literal, Protocol
 
 from fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, field_validator
@@ -42,6 +42,7 @@ class EnergyService(Protocol):
     async def health(self, *, principal: Principal) -> dict[str, Any]: ...
     async def recent_audit(self, *, principal: Principal, limit: int) -> dict[str, Any]: ...
     async def get_energy_days(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_plant_history(self, **kwargs: Any) -> dict[str, Any]: ...
     async def submit_intent(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
@@ -127,6 +128,35 @@ def create_mcp_server(
         if isinstance(limit, bool) or not 1 <= limit <= 31:
             raise ValueError("limit must be between 1 and 31")
         return await service.get_energy_days(principal=session_principal, limit=limit)
+
+    @server.tool
+    async def get_plant_history(
+        from_: Annotated[str, Field(alias="from")],
+        to: str,
+        unit_ids: tuple[str, ...] | None = None,
+        fields: tuple[str, ...] | None = None,
+        points: StrictInt = 600,
+    ) -> dict[str, Any]:
+        """Return windowed, server-downsampled plant history (read-only).
+
+        ``from``/``to`` are ISO-8601 timestamps with explicit offsets;
+        ``unit_ids``/``fields`` narrow the response; ``points`` (50..2000) is
+        the per-series downsample target.  Answers 409-shaped errors when the
+        site did not commission the ``plant_history`` block.
+        """
+        # API_CONTRACTS "Plant history": a read-only ride-along tool -- the
+        # historian is observability only and no MCP surface mutates it.
+        _require(session_principal, "observe")
+        if isinstance(points, bool) or not 50 <= points <= 2000:
+            raise ValueError("points must be between 50 and 2000")
+        return await service.get_plant_history(
+            principal=session_principal,
+            range_from=from_,
+            range_to=to,
+            unit_ids=None if unit_ids is None else list(unit_ids),
+            fields=None if fields is None else list(fields),
+            points=points,
+        )
 
     @server.tool
     async def get_recent_audit(limit: StrictInt = 100) -> dict[str, Any]:

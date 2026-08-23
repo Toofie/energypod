@@ -13,7 +13,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Final, Literal, Protocol, cast
+from typing import Annotated, Any, Final, Literal, Protocol, cast
 from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Query, Request, WebSocket, WebSocketException
@@ -33,6 +33,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from energypod.application.energy import EnergyScorecardRefusal
 from energypod.application.excess_charge import ExcessChargingRefusal
+from energypod.application.history import PlantHistoryRefusal
 from energypod.application.scheduling import SchedulePublishValidationError, ScheduleRefusal
 
 from .idempotency import IdempotencyConflictError, IdempotencyCoordinator, StoredResult
@@ -76,6 +77,7 @@ class EnergyService(Protocol):
     async def get_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
     async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_energy_days(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_plant_history(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_observed_objectives(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
@@ -1013,6 +1015,39 @@ def create_api_app(
         except EnergyScorecardRefusal as exc:
             raise BoundaryError(409, exc.code, exc.message) from exc
 
+    @app.get(f"{API_PREFIX}/history")
+    async def get_history(
+        from_: Annotated[str, Query(alias="from")],
+        to: str = Query(),
+        unit_ids: str | None = Query(default=None),
+        fields: str | None = Query(default=None),
+        points: int = Query(default=600, ge=50, le=2000),
+        identity: Principal = observe_dependency,
+    ) -> Any:
+        """DESIGN_PLANT_HISTORY section 3.1: the windowed history read.
+
+        Observe scope, read-only.  ``from``/``to`` are REQUIRED ISO-8601
+        timestamps WITH explicit offsets (naive = 422; a missing bound = 422
+        in the house envelope); ``unit_ids``/``fields`` are comma-separated
+        selections (defaults: every configured unit / the five default
+        fields); ``points`` 50..2000.  Answers 409
+        ``plant_history_not_commissioned`` when the config block is absent.
+        This surface deliberately uses NO bare 400.
+        """
+        try:
+            return await service.get_plant_history(
+                principal=identity,
+                range_from=from_,
+                range_to=to,
+                unit_ids=_split_query_list(unit_ids),
+                fields=_split_query_list(fields),
+                points=points,
+            )
+        except PlantHistoryRefusal as exc:
+            raise BoundaryError(409, exc.code, exc.message) from exc
+        except ValueError as exc:
+            raise BoundaryError(422, "validation_error", str(exc)) from exc
+
     @app.get(f"{API_PREFIX}/objectives/observed")
     async def get_observed_objectives(
         last: str = Query(default="24h", pattern=r"^[0-9]{1,3}(h|d)$"),
@@ -1093,6 +1128,14 @@ def create_api_app(
         await _stream_events(websocket, event_source, sequence, websocket_queue_capacity)
 
     return app
+
+
+def _split_query_list(raw: str | None) -> list[str] | None:
+    """A comma-separated query selection: ``a,b`` -> ``['a', 'b']``."""
+    if raw is None:
+        return None
+    parts = [item.strip() for item in raw.split(",")]
+    return [item for item in parts if item] or None
 
 
 async def _authenticate_header(header: str | None, authenticator: Authenticator) -> Principal:

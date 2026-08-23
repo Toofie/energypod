@@ -3028,6 +3028,197 @@ async def test_the_day_roll_promotion_serves_the_energy_block_exactly_once() -> 
     assert (0x4101, 12) not in again, "the promotion lasts exactly one cycle"
 
 
+# --- plant history (DESIGN_PLANT_HISTORY sections 2.5 + 2.1/2.4, H3) -------------
+
+
+def _history_payload(database: Path, *, block: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = _config_payload(database)
+    if block is not None:
+        payload["plant_history"] = dict(block)
+    return payload
+
+
+def compose_history(
+    database: Path,
+    *,
+    clock: Any | None = None,
+    block: dict[str, Any] | None = None,
+    simulate: bool = True,
+) -> Any:
+    config = _validate(_history_payload(database, block=block))
+    return _compose_with(config, simulate=simulate, clock=clock)
+
+
+async def test_a_present_plant_history_block_composes_the_historian_and_snapshot_key(
+    tmp_path: Path,
+) -> None:
+    """DESIGN section 2.5: a PRESENT block composes the historian, the
+    repository handle, and the snapshot's feature-detected ``history_state``
+    (the live "history is recording" hint, null for a unit not yet sampled)."""
+    runtime = compose_history(tmp_path / "history.sqlite3", block={"sample_interval_s": 15.0})
+
+    assert runtime.historian is not None
+    assert runtime.history_repository is not None
+    assert runtime.history_surface is not None
+
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert set(snapshot["history_state"]) == {
+        "sample_interval_s",
+        "retention_full_resolution_days",
+        "last_sample_at",
+    }
+    state = snapshot["history_state"]
+    assert state["sample_interval_s"] == 15.0
+    assert state["retention_full_resolution_days"] == 14
+    assert state["last_sample_at"] == {unit: None for unit in UNIT_IDS}
+
+
+async def test_an_absent_plant_history_block_composes_nothing(tmp_path: Path) -> None:
+    """Block-absent doctrine: no historian, no repository handle, no
+    ``history_state`` key -- the snapshot stays byte-identical to the
+    pre-history shape."""
+    runtime = compose_history(tmp_path / "no-history.sqlite3")
+
+    assert runtime.historian is None
+    assert runtime.history_repository is None
+    assert runtime.history_surface is None
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert "history_state" not in snapshot
+
+
+async def test_the_historian_ticks_after_the_accountant_and_before_the_kernel(
+    tmp_path: Path,
+) -> None:
+    """DESIGN section 2.1 (the pinned ordering): one bounded, suppressed
+    historian tick per fleet cycle, AFTER the polls and the energy-accountant
+    step and BEFORE the kernel tick -- observability can never delay renewal
+    or control."""
+    runtime = compose_history(
+        tmp_path / "history-order.sqlite3",
+        clock=ScriptedClock(),
+        block={"sample_interval_s": 1.0},
+    )
+    assert runtime.energy_accountant is None, "the base payload carries no scorecard"
+    order: list[str] = []
+    historian_tick = runtime.historian.tick
+    kernel_tick = runtime.kernel.tick
+
+    async def traced_historian(*args: Any, **kwargs: Any) -> None:
+        order.append("historian")
+        await historian_tick(*args, **kwargs)
+
+    async def traced_kernel() -> Any:
+        order.append("kernel")
+        return await kernel_tick()
+
+    runtime.historian.tick = traced_historian  # type: ignore[method-assign]
+    runtime.kernel.tick = traced_kernel  # type: ignore[method-assign]
+
+    session = _LifespanSession(runtime.app)
+    session.send("lifespan.startup")
+    await session.pump_until(lambda: order.count("historian") >= 2, message="two cycles")
+    await session.close()
+
+    assert order.index("historian") < order.index("kernel"), (
+        "the historian tick precedes the kernel tick in the same cycle"
+    )
+    from itertools import pairwise
+
+    assert all(earlier == "historian" for earlier, later in pairwise(order) if later == "kernel"), (
+        "every kernel tick follows a historian tick"
+    )
+
+
+async def test_the_historian_samples_the_simulated_fleet_during_the_loop(
+    tmp_path: Path,
+) -> None:
+    """DESIGN section 2.1: the composed simulate runtime records real sample
+    rows through the fleet loop (the in-memory adapter), and the snapshot's
+    ``history_state`` reports the last sample per unit."""
+    from energypod.adapters.persistence.memory import InMemoryTelemetryHistoryRepository
+
+    clock = ScriptedClock()
+    runtime = compose_history(
+        tmp_path / "history-loop.sqlite3", clock=clock, block={"sample_interval_s": 1.0}
+    )
+    assert isinstance(runtime.history_repository, InMemoryTelemetryHistoryRepository)
+
+    session = _LifespanSession(runtime.app)
+    session.send("lifespan.startup")
+    await session.pump_until(lambda: clock.elapsed_s > 1.5, message="one sample interval")
+    try:
+        snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+        last_sample = snapshot["history_state"]["last_sample_at"]
+        assert all(value is not None for value in last_sample.values()), (
+            f"every simulated unit must have recorded a sample: {last_sample!r}"
+        )
+        rows = runtime.history_repository.samples(
+            tuple(UNIT_IDS),
+            datetime(2020, 1, 1, tzinfo=UTC),
+            datetime(2100, 1, 1, tzinfo=UTC),
+        )
+        assert rows, "the fleet loop must have recorded sample rows"
+        first = rows[0]
+        assert first.unit_id in UNIT_IDS
+        assert first.lifecycle is not None
+        assert first.quality is not None
+    finally:
+        await session.close()
+
+
+async def test_boot_maintenance_rolls_the_durable_store_on_composition(
+    tmp_path: Path,
+) -> None:
+    """DESIGN section 2.4: the maintenance pass runs once at boot, after the
+    store opens -- a run-mode composition over a database holding rows older
+    than the configured retention rolls and prunes them before the loop
+    starts."""
+    from datetime import timedelta
+
+    from energypod.adapters.persistence.sqlite import (
+        SQLiteDatabase,
+        SQLiteTelemetryHistoryRepository,
+    )
+    from tests.unit.test_repositories import _sample_row
+
+    database_path = tmp_path / "history-boot.sqlite3"
+    database = SQLiteDatabase(database_path)
+    database.open()
+    try:
+        repository = SQLiteTelemetryHistoryRepository(
+            database, retention_full_resolution_s=86_400.0
+        )
+        # Pinned to a whole hour so the seeded pair cannot straddle an hour
+        # boundary when the test runs near the top of an hour.
+        stale = (datetime.now(UTC).replace(microsecond=0) - timedelta(days=3)).replace(
+            minute=0, second=0
+        )
+        repository.append_samples(
+            tuple(_sample_row(UNIT_IDS[0], stale + timedelta(minutes=m)) for m in range(0, 60, 30))
+        )
+    finally:
+        database.close()
+
+    runtime = compose_history(
+        database_path,
+        simulate=False,
+        block={"retention_full_resolution_days": 1},
+    )
+    repository = runtime.history_repository
+    assert repository is not None
+    hours = repository.rollup_hours(
+        (UNIT_IDS[0],),
+        stale - timedelta(hours=1),
+        stale + timedelta(hours=1),
+    )
+    assert len(hours) == 1, "the boot pass rolled the stale hour"
+    assert hours[0].sample_count == 2
+    remaining = repository.samples(
+        (UNIT_IDS[0],), stale - timedelta(hours=1), stale + timedelta(hours=1)
+    )
+    assert remaining == (), "the boot pass pruned the rolled rows"
+
+
 class _LazyTransport:
     """Duck-typed stand-in for the lazy transport the live decode expects."""
 

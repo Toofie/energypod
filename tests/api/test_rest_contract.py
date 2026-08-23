@@ -1912,3 +1912,125 @@ def test_observed_objectives_has_no_mutation_on_the_surface(
                 f"{API}/objectives/observed", headers=_auth("operator-token")
             )
             assert response.status_code == 405, method
+
+
+# --- plant history (DESIGN_PLANT_HISTORY section 3.1, H5) ------------------------
+
+
+def test_history_requires_authentication_and_serves_the_pinned_body(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """Observe scope; GET /api/v1/history?from&to serves the DESIGN section
+    3.3 body verbatim, with the default fields/points and every-unit set."""
+    window = {"from": "2026-08-25T06:00:00Z", "to": "2026-08-26T06:00:00Z"}
+    with _client(service, authenticator) as client:
+        anonymous = client.get(f"{API}/history", params=window)
+        unscoped = client.get(f"{API}/history", params=window, headers=_auth("audit-only-token"))
+        viewed = client.get(f"{API}/history", params=window, headers=_auth("viewer-token"))
+
+    _assert_error(anonymous, 401, "authentication_required")
+    _assert_error(unscoped, 403, "insufficient_scope")
+    assert viewed.status_code == 200
+    body = viewed.json()
+    assert set(body) == {"from", "to", "resolution", "points", "fields", "units", "fleet"}
+    assert body["resolution"] == "full"
+    assert body["points"] == 600
+    forwarded = [values for name, values in service.calls if name == "get_plant_history"]
+    assert forwarded[0]["principal"].subject == "person:viewer"
+    assert forwarded[0]["range_from"] == "2026-08-25T06:00:00Z"
+    assert forwarded[0]["unit_ids"] is None, "the default is every configured unit"
+    assert forwarded[0]["fields"] is None
+    assert forwarded[0]["points"] == 600
+
+
+def test_history_forwards_the_comma_separated_unit_and_field_selections(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        response = client.get(
+            f"{API}/history",
+            params={
+                "from": "2026-08-25T06:00:00Z",
+                "to": "2026-08-26T06:00:00Z",
+                "unit_ids": "mid,rhs",
+                "fields": "soc_pct,commanded",
+                "points": 1200,
+            },
+            headers=_auth("viewer-token"),
+        )
+    assert response.status_code == 200
+    forwarded = [values for name, values in service.calls if name == "get_plant_history"][-1]
+    assert forwarded["unit_ids"] == ["mid", "rhs"]
+    assert forwarded["fields"] == ["soc_pct", "commanded"]
+    assert forwarded["points"] == 1200
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"from": "2026-08-25T06:00:00"},  # naive: an implicit zone is a silent lie
+        {"to": "2026-08-26T06:00:00"},
+        {"from": "nonsense"},
+        {"from": "2026-08-26T06:00:00Z", "to": "2026-08-25T06:00:00Z"},
+        {"from": "2026-08-01T06:00:00Z", "to": "2026-09-02T06:00:00Z"},
+        {"unit_ids": "ghost"},
+        {"fields": "watts"},
+        {"points": 49},
+        {"points": 2001},
+        {"points": "many"},
+    ],
+)
+def test_history_parameter_matrix_answers_the_422_envelope(
+    overrides: dict[str, str], service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """DESIGN section 3.1: every parameter rule is 422 validation_error --
+    this surface deliberately uses NO bare 400."""
+    params = {"from": "2026-08-25T06:00:00Z", "to": "2026-08-26T06:00:00Z", **overrides}
+    with _client(service, authenticator) as client:
+        response = client.get(f"{API}/history", params=params, headers=_auth("viewer-token"))
+    _assert_error(response, 422, "validation_error")
+    assert all(name != "get_plant_history" for name, _ in service.calls)
+
+
+def test_history_requires_both_window_bounds(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    with _client(service, authenticator) as client:
+        missing_from = client.get(
+            f"{API}/history", params={"to": "2026-08-26T06:00:00Z"}, headers=_auth("viewer-token")
+        )
+        missing_to = client.get(
+            f"{API}/history",
+            params={"from": "2026-08-25T06:00:00Z"},
+            headers=_auth("viewer-token"),
+        )
+    _assert_error(missing_from, 422, "validation_error")
+    _assert_error(missing_to, 422, "validation_error")
+
+
+def test_history_maps_the_not_commissioned_refusal_verbatim(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    from energypod.application.history import PlantHistoryRefusal
+
+    service.history_refusal = PlantHistoryRefusal(
+        "plant_history_not_commissioned",
+        "the plant history feature is not composed on this site",
+    )
+    with _client(service, authenticator) as client:
+        response = client.get(
+            f"{API}/history",
+            params={"from": "2026-08-25T06:00:00Z", "to": "2026-08-26T06:00:00Z"},
+            headers=_auth("viewer-token"),
+        )
+    _assert_error(response, 409, "plant_history_not_commissioned")
+
+
+def test_the_history_surface_has_no_mutation(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """Read-only by construction: no mutation exists on this surface."""
+    with _client(service, authenticator) as client:
+        for method in ("post", "put", "delete"):
+            response = getattr(client, method)(f"{API}/history", headers=_auth("operator-token"))
+            assert response.status_code == 405, method

@@ -34,6 +34,7 @@ from typing import Any
 import pytest
 
 from energypod.domain import DataQuality, DecisionStatus, IntentSource, UnitLifecycle
+from energypod.domain.intents import Direction, PowerIntent
 from energypod.runtime.config import ControllerConfig
 
 SITE_ID = "home"
@@ -1386,3 +1387,117 @@ async def test_energy_scorecard_golden_dst_day_is_honest(tmp_path: Path) -> None
     days = await runtime.facade.get_energy_days(principal=OPERATOR, limit=8)
     assert days["days"][0]["date"] == "2026-10-04"
     assert days["days"][0]["utc_offset_minutes"] == 600
+
+
+# --- plant history (DESIGN_PLANT_HISTORY section 5, H6 -- the golden family) ------
+
+
+def _history_config(database: Path) -> ControllerConfig:
+    """The golden fleet plus the commissioned ``plant_history`` block.
+
+    The sampling cadence sits far above the control period, and the
+    device-command lease outlives one golden sampling step so a scripted
+    objective holds without per-cycle heartbeat renewal.
+    """
+    base = fleet_config(database).model_dump(mode="json")
+    base["revision"] = 4
+    base["timing"]["device_command_expiry_s"] = 61.0
+    base["plant_history"] = {
+        "sample_interval_s": 60.0,
+        "retention_full_resolution_days": 14,
+    }
+    return ControllerConfig.model_validate(base)
+
+
+def _history_iso(clock: ManualClock, offset_s: float) -> str:
+    moment = clock.wall + timedelta(seconds=offset_s)
+    return moment.astimezone(UTC).replace(microsecond=0).isoformat()
+
+
+async def test_the_golden_historian_records_the_archaeology_strip(tmp_path: Path) -> None:
+    """DESIGN_PLANT_HISTORY section 6: history is the archaeology view -- a
+    scripted charge leaves the commanded triple BESIDE the measured watts in
+    the stored rows, and the query serves the exact change-point strip.
+
+    One pod, three sampling ticks: idle, charging under a manual intent,
+    idle again after the intent lapses.  Golden numbers derive from the
+    scripted device model and the injected clock, never mirrored output.
+    """
+    from energypod.adapters.modbus import encode_pq_registers
+
+    clock = ManualClock()
+    runtime = compose_runtime(_history_config(tmp_path / "history.sqlite3"), clock)
+    historian = runtime.historian
+    repository = runtime.history_repository
+    surface = runtime.history_surface
+    assert historian is not None and repository is not None and surface is not None
+    pod = runtime.simulators[UNIT_ID]
+    actor = runtime.actors[UNIT_ID]
+    await actor.start()
+    charge = PowerIntent(
+        id="golden-history-charge",
+        source=IntentSource.MANUAL,
+        selected_unit_ids=frozenset({UNIT_ID}),
+        direction=Direction.CHARGE,
+        watts=2500,
+        duration_s=120.0,
+        accepted_at_mono=clock.monotonic() + 60.0,
+        actor_identity="person:operator",
+    )
+    frame = encode_pq_registers(-2500, 0)
+
+    # Tick 1: idle.  The boot baseline samples on the first tick.
+    clock.advance(60.0)
+    pod.poll()
+    await actor.poll_once()
+    await historian.tick()
+    # Tick 2: the charge window -- the intent is live and the pod serves the
+    # scripted objective, so the row carries the commanded triple beside the
+    # measured -2500 W.
+    clock.advance(60.0)
+    await runtime.intents.add(charge)
+    pod.apply_pq_frame(frame)
+    pod.poll()
+    await actor.poll_once()
+    await historian.tick(authorized={UNIT_ID: (2500, "charge")})
+    # Tick 3: the intent has lapsed and the pod's watchdog lease (61 s) has
+    # expired, so the measured watts return to zero -- the honest stand-down
+    # lag: the objective dies with the device lease, not the intent.
+    clock.advance(62.0)
+    pod.poll()
+    await actor.poll_once()
+    await historian.tick()
+
+    rows = repository.samples((UNIT_ID,), datetime(2020, 1, 1, tzinfo=UTC), clock.wall_now())
+    assert [row.battery_watts for row in rows] == [0.0, -2500.0, 0.0]
+    assert [(row.commanded_source, row.commanded_direction, row.commanded_w) for row in rows] == [
+        (None, None, None),
+        ("manual", "charge", 2500),
+        (None, None, None),
+    ]
+    assert rows[1].run_mode_w == 1 and rows[0].run_mode_w == 0
+
+    body = surface.query_payload(
+        range_from=_history_iso(clock, -122.0),
+        range_to=_history_iso(clock, 0.0),
+        fields=("battery_watts", "commanded"),
+        points=50,
+    )
+    assert body["resolution"] == "full"
+    sampled_at = [
+        _history_iso(clock, row.sampled_at.timestamp() - clock.wall.timestamp()) for row in rows
+    ]
+    assert sampled_at == [
+        _history_iso(clock, -122.0),
+        _history_iso(clock, -62.0),
+        _history_iso(clock, 0.0),
+    ]
+    assert body["units"][UNIT_ID]["commanded_changes"] == [
+        {"t": sampled_at[0], "source": None, "direction": None, "watts": None},
+        {"t": sampled_at[1], "source": "manual", "direction": "charge", "watts": 2500},
+        {"t": sampled_at[2], "source": None, "direction": None, "watts": None},
+    ]
+    battery = body["units"][UNIT_ID]["series"]["battery_watts"]
+    assert battery["window_min"] == -2500.0
+    assert battery["window_max"] == 0.0
+    assert [point["v"] for point in battery["points"]] == [0.0, -2500.0, 0.0]

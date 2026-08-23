@@ -51,6 +51,7 @@ from .arbiter import IntentArbiter
 from .energy import EnergyScorecardRefusal
 from .excess_charge import ExcessChargingRefusal
 from .foreign_objective import empty_objective_entry
+from .history import PLANT_HISTORY_NOT_COMMISSIONED, PlantHistoryRefusal
 from .scheduling import (
     SchedulePolicy,
     SchedulePublishValidationError,
@@ -345,6 +346,28 @@ class EnergyScorecardSurface(Protocol):
     def today_payload(self) -> dict[str, Any]: ...
 
     def days_payload(self, limit: int) -> dict[str, Any]: ...
+
+
+class PlantHistorySurface(Protocol):
+    """The composed plant historian's facade-facing half (block presence).
+
+    ``energypod.application.history.PlantHistoryControl`` is the composed
+    implementation.  Pure projection reads: the facade adds the snapshot's
+    ``history_state`` key and serves the query route, and NOTHING on this
+    surface mutates anything -- history is never safety-authoritative.
+    """
+
+    def state_payload(self) -> dict[str, Any]: ...
+
+    def query_payload(
+        self,
+        *,
+        range_from: str,
+        range_to: str,
+        unit_ids: Sequence[str] | None = None,
+        fields: Sequence[str] | None = None,
+        points: int = 600,
+    ) -> dict[str, Any]: ...
 
 
 class ActorHandle(Protocol):
@@ -984,6 +1007,7 @@ class EnergyServiceFacade:
         excess: ExcessChargingControl | None = None,
         schedules: ScheduleSurface | None = None,
         energy: EnergyScorecardSurface | None = None,
+        history: PlantHistorySurface | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -1007,6 +1031,7 @@ class EnergyServiceFacade:
         self._excess = excess
         self._schedules = schedules
         self._energy = energy
+        self._history = history
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._schedule_correlations = itertools.count(1)
@@ -1059,6 +1084,13 @@ class EnergyServiceFacade:
             # optional tariff), present whenever the ``energy_scorecard``
             # block is composed, ABSENT when it is not.
             view["energy_today"] = self._energy.today_payload()
+        if self._history is not None:
+            # DESIGN_PLANT_HISTORY section 2.5: the feature-detected
+            # ``history_state`` projection rides TOP LEVEL beside its
+            # siblings, present whenever the ``plant_history`` block is
+            # composed, ABSENT when it is not -- the live "history is
+            # recording" hint the console keys on.
+            view["history_state"] = self._history.state_payload()
         # Console truth (2026-08-23): a latched emergency stop must be
         # visible in a snapshot taken after the latch event, not only on
         # the event stream.  Only non-acknowledged latches appear -- an
@@ -1225,6 +1257,38 @@ class EnergyServiceFacade:
                 "the energy scorecard is not composed on this site",
             )
         return surface.days_payload(limit)
+
+    async def get_plant_history(
+        self,
+        *,
+        principal: Principal,
+        range_from: str,
+        range_to: str,
+        unit_ids: Sequence[str] | None = None,
+        fields: Sequence[str] | None = None,
+        points: int = 600,
+    ) -> dict[str, Any]:
+        """DESIGN_PLANT_HISTORY section 3: the windowed history read.
+
+        Observe scope, read-only (no mutation exists on this surface).
+        Answers 409 ``plant_history_not_commissioned`` when the config block
+        is absent; every parameter rule surfaces as ``ValueError`` (the
+        boundary's 422 envelope); a window the data cannot answer is an
+        EMPTY 200, never an error.
+        """
+        self._admit(principal, "observe")
+        if self._history is None:
+            raise PlantHistoryRefusal(
+                PLANT_HISTORY_NOT_COMMISSIONED,
+                "the plant history feature is not composed on this site",
+            )
+        return self._history.query_payload(
+            range_from=range_from,
+            range_to=range_to,
+            unit_ids=unit_ids,
+            fields=fields,
+            points=points,
+        )
 
     async def get_observed_objectives(
         self, *, principal: Principal, last: str = "24h"

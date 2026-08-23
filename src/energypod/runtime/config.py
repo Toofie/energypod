@@ -580,6 +580,27 @@ class NightChargingConfig(_FrozenModel):
         return tuple(cleaned)
 
 
+class PlantHistoryConfig(_FrozenModel):
+    """DESIGN_PLANT_HISTORY section 2.5 (the block-presence doctrine).
+
+    A PRESENT block composes the historian into the fleet loop, the query
+    route, the read-only MCP tool, and the snapshot's feature-detected
+    ``history_state``; an ABSENT block composes nothing (byte-identical
+    snapshot, 409 on the route, no samples taken).  There is deliberately NO
+    ``enabled`` key: a second master switch is a second way to be silently
+    off.  A PRESENT block additionally REQUIRES the ``storage`` block --
+    durable history is the entire point, and a historian silently keeping
+    its rows in memory is exactly the invisible-off class this project
+    refuses (cross-validated on ``ControllerConfig`` where storage lives).
+    """
+
+    sample_interval_s: Annotated[StrictFloat, Field(gt=0, le=3600)] = 30.0
+    retention_full_resolution_days: Annotated[StrictInt, Field(ge=1, le=3650)] = 14
+    # 0 keeps the hourly rollups forever (the commissioned default, ~10.5 MB
+    # per year); a positive day count bounds them.
+    retention_rollup_days: Annotated[StrictInt, Field(ge=0, le=36500)] = 0
+
+
 class ControllerConfig(_FrozenModel):
     schema_version: Annotated[StrictInt, Field(ge=1)]
     revision: Annotated[StrictInt, Field(ge=1)]
@@ -607,6 +628,10 @@ class ControllerConfig(_FrozenModel):
     # validator sees the already-validated policy, timing, units, and the
     # schedule block the PARTITION grant is judged against.
     night_charging: NightChargingConfig | None = None
+    # DESIGN_PLANT_HISTORY §2.5: the telemetry historian block, declared last
+    # beside its siblings so its commissioning validator sees the
+    # already-validated timing and storage blocks.
+    plant_history: PlantHistoryConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -932,6 +957,40 @@ class ControllerConfig(_FrozenModel):
                 "applications until the partition is granted"
             )
         return night
+
+    @field_validator("plant_history")
+    @classmethod
+    def validate_plant_history(
+        cls, plant_history: PlantHistoryConfig | None, info: ValidationInfo
+    ) -> PlantHistoryConfig | None:
+        """The commissioning gates for a PRESENT plant-history block.
+
+        Durable history is the entire point: the block REQUIRES the
+        ``storage`` block, and the sampling cadence must sit strictly above
+        the control period (a historian tick per fleet cycle samples at most
+        once per cycle, so a cadence the loop cannot out-run would record
+        nothing but gaps).
+        """
+        if plant_history is None:
+            return plant_history
+        values = info.data
+        if values.get("storage") is None:
+            raise ValueError(
+                "plant_history requires the storage block: durable history is the "
+                "entire point, and a historian silently keeping its rows in the "
+                "memory of a database-less deployment is exactly the invisible-off "
+                "class this project refuses (energypod simulate composes the "
+                "in-memory adapter explicitly, for scenario tests)"
+            )
+        timing = values.get("timing")
+        if timing is not None and plant_history.sample_interval_s <= timing.control_period_s:
+            raise ValueError(
+                "plant_history.sample_interval_s must exceed timing.control_period_s: "
+                "the historian ticks once per fleet cycle and samples at most once "
+                "per cycle, so a cadence at or below the control period could never "
+                "govern anything"
+            )
+        return plant_history
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:
