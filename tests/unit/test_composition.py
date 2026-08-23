@@ -1818,6 +1818,42 @@ def test_export_bound_never_touches_manual_or_discharge_intents() -> None:
     assert getattr(discharge_proposals[0], "export_bounded", True) is False
 
 
+def test_allocator_adapter_distributes_multi_unit_requests_by_headroom() -> None:
+    """The composed headroom path feeds the capacity-weighted distributor.
+
+    The adapter's per-unit headroom is min(static policy limit, served dynamic
+    BMS limit); a fleet request under that combined headroom must reach every
+    selected unit, not just the first sorted one (2026-08-23 operator
+    complaint: one unit absorbed each whole request while the rest sat at
+    zero-watt proposals).
+    """
+    observations = {
+        "mid": SimpleNamespace(dynamic_charge_limit_w=8_056.0, dynamic_discharge_limit_w=8_056.0),
+        "rhs": SimpleNamespace(dynamic_charge_limit_w=6_752.0, dynamic_discharge_limit_w=6_752.0),
+    }
+    policy = _export_control_policy()
+
+    fleet = PowerIntent(
+        id="fleet-1",
+        source=IntentSource.MANUAL,
+        selected_unit_ids=frozenset({"mid", "rhs"}),
+        direction=Direction.DISCHARGE,
+        watts=3_000,
+        duration_s=60.0,
+        accepted_at_mono=100.0,
+        acceptance_revision=1,
+        actor_identity="operator:local",
+    )
+
+    proposals = _allocate_export(fleet, observations, policy)
+
+    by_unit = {proposal.unit_id: proposal.watts for proposal in proposals}
+    # Static caps dominate both units (2500 W < 8056/6752 W dynamic), so the
+    # 3000 W split is 1500/1500 with neither unit at a zero-watt proposal.
+    assert by_unit == {"mid": 1_500, "rhs": 1_500}
+    assert sum(by_unit.values()) == 3_000
+
+
 def test_disabled_excess_charging_composes_no_adviser(tmp_path: Path) -> None:
     """Default configuration: no adviser handle is composed at all."""
     runtime = compose_write_enabled(tmp_path / "no-adviser.sqlite3")
