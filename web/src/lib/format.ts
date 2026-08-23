@@ -74,6 +74,15 @@ export function formatAmps(value: number): string {
   return `${formatDecimal(value)} A`;
 }
 
+/**
+ * Kilowatt-hours with their unit ("8.4 kWh", "1,234.56 kWh"): the energy
+ * scorecard's figures — daily energies and the lifetime counter readthroughs
+ * — at the same display bound as every other metric.
+ */
+export function formatKilowattHours(value: number): string {
+  return `${formatDecimal(value)} kWh`;
+}
+
 /** Celsius with its unit ("23 °C", "27.65 °C"). */
 export function formatTemp(value: number): string {
   return `${formatDecimal(value)} °C`;

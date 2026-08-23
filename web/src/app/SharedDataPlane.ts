@@ -322,6 +322,9 @@ export function sharedClient(plane: SharedDataPlane, real: ApiClient): ApiClient
     getHealth: () => plane.health(),
     getUnitDetail: (unitId) => real.getUnitDetail(unitId),
     getAudit: (limit, afterSequence) => real.getAudit(limit, afterSequence),
+    // The energy ledger read passes straight through: it is a plain observe
+    // read with no coalescing value (the ledger is slow-moving and per-view).
+    getEnergyDays: (limit) => real.getEnergyDays(limit),
     postIntent: (body, idempotencyKey) => real.postIntent(body, idempotencyKey),
     postIntentCancel: (intentId, idempotencyKey) =>
       real.postIntentCancel(intentId, idempotencyKey),

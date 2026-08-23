@@ -188,6 +188,7 @@ const makeClient = (): ApiClient => ({
   getHealth: vi.fn(),
   getUnitDetail: vi.fn(),
   getAudit: vi.fn(),
+  getEnergyDays: vi.fn(),
   postIntent: vi.fn(),
   postIntentCancel: vi.fn(),
   postArm: vi.fn(),

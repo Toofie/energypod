@@ -111,6 +111,19 @@ export interface UnitDetail {
   cell_voltages_v: number[] | null;
   temperatures_c: number[] | null;
   quality: Record<string, string> | null;
+  /**
+   * The six ADVISORY cumulative-energy readthroughs (API_CONTRACTS.md "Energy
+   * scorecard", PENDING on the wire): lifetime kWh counters, null when the
+   * `0x4101` energy block was not served this observation — never zero-filled.
+   * The grid pair keeps NEUTRAL A/B names; its buy/sell roles are evidence-open
+   * (field-mapping A-1), so no consumer may label either counter "bought".
+   */
+  energy_grid_a_kwh?: number | null;
+  energy_grid_b_kwh?: number | null;
+  energy_load_kwh?: number | null;
+  energy_pv_kwh?: number | null;
+  energy_charge_kwh?: number | null;
+  energy_discharge_kwh?: number | null;
 }
 
 /** One per-unit recovery row in the health view's `units` block (the
@@ -264,6 +277,17 @@ export interface ApiClient {
     body: Record<string, unknown>,
     idempotencyKey?: string,
   ): Promise<Record<string, unknown>>;
+  /**
+   * The energy scorecard's daily ledger (GET /api/v1/energy/days?limit=N,
+   * observe scope; DESIGN_ENERGY_SCORECARD.md §6): the newest-last day
+   * records, the site's grid-counter role pin, and the solar-production
+   * fact. N ∈ 1..31 (default 8 on the service). A deployment without the
+   * `energy_scorecard` config block refuses with 409
+   * `energy_scorecard_not_commissioned` — the ledger's honest
+   * not-commissioned state. There is deliberately no mutation on this
+   * surface, so no idempotency key exists either.
+   */
+  getEnergyDays(limit?: number): Promise<Record<string, unknown>>;
   openEvents(afterSequence?: number): AsyncIterable<StreamEvent>;
 }
 
@@ -582,5 +606,14 @@ export function createApiClient(token: string): ApiClient {
         body,
         idempotencyKey: withKey(idempotencyKey),
       }),
+    getEnergyDays: (limit?: number) => {
+      const params = new URLSearchParams(
+        limit === undefined ? {} : { limit: String(limit) },
+      );
+      const query = params.toString();
+      return request<Record<string, unknown>>(
+        `/api/v1/energy/days${query === "" ? "" : `?${query}`}`,
+      );
+    },
   };
 }

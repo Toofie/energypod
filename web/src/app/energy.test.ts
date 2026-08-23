@@ -1,0 +1,199 @@
+/**
+ * Behavior contract for the energy scorecard's shared wire model
+ * (DESIGN_ENERGY_SCORECARD.md §5/§6 + API_CONTRACTS.md "Energy scorecard"):
+ * the `EnergyDayRecord` parse, the `energy_today` snapshot block, the days
+ * route body, and the `energy.day_rolled` event — null-safe and
+ * absent-tolerant per field, never zero-filled — plus the plain-language pins
+ * (the neutral A/B naming, the provenance labels, the never-solar-as-measured
+ * wording).
+ *
+ * PENDING-BACKEND fixtures come from web/src/test/wire.ts; the pinned shapes
+ * are the docs', never a view's preference.
+ */
+import { describe, expect, it } from "vitest";
+import {
+  SOLAR_FOOTNOTE,
+  counterRolesNote,
+  dayMarkerText,
+  gridProvenanceNote,
+  kwhText,
+  sourceProvenanceText,
+  toEnergyDayRecord,
+  toEnergyDayRolledEvent,
+  toEnergyDaysView,
+  toEnergyToday,
+} from "./energy";
+import {
+  energyDayRecord,
+  energyDayRolled,
+  energyToday,
+  getEnergyDaysOk,
+} from "../test/wire";
+
+describe("energy — the day-record parse (null-safe, absent-tolerant)", () => {
+  it("parses the design's own §5 record with the fleet sums and worst-unit coverage", () => {
+    const record = toEnergyDayRecord(energyDayRecord())!;
+    expect(record).not.toBeNull();
+    expect(record.date).toBe("2026-08-26");
+    expect(record.timezone).toBe("Australia/Brisbane");
+    expect(record.utcOffsetMinutes).toBe(600);
+    expect(record.kind).toBe("in_progress");
+    expect(record.solarProductionMeasured).toBe(false);
+    // The fleet sums are the three units' own figures: 1.2 + 2.1 + 5.1 import.
+    expect(record.fleet.gridImportKwh).toBeCloseTo(8.4, 10);
+    expect(record.fleet.gridExportKwh).toBeCloseTo(12.9, 10);
+    expect(record.fleet.batteryChargedKwh).toBeCloseTo(6.2, 10);
+    expect(record.fleet.batteryDischargedKwh).toBeCloseTo(4.1, 10);
+    // Fleet coverage is the WORST unit's (99.4 / 100 / 98.7 -> 98.7).
+    expect(record.fleet.coveragePct).toBeCloseTo(98.7, 10);
+    expect(record.sources).toEqual({
+      grid: "integrated_ct",
+      battery: "device_counter",
+      load: "device_counter",
+      surplus: "attributed_adviser",
+    });
+    expect(record.counterCrossCheck).toEqual({
+      gridADeltaKwh: 8.3,
+      gridBDeltaKwh: 12.8,
+      consistentWith: "vendor_labels",
+      discriminating: true,
+    });
+    // Only mid carries a surplus attribution in the default record; the
+    // non-target units carry a REAL 0 (the adviser was never pointed at
+    // them), and the fleet sum is the honest 3.1.
+    expect(record.units.mid!.chargedFromSurplusKwh).toBeCloseTo(3.1, 10);
+    expect(record.units.rhs!.chargedFromSurplusKwh).toBe(0);
+    expect(record.fleet.chargedFromSurplusKwh).toBeCloseTo(3.1, 10);
+    expect(record.units.mid!.metricFlags).toEqual([]);
+  });
+
+  it("keeps an absent per-unit figure null and a reset flag verbatim — never zero-filled", () => {
+    const record = toEnergyDayRecord(
+      energyDayRecord({
+        units: {
+          mid: {
+            grid_import_kwh: null,
+            grid_export_kwh: null,
+            battery_charged_kwh: 0,
+            battery_discharged_kwh: null,
+            load_kwh: null,
+            charged_from_surplus_kwh: null,
+            coverage_pct: null,
+            metric_flags: ["counter_reset_observed"],
+          },
+        },
+      }),
+    )!;
+    const mid = record.units.mid!;
+    expect(mid.gridImportKwh).toBeNull();
+    expect(mid.batteryDischargedKwh).toBeNull();
+    expect(mid.coveragePct).toBeNull();
+    // A real 0 is a real 0 — distinct from an absent source.
+    expect(mid.batteryChargedKwh).toBe(0);
+    expect(mid.metricFlags).toEqual(["counter_reset_observed"]);
+  });
+
+  it("returns null only for a non-object; a partial record keeps every figure honestly absent", () => {
+    expect(toEnergyDayRecord(null)).toBeNull();
+    expect(toEnergyDayRecord("nope")).toBeNull();
+    const partial = toEnergyDayRecord({ date: "2026-08-27" })!;
+    expect(partial).not.toBeNull();
+    expect(partial.date).toBe("2026-08-27");
+    expect(partial.kind).toBe("complete");
+    expect(partial.fleet.gridImportKwh).toBeNull();
+    expect(partial.units).toEqual({});
+    expect(partial.solarProductionMeasured).toBeNull();
+    expect(partial.counterCrossCheck).toBeNull();
+  });
+});
+
+describe("energy — the snapshot block, the route body, and the rollover event", () => {
+  it("narrowes energy_today as the record plus as_of", () => {
+    const today = toEnergyToday(energyToday({ as_of: "2026-08-26T14:03:00+10:00" }))!;
+    expect(today.asOf).toBe("2026-08-26T14:03:00+10:00");
+    expect(today.kind).toBe("in_progress");
+    expect(toEnergyToday(null)).toBeNull();
+    // An absent as_of stays null, never a fabricated stamp.
+    expect(toEnergyToday(energyDayRecord())!.asOf).toBeNull();
+  });
+
+  it("narrowes the days route body: days newest-last, the roles vocabulary, the solar fact", () => {
+    const body = getEnergyDaysOk({
+      days: [
+        energyDayRecord({ date: "2026-08-25", kind: "complete" }),
+        energyDayRecord({ date: "2026-08-26", kind: "partial" }),
+      ],
+      grid_counter_roles: "vendor_labels",
+    });
+    const view = toEnergyDaysView(body)!;
+    expect(view.days.map((day) => day.date)).toEqual(["2026-08-25", "2026-08-26"]);
+    expect(view.days[1]!.kind).toBe("partial");
+    expect(view.gridCounterRoles).toBe("vendor_labels");
+    expect(view.solarProductionMeasured).toBe(false);
+    // An unknown roles answer is never promoted to a pin it does not carry.
+    expect(toEnergyDaysView({ days: [], grid_counter_roles: "guessed" })!.gridCounterRoles).toBe(
+      "unpinned",
+    );
+    expect(toEnergyDaysView("not an object")).toBeNull();
+  });
+
+  it("narrowes the day_rolled payload as the completed record itself", () => {
+    const frame = energyDayRolled(4102, energyDayRecord({ date: "2026-08-26", kind: "complete" }));
+    const rolled = toEnergyDayRolledEvent(frame.payload)!;
+    expect(rolled.date).toBe("2026-08-26");
+    expect(rolled.kind).toBe("complete");
+    expect(toEnergyDayRolledEvent(null)).toBeNull();
+  });
+});
+
+describe("energy — the plain-language pins", () => {
+  it("names an absent figure, never a zero standing in for it", () => {
+    expect(kwhText(null)).toBe("not available");
+    expect(kwhText(8.4)).toBe("8.4 kWh");
+    expect(kwhText(0)).toBe("0 kWh");
+  });
+
+  it("words the day marker: so-far, partial-day breach, coverage riding either", () => {
+    expect(dayMarkerText("in_progress", 87)).toBe("so far today — 87% coverage");
+    expect(dayMarkerText("in_progress", null)).toBe("so far today");
+    expect(dayMarkerText("partial", 61.2)).toBe(
+      "partial day — 61.2% coverage — below the commissioned coverage threshold, so the figures are incomplete",
+    );
+    expect(dayMarkerText("complete", 100)).toBe("full day — 100% coverage");
+  });
+
+  it("labels each metric source in the design's own provenance classes", () => {
+    expect(sourceProvenanceText("integrated_ct")).toBe("measured by the controller");
+    expect(sourceProvenanceText("device_counter")).toBe(
+      "recorded by the pods' own energy counters",
+    );
+    expect(sourceProvenanceText("attributed_adviser")).toBe(
+      "attributed from measured watts while solar-surplus charging was active",
+    );
+  });
+
+  it("carries the A/B unpinned note wherever the integrated source is in play, and never guesses bought/sold", () => {
+    const unpinned = gridProvenanceNote("integrated_ct");
+    expect(unpinned).toContain("measured by the controller");
+    expect(unpinned).toContain("counter A and counter B");
+    // The pin: the note never assigns a bought/sold role to either counter.
+    expect(unpinned).not.toMatch(/[AB]\s*=\s*bought|[AB]\s*=\s*sold/i);
+    const pinned = gridProvenanceNote("device_counter");
+    expect(pinned).toContain("roles confirmed");
+  });
+
+  it("words the ledger's counter-roles note for every route answer", () => {
+    expect(counterRolesNote("unpinned")).toContain("counter A and counter B");
+    expect(counterRolesNote("unpinned")).toContain("not confirmed yet");
+    expect(counterRolesNote("unpinned")).toContain("measured by the controller");
+    expect(counterRolesNote("vendor_labels")).toContain("confirmed as the vendor's labels");
+    expect(counterRolesNote("swapped")).toContain("SWAPPED");
+  });
+
+  it("pins the solar footnote: sold is the export, never a measured production", () => {
+    expect(SOLAR_FOOTNOTE).toBe(
+      "Solar panels are not measured by the pods — 'sold' is the surplus the site exported.",
+    );
+    expect(SOLAR_FOOTNOTE).not.toMatch(/solar production/i);
+  });
+});

@@ -110,6 +110,15 @@ export const UNIT_UNEXPECTED_AUTONOMY = "unit.unexpected_autonomy" as const;
  */
 export const EXCESS_ADVISER_STATE_CHANGED = "excess_adviser.state_changed" as const;
 
+/**
+ * The energy scorecard's rollover TRANSITION event (DESIGN_ENERGY_SCORECARD.md
+ * §6): published exactly once per site-timezone midnight with the COMPLETED
+ * day's record as the payload — never a heartbeat. PENDING-BACKEND — the
+ * accountant is not composed yet, so this type is not in
+ * PUBLISHED_EVENT_TYPES; suites attach it with `energyDayRolled`.
+ */
+export const ENERGY_DAY_ROLLED = "energy.day_rolled" as const;
+
 /** Every event type the composed service publishes, as a runtime checklist. */
 export const PUBLISHED_EVENT_TYPES: readonly string[] = [
   OBSERVATION_PUBLISHED,
@@ -961,6 +970,14 @@ export interface WireSnapshot {
    * `withScheduleState`.
    */
   readonly schedule_state?: WireScheduleState;
+  /**
+   * The energy scorecard's live-day block (PENDING, feature-detected): the
+   * in-progress day's `EnergyDayRecord` plus `as_of`, present only when the
+   * `energy_scorecard` config block is composed. ABSENT (the default, today's
+   * wire) = the feature is not composed — no Today card, no ledger, nothing
+   * else changes. Attach with `withEnergyToday`.
+   */
+  readonly energy_today?: WireEnergyToday;
 }
 
 /** The snapshot `intent` block's object form; every map nullable inside. */
@@ -1498,6 +1515,260 @@ export function excessChargingToggleOk(state: WireAdviserState): Record<string, 
   };
 }
 
+// ---------------------------------------------------------------------------
+// Energy scorecard (DESIGN_ENERGY_SCORECARD.md §5/§6, API_CONTRACTS.md
+// "Energy scorecard") — the whole family is PENDING-BACKEND: the days route,
+// the `energy_today` snapshot block, and the `energy.day_rolled` bus event are
+// not live yet, so none of these shapes is served by today's wire (the default
+// snapshot omits `energy_today` entirely; an absent field is today's wire
+// truth). Defaults are the design's own §5 illustrative record (mid's figures
+// verbatim, rhs/lhs filled to the same shape) with the fleet sums computed
+// from the three units exactly as the accountant would roll them up.
+// ---------------------------------------------------------------------------
+
+/** One unit's day inside an `EnergyDayRecord`; every figure nullable, never 0-filled. */
+export interface WireEnergyUnitDay {
+  readonly grid_import_kwh: number | null;
+  readonly grid_export_kwh: number | null;
+  readonly battery_charged_kwh: number | null;
+  readonly battery_discharged_kwh: number | null;
+  readonly load_kwh: number | null;
+  readonly charged_from_surplus_kwh: number | null;
+  readonly coverage_pct: number | null;
+  readonly metric_flags: readonly string[];
+}
+
+/** The fleet rollup: the five sums + charged_from_surplus + worst-unit coverage. */
+export interface WireEnergyFleetDay {
+  readonly grid_import_kwh: number | null;
+  readonly grid_export_kwh: number | null;
+  readonly battery_charged_kwh: number | null;
+  readonly battery_discharged_kwh: number | null;
+  readonly load_kwh: number | null;
+  readonly charged_from_surplus_kwh: number | null;
+  readonly coverage_pct: number | null;
+}
+
+/** The record's own source naming, per metric family (§2's provenance classes). */
+export interface WireEnergySources {
+  readonly grid: "integrated_ct" | "device_counter";
+  readonly battery: "device_counter";
+  readonly load: "device_counter";
+  readonly surplus: "attributed_adviser";
+}
+
+/** The A-1 passive cross-check block (§3) — evidence, never a display source. */
+export interface WireEnergyCrossCheck {
+  readonly grid_a_delta_kwh: number | null;
+  readonly grid_b_delta_kwh: number | null;
+  readonly consistent_with: string;
+  readonly discriminating: boolean;
+}
+
+/** One site-day, frozen (§5's JSON, verbatim keys). */
+export interface WireEnergyDayRecord {
+  readonly date: string;
+  readonly timezone: string;
+  readonly utc_offset_minutes: number;
+  readonly kind: "complete" | "partial" | "in_progress";
+  readonly units: Readonly<Record<string, WireEnergyUnitDay>>;
+  readonly fleet: WireEnergyFleetDay;
+  readonly sources: WireEnergySources;
+  readonly counter_cross_check: WireEnergyCrossCheck | null;
+  readonly solar_production_measured: false;
+}
+
+/** A per-unit-day fixture; explicit nulls are preserved (never zero-filled). */
+export function energyUnitDay(
+  spec: Partial<WireEnergyUnitDay> = {},
+): WireEnergyUnitDay {
+  return {
+    grid_import_kwh: spec.grid_import_kwh === undefined ? 1.2 : spec.grid_import_kwh,
+    grid_export_kwh: spec.grid_export_kwh === undefined ? 6.8 : spec.grid_export_kwh,
+    battery_charged_kwh:
+      spec.battery_charged_kwh === undefined ? 3.4 : spec.battery_charged_kwh,
+    battery_discharged_kwh:
+      spec.battery_discharged_kwh === undefined ? 0.7 : spec.battery_discharged_kwh,
+    load_kwh: spec.load_kwh === undefined ? 5.1 : spec.load_kwh,
+    charged_from_surplus_kwh:
+      spec.charged_from_surplus_kwh === undefined ? 3.1 : spec.charged_from_surplus_kwh,
+    coverage_pct: spec.coverage_pct === undefined ? 99.4 : spec.coverage_pct,
+    metric_flags: [...(spec.metric_flags ?? [])],
+  };
+}
+
+function sumOf(
+  units: readonly WireEnergyUnitDay[],
+  pick: (unit: WireEnergyUnitDay) => number | null,
+): number | null {
+  let total = 0;
+  for (const unit of units) {
+    const value = pick(unit);
+    if (value === null) {
+      return null;
+    }
+    total += value;
+  }
+  // The backend's own sums are clean decimals (0.1 kWh counter quanta); the
+  // fixture rounds away binary-float noise so a pinned figure is exactly the
+  // decimal a suite asserts on. The display bound rounds again anyway.
+  return units.length === 0 ? null : Math.round(total * 1e6) / 1e6;
+}
+
+/** The worst unit's coverage — the evidence-rollup precedence doctrine (§4). */
+function worstCoverage(units: readonly WireEnergyUnitDay[]): number | null {
+  let worst: number | null = null;
+  for (const unit of units) {
+    const coverage = unit.coverage_pct;
+    if (coverage === null) {
+      return null;
+    }
+    worst = worst === null ? coverage : Math.min(worst, coverage);
+  }
+  return worst;
+}
+
+function fleetOf(units: readonly WireEnergyUnitDay[]): WireEnergyFleetDay {
+  return {
+    grid_import_kwh: sumOf(units, (unit) => unit.grid_import_kwh),
+    grid_export_kwh: sumOf(units, (unit) => unit.grid_export_kwh),
+    battery_charged_kwh: sumOf(units, (unit) => unit.battery_charged_kwh),
+    battery_discharged_kwh: sumOf(units, (unit) => unit.battery_discharged_kwh),
+    load_kwh: sumOf(units, (unit) => unit.load_kwh),
+    charged_from_surplus_kwh: sumOf(units, (unit) => unit.charged_from_surplus_kwh),
+    coverage_pct: worstCoverage(units),
+  };
+}
+
+/**
+ * A day-record fixture. Defaults: the design's own §5 illustrative day
+ * (2026-08-26, mid's figures verbatim) extended to the commissioned three-unit
+ * topology, the grid source the v1 default (our own CT integration — the
+ * unpinned-roles fallback), and the A-1 cross-check block recording both
+ * counter deltas. Override `units` wholesale or per unit; the fleet sums are
+ * always recomputed from the units given.
+ */
+export function energyDayRecord(
+  spec: Partial<Omit<WireEnergyDayRecord, "fleet" | "units">> & {
+    units?: Readonly<Record<string, WireEnergyUnitDay>>;
+  } = {},
+): WireEnergyDayRecord {
+  const units =
+    spec.units ??
+    ({
+      mid: energyUnitDay(),
+      rhs: energyUnitDay({
+        grid_import_kwh: 2.1,
+        grid_export_kwh: 4.2,
+        battery_charged_kwh: 2.0,
+        battery_discharged_kwh: 1.6,
+        load_kwh: 4.4,
+        // A non-target unit's surplus attribution is a real 0 (the adviser
+        // was never pointed at it), not an absent source.
+        charged_from_surplus_kwh: 0,
+        coverage_pct: 100,
+      }),
+      lhs: energyUnitDay({
+        grid_import_kwh: 5.1,
+        grid_export_kwh: 1.9,
+        battery_charged_kwh: 0.8,
+        battery_discharged_kwh: 1.8,
+        load_kwh: 5.2,
+        charged_from_surplus_kwh: 0,
+        coverage_pct: 98.7,
+      }),
+    } as Readonly<Record<string, WireEnergyUnitDay>>);
+  const unitList = Object.values(units);
+  return {
+    date: spec.date ?? "2026-08-26",
+    timezone: spec.timezone ?? "Australia/Brisbane",
+    utc_offset_minutes: spec.utc_offset_minutes ?? 600,
+    kind: spec.kind ?? "in_progress",
+    units,
+    fleet: fleetOf(unitList),
+    sources:
+      spec.sources ?? {
+        grid: "integrated_ct",
+        battery: "device_counter",
+        load: "device_counter",
+        surplus: "attributed_adviser",
+      },
+    counter_cross_check:
+      spec.counter_cross_check === undefined
+        ? {
+            grid_a_delta_kwh: 8.3,
+            grid_b_delta_kwh: 12.8,
+            consistent_with: "vendor_labels",
+            discriminating: true,
+          }
+        : spec.counter_cross_check,
+    solar_production_measured: false,
+  };
+}
+
+/** The snapshot's `energy_today` block: the live record plus `as_of`. */
+export interface WireEnergyToday extends WireEnergyDayRecord {
+  readonly as_of: string;
+}
+
+export function energyToday(
+  spec: Parameters<typeof energyDayRecord>[0] & { as_of?: string } = {},
+): WireEnergyToday {
+  const { as_of: asOf, ...record } = spec;
+  return {
+    ...energyDayRecord(record),
+    as_of: asOf ?? "2026-08-26T14:03:00+10:00",
+  };
+}
+
+/** Attach the pending energy block to a snapshot world. */
+export function withEnergyToday(world: WireSnapshot, today: WireEnergyToday): WireSnapshot {
+  return { ...world, energy_today: today };
+}
+
+/**
+ * One `energy.day_rolled` frame: the payload IS the completed record (§6).
+ * PENDING-BACKEND.
+ */
+export function energyDayRolled(
+  sequence: number,
+  record: WireEnergyDayRecord = energyDayRecord({ kind: "complete" }),
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<WireEnergyDayRecord> {
+  return frame(ENERGY_DAY_ROLLED, sequence, record, occurredAt);
+}
+
+/** The GET /api/v1/energy/days 200 body (newest-last; N ∈ 1..31). PENDING-BACKEND. */
+export function getEnergyDaysOk(view: {
+  days?: readonly WireEnergyDayRecord[];
+  grid_counter_roles?: "unpinned" | "vendor_labels" | "swapped";
+}): Record<string, unknown> {
+  return {
+    days: [...(view.days ?? [])],
+    grid_counter_roles: view.grid_counter_roles ?? "unpinned",
+    solar_production_measured: false,
+  };
+}
+
+/**
+ * The days route's not-commissioned refusal (the schedules precedent
+ * verbatim): 409 `energy_scorecard_not_commissioned` when the config block is
+ * absent. Shaped exactly as the thrown `ApiClientError` carries it.
+ */
+export function energyNotCommissionedEnvelope(options: {
+  message?: string;
+} = {}): { status: number; code: string; message: string; details: Record<string, unknown> | null; request_id: string } {
+  return {
+    status: 409,
+    code: "energy_scorecard_not_commissioned",
+    message:
+      options.message ??
+      "The energy scorecard is not commissioned in this deployment's config.",
+    details: null,
+    request_id: "req-energy-scorecard",
+  };
+}
+
 export function snapshot(
   units: readonly WireUnitSnapshot[],
   spec: { site_id?: string; snapshot_sequence?: number; captured_at?: string } = {},
@@ -1650,6 +1921,19 @@ export interface WireUnitDetail {
   /** Same readthrough fields as the snapshot's telemetry block (see there). */
   readonly grid_power_w: number | null;
   readonly load_power_w: number | null;
+  /**
+   * The six ADVISORY cumulative-energy readthroughs (API_CONTRACTS.md "Energy
+   * scorecard", PENDING-BACKEND): float kWh lifetime counters, null when the
+   * `0x4101` cold-ring window was not served this observation — never
+   * zero-filled. The grid pair keeps NEUTRAL A/B names (the pair ORDER is
+   * vendor-confirmed; the buy/sell ROLE labels are evidence-open, A-1).
+   */
+  readonly energy_grid_a_kwh: number | null;
+  readonly energy_grid_b_kwh: number | null;
+  readonly energy_load_kwh: number | null;
+  readonly energy_pv_kwh: number | null;
+  readonly energy_charge_kwh: number | null;
+  readonly energy_discharge_kwh: number | null;
   readonly active_faults: readonly string[] | null;
   readonly active_warnings: readonly string[] | null;
   readonly cell_voltages_v: readonly number[] | null;
@@ -1680,6 +1964,20 @@ interface FleetUnitFacts {
   readonly tempMaxC: number;
   readonly serial: string;
   readonly rtuId: string;
+  /**
+   * The six cumulative-energy counters as the 2026-08-22 capture decoded them
+   * (field-mapping §2.7, vendor pair order grid-buy, grid-sell, load, PV, BMS
+   * charge, BMS discharge — the A/B ROLE labels are the open A-1 question, so
+   * the names here stay neutral).
+   */
+  readonly energy: readonly [
+    number,
+    number,
+    number,
+    number,
+    number,
+    number,
+  ] | null;
 }
 
 const FLEET_FACTS: Record<string, FleetUnitFacts> = {
@@ -1700,6 +1998,7 @@ const FLEET_FACTS: Record<string, FleetUnitFacts> = {
     tempMaxC: 28,
     serial: "BEP0005KXX11B10500151",
     rtuId: "0x2C225097",
+    energy: [9709.2, 3187.7, 3789.4, 0.0, 3567.2, 5678.9],
   },
   RHS: {
     soc: 68,
@@ -1717,6 +2016,7 @@ const FLEET_FACTS: Record<string, FleetUnitFacts> = {
     tempMaxC: 27,
     serial: "BEP0005KXX11B10500118",
     rtuId: "0x2C225076",
+    energy: [2346.2, 5175.1, 2018.8, 0.0, 2103.7, 6351.9],
   },
   LHS: {
     soc: 48,
@@ -1734,6 +2034,7 @@ const FLEET_FACTS: Record<string, FleetUnitFacts> = {
     tempMaxC: 27,
     serial: "BEP0005KXX11B10500149",
     rtuId: "0x2C225095",
+    energy: [6960.5, 4256.7, 4881.0, 6.2, 4654.8, 6156.9],
   },
 };
 
@@ -1780,6 +2081,11 @@ function temperatureSensorCount(cellCount: number): number {
  */
 export function unitDetail(unitId: string, spec: Partial<WireUnitDetail> = {}): WireUnitDetail {
   const facts = FLEET_FACTS[unitId];
+  /** One captured cumulative counter, or null (block unserved / unknown unit). */
+  const capturedEnergy = (index: number): number | null => {
+    const counters = facts?.energy;
+    return counters == null ? null : (counters[index] ?? null);
+  };
   const cellCount = facts?.cellCount ?? 60;
   const cells = cellVoltages(cellCount, facts?.cellMinV ?? 3.205, facts?.cellMaxV ?? 3.209);
   const temperatureCount = temperatureSensorCount(facts?.cellCount ?? 60);
@@ -1814,6 +2120,21 @@ export function unitDetail(unitId: string, spec: Partial<WireUnitDetail> = {}): 
     temperature_max_c: facts === undefined ? null : facts.tempMaxC,
     grid_power_w: spec.grid_power_w === undefined ? null : spec.grid_power_w,
     load_power_w: spec.load_power_w === undefined ? null : spec.load_power_w,
+    // The captured cumulative counters for the three commissioned units (null
+    // for an unknown id — an absent block is never a zero); explicit overrides
+    // win per field so a suite can serve the unserved-block nulls.
+    energy_grid_a_kwh:
+      spec.energy_grid_a_kwh === undefined ? capturedEnergy(0) : spec.energy_grid_a_kwh,
+    energy_grid_b_kwh:
+      spec.energy_grid_b_kwh === undefined ? capturedEnergy(1) : spec.energy_grid_b_kwh,
+    energy_load_kwh:
+      spec.energy_load_kwh === undefined ? capturedEnergy(2) : spec.energy_load_kwh,
+    energy_pv_kwh:
+      spec.energy_pv_kwh === undefined ? capturedEnergy(3) : spec.energy_pv_kwh,
+    energy_charge_kwh:
+      spec.energy_charge_kwh === undefined ? capturedEnergy(4) : spec.energy_charge_kwh,
+    energy_discharge_kwh:
+      spec.energy_discharge_kwh === undefined ? capturedEnergy(5) : spec.energy_discharge_kwh,
     active_faults: [],
     active_warnings: ["PCS_Warning0_1", "DCDC_Warning0_1"],
     cell_voltages_v: cells,
@@ -1857,6 +2178,12 @@ export function emptyUnitDetail(unitId: string): WireUnitDetail {
     temperature_max_c: null,
     grid_power_w: null,
     load_power_w: null,
+    energy_grid_a_kwh: null,
+    energy_grid_b_kwh: null,
+    energy_load_kwh: null,
+    energy_pv_kwh: null,
+    energy_charge_kwh: null,
+    energy_discharge_kwh: null,
     active_faults: null,
     active_warnings: null,
     cell_voltages_v: null,
