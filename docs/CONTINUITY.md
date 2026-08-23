@@ -460,7 +460,21 @@ direction, freshness, and watchdog timing per physical unit.
   (config 19, strategy 32, facade 13, REST 12, composition 7, events 6,
   simulator 1); FULL SUITE 2145 green; ruff + format + MYPYPATH=src mypy
   strict clean each commit. SIMULATOR DEMO (../night-charge-demo/, run
-  TWICE, identical digest — see the entry's figures in the final report).
+  TWICE, identical digest a735b16465cfda889897547fbcfb7fd039e9321a478511efa319eb303ae62de7):
+  the composed fleet walked the whole acceptance night — units_disarmed
+  boot -> arm -> pacing at the 2500 W cap with rhs skipped_full and the
+  pods' measured battery watts at -2000 W on the ramp (autonomy replaced)
+  -> the 1300 W EV spike holding every participant at 100 W with measured
+  watts never positive (no discharge, no cycling) -> the 900 W band not
+  releasing -> the 700 W resume -> the dawn corner with BOTH optimizer
+  intents live and the night adviser excluding the excess claim's unit
+  (lhs) -> the export ending and lhs rejoining -> a manual request on mid
+  excluding mid while lhs kept charging -> completion at 05:29 (all three
+  at the 94% ceiling, nothing charging) -> 06:00 non-renewal. Two demo-
+  only timing notes recorded in the script: the allocator's optimizer
+  export bound never applies to night- intents (pinned by 4cbf1b4), and
+  the injected clock's read-preempt path advances 0.9 s/cycle so the
+  demo's authority lifetime sits at 2.0 s.
   LIVE STAGING (writemode36): the config block PRESENT with enabled:false
   and the PARTITION grant widened in the same revision (schedule posture
   now partition); controller restarted clean; the snapshot carries
