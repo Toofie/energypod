@@ -689,6 +689,20 @@ coordinator, the event bus, and per-unit actor handles.
 - Scenario hooks inject faults, warnings, disconnects, and malformed registers for testing.
   The simulator is a distinct deployment target composed through `build_runtime` with
   simulator transports and in-memory persistence.
+- Honest per-field quality (MUTATION-3/6, 2026-08-25): the composed simulate-mode decode
+  derives every quality-map field from the served words with the production wire decoder's
+  own fail-closed helpers (signed measurements, 0-100 percentages, non-negative dynamic
+  limits) — never blanket GOOD. A sentinel limit word (0xFFFF/0x8000-style, or a
+  malformed-injected complement such as 3000 ^ 0xFFFF = 62,535 unsigned = -3001 signed)
+  decodes as BAD with the value absent, exactly as the live wire decode refuses it; an
+  out-of-range percentage word fails its FIELD closed (BAD, value absent) instead of
+  failing the whole poll. With a clean bank every field is GOOD and the decoded values are
+  byte-identical to the previous behavior. `script_quality(field, quality)` /
+  `clear_scripted_quality(field)` on the pod script one quality-map field's decode
+  judgment for a scenario WITHOUT touching any served register word (the device keeps
+  serving its bytes; only the decode's trust moves): BAD/MISSING also withdraw the
+  field's decoded value, SUSPECT/STALE keep it; the field must be one of the twelve
+  quality-map fields and the quality a `DataQuality` member.
 
 ## Cancel intent
 

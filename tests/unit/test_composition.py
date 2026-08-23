@@ -2164,7 +2164,12 @@ async def test_cancel_intent_endpoint_cancels_the_active_intent(tmp_path: Path) 
         json_body={"intent_id": "current"},
     )
     assert status == 200, cancelled
-    assert cancelled == {"intent_id": intent_id, "status": "cancelled", "unit_ids": ["mid"]}
+    assert cancelled == {
+        "intent_id": intent_id,
+        "status": "cancelled",
+        "unit_ids": ["mid"],
+        "degraded": [],
+    }
     assert not await _settle(runtime.intents.active(runtime.clock.monotonic()))
 
     # Idempotent replay of the same key returns the same result.

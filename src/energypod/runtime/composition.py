@@ -67,7 +67,6 @@ from energypod.adapters.modbus import (
     encode_pq_registers,
     encode_stop_registers,
     faults,
-    protocol_codec,
     register_layout,
 )
 from energypod.adapters.modbus import decode as wire_decode
@@ -1055,6 +1054,79 @@ class _SimulatorTelemetry:
         cells = blocks[self._cell_voltage_window]
         temperatures = blocks[self._cell_temperature_window]
         served_temperatures = self._verify_served_bank(bms, cells, temperatures)
+
+        # MUTATION-3/6 (blanket-GOOD masking): every field's quality judgment
+        # is DERIVED from the served words with the production wire decoder's
+        # own fail-closed helpers -- signed measurements, 0-100 percentages,
+        # non-negative dynamic limits.  The simulator is the reference model,
+        # so a sentinel word (a malformed-injected limit served as its
+        # complement, 62,535 unsigned) must fail closed here exactly as the
+        # live wire decode refuses it: value absent, quality BAD -- never a
+        # giant valid limit reported GOOD.  The helpers are imported from the
+        # decoder deliberately: one implementation, zero semantic drift.
+        grid_power_w, grid_quality = wire_decode._measurement(pcs_live, 17, 1.0)
+        load_power_w, load_quality = wire_decode._measurement(pcs_live, 20, 1.0)
+        system_soc_word = wire_decode._served_word(system, 17)
+        if system_soc_word is None:  # pragma: no cover - the plan serves it
+            system_soc_pct, system_soc_quality = None, DataQuality.MISSING
+        else:
+            # Mapping S2.13: the system SOC is the word's low byte.
+            system_soc_pct = float(system_soc_word & 0xFF)
+            system_soc_quality = (
+                DataQuality.GOOD if 0.0 <= system_soc_pct <= 100.0 else DataQuality.BAD
+            )
+            if system_soc_quality is DataQuality.BAD:
+                system_soc_pct = None
+        soh_pct, soh_quality = wire_decode._percentage(system, 22)
+        battery_watts, watts_quality = wire_decode._measurement(system, 20, 1.0)
+        pack_voltage_v, pack_voltage_quality = wire_decode._measurement(system, 18, 0.1)
+        pack_current_a, pack_current_quality = wire_decode._measurement(system, 19, 0.1)
+        bms_soc_pct, bms_soc_quality = wire_decode._percentage(bms, 9)
+        dynamic_charge_limit_w, charge_quality = wire_decode._power_limit(bms, 13)
+        dynamic_discharge_limit_w, discharge_quality = wire_decode._power_limit(bms, 14)
+
+        values: dict[str, Any] = {
+            "system_soc_pct": system_soc_pct,
+            "bms_soc_pct": bms_soc_pct,
+            "soh_pct": soh_pct,
+            "battery_watts": battery_watts,
+            "pack_voltage_v": pack_voltage_v,
+            "pack_current_a": pack_current_a,
+            "dynamic_charge_limit_w": dynamic_charge_limit_w,
+            "dynamic_discharge_limit_w": dynamic_discharge_limit_w,
+            "grid_power_w": grid_power_w,
+            "load_power_w": load_power_w,
+            # Cell blocks: millivolt words and raw-40-offset temperature words.
+            # The evidenced window serves every cell the packing holds; the
+            # unit's commissioned count takes the prefix it declares.  The
+            # bank shape itself is verified above, so a served bank is GOOD.
+            "cell_voltages_v": tuple(
+                value / 1000.0 for value in cells[: self._expected_cell_count]
+            ),
+            "temperatures_c": tuple(float(value - 40) for value in temperatures),
+        }
+        quality: dict[str, DataQuality] = {
+            "system_soc_pct": system_soc_quality,
+            "bms_soc_pct": bms_soc_quality,
+            "soh_pct": soh_quality,
+            "battery_watts": watts_quality,
+            "pack_voltage_v": pack_voltage_quality,
+            "pack_current_a": pack_current_quality,
+            "dynamic_charge_limit_w": charge_quality,
+            "dynamic_discharge_limit_w": discharge_quality,
+            "cell_voltages_v": DataQuality.GOOD,
+            "temperatures_c": DataQuality.GOOD,
+            "grid_power_w": grid_quality,
+            "load_power_w": load_quality,
+        }
+        # Scripted scenario degradation rides ON TOP of the derived judgment
+        # and never touches the served words (MUTATION-3/6): BAD/MISSING also
+        # withdraw the value, SUSPECT/STALE keep it.
+        for field, flag in dict(self._pod.scripted_quality()).items():
+            quality[field] = flag
+            if flag in (DataQuality.BAD, DataQuality.MISSING):
+                values[field] = () if field in ("cell_voltages_v", "temperatures_c") else None
+
         return Observation(
             unit_id=self._unit_id,
             device_identity=self._pod.identity,
@@ -1064,39 +1136,14 @@ class _SimulatorTelemetry:
             sequence=self._pod.telemetry_sequence,
             lifecycle=lifecycle,
             protocol_profile=self._expected_profile,
-            # Advisory per-pod CT words, PROTOCOL_EVIDENCE 4c: the simulator
-            # serves the PCS live block every cycle (its plan is the full IoT
-            # set), so the scripted scenario words decode GOOD — negative
-            # grid = import, positive = export, exactly as the live wire.
-            grid_power_w=float(protocol_codec.decode_signed16(pcs_live[17])),
-            load_power_w=float(protocol_codec.decode_signed16(pcs_live[20])),
-            # System block: SOC at +17, pack voltage x0.1 V at +18, pack
-            # current x0.1 A at +19, signed battery watts at +20, SOH at +22.
-            system_soc_pct=float(system[17]),
-            soh_pct=float(system[22]),
-            battery_watts=float(protocol_codec.decode_signed16(system[20])),
-            pack_voltage_v=system[18] * 0.1,
-            pack_current_a=protocol_codec.decode_signed16(system[19]) * 0.1,
-            # BMS block: SOC at +9, dynamic charge/discharge power limits at
-            # +13/+14 (raw watts, the device's own headroom report).
-            bms_soc_pct=float(bms[9]),
-            dynamic_charge_limit_w=float(bms[13]),
-            dynamic_discharge_limit_w=float(bms[14]),
             expected_cell_count=self._expected_cell_count,
-            # Cell blocks: millivolt words and raw-40-offset temperature words.
-            # The evidenced window serves every cell the packing holds; the
-            # unit's commissioned count takes the prefix it declares.
-            cell_voltages_v=tuple(value / 1000.0 for value in cells[: self._expected_cell_count]),
             cell_captured_at_mono=self._pod.cell_captured_at_mono,
             cell_sequence=self._pod.cell_sequence,
             expected_temperature_count=served_temperatures,
-            temperatures_c=tuple(float(value - 40) for value in temperatures),
             active_faults=fault_codes,
             active_warnings=warning_codes,
-            quality={
-                field: DataQuality.GOOD
-                for field in Observation.QUALITY_FIELDS | Observation.ADVISORY_QUALITY_FIELDS
-            },
+            **values,
+            quality=quality,
         )
 
     def _verify_served_bank(

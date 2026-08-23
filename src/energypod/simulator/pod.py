@@ -22,9 +22,12 @@ from __future__ import annotations
 import math
 import random
 import zlib
+from collections.abc import Mapping
+from types import MappingProxyType
 from typing import Any
 
 from energypod.adapters.modbus import faults, protocol_codec, register_layout
+from energypod.domain.observations import DataQuality, Observation
 
 # Served holding-register block bases (PROTOCOL_EVIDENCE section 5).
 _PQ_HEADER_WORD = 1  # first word of the evidenced [1, P, Q] objective frame
@@ -55,6 +58,13 @@ _FAULT_BLOCK_BASES: tuple[tuple[faults.FaultBlock, int], ...] = (
     (faults.FaultBlock.IOT_PCS, 0x1040),
     (faults.FaultBlock.IOT_DCDC, 0x2040),
     (faults.FaultBlock.IOT_BMS, 0x5040),
+)
+
+# MUTATION-3/6 (scriptable quality): the scenario hook may distrust exactly
+# the observation's own quality-map fields -- the ten safety-critical fields
+# plus the two advisory CT words -- and nothing else.
+_SCRIPTABLE_QUALITY_FIELDS: frozenset[str] = frozenset(
+    Observation.QUALITY_FIELDS | Observation.ADVISORY_QUALITY_FIELDS
 )
 
 _IOT_FAULT_PREFIXES: frozenset[str] = frozenset(
@@ -171,6 +181,9 @@ class SimulatedEnergyPod:
         self._scripted_load_power_w = 0
         self._fault_words: dict[str, int] = {}
         self._malformed_addresses: set[int] = set()
+        # Scripted decode-trust overrides (MUTATION-3/6): field -> quality.
+        # The served register bank is untouched by these; see script_quality.
+        self._scripted_quality: dict[str, DataQuality] = {}
         self._link_up = True
         self._connection_epoch = 1
 
@@ -305,6 +318,35 @@ class SimulatedEnergyPod:
     def script_load_power_w(self, watts: int) -> None:
         """Scenario hook: script the per-pod CT load power word (+20)."""
         self._scripted_load_power_w = self._ct_word(watts, "load power")
+
+    def script_quality(self, field: str, quality: DataQuality) -> None:
+        """Scenario hook: script one quality-map field's decode judgment.
+
+        MUTATION-3/6 (blanket-GOOD masking): the device model keeps serving
+        its register bytes verbatim -- a register-image pin still sees the
+        same bank -- and only the composed decode's TRUST moves.  BAD/MISSING
+        also withdraw the field's decoded value (a distrusted figure is never
+        served as if trusted); SUSPECT/STALE keep the value, mirroring the
+        production fail-closed downgrade.  Use this to exercise fail-closed
+        consumers (the safety kernel's quality gate, the excess adviser's
+        export bound) against degraded telemetry the served words alone
+        cannot express.
+        """
+        if type(field) is not str or field not in _SCRIPTABLE_QUALITY_FIELDS:
+            raise ValueError("field must name a decoded quality-map field")
+        if type(quality) is not DataQuality:
+            raise ValueError("quality must be a DataQuality member")
+        self._scripted_quality[field] = quality
+
+    def clear_scripted_quality(self, field: str) -> None:
+        """Restore the derived judgment for one scripted quality field."""
+        if type(field) is not str or field not in _SCRIPTABLE_QUALITY_FIELDS:
+            raise ValueError("field must name a decoded quality-map field")
+        self._scripted_quality.pop(field, None)
+
+    def scripted_quality(self) -> Mapping[str, DataQuality]:
+        """The scripted decode-trust overrides, read-only."""
+        return MappingProxyType(dict(self._scripted_quality))
 
     @staticmethod
     def _ct_word(watts: int, label: str) -> int:

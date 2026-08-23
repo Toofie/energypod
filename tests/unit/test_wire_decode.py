@@ -739,20 +739,30 @@ def test_out_of_range_percentage_fails_closed(
 
 
 @pytest.mark.parametrize(
-    ("offset", "field"),
-    [(13, "dynamic_charge_limit_w"), (14, "dynamic_discharge_limit_w")],
+    ("offset", "field", "word"),
+    [
+        (13, "dynamic_charge_limit_w", 0x8000),
+        (14, "dynamic_discharge_limit_w", 0x8000),
+        # MUTATION-3/6 (blanket-GOOD masking, 2026-08-25): the exact sentinel
+        # named in the finding.  0xFFFF is 65,535 read unsigned but -1 signed;
+        # the limit domain forbids negatives, so it must fail closed -- never
+        # decode as a giant valid limit.
+        (13, "dynamic_charge_limit_w", 0xFFFF),
+        (14, "dynamic_discharge_limit_w", 0xFFFF),
+    ],
 )
 def test_negative_dynamic_limit_fails_closed(
-    wire_decode: Any, capture: Any, offset: int, field: str
+    wire_decode: Any, capture: Any, offset: int, field: str, word: int
 ) -> None:
     """T-UNIT-WIRE-022 / garbage registers / S0.
 
-    0x8000 decodes to -32768 W; the domain forbids negative limits, so the
-    decode must fail closed instead of raising or wrapping.
+    0x8000 decodes to -32768 W and 0xFFFF to -1 W; the domain forbids
+    negative limits, so the decode must fail closed instead of raising or
+    wrapping.
     """
     blocks = _blocks_of(capture, "LHS")
     bms = list(blocks[_BMS_BASE])
-    bms[offset] = 0x8000
+    bms[offset] = word
     blocks[_BMS_BASE] = tuple(bms)
 
     observation = _decode_unit(wire_decode, capture, "LHS", blocks=blocks)
