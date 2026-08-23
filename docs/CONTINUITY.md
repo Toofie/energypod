@@ -953,6 +953,24 @@ direction, freshness, and watchdog timing per physical unit.
   held for this run and is now LIVE (controller restarted writemode22).
   Live SOC at run: mid 67 (both directions eligible), rhs/lhs 98.
 
+- 2026-08-24 (console-complete): CONSOLE AT PARITY WITH THE BACKEND
+  (0b81471, 57cda5f, c96dcfb; 272/272 web tests). Now view: ONE CARD PER
+  ACTIVE REQUEST (keyed by intent id) with independent countdowns, per-
+  card direction and per-battery figures, take-over display when a newer
+  request claims one battery (older card's other batteries continue),
+  and a live CANCEL button per card (POST /api/v1/intents/cancel
+  {intent_id}; bus intent.cancelled retires the card). Batteries summary
+  and the fleet banner render per-battery truth from the shared tracker
+  maps — no surface anywhere stamps a fleet total on a per-battery card
+  or derives Limited from a fleet-vs-unit comparison. The snapshot intent
+  block is LIVE on the controller (verified serving; null when no active
+  claimant) so cold loads are exact. QUEUED SMALL BACKEND NICETIES:
+  intent.accepted payloads should carry expires_in_s (other operators'
+  cards currently show "Remaining time: Not available"); audit.appended
+  bus summaries should carry correlation_id so cards can join cycles by
+  id instead of unit membership. Full test suite launched for the first
+  clean end-to-end run since the hanging-tests fix.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
