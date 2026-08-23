@@ -11,7 +11,14 @@ from typing import Any, Final, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 from energypod.domain.intents import Direction, IntentSource
-from energypod.domain.schedule import ScheduleEntry, SchedulePlan, ScheduleValidationError, Weekday
+from energypod.domain.schedule import (
+    OPEN_EFFECTIVE_FROM,
+    OPEN_EFFECTIVE_UNTIL,
+    ScheduleEntry,
+    SchedulePlan,
+    ScheduleValidationError,
+    Weekday,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +175,13 @@ def window_end(entry: ScheduleEntry, at: datetime) -> datetime:
 
 def schedule_wire_entry(entry: ScheduleEntry) -> dict[str, Any]:
     """The §5 wire shape of one entry (the editor renders straight from it)."""
+
+    def _wire_bound(bound: Any, open_bound: Any) -> str | None:
+        # An open bound (published without a date, DESIGN_SCHEDULES §1) echoes
+        # as null — GET shows exactly what the operator published, and the
+        # editor's optional date fields stay empty on reload.
+        return None if bound == open_bound else bound.isoformat()
+
     wire: dict[str, Any] = {
         "entry_id": entry.entry_id,
         "days": [_WIRE_DAYS[int(day)] for day in sorted(entry.days)],
@@ -175,8 +189,8 @@ def schedule_wire_entry(entry: ScheduleEntry) -> dict[str, Any]:
         "end_local": entry.end_local.strftime("%H:%M"),
         "action": entry.action.value,
         "unit_ids": sorted(entry.unit_ids),
-        "effective_from": entry.effective_from.isoformat(),
-        "effective_until": entry.effective_until.isoformat(),
+        "effective_from": _wire_bound(entry.effective_from, OPEN_EFFECTIVE_FROM),
+        "effective_until": _wire_bound(entry.effective_until, OPEN_EFFECTIVE_UNTIL),
         "priority": entry.priority,
         "enabled": entry.enabled,
     }

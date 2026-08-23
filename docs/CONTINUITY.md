@@ -349,6 +349,37 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-23 (schedules wire contract): LIVE 422 ON PUBLISH FIXED — the docs
+  govern. The operator's first editor publish (per-battery watts, no advanced
+  dates) was refused 422 validation_error at the STRICT REST schema
+  (body.entries.0.effective_from/effective_until "Field required") because B4
+  had spelled ScheduleEntryRequest with both dates REQUIRED, while
+  DESIGN_SCHEDULES §1 pins "an optional date range it is effective within" —
+  the backend deviated, the console did not. Resolution (backend): the wire
+  accepts absent/null effective_from/effective_until (a present bound is still
+  a 10-char ISO date); the facade resolves an absent bound onto new domain
+  sentinels OPEN_EFFECTIVE_FROM/UNTIL (date.min/max — every comparison site
+  stays a plain date comparison; the SQLite payload round-trips the sentinels);
+  schedule_wire_entry echoes an open bound as NULL so GET shows exactly what
+  the operator published and the editor's optional date fields stay empty on
+  reload. Web (defense for future drift): a wire-schema 422's pydantic loc
+  paths (body.entries.0.days.1) now map onto the offending draft row by index
+  when derivable, and otherwise render in the banner naming the field path —
+  never a bare "Request validation failed"; the sentence names where the
+  reasons rendered (rows, field paths, or both). LIVE: controller restarted
+  onto the fix (boot disarmed; durable plan in var/live-write.sqlite3); the
+  operator's own retries published v1 then v2 ("Testing", 19:35-19:36
+  discharge 999 W per battery, dates 2026-08-17..09-25) and the window RAN
+  after they armed (audit: pre-arm submits rejected lifecycle_not_controllable
+  every tick, accepted+authorized from the tick after the arm; ended by
+  non-renewal + watchdog hand-back). FINDING (recorded, not improvised): the
+  schedule_state reason vocabulary cannot say "window open but the units are
+  disarmed" — the pre-arm refusal stream is audit-only, so the operator had
+  to discover the arm requirement by trying; a projection vocabulary addition
+  is the honest fix if the operator wants it. Reminder: restarts boot
+  DISARMED — an armed epoch does not survive a controller restart, so a
+  window only commands if somebody arms again after every boot.
+
 - 2026-08-25 (schedules backend): THE SCHEDULES SURFACE IMPLEMENTED (B1-B6;
   3e351f5, 1019640, f4d0eec, bdc592c, c67742c, + this pass) against the
   accepted contract docs/DESIGN_SCHEDULES.md (18db3ff) and API_CONTRACTS

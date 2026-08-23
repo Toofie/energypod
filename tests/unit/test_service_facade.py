@@ -18,7 +18,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import Any
 
@@ -3924,6 +3924,55 @@ async def test_publish_carries_per_unit_watts_as_the_native_form(api: Any) -> No
     assert stored.watts == 1500
     assert result["plan"]["entries"][0]["watts_by_unit"] == {"pod-a": 800, "pod-b": 700}
     assert "watts" not in result["plan"]["entries"][0]
+
+
+@pytest.mark.parametrize(
+    "dates",
+    [
+        None,  # both bounds absent — the editor's normal case
+        {"effective_from": None, "effective_until": None},  # explicit nulls
+        {"effective_from": None},  # half-open: no start bound
+        {"effective_until": None},  # half-open: no end bound
+    ],
+)
+async def test_publish_without_effective_dates_is_open_bounded_and_echoes_null(
+    api: Any, dates: dict[str, Any] | None
+) -> None:
+    # DESIGN_SCHEDULES §1: the effective date range is OPTIONAL. An entry
+    # published without a bound (the editor's normal case — the fields sit
+    # empty) resolves onto the domain's open bounds and echoes null on the
+    # wire, so the editor's optional date fields stay empty on reload and the
+    # entry never silently expires.
+    from energypod.domain.schedule import OPEN_EFFECTIVE_FROM, OPEN_EFFECTIVE_UNTIL
+
+    rig, surface = make_schedule_rig(api)
+
+    entry = {
+        key: value
+        for key, value in wire_entry().items()
+        if key not in ("effective_from", "effective_until")
+    }
+    entry.update(dates or {})
+    result = await rig.facade.replace_schedule(**publish_kwargs(entries=[entry]))
+
+    expected_from = OPEN_EFFECTIVE_FROM if entry.get("effective_from") is None else date(2026, 1, 1)
+    expected_until = (
+        OPEN_EFFECTIVE_UNTIL if entry.get("effective_until") is None else date(2026, 12, 31)
+    )
+    stored = surface.store.plan.entries[0]
+    assert stored.effective_from == expected_from
+    assert stored.effective_until == expected_until
+    wire = result["plan"]["entries"][0]
+    assert wire["effective_from"] == (
+        None if expected_from == OPEN_EFFECTIVE_FROM else "2026-01-01"
+    )
+    assert wire["effective_until"] == (
+        None if expected_until == OPEN_EFFECTIVE_UNTIL else "2026-12-31"
+    )
+    assert result["next_action"] is not None, "an open-bounded entry always occurs again"
+    view = await rig.facade.get_schedule(principal=OPERATOR)
+    assert view["plan"]["entries"][0]["effective_from"] == wire["effective_from"]
+    assert view["plan"]["entries"][0]["effective_until"] == wire["effective_until"]
 
 
 @pytest.mark.parametrize(

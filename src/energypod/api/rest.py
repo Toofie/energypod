@@ -232,8 +232,11 @@ class ScheduleEntryRequest(StrictRequest):
     watts: StrictInt | None = Field(default=None, ge=0)
     watts_by_unit: dict[str, StrictInt] | None = None
     unit_ids: list[str] = Field(min_length=1)
-    effective_from: str = Field(min_length=10, max_length=10)
-    effective_until: str = Field(min_length=10, max_length=10)
+    # DESIGN_SCHEDULES §1: the effective date range is OPTIONAL — an absent
+    # (or null) bound is unbounded; the facade resolves the open bound.  A
+    # PRESENT bound is a 10-character ISO date (YYYY-MM-DD).
+    effective_from: str | None = Field(default=None, min_length=10, max_length=10)
+    effective_until: str | None = Field(default=None, min_length=10, max_length=10)
     priority: StrictInt
     enabled: StrictBool
 

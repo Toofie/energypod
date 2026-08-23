@@ -520,6 +520,34 @@ def test_per_unit_entries_round_trip_through_the_durable_payload() -> None:
     assert scalar.watts_by_unit is None
 
 
+def test_open_bounded_entries_round_trip_and_echo_null_dates() -> None:
+    """DESIGN_SCHEDULES §1: the effective date range is OPTIONAL — a bound
+    published absent resolves onto the domain's open bounds, survives the
+    durable payload, and echoes null on the wire so the editor's optional
+    date fields stay empty on reload."""
+    from energypod.adapters.persistence.sqlite import SQLiteScheduleRepository
+    from energypod.domain.schedule import OPEN_EFFECTIVE_FROM, OPEN_EFFECTIVE_UNTIL
+
+    store = SQLiteScheduleRepository.__new__(SQLiteScheduleRepository)
+    plan = _plan(
+        _entry(effective_from=OPEN_EFFECTIVE_FROM, effective_until=OPEN_EFFECTIVE_UNTIL),
+        version=1,
+    )
+    decoded = store._decode(store._encode(plan))
+    assert decoded == plan
+    assert decoded.entries[0].effective_from == OPEN_EFFECTIVE_FROM
+    assert decoded.entries[0].effective_until == OPEN_EFFECTIVE_UNTIL
+
+    from energypod.application.scheduling import schedule_wire_entry
+
+    wire = schedule_wire_entry(decoded.entries[0])
+    assert wire["effective_from"] is None
+    assert wire["effective_until"] is None
+    bounded = schedule_wire_entry(_entry())
+    assert bounded["effective_from"] == "2026-01-01"
+    assert bounded["effective_until"] == "2026-12-31"
+
+
 def test_scalar_rows_written_before_the_extension_still_decode() -> None:
     """A durable payload without the watts_by_unit key decodes unchanged."""
     from energypod.adapters.persistence.sqlite import SQLiteScheduleRepository

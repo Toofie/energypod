@@ -538,6 +538,8 @@ def _parse_schedule_wire_entries(
     from datetime import date as _date
 
     from energypod.domain.schedule import (
+        OPEN_EFFECTIVE_FROM,
+        OPEN_EFFECTIVE_UNTIL,
         ScheduleEntry,
         SchedulePlan,
         ScheduleValidationError,
@@ -627,9 +629,17 @@ def _parse_schedule_wire_entries(
             continue
         else:
             resolved_watts = watts
+        # DESIGN_SCHEDULES §1: the date range is optional — an absent (or null)
+        # bound is unbounded and resolves onto the domain's open bounds.
         dates: dict[str, Any] = {}
-        for field in ("effective_from", "effective_until"):
+        for field, open_bound in (
+            ("effective_from", OPEN_EFFECTIVE_FROM),
+            ("effective_until", OPEN_EFFECTIVE_UNTIL),
+        ):
             value = item.get(field)
+            if value is None:
+                dates[field] = open_bound
+                continue
             try:
                 if not isinstance(value, str):
                     raise ValueError("not a string")

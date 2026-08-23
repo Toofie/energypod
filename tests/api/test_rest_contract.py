@@ -1704,3 +1704,37 @@ def test_schedule_put_accepts_an_empty_entries_list_as_off(
     assert response.status_code == 200
     forwarded = [values for name, values in service.calls if name == "replace_schedule"]
     assert forwarded[0]["entries"] == []
+
+
+def test_schedule_put_accepts_the_optional_effective_dates_as_absent_or_null(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    # DESIGN_SCHEDULES §1: the effective date range is OPTIONAL. The editor
+    # omits both fields when the operator left them empty (and sends null on a
+    # cleared field) — the strict wire schema must pass that through to the
+    # facade, which resolves the open bounds. This is the exact shape the
+    # 2026-08-23 console publish was refused for.
+    absent = {
+        key: value
+        for key, value in _wire_entry().items()
+        if key not in ("effective_from", "effective_until")
+    }
+    with _client(service, authenticator) as client:
+        first = client.put(
+            f"{API}/schedule",
+            json=_put_body(entries=[absent]),
+            headers=_mutation_headers("operator-token", key="publish-open-1"),
+        )
+        nulled = client.put(
+            f"{API}/schedule",
+            json=_put_body(entries=[_wire_entry(effective_from=None)]),
+            headers=_mutation_headers("operator-token", key="publish-open-2"),
+        )
+
+    assert first.status_code == 200
+    assert nulled.status_code == 200
+    forwarded = [values for name, values in service.calls if name == "replace_schedule"]
+    assert forwarded[0]["entries"][0]["effective_from"] is None
+    assert forwarded[0]["entries"][0]["effective_until"] is None
+    assert forwarded[1]["entries"][0]["effective_from"] is None
+    assert forwarded[1]["entries"][0]["effective_until"] == "2026-12-31"

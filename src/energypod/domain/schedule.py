@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, time, timedelta
 from enum import IntEnum
+from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from energypod.domain.intents import Direction
@@ -34,6 +35,15 @@ def _strict_text(value: object, label: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ScheduleValidationError(f"{label} must be non-empty without surrounding whitespace")
     return value
+
+
+# DESIGN_SCHEDULES §1: an entry's effective date range is OPTIONAL — "an
+# optional date range it is effective within".  The domain always carries
+# concrete bounds (every comparison site stays a plain date comparison); an
+# absent wire bound maps onto these sentinels, and the wire layer echoes a
+# sentinel bound back as null so GET shows exactly what the operator published.
+OPEN_EFFECTIVE_FROM: Final[date] = date.min
+OPEN_EFFECTIVE_UNTIL: Final[date] = date.max
 
 
 @dataclass(frozen=True, slots=True)
