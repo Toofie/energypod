@@ -26,6 +26,7 @@ export type ViewRegistry = Partial<Record<ViewId, ShellView>>;
 export type ViewId =
   | "home"
   | "batteries"
+  | "flow"
   | "now"
   | "schedule"
   | "activity"
@@ -41,6 +42,7 @@ export interface ViewDescriptor {
 export const VIEWS: readonly ViewDescriptor[] = [
   { id: "home", label: "Home" },
   { id: "batteries", label: "Batteries" },
+  { id: "flow", label: "Flow" },
   { id: "now", label: "Now" },
   { id: "schedule", label: "Schedule" },
   { id: "activity", label: "Activity" },
@@ -67,5 +69,11 @@ export const VIEWS: readonly ViewDescriptor[] = [
  * evidence view landed (API_CONTRACTS.md "Night-writer detector"): its read
  * surface composes ALWAYS (no config block exists), so the link is always
  * offered and always has an answer once the detector's backend half lands.
+ *
+ * "Flow" (Energy flow) was promoted out of this list when the live flow view
+ * landed: every datum it renders already lives in the snapshot's per-unit
+ * telemetry (grid/load/battery watts, charge level), so the link is always
+ * offered and the view always has an answer — its honest states ("not
+ * available" per absent datum) are the view's own, never a placeholder.
  */
-export const PLANNED_VIEWS: readonly string[] = ["Energy flow", "Plan history"];
+export const PLANNED_VIEWS: readonly string[] = ["Plan history"];

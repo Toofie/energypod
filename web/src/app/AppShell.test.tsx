@@ -1481,7 +1481,7 @@ describe("AppShell — navigation", () => {
     // Home is the default view.
     expect(within(nav).getByRole("link", { name: "Home", current: "page" })).toBeVisible();
 
-    for (const name of ["Batteries", "Now", "Schedule", "Activity", "Insights"]) {
+    for (const name of ["Batteries", "Flow", "Now", "Schedule", "Activity", "Insights"]) {
       expect(within(nav).getByRole("link", { name })).toBeVisible();
     }
 
@@ -1490,8 +1490,11 @@ describe("AppShell — navigation", () => {
     // view itself answers a not-commissioned deployment honestly (the pinned
     // decision in views.ts). Insights left this list the same way when the
     // energy scorecard's ledger landed — its link is always offered and the
-    // view answers a not-commissioned deployment honestly.
-    for (const name of ["Energy Flow", "Plan history"]) {
+    // view answers a not-commissioned deployment honestly. Flow (Energy flow)
+    // left the same way when the live flow view landed: its link is always
+    // offered and the view always has an answer from the snapshot's own
+    // telemetry.
+    for (const name of ["Plan history"]) {
       expect(within(nav).queryByRole("link", { name: new RegExp(name, "i") })).toBeNull();
       const entry = within(nav).getByRole("listitem", { name: new RegExp(name, "i") });
       expectVisibleText(entry, /not available|coming soon|not yet/i);
@@ -1524,6 +1527,11 @@ describe("AppShell — navigation", () => {
     const batteries = within(nav).getByRole("link", { name: "Batteries" });
     expect(batteries).toHaveFocus();
     expect(batteries).toBeVisible();
+
+    await user.tab();
+    const flowLink = within(nav).getByRole("link", { name: "Flow" });
+    expect(flowLink).toHaveFocus();
+    expect(flowLink).toBeVisible();
 
     await user.tab();
     const nowLink = within(nav).getByRole("link", { name: "Now" });

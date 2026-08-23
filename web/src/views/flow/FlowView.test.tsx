@@ -1,0 +1,570 @@
+/**
+ * Behavior contract for the "Flow" (Energy Flow) view
+ * (web/src/views/flow/FlowView.tsx).
+ *
+ * PROP SEAM (web/src/app/views.ts `ShellViewProps`): the composed app mounts
+ * this view through the shell's injection point with exactly one prop — the
+ * session's shared `{ client }` (a second client would open a second events
+ * socket). The suite injects the client the same way.
+ *
+ * The client module is mocked at its exact surface (`createApiClient`
+ * replaced, every other canonical export preserved), exactly like the other
+ * view suites; envelope fixtures mirror the real REST/WS wire (lowercase
+ * enums, signed telemetry: grid negative = import / positive = export,
+ * battery negative = charge / positive = discharge).
+ *
+ * The pins:
+ *
+ * - RENDERING PER STATE: the all-idle site, the charging fleet, the mixed
+ *   discharging/charging fleet, the import+export split across phases, and
+ *   the adviser-active picture with its commanded-vs-measured overlay — each
+ *   with its story sentence and per-phase worded figures.
+ * - SIGN-TO-WORDS DISCIPLINE: a snapshot full of negative watts never puts a
+ *   raw negative on screen; every flow renders as a direction word plus the
+ *   absolute magnitude.
+ * - LIVE-UPDATE PIN: two successive snapshots change the figures on screen.
+ * - ACCESSIBILITY: each phase column carries its whole state as a text label;
+ *   the diagram's SVG is decorative duplication, never the only carrier.
+ * - FEATURE-ABSENT HONESTY: absent telemetry words "not available" (never
+ *   zero-filled); absent adviser projections claim nothing; the solar
+ *   footnote states the site fact.
+ */
+import { render, screen, waitFor, within } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ApiClientError } from "../../api/client";
+import type { ApiClient } from "../../api/client";
+import { FlowView } from "./FlowView";
+
+const api = vi.hoisted(() => {
+  const client = {
+    getSnapshot: vi.fn(),
+    getHealth: vi.fn(),
+    getAudit: vi.fn(),
+    postIntent: vi.fn(),
+    postArm: vi.fn(),
+    postDisarm: vi.fn(),
+    postEmergencyStop: vi.fn(),
+    openEvents: vi.fn(),
+  };
+  return { createApiClient: vi.fn(), client };
+});
+
+/** The mocked client as the shell hands it to the view (one bridging cast). */
+function injectedClient(): ApiClient {
+  return api.client as unknown as ApiClient;
+}
+
+vi.mock("../../api/client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../api/client")>()),
+  createApiClient: api.createApiClient,
+}));
+
+// --- envelope fixtures (shapes from the real service adapter) -------------------
+
+type PowerView = { direction: string; watts: number };
+
+type TelemetrySpec = {
+  soc_pct?: number | null;
+  grid_power_w?: number | null;
+  load_power_w?: number | null;
+  battery_watts?: number | null;
+};
+
+type UnitSpec = {
+  unit_id: string;
+  lifecycle?: string;
+  requested_power?: PowerView;
+  authorized_power?: PowerView | null;
+  measured_watts?: number | null;
+  telemetry?: TelemetrySpec | null;
+};
+
+type SnapshotEnvelope = {
+  site_id: string;
+  snapshot_sequence: number;
+  captured_at: string;
+  units: UnitSpec[];
+  adviser_state?: Record<string, unknown>;
+  night_charge_state?: Record<string, unknown>;
+};
+
+/** A unit whose telemetry is present with every flow datum explicit. */
+function unit(
+  unitId: string,
+  telemetry: TelemetrySpec = {},
+  over: Partial<UnitSpec> = {},
+): UnitSpec {
+  return {
+    unit_id: unitId,
+    lifecycle: "active",
+    requested_power: { direction: "idle", watts: 0 },
+    authorized_power: null,
+    measured_watts: null,
+    telemetry: {
+      soc_pct: null,
+      grid_power_w: null,
+      load_power_w: null,
+      battery_watts: null,
+      ...telemetry,
+    },
+    ...over,
+  };
+}
+
+function snapshotEnvelope(units: UnitSpec[], sequence = 41): SnapshotEnvelope {
+  return {
+    site_id: "site-1",
+    snapshot_sequence: sequence,
+    captured_at: "2026-08-22T12:00:00+10:00",
+    units,
+  };
+}
+
+type Frame = Record<string, unknown> & { type: string };
+
+/** A controllable stream: yields the initial frames, then pushed frames. */
+function liveChannel(initial: Frame[]): { push(frame: Frame): void } {
+  const queue: Frame[] = [...initial];
+  let wake: (() => void) | null = null;
+  api.client.openEvents.mockImplementation(() => {
+    return (async function* channel(): AsyncGenerator<Frame, void, unknown> {
+      while (true) {
+        while (queue.length > 0) {
+          const next = queue.shift();
+          if (next !== undefined) {
+            yield next;
+          }
+        }
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+        });
+      }
+    })();
+  });
+  return {
+    push: (frame) => {
+      queue.push(frame);
+      const release = wake;
+      wake = null;
+      release?.();
+    },
+  };
+}
+
+/** A stream that delivers its frames and then ends (connection loss). */
+function endingStream(frames: Frame[]): void {
+  api.client.openEvents.mockImplementationOnce(() => {
+    return (async function* ending(): AsyncGenerator<Frame, void, unknown> {
+      for (const frame of frames) {
+        yield frame;
+      }
+    })();
+  });
+}
+
+function renderFlow() {
+  render(<FlowView client={injectedClient()} />);
+}
+
+beforeEach(() => {
+  vi.resetAllMocks();
+});
+
+// --- the states -----------------------------------------------------------------
+
+describe("FlowView — rendering per state", () => {
+  it("renders the all-idle site with honest Idle labels and the idle story", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("mid", { soc_pct: 100, grid_power_w: 0, load_power_w: 0, battery_watts: 0 }),
+        unit("rhs", { soc_pct: 98, grid_power_w: 0, load_power_w: 0, battery_watts: 0 }),
+        unit("lhs", { soc_pct: 99, grid_power_w: 0, load_power_w: 0, battery_watts: 0 }),
+      ]),
+    );
+
+    renderFlow();
+
+    expect(await screen.findByText(/Nothing is flowing/i)).toBeVisible();
+    // Idle says Idle, never a zero dressed up as a flow: grid and battery
+    // figures across the three phases plus the fleet column.
+    expect((await screen.findAllByText("Idle")).length).toBe(8);
+    expect(screen.getAllByText("Using 0 W").length).toBe(4);
+    expect(screen.getByText("100% charged")).toBeVisible();
+  });
+
+  it("renders the charging fleet: per-phase words, fleet sums, and the story", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("mid", { soc_pct: 20, grid_power_w: -2000, load_power_w: 270, battery_watts: -1900 }),
+        unit("rhs", { soc_pct: 30, grid_power_w: -2000, load_power_w: 270, battery_watts: -1900 }),
+        unit("lhs", { soc_pct: 40, grid_power_w: -2000, load_power_w: 270, battery_watts: -1900 }),
+      ]),
+    );
+
+    renderFlow();
+
+    expect(
+      await screen.findByText(
+        "All the batteries are charging 5,700 W in total from the grid, the house using 810 W.",
+      ),
+    ).toBeVisible();
+    expect(screen.getAllByText("Importing 2,000 W").length).toBe(3);
+    expect(screen.getAllByText("Charging 1,900 W").length).toBe(3);
+    expect(screen.getByLabelText(/Phase mid — grid: Importing 2,000 W/)).toBeVisible();
+    expect(screen.getByLabelText(/Whole site/i)).toBeVisible();
+    // The fleet column words its sums, never a netted import/export figure.
+    const fleet = screen.getByLabelText(/Whole site/i);
+    expectVisibleText(fleet, /Importing 6,000 W/);
+    expectVisibleText(fleet, /Charging 5,700 W/);
+    expectVisibleText(fleet, /Using 810 W/);
+  });
+
+  it("renders the mixed fleet with no raw negative anywhere on screen", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("lhs", { soc_pct: 60, grid_power_w: 300, load_power_w: 100, battery_watts: 800 }),
+        unit("mid", { soc_pct: 25, grid_power_w: -1500, load_power_w: 200, battery_watts: -1900 }),
+        unit("rhs", { soc_pct: 35, grid_power_w: -1200, load_power_w: 110, battery_watts: -1900 }),
+      ]),
+    );
+
+    renderFlow();
+
+    expect(
+      await screen.findByText(
+        "lhs is discharging 800 W while mid and rhs are charging 3,800 W in total, the house using 410 W, importing 2,700 W on mid and rhs while exporting 300 W on lhs.",
+      ),
+    ).toBeVisible();
+    expect(screen.getAllByText("Discharging 800 W").length).toBe(1); // the lhs node
+    expect(screen.getAllByText("Exporting 300 W").length).toBe(1); // the lhs grid node
+    // The fleet column words BOTH sides — never a netted figure.
+    const fleet = screen.getByLabelText(/Whole site/i);
+    expectVisibleText(fleet, /Importing 2,700 W · Exporting 300 W/);
+    expectVisibleText(fleet, /Charging 3,800 W · Discharging 800 W/);
+    // THE SIGN DISCIPLINE: the wire is full of negatives; the operator sees none.
+    const view = document.body.querySelector(".flow-view");
+    expect(view?.textContent ?? "").not.toMatch(/-\d/);
+  });
+
+  it("renders the import+export split across phases with both fleet sides", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("mid", { grid_power_w: -800, load_power_w: 400, battery_watts: 0 }),
+        unit("rhs", { grid_power_w: 300, load_power_w: 0, battery_watts: 0 }),
+        unit("lhs", { grid_power_w: 0, load_power_w: 0, battery_watts: 0 }),
+      ]),
+    );
+
+    renderFlow();
+
+    expect(
+      await screen.findByText(
+        "The phases are pulling different ways, importing 800 W on mid while exporting 300 W on rhs, the house using 400 W.",
+      ),
+    ).toBeVisible();
+    const fleet = screen.getByLabelText(/Whole site/i);
+    expectVisibleText(fleet, /Importing 800 W · Exporting 300 W/);
+  });
+});
+
+// --- the command overlay ------------------------------------------------------------
+
+describe("FlowView — commanded vs measured", () => {
+  it("renders the overlay from the snapshot's per-unit authorized figures", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit(
+          "mid",
+          { soc_pct: 45, grid_power_w: -1980, load_power_w: 340, battery_watts: -980 },
+          {
+            lifecycle: "active",
+            requested_power: { direction: "charge", watts: 1000 },
+            authorized_power: { direction: "charge", watts: 1000 },
+          },
+        ),
+        unit("rhs", { soc_pct: 50, grid_power_w: -200, load_power_w: 120, battery_watts: 0 }),
+      ]),
+    );
+
+    renderFlow();
+
+    expect(
+      await screen.findByText("mid — commanded 1,000 W charge, charging at 980 W"),
+    ).toBeVisible();
+    // The request is what the flows are carrying out: the story says so.
+    expect(
+      screen.getByText(
+        "Carrying out a power request — mid is charging 980 W in total from the grid, the house using 460 W.",
+      ),
+    ).toBeVisible();
+    expect(screen.getByRole("heading", { name: /commanded vs delivering/i })).toBeVisible();
+  });
+
+  it("renders no overlay while nothing is commanded", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([unit("mid", { grid_power_w: -100, load_power_w: 100, battery_watts: 0 })]),
+    );
+
+    renderFlow();
+
+    await screen.findByRole("group", { name: /power flow by phase/i });
+    expect(screen.queryByRole("heading", { name: /commanded vs delivering/i })).toBeNull();
+  });
+});
+
+// --- honesty pins ---------------------------------------------------------------------
+
+describe("FlowView — honesty", () => {
+  it("words absent telemetry as not available, never zero-filled, and says so in the story", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([unit("mid", {}, { telemetry: null }), unit("rhs", {}, { telemetry: null })]),
+    );
+
+    renderFlow();
+
+    expect(
+      await screen.findByText(/No power readings yet — the pods have not reported a measurement/),
+    ).toBeVisible();
+    expect(screen.getAllByText("not available").length).toBeGreaterThanOrEqual(9);
+    // The fleet rollup never sums a silence into a zero.
+    const fleet = screen.getByLabelText(/Whole site/i);
+    expectVisibleText(fleet, /not available/);
+  });
+
+  it("carries the solar footnote on every picture", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([unit("mid", { grid_power_w: 0, load_power_w: 0, battery_watts: 0 })]),
+    );
+
+    renderFlow();
+
+    expect(await screen.findByText(/not wired to the pods' sensors/i)).toBeVisible();
+  });
+
+  it("renders the measured story — and never a solar claim — while the excess projection is absent", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("mid", { grid_power_w: 500, load_power_w: 100, battery_watts: -300 }),
+        unit("rhs", { grid_power_w: 500, load_power_w: 100, battery_watts: -300 }),
+      ]),
+    );
+
+    renderFlow();
+
+    expect(
+      await screen.findByText(
+        "All the batteries are charging 600 W in total, while the site exports 1,000 W, the house using 200 W.",
+      ),
+    ).toBeVisible();
+    expect(screen.queryByText(/Solar-surplus charging is active/i)).toBeNull();
+  });
+
+  it("renders the excess adviser's story while its projection says it is commanding", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue({
+      site_id: "site-1",
+      snapshot_sequence: 41,
+      captured_at: "2026-08-22T12:00:00+10:00",
+      adviser_state: {
+        enabled: true,
+        active: true,
+        fleet_export_w: 3400,
+      },
+      units: [
+        unit("mid", { grid_power_w: 1200, load_power_w: 100, battery_watts: -950 }),
+        unit("rhs", { grid_power_w: 1200, load_power_w: 100, battery_watts: -950 }),
+      ],
+    } as unknown as SnapshotEnvelope);
+
+    renderFlow();
+
+    expect(
+      await screen.findByText(
+        "Solar-surplus charging is active — All the batteries are charging 1,900 W in total, while the site exports 3,400 W.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("renders the night strategy's story from its snapshot projection", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue({
+      site_id: "site-1",
+      snapshot_sequence: 41,
+      captured_at: "2026-08-22T12:00:00+10:00",
+      night_charge_state: {
+        enabled: true,
+        active: true,
+        phase: "pacing",
+        window: { start_local: "00:00", end_local: "06:00", timezone: "Australia/Brisbane" },
+      },
+      units: [
+        unit("mid", { grid_power_w: -2000, load_power_w: 270, battery_watts: -1900 }),
+        unit("rhs", { grid_power_w: -2000, load_power_w: 270, battery_watts: -1900 }),
+        unit("lhs", { grid_power_w: -2000, load_power_w: 260, battery_watts: -1900 }),
+      ],
+    } as unknown as SnapshotEnvelope);
+
+    renderFlow();
+
+    expect(
+      await screen.findByText(
+        "Night charging is running — All the batteries are charging 5,700 W in total, the house using 800 W.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("renders the night strategy's demand-hold story while the house spikes", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue({
+      site_id: "site-1",
+      snapshot_sequence: 41,
+      captured_at: "2026-08-22T12:00:00+10:00",
+      night_charge_state: {
+        enabled: true,
+        active: true,
+        phase: "holding_on_demand",
+        demand_w: 1900,
+      },
+      units: [
+        unit("mid", { grid_power_w: -1900, load_power_w: 950, battery_watts: 0 }),
+        unit("rhs", { grid_power_w: -1900, load_power_w: 950, battery_watts: 0 }),
+      ],
+    } as unknown as SnapshotEnvelope);
+
+    renderFlow();
+
+    expect(
+      await screen.findByText(
+        "Night charging is holding — house demand is 1,900 W, so the batteries neither drain nor cycle while the grid meets the house.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("explains an empty fleet", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(snapshotEnvelope([]));
+
+    renderFlow();
+
+    expect(await screen.findByText(/No batteries are connected yet/i)).toBeVisible();
+  });
+
+  it("renders a refused load verbatim with a retry", async () => {
+    api.client.getSnapshot.mockRejectedValue(
+      new ApiClientError({
+        code: "network_error",
+        message: "The EnergyPod service could not be reached",
+        details: null,
+        request_id: "req-1",
+        status: 0,
+      }),
+    );
+
+    renderFlow();
+
+    const alert = await screen.findByRole("alert");
+    expectVisibleText(alert, /network_error/);
+    expectVisibleText(alert, /The EnergyPod service could not be reached/);
+    expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
+  });
+});
+
+// --- the live-update pin ----------------------------------------------------------------
+
+describe("FlowView — live updates", () => {
+  it("adopts two successive snapshots: the figures on screen change", async () => {
+    const first = snapshotEnvelope(
+      [
+        unit("mid", { grid_power_w: -412, load_power_w: 340, battery_watts: -1900 }),
+        unit("rhs", { grid_power_w: 0, load_power_w: 120, battery_watts: 0 }),
+      ],
+      41,
+    );
+    const second = snapshotEnvelope(
+      [
+        unit("mid", { grid_power_w: -520, load_power_w: 350, battery_watts: -2100 }),
+        unit("rhs", { grid_power_w: 300, load_power_w: 130, battery_watts: 800 }),
+      ],
+      42,
+    );
+    api.client.getSnapshot.mockResolvedValue(first);
+    const channel = liveChannel([]);
+
+    renderFlow();
+
+    expect((await screen.findAllByText("Importing 412 W")).length).toBe(2); // mid + fleet
+    expect(screen.getAllByText("Charging 1,900 W").length).toBe(2);
+
+    // The shell's measured-data heartbeat republishes the refreshed snapshot
+    // to this view's subscription: sequence 42 advances the picture.
+    channel.push({ type: "snapshot", sequence: 42, data: second });
+
+    await waitFor(() => {
+      expect(screen.getByText("Importing 520 W")).toBeVisible();
+    });
+    expect(screen.getByText("Charging 2,100 W")).toBeVisible();
+    expect(screen.getByText("Exporting 300 W")).toBeVisible();
+    expect(screen.queryByText("Importing 412 W")).toBeNull();
+
+    // One client, one stream: the view never minted a second socket.
+    expect(api.createApiClient).not.toHaveBeenCalled();
+    expect(api.client.openEvents).toHaveBeenCalledTimes(1);
+    expect(api.client.openEvents).toHaveBeenCalledWith(41);
+  });
+
+  it("does not rewind the picture for a snapshot the picture already advanced past", async () => {
+    const first = snapshotEnvelope([unit("mid", { grid_power_w: -412, load_power_w: 340, battery_watts: -1900 })], 41);
+    const second = snapshotEnvelope([unit("mid", { grid_power_w: -520, load_power_w: 350, battery_watts: -2100 })], 42);
+    const stale = snapshotEnvelope([unit("mid", { grid_power_w: -100, load_power_w: 10, battery_watts: -50 })], 41);
+    api.client.getSnapshot.mockResolvedValue(first);
+    const channel = liveChannel([]);
+
+    renderFlow();
+    await screen.findAllByText("Importing 412 W");
+
+    channel.push({ type: "snapshot", sequence: 42, data: second });
+    await waitFor(() => {
+      // mid's node and the fleet's grid figure (the only phase importing).
+      expect(screen.getAllByText("Importing 520 W").length).toBe(2);
+    });
+
+    // A republished frame behind the adopted sequence must not rewind it.
+    channel.push({ type: "snapshot", sequence: 41, data: stale });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(screen.getAllByText("Importing 520 W").length).toBe(2);
+  });
+
+  it("shows the disconnected state and keeps the last known picture", async () => {
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([unit("mid", { grid_power_w: -412, load_power_w: 340, battery_watts: -1900 })]),
+    );
+    endingStream([{ type: "snapshot", sequence: 41, data: snapshotEnvelope([unit("mid", { grid_power_w: -412, load_power_w: 340, battery_watts: -1900 })]) }]);
+
+    renderFlow();
+
+    expect(await screen.findByText(/Connection lost — showing the last known picture/i)).toBeVisible();
+    expect(screen.getAllByText("Importing 412 W").length).toBe(2);
+  });
+});
+
+// --- helpers ---------------------------------------------------------------------------
+
+/** A visible text match inside a scope (the wording itself, not an ancestor). */
+function expectVisibleText(scope: HTMLElement, pattern: RegExp): void {
+  const matches = within(scope)
+    .getAllByText((_: string, element: Element | null) => pattern.test(element?.textContent ?? ""))
+    .map((element: HTMLElement) => element.textContent ?? "");
+  if (matches.length === 0) {
+    throw new Error(`expected visible text matching ${pattern} within the scope`);
+  }
+  expect(matches.length).toBeGreaterThan(0);
+}

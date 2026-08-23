@@ -1,0 +1,226 @@
+/*
+ * Energy Flow view styling — the console's most legible view. The diagram is
+ * the centerpiece: one column per phase plus a fleet column, three nodes
+ * (Grid / Battery / Home) under a bus whose stub arrows are proportional to
+ * watts. Color always rides with a word (the node figures carry every fact as
+ * text); motion is limited to nothing but what CSS transitions the browser
+ * gives stroke widths by default, and reduced motion is honored globally by
+ * styles.css.
+ */
+
+.flow-view {
+  display: grid;
+  gap: 1rem;
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+.flow-heading-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+}
+
+.flow-view h2 {
+  margin: 0;
+  font-size: 1.2rem;
+  line-height: 1.3;
+}
+
+.flow-connection {
+  margin: 0;
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+}
+
+.flow-connection--live {
+  color: var(--yes);
+}
+
+.flow-connection--lost {
+  color: var(--no);
+}
+
+/* THE STORY LINE — the one sentence an operator reads aloud. */
+.flow-story {
+  margin: 0;
+  padding: 0.65rem 0.9rem;
+  border-left: 4px solid var(--active);
+  background: var(--card);
+  border-radius: 0 10px 10px 0;
+  font-size: 1.05rem;
+  line-height: 1.45;
+}
+
+/* --- the diagram ------------------------------------------------------------ */
+
+.flow-diagram {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 0.75rem;
+  align-items: stretch;
+}
+
+.flow-phase {
+  display: grid;
+  gap: 0.4rem;
+  padding: 0.85rem 0.9rem 0.95rem;
+  border: 1px solid var(--line);
+  border-radius: 0.9rem;
+  background: var(--card);
+}
+
+.flow-phase--fleet {
+  border-color: var(--active);
+  border-width: 2px;
+  background: #f4f8ff;
+}
+
+.flow-phase-name {
+  margin: 0;
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.flow-phase--fleet .flow-phase-name {
+  color: var(--active);
+}
+
+.flow-phase-note {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--warn);
+}
+
+/* The bus is decorative duplication (aria-hidden): the worded figures below
+   each stub carry the same facts as text. */
+.flow-bus {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.flow-bus-rail {
+  stroke: var(--line);
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+
+.flow-nodes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.4rem;
+}
+
+.flow-node {
+  display: grid;
+  gap: 0.15rem;
+  justify-items: center;
+  text-align: center;
+  padding: 0.45rem 0.3rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  min-width: 0;
+}
+
+.flow-node--battery {
+  background: #fffaf0;
+}
+
+.flow-node-name {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.flow-node--grid .flow-node-name {
+  color: var(--active);
+}
+
+.flow-node--battery .flow-node-name {
+  color: var(--armed);
+}
+
+.flow-node-figure {
+  font-size: 0.95rem;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.flow-node-extra {
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+}
+
+/* --- the command overlay ------------------------------------------------------ */
+
+.flow-commands {
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.9rem;
+  background: var(--card);
+}
+
+.flow-commands h3 {
+  margin: 0 0 0.4rem;
+  font-size: 0.95rem;
+}
+
+.flow-commands ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.flow-commands li {
+  font-size: 0.95rem;
+}
+
+/* --- the footnote and the quiet states ----------------------------------------- */
+
+.flow-footnote {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+.flow-loading,
+.flow-empty {
+  margin: 0;
+  padding: 0.75rem 0.9rem;
+  border: 1px dashed var(--line);
+  border-radius: 0.9rem;
+  color: var(--ink-soft);
+  background: var(--card);
+}
+
+.flow-error {
+  display: grid;
+  gap: 0.4rem;
+  justify-items: start;
+  padding: 0.75rem 1rem;
+  border-left: 4px solid var(--no);
+  background: #fdf3f2;
+  border-radius: 0 10px 10px 0;
+}
+
+.flow-error code {
+  font-size: 0.85rem;
+}
+
+/* While disconnected, the last known picture stays — dimmed, never gone (the
+   shell's own rule; the connection line names why). */
+.flow-view[data-connection="lost"] .flow-diagram,
+.flow-view[data-connection="lost"] .flow-story {
+  opacity: 0.75;
+}

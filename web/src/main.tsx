@@ -13,6 +13,7 @@ import { AppShell } from "./app/AppShell";
 import type { ShellView, ViewId, ViewRegistry } from "./app/views";
 import { ActivityView } from "./views/activity/ActivityView";
 import { BatteriesView } from "./views/batteries/BatteriesView";
+import { FlowView } from "./views/flow/FlowView";
 import { HomeView } from "./views/home/HomeView";
 import { InsightsView } from "./views/insights/InsightsView";
 import { NowView } from "./views/now/NowView";
@@ -23,6 +24,7 @@ import "./styles.css";
 const views: ViewRegistry = {
   home: HomeView,
   batteries: BatteriesView,
+  flow: FlowView,
   now: NowView,
   schedule: ScheduleView,
   activity: ActivityView,
