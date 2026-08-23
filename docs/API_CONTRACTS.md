@@ -353,6 +353,22 @@ coordinator, the event bus, and per-unit actor handles.
   The simulator is a distinct deployment target composed through `build_runtime` with
   simulator transports and in-memory persistence.
 
+## Cancel intent
+
+- `cancel_intent(principal, intent_id, idempotency_key, request_id)` (REST `POST
+  /api/v1/intents/cancel`, body `{"intent_id": "<exact id>" | "current"}`, `dispatch` scope with
+  NO interactive requirement) cancels the active intent: the repository removes it, the kernel's
+  next tick finds no winner and revokes authority, and the device watchdog hands power back
+  (~3.5-4 s). Stopping is the safety-positive direction, so automation may drive it.
+- `"current"` resolves the newest active non-emergency intent; an unknown or no-longer-active id is
+  the structured 404 `intent_not_found`, and nothing-active is the 409 `intent_not_cancelable`. A
+  latched emergency stop is never cancellable here — it leaves only through its privileged
+  acknowledgement.
+- The mutation is idempotent (Idempotency-Key), audited as `intent_cancelled`
+  (`result: cancelled`, the intent's identity and units), and published on the bus as
+  `intent.cancelled` (`principal`, `intent_id`, `unit_ids`) so console request cards clear the same
+  way they do on expiry.
+
 ## Inhibit acknowledgement
 
 - Entering `INHIBITED` records a cause class: `TRANSIENT`, `QUALIFIED`, or `LATCHED`

@@ -770,6 +770,81 @@ class EnergyServiceFacade:
             "expires_in_s": duration_s,
         }
 
+    async def cancel_intent(
+        self,
+        *,
+        intent_id: Any,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """Cancel the active intent by exact id or ``"current"``.
+
+        Stopping power is safety-positive, so this shares the dispatch scope
+        with no interactive requirement: the intent is removed from the
+        repository, the kernel's next tick finds no winner and revokes, and
+        the device watchdog hands power back.  A latched emergency stop is
+        not an intent here -- it leaves only through its privileged
+        acknowledgement -- and every refusal is loud, never a silent no-op.
+        """
+        self._admit(principal, "dispatch")
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        if (
+            not isinstance(intent_id, str)
+            or not intent_id
+            or intent_id != intent_id.strip()
+            or len(intent_id) > 128
+        ):
+            raise ValueError("intent_id must be a canonical identifier or 'current'")
+        now_mono = float(self._clock.monotonic())
+        active = await self._intents.active(now_mono)
+        if intent_id == "current":
+            candidates = [
+                intent
+                for intent in active
+                if _enum_value(getattr(intent, "source", None)) != "emergency_stop"
+            ]
+            if not candidates:
+                raise ValueError("no active intent to cancel")
+            target = max(
+                candidates,
+                key=lambda intent: (
+                    getattr(intent, "acceptance_revision", 0),
+                    getattr(intent, "accepted_at_mono", 0.0),
+                ),
+            )
+        else:
+            target = next(
+                (intent for intent in active if getattr(intent, "id", None) == intent_id), None
+            )
+            if target is None:
+                raise LookupError(f"no active intent with id {intent_id!r}")
+            if _enum_value(getattr(target, "source", None)) == "emergency_stop":
+                raise ValueError("an emergency stop is released by acknowledgement, not cancelled")
+        selected = sorted(getattr(target, "selected_unit_ids", ()) or ())
+        await self._intents.remove(target.id)
+        await self._append_audit(
+            self._mutation_audit(
+                event_type="intent_cancelled",
+                subject=principal.subject,
+                result="cancelled",
+                request_id=request,
+                source=getattr(target, "source", None),
+                intent_id=target.id,
+                reason_codes=("cancelled",),
+                lifecycle=self._handle_lifecycle(selected[0])
+                if selected
+                else UnitLifecycle.DISARMED,
+                payload={"intent_id": target.id, "unit_ids": selected},
+            )
+        )
+        await self._publish(
+            "intent.cancelled",
+            {"principal": principal.subject, "intent_id": target.id, "unit_ids": selected},
+        )
+        return {"intent_id": target.id, "status": "cancelled", "unit_ids": selected}
+
     async def arm(
         self,
         *,

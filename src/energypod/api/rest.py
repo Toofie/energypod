@@ -53,6 +53,7 @@ class EnergyService(Protocol):
         self, *, principal: Principal, limit: int, cursor: int | None = None
     ) -> dict[str, Any]: ...
     async def submit_intent(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def cancel_intent(self, **kwargs: Any) -> dict[str, Any]: ...
     async def arm(self, **kwargs: Any) -> dict[str, Any]: ...
     async def disarm(self, **kwargs: Any) -> dict[str, Any]: ...
     async def emergency_stop(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -105,6 +106,18 @@ class ArmRequest(StrictRequest):
     @classmethod
     def validate_units(cls, value: list[str]) -> list[str]:
         return IntentRequest.validate_units(value)
+
+
+class CancelIntentRequest(StrictRequest):
+    # The exact intent id or the literal "current" for the newest active one.
+    intent_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("intent_id")
+    @classmethod
+    def canonical_intent_id(cls, value: str) -> str:
+        if value != "current" and not _valid_id(value):
+            raise ValueError("intent_id must be canonical or the literal 'current'")
+        return value
 
 
 class DisarmRequest(StrictRequest):
@@ -504,6 +517,42 @@ def create_api_app(
                 idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
                 request_id=request.state.request_id,
             ),
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.post(f"{API_PREFIX}/intents/cancel")
+    async def cancel_intent(
+        body: CancelIntentRequest,
+        request: Request,
+        identity: Principal = dispatch_dependency,
+    ) -> JSONResponse:
+        # Cancelling an intent stops power: like disarm, the safety-positive
+        # direction needs the dispatch scope but NO interactive human
+        # principal, so automation may always reach the safe state.
+        payload = body.model_dump(mode="json")
+
+        async def invoke() -> dict[str, Any]:
+            try:
+                return await service.cancel_intent(
+                    intent_id=payload["intent_id"],
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
+            except LookupError as exc:
+                raise BoundaryError(
+                    404, "intent_not_found", "The intent identifier is not active"
+                ) from exc
+            except ValueError as exc:
+                raise BoundaryError(409, "intent_not_cancelable", str(exc)) from exc
+
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="cancel_intent",
+            payload=payload,
+            status_code=200,
+            invoke=invoke,
         )
         return JSONResponse(status_code=result.status_code, content=dict(result.body))
 
