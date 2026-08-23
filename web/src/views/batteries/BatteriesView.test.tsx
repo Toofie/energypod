@@ -1045,6 +1045,53 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     expect(client.openEvents).toHaveBeenLastCalledWith(4102);
   });
 
+  it("keeps the disconnected notice through the retries while the plane's cached replay is all that arrives (a stale replay is data, never liveness)", async () => {
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
+    // The shared plane's replay frame: the cached picture, marked `stale`
+    // precisely because the one real stream is down. Each subscription
+    // delivers it and then ends (the plane ends every subscriber on loss).
+    const staleReplay: StreamEvent = {
+      type: "snapshot",
+      sequence: 4100,
+      captured_at: CAPTURED_AT,
+      stale: true,
+      data: HEALTHY_SNAPSHOT,
+    } as unknown as StreamEvent;
+    client.openEvents.mockImplementation(() => openStream([staleReplay], "fail"));
+    renderView(client);
+
+    expect(await screen.findByRole("group", { name: "MID" })).toBeInTheDocument();
+    expect(await screen.findByText(/disconnected/i)).toBeInTheDocument();
+
+    // The reconnects keep re-delivering the stale replay; the notice must
+    // STAY up — an unconditional "any frame clears it" used to flip the view
+    // back to connected ~300 ms into every outage.
+    await waitFor(() =>
+      expect(client.openEvents.mock.calls.length).toBeGreaterThanOrEqual(3),
+    );
+    expect(screen.getByText(/disconnected/i)).toBeInTheDocument();
+  });
+
+  it("clears the disconnected notice once a frame that is not the stale replay arrives", async () => {
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
+    let live = false;
+    client.openEvents.mockImplementation(() =>
+      openStream(live ? HEALTHY_EVENTS : [], live ? "open" : "fail"),
+    );
+    renderView(client);
+
+    expect(await screen.findByText(/disconnected/i)).toBeInTheDocument();
+
+    // The plane's real stream lands: its snapshot frame carries no stale
+    // flag, and the notice goes.
+    live = true;
+    await waitFor(() => {
+      expect(screen.queryByText(/disconnected/i)).toBeNull();
+    });
+  });
+
   it("shows the disconnected notice from the shell's connection fact while the last snapshot stays rendered", async () => {
     const client = makeClient();
     client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);

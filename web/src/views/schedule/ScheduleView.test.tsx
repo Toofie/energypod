@@ -17,6 +17,7 @@ import {
   getScheduleOk,
   putScheduleOk,
   scheduleEntry,
+  scheduleNextAction,
   schedulePlan,
   schedulePolicy,
   scheduleRefusalEnvelope,
@@ -129,7 +130,7 @@ describe("ScheduleView — loading, not-commissioned, and errors", () => {
     renderView(harness);
 
     expect(await screen.findByText("validation_error")).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await userEvent.click(screen.getByRole("button", { name: "Try again" }));
     await waitFor(() => {
       expect(screen.getByText(/No schedule published yet/i)).toBeVisible();
     });
@@ -187,6 +188,34 @@ describe("ScheduleView — the commissioned windows and the plan line", () => {
       ).toBeVisible();
     });
     expect(screen.getByText(/Schedules may command 20:00–06:00/i)).toBeVisible();
+  });
+
+  // The Next line's countdown is a MARKER, never the GET's static figure:
+  // an editor left open must say "in 59 s" a second after a "in 1 min" read,
+  // not keep the hour-old figure until the next publish anywhere.
+  it("runs the next occurrence's countdown down between reads", async () => {
+    const harness = installHarness({
+      get: vi.fn(() =>
+        Promise.resolve(
+          getScheduleOk({
+            plan: planWith([DAY_CHARGE_ENTRY]),
+            policy: schedulePolicy(),
+            next_action: scheduleNextAction({ starts_in_s: 60 }),
+          }),
+        ),
+      ),
+    });
+    renderView(harness);
+
+    await waitFor(() => {
+      expect(screen.getByText(/Next: Night Charge .* \(in 1 min\)\./i)).toBeVisible();
+    });
+    await waitFor(
+      () => {
+        expect(screen.getByText(/\(in 59 s\)\./i)).toBeVisible();
+      },
+      { timeout: 4000 },
+    );
   });
 });
 

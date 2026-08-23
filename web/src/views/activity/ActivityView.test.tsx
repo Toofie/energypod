@@ -1638,4 +1638,118 @@ describe("Activity view — the night strategy's audit facts (quiet informationa
     // Quiet: no refetch was forced and no second read ran for the frame.
     expect(client.getAudit).toHaveBeenCalledTimes(1);
   });
+
+  // The view's OWN stream-loss fact: the `connection` prop carries the
+  // shell's signal only when the shell provides one, and the shared plane
+  // ends every subscription the moment the one real stream goes down — the
+  // view must say so itself, or a dropped line leaves a timeline that
+  // silently stops growing with no notice at all.
+  it("shows its own disconnected notice when the subscription ends, and clears it when frames flow again", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const queue: Record<string, unknown>[] = [];
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    const channel = {
+      openEvents: () =>
+        (async function* channel(): AsyncGenerator<Record<string, unknown>, void, unknown> {
+          while (true) {
+            while (queue.length > 0) {
+              const next = queue.shift();
+              if (next !== undefined) {
+                yield next;
+              }
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        })(),
+      push: (frame: Record<string, unknown>): void => {
+        queue.push(frame);
+        notify();
+      },
+    };
+    let firstCall = true;
+    client.openEvents = vi.fn(() => {
+      if (firstCall) {
+        firstCall = false;
+        // The first subscription delivers nothing and ends — the plane's
+        // streamLost(), or a socket that closed before any frame.
+        return (async function* ended(): AsyncGenerator<Record<string, unknown>, void, unknown> {})();
+      }
+      return channel.openEvents();
+    }) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    expect(await screen.findByText("Connection lost")).toBeVisible();
+
+    // Frames flow again on the re-subscription: the notice goes.
+    channel.push(observationPublished(95, "MID", {}) as unknown as Record<string, unknown>);
+    await waitFor(() => {
+      expect(screen.queryByText("Connection lost")).toBeNull();
+    });
+  });
+
+  // A plane-republished REST read is data, never liveness: the plane marks
+  // its cached replay `stale` exactly while the one real stream is down, and
+  // a stale replay delivered on the reconnect must not clear the notice.
+  it("does not treat the plane's stale cached replay as proof the line is back", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const replay: Record<string, unknown> = {
+      type: "snapshot",
+      sequence: 4100,
+      stale: true,
+      data: { site_id: "site", snapshot_sequence: 4100, units: [] },
+    };
+    let calls = 0;
+    client.openEvents = vi.fn(() => {
+      calls += 1;
+      // Every subscription delivers the stale replay and then ends.
+      return (async function* replayThenEnd(): AsyncGenerator<Record<string, unknown>, void, unknown> {
+        yield { ...replay };
+      })();
+    }) as unknown as typeof client.openEvents;
+    renderView();
+
+    expect(await screen.findByText("Connection lost")).toBeVisible();
+    await waitFor(() => {
+      expect(calls).toBeGreaterThanOrEqual(2);
+    });
+    // The replay kept arriving and the notice is still up: cached data is
+    // not a live connection.
+    expect(screen.getByText("Connection lost")).toBeVisible();
+  });
+
+  // The age ticker: "just now" must become "1 minute ago" with the clock
+  // alone — an age that only moves when a new bus frame lands is a frozen
+  // reading wearing a live view's clothes.
+  it("advances entry ages on its own clock, not only when a new frame lands", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage([
+        auditEvent({
+          sequence: 96,
+          event_type: "unit_armed",
+          unit_id: "MID",
+          occurred_at: new Date(Date.now() - 59_000).toISOString(),
+          principal: PRINCIPAL,
+          result: "armed",
+          reason_codes: ["armed"],
+        }),
+      ]),
+    );
+    renderView();
+    const item = await screen.findByRole("listitem");
+    expect(item).toHaveTextContent("just now");
+    await waitFor(
+      () => {
+        expect(screen.getByRole("listitem")).toHaveTextContent("1 minute ago");
+      },
+      { timeout: 4000 },
+    );
+  });
 });

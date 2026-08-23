@@ -24,9 +24,10 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
-import type { ApiClient } from "../../api/client";
+import type { ApiClient, StreamEvent } from "../../api/client";
 import { OBJECTIVE_SIGNATURE_HONESTY_NOTE } from "../../app/objectives";
 import {
+  foreignObjectiveObserved,
   getObservedObjectivesOk,
   lastObjectiveObserved,
   observedObjectivesUnit,
@@ -50,11 +51,22 @@ function refusal(
   return new ApiClientError({ code, message, details: null, request_id: requestId, status });
 }
 
+/** An event stream that stays open and delivers nothing (the quiet bus). */
+function parkedStream(): AsyncIterable<StreamEvent> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      await new Promise<never>(() => {});
+    },
+  };
+}
+
 function installClient(
   getObjectives: ApiClient["getObservedObjectives"],
+  openEvents: ApiClient["openEvents"] = () => parkedStream(),
 ): ApiClient {
   const client = {
     getObservedObjectives: vi.fn(getObjectives),
+    openEvents: vi.fn(openEvents),
   } as unknown as ApiClient;
   createClientMock.mockReturnValue(client);
   return client;
@@ -254,5 +266,111 @@ describe("ObjectivesView — the evidence table (API_CONTRACTS 'Night-writer det
     // The honesty note heads the view even while loading — it is the table's
     // standing contract, not data.
     expect(screen.getByText(OBJECTIVE_SIGNATURE_HONESTY_NOTE)).toBeVisible();
+  });
+
+  // The live path: the detector's ALERT frame is exactly the moment this
+  // table's world changed. Without the subscription a console left open on
+  // Objectives showed the mount-time window for the whole session while
+  // Home, Batteries and Activity all moved (Insights' day_rolled pattern).
+  it("re-reads the window when the detector's alert frame lands on the bus — silently, never blanking the table", async () => {
+    const answers = [
+      getObservedObjectivesOk({ units: [NIGHTLY_ROW] }),
+      getObservedObjectivesOk({ units: [NIGHTLY_ROW, FOREIGN_NOW_ROW] }),
+    ];
+    const getObjectives = vi.fn(() => Promise.resolve(answers.shift()!));
+    const queue: StreamEvent[] = [];
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    let wake: (() => void) | null = null;
+    const openEvents = (): AsyncIterable<StreamEvent> => ({
+      async *[Symbol.asyncIterator]() {
+        while (true) {
+          while (queue.length > 0) {
+            const next = queue.shift();
+            if (next !== undefined) {
+              yield next;
+            }
+          }
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+        }
+      },
+    });
+    installClient(
+      getObjectives as unknown as ApiClient["getObservedObjectives"],
+      openEvents,
+    );
+    renderView();
+
+    // The mount read answered one quiet battery; the alert tier fires.
+    const table = await screen.findByRole("table");
+    expect(within(table).queryByRole("row", { name: /^mid/i })).toBeNull();
+    queue.push(foreignObjectiveObserved(501) as unknown as StreamEvent);
+    notify();
+
+    // One silent re-read lands the new evidence row — no loading flash, no
+    // error state over data that was already on screen.
+    await waitFor(() => {
+      expect(getObjectives).toHaveBeenCalledTimes(2);
+    });
+    const midRow = await within(await screen.findByRole("table")).findByRole("row", {
+      name: /^mid/i,
+    });
+    expect(midRow.textContent).toContain("foreign now");
+  });
+
+  it("keeps the last table when the alert-driven re-read fails — the caption still names its own as-of stamp", async () => {
+    const answers: (Promise<Record<string, unknown>> | null)[] = [
+      Promise.resolve(getObservedObjectivesOk({ units: [NIGHTLY_ROW] })),
+      null,
+    ];
+    const getObjectives = vi.fn(() => {
+      const next = answers.shift();
+      return next ?? Promise.reject(refusal("network_error", "unreachable", 0, ""));
+    });
+    const queue: StreamEvent[] = [];
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    let wake: (() => void) | null = null;
+    const openEvents = (): AsyncIterable<StreamEvent> => ({
+      async *[Symbol.asyncIterator]() {
+        while (true) {
+          while (queue.length > 0) {
+            const next = queue.shift();
+            if (next !== undefined) {
+              yield next;
+            }
+          }
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+        }
+      },
+    });
+    installClient(
+      getObjectives as unknown as ApiClient["getObservedObjectives"],
+      openEvents,
+    );
+    renderView();
+
+    const table = await screen.findByRole("table");
+    expect(table.textContent).toContain("rhs");
+    queue.push(foreignObjectiveObserved(502) as unknown as StreamEvent);
+    notify();
+
+    await waitFor(() => {
+      expect(getObjectives).toHaveBeenCalledTimes(2);
+    });
+    // The transient failure neither blanks the table nor raises the error
+    // state — the silent path keeps the last honest picture.
+    expect(await screen.findByRole("table")).toBeInTheDocument();
+    expect(screen.queryByText(/We couldn't load the observed objectives./i)).toBeNull();
   });
 });

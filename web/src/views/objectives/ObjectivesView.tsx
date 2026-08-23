@@ -32,7 +32,7 @@
  *   server-side (the contract's response shape carries the rollup only) —
  *   nothing here invents them.
  */
-import { useCallback, useEffect, useState, type JSX } from "react";
+import { useCallback, useEffect, useRef, useState, type JSX } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient } from "../../api/client";
 import {
@@ -49,6 +49,18 @@ import { formatWatts } from "../../lib/format";
 import "./objectives.css";
 
 type Phase = "loading" | "ready" | "error";
+
+/**
+ * Reconnect pause for the shared event stream: seen retrying within a glance,
+ * never a tight spin (the Insights/Schedule views' own constant).
+ */
+const STREAM_RECONNECT_MS = 1000;
+/**
+ * The alert-driven re-read's debounce: the detector fires once per
+ * (episode, reason), but a first-contact burst can land several units at
+ * once — one read serves the burst.
+ */
+const ALERT_REREAD_DELAY_MS = 500;
 
 interface ErrorView {
   code: string;
@@ -174,6 +186,12 @@ export function ObjectivesView({ client }: ObjectivesViewProps): JSX.Element {
     last: string | null;
     asOf: string | null;
   } | null>(null);
+  /**
+   * The current window by reference: the live re-read below reads whatever
+   * window is selected when it fires, without re-subscribing on a switch.
+   */
+  const windowRef = useRef(window);
+  windowRef.current = window;
 
   const read = useCallback(
     async (last: string): Promise<boolean> => {
@@ -221,6 +239,91 @@ export function ObjectivesView({ client }: ObjectivesViewProps): JSX.Element {
     setPhase("loading");
     void read(window);
   }, [read, window]);
+
+  /**
+   * The silent re-read the live path uses: no loading flash over data that is
+   * already on screen, and a transient failure changes nothing — the table
+   * keeps its last honest picture (its `as of` caption says when it was
+   * taken), and the next alert frame or the operator's retry re-reads.
+   */
+  const reread = useCallback(async (): Promise<void> => {
+    const askedWindow = windowRef.current;
+    try {
+      const body = await client.getObservedObjectives(askedWindow);
+      if (askedWindow !== windowRef.current) {
+        return; // the operator switched windows while the read was in flight
+      }
+      const parsed = toObservedObjectivesView(body);
+      if (parsed === null) {
+        return;
+      }
+      setView({ units: parsed.units, last: parsed.last, asOf: parsed.asOf });
+      setError(null);
+    } catch {
+      // The last table stays; the caption keeps naming its own as-of stamp.
+    }
+  }, [client]);
+
+  // The live bus: the detector's ALERT frame (`foreign_objective.observed`)
+  // is exactly the moment this evidence table's world changed — a sustained
+  // foreign objective never re-fires, so without this subscription a console
+  // left open on Objectives showed the mount-time window for the whole
+  // session while Home/Batteries/Activity all moved (Insights' day_rolled
+  // pattern: the transition drives one quiet re-read).
+  useEffect(() => {
+    let cancelled = false;
+    let rereadTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleReread = (): void => {
+      if (rereadTimer !== null) {
+        return; // one read serves the burst
+      }
+      rereadTimer = setTimeout(() => {
+        rereadTimer = null;
+        if (!cancelled) {
+          void reread();
+        }
+      }, ALERT_REREAD_DELAY_MS);
+    };
+    const run = async (): Promise<void> => {
+      while (!cancelled) {
+        let resync = false;
+        try {
+          for await (const frame of client.openEvents()) {
+            if (cancelled) {
+              return;
+            }
+            if (frame.type === "resync_required") {
+              resync = true;
+              break;
+            }
+            if (frame.type === "foreign_objective.observed") {
+              scheduleReread();
+            }
+          }
+        } catch {
+          // A failed stream is treated exactly like a dropped one: retry.
+        }
+        if (cancelled) {
+          return;
+        }
+        if (resync) {
+          // A discontinuity means the window may be out of step; one quiet
+          // re-read replaces it (the route is the truth here).
+          void reread();
+        }
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, STREAM_RECONNECT_MS);
+        });
+      }
+    };
+    void run();
+    return () => {
+      cancelled = true;
+      if (rereadTimer !== null) {
+        clearTimeout(rereadTimer);
+      }
+    };
+  }, [client, reread]);
 
   return (
     <section className="objectives-view" aria-labelledby="objectives-heading">

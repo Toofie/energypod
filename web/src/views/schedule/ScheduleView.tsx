@@ -377,23 +377,81 @@ export interface PublishedSchedule {
   plan: SchedulePlan | null;
   policy: SchedulePolicy;
   acknowledgedNightWindows: boolean;
-  /** The GET's own next occurrence, rendered beside the editor. */
-  nextActionSummary: string | null;
+  /**
+   * The next occurrence itself (the summary's source): the rendered
+   * countdown runs down from it between reads instead of freezing at the
+   * figure the GET carried (Home's Next card's own rule).
+   */
+  next: ScheduleState["next"];
+}
+
+/** A monotonic reading: countdown markers must never run backwards. */
+function monotonicNowMs(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+/** The once-a-second re-render a rendered countdown needs (never an
+ * animation: a countdown frozen at the GET's figure reads as current). */
+const COUNTDOWN_TICK_MS = 1000;
+
+function useTickingNow(enabled: boolean): number {
+  const [nowMs, setNowMs] = useState(monotonicNowMs);
+  useEffect(() => {
+    if (!enabled) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      setNowMs(monotonicNowMs());
+    }, COUNTDOWN_TICK_MS);
+    const refreshNow = (): void => {
+      if (document.visibilityState === "visible") {
+        setNowMs(monotonicNowMs());
+      }
+    };
+    document.addEventListener("visibilitychange", refreshNow);
+    window.addEventListener("focus", refreshNow);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshNow);
+      window.removeEventListener("focus", refreshNow);
+    };
+  }, [enabled]);
+  return nowMs;
+}
+
+/**
+ * A remaining-seconds marker that runs down (Home's Next card's own rule):
+ * re-captured whenever the wire delivers a fresh figure or the occurrence it
+ * belongs to changes, ticked locally between reads. Null when the wire
+ * carries no countdown.
+ */
+function useCountdownMarker(
+  remainingS: number | null,
+  resetKey: string,
+  nowMs: number,
+): number | null {
+  const markerRef = useRef<{ remainingS: number; atMs: number; resetKey: string } | null>(null);
+  if (remainingS === null) {
+    markerRef.current = null;
+  } else if (
+    markerRef.current === null ||
+    markerRef.current.remainingS !== remainingS ||
+    markerRef.current.resetKey !== resetKey
+  ) {
+    markerRef.current = { remainingS, atMs: monotonicNowMs(), resetKey };
+  }
+  const marker = markerRef.current;
+  if (marker === null) {
+    return null;
+  }
+  return Math.max(0, marker.remainingS - Math.max(0, (nowMs - marker.atMs) / 1000));
 }
 
 interface GetView {
   published: PublishedSchedule;
   next: ScheduleState["next"];
-}
-
-/** The one-line summary of a next occurrence (the editor's plan line). */
-function nextActionSummaryOf(next: ScheduleState["next"]): string | null {
-  if (next === null) {
-    return null;
-  }
-  return `${next.entryId} — ${wattsSummaryText(next)} — starts ${next.startLocal} (in ${
-    next.startsInS === null ? "…" : countdownText(next.startsInS)
-  })`;
 }
 
 function toGetView(body: unknown): GetView | null {
@@ -411,7 +469,7 @@ function toGetView(body: unknown): GetView | null {
       plan: toSchedulePlan(record.plan),
       policy,
       acknowledgedNightWindows: record.acknowledged_night_windows === true,
-      nextActionSummary: nextActionSummaryOf(next),
+      next,
     },
     next,
   };
@@ -984,7 +1042,7 @@ export function ScheduleView({ client }: ScheduleViewProps): JSX.Element {
             plan,
             policy: published.policy,
             acknowledgedNightWindows: response.acknowledged_night_windows === true,
-            nextActionSummary: nextActionSummaryOf(next),
+            next,
           });
           setDraft(draftFromPlan(plan));
           const diff = response.diff;
@@ -1050,6 +1108,18 @@ export function ScheduleView({ client }: ScheduleViewProps): JSX.Element {
 
   // --- the honest non-ready states --------------------------------------------------
 
+  // The Next line's countdown RUNS DOWN between reads (Home's Next card's
+  // own rule): the GET's `starts_in_s` is a marker, never a static figure —
+  // without the tick the editor could say "in 3 h" for four hours. Declared
+  // above every early return so the hook order is stable across phases.
+  const nextOccurrence = published?.next ?? null;
+  const nowMs = useTickingNow(nextOccurrence?.startsInS != null);
+  const startsIn = useCountdownMarker(
+    nextOccurrence?.startsInS ?? null,
+    `next:${nextOccurrence?.entryId ?? ""}`,
+    nowMs,
+  );
+
   if (phase === "loading") {
     return (
       <section className="schedule-view" aria-live="polite">
@@ -1100,7 +1170,7 @@ export function ScheduleView({ client }: ScheduleViewProps): JSX.Element {
             retry now.
           </p>
           <button type="button" className="schedule-retry" onClick={retry}>
-            Retry
+            Try again
           </button>
         </div>
       </section>
@@ -1120,10 +1190,15 @@ export function ScheduleView({ client }: ScheduleViewProps): JSX.Element {
     published.plan === null
       ? "No schedule published yet — the first publish creates the plan."
       : `Published plan v${published.plan.version} · times follow ${published.plan.timezone}.`;
+  // The Next line's countdown RUNS DOWN between reads (Home's Next card's
+  // own rule): the GET's `starts_in_s` is a marker, never a static figure —
+  // without the tick the editor could say "in 3 h" for four hours.
   const nextLine =
-    published.nextActionSummary === null
+    nextOccurrence === null
       ? "Nothing is coming up — every entry is paused or past its date range."
-      : `Next: ${published.nextActionSummary}.`;
+      : `Next: ${nextOccurrence.entryId} — ${wattsSummaryText(nextOccurrence)} — starts ${
+          nextOccurrence.startLocal
+        } (in ${nextOccurrence.startsInS === null ? "…" : countdownText(startsIn ?? 0)}).`;
 
   return (
     <section className="schedule-view" aria-label="Schedules">

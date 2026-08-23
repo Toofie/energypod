@@ -62,6 +62,7 @@ import type {
   AuditPage,
   StreamEvent,
 } from "../../api/client";
+import { isPlaneSnapshot } from "../../app/SharedDataPlane";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import {
   applyHealthPatch,
@@ -275,6 +276,51 @@ const AUDIT_LIMIT = 50;
  * freshness clock. */
 const GOOD_TELEMETRY_MAX_AGE_S = 30;
 
+/** The once-a-second re-render every displayed data age needs (never an
+ * animation: a frozen "3 seconds old" reads as current forever). */
+const AGE_TICK_MS = 1000;
+
+/** A monotonic reading: displayed ages must never run backwards. */
+function monotonicNowMs(): number {
+  return typeof performance !== "undefined" && typeof performance.now === "function"
+    ? performance.now()
+    : Date.now();
+}
+
+/**
+ * A ticking "now" while an on-screen value depends on elapsed time. The
+ * snapshot's `telemetry_age_s` is the age AT CAPTURE: without the tick the
+ * card's "N seconds old" line freezes at the value the last snapshot arrived
+ * with (Home's and Now's pinned rule — an age that never grows is a frozen
+ * reading, not a current one). A backgrounded tab gets its timers throttled,
+ * so the clock is also re-read the moment the tab becomes visible or focused
+ * again: the first render after coming back carries the true age.
+ */
+function useTickingNow(enabled: boolean): number {
+  const [nowMs, setNowMs] = useState(monotonicNowMs);
+  useEffect(() => {
+    if (!enabled) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      setNowMs(monotonicNowMs());
+    }, AGE_TICK_MS);
+    const refreshNow = (): void => {
+      if (document.visibilityState === "visible") {
+        setNowMs(monotonicNowMs());
+      }
+    };
+    document.addEventListener("visibilitychange", refreshNow);
+    window.addEventListener("focus", refreshNow);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshNow);
+      window.removeEventListener("focus", refreshNow);
+    };
+  }, [enabled]);
+  return nowMs;
+}
+
 /**
  * The cell-imbalance EARLY-WARNING line (2026-08-23): the live policy's
  * imbalance bound was operator-relaxed tenfold (0.050 V -> 0.500 V) so a wide
@@ -402,30 +448,30 @@ function cardPowerText(unit: ViewUnit): string {
 }
 
 /** Charge row: the telemetry block's SOC, or the named gap. */
-function cardChargeText(unit: ViewUnit): string {
+function cardChargeText(unit: ViewUnit, ageSeconds: number | null): string {
   const soc = unit.telemetry?.socPct;
   if (soc === null || soc === undefined) {
-    return missingText(unit.telemetry_age_s);
+    return missingText(ageSeconds);
   }
   return formatPercent(soc);
 }
 
 /** Pack voltage row: present only as the observation reported it. */
-function cardPackVoltageText(unit: ViewUnit): string {
+function cardPackVoltageText(unit: ViewUnit, ageSeconds: number | null): string {
   const volts = unit.telemetry?.packVoltageV;
   if (volts === null || volts === undefined) {
-    return missingText(unit.telemetry_age_s);
+    return missingText(ageSeconds);
   }
   return formatVolts(volts);
 }
 
 /** Cell spread row: spread first, the population it was measured over named. */
-function cardCellSpreadText(unit: ViewUnit): string {
+function cardCellSpreadText(unit: ViewUnit, ageSeconds: number | null): string {
   const telemetry = unit.telemetry;
   const spread = telemetry?.cellSpreadMv ?? null;
   const count = telemetry?.cellCount ?? null;
   if (spread === null && count === null) {
-    return missingText(unit.telemetry_age_s);
+    return missingText(ageSeconds);
   }
   if (spread === null) {
     return `${count} cells`;
@@ -451,11 +497,11 @@ function cellImbalanceWarning(unit: ViewUnit): string | null {
 }
 
 /** Temperature row: the observed range, min to max. */
-function cardTemperatureText(unit: ViewUnit): string {
+function cardTemperatureText(unit: ViewUnit, ageSeconds: number | null): string {
   const min = unit.telemetry?.temperatureMinC ?? null;
   const max = unit.telemetry?.temperatureMaxC ?? null;
   if (min === null && max === null) {
-    return missingText(unit.telemetry_age_s);
+    return missingText(ageSeconds);
   }
   if (min === null) {
     return `up to ${formatTemp(max as number)}`;
@@ -520,12 +566,18 @@ function observationText(track: ObservationTrack | undefined): string {
 }
 
 /** The service's own quality projection already encodes staleness: anything
- * but "good" is data past its freshness bound or otherwise unusable. */
-function isStaleData(unit: ViewUnit): boolean {
+ * but "good" is data past its freshness bound or otherwise unusable. The age
+ * is the DISPLAYED one (captured plus elapsed): a reading whose age has grown
+ * past the bound between snapshots is stale on screen too, never merely
+ * waiting for the next refresh to say so. */
+function isStaleData(unit: ViewUnit, ageSeconds: number | null): boolean {
   if (unit.quality !== "good") {
     return true;
   }
-  return unit.telemetry_age_s === null || unit.telemetry_age_s > GOOD_TELEMETRY_MAX_AGE_S;
+  if (ageSeconds === null) {
+    return true;
+  }
+  return ageSeconds > GOOD_TELEMETRY_MAX_AGE_S;
 }
 
 // ---------------------------------------------------------------------------
@@ -772,6 +824,12 @@ function toErrorView(error: unknown): ErrorView {
 
 interface FleetCardProps {
   unit: ViewUnit;
+  /**
+   * The unit's DISPLAYED data age (captured `telemetry_age_s` plus elapsed
+   * monotonic time since the snapshot landed) — it ticks, so staleness can
+   * arrive with time alone and never freezes between refreshes.
+   */
+  ageSeconds: number | null;
   observation: ObservationTrack | undefined;
   /**
    * The snapshot's `energy_today` block (PENDING, feature-detected): null
@@ -816,13 +874,13 @@ function acknowledgeOffered(unit: ViewUnit): boolean {
 
 function FleetCard({
   unit,
+  ageSeconds,
   observation,
   today,
   onOpenDetail,
   onAcknowledge,
 }: FleetCardProps): JSX.Element {
-  const telemetryAge = unit.telemetry_age_s;
-  const dimmed = isStaleData(unit);
+  const dimmed = isStaleData(unit, ageSeconds);
   const imbalanceWarning = cellImbalanceWarning(unit);
   return (
     <div
@@ -861,19 +919,19 @@ function FleetCard({
         <b>Availability:</b> {availabilityWord(unit.lifecycle)}
       </p>
       <p>
-        <b>Charge level:</b> {cardChargeText(unit)}
+        <b>Charge level:</b> {cardChargeText(unit, ageSeconds)}
       </p>
       <p>
         <b>Power:</b> {cardPowerText(unit)}
       </p>
       <p>
-        <b>Pack voltage:</b> {cardPackVoltageText(unit)}
+        <b>Pack voltage:</b> {cardPackVoltageText(unit, ageSeconds)}
       </p>
       <p>
-        <b>Temperature:</b> {cardTemperatureText(unit)}
+        <b>Temperature:</b> {cardTemperatureText(unit, ageSeconds)}
       </p>
       <p>
-        <b>Cell spread:</b> {cardCellSpreadText(unit)}
+        <b>Cell spread:</b> {cardCellSpreadText(unit, ageSeconds)}
       </p>
       <p>
         <b>Grid and load:</b> {cardGridLoadText(unit)}
@@ -889,7 +947,7 @@ function FleetCard({
         </p>
       )}
       <p>
-        <b>Data age:</b> {ageText(telemetryAge)}
+        <b>Data age:</b> {ageText(ageSeconds)}
         {dimmed ? " (stale)" : ""}
       </p>
       <p>
@@ -931,6 +989,8 @@ function FleetCard({
 
 interface UnitDetailProps {
   unit: ViewUnit;
+  /** The unit's DISPLAYED (ticking) data age — the panels never re-derive it. */
+  ageSeconds: number | null;
   /** The whole fleet snapshot: a shared requested figure is a fleet total. */
   units: ViewUnit[];
   requestedByUnit: WattsByUnit | null;
@@ -956,6 +1016,7 @@ interface UnitDetailProps {
 function SummaryPanel({
   unit,
   units,
+  ageSeconds,
   requestedByUnit,
   authorizedByUnit,
   observation,
@@ -965,6 +1026,7 @@ function SummaryPanel({
 }: {
   unit: ViewUnit;
   units: ViewUnit[];
+  ageSeconds: number | null;
   requestedByUnit: WattsByUnit | null;
   authorizedByUnit: WattsByUnit | null;
   observation: ObservationTrack | undefined;
@@ -1030,7 +1092,7 @@ function SummaryPanel({
       </p>
       <p>
         <b>Charge level:</b>{" "}
-        {soc === null ? missingText(unit.telemetry_age_s) : formatPercent(soc)}
+        {soc === null ? missingText(ageSeconds) : formatPercent(soc)}
         {soh === null ? "" : `; state of health ${formatPercent(soh)}`}
       </p>
       <p>
@@ -1053,7 +1115,7 @@ function SummaryPanel({
       <p>
         <b>Device limits (dynamic):</b>{" "}
         {chargeLimit === null && dischargeLimit === null
-          ? missingText(unit.telemetry_age_s)
+          ? missingText(ageSeconds)
           : `charge up to ${chargeLimit === null ? "no data" : formatWatts(chargeLimit)}, discharge up to ${
               dischargeLimit === null ? "no data" : formatWatts(dischargeLimit)
             }`}
@@ -1069,7 +1131,7 @@ function SummaryPanel({
         <b>Identity:</b> {identity}
       </p>
       <p>
-        <b>Communications:</b> last telemetry {ageText(unit.telemetry_age_s)}, quality{" "}
+        <b>Communications:</b> last telemetry {ageText(ageSeconds)}, quality{" "}
         {unit.quality}; last observation {observationText(observation)}
       </p>
       {/* The night-writer detector's recorded sample — the DETAIL surface, the
@@ -1198,21 +1260,21 @@ function completenessText(detail: UnitDetailView): string {
 }
 
 function CellsPanel({
-  unit,
+  ageSeconds,
   detailData,
   detailPhase,
   detailError,
   onRetry,
   disconnected,
 }: {
-  unit: ViewUnit;
+  ageSeconds: number | null;
   detailData: UnitDetailView | null;
   detailPhase: DetailPhase;
   detailError: ErrorView | null;
   onRetry: () => void;
   disconnected: boolean;
 }): JSX.Element {
-  const age = unit.telemetry_age_s;
+  const age = ageSeconds;
   if (detailPhase === "loading") {
     return (
       <div>
@@ -1371,12 +1433,14 @@ function EventsPanel({
 
 function DetailsPanel({
   unit,
+  ageSeconds,
   observation,
   siteId,
   capturedAt,
   detailData,
 }: {
   unit: ViewUnit;
+  ageSeconds: number | null;
   observation: ObservationTrack | undefined;
   siteId: string;
   capturedAt: string;
@@ -1403,10 +1467,10 @@ function DetailsPanel({
     <div>
       <p>
         <b>Data quality:</b> {unit.quality}
-        {isStaleData(unit) ? " (stale)" : ""}
+        {isStaleData(unit, ageSeconds) ? " (stale)" : ""}
       </p>
       <p>
-        <b>Telemetry age:</b> {ageText(unit.telemetry_age_s)}
+        <b>Telemetry age:</b> {ageText(ageSeconds)}
       </p>
       <p>
         <b>Observation detail:</b> last observation {observationText(observation)}; connection
@@ -1455,6 +1519,7 @@ function DetailsPanel({
 
 function UnitDetail({
   unit,
+  ageSeconds,
   units,
   requestedByUnit,
   authorizedByUnit,
@@ -1538,6 +1603,7 @@ function UnitDetail({
           <SummaryPanel
             unit={unit}
             units={units}
+            ageSeconds={ageSeconds}
             requestedByUnit={requestedByUnit}
             authorizedByUnit={authorizedByUnit}
             observation={observation}
@@ -1548,7 +1614,7 @@ function UnitDetail({
         )}
         {tab === "cells" && (
           <CellsPanel
-            unit={unit}
+            ageSeconds={ageSeconds}
             detailData={detailData}
             detailPhase={detailPhase}
             detailError={detailError}
@@ -1567,6 +1633,7 @@ function UnitDetail({
         {tab === "details" && (
           <DetailsPanel
             unit={unit}
+            ageSeconds={ageSeconds}
             observation={observation}
             siteId={siteId}
             capturedAt={capturedAt}
@@ -1733,6 +1800,13 @@ export function BatteriesView({
   const streamStartedRef = useRef(false);
   const openerRef = useRef<HTMLElement | null>(null);
   /**
+   * The monotonic moment the picture on screen was captured: every displayed
+   * data age is the snapshot's own `telemetry_age_s` PLUS elapsed time from
+   * here, so an age keeps growing between refreshes instead of freezing at
+   * the value the last snapshot arrived with.
+   */
+  const capturedAtRef = useRef<number>(monotonicNowMs());
+  /**
    * The open detail, by reference: the stream effect below re-reads the
    * unit's full projection whenever the world advances while its detail is
    * open, without re-subscribing per open/close.
@@ -1761,6 +1835,7 @@ export function BatteriesView({
         return;
       }
       adoptFigures(raw);
+      capturedAtRef.current = monotonicNowMs();
       setFleet(parsed);
       if (!streamStartedRef.current) {
         cursorRef.current = parsed.sequence;
@@ -1950,7 +2025,15 @@ export function BatteriesView({
             if (cancelled) {
               return;
             }
-            setStreamLost(false);
+            // A plane-republished REST read is data, never liveness: the plane
+            // marks its cached replay `stale` exactly while the one real
+            // stream is down, and honoring that flag is what keeps the
+            // disconnected notice on screen through the reconnect retries —
+            // an unconditional clear here used to flip the view back to
+            // "connected" ~300 ms into every outage (Home/Now/Flow's rule).
+            if (!(isPlaneSnapshot(frame) && frame.stale)) {
+              setStreamLost(false);
+            }
             // Every frame feeds the shared per-unit figure tracker (its own
             // no-ops carry most kinds): acceptances, control-decision audits,
             // and authority grants move the maps, request-ending frames clear
@@ -2122,6 +2205,18 @@ export function BatteriesView({
     })();
   };
 
+  // Displayed data ages are captured values plus elapsed monotonic time: the
+  // shared plane republishes a fresh snapshot every couple of seconds while
+  // the session is healthy, and between refreshes (and through any outage)
+  // the age keeps ticking instead of freezing at the captured figure.
+  const needsAgeTick = fleet?.units.some((unit) => unit.telemetry_age_s !== null) ?? false;
+  const nowMs = useTickingNow(needsAgeTick);
+  const elapsedSeconds = Math.max(0, (nowMs - capturedAtRef.current) / 1000);
+  /** A unit's displayed data age: the captured age plus elapsed time. The
+   * row's own `ageText` lands on whole seconds (the display bound's rule). */
+  const ageOf = (unit: ViewUnit): number | null =>
+    unit.telemetry_age_s === null ? null : unit.telemetry_age_s + elapsedSeconds;
+
   if (fleet === null) {
     if (phase === "error" && snapshotError !== null) {
       return (
@@ -2205,6 +2300,7 @@ export function BatteriesView({
           <FleetCard
             key={unit.unit_id}
             unit={unit}
+            ageSeconds={ageOf(unit)}
             observation={observations[unit.unit_id]}
             today={fleet?.energyToday ?? null}
             onOpenDetail={(unitId) => setDetail({ unitId, tab: "summary" })}
@@ -2219,6 +2315,7 @@ export function BatteriesView({
           <UnitDetail
             key={detailUnit.unit_id}
             unit={detailUnit}
+            ageSeconds={ageOf(detailUnit)}
             units={units}
             requestedByUnit={unitFigures.requestedByUnit}
             authorizedByUnit={unitFigures.authorizedByUnit}

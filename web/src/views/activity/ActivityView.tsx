@@ -37,6 +37,7 @@ import { Fragment } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, AuditEvent, StreamEvent } from "../../api/client";
+import { isPlaneSnapshot } from "../../app/SharedDataPlane";
 import { toUnexpectedAutonomyEvent } from "../../app/fleet";
 import { objectiveReasonText, toForeignObjectiveEvent } from "../../app/objectives";
 import {
@@ -84,6 +85,11 @@ const STALE_AFTER_MS = 60 * 60_000;
 /** Reconnect pause for the shared event stream: short enough that a dropped
  * line is seen retrying within a glance, never a tight spin. */
 const RECONNECT_DELAY_MS = 300;
+
+/** The once-a-second re-render every displayed entry age needs: "just now"
+ * must become "2 minutes ago" with time alone, whether or not anything new
+ * landed on the bus (an age that never grows is a frozen reading). */
+const AGE_TICK_MS = 1000;
 
 /**
  * How many session-live entries (bus frames) the timeline keeps. Observations
@@ -788,6 +794,15 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
    * trail never holds, observation.published).
    */
   const [liveEntries, setLiveEntries] = useState<AuditEvent[]>([]);
+  /**
+   * The view's OWN stream-loss fact. The `connection` prop carries the
+   * shell's when the shell provides one, but the shared plane's subscription
+   * ending is this view's direct evidence and must surface on its own —
+   * without it a dropped line left a timeline that silently stopped growing
+   * with no notice at all (the shell-level notice names the connection, not
+   * the timeline).
+   */
+  const [streamDown, setStreamDown] = useState(false);
 
   const applyFirstPage = (page: { events: AuditEvent[]; next_cursor: number | null }) => {
     setEvents(newestFirst(page.events));
@@ -859,6 +874,13 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
             if (cancelled) {
               return;
             }
+            // A plane-republished REST read is data, never liveness: the
+            // plane marks its cached replay `stale` exactly while the one
+            // real stream is down, and only a frame that is NOT that replay
+            // proves the subscription is live again (Home/Now/Flow's rule).
+            if (!(isPlaneSnapshot(frame) && frame.stale)) {
+              setStreamDown(false);
+            }
             if (frame.type === "resync_required") {
               resync = true;
               break;
@@ -910,6 +932,12 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
         if (cancelled) {
           return;
         }
+        if (!resync) {
+          // The subscription ended without a resync marker: the shared line
+          // is down. The notice shows while the last entries stay rendered
+          // with their (ticking) ages; the loop below retries on the pause.
+          setStreamDown(true);
+        }
         if (resync) {
           // A discontinuity means the loaded history may be out of step; one
           // quiet refresh re-reads it (merged, so loaded history is kept).
@@ -934,6 +962,32 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
       cancelled = true;
     };
   }, [client, appendLiveEntry]);
+
+  // The age ticker: one render a second while the timeline is on screen, so
+  // every "N minutes ago" line and the stale dimming follow the clock instead
+  // of the last bus frame's arrival. A hidden tab's throttled timers are
+  // re-read the moment the tab becomes visible or focused again.
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  useEffect(() => {
+    if (phase !== "ready") {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      setNowTick(Date.now());
+    }, AGE_TICK_MS);
+    const refreshNow = (): void => {
+      if (document.visibilityState === "visible") {
+        setNowTick(Date.now());
+      }
+    };
+    document.addEventListener("visibilitychange", refreshNow);
+    window.addEventListener("focus", refreshNow);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshNow);
+      window.removeEventListener("focus", refreshNow);
+    };
+  }, [phase]);
 
   // Retry with nothing loaded: the error stays on screen (no skeleton flash,
   // no fake entries) until the new page actually lands.
@@ -1058,7 +1112,10 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
     setUnitFilter(null);
   }, []);
 
-  const now = Date.now();
+  const now = nowTick;
+  // Either signal is enough: the shell's connection fact (when provided) or
+  // the view's own subscription having ended.
+  const disconnected = connection === "disconnected" || streamDown;
 
   return (
     <section className="activity-view" aria-labelledby="activity-view-heading">
@@ -1069,7 +1126,7 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
         </p>
       </header>
 
-      {connection === "disconnected" && (
+      {disconnected && (
         <div role="status" className="activity-notice">
           <p className="activity-notice__title">Connection lost</p>
           <p className="activity-notice__body">
@@ -1133,7 +1190,7 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
           ) : (
             <ol
               className={
-                connection === "disconnected"
+                disconnected
                   ? "activity-timeline activity-timeline--dimmed"
                   : "activity-timeline"
               }
