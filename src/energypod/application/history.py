@@ -40,13 +40,19 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
+from itertools import pairwise
 from typing import Any, Final, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from energypod.domain.history import (
+    DEFAULT_QUERY_FIELDS,
+    QUERY_FIELD_VOCABULARY,
+    QUERY_META_FIELDS,
+    QUERY_NUMERIC_FIELDS,
     TelemetrySampleRow,
     format_history_timestamp,
+    parse_history_timestamp,
     worst_quality,
 )
 from energypod.domain.intents import IntentSource
@@ -445,6 +451,525 @@ class PlantHistoryControl:
                 for unit in self._unit_ids
             },
         }
+
+    # --- the query engine (DESIGN_PLANT_HISTORY section 3) ---------------------
+
+    _MAX_WINDOW = timedelta(days=31)
+    _MIN_POINTS = 50
+    _MAX_POINTS = 2000
+    _GAP_INTERVALS = 3.0
+    _FLEET_FLOW_FIELDS = ("grid_power_w", "load_power_w", "battery_watts")
+
+    def query_payload(
+        self,
+        *,
+        range_from: str,
+        range_to: str,
+        unit_ids: Sequence[str] | None = None,
+        fields: Sequence[str] | None = None,
+        points: int = 600,
+    ) -> dict[str, Any]:
+        """One windowed, server-downsampled history response (DESIGN section 3).
+
+        Every parameter rule raises ``ValueError`` (the boundary's 422
+        envelope); a window the data cannot answer is an EMPTY 200, never an
+        error.  One resolution per response, chosen by the data horizon.
+        """
+        start, end = _parse_window(range_from, range_to, self._MAX_WINDOW)
+        effective_units = self._effective_units(unit_ids)
+        requested = _normalize_fields(fields)
+        threshold = _normalize_points(points)
+        oldest = self._repository.oldest_full_res_at()
+        if oldest is not None:
+            resolution = "full" if start >= oldest else "hourly"
+        else:
+            # No full-resolution row is retained anywhere: the window is
+            # hourly whenever rollups can answer it, and full (vacuously
+            # empty) only when the store holds nothing at all -- the
+            # boundary stays data-driven, never config-coupled.
+            resolution = (
+                "hourly" if self._repository.rollup_hours(effective_units, start, end) else "full"
+            )
+        if resolution == "full":
+            units_payload, fleet_payload = self._full_resolution(
+                effective_units, requested, threshold, start, end
+            )
+        else:
+            units_payload, fleet_payload = self._hourly_resolution(
+                effective_units, requested, start, end
+            )
+        return {
+            "from": format_history_timestamp(start),
+            "to": format_history_timestamp(end),
+            "resolution": resolution,
+            "points": threshold,
+            "fields": list(requested),
+            "units": units_payload,
+            "fleet": fleet_payload,
+        }
+
+    def _effective_units(self, unit_ids: Sequence[str] | None) -> tuple[str, ...]:
+        if unit_ids is None:
+            return self._unit_ids
+        requested = tuple(unit_ids)
+        if not requested:
+            raise ValueError("unit_ids must name at least one configured unit")
+        unknown = [unit for unit in requested if unit not in set(self._unit_ids)]
+        if unknown:
+            raise ValueError(f"unit_ids name units this site does not configure: {sorted(unknown)}")
+        return requested
+
+    def _full_resolution(
+        self,
+        effective_units: tuple[str, ...],
+        requested: tuple[str, ...],
+        threshold: int,
+        start: datetime,
+        end: datetime,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        rows = self._repository.samples(effective_units, start, end)
+        by_unit: dict[str, list[TelemetrySampleRow]] = {unit: [] for unit in effective_units}
+        for row in rows:
+            by_unit.setdefault(row.unit_id, []).append(row)
+        numeric = tuple(field for field in requested if field not in QUERY_META_FIELDS)
+        units_payload: dict[str, Any] = {}
+        for unit in effective_units:
+            units_payload[unit] = self._full_unit_block(
+                by_unit[unit], numeric, requested, threshold
+            )
+        fleet_payload = self._full_fleet_block(by_unit, effective_units, numeric, threshold)
+        return units_payload, fleet_payload
+
+    def _full_unit_block(
+        self,
+        rows: list[TelemetrySampleRow],
+        numeric: tuple[str, ...],
+        requested: tuple[str, ...],
+        threshold: int,
+    ) -> dict[str, Any]:
+        timestamps = [row.sampled_at for row in rows]
+        block: dict[str, Any] = {
+            "first_sample_at": None if not rows else format_history_timestamp(rows[0].sampled_at),
+            "last_sample_at": None if not rows else format_history_timestamp(rows[-1].sampled_at),
+            "sample_count": len(rows),
+            "quality_worst": (
+                None if not rows else worst_quality(row.quality for row in rows).value
+            ),
+            "gaps": _full_gaps(timestamps, self._sample_interval_s * self._GAP_INTERVALS),
+            "series": {field: _full_series(rows, field, threshold) for field in numeric},
+        }
+        if "lifecycle" in requested:
+            block["lifecycle_changes"] = _step_changes(
+                rows, lambda row: row.lifecycle, lambda value: {"v": value}
+            )
+        if "health_state" in requested:
+            block["health_state_changes"] = _step_changes(
+                rows, lambda row: row.health_state, lambda value: {"v": value}
+            )
+        if "commanded" in requested:
+            block["commanded_changes"] = _step_changes(
+                rows,
+                lambda row: (row.commanded_source, row.commanded_direction, row.commanded_w),
+                lambda value: {"source": value[0], "direction": value[1], "watts": value[2]},
+            )
+        return block
+
+    def _full_fleet_block(
+        self,
+        by_unit: Mapping[str, list[TelemetrySampleRow]],
+        effective_units: tuple[str, ...],
+        numeric: tuple[str, ...],
+        threshold: int,
+    ) -> dict[str, Any]:
+        flow = tuple(field for field in self._FLEET_FLOW_FIELDS if field in numeric)
+        series: dict[str, Any] = {}
+        intersection: list[datetime] = []
+        if flow:
+            # Sum over the RAW rows first (sum-after-downsample would lie),
+            # and only where EVERY unit in the set has a row at that
+            # timestamp -- one unreadable unit is never treated as zero.
+            by_timestamp: dict[str, dict[str, TelemetrySampleRow]] = {}
+            for unit in effective_units:
+                for row in by_unit.get(unit, []):
+                    by_timestamp.setdefault(format_history_timestamp(row.sampled_at), {})[unit] = (
+                        row
+                    )
+            intersection = [
+                parse_history_timestamp(key)
+                for key, holders in sorted(by_timestamp.items())
+                if len(holders) == len(effective_units)
+            ]
+            for field in flow:
+                values = [
+                    sum(
+                        by_timestamp[format_history_timestamp(moment)][unit].field_value(
+                            QUERY_NUMERIC_FIELDS[field]
+                        )
+                        or 0.0
+                        for unit in effective_units
+                    )
+                    for moment in intersection
+                ]
+                indices = _lttb_indices(
+                    [moment.timestamp() for moment in intersection], values, threshold
+                )
+                points = [
+                    {"t": format_history_timestamp(intersection[index]), "v": values[index]}
+                    for index in indices
+                ]
+                series[field] = _extremes_payload(intersection, values, points)
+        return {
+            "series": series,
+            "gaps": _full_gaps(intersection, self._sample_interval_s * self._GAP_INTERVALS),
+        }
+
+    def _hourly_resolution(
+        self,
+        effective_units: tuple[str, ...],
+        requested: tuple[str, ...],
+        start: datetime,
+        end: datetime,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        hours = self._repository.rollup_hours(effective_units, start, end)
+        by_unit: dict[str, list[Any]] = {unit: [] for unit in effective_units}
+        for rollup in hours:
+            by_unit.setdefault(rollup.unit_id, []).append(rollup)
+        numeric = tuple(field for field in requested if field not in QUERY_META_FIELDS)
+        units_payload: dict[str, Any] = {}
+        for unit in effective_units:
+            units_payload[unit] = self._hourly_unit_block(by_unit[unit], numeric, requested)
+        fleet_payload = self._hourly_fleet_block(by_unit, effective_units, numeric)
+        return units_payload, fleet_payload
+
+    def _hourly_unit_block(
+        self, hours: list[Any], numeric: tuple[str, ...], requested: tuple[str, ...]
+    ) -> dict[str, Any]:
+        starts = [rollup.hour_start for rollup in hours]
+        block: dict[str, Any] = {
+            "first_sample_at": (
+                None if not hours else format_history_timestamp(hours[0].hour_start)
+            ),
+            "last_sample_at": (
+                None if not hours else format_history_timestamp(hours[-1].hour_start)
+            ),
+            "sample_count": sum(rollup.sample_count for rollup in hours),
+            "quality_worst": (
+                None if not hours else worst_quality(rollup.worst_quality for rollup in hours).value
+            ),
+            "gaps": _hourly_gaps(starts),
+            "series": {field: _hourly_series(hours, field) for field in numeric},
+        }
+        # The step encodings are full-resolution-only: the hourly tier keeps
+        # no lifecycle/health/commanded words, so the honest hourly answer is
+        # an empty strip (the console hides what the tier never stored).
+        if "lifecycle" in requested:
+            block["lifecycle_changes"] = []
+        if "health_state" in requested:
+            block["health_state_changes"] = []
+        if "commanded" in requested:
+            block["commanded_changes"] = []
+        return block
+
+    def _hourly_fleet_block(
+        self,
+        by_unit: Mapping[str, list[Any]],
+        effective_units: tuple[str, ...],
+        numeric: tuple[str, ...],
+    ) -> dict[str, Any]:
+        flow = tuple(field for field in self._FLEET_FLOW_FIELDS if field in numeric)
+        series: dict[str, Any] = {}
+        shared: list[datetime] = []
+        if flow:
+            by_hour: dict[str, dict[str, Any]] = {}
+            for unit in effective_units:
+                for rollup in by_unit.get(unit, []):
+                    by_hour.setdefault(format_history_timestamp(rollup.hour_start), {})[unit] = (
+                        rollup
+                    )
+            shared = [
+                parse_history_timestamp(key)
+                for key, holders in sorted(by_hour.items())
+                if len(holders) == len(effective_units)
+            ]
+            for field in flow:
+                points: list[dict[str, Any]] = []
+                for moment in shared:
+                    holders = by_hour[format_history_timestamp(moment)]
+                    rollups = [holders[unit] for unit in effective_units]
+                    summed = tuple(  # summed mean/min/max over the present units
+                        sum(
+                            (rollup.metrics[QUERY_NUMERIC_FIELDS[field]][index] or 0.0)
+                            for rollup in rollups
+                        )
+                        for index in range(3)
+                    )
+                    points.append(
+                        {
+                            "t": format_history_timestamp(moment),
+                            "v": summed[2],
+                            "min": summed[0],
+                            "max": summed[1],
+                            # The weakest per-unit coverage is the honest
+                            # coverage marker for the summed hour.
+                            "n": min(rollup.sample_count for rollup in rollups),
+                        }
+                    )
+                series[field] = _hourly_extremes_payload(points)
+        return {"series": series, "gaps": _hourly_gaps(shared)}
+
+
+# --- the query engine's pinned helpers --------------------------------------------
+
+
+def _parse_instant(raw: Any, label: str) -> datetime:
+    """One query bound: ISO-8601 WITH an explicit offset, never naive."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{label} must be an ISO-8601 timestamp with an explicit offset")
+    try:
+        moment = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{label} must be an ISO-8601 timestamp with an explicit offset: {raw!r}"
+        ) from exc
+    if moment.tzinfo is None or moment.utcoffset() is None:
+        raise ValueError(
+            f"{label} must carry an explicit UTC offset (Z or +/-HH:MM): a naive timestamp "
+            "would silently imply the server's local zone"
+        )
+    return moment.astimezone(UTC)
+
+
+def _parse_window(
+    range_from: Any, range_to: Any, max_window: timedelta
+) -> tuple[datetime, datetime]:
+    start = _parse_instant(range_from, "from")
+    end = _parse_instant(range_to, "to")
+    if start >= end:
+        raise ValueError("from must be strictly before to")
+    if end - start > max_window:
+        raise ValueError(f"the from/to window must stay at or below {max_window.days} days")
+    return start, end
+
+
+def _normalize_fields(fields: Sequence[str] | None) -> tuple[str, ...]:
+    if fields is None:
+        return DEFAULT_QUERY_FIELDS
+    requested: list[str] = []
+    for field in fields:
+        if not isinstance(field, str) or field not in QUERY_FIELD_VOCABULARY:
+            raise ValueError(
+                f"fields names an unknown history field: {field!r} "
+                f"(vocabulary: {sorted(QUERY_FIELD_VOCABULARY)})"
+            )
+        if field not in requested:
+            requested.append(field)
+    if not requested:
+        raise ValueError("fields must name at least one history field")
+    return tuple(requested)
+
+
+def _normalize_points(points: Any) -> int:
+    if isinstance(points, bool) or not isinstance(points, int):
+        raise ValueError("points must be an integer between 50 and 2000")
+    threshold: int = int(points)
+    if not PlantHistoryControl._MIN_POINTS <= threshold <= PlantHistoryControl._MAX_POINTS:
+        raise ValueError("points must be an integer between 50 and 2000")
+    return threshold
+
+
+def _lttb_indices(xs: Sequence[float], ys: Sequence[float], threshold: int) -> list[int]:
+    """Classic LTTB (Steinarsson): the pinned server-side downsample.
+
+    The first and last samples are always retained; every other selected
+    point maximizes its triangle area against the previous selection and the
+    NEXT bucket's average; strict ``>`` keeps the EARLIER sample on ties, so
+    the output is a pure function of the input (no clock or hash order).
+    """
+    count = len(xs)
+    if count <= threshold:
+        return list(range(count))
+    if threshold < 3:
+        return [0, count - 1]
+    every = (count - 2) / (threshold - 2)
+
+    def bucket_bounds(bucket: int) -> tuple[int, int]:
+        start = 1 + int(bucket * every)
+        end = min(1 + int((bucket + 1) * every), count - 1)
+        return start, max(end, start + 1)
+
+    averages: list[tuple[float, float]] = []
+    for bucket in range(threshold - 2):
+        start, end = bucket_bounds(bucket)
+        slice_x = xs[start:end]
+        slice_y = ys[start:end]
+        averages.append((sum(slice_x) / len(slice_x), sum(slice_y) / len(slice_y)))
+    selected = [0]
+    for bucket in range(threshold - 2):
+        start, end = bucket_bounds(bucket)
+        if bucket + 1 < threshold - 2:
+            anchor_x, anchor_y = averages[bucket + 1]
+        else:
+            anchor_x, anchor_y = xs[-1], ys[-1]
+        prev_x, prev_y = xs[selected[-1]], ys[selected[-1]]
+        best_area = -1.0
+        best_index = start
+        for index in range(start, end):
+            area = abs(
+                (prev_x - anchor_x) * (ys[index] - prev_y)
+                - (prev_x - xs[index]) * (anchor_y - prev_y)
+            )
+            if area > best_area:
+                best_area = area
+                best_index = index
+        selected.append(best_index)
+    selected.append(count - 1)
+    return selected
+
+
+def _full_series(rows: Sequence[TelemetrySampleRow], field: str, threshold: int) -> dict[str, Any]:
+    column = QUERY_NUMERIC_FIELDS[field]
+    moments: list[datetime] = []
+    values: list[float] = []
+    for row in rows:
+        value = row.field_value(column)
+        if value is not None:  # a null point is never emitted, never zeroed
+            moments.append(row.sampled_at)
+            values.append(value)
+    indices = _lttb_indices([moment.timestamp() for moment in moments], values, threshold)
+    points = [
+        {"t": format_history_timestamp(moments[index]), "v": values[index]} for index in indices
+    ]
+    return _extremes_payload(moments, values, points)
+
+
+def _extremes_payload(
+    moments: Sequence[datetime], values: Sequence[float], points: list[dict[str, Any]]
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"points": points, "sample_count": len(values)}
+    if values:
+        minimum = min(values)
+        maximum = max(values)
+        earliest_min = moments[values.index(minimum)]
+        earliest_max = moments[values.index(maximum)]
+        payload["window_min"] = minimum
+        payload["window_min_at"] = format_history_timestamp(earliest_min)
+        payload["window_max"] = maximum
+        payload["window_max_at"] = format_history_timestamp(earliest_max)
+    else:
+        payload["window_min"] = None
+        payload["window_min_at"] = None
+        payload["window_max"] = None
+        payload["window_max_at"] = None
+    return payload
+
+
+def _hourly_series(hours: Sequence[Any], field: str) -> dict[str, Any]:
+    column = QUERY_NUMERIC_FIELDS[field]
+    points: list[dict[str, Any]] = []
+    minimum = maximum = None
+    minimum_at = maximum_at = None
+    total = 0
+    for rollup in hours:
+        low, high, mean = rollup.metrics[column]
+        total += rollup.sample_count
+        points.append(
+            {
+                "t": format_history_timestamp(rollup.hour_start),
+                "v": mean,
+                "min": low,
+                "max": high,
+                "n": rollup.sample_count,
+            }
+        )
+        if low is not None and (minimum is None or low < minimum):
+            minimum, minimum_at = low, rollup.hour_start
+        if high is not None and (maximum is None or high > maximum):
+            maximum, maximum_at = high, rollup.hour_start
+    return {
+        "points": points,
+        "sample_count": total,
+        "window_min": minimum,
+        "window_min_at": None if minimum_at is None else format_history_timestamp(minimum_at),
+        "window_max": maximum,
+        "window_max_at": None if maximum_at is None else format_history_timestamp(maximum_at),
+    }
+
+
+def _hourly_extremes_payload(points: list[dict[str, Any]]) -> dict[str, Any]:
+    minimum = maximum = None
+    minimum_at = maximum_at = None
+    total = 0
+    for point in points:
+        total += point["n"]
+        if point["min"] is not None and (minimum is None or point["min"] < minimum):
+            minimum, minimum_at = point["min"], point["t"]
+        if point["max"] is not None and (maximum is None or point["max"] > maximum):
+            maximum, maximum_at = point["max"], point["t"]
+    return {
+        "points": points,
+        "sample_count": total,
+        "window_min": minimum,
+        "window_min_at": minimum_at,
+        "window_max": maximum,
+        "window_max_at": maximum_at,
+    }
+
+
+def _full_gaps(timestamps: Sequence[datetime], max_spacing_s: float) -> list[dict[str, str]]:
+    """Row-to-row gaps beyond the 3 x cadence line; edges are never gaps."""
+    gaps: list[dict[str, str]] = []
+    for earlier, later in pairwise(timestamps):
+        if (later - earlier).total_seconds() > max_spacing_s:
+            gaps.append(
+                {
+                    "from": format_history_timestamp(earlier),
+                    "to": format_history_timestamp(later),
+                }
+            )
+    return gaps
+
+
+def _hourly_gaps(starts: Sequence[datetime]) -> list[dict[str, str]]:
+    """Missing hours strictly between the first and last rollup hours."""
+    gaps: list[dict[str, str]] = []
+    for earlier, later in pairwise(starts):
+        missing = later - earlier
+        if missing.total_seconds() > 3600:
+            cursor = earlier + timedelta(hours=1)
+            while cursor < later:
+                gaps.append(
+                    {
+                        "from": format_history_timestamp(cursor),
+                        "to": format_history_timestamp(cursor + timedelta(hours=1)),
+                    }
+                )
+                cursor += timedelta(hours=1)
+    return gaps
+
+
+def _step_changes(
+    rows: Sequence[TelemetrySampleRow],
+    read: Callable[[TelemetrySampleRow], Any],
+    render: Callable[[Any], dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """The change-point encoding: the first sample always, then only diffs."""
+    changes: list[dict[str, Any]] = []
+    previous: Any = _MISSING
+    for row in rows:
+        value = read(row)
+        if previous is _MISSING or value != previous:
+            changes.append({"t": format_history_timestamp(row.sampled_at), **render(value)})
+            previous = value
+    return changes
+
+
+class _Missing:
+    """Sentinel distinguishing "no previous sample" from a null value."""
+
+    __slots__ = ()
+
+
+_MISSING: Any = _Missing()
 
 
 def _direction_word(direction: Any) -> str:
