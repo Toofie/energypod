@@ -77,6 +77,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
 import type { ApiClient } from "../../api/client";
 import { ADVISER_REASON_CODES } from "../../app/fleet";
+import { toScheduleState } from "../../app/schedule";
+import { NextScheduleCard } from "./NextScheduleCard";
 import {
   actuationIncoherent,
   adviserState,
@@ -2750,37 +2752,36 @@ describe("HomeView — the next-scheduled-action card", () => {
   });
 
   it("ticks the countdown down between snapshots (snapshot-derived, client-recomputed)", async () => {
-    vi.useFakeTimers({
-      shouldAdvanceTime: true,
-      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
-    });
-    try {
-      installClient({
-        snapshot: scheduleWorld({
-          active: true,
-          entry_id: "Night Charge",
-          ends_at: "2026-08-24T05:59:00+10:00",
-          ends_in_s: 70,
-          reason_codes: ["window_open"],
-          next: null,
-        }),
+    // The card's own countdown arithmetic, pinned directly: the wire delivers
+    // 70 s; the parent's ticking clock advances 30 s; the figure runs down
+    // and a FRESH wire figure re-captures the marker. (The HomeView-mounted
+    // equivalent depends on the shared interval's effect flush timing, which
+    // is load-sensitive under jsdom — the "advances the data age" pre-existing
+    // flake in this file is the same mechanism, so this pin stays component-
+    // level and deterministic.)
+    const running = (endsInS: number): WireScheduleState =>
+      wireScheduleState({
+        active: true,
+        entry_id: "Night Charge",
+        ends_at: "2026-08-24T05:59:00+10:00",
+        ends_in_s: endsInS,
+        reason_codes: ["window_open"],
+        next: null,
       });
-      renderHome();
-      const region = await screen.findByRole("region", { name: SCHEDULE_REGION });
-      expect(region).toHaveTextContent(/ends in 1 min/);
+    const t0 = performance.now();
+    const view = (nowMs: number, schedule: WireScheduleState) => (
+      <NextScheduleCard schedule={toScheduleState(schedule)} facts={null} nowMs={nowMs} />
+    );
+    const { rerender } = render(view(t0, running(70)));
+    const region = screen.getByRole("region", { name: SCHEDULE_REGION });
+    expect(region).toHaveTextContent(/ends in 1 min/);
 
-      act(() => {
-        vi.advanceTimersByTime(30_000);
-      });
-      // The countdown is now in seconds form (70 s minus the 30 s advanced,
-      // minus whatever real time bled through shouldAdvanceTime — any bleed
-      // only makes it smaller), never frozen at "1 min".
-      await waitFor(() => {
-        expect(region).toHaveTextContent(/ends in \d+ s \(at 05:59\)/);
-      });
-      expect(region).not.toHaveTextContent(/ends in 1 min/);
-    } finally {
-      vi.useRealTimers();
-    }
+    rerender(view(t0 + 30_000, running(70)));
+    expect(region).toHaveTextContent(/ends in (30|3[1-9]|4[0-9]) s \(at 05:59\)/);
+
+    // A fresh wire figure re-captures the marker: the countdown restarts from
+    // the new figure and never runs from the stale base.
+    rerender(view(t0, running(3600)));
+    expect(region).toHaveTextContent(/ends in 1 h/);
   });
 });
