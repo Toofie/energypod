@@ -637,3 +637,87 @@ plant_history:
   # Hourly rollup retention: 0 (default) = forever; a positive day
   # count bounds the rollup tier too.
   retention_rollup_days: 0
+
+# ---------------------------------------------------------------------------
+# FORECAST PROVIDERS (ARCHITECTURE section 17 — the reserved advisory layer).
+#
+# ADVISORY-ONLY, BY CONSTRUCTION: providers feed advisers and projections
+# and NOTHING else — no kernel input, no read plan, no intent.  A missing,
+# stale, or wrong forecast can only make an adviser's PROPOSAL worse, never
+# actuate anything; a provider failure surfaces as its own data being
+# unavailable (the consumer falls back) and never crashes observation.
+# The architecture-fitness test pins it: no domain or application module
+# may import adapters.providers.
+#
+# BLOCK PRESENCE + THE STAGED POSTURE: a PRESENT block declares the stack;
+# `enabled: false` (below, the shipped posture) composes NOTHING — the wire
+# families stay off until the operator flips the key as one deliberate act
+# (network egress + third-party accounts start with that flip).  An ABSENT
+# block is byte-identical.  Boot always recomposes from this file; nothing
+# runtime-persists.
+#
+# THE WIRE BUDGET (shared by every HTTP family): request_timeout_s bounds
+#   one leg; refresh_interval_s is the MINIMUM spacing between legs (the
+#   rate-limit budget — Solcast hobbyist keys allow 10 requests per UTC day,
+#   and the free Open-Meteo tier 10k/day); stale_after_s is when the
+#   staleness report calls the data stale (>= refresh_interval_s).  A failed
+#   refresh serves the cache with its ORIGINAL fetched_at — rereading never
+#   freshens (the architecture's caching honesty rule).
+#
+# THE FAMILIES (declare the ones this site wants; PV sources are mutually
+#   exclusive — exactly one PV truth per site):
+#   open_meteo: keyless weather (irradiance W/m2, cloud %, temperature C)
+#     and, with `pv:`, a derived PV forecast.  Open-Meteo publishes NO
+#     power variable; watts are derived here from tilted-plane irradiance
+#     as capacity_kw x GTI x derate.  azimuth uses the DOCS convention
+#     (0 = south, -90 = east, +90 = west) — the OpenAPI YAML's "North=0"
+#     wording is wrong.  Attribution (CC BY 4.0): "Weather data by
+#     Open-Meteo.com" must accompany any surface that shows the data.
+#   solcast: the quantiled rooftop forecast (central/10%/90% slices).
+#     THE KEY IS A REFERENCE, NEVER MATERIAL: api_key_env names the
+#     environment variable resolved at boot (export SOLCAST_API_KEY=...);
+#     the key rides the Authorization: Bearer header and never a query
+#     string or this file.
+#   load_baseline: no external API — tomorrow's load as the SAME SLOT LAST
+#     WEEK read from the telemetry historian (requires the plant_history
+#     block above; a missing unit or null word excludes a timestamp, never
+#     zero-fills).  A baseline to graduate from, not a model.
+#   tariff: no market feed yet (wholesale is a deferred ADR) — the
+#     operator's own declared windows over a flat default, expanded in the
+#     SITE timezone as contiguous intervals (DST-honest).  Every interval
+#     is labeled market=static-config/quality=static so no consumer can
+#     mistake it for a market signal.
+forecast_providers:
+  enabled: false   # the staged posture: nothing composes until this flips
+  request_timeout_s: 10.0
+  refresh_interval_s: 900.0   # 15 min between wire legs
+  stale_after_s: 3600.0       # an hour-old forecast reports stale
+  # open_meteo:
+  #   latitude: -27.4698
+  #   longitude: 153.0251
+  #   forecast_days: 2
+  #   pv:
+  #     tilt_deg: 25.0
+  #     azimuth_deg: 10.0
+  #     capacity_kw: 5.0
+  #     derate: 0.9
+  # solcast:
+  #   api_key_env: SOLCAST_API_KEY   # the reference, never the key itself
+  #   latitude: -27.4698
+  #   longitude: 153.0251
+  #   capacity_kw: 5.0
+  #   hours: 48
+  #   period: PT30M
+  # load_baseline:
+  #   slot_s: 1800.0
+  #   horizon_s: 43200.0
+  #   weeks_back: 1
+  # tariff:
+  #   currency: AUD
+  #   default_import_cents_per_kwh: 28.0
+  #   default_export_cents_per_kwh: 9.0
+  #   horizon_s: 172800.0
+  #   windows:
+  #     - window_local: ["00:00", "06:00"]
+  #       import_cents_per_kwh: 12.0
+  #       export_cents_per_kwh: 5.0

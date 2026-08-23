@@ -55,6 +55,7 @@ from collections import deque
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from os import environ
 from typing import Any, Protocol, cast
 
 from fastapi import FastAPI
@@ -87,6 +88,17 @@ from energypod.adapters.persistence.sqlite import (
     SQLiteScheduleRepository,
     SQLiteTelemetryHistoryRepository,
 )
+from energypod.adapters.providers.http import HttpxForecastTransport
+from energypod.adapters.providers.load_baseline import HistorianLoadForecast
+from energypod.adapters.providers.open_meteo import OpenMeteoPvForecast, OpenMeteoWeather
+from energypod.adapters.providers.ports import (
+    LoadForecastProvider,
+    PvForecastProvider,
+    WeatherProvider,
+)
+from energypod.adapters.providers.registry import ForecastProviderRegistry
+from energypod.adapters.providers.solcast import SolcastPvForecast
+from energypod.adapters.providers.tariff_static import StaticTariffProvider, TariffRateWindow
 from energypod.api.mcp import create_mcp_server
 from energypod.api.rest import create_api_app
 from energypod.application.actor import EnergyPodActor
@@ -2796,6 +2808,14 @@ class ComposedRuntime:
         SQLiteTelemetryHistoryRepository | InMemoryTelemetryHistoryRepository | None
     ) = None
     history_surface: PlantHistoryControl | None = None
+    # ARCHITECTURE section 17 (the reserved advisory layer): composed only
+    # when the ``forecast_providers`` block is PRESENT and ENABLED -- the
+    # staged posture ships disabled.  ADVISORY-ONLY: no fleet-loop slot, no
+    # facade surface, no snapshot key reads this handle; constructing the
+    # adapters opens no socket, and the first forecast-consuming adviser
+    # wires its own fetch loop against it.  ``notes`` records every declared
+    # provider the environment could not deliver (a missing Solcast key).
+    forecast_providers: ForecastProviderRegistry | None = None
 
 
 def _simulator_pod(
@@ -3383,6 +3403,121 @@ def _build_runtime(
             retention_full_resolution_days=int(history_config.retention_full_resolution_days),
             repository=history_store,
         )
+    # --- advisory forecast providers (ARCHITECTURE section 17) -----------
+    # Composed only when the ``forecast_providers`` block is PRESENT and
+    # ENABLED (an absent or disabled block composes NOTHING -- the staged
+    # posture, byte-identical).  ADVISORY-ONLY: this handle feeds advisers
+    # and projections only; nothing in the fleet loop, the kernel, or any
+    # safety path reads it, and constructing the adapters opens no socket
+    # (the transport is inert until a consumer's first fetch).  A declared
+    # provider the environment cannot deliver (the Solcast key reference
+    # pointing at an unset variable) is OMITTED WITH A NOTE, never a boot
+    # failure -- an advisory provider's absence degrades its own data only.
+    forecast_registry: ForecastProviderRegistry | None = None
+    providers_config = config.forecast_providers
+    if providers_config is not None and providers_config.enabled:
+        configured_units = tuple(unit.unit_id for unit in config.units)
+        refresh_s = float(providers_config.refresh_interval_s)
+        stale_s = float(providers_config.stale_after_s)
+        wire = HttpxForecastTransport(timeout_s=float(providers_config.request_timeout_s))
+        registry_weather: WeatherProvider | None = None
+        registry_pv: PvForecastProvider | None = None
+        registry_load: LoadForecastProvider | None = None
+        registry_tariff: StaticTariffProvider | None = None
+        registry_notes: list[str] = []
+        open_meteo = providers_config.open_meteo
+        if open_meteo is not None:
+            registry_weather = OpenMeteoWeather(
+                transport=wire,
+                clock=resolved_clock,
+                latitude=float(open_meteo.latitude),
+                longitude=float(open_meteo.longitude),
+                forecast_days=int(open_meteo.forecast_days),
+                refresh_interval_s=refresh_s,
+                stale_after_s=stale_s,
+            )
+            if open_meteo.pv is not None:
+                plane = open_meteo.pv
+                registry_pv = OpenMeteoPvForecast(
+                    transport=wire,
+                    clock=resolved_clock,
+                    latitude=float(open_meteo.latitude),
+                    longitude=float(open_meteo.longitude),
+                    tilt_deg=float(plane.tilt_deg),
+                    azimuth_deg=float(plane.azimuth_deg),
+                    capacity_kw=float(plane.capacity_kw),
+                    derate=float(plane.derate),
+                    forecast_days=int(open_meteo.forecast_days),
+                    refresh_interval_s=refresh_s,
+                    stale_after_s=stale_s,
+                )
+        solcast = providers_config.solcast
+        if solcast is not None:
+            # The secret REFERENCE resolves here, once, at composition: the
+            # key itself never lives in the configuration file.
+            api_key = environ.get(solcast.api_key_env)
+            if api_key:
+                registry_pv = SolcastPvForecast(
+                    transport=wire,
+                    clock=resolved_clock,
+                    api_key=api_key,
+                    latitude=float(solcast.latitude),
+                    longitude=float(solcast.longitude),
+                    capacity_kw=float(solcast.capacity_kw),
+                    hours=int(solcast.hours),
+                    period=str(solcast.period),
+                    refresh_interval_s=refresh_s,
+                    stale_after_s=stale_s,
+                )
+            else:
+                registry_notes.append(
+                    f"solcast: the api key environment variable "
+                    f"{solcast.api_key_env} is not set; the PV provider is absent "
+                    f"until the reference resolves"
+                )
+        baseline = providers_config.load_baseline
+        if baseline is not None:
+            if history_store is not None:
+                registry_load = HistorianLoadForecast(
+                    source=history_store,
+                    unit_ids=configured_units,
+                    clock=resolved_clock,
+                    slot_s=float(baseline.slot_s),
+                    horizon_s=float(baseline.horizon_s),
+                    weeks_back=int(baseline.weeks_back),
+                )
+            else:  # pragma: no cover - the config gate requires plant_history
+                registry_notes.append(
+                    "load_baseline: no history store composed; the baseline is absent"
+                )
+        declared_tariff = providers_config.tariff
+        if declared_tariff is not None:
+            registry_tariff = StaticTariffProvider(
+                clock=resolved_clock,
+                timezone_name=config.site.timezone,
+                currency=str(declared_tariff.currency),
+                default_import_cents_per_kwh=float(declared_tariff.default_import_cents_per_kwh),
+                default_export_cents_per_kwh=float(declared_tariff.default_export_cents_per_kwh),
+                windows=tuple(
+                    TariffRateWindow(
+                        window_local=(
+                            str(window.window_local[0]),
+                            str(window.window_local[1]),
+                        ),
+                        import_cents_per_kwh=float(window.import_cents_per_kwh),
+                        export_cents_per_kwh=float(window.export_cents_per_kwh),
+                    )
+                    for window in declared_tariff.windows
+                ),
+                horizon_s=float(declared_tariff.horizon_s),
+            )
+        forecast_registry = ForecastProviderRegistry(
+            weather=registry_weather,
+            pv=registry_pv,
+            load=registry_load,
+            tariff=registry_tariff,
+            notes=tuple(registry_notes),
+        )
     facade = _ComposedFacade(
         site_id=config.site.site_id,
         clock=resolved_clock,
@@ -3664,6 +3799,7 @@ def _build_runtime(
         historian=historian,
         history_repository=history_store,
         history_surface=history_surface,
+        forecast_providers=forecast_registry,
     )
 
 

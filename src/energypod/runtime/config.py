@@ -620,6 +620,158 @@ class PlantHistoryConfig(_FrozenModel):
     retention_rollup_days: Annotated[StrictInt, Field(ge=0, le=36500)] = 0
 
 
+class OpenMeteoPvConfig(_FrozenModel):
+    """The plane declaration the Open-Meteo PV derivation needs.
+
+    ``capacity_kw`` is the installed kWp and ``derate`` the plane-to-AC loss
+    factor the operator folds temperature, soiling, and inverter losses into.
+    ``azimuth_deg`` uses Open-Meteo's docs-page convention (0 = south, -90 =
+    east, +90 = west, +-180 = north) -- live-verified, and deliberately NOT
+    the OpenAPI YAML's wrong "North=0" wording.
+    """
+
+    tilt_deg: Annotated[StrictFloat, Field(ge=0, le=90)]
+    azimuth_deg: Annotated[StrictFloat, Field(ge=-180, le=180)]
+    capacity_kw: PositiveFiniteFloat
+    derate: Annotated[StrictFloat, Field(gt=0, le=1)] = 0.9
+
+
+class OpenMeteoProviderConfig(_FrozenModel):
+    """The keyless Open-Meteo site location (weather always, PV iff ``pv``)."""
+
+    latitude: Annotated[StrictFloat, Field(ge=-90, le=90)]
+    longitude: Annotated[StrictFloat, Field(ge=-180, le=180)]
+    forecast_days: Annotated[StrictInt, Field(ge=1, le=16)] = 2
+    pv: OpenMeteoPvConfig | None = None
+
+
+class SolcastProviderConfig(_FrozenModel):
+    """The keyed Solcast site declaration.
+
+    The API key is a REFERENCE, never material: ``api_key_env`` names the
+    environment variable the composition root resolves at boot (the
+    architecture's "provider credentials by secret reference").  ``period``
+    is Solcast's documented averaging enum.
+    """
+
+    api_key_env: NonEmpty
+    latitude: Annotated[StrictFloat, Field(ge=-90, le=90)]
+    longitude: Annotated[StrictFloat, Field(ge=-180, le=180)]
+    capacity_kw: PositiveFiniteFloat
+    hours: Annotated[StrictInt, Field(ge=1, le=336)] = 48
+    period: Literal["PT5M", "PT10M", "PT15M", "PT20M", "PT30M", "PT60M"] = "PT30M"
+
+    @field_validator("api_key_env")
+    @classmethod
+    def validate_api_key_env(cls, value: str) -> str:
+        return _plain(
+            value,
+            label="api_key_env",
+        )
+
+
+class LoadBaselineConfig(_FrozenModel):
+    """The historian-statistics baseline's slot grid and look-back."""
+
+    slot_s: Annotated[StrictFloat, Field(gt=0, le=86400)] = 1800.0
+    horizon_s: Annotated[StrictFloat, Field(gt=0, le=14 * 86400)] = 43200.0
+    weeks_back: Annotated[StrictInt, Field(ge=1, le=8)] = 1
+
+
+class TariffWindowConfig(_FrozenModel):
+    """One declared day-local tariff rate window (midnight-crossing allowed)."""
+
+    window_local: tuple[NonEmpty, NonEmpty]
+    import_cents_per_kwh: NonNegativeFiniteFloat
+    export_cents_per_kwh: NonNegativeFiniteFloat
+
+    @field_validator("window_local")
+    @classmethod
+    def validate_window(cls, values: tuple[str, str]) -> tuple[str, str]:
+        start = _valid_policy_wall(values[0])
+        end = _valid_policy_wall(values[1])
+        if start == end:
+            raise ValueError("window_local pairs must not be zero-length")
+        return (start, end)
+
+
+class StaticTariffConfig(_FrozenModel):
+    """The operator's declared schedule: windows over a flat default.
+
+    ``market``/``quality`` metadata are the provider's own honesty (every
+    interval says ``static-config``/``static``); here only the numbers and
+    the day-local windows are the operator's.
+    """
+
+    currency: NonEmpty
+    default_import_cents_per_kwh: NonNegativeFiniteFloat
+    default_export_cents_per_kwh: NonNegativeFiniteFloat
+    windows: tuple[TariffWindowConfig, ...] = ()
+    horizon_s: Annotated[StrictFloat, Field(gt=0, le=31 * 86400)] = 172800.0
+
+    @field_validator("currency")
+    @classmethod
+    def validate_currency(cls, value: str) -> str:
+        value = _plain(value.upper(), label="currency")
+        if len(value) != 3 or not value.isalpha():
+            raise ValueError("currency must be a 3-letter ISO 4217 code")
+        return value
+
+
+class ForecastProvidersConfig(_FrozenModel):
+    """The advisory forecast-provider stack (ARCHITECTURE sections 17 and 19).
+
+    Block-presence doctrine: a PRESENT block DECLARES the stack; an ABSENT
+    block composes nothing.  ``enabled`` defaults to ``false`` and gates
+    composition only -- the staged posture for a family whose wire sources
+    need operator decisions (the Solcast key, the PV plane numbers, the
+    tariff rates); runtime state never persists, boot recomposes from this
+    file.  The shared wire budget: ``request_timeout_s`` bounds one leg,
+    ``refresh_interval_s`` is the minimum spacing between legs (the
+    rate-limit budget -- Solcast hobbyist keys allow 10 requests per UTC
+    day), and ``stale_after_s`` is when the staleness report calls the data
+    stale; staleness may not hit before the first allowed reread.
+
+    Providers are ADVISORY-ONLY: nothing in the control path reads them, and
+    no provider failure may affect anything but its own data's availability.
+    """
+
+    enabled: StrictBool = False
+    request_timeout_s: PositiveFiniteFloat = 10.0
+    refresh_interval_s: PositiveFiniteFloat = 900.0
+    stale_after_s: PositiveFiniteFloat = 3600.0
+    open_meteo: OpenMeteoProviderConfig | None = None
+    solcast: SolcastProviderConfig | None = None
+    load_baseline: LoadBaselineConfig | None = None
+    tariff: StaticTariffConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_provider_relations(self) -> Self:
+        if self.stale_after_s < self.refresh_interval_s:
+            raise ValueError(
+                "forecast_providers.stale_after_s must be at least refresh_interval_s "
+                "(data turns stale no earlier than the first allowed reread)"
+            )
+        if (
+            self.open_meteo is not None
+            and self.open_meteo.pv is not None
+            and (self.solcast is not None)
+        ):
+            raise ValueError(
+                "forecast_providers: open_meteo.pv and solcast are two PV truths for "
+                "one site -- declare exactly one PV source"
+            )
+        if self.enabled and not any(
+            (self.open_meteo, self.solcast, self.load_baseline, self.tariff)
+        ):
+            raise ValueError(
+                "forecast_providers.enabled requires at least one provider family: "
+                "an enabled block that composes nothing is the invisible-off class "
+                "this project refuses"
+            )
+        return self
+
+
 class ControllerConfig(_FrozenModel):
     schema_version: Annotated[StrictInt, Field(ge=1)]
     revision: Annotated[StrictInt, Field(ge=1)]
@@ -651,6 +803,10 @@ class ControllerConfig(_FrozenModel):
     # beside its siblings so its commissioning validator sees the
     # already-validated timing and storage blocks.
     plant_history: PlantHistoryConfig | None = None
+    # The advisory forecast-provider stack (ARCHITECTURE section 17),
+    # declared last beside its siblings so its cross-block validator sees
+    # the already-validated plant_history block the load baseline reads.
+    forecast_providers: ForecastProvidersConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -1012,6 +1168,29 @@ class ControllerConfig(_FrozenModel):
                 "govern anything"
             )
         return plant_history
+
+    @field_validator("forecast_providers")
+    @classmethod
+    def validate_forecast_providers(
+        cls, providers: ForecastProvidersConfig | None, info: ValidationInfo
+    ) -> ForecastProvidersConfig | None:
+        """The forecast stack's one cross-block gate.
+
+        The load baseline READS the telemetry historian, so declaring it
+        without the ``plant_history`` block would compose a provider over a
+        historian that never samples -- a baseline silently empty forever.
+        The gate binds to block-PRESENCE (not ``enabled``), so the refusal
+        surfaces at validation time however the stack is staged.
+        """
+        if providers is None or providers.load_baseline is None:
+            return providers
+        if info.data.get("plant_history") is None:
+            raise ValueError(
+                "forecast_providers.load_baseline requires the plant_history block: "
+                "the baseline is the same slot last week read from the historian, and "
+                "without the historian it would be silently empty forever"
+            )
+        return providers
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:
