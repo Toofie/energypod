@@ -763,3 +763,38 @@ async def test_aclose_detaches_so_later_publishes_reach_no_closed_queue(
     assert [event["sequence"] for event in events] == [1, 2, 3]
     await close_subscription(live)
     assert retained() is None
+
+
+@pytest.mark.parametrize(
+    "body, error",
+    [
+        ({"type": "observation.updated", 1: "x"}, TypeError),
+        ({"type": "observation.updated", "payload": [1, 2]}, TypeError),
+        ({"type": "observation.updated", "payload": "text"}, TypeError),
+    ],
+)
+async def test_non_json_object_shapes_are_rejected_at_publish(
+    bus_module: Any, body: dict[str, Any], error: type[Exception]
+) -> None:
+    # Deferred P2 (implementation review 2026-08-22): non-string keys were
+    # silently stringified by json.dumps (in-memory and wire shapes diverging)
+    # and non-mapping payloads were accepted against the documented payload
+    # object contract.
+    bus = make_bus(bus_module)
+    with pytest.raises(error):
+        await bus.publish(body)
+    assert bus.snapshot_sequence() == 0
+
+
+async def test_mapping_proxy_payload_is_served_as_a_plain_wire_dict(
+    bus_module: Any,
+) -> None:
+    from types import MappingProxyType
+
+    bus = make_bus(bus_module, retention=8, queue_capacity=8)
+    iterator = bus.subscribe(after_sequence=0)
+    await bus.publish({"type": "observation.updated", "payload": MappingProxyType({"watts": 900})})
+    event = await next_event(iterator)
+    assert event is not _EXHAUSTED
+    assert type(event["payload"]) is dict and event["payload"] == {"watts": 900}
+    await close_subscription(iterator)

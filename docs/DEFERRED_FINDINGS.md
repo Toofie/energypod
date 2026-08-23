@@ -91,6 +91,10 @@ From the 32-agent Milestone A implementation review (all P0/P1 were fixed in
    reclaimed at the next publish, while aclose() still detaches eagerly.
 4. EventBus: envelope accepts non-string keys / non-mapping payloads; in-memory
    vs wire shape can diverge.
+   Status: FIXED 2026-08-23 — non-string body keys and non-mapping payloads
+   are rejected at publish (TypeError, no sequence consumed); any Mapping
+   payload is canonicalized to a plain dict so the retained envelope is
+   exactly the wire shape.
 5. EventBus: `resync_required` control type shares the publisher vocabulary; a
    publisher event of that type closes every client stream.
 6. Simulator: blanket GOOD quality lets a malformed-injected limit word report

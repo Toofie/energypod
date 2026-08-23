@@ -46,8 +46,19 @@ def _build_envelope(body: Mapping[str, Any], *, sequence: int, occurred_at: str)
     event_type = body.get("type")
     if not isinstance(event_type, str) or not event_type:
         raise ValueError("a published event body requires a non-empty string type")
+    if any(not isinstance(key, str) for key in body):
+        # json.dumps would silently stringify non-string keys, leaving the
+        # in-memory envelope and the wire shape naming different fields.
+        raise TypeError("published event body keys must be strings")
+    if "payload" in body and not isinstance(body["payload"], Mapping):
+        # The consumption contract publishes payload objects; a scalar or
+        # array payload is a shape mistake, not a vocabulary choice.
+        raise TypeError("a published event payload must be a mapping")
     envelope = {key: value for key, value in body.items() if key not in _SERVER_ASSIGNED_KEYS}
-    envelope.setdefault("payload", {})
+    # Canonicalize the payload out of any Mapping (a MappingProxyType or the
+    # domain's frozen mappings are contract-legal payloads but not JSON
+    # natively); nested exotic mappings still fail closed below.
+    envelope["payload"] = dict(envelope.get("payload", {}))
     envelope["sequence"] = sequence
     envelope["occurred_at"] = occurred_at
     # Fail closed at the publisher AND detach from caller-owned objects: the
