@@ -52,6 +52,7 @@ _CELL_VOLTAGE_BASE = 0x5200
 _CELL_TEMPERATURE_BASE = 0x523C
 _RTU_ID_BASE = 0x8106
 _DEVICE_PARAMETERS_BASE = 0x8102
+_DEBUG_MODE_BLOCK_BASE = 0x8100
 
 # PCS live block advisory offsets, PROTOCOL_EVIDENCE 4c (SysControl.cs:500
 # and :503): the per-pod CT external-grid power at +17 and the load power at
@@ -76,6 +77,18 @@ _BMS_DISCHARGE_LIMIT_OFFSET = 14
 # RTU-ID mirror sits at offsets 4-5, low word first.
 _SYSTEM_SOC_OFFSET = 17
 _RTU_ID_MIRROR_OFFSET = 4
+
+# Advisory device-mode words (2026-08-23 incident 1, field-mapping S2.13/
+# S2.14/S2): the system overview carries ctrlMode at +1 (enum 1 Remote /
+# 2 Local, GlobalFun.cs:204-211) and workMode at +2 (kept RAW: MID's
+# captured 7 is deliberately unmapped, field-mapping A-17); the PCS live
+# block carries runMode at +2 (enum 0 Matching Load / 1 Remote PQ Power,
+# GlobalFun.cs:178-188); the debug-mode readback 0x8100+0 is the vendor
+# PQ-dispatch precondition (MiniESapp.cs:2180-2184 refuses when nonzero).
+# They decode as raw advisory words, never as quality-map keys.
+_CTRL_MODE_OFFSET = 1
+_WORK_MODE_OFFSET = 2
+_PCS_RUN_MODE_OFFSET = 2
 
 # Topology formulae, field-mapping S1/S4 (SysControl.cs:839-844, 869-890).
 _CELLS_PER_BIC = 10
@@ -297,6 +310,14 @@ def decode_observation(
     grid_power_w, grid_power_quality = _measurement(pcs_live, _PCS_GRID_POWER_OFFSET, _WATT_SCALE)
     load_power_w, load_power_quality = _measurement(pcs_live, _PCS_LOAD_POWER_OFFSET, _WATT_SCALE)
 
+    # Advisory device-mode words: raw registers, present only when their block
+    # was served.  They carry the vendor's dispatch preconditions but never
+    # enter the quality map or the safety-critical completeness set.
+    debug_mode_w = _served_word(blocks.get(_DEBUG_MODE_BLOCK_BASE), 0)
+    ctrl_mode_w = _served_word(system, _CTRL_MODE_OFFSET)
+    work_mode_w = _served_word(system, _WORK_MODE_OFFSET)
+    run_mode_w = _served_word(pcs_live, _PCS_RUN_MODE_OFFSET)
+
     quality: dict[str, DataQuality] = {
         "system_soc_pct": system_soc_quality,
         "bms_soc_pct": bms_soc_quality,
@@ -351,6 +372,10 @@ def decode_observation(
         temperatures_c=temperatures_c,
         grid_power_w=grid_power_w,
         load_power_w=load_power_w,
+        debug_mode_w=debug_mode_w,
+        ctrl_mode_w=ctrl_mode_w,
+        work_mode_w=work_mode_w,
+        run_mode_w=run_mode_w,
         active_faults=fault_codes,
         active_warnings=warning_codes,
         quality=quality,

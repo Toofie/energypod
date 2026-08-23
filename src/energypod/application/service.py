@@ -71,6 +71,10 @@ _TELEMETRY_SUMMARY_FIELDS: Final[tuple[str, ...]] = (
     "active_warnings",
     "grid_power_w",
     "load_power_w",
+    "debug_mode_w",
+    "ctrl_mode_w",
+    "work_mode_w",
+    "run_mode_w",
 )
 
 # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the advisory
@@ -368,6 +372,14 @@ def _telemetry_summary(observation: Any) -> dict[str, Any] | None:
         # not serve the PCS live block, never zero-filled or fabricated.
         "grid_power_w": _optional_float(getattr(observation, "grid_power_w", None)),
         "load_power_w": _optional_float(getattr(observation, "load_power_w", None)),
+        # Advisory device-mode words (2026-08-23 incident 1), same doctrine:
+        # the raw registers read through, null when the poll served no such
+        # block.  They are evidence for the console and the dispatch gate,
+        # never a quality judgment.
+        "debug_mode_w": _optional_int(getattr(observation, "debug_mode_w", None)),
+        "ctrl_mode_w": _optional_int(getattr(observation, "ctrl_mode_w", None)),
+        "work_mode_w": _optional_int(getattr(observation, "work_mode_w", None)),
+        "run_mode_w": _optional_int(getattr(observation, "run_mode_w", None)),
     }
 
 
@@ -591,6 +603,7 @@ class EnergyServiceFacade:
         unknown = [unit_id for unit_id in units if unit_id not in self._actors]
         if unknown:
             raise ValueError(f"unknown units requested: {unknown}")
+        await self._refuse_undispatchable_modes(units)
         resolved_direction = _dispatch_direction(direction)
         resolved_watts = _positive_watts(watts)
         duration_s = _positive_duration(ttl_s)
@@ -696,6 +709,7 @@ class EnergyServiceFacade:
         unknown = [unit_id for unit_id in units if unit_id not in self._actors]
         if unknown:
             raise ValueError(f"unknown units requested: {unknown}")
+        await self._refuse_undispatchable_modes(units)
         resolved_direction = _dispatch_direction(direction)
         resolved_watts = _positive_watts(watts)
         duration_s = _positive_duration(ttl_s)
@@ -1194,6 +1208,42 @@ class EnergyServiceFacade:
         }
 
     # --- internal helpers ---------------------------------------------------
+
+    async def _refuse_undispatchable_modes(self, units: Sequence[str]) -> None:
+        """Refuse dispatch onto units whose mode words say it would be ignored.
+
+        Vendor precedent (MiniESapp.cs:2180-2184, 2026-08-23 incident 1): the
+        pod ignores external PQ objectives while its debug-mode readback is
+        nonzero, and only accepts them under Remote control (ctrlMode 1,
+        GlobalFun.cs:204-211).  Decoded positive evidence refuses the intent
+        with the explicit reason before anything is stored; ABSENT evidence
+        (a read plan without the mode blocks, or a unit yet to publish)
+        changes nothing -- the advisory doctrine, and the safety kernel's own
+        staleness gates remain the backstop.
+        """
+        debugging: list[str] = []
+        local: list[str] = []
+        for unit_id in units:
+            observation = await self._latest_observation(unit_id)
+            if getattr(observation, "debug_mode_active", None) is True:
+                debugging.append(unit_id)
+            elif getattr(observation, "ctrl_mode_remote", None) is False:
+                local.append(unit_id)
+        if debugging:
+            raise ValueError(f"device_debug_mode_active: {sorted(debugging)}")
+        if local:
+            raise ValueError(f"device_mode_not_remote: {sorted(local)}")
+
+    async def _latest_observation(self, unit_id: str) -> Any | None:
+        """The unit's latest observation, or ``None`` when it cannot be read.
+
+        An unreadable observation never grants: the kernel's own evidence
+        gates refuse the mint, so absence is not evidence here either.
+        """
+        try:
+            return await self._observations.latest(unit_id)
+        except Exception:
+            return None
 
     def _admit(self, principal: Principal, scope: str, *, interactive: bool = False) -> None:
         """Reject malformed and cross-site principals before any port is touched."""

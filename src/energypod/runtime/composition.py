@@ -169,6 +169,12 @@ _BMS_FAULT_BLOCK_BASE = 0x5040
 _CELL_VOLTAGE_BASE = 0x5200
 _CELL_TEMPERATURE_BASE = 0x523C
 _IDENTITY_BLOCK_BASE = 0x8106
+# The one-word debug-mode readback (field-mapping S2.14): the vendor's
+# PQ-dispatch precondition (MiniESapp.cs:2180 refuses when nonzero).  It rides
+# the core like the identity pair so the dispatch gate (2026-08-23 incident 1)
+# judges the precondition at the control rate, never a cold-ring refresh old
+# enough to have missed a mode flip.
+_DEBUG_MODE_BLOCK_BASE = 0x8100
 
 _RUNTIME_PRINCIPAL = "energypod:runtime"
 _COMPOSITION_POLICY_VERSION = "composition"
@@ -1199,6 +1205,11 @@ class _LiveDecodeTelemetry:
             # or re-addressed unit must latch on the very next poll, not on a
             # slow ring refresh.
             _IDENTITY_BLOCK_BASE,
+            # The one-word debug-mode readback rides the core for the same
+            # reason: the vendor's dispatch precondition must be judged at
+            # the control rate (2026-08-23 incident 1), and the steady-state
+            # plan stays inside the commissioned window budget (7 + probe).
+            _DEBUG_MODE_BLOCK_BASE,
         }
         if self._promote_pcs_live_block:
             core_bases.add(_PCS_LIVE_BLOCK_BASE)

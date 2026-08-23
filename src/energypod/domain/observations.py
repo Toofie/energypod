@@ -99,6 +99,17 @@ class Observation(BaseModel):
     # serve the PCS live block; never zero-filled.
     grid_power_w: float | None = None
     load_power_w: float | None = None
+    # Advisory device-mode words (2026-08-23 incident 1, field-mapping
+    # S2.13/S2.14/S2): the debug-mode readback 0x8100+0, the system
+    # overview's ctrlMode 0x0100+1 and workMode +2, and the PCS live runMode
+    # 0x1000+2.  They carry the vendor's dispatch preconditions but stay
+    # OUTSIDE the quality map exactly like the CT words: a read plan without
+    # their blocks keeps fully qualified observations, and absent evidence
+    # (``None``) never refuses anything.
+    debug_mode_w: int | None = None
+    ctrl_mode_w: int | None = None
+    work_mode_w: int | None = None
+    run_mode_w: int | None = None
     expected_cell_count: int | None = None
     cell_voltages_v: tuple[float, ...]
     cell_captured_at_mono: float | None = None
@@ -185,6 +196,13 @@ class Observation(BaseModel):
             raise ValueError("limit must be finite and non-negative")
         return value
 
+    @field_validator("debug_mode_w", "ctrl_mode_w", "work_mode_w", "run_mode_w")
+    @classmethod
+    def _mode_word(cls, value: int | None) -> int | None:
+        if value is not None and (type(value) is not int or not 0 <= value <= 0xFFFF):
+            raise ValueError("a mode word must be an unsigned 16-bit register value")
+        return value
+
     @field_validator("cell_voltages_v", "temperatures_c")
     @classmethod
     def _finite_tuple(cls, value: tuple[float, ...]) -> tuple[float, ...]:
@@ -267,6 +285,25 @@ class Observation(BaseModel):
             and len(self.temperatures_c) == self.expected_temperature_count
             and self.quality["temperatures_c"] is DataQuality.GOOD
         )
+
+    @property
+    def debug_mode_active(self) -> bool | None:
+        """The vendor's PQ-dispatch precondition, MiniESapp.cs:2180-2184.
+
+        ``True`` when the debug-mode readback is nonzero (the vendor app
+        refuses sends); ``False`` when it reads zero (Normal Mode); ``None``
+        when the poll served no debug-mode word -- absent evidence is never
+        a refusal.
+        """
+        return None if self.debug_mode_w is None else self.debug_mode_w != 0
+
+    @property
+    def ctrl_mode_remote(self) -> bool | None:
+        """ctrlMode enum 1 Remote / 2 Local (GlobalFun.cs:204-211).
+
+        ``None`` when the poll served no system-overview block.
+        """
+        return None if self.ctrl_mode_w is None else self.ctrl_mode_w == 1
 
     @property
     def safety_data_complete(self) -> bool:

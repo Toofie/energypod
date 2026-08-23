@@ -465,6 +465,25 @@ eligible_charge_w = min(max_charge_from_export_w,
 - The facade snapshot telemetry summary and the unit-detail projection expose both fields
   readthrough-style: nullable, never zero-filled, never fabricated.
 
+## Device-mode telemetry and dispatch gating
+
+- `Observation` gains four more ADVISORY words (2026-08-23 incident 1), same doctrine as the CT
+  fields but with NO quality-map keys: `debug_mode_w` (readback `0x8100+0`; the vendor's PQ-dispatch
+  precondition — MiniESapp.cs:2180 refuses sends when nonzero), `ctrl_mode_w` (`0x0100+1`; enum 1
+  Remote / 2 Local, GlobalFun.cs:204), `work_mode_w` (`0x0100+2`, kept raw — MID's captured 7 is
+  deliberately unmapped, field-mapping A-17), and `run_mode_w` (PCS live `0x1000+2`; enum 0
+  Matching Load / 1 Remote PQ Power). Each is `None` when its block was not served; the convenience
+  reads `debug_mode_active` and `ctrl_mode_remote` are `None` on absent evidence.
+- The snapshot telemetry summary and unit-detail projection expose all four readthrough-style. In
+  run mode the one-word debug readback rides the control-rate core (like the identity pair) so a
+  mode flip is judged on the next poll; the system block still rides its existing tiers.
+- Dispatch gating: `submit_intent` and the advisory twin refuse with
+  `device_debug_mode_active: [units]` while any selected unit's decoded debug word is nonzero, and
+  with `device_mode_not_remote: [units]` while its ctrlMode is not Remote (2 = Local). Absent
+  evidence — a read plan without the mode blocks, or a unit yet to publish — refuses nothing: the
+  advisory doctrine, with the safety kernel's staleness gates as the backstop. The controller never
+  writes `0x8000`/`0x0101`; the mode words are read-only evidence.
+
 ### Read-plan tier promotion
 
 With the feature enabled, the live decode strategy promotes the PCS live block `0x1000` (grid at
