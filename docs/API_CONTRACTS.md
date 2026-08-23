@@ -294,6 +294,13 @@ coordinator, the event bus, and per-unit actor handles.
   `occurred_at`, and a minimal payload; additional non-secret metadata (for example a unique
   event id) is permitted. Observation, decision/audit, lifecycle, arming, intent-acceptance,
   and stop events are the initial vocabulary (`intent.accepted` for facade intent acceptance).
+- Intent-lifecycle and grant events (2026-08-23): `intent.expired` publishes exactly once per
+  intent whose acceptance window lapses (payload: `intent_id`, `source`, `direction`, `watts`,
+  `unit_ids`); an intent that leaves by removal — cancellation or stop acknowledgement — never
+  publishes an expiry. `authorization.granted` publishes when a batch lands in the authorization
+  store (payload: `cycle_id`, `generation`, `unit_ids`), symmetric with `authorization.revoked`.
+  `audit.appended` payloads additionally carry the event's `requested_active_w` and
+  `authorized_active_w` so consoles render watt figures straight off the stream.
 
 ## Runtime composition and entry point
 

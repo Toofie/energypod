@@ -410,6 +410,11 @@ class _InMemoryScheduleRepository:
 # ---------------------------------------------------------------------------
 
 
+def _payload_enum(raw: Any) -> Any:
+    """JSON-native spelling of a domain enum for a bus payload."""
+    return getattr(raw, "value", raw)
+
+
 class _AsyncIntentRepository:
     """Awaitable intent port over the process-local intent store.
 
@@ -419,19 +424,65 @@ class _AsyncIntentRepository:
     exactly as if the stop were still live.  The runtime principal carries the
     stop-acknowledge scope here only after the facade has already admitted the
     human operator with that scope; this bridge is wiring, not authority.
+
+    The port is also where intent TTL lapses become observable (2026-08-23
+    observability root cause): the kernel's no-winner revoke publishes bus
+    events only while a unit still holds a capability, which is never true at
+    expiry, so an intent silently vanished from the console.  Every ``active``
+    read compares the store's answer against the intents this port tracked and
+    announces each newly lapsed intent exactly once as ``intent.expired`` --
+    the read the kernel itself performs each tick, so the expiry the fleet
+    actually acted on is the one the bus carries.  An intent that leaves by
+    removal (cancel, stop acknowledgement) never announces an expiry.
     """
 
-    def __init__(self, store: InMemoryIntentRepository, *, arbiter: IntentArbiter) -> None:
+    def __init__(
+        self, store: InMemoryIntentRepository, *, arbiter: IntentArbiter, bus: EventBus
+    ) -> None:
         self._store = store
         self._arbiter = arbiter
+        self._bus = bus
+        self._tracked: dict[str, Any] = {}
 
     async def add(self, intent: Any) -> None:
         self._store.add(intent)
+        intent_id = getattr(intent, "id", None)
+        if isinstance(intent_id, str):
+            self._tracked[intent_id] = intent
 
     async def active(self, now_mono: float) -> tuple[Any, ...]:
-        return self._store.active(now_mono)
+        active = self._store.active(now_mono)
+        active_ids = {getattr(intent, "id", None) for intent in active}
+        lapsed = [
+            (intent_id, intent)
+            for intent_id, intent in self._tracked.items()
+            if intent_id not in active_ids
+        ]
+        for intent_id, _intent in lapsed:
+            del self._tracked[intent_id]
+        for _intent_id, intent in lapsed:
+            # Observability must never gate control: the kernel's tick reads
+            # through this method, so a failed announcement is suppressed
+            # rather than allowed to fail the cycle.
+            with contextlib.suppress(Exception):
+                await self._bus.publish(
+                    {
+                        "type": "intent.expired",
+                        "payload": {
+                            "intent_id": getattr(intent, "id", None),
+                            "source": _payload_enum(getattr(intent, "source", None)),
+                            "direction": _payload_enum(getattr(intent, "direction", None)),
+                            "watts": getattr(intent, "watts", None),
+                            "unit_ids": sorted(getattr(intent, "selected_unit_ids", ()) or ()),
+                        },
+                    }
+                )
+        return active
 
     async def remove(self, intent_id: str) -> None:
+        # A removal is deliberate: untrack first so it can never be announced
+        # as a TTL lapse by a concurrent or later ``active`` read.
+        self._tracked.pop(intent_id, None)
         try:
             self._arbiter.acknowledge_emergency_stop(
                 intent_id=intent_id,
@@ -524,6 +575,11 @@ class _AsyncAuditRepository:
                     "generation": getattr(event, "generation", None),
                     "result": getattr(event, "result", None),
                     "reason_codes": list(getattr(event, "reason_codes", ()) or ()),
+                    # Watt figures render straight off the stream (2026-08-23):
+                    # the console must not re-fetch audit pages to label a
+                    # request card's requested/authorized power.
+                    "requested_active_w": getattr(event, "requested_active_w", None),
+                    "authorized_active_w": getattr(event, "authorized_active_w", None),
                 },
             }
         )
@@ -573,6 +629,26 @@ class _AsyncAuthorizationRepository:
 
     async def publish(self, batch: Any) -> None:
         self._store.publish(batch)
+        # Symmetry with ``authorization.revoked`` (2026-08-23): a batch that
+        # lands in the store is announced as ``authorization.granted`` with
+        # the cycle, generation, and units it carries authority for -- grants
+        # were store-only, so the console never saw authority arrive.  The
+        # store hold precedes the announcement and a failed announcement is
+        # suppressed: observability never gates the grant.
+        with contextlib.suppress(Exception):
+            await self._bus.publish(
+                {
+                    "type": "authorization.granted",
+                    "payload": {
+                        "cycle_id": getattr(batch, "cycle_id", None),
+                        "generation": getattr(batch, "generation", None),
+                        "unit_ids": sorted(
+                            getattr(item, "unit_id", None)
+                            for item in getattr(batch, "authorizations", ())
+                        ),
+                    },
+                }
+            )
 
     async def current(self, unit_id: str, now_monotonic: float) -> Any | None:
         return self._store.current(unit_id, now_monotonic)
@@ -2009,7 +2085,7 @@ def _build_runtime(
     # --- async ports over the exposed stores ------------------------------
     audit_port = _AsyncAuditRepository(audit_store, bus=bus)
     observation_port = _AsyncObservationRepository(store=observation_store, bus=bus)
-    intent_port = _AsyncIntentRepository(intent_store, arbiter=arbiter)
+    intent_port = _AsyncIntentRepository(intent_store, arbiter=arbiter, bus=bus)
     authorization_port = _AsyncAuthorizationRepository(
         authorization_store,
         fleet_unit_ids=unit_ids,
