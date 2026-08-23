@@ -469,6 +469,35 @@ class RecordingCoordinator:
         return moved
 
 
+class FakeRecoveryView:
+    """Inline stand-in for the recovery monitor's read projection (R4).
+
+    Serves fixed ``UnitHealthView``-shaped records so the facade's snapshot
+    and health projections can be pinned without composing the monitor.
+    """
+
+    def __init__(
+        self, states: Mapping[str, Mapping[str, Any]] | None = None, *, failing: bool = False
+    ) -> None:
+        self.states = {
+            unit_id: SimpleNamespace(
+                unit_id=unit_id,
+                state=spec.get("state"),
+                reasons=tuple(spec.get("reasons", ())),
+                remediation_hint=spec.get("remediation_hint"),
+            )
+            for unit_id, spec in (states or {}).items()
+        }
+        self.failing = failing
+        self.calls = 0
+
+    async def unit_health_states(self) -> dict[str, Any]:
+        self.calls += 1
+        if self.failing:
+            raise OSError("recovery view unavailable")
+        return dict(self.states)
+
+
 class FakeActorHandle:
     """Inline stand-in for the per-unit actor handle port the facade composes."""
 
@@ -606,6 +635,7 @@ class Rig:
     coordinator: RecordingCoordinator
     handles: dict[str, FakeActorHandle]
     history: list[str]
+    recovery: FakeRecoveryView | None = None
 
     def reset_recorders(self) -> None:
         self.intents.added.clear()
@@ -672,6 +702,7 @@ def make_rig(
     seeded_intents: tuple[Any, ...] = (),
     audit_events: tuple[Any, ...] = (),
     bus_sequence: int = 0,
+    recovery: FakeRecoveryView | None = None,
 ) -> Rig:
     clock = FakeClock()
     history: list[str] = []
@@ -708,6 +739,7 @@ def make_rig(
         events=bus,
         coordinator=coordinator,
         actors=handles,
+        recovery=recovery,
     )
     return Rig(
         api=api,
@@ -721,6 +753,7 @@ def make_rig(
         coordinator=coordinator,
         handles=handles,
         history=history,
+        recovery=recovery,
     )
 
 
@@ -1640,6 +1673,136 @@ async def test_health_reports_an_unresponsive_generation_coordinator(api: Any) -
     assert report["liveness"]["ok"] is True
     assert report["service_readiness"]["ready"] is False
     assert report["service_readiness"]["reasons"]
+
+
+# --- recovery health views (self-healing awareness layer, R4) --------------------
+
+
+async def test_snapshot_carries_the_derived_health_state_per_unit(api: Any) -> None:
+    """The recovery monitor's derived per-unit state rides the snapshot: a
+    quietly self-healing unit names its reason with no remediation, and a
+    not-responding wedge carries the R5 honest-terminal guidance."""
+    recovery = FakeRecoveryView(
+        {
+            "pod-a": {
+                "state": "self_healing",
+                "reasons": ["autonomous_self_charge"],
+                "remediation_hint": None,
+            },
+            "pod-b": {
+                "state": "not_responding",
+                "reasons": ["reads_timing_out"],
+                "remediation_hint": (
+                    "pod not responding — remote recovery exhausted; physical restart required"
+                ),
+            },
+        }
+    )
+    rig = make_rig(api, recovery=recovery)
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in snapshot["units"]}
+    assert units["pod-a"]["health_state"] == "self_healing"
+    assert units["pod-a"]["health_reasons"] == ["autonomous_self_charge"]
+    assert units["pod-a"]["remediation_hint"] is None
+    assert units["pod-b"]["health_state"] == "not_responding"
+    assert units["pod-b"]["health_reasons"] == ["reads_timing_out"]
+    assert units["pod-b"]["remediation_hint"] is not None
+    assert "physical restart" in units["pod-b"]["remediation_hint"]
+    # The projection is a read: no mutation, audit, or publication happened.
+    assert rig.audit.appended == []
+    assert rig.bus.published == []
+
+
+async def test_health_view_carries_per_unit_recovery_states(api: Any) -> None:
+    """/api/v1/health serves the same derived recovery view per unit, with the
+    remediation hint alongside -- the console renders it later, feature-
+    detected, straight off the health read."""
+    recovery = FakeRecoveryView(
+        {
+            "pod-a": {"state": "healthy", "reasons": [], "remediation_hint": None},
+            "pod-b": {
+                "state": "actuation_incoherent",
+                "reasons": ["authorized_not_actuating", "echo_matches_write"],
+                "remediation_hint": "pod not responding — physical restart required",
+            },
+        }
+    )
+    rig = make_rig(api, recovery=recovery)
+
+    report = await rig.facade.health(principal=OPERATOR)
+
+    units = {unit["unit_id"]: unit for unit in report["units"]}
+    assert set(units) == {"pod-a", "pod-b"}
+    assert units["pod-a"] == {
+        "unit_id": "pod-a",
+        "health_state": "healthy",
+        "reasons": [],
+        "remediation_hint": None,
+    }
+    assert units["pod-b"]["health_state"] == "actuation_incoherent"
+    assert units["pod-b"]["reasons"] == ["authorized_not_actuating", "echo_matches_write"]
+    assert units["pod-b"]["remediation_hint"] is not None
+
+
+async def test_control_readiness_names_an_actuation_incoherent_unit(api: Any) -> None:
+    """The watchdog's verdict is a control-readiness reason: a unit that is
+    armed and qualified but authorizing without actuating is not ready to
+    act, and the health view says which unit and why."""
+    recovery = FakeRecoveryView(
+        {
+            "pod-a": {
+                "state": "actuation_incoherent",
+                "reasons": ["authorized_not_actuating"],
+                "remediation_hint": None,
+            }
+        }
+    )
+    rig = make_rig(
+        api,
+        units={"pod-a": {"lifecycle": api.UnitLifecycle.ARMED_IDLE}, "pod-b": {}},
+        recovery=recovery,
+    )
+
+    report = await rig.facade.health(principal=OPERATOR)
+
+    assert "pod-a:actuation_incoherent" in report["control_readiness"]["reasons"]
+    assert report["control_readiness"]["ready"] is False
+
+
+async def test_recovery_fields_are_null_when_no_monitor_is_wired(api: Any) -> None:
+    """A facade driven without the recovery port (embedded tests, older rigs)
+    serves explicit nulls, never fabricated states."""
+    rig = make_rig(api)
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    report = await rig.facade.health(principal=OPERATOR)
+
+    for unit in snapshot["units"]:
+        assert unit["health_state"] is None
+        assert unit["health_reasons"] is None
+        assert unit["remediation_hint"] is None
+    assert {unit["unit_id"] for unit in report["units"]} == set(rig.handles)
+    for unit in report["units"]:
+        assert unit["health_state"] is None
+        assert unit["reasons"] is None
+        assert unit["remediation_hint"] is None
+
+
+async def test_a_failing_recovery_view_never_breaks_the_views(api: Any) -> None:
+    """Detection must never gate reads: an unavailable recovery projection
+    degrades to explicit nulls on both views instead of failing them."""
+    recovery = FakeRecoveryView({"pod-a": {"state": "healthy"}})
+    recovery.failing = True
+    rig = make_rig(api, recovery=recovery)
+
+    snapshot = await rig.facade.snapshot(principal=OPERATOR)
+    report = await rig.facade.health(principal=OPERATOR)
+
+    assert snapshot["units"][0]["health_state"] is None
+    assert report["units"][0]["health_state"] is None
+    assert report["service_readiness"]["ready"] is True
 
 
 # --- recent_audit -----------------------------------------------------------

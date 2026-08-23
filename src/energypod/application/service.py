@@ -158,6 +158,19 @@ class GenerationCoordinator(Protocol):
     async def advance(self, *, reason: str) -> Any: ...
 
 
+class RecoveryView(Protocol):
+    """The recovery monitor's derived per-unit health projection (R4).
+
+    ``energypod.application.recovery.RecoveryMonitor`` is the composed
+    implementation; the facade only ever PROJECTS from it (the monitor owns
+    the classification, the transitions, and the ``unit.health_changed``
+    publications).  An unavailable projection degrades to explicit nulls --
+    detection must never gate a read.
+    """
+
+    async def unit_health_states(self) -> Mapping[str, Any]: ...
+
+
 class ActorHandle(Protocol):
     """Per-unit control handle owned by the actor (or its composition wrapper).
 
@@ -460,6 +473,29 @@ def _telemetry_summary(observation: Any) -> dict[str, Any] | None:
     }
 
 
+def _health_projection(
+    states: Mapping[str, Any] | None, unit_id: str, *, summary_field: str
+) -> dict[str, Any]:
+    """Project one unit's derived recovery view; nulls when it is absent.
+
+    ``summary_field`` names the reasons key on the target view (``health_
+    reasons`` beside the snapshot's other per-unit fields, ``reasons`` inside
+    the health view's recovery-only unit block).  An absent or unusable
+    projection is explicit nulls, never a fabricated state.
+    """
+    view = states.get(unit_id) if states is not None else None
+    if view is None:
+        return {"health_state": None, summary_field: None, "remediation_hint": None}
+    state = getattr(view, "state", None)
+    reasons = getattr(view, "reasons", None)
+    hint = getattr(view, "remediation_hint", None)
+    return {
+        "health_state": None if state is None else _enum_value(state),
+        summary_field: (None if reasons is None else [str(reason) for reason in reasons]),
+        "remediation_hint": hint if isinstance(hint, str) else None,
+    }
+
+
 def _unit_projection(unit_id: str, observation: Any) -> dict[str, Any]:
     """Full single-unit projection served by ``unit_detail``.
 
@@ -510,6 +546,7 @@ class EnergyServiceFacade:
         events: EventPublisher,
         coordinator: GenerationCoordinator,
         actors: Mapping[str, ActorHandle],
+        recovery: RecoveryView | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -528,6 +565,7 @@ class EnergyServiceFacade:
         self._events = events
         self._coordinator = coordinator
         self._actors = handles
+        self._recovery = recovery
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._latched_stops: dict[str, _LatchedStop] = {}
@@ -544,10 +582,13 @@ class EnergyServiceFacade:
         sequence = self._events.snapshot_sequence()
         latest = await self._observations.all_latest()
         active = await self._intents.active(now_mono)
+        recovery_states = await self._recovery_states()
         units: list[dict[str, Any]] = []
         for unit_id, handle in self._actors.items():
             telemetry = latest.get(unit_id) if isinstance(latest, Mapping) else None
-            units.append(await self._unit_view(unit_id, handle, telemetry, active, now_mono))
+            units.append(
+                await self._unit_view(unit_id, handle, telemetry, active, now_mono, recovery_states)
+            )
         return {
             "site_id": self._site_id,
             "snapshot_sequence": sequence,
@@ -619,7 +660,8 @@ class EnergyServiceFacade:
             "authority_coordinator_unavailable",
             lambda: self._coordinator.snapshot(),
         )
-        control_reasons = self._control_readiness_reasons()
+        recovery_states = await self._recovery_states()
+        control_reasons = await self._control_readiness_reasons(recovery_states)
         return {
             "liveness": {
                 "ok": True,
@@ -632,6 +674,16 @@ class EnergyServiceFacade:
             },
             "service_readiness": {"ready": not service_reasons, "reasons": service_reasons},
             "control_readiness": {"ready": not control_reasons, "reasons": control_reasons},
+            # The self-healing awareness layer's derived per-unit recovery
+            # view (R4): informational by design, with the R5 honest-terminal
+            # remediation hint riding next to the state it belongs to.
+            "units": [
+                {
+                    "unit_id": unit_id,
+                    **_health_projection(recovery_states, unit_id, summary_field="reasons"),
+                }
+                for unit_id in self._actors
+            ],
         }
 
     async def recent_audit(
@@ -1450,6 +1502,7 @@ class EnergyServiceFacade:
         telemetry: Any,
         active_intents: Sequence[Any],
         now_mono: float,
+        recovery_states: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         age_s: float | None = None
         measured_watts: float | None = None
@@ -1481,6 +1534,10 @@ class EnergyServiceFacade:
             "inhibit_cause": _enum_value(inhibit_cause)
             if inhibit_latched and inhibit_cause is not None
             else None,
+            # Self-healing awareness (R4): the derived recovery state, its
+            # reasons, and -- only where a wedge is proven -- the honest
+            # terminal remediation hint.
+            **_health_projection(recovery_states, unit_id, summary_field="health_reasons"),
         }
 
     async def _intent_projection(
@@ -1595,7 +1652,22 @@ class EnergyServiceFacade:
             # Cancellation is a BaseException and is never swallowed here.
             reasons.append(code)
 
-    def _control_readiness_reasons(self) -> list[str]:
+    async def _recovery_states(self) -> Mapping[str, Any] | None:
+        """The recovery monitor's derived view, or None when unavailable.
+
+        A failing or unwired projection never fails a read: the health
+        fields degrade to explicit nulls instead.
+        """
+        if self._recovery is None:
+            return None
+        try:
+            return await self._recovery.unit_health_states()
+        except Exception:
+            return None
+
+    async def _control_readiness_reasons(
+        self, recovery_states: Mapping[str, Any] | None = None
+    ) -> list[str]:
         reasons: list[str] = []
         any_armed = False
         for unit_id, handle in self._actors.items():
@@ -1606,6 +1678,11 @@ class EnergyServiceFacade:
                 reasons.append(f"{unit_id}:inhibit_latched")
             if lifecycle == "inhibited":
                 reasons.append(f"{unit_id}:inhibited")
+            # P1 vi: a unit authorizing without actuating is not ready to
+            # act, whatever its lifecycle says.
+            view = recovery_states.get(unit_id) if recovery_states is not None else None
+            if _enum_value(getattr(view, "state", None)) == "actuation_incoherent":
+                reasons.append(f"{unit_id}:actuation_incoherent")
             if qualified is False:
                 reasons.append(f"{unit_id}:not_qualified")
             elif qualified is None:
