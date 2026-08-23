@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-SCHEMA_VERSION: Final[int] = 2
+SCHEMA_VERSION: Final[int] = 3
 BASELINE_VERSION: Final[int] = 0
 
 _CREATE_VERSION_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS schema_version (
@@ -41,6 +41,65 @@ _CREATE_ENERGY_BASELINE_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS energy
     unit_id TEXT PRIMARY KEY,
     payload TEXT NOT NULL
 )"""
+# DESIGN_PLANT_HISTORY section 2.2: the telemetry historian's append-only
+# sample rows, clustered on (unit_id, sampled_at) with WITHOUT ROWID so both
+# the append right-edge and the windowed range scan ride the primary key
+# with no secondary index to maintain.  Every numeric column is NULL when
+# the observation's datum was absent -- never zero-filled.
+_CREATE_TELEMETRY_SAMPLE_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS telemetry_sample (
+    unit_id TEXT NOT NULL,
+    sampled_at TEXT NOT NULL,
+    system_soc_pct REAL, bms_soc_pct REAL, soh_pct REAL,
+    battery_watts REAL, grid_power_w REAL, load_power_w REAL,
+    pack_voltage_v REAL, pack_current_a REAL,
+    cell_min_v REAL, cell_max_v REAL, cell_spread_mv REAL,
+    temperature_min_c REAL, temperature_max_c REAL,
+    dynamic_charge_limit_w REAL, dynamic_discharge_limit_w REAL,
+    lifecycle TEXT NOT NULL,
+    health_state TEXT,
+    quality TEXT NOT NULL,
+    commanded_source TEXT,
+    commanded_direction TEXT,
+    commanded_w INTEGER,
+    debug_mode_w INTEGER, ctrl_mode_w INTEGER, work_mode_w INTEGER, run_mode_w INTEGER,
+    PRIMARY KEY (unit_id, sampled_at)
+) WITHOUT ROWID"""
+# DESIGN_PLANT_HISTORY section 2.3: the hourly rollups keyed by UTC hour (no
+# DST ambiguity in storage; the console renders site-local).  An hour with
+# zero samples writes NO row -- an absent hour is a gap, never a zeroed
+# hour -- and each numeric field carries the hour's min/max/mean triple.
+_ROLLUP_METRIC_COLUMNS: Final[str] = ",\n    ".join(
+    f"{field}_min REAL, {field}_max REAL, {field}_mean REAL"
+    for field in (
+        "system_soc_pct",
+        "bms_soc_pct",
+        "soh_pct",
+        "battery_watts",
+        "grid_power_w",
+        "load_power_w",
+        "pack_voltage_v",
+        "pack_current_a",
+        "cell_min_v",
+        "cell_max_v",
+        "cell_spread_mv",
+        "temperature_min_c",
+        "temperature_max_c",
+        "dynamic_charge_limit_w",
+        "dynamic_discharge_limit_w",
+    )
+)
+_CREATE_TELEMETRY_ROLLUP_TABLE: Final[str] = (
+    """CREATE TABLE IF NOT EXISTS telemetry_rollup_hourly (
+    unit_id TEXT NOT NULL,
+    hour_start TEXT NOT NULL,
+    """
+    + _ROLLUP_METRIC_COLUMNS
+    + """,
+    sample_count INTEGER NOT NULL,
+    worst_quality TEXT NOT NULL,
+    PRIMARY KEY (unit_id, hour_start)
+) WITHOUT ROWID"""
+)
 
 
 @dataclass(frozen=True)
@@ -63,12 +122,19 @@ class MigrationResult:
 # create (audit_events, active_schedule) plus the version table itself, so a
 # pre-schema database upgrades in place without any data change.  Version 2
 # adds the energy scorecard's ledger tables (E3): energy_day keyed by local
-# date, energy_baseline keyed by unit.
+# date, energy_baseline keyed by unit.  Version 3 adds the telemetry
+# historian's tables (DESIGN_PLANT_HISTORY section 2.2): telemetry_sample
+# and telemetry_rollup_hourly -- an in-place upgrade that touches no
+# existing table.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, statements=(_CREATE_VERSION_TABLE,)),
     Migration(
         version=2,
         statements=(_CREATE_ENERGY_DAY_TABLE, _CREATE_ENERGY_BASELINE_TABLE),
+    ),
+    Migration(
+        version=3,
+        statements=(_CREATE_TELEMETRY_SAMPLE_TABLE, _CREATE_TELEMETRY_ROLLUP_TABLE),
     ),
 )
 

@@ -20,6 +20,7 @@ try:
         SQLiteDatabase,
         SQLiteEnergyLedgerRepository,
         SQLiteScheduleRepository,
+        SQLiteTelemetryHistoryRepository,
     )
     from energypod.domain.audit import AuditEvent, DuplicateAuditEventError
     from energypod.domain.authorization import (
@@ -44,6 +45,7 @@ except ImportError as exc:  # pragma: no cover - initial red phase only
     SQLiteDatabase: Any = None
     SQLiteEnergyLedgerRepository: Any = None
     SQLiteScheduleRepository: Any = None
+    SQLiteTelemetryHistoryRepository: Any = None
     AuditEvent: Any = None
     DuplicateAuditEventError: Any = None
     AuthorizationBatch: Any = None
@@ -815,5 +817,297 @@ def test_sqlite_energy_ledger_refuses_malformed_rows(tmp_path: Path) -> None:
             )
         with pytest.raises(ValueError):
             repository.get_day(date(2026, 8, 26))
+    finally:
+        database.close()
+
+
+# --- plant history (DESIGN_PLANT_HISTORY sections 2.2-2.4, H1) -------------------
+
+
+def _sample_row(
+    unit_id: str,
+    sampled_at: datetime,
+    *,
+    battery_watts: float | None = -1500.0,
+    bms_soc_pct: float | None = 55.0,
+    quality: str = "good",
+    health_state: str | None = "healthy",
+    commanded_source: str | None = None,
+    commanded_direction: str | None = None,
+    commanded_w: int | None = None,
+    run_mode_w: int | None = 1,
+) -> Any:
+    _require_contract()
+    from energypod.domain.history import TelemetrySampleRow
+
+    return TelemetrySampleRow(
+        unit_id=unit_id,
+        sampled_at=sampled_at,
+        system_soc_pct=54.0 if bms_soc_pct is not None else None,
+        bms_soc_pct=bms_soc_pct,
+        soh_pct=98.0,
+        battery_watts=battery_watts,
+        grid_power_w=None,
+        load_power_w=None,
+        pack_voltage_v=205.5,
+        pack_current_a=-7.3,
+        cell_min_v=3.30,
+        cell_max_v=3.35,
+        cell_spread_mv=50.0,
+        temperature_min_c=22.0,
+        temperature_max_c=27.5,
+        dynamic_charge_limit_w=2500.0,
+        dynamic_discharge_limit_w=2500.0,
+        lifecycle="disarmed",
+        health_state=health_state,
+        quality=quality,
+        commanded_source=commanded_source,
+        commanded_direction=commanded_direction,
+        commanded_w=commanded_w,
+        debug_mode_w=0,
+        ctrl_mode_w=1,
+        work_mode_w=None,
+        run_mode_w=run_mode_w,
+    )
+
+
+def _history_sqlite(database: Any) -> Any:
+    _require_contract()
+    return SQLiteTelemetryHistoryRepository(database)
+
+
+def _history_memory(retention_s: float = 14 * 86_400.0) -> Any:
+    _require_contract()
+    from energypod.adapters.persistence.memory import InMemoryTelemetryHistoryRepository
+
+    return InMemoryTelemetryHistoryRepository(retention_full_resolution_s=retention_s)
+
+
+def test_history_schema_migrates_a_version_two_database_in_place(tmp_path: Path) -> None:
+    """DESIGN_PLANT_HISTORY section 2.2 / schema_version 3 migration in place.
+
+    A database stamped at version 2 (the energy-ledger schema, with live rows)
+    upgrades in place: the stamped version becomes 3, the energy ledger rows
+    are untouched, and both history tables exist.
+    """
+    from energypod.db.schema import SCHEMA_VERSION
+
+    assert SCHEMA_VERSION == 3
+    path = tmp_path / "history-migrate.sqlite3"
+    raw = sqlite3.connect(path)
+    try:
+        raw.execute(
+            "CREATE TABLE schema_version ("
+            "singleton INTEGER PRIMARY KEY CHECK (singleton = 1),"
+            "version INTEGER NOT NULL UNIQUE)"
+        )
+        raw.execute("INSERT INTO schema_version(singleton, version) VALUES (1, 2)")
+        raw.execute("CREATE TABLE energy_day (day TEXT PRIMARY KEY, payload TEXT NOT NULL)")
+        raw.execute("INSERT INTO energy_day(day, payload) VALUES ('2026-08-25', '{}')")
+        raw.commit()
+    finally:
+        raw.close()
+
+    database = _open_database(path)
+    try:
+        stamped = database.connection.execute(
+            "SELECT version FROM schema_version WHERE singleton = 1"
+        ).fetchone()
+        assert stamped == (3,)
+        assert database.connection.execute("SELECT COUNT(*) FROM energy_day").fetchone() == (1,)
+        tables = {
+            name
+            for (name,) in database.connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+            )
+        }
+        assert {"telemetry_sample", "telemetry_rollup_hourly"} <= tables
+        # The sample table clusters on its primary key (WITHOUT ROWID): the
+        # design's clustering pin, checked structurally.
+        sql = str(
+            database.connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE name = 'telemetry_sample'"
+            ).fetchone()[0]
+        ).lower()
+        assert "without rowid" in sql
+    finally:
+        database.close()
+
+
+def test_telemetry_history_round_trips_rows_with_nulls_verbatim(tmp_path: Path) -> None:
+    """DESIGN_PLANT_HISTORY sections 2.1-2.2 / append + windowed query / S0.
+
+    One batch append (the per-tick executemany), then the windowed range scan:
+    every null stays null, every value round-trips exactly, ordering is unit
+    then time, and the window bounds are inclusive.  Both adapters answer
+    identically.
+    """
+    rows = (
+        _sample_row("lhs", datetime(2026, 8, 25, 6, 0, 30, tzinfo=UTC)),
+        _sample_row("mid", datetime(2026, 8, 25, 6, 0, 30, tzinfo=UTC), battery_watts=None),
+        _sample_row("mid", datetime(2026, 8, 25, 6, 30, 0, tzinfo=UTC)),
+        _sample_row("mid", datetime(2026, 8, 25, 7, 0, 0, tzinfo=UTC), quality="stale"),
+        _sample_row(
+            "mid",
+            datetime(2026, 8, 25, 7, 30, 0, tzinfo=UTC),
+            commanded_source="night_adviser",
+            commanded_direction="charge",
+            commanded_w=2500,
+        ),
+        _sample_row("mid", datetime(2026, 8, 26, 8, 0, 0, tzinfo=UTC)),
+    )
+    database = _open_database(tmp_path / "history.sqlite3")
+    try:
+        repositories = [_history_sqlite(database), _history_memory()]
+        for repository in repositories:
+            repository.append_samples(rows)
+        window = (
+            datetime(2026, 8, 25, 6, 0, 30, tzinfo=UTC),
+            datetime(2026, 8, 25, 7, 30, 0, tzinfo=UTC),
+        )
+        for repository in repositories:
+            selected = repository.samples(("mid", "lhs"), window[0], window[1])
+            assert selected == (rows[0], rows[1], rows[2], rows[3], rows[4]), (
+                "ascending unit id, ascending time, inclusive bounds, nulls verbatim"
+            )
+            assert repository.samples(("mid",), window[0] + timedelta(seconds=1), window[1]) == (
+                rows[2],
+                rows[3],
+                rows[4],
+            )
+            assert repository.oldest_full_res_at() == rows[0].sampled_at
+            assert repository.last_sample_at(("mid", "lhs", "ghost")) == {
+                "mid": rows[5].sampled_at,
+                "lhs": rows[0].sampled_at,
+                "ghost": None,
+            }
+        # An empty batch is a no-op and a re-append's duplicate primary key is
+        # ignored (a retried tick can never corrupt the store).
+        repositories[0].append_samples(())
+        repositories[0].append_samples(rows)
+        assert len(repositories[0].samples(("mid",), window[0], window[1])) == 4
+    finally:
+        database.close()
+
+
+def test_history_maintain_rolls_up_then_prunes_idempotently(tmp_path: Path) -> None:
+    """DESIGN_PLANT_HISTORY section 2.4 / rollup + prune in one transaction / S0."""
+    rows = [
+        _sample_row("mid", datetime(2026, 8, 24, 10, 0, 0, tzinfo=UTC) + timedelta(minutes=m))
+        for m in range(0, 60, 15)
+    ] + [
+        # The 12:00 hour holds only two samples (partial coverage is honest
+        # coverage: sample_count says so) and one missing-quality row.
+        _sample_row(
+            "mid",
+            datetime(2026, 8, 24, 12, 0, 30, tzinfo=UTC),
+            quality="missing",
+            battery_watts=None,
+        ),
+        _sample_row("mid", datetime(2026, 8, 24, 12, 20, 0, tzinfo=UTC), battery_watts=-2000.0),
+        # 14:30 stays inside the full-resolution window (never rolled).
+        _sample_row("mid", datetime(2026, 8, 24, 14, 30, 0, tzinfo=UTC)),
+    ]
+    now = datetime(2026, 9, 7, 13, 0, 0, tzinfo=UTC)  # 14 days later: horizon 08-24T13:00
+    database = _open_database(tmp_path / "history-maintain.sqlite3")
+    try:
+        for repository in (_history_sqlite(database), _history_memory()):
+            for row in rows:
+                repository.append_samples((row,))
+            first = repository.maintain(now)
+            hours = repository.rollup_hours(
+                ("mid",),
+                datetime(2026, 8, 24, 0, 0, 0, tzinfo=UTC),
+                datetime(2026, 8, 25, 0, 0, 0, tzinfo=UTC),
+            )
+            assert [rollup.hour_start for rollup in hours] == [
+                datetime(2026, 8, 24, 10, 0, 0, tzinfo=UTC),
+                datetime(2026, 8, 24, 12, 0, 0, tzinfo=UTC),
+            ], "hour 11:00 holds no rows, so no rollup row exists"
+            ten, twelve = hours
+            assert ten.sample_count == 4
+            assert ten.metrics["battery_watts"] == (-1500.0, -1500.0, -1500.0)
+            assert ten.metrics["grid_power_w"] == (None, None, None), "all-null rolls to null"
+            assert ten.worst_quality == "good"
+            assert twelve.sample_count == 2
+            assert twelve.metrics["battery_watts"] == (-2000.0, -2000.0, -2000.0)
+            assert twelve.worst_quality == "missing"
+            remaining = repository.samples(
+                ("mid",),
+                datetime(2026, 8, 24, 0, 0, 0, tzinfo=UTC),
+                datetime(2026, 8, 25, 0, 0, 0, tzinfo=UTC),
+            )
+            assert [row.sampled_at for row in remaining] == [
+                datetime(2026, 8, 24, 14, 30, 0, tzinfo=UTC)
+            ], "prune deletes exactly the rolled hours (both were < 13:00)"
+
+            second = repository.maintain(now)
+            assert second.rolled_hours == 0 and second.pruned_samples == 0, "idempotent"
+            assert repository.oldest_full_res_at() == datetime(2026, 8, 24, 14, 30, 0, tzinfo=UTC)
+            assert first.rolled_hours == 2 and first.pruned_samples == 6
+    finally:
+        database.close()
+
+
+def test_history_prune_only_after_rollup_a_forced_failure_deletes_nothing(
+    tmp_path: Path,
+) -> None:
+    """DESIGN_PLANT_HISTORY section 2.4 step 2 / prune-only-inside-the-commit / S0."""
+    database = _open_database(tmp_path / "history-prune.sqlite3")
+    try:
+        repository = _history_sqlite(database)
+        repository.append_samples(
+            tuple(
+                _sample_row(
+                    "mid", datetime(2026, 8, 10, 6, 0, 0, tzinfo=UTC) + timedelta(minutes=m)
+                )
+                for m in range(0, 90, 30)
+            )
+        )
+        with database.lock:
+            database.connection.execute(
+                "CREATE TRIGGER refuse_rollup BEFORE INSERT ON telemetry_rollup_hourly"
+                " BEGIN SELECT RAISE(ABORT, 'forced rollup failure'); END"
+            )
+        with pytest.raises(Exception, match="forced rollup failure"):
+            repository.maintain(datetime(2026, 9, 1, 0, 0, 0, tzinfo=UTC))
+        assert (
+            len(
+                repository.samples(
+                    ("mid",),
+                    datetime(2026, 8, 10, 0, 0, 0, tzinfo=UTC),
+                    datetime(2026, 8, 11, 0, 0, 0, tzinfo=UTC),
+                )
+            )
+            == 3
+        ), "a failed rollup can never delete the only copy"
+    finally:
+        database.close()
+
+
+def test_history_rollup_prunes_old_hours_when_a_rollup_horizon_is_configured(
+    tmp_path: Path,
+) -> None:
+    """DESIGN_PLANT_HISTORY section 2.3 / ``retention_rollup_days`` 0 = forever."""
+    database = _open_database(tmp_path / "history-rollup-prune.sqlite3")
+    try:
+        keep_all = SQLiteTelemetryHistoryRepository(database, retention_full_resolution_s=3600.0)
+        bounded = SQLiteTelemetryHistoryRepository(
+            database, retention_full_resolution_s=3600.0, retention_rollup_s=7200.0
+        )
+        base = datetime(2026, 8, 24, 6, 0, 0, tzinfo=UTC)
+        for hour in range(4):
+            for minute in range(0, 60, 30):
+                keep_all.append_samples(
+                    (_sample_row("mid", base + timedelta(hours=hour, minutes=minute)),)
+                )
+        now = base + timedelta(hours=5)
+        keep_all.maintain(now)
+        assert len(keep_all.rollup_hours(("mid",), base, now)) == 4
+        # A bounded rollup retention prunes only hours strictly older than
+        # its own horizon: 11:00 - 2 h = 09:00, so hours 06:00..08:00 go.
+        bounded.maintain(now)
+        remaining = [rollup.hour_start for rollup in bounded.rollup_hours(("mid",), base, now)]
+        assert remaining == [base + timedelta(hours=3)]
     finally:
         database.close()

@@ -4,13 +4,24 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict, deque
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime, timedelta
 from threading import RLock
 from typing import Any
 
 from energypod.domain import IntentSource
 from energypod.domain.authorization import AuthorizationBatch, StaleGenerationError
 from energypod.domain.energy import EnergyDayRecord, EnergyUnitBaseline
+from energypod.domain.history import (
+    HISTORY_NUMERIC_FIELDS,
+    MaintenanceResult,
+    TelemetryRollupHour,
+    TelemetrySampleRow,
+    format_history_timestamp,
+    hour_start_of,
+    parse_history_timestamp,
+)
+from energypod.domain.history import worst_quality as worst_of
 
 
 class InMemoryEnergyLedgerRepository:
@@ -373,3 +384,170 @@ class InMemoryIntentRepository:
         # Duck-typed so structural fakes may carry either the enum or its value.
         source = getattr(intent, "source", None)
         return getattr(source, "value", source) == IntentSource.EMERGENCY_STOP.value
+
+
+class InMemoryTelemetryHistoryRepository:
+    """Process-local telemetry historian (DESIGN_PLANT_HISTORY sections 2.2-2.4).
+
+    The simulate-mode and database-less deployment twin of the durable store:
+    explicitly non-durable (rows vanish at restart), with EXACTLY the durable
+    contract's semantics -- batch append, inclusive windowed reads, and the
+    one-transaction rollup-then-prune maintenance pass with the same
+    hour-boundary and first-rollup-stands rules.
+    """
+
+    def __init__(
+        self,
+        *,
+        retention_full_resolution_s: float = 14 * 86_400.0,
+        retention_rollup_s: float | None = None,
+    ) -> None:
+        if not isinstance(retention_full_resolution_s, int | float) or (
+            not math.isfinite(float(retention_full_resolution_s))
+            or retention_full_resolution_s <= 0
+        ):
+            raise ValueError("retention_full_resolution_s must be a positive finite number")
+        if retention_rollup_s is not None and (
+            not isinstance(retention_rollup_s, int | float)
+            or not math.isfinite(float(retention_rollup_s))
+            or retention_rollup_s <= 0
+        ):
+            raise ValueError("retention_rollup_s must be a positive finite number or None")
+        self._retention_full_resolution_s = float(retention_full_resolution_s)
+        self._retention_rollup_s = None if retention_rollup_s is None else float(retention_rollup_s)
+        # Keyed by the STORED spelling so the fixed-width ISO ordering that
+        # makes the durable primary key correct does the same work here.
+        self._samples: dict[str, dict[str, TelemetrySampleRow]] = defaultdict(dict)
+        self._rollups: dict[tuple[str, str], TelemetryRollupHour] = {}
+        self._lock = RLock()
+
+    def append_samples(self, rows: Sequence[TelemetrySampleRow]) -> None:
+        if any(type(row) is not TelemetrySampleRow for row in rows):
+            raise TypeError("rows must be TelemetrySampleRow values")
+        if not rows:
+            return
+        with self._lock:
+            for row in rows:
+                # The first sample for a (unit, tick) stands: a retried tick
+                # after a suppressed failure is the durable ON CONFLICT rule.
+                self._samples[row.unit_id].setdefault(format_history_timestamp(row.sampled_at), row)
+
+    def samples(
+        self, unit_ids: Sequence[str], from_at: datetime, to_at: datetime
+    ) -> tuple[TelemetrySampleRow, ...]:
+        normalized = self._require_units(unit_ids)
+        start, end = (
+            format_history_timestamp(from_at),
+            format_history_timestamp(to_at),
+        )
+        with self._lock:
+            selected: list[TelemetrySampleRow] = []
+            # Ascending unit id, ascending time: the durable store's own
+            # clustering order, so both adapters answer in one shape.
+            for unit_id in sorted(normalized):
+                history = self._samples.get(unit_id, {})
+                selected.extend(history[key] for key in sorted(history) if start <= key <= end)
+            return tuple(selected)
+
+    def rollup_hours(
+        self, unit_ids: Sequence[str], from_at: datetime, to_at: datetime
+    ) -> tuple[TelemetryRollupHour, ...]:
+        normalized = self._require_units(unit_ids)
+        start = format_history_timestamp(hour_start_of(from_at))
+        end = format_history_timestamp(to_at)
+        with self._lock:
+            selected = [
+                rollup
+                for (unit_id, hour_key) in sorted(self._rollups)
+                if unit_id in normalized and start <= hour_key <= end
+                for rollup in (self._rollups[(unit_id, hour_key)],)
+            ]
+            return tuple(selected)
+
+    def oldest_full_res_at(self) -> datetime | None:
+        with self._lock:
+            oldest: str | None = None
+            for history in self._samples.values():
+                for key in history:
+                    if oldest is None or key < oldest:
+                        oldest = key
+            return None if oldest is None else parse_history_timestamp(oldest)
+
+    def last_sample_at(self, unit_ids: Sequence[str]) -> dict[str, datetime | None]:
+        normalized = self._require_units(unit_ids)
+        latest: dict[str, datetime | None] = {}
+        with self._lock:
+            for unit_id in normalized:
+                history = self._samples.get(unit_id)
+                latest[unit_id] = None if not history else parse_history_timestamp(max(history))
+        return latest
+
+    def maintain(self, now: datetime) -> MaintenanceResult:
+        """Rollup then prune with the durable pass's exact semantics."""
+        from energypod.domain.observations import DataQuality
+
+        moment = now if now.tzinfo is UTC else now.astimezone(UTC)
+        horizon = hour_start_of(moment - timedelta(seconds=self._retention_full_resolution_s))
+        horizon_key = format_history_timestamp(horizon)
+        rolled = pruned = pruned_rollups = 0
+        with self._lock:
+            buckets: dict[tuple[str, str], list[TelemetrySampleRow]] = defaultdict(list)
+            for unit_id, history in self._samples.items():
+                for key, row in history.items():
+                    if key < horizon_key:
+                        buckets[
+                            (unit_id, format_history_timestamp(hour_start_of(row.sampled_at)))
+                        ].append(row)
+            for (unit_id, hour_key), bucket in sorted(buckets.items()):
+                if (unit_id, hour_key) in self._rollups:
+                    continue
+                metrics: dict[str, tuple[float | None, float | None, float | None]] = {}
+                for field in HISTORY_NUMERIC_FIELDS:
+                    values = [
+                        value
+                        for value in (getattr(row, field) for row in bucket)
+                        if value is not None
+                    ]
+                    metrics[field] = (
+                        (min(values), max(values), sum(values) / len(values))
+                        if values
+                        else (None, None, None)
+                    )
+                self._rollups[(unit_id, hour_key)] = TelemetryRollupHour(
+                    unit_id=unit_id,
+                    hour_start=parse_history_timestamp(hour_key),
+                    metrics=metrics,
+                    sample_count=len(bucket),
+                    worst_quality=worst_of(DataQuality(row.quality) for row in bucket).value,
+                )
+                rolled += 1
+            for history in self._samples.values():
+                for key in [key for key in history if key < horizon_key]:
+                    del history[key]
+                    pruned += 1
+            if self._retention_rollup_s is not None:
+                rollup_horizon = format_history_timestamp(
+                    hour_start_of(moment - timedelta(seconds=self._retention_rollup_s))
+                )
+                stale = [
+                    rollup_key for rollup_key in self._rollups if rollup_key[1] < rollup_horizon
+                ]
+                for rollup_key in stale:
+                    del self._rollups[rollup_key]
+                    pruned_rollups += 1
+        return MaintenanceResult(
+            rolled_hours=rolled,
+            pruned_samples=pruned,
+            pruned_rollups=pruned_rollups,
+        )
+
+    @staticmethod
+    def _require_units(unit_ids: Sequence[str]) -> tuple[str, ...]:
+        normalized = tuple(unit_ids)
+        if not normalized or any(
+            not isinstance(unit, str) or not unit or unit != unit.strip() for unit in normalized
+        ):
+            raise ValueError("unit_ids must be non-empty normalized identifiers")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("unit_ids must be unique")
+        return normalized
