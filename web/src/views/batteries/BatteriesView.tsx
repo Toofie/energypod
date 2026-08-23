@@ -755,10 +755,14 @@ function FleetCard({
       </div>
       {/* The self-healing awareness badge: silent while healthy (and for the
           states the inhibit surfaces already tell), quiet-positive while the
-          battery manages itself, the honest terminal when recovery fails. */}
+          battery manages itself, the honest terminal when recovery fails.
+          The unit's own measured figure feeds the self-charge sentence's
+          direction (evening lhs load-serves at positive watts while mid/rhs
+          gently charge). */}
       <UnitHealthTag
         health={unit.health}
         authorizedWatts={unit.authorized_power?.watts ?? null}
+        measuredWatts={unit.measured_watts}
       />
       <p>
         <b>Availability:</b> {availabilityWord(unit.lifecycle)}

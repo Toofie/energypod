@@ -34,10 +34,13 @@ import type { UnitHealth } from "./fleet";
  * The quiet-positive wording for a self-healing battery, keyed by the
  * backend's own reason codes (recovery.py `_derive`). The first recognized
  * reason decides; an unknown reason still earns the honest generic line —
- * never silence, never a raw code.
+ * never silence, never a raw code. `autonomous_self_charge` is the one code
+ * that also reads the battery's own measured figure: config rev 5 widened
+ * the uncommanded band to the pods' evening behavior, where mid/rhs gently
+ * self-charge while lhs load-serves, so the sentence follows the direction
+ * the battery itself reports.
  */
 const SELF_HEALING_WORDS: Record<string, string> = {
-  autonomous_self_charge: "Managing itself — solar self-charge",
   requalifying_after_inhibit: "Re-qualifying",
   cell_balancing: "Cell balancing",
 };
@@ -45,8 +48,21 @@ const SELF_HEALING_WORDS: Record<string, string> = {
 /** The generic quiet line when the reasons carry no recognized code. */
 const SELF_HEALING_GENERIC = "Managing itself";
 
-export function selfHealingText(health: UnitHealth): string {
+/**
+ * Wire convention (live-proven): a POSITIVE measured watt figure is DISCHARGE
+ * — the battery powering the home — negative is CHARGE. A figure inside the
+ * deadband carries no direction worth naming, and no figure at all keeps
+ * today's sentence: the tag never guesses a direction.
+ */
+const SELF_CHARGE_DEADBAND_W = 10;
+
+export function selfHealingText(health: UnitHealth, measuredWatts: number | null = null): string {
   for (const reason of health.reasons) {
+    if (reason === "autonomous_self_charge") {
+      return measuredWatts !== null && measuredWatts >= SELF_CHARGE_DEADBAND_W
+        ? "Managing itself — powering the home"
+        : "Managing itself — solar self-charge";
+    }
     const words = SELF_HEALING_WORDS[reason];
     if (words !== undefined) {
       return words;
@@ -107,6 +123,12 @@ interface UnitHealthTagProps {
    * figure; null when no authorization is on screen.
    */
   authorizedWatts?: number | null;
+  /**
+   * The battery's OWN measured watts, for the self-healing line's direction
+   * (positive = powering the home, negative = solar self-charge). Null or
+   * absent keeps the generic sentence — the tag never guesses a direction.
+   */
+  measuredWatts?: number | null;
 }
 
 /**
@@ -115,7 +137,11 @@ interface UnitHealthTagProps {
  * a healthy unit (silence is the design), and the two states whose stories
  * the existing inhibit surfaces already tell (foreign_writer, inhibited).
  */
-export function UnitHealthTag({ health, authorizedWatts = null }: UnitHealthTagProps): JSX.Element | null {
+export function UnitHealthTag({
+  health,
+  authorizedWatts = null,
+  measuredWatts = null,
+}: UnitHealthTagProps): JSX.Element | null {
   if (health === null) {
     return null;
   }
@@ -131,7 +157,7 @@ export function UnitHealthTag({ health, authorizedWatts = null }: UnitHealthTagP
       return null;
     case "self_healing":
       kind = "healing";
-      text = selfHealingText(health);
+      text = selfHealingText(health, measuredWatts);
       break;
     case "actuation_incoherent":
       kind = "warning";

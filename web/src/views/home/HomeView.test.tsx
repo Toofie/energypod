@@ -2317,12 +2317,14 @@ describe("HomeView — the per-unit recovery health badge", () => {
   function healingFleet(
     health: { state: string; reasons?: readonly string[]; remediation_hint?: string | null },
     authorized?: { direction: "charge" | "discharge"; watts: number },
+    measuredWatts?: number,
   ): FleetView {
     return fleet([
       {
         ...unit({
           unit_id: "pod-mid",
           lifecycle: "active",
+          ...(measuredWatts === undefined ? {} : { measured_watts: measuredWatts }),
           ...(authorized === undefined
             ? {}
             : {
@@ -2354,6 +2356,24 @@ describe("HomeView — the per-unit recovery health badge", () => {
     // The units without health fields stay silent.
     const quiet = await findUnitEntry(POWER_REGION, "pod-rhs");
     expect(within(quiet).queryByRole("note")).toBeNull();
+  });
+
+  it.each([
+    ["charging gently (the evening mid/rhs story, negative watts)", -780.5, "Managing itself — solar self-charge"],
+    ["load-serving (the evening lhs story, ~+780 W)", 780, "Managing itself — powering the home"],
+  ] as const)("words the solar self-charge line by the unit's own measured direction: %s", async (_name, watts, words) => {
+    installClient({
+      snapshot: healingFleet(
+        { state: "self_healing", reasons: ["autonomous_self_charge"] },
+        undefined,
+        watts,
+      ),
+    });
+    renderHome();
+    const entry = await findUnitEntry(POWER_REGION, "pod-mid");
+    await waitFor(() => {
+      expectVisibleText(entry, words);
+    });
   });
 
   it("tells the plain incoherence story with the battery's own allowed figure", async () => {

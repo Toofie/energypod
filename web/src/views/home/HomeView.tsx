@@ -1663,8 +1663,14 @@ function UnitPowerEntry({
       {/* The self-healing awareness badge on the unit line: silent while
           healthy (and for the states the Inhibited badge above already
           tells), quiet-positive while the battery manages itself, the honest
-          terminal when recovery fails. */}
-      <UnitHealthTag health={unit.health} authorizedWatts={figures.authorizedWatts} />
+          terminal when recovery fails. The unit's own measured figure feeds
+          the self-charge sentence's direction (evening lhs load-serves at
+          positive watts while mid/rhs gently charge). */}
+      <UnitHealthTag
+        health={unit.health}
+        authorizedWatts={figures.authorizedWatts}
+        measuredWatts={unit.measured_watts}
+      />
       <div className="home-figures">
         <div className="home-figure" role="figure" aria-label="Requested">
           <span className="home-figure-label">Requested</span>

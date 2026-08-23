@@ -1497,7 +1497,10 @@ describe("BatteriesView — open panels stay live", () => {
 
 describe("BatteriesView — the per-unit recovery health badge", () => {
   /** A snapshot whose MID carries the given derived health (and optionally
-   * its own authorized figure, for the incoherence story's commanded watts). */
+   * its own authorized figure, for the incoherence story's commanded watts,
+   * and its own measured figure, for the self-charge sentence's direction —
+   * the evening self-charge story is gentle CHARGING, so negative is the
+   * honest default here, not HEALTHY_SNAPSHOT's discharging +2,400 W). */
   function healthSnapshot(
     health: {
       state?: string | null;
@@ -1505,6 +1508,7 @@ describe("BatteriesView — the per-unit recovery health badge", () => {
       remediation_hint?: string | null;
     },
     authorized?: { direction: string; watts: number },
+    measuredWatts: number = -780,
   ): WireSnapshot {
     return {
       ...HEALTHY_SNAPSHOT,
@@ -1513,6 +1517,7 @@ describe("BatteriesView — the per-unit recovery health badge", () => {
           ? withHealth(
               {
                 ...unit,
+                measured_watts: measuredWatts,
                 ...(authorized === undefined
                   ? {}
                   : { authorized_power: authorized, requested_power: authorized }),
@@ -1592,6 +1597,20 @@ describe("BatteriesView — the per-unit recovery health badge", () => {
     // The other cards, whose units carry no health fields, stay silent.
     const rhsCard = await screen.findByRole("group", { name: "RHS" });
     expect(within(rhsCard).queryByRole("note")).toBeNull();
+  });
+
+  it.each([
+    ["charging gently (the evening mid/rhs story, negative watts)", -780.5, "Managing itself — solar self-charge"],
+    ["load-serving (the evening lhs story, ~+780 W)", 780, "Managing itself — powering the home"],
+  ] as const)("words the solar self-charge badge by the unit's own measured direction: %s", async (_name, watts, words) => {
+    const state = healthSnapshot(
+      { state: "self_healing", reasons: ["autonomous_self_charge"] },
+      undefined,
+      watts,
+    );
+    renderView(healthyClient(state, fleetEvents(state)));
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    expect(within(midCard).getByRole("note").textContent).toBe(words);
   });
 
   it("tells the plain incoherence story with the battery's own commanded figure", async () => {

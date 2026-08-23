@@ -26,6 +26,12 @@
  * - self_healing is quiet and positive, worded by the backend's own reason
  *   codes; actuation_incoherent carries the plain story with the battery's
  *   OWN authorized figure; not_responding is the prominent honest terminal.
+ * - The autonomous_self_charge sentence SPLITS by the battery's own measured
+ *   direction (config rev 5 widened the band to the pods' evening behavior:
+ *   mid/rhs gently self-charge while lhs load-serves at ~+780 W): positive
+ *   watts are the home being powered, negative are solar self-charge, and a
+ *   figure inside the deadband — or no figure at all — keeps today's generic
+ *   sentence. The tag never guesses a direction.
  */
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
@@ -214,6 +220,39 @@ describe("UnitHealthTag — one badge, per state, with the design's quietness", 
     render(<UnitHealthTag health={health("self_healing", ["something_new"])} />);
     expect(screen.getByRole("note").textContent).toBe("Managing itself");
   });
+
+  it.each([
+    ["a charging figure (the evening mid/rhs story, negative watts)", -780.5],
+    ["the deadband zone (the sign is noise)", 9],
+    ["no figure on screen (never guessed)", null],
+  ] as const)(
+    "keeps the solar self-charge sentence for autonomous_self_charge with %s",
+    (_name, measuredWatts) => {
+      render(
+        <UnitHealthTag
+          health={health("self_healing", ["autonomous_self_charge"])}
+          measuredWatts={measuredWatts}
+        />,
+      );
+      expect(screen.getByRole("note").textContent).toBe("Managing itself — solar self-charge");
+    },
+  );
+
+  it.each([
+    ["a load-serving figure (the evening lhs story, ~+780 W)", 780],
+    ["exactly the deadband edge (positive means serving)", 10],
+  ] as const)(
+    "words autonomous_self_charge as powering the home for %s",
+    (_name, measuredWatts) => {
+      render(
+        <UnitHealthTag
+          health={health("self_healing", ["autonomous_self_charge"])}
+          measuredWatts={measuredWatts}
+        />,
+      );
+      expect(screen.getByRole("note").textContent).toBe("Managing itself — powering the home");
+    },
+  );
 
   it("tells the plain incoherence story with the battery's own commanded figure", () => {
     render(<UnitHealthTag health={health("actuation_incoherent")} authorizedWatts={1000} />);
