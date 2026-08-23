@@ -349,84 +349,75 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
-- 2026-08-26 (night-writer detector): THE NIGHT-WRITER DETECTOR IMPLEMENTED
-  AND COMMISSIONED (46c828a contract, bc7e95f red, b72935e the known-writer
-  amendment, b6d693e wire+sim, c197d0b monitor, 3bb3828 composition+api)
-  against API_CONTRACTS "Night-writer detector" — PRODUCT_NEXT §2 S2, the
-  census's queued between-cycles foreign-objective detector, closing the
-  7.3 h overnight blind spot with evidence. MID-BUILD OPERATOR CONTEXT
-  (recorded in the contract's motivation note): the night writer is KNOWN —
-  the site's existing Docker solution charges ALL THREE batteries at 2500 W
-  per unit from 00:00 to 06:00 nightly — and the earlier night-load
-  investigation's "no external writer" conclusion sampled only the
-  pre-midnight window. (1) WIRE (zero extra frames): the served PQ
-  objective (PCS detail 0x1060+17/+18, PROTOCOL_EVIDENCE 4b — the arm
+- 2026-08-26 (night-writer detector): THE NIGHT-WRITER DETECTOR IMPLEMENTED,
+  COMMISSIONED, AND LIVE-PROVEN ON THE REAL NIGHTLY WRITER (46c828a
+  contract, bc7e95f red, b72935e the known-writer amendment, b6d693e
+  wire+sim, c197d0b monitor, 3bb3828 composition+api, 408f43b docs, 314ef3c
+  the live-path pin, 1efda80 the synchronized-GROUP fix) against
+  API_CONTRACTS "Night-writer detector" — PRODUCT_NEXT §2 S2, closing the
+  census's 7.3 h overnight blind spot with evidence. (1) WIRE (zero extra
+  frames): the served PQ objective (PCS detail 0x1060+17/+18 — the arm
   preflight's own window, already in the read plan) decodes into every
-  observation as advisory mode-word-class fields — signed
-  served_active_objective_w / served_reactive_objective_var plus
-  objective_captured_at_mono, the serving's capture clock (the live tiered
-  plan's cached ride-along keeps its ORIGINAL clock, so a fresh serving is
-  distinguishable from a stale one); quality shapes stay 10/12/18. The
-  simulated telemetry decodes the same words (mode words included), and the
-  simulator gained script_objective/clear_scripted_objective (remote_mode
-  selectable) — a FOREIGN writer's words on the wire without touching the
-  pod's own applied state. (2) THE MONITOR
-  (application/foreign_objective.py, composed ALWAYS — no config block,
-  five defaulted policy keys): driven once per fleet cycle per unit by one
-  bounded fully-suppressed pass after the polls and the recovery pass;
-  samples when the words are fresh, the interval floor elapsed, the
-  lifecycle is observe_only/disarmed/armed_idle/inhibited, no intent claims
-  the unit, and the handback grace expired; a failed poll is a gap.
-  CLASSIFICATION (first match wins): zero records nothing and closes any
-  episode; inside the grace our own lapse's residue records quiet
-  handback_grace; Q != 0 alerts reactive_objective_observed (the ADD-1
-  doctrine); outside expected_autonomy_band_w alerts outside_autonomy_band
-  on the FIRST sample; the EXPECTED NIGHTLY CHARGE (the site's own
-  scheduler: in-band, 0.8x..1.2x of foreign_objective_expected_charge_w,
-  FLEET-SYNCHRONIZED — every other unit's latest sample inside
-  max(5x interval, 300 s) is a charge in the same class) records quiet
-  expected_nightly_charge and outranks both pattern rules; otherwise
-  sustained_remote_mode_objective (N consecutive nonzero in-band samples
-  while run_mode_w == 1 "Remote PQ Power" — the pod's own CT-following
-  reads 0 "Matching Load") or sustained_charge_without_pv_evidence (N
-  consecutive P <= -self-charge-class samples with grid_power_w <= 0) alert.
-  DELIBERATE REFINEMENT recorded: the blanket positive-at-no-PV rule was
-  REFUSED (lhs's observed +695..914 W Matching-Load hold after dark is
-  normal autonomy; the band's +1000 edge exists for it). ONE audit fact +
-  ONE foreign_objective.observed bus event per (episode, reason); quiet
-  tiers never publish. (3) SURFACES: the per-unit session record (7 d /
-  4096 samples rolling, in-memory, restart resets it — the audit keeps the
-  alerts) serves GET /api/v1/objectives/observed?last=24h (observe; Nh/Nd
-  1..168 h; 422 otherwise; NO mutation) with first/last seen, sample and
-  sign counts, signed min/typical/max (lower median), classification
-  counts, foreign episode count/active/reason, and the FULL per-sample
-  evidence record; every snapshot unit and health units entry carries the
-  COMPACT last_objective_observed summary (nullable, never absent).
-  ARM-TIME INTERPLAY pinned: the sole-writer preflight and its
+  observation as advisory fields with the serving's capture clock (the
+  cached ride-along keeps its ORIGINAL clock); the simulator gained
+  script_objective/clear_scripted_objective (remote_mode selectable). (2)
+  THE MONITOR (application/foreign_objective.py, composed ALWAYS — six
+  defaulted policy keys, no block): one bounded suppressed pass per fleet
+  cycle after the recovery pass; samples when the words are fresh, the
+  interval floor elapsed, the lifecycle uncommanded, no claim, outside the
+  handback grace; a failed poll is a gap. CLASSIFICATION (first match
+  wins): zero records nothing and closes the episode; inside the grace our
+  own lapse records handback_grace; Q != 0 alerts
+  reactive_objective_observed; outside expected_autonomy_band_w alerts
+  outside_autonomy_band on the first sample; the EXPECTED NIGHTLY CHARGE
+  (in-band, 0.8x..1.2x of foreign_objective_expected_charge_w,
+  SYNCHRONIZED across >= foreign_objective_expected_min_units units
+  counting this one, each corroborated inside max(5x interval, 300 s))
+  records quiet expected_nightly_charge and outranks both pattern rules;
+  otherwise sustained_remote_mode_objective (N consecutive nonzero samples
+  while run_mode_w == 1 — the pod's own CT-following reads 0) or
+  sustained_charge_without_pv_evidence (N consecutive beyond-class charges
+  with grid_power_w <= 0) alert. ONE audit fact + ONE
+  foreign_objective.observed bus event per (episode, reason). DELIBERATE
+  REFINEMENTS recorded in the contract: the blanket positive-at-no-PV rule
+  REFUSED (lhs's observed Matching-Load evening hold), and the
+  all-fleet sync requirement replaced by the synchronized GROUP after the
+  live commissioning observation. (3) SURFACES: the session record (7 d /
+  4096 samples per unit, in-memory; the audit keeps alerts) serves
+  GET /api/v1/objectives/observed?last=24h (observe; Nh/Nd 1..168 h; no
+  mutation) with first/last seen, counts, signed min/typical/max,
+  classification counts, foreign episode facts, and the FULL per-sample
+  evidence; every snapshot unit and health units entry carries the COMPACT
+  nullable last_objective_observed. The arm-time preflight and its
   external_writer latch are untouched — expected is CHARACTERIZED, never
-  sanctioned; a mid-charge arm follows the ADD-1 doctrine verbatim
-  (pod_autonomy under the commissioned 2500 W signature band, external_
-  writer under the strict posture). VERIFICATION: contract-first 94 red ->
-  0 across eight families (monitor 65 incl. the expected-writer matrix,
-  wire 5, config 15, facade 8 + one deliberate health-shape amendment,
-  REST 12, event 2, simulator 5, composition 4); FULL SUITE 1972 green;
-  ruff + format + MYPYPATH=src mypy strict clean each commit. SIMULATOR
-  DEMO (script OUTSIDE the repo at ../night-writer-demo/, run twice,
-  identical digests): autonomy float quiet; a lone -2400 W writer escalates
-  exactly once then closes; our own intent never samples while claimed and
-  its lapse is handback_grace; the -2500 W x 3 synchronized six-hour
-  nightly writer holds expected_nightly_charge end to end with ZERO alerts
-  and ~6 h characterized spans; the actor-level arm interplay shows
-  sole_writer / pod_autonomy-proceeds / external_writer-latches. LIVE:
-  commissioned onto the running controller via the config keys (the
-  live-write example documents all five; expected 2500) and a clean
-  restart — the sampler running, first samples visible, log clean.
+  sanctioned. VERIFICATION: contract-first red -> 0 across eight families
+  (final counts: monitor 68, wire 5, config 17, facade 8, REST 12, event
+  2, simulator 5, composition 4, live-path 1); FULL SUITE 1979 green;
+  ruff + format + MYPYPATH=src mypy strict clean each commit (scoped —
+  another agent's worktree now lives under .claude/). SIMULATOR DEMO
+  (../night-writer-demo/, run TWICE, identical digest ad6a5eb07552af8a):
+  autonomy float quiet; a lone -2400 W writer escalates exactly once then
+  closes; our own intent never samples while claimed, its lapse
+  handback_grace; the -2500 W x 3 six-hour nightly writer stays
+  expected_nightly_charge with zero alerts; the actor-level arm interplay
+  shows sole_writer / pod_autonomy-proceeds / external_writer-latches.
+  LIVE COMMISSIONING (writemode34 -> 35): restarted onto the build
+  (config keys on the live-write example; expected 2500 W, min-units 2),
+  sampler verified read-only — and at 00:01 AEST the REAL nightly writer
+  appeared: lhs+mid holding -2500 W simultaneously (run mode 1, grid
+  importing ~-2.6 kW each, batteries at -2.2 kW), first samples within
+  milliseconds of each other; the first minutes (all-fleet-sync rule)
+  raised two honest sustained_remote_mode_objective alerts — the
+  commissioning evidence that produced the GROUP fix — and after the
+  1efda80 restart both units classify expected_nightly_charge quietly
+  while a full rhs (98% SOC) floats uncharged: the KNOWN writer is now
+  characterized, not alarmed. Log clean; the standing GET-only night
+  sampler keeps running beside the detector's own overnight observation.
   CONSOLE (web agent, feature-detected): the observed-objectives view and
-  the per-unit last_objective_observed summary; foreign_objective.observed
-  is the alert tier, expected_nightly_charge/pod_autonomy/handback_grace
-  are quiet evidence. OPERATOR DECISIONS: none required for operation; the
-  strict-vs-expected posture is the one knob (foreign_objective_expected_
-  charge_w: null restores strict).
+  the per-unit summary; foreign_objective.observed is the alert tier,
+  expected_nightly_charge/pod_autonomy/handback_grace quiet. OPERATOR
+  KNOBS: foreign_objective_expected_charge_w null restores the strict
+  posture; expected_min_units widens the group.
 
 - 2026-08-26 (scorecard backend): THE DAILY ENERGY SCORECARD BACKEND
   IMPLEMENTED (E1-E7; 7697aed, 0e8db09, 2fd879f, 89c1925, f7f80f0,
