@@ -149,14 +149,21 @@ class SimulatedEnergyPod:
         self._soh_pct = rng.randrange(98, 101)
         self._cell_base_millivolts = [3200 + rng.randrange(0, 201) for _ in range(bic_count * 10)]
         self._cell_base_temperature_words = [64 + rng.randrange(0, 7) for _ in range(bic_count * 3)]
-        self._grid_buy_counts = rng.randrange(_ENERGY_BASE_FLOOR, _ENERGY_BASE_CEILING)
-        self._grid_sell_counts = rng.randrange(_ENERGY_BASE_FLOOR, _ENERGY_BASE_CEILING)
-        self._load_counts = rng.randrange(_ENERGY_BASE_FLOOR, _ENERGY_BASE_CEILING)
+        self._grid_buy_counts_base = rng.randrange(_ENERGY_BASE_FLOOR, _ENERGY_BASE_CEILING)
+        self._grid_sell_counts_base = rng.randrange(_ENERGY_BASE_FLOOR, _ENERGY_BASE_CEILING)
+        self._load_counts_base = rng.randrange(_ENERGY_BASE_FLOOR, _ENERGY_BASE_CEILING)
         self._pv_counts = rng.randrange(_ENERGY_BASE_FLOOR, _ENERGY_BASE_CEILING)
         self._charge_base_counts = rng.randrange(_ENERGY_BASE_FLOOR, _ENERGY_BASE_CEILING)
         self._discharge_base_counts = rng.randrange(_ENERGY_BASE_FLOOR, _ENERGY_BASE_CEILING)
         self._charge_watt_seconds = 0.0
         self._discharge_watt_seconds = 0.0
+        # Energy scorecard (DESIGN_ENERGY_SCORECARD section 9 family 8): the
+        # GRID and LOAD counter pairs accumulate from the scripted CT words
+        # exactly the way charge/discharge accumulate from the applied
+        # objective -- watt-seconds over the injected clock, deterministic.
+        self._grid_buy_watt_seconds = 0.0
+        self._grid_sell_watt_seconds = 0.0
+        self._load_watt_seconds = 0.0
 
         # Identity through evidenced registers only: the RTU ID is one
         # low-word-first uint32, derived deterministically from the identity.
@@ -370,7 +377,30 @@ class SimulatedEnergyPod:
             self._accumulate(0, now - previous - live_seconds)
         else:
             self._accumulate(self._applied_active_w, now - previous)
+        # The CT accumulators follow the SCRIPTED site conditions over the
+        # whole interval, independent of any latched objective.
+        self._accumulate_ct(now - previous)
         self._last_poll_mono = now
+
+    def _accumulate_ct(self, seconds: float) -> None:
+        """Accumulate the scripted per-pod CT words into the grid/load pairs.
+
+        The sign contract is the live-proven one (negative grid = import,
+        positive = export): imports accrue the vendor's FIRST grid pair,
+        exports the SECOND, and load accrues only positive load power.  This
+        is the scorecard's reference model -- the pod's own counters carry
+        the site conditions whether or not any controller is watching.
+        """
+        if seconds <= 0.0:
+            return
+        grid_w = self._scripted_grid_power_w
+        if grid_w < 0:
+            self._grid_buy_watt_seconds += -grid_w * seconds
+        elif grid_w > 0:
+            self._grid_sell_watt_seconds += grid_w * seconds
+        load_w = self._scripted_load_power_w
+        if load_w > 0:
+            self._load_watt_seconds += load_w * seconds
 
     def _accumulate(self, power_w: int, seconds: float) -> None:
         if seconds <= 0.0:
@@ -479,12 +509,28 @@ class SimulatedEnergyPod:
     def _rebuild_dcdc_detail_block(self) -> None:
         self._blocks[_DCDC_DETAIL_BASE] = [0] * 19
 
+    def _grid_buy_counts(self) -> int:
+        counts = self._grid_buy_counts_base + int(
+            self._grid_buy_watt_seconds / _WATT_SECONDS_PER_COUNT
+        )
+        return min(_ENERGY_COUNT_CEILING - 1, counts)
+
+    def _grid_sell_counts(self) -> int:
+        counts = self._grid_sell_counts_base + int(
+            self._grid_sell_watt_seconds / _WATT_SECONDS_PER_COUNT
+        )
+        return min(_ENERGY_COUNT_CEILING - 1, counts)
+
+    def _load_counts(self) -> int:
+        counts = self._load_counts_base + int(self._load_watt_seconds / _WATT_SECONDS_PER_COUNT)
+        return min(_ENERGY_COUNT_CEILING - 1, counts)
+
     def _rebuild_totals_block(self) -> None:
         words: list[int] = []
         for counts in (
-            self._grid_buy_counts,
-            self._grid_sell_counts,
-            self._load_counts,
+            self._grid_buy_counts(),
+            self._grid_sell_counts(),
+            self._load_counts(),
             self._pv_counts,
             self._charge_energy_counts(),
             self._discharge_energy_counts(),

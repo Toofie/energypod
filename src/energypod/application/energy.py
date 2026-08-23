@@ -815,12 +815,22 @@ class EnergyAccountant:
         return baselines
 
     def _restore_baseline(self, baselines: Mapping[str, EnergyUnitBaseline]) -> None:
+        dates = {baseline.date for baseline in baselines.values()}
+        if len(dates) > 1:
+            # Units straddling different live days cannot be one site-day;
+            # the freshest process keeps only the latest (the earlier day
+            # was finalized or lost to the outage).
+            latest = max(dates)
+            baselines = {
+                unit: baseline for unit, baseline in baselines.items() if baseline.date == latest
+            }
+            dates = {latest}
         for unit, baseline in baselines.items():
             state = self._states.get(unit)
             if state is None:
                 continue
             self._live_date = baseline.date
-            self._live_offset_minutes = None
+            self._live_offset_minutes = self._midnight_offset_minutes(baseline.date)
             state.counter_start = dict(baseline.counter_start)
             state.counter_last = dict(baseline.counter_last)
             state.import_watt_seconds = baseline.import_watt_seconds

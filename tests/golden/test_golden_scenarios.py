@@ -1161,3 +1161,228 @@ async def test_identical_scripts_produce_identical_audit_and_bus_streams(
     assert left["bus_sequences"] == right["bus_sequences"]
     assert left["bus_sequences"] == list(range(1, len(left["bus_sequences"]) + 1))
     assert left["measured"] == right["measured"] == float(HEALTHY_DISPATCH_W)
+
+
+# --- energy scorecard golden reference (DESIGN_ENERGY_SCORECARD section 9, E6) --
+#
+# The deferred golden energy/SOC scenario (DEFERRED_FINDINGS item 3): a
+# scripted import-day / export-day / mixed-day-with-mid-day-restart against
+# EXACT expected kWh.  Every figure derives from the scripted trace alone:
+# 36 s at 10,000 W is exactly 360,000 Ws = 0.1 kWh -- one device-counter
+# quantum per interval for the pod's own accumulation, and one exact step of
+# the controller's zero-order-hold integration between consecutive polls.
+# The polls run through the composed actor (the real decode publishes the
+# observations); the accounting runs through the composed accountant's own
+# tick -- the same call the fleet loop makes.
+
+_ENERGY_INTERVAL_S = 36.0
+_ENERGY_STEP_W = 10_000
+_ENERGY_STEP_KWH = _ENERGY_STEP_W * _ENERGY_INTERVAL_S / 3_600_000.0  # 0.1 exactly
+_BRISBANE_MIDNIGHT_UTC = datetime(2026, 8, 21, 14, 0, 0, tzinfo=UTC)  # Aug 22 00:00 AEST
+
+
+def _energy_fleet_config(database: Path, *, timezone: str = "Australia/Brisbane") -> Any:
+    """The golden fleet config with the energy_scorecard block composed.
+
+    The gap (60 s) exceeds the control period and every scripted interval
+    (36 s); the coverage threshold is the commissioned default.
+    """
+    base = fleet_config(database).model_dump(mode="json")
+    base["site"]["timezone"] = timezone
+    base["energy_scorecard"] = {
+        "integration_max_gap_s": 60.0,
+        "min_day_coverage_pct": 95.0,
+    }
+    return ControllerConfig.model_validate(base)
+
+
+async def _energy_poll_and_tick(runtime: Any, clock: ManualClock, advance_s: float) -> Any:
+    clock.advance(advance_s)
+    actor = runtime.actors[UNIT_ID]
+    await actor.poll_once()
+    latest = await runtime.observations.all_latest()
+    await runtime.energy_accountant.tick(latest, adviser_active_targets=frozenset())
+    return await runtime.observations.latest(UNIT_ID)
+
+
+async def test_energy_scorecard_golden_days(tmp_path: Path) -> None:
+    """Import day -> export day -> mixed day with a mid-day restart, every
+    kWh figure exact against the scripted trace."""
+    clock = ManualClock()
+    clock.wall = _BRISBANE_MIDNIGHT_UTC  # local midnight, Aug 22, Brisbane
+    runtime = compose_runtime(_energy_fleet_config(tmp_path / "energy-golden.sqlite3"), clock)
+    await runtime.actors[UNIT_ID].start()
+    pod = runtime.simulators[UNIT_ID]
+    accountant = runtime.energy_accountant
+    assert accountant is not None
+
+    async def script_and_sample(watts: int, intervals: int) -> None:
+        pod.script_grid_power_w(watts)
+        for _ in range(intervals):
+            await _energy_poll_and_tick(runtime, clock, _ENERGY_INTERVAL_S)
+        pod.script_grid_power_w(0)
+
+    # --- day 1 (Aug 22): a pure import day, fully sampled from midnight ---
+    # The CT word is scripted BEFORE the midnight anchor poll so every one of
+    # the ten intervals integrates -10,000 W.
+    pod.script_grid_power_w(-_ENERGY_STEP_W)
+    await _energy_poll_and_tick(runtime, clock, 0.0)
+    for _ in range(10):
+        await _energy_poll_and_tick(runtime, clock, _ENERGY_INTERVAL_S)
+    pod.script_grid_power_w(0)
+
+    day1 = accountant.today_summary()
+    unit = day1.units[UNIT_ID]
+    assert unit.grid_import_kwh == pytest.approx(10 * _ENERGY_STEP_KWH), "1.0 kWh"
+    assert unit.grid_export_kwh == pytest.approx(0.0)
+    # The device counters accrued the same ten quanta over the same window.
+    assert day1.counter_cross_check is not None
+    assert day1.counter_cross_check.grid_a_delta_kwh == pytest.approx(1.0)
+    assert day1.counter_cross_check.grid_b_delta_kwh == pytest.approx(0.0)
+    # No export side -> the day cannot discriminate (A-1, section 3).
+    assert day1.counter_cross_check.discriminating is False
+    assert unit.coverage_pct == pytest.approx(100.0, abs=0.01)
+
+    # --- day 2 (Aug 23): a pure export day; the roll lands at local midnight.
+    # The export word is scripted BEFORE the midnight anchor poll (the
+    # inter-day jump lands in the new day's counter BASELINE only -- a
+    # baseline is never a delta).
+    pod.script_grid_power_w(_ENERGY_STEP_W)
+    await _energy_poll_and_tick(
+        runtime, clock, 86_400.0 - 10 * _ENERGY_INTERVAL_S
+    )  # exactly local midnight Aug 23
+    rolled = runtime.energy_accountant.live_day
+    assert rolled is not None and rolled.isoformat() == "2026-08-23"
+    # Day 1 is durable and complete.
+    days = await runtime.facade.get_energy_days(principal=OPERATOR, limit=8)
+    assert [day["date"] for day in days["days"]] == ["2026-08-22"]
+    assert days["days"][0]["kind"] == "complete"
+    assert days["grid_counter_roles"] == "unpinned"
+
+    for _ in range(10):
+        await _energy_poll_and_tick(runtime, clock, _ENERGY_INTERVAL_S)
+    pod.script_grid_power_w(-_ENERGY_STEP_W)
+    day2_live = accountant.today_summary()
+    assert day2_live.units[UNIT_ID].grid_export_kwh == pytest.approx(1.0)
+    assert day2_live.units[UNIT_ID].grid_import_kwh == pytest.approx(0.0)
+
+    # --- day 3 (Aug 24): import morning, controller restart, export evening ---
+    await _energy_poll_and_tick(
+        runtime, clock, 86_400.0 - 10 * _ENERGY_INTERVAL_S
+    )  # exactly local midnight Aug 24 (import already scripted)
+    assert accountant.live_day is not None and accountant.live_day.isoformat() == "2026-08-24"
+    for _ in range(5):
+        await _energy_poll_and_tick(runtime, clock, _ENERGY_INTERVAL_S)
+    pod.script_grid_power_w(0)
+
+    # The restart: a FRESH accountant over the SAME durable ledger and the
+    # same fleet -- the exact seam the fleet loop drives -- composed 360 s
+    # later (an outage above the commissioned 60 s gap: excluded from the
+    # integration, never interpolated; the device itself kept counting, but
+    # the CT word was 0 through the outage so nothing diverged).
+    from energypod.application.energy import EnergyAccountant, EnergyAccountingSettings
+
+    restarted_accountant = EnergyAccountant(
+        unit_ids=(UNIT_ID,),
+        timezone="Australia/Brisbane",
+        settings=EnergyAccountingSettings(integration_max_gap_s=60.0, min_day_coverage_pct=95.0),
+        clock=runtime.clock,
+        ledger=runtime.energy_ledger,
+        bus=runtime.event_bus,
+    )
+    assert restarted_accountant.live_day is not None
+    assert restarted_accountant.live_day.isoformat() == "2026-08-24", (
+        "the durable baseline restored the live day"
+    )
+    restored = restarted_accountant.today_summary()
+    assert restored.units[UNIT_ID].grid_import_kwh == pytest.approx(0.5), (
+        "the morning's integration survived the restart"
+    )
+
+    async def restarted_poll_and_tick(advance_s: float) -> None:
+        clock.advance(advance_s)
+        await runtime.actors[UNIT_ID].poll_once()
+        latest = await runtime.observations.all_latest()
+        await restarted_accountant.tick(latest, adviser_active_targets=frozenset())
+
+    # A 0 W anchor poll closes the 360 s outage window; then the export evening.
+    await restarted_poll_and_tick(360.0)
+    pod.script_grid_power_w(_ENERGY_STEP_W)
+    for _ in range(6):
+        await restarted_poll_and_tick(_ENERGY_INTERVAL_S)
+    pod.script_grid_power_w(0)
+
+    # Roll day 3 at the next local midnight (the export word cleared).
+    await restarted_poll_and_tick(86_400.0 - (540.0 + 6 * _ENERGY_INTERVAL_S))
+    assert restarted_accountant.live_day is not None
+    assert restarted_accountant.live_day.isoformat() == "2026-08-25"
+
+    days = await runtime.facade.get_energy_days(principal=OPERATOR, limit=8)
+    by_date = {day["date"]: day for day in days["days"]}
+    assert set(by_date) == {"2026-08-22", "2026-08-23", "2026-08-24"}, sorted(by_date)
+    day3 = by_date["2026-08-24"]
+    day3_unit = day3["units"][UNIT_ID]
+    # 0.5 kWh imported and 0.5 kWh exported across the restart; the outage
+    # contributed nothing (never interpolated).
+    assert day3_unit["grid_import_kwh"] == pytest.approx(0.5)
+    assert day3_unit["grid_export_kwh"] == pytest.approx(0.5)
+    # The outage left the day below the coverage threshold -> partial.
+    assert day3_unit["coverage_pct"] == pytest.approx(100.0 * 396.0 / 756.0, abs=0.01)
+    assert day3["kind"] == "partial"
+    assert day3_unit["metric_flags"] == []
+    assert day3["counter_cross_check"]["discriminating"] is False, (
+        "a sub-threshold-coverage day never discriminates"
+    )
+    # Days are immutable and newest-last.
+    assert [day["date"] for day in days["days"]] == [
+        "2026-08-22",
+        "2026-08-23",
+        "2026-08-24",
+    ]
+    assert days["solar_production_measured"] is False
+
+
+async def test_energy_scorecard_golden_dst_day_is_honest(tmp_path: Path) -> None:
+    """Sydney 2026-10-04: DST starts at 02:00 local -- a 23-hour day.  The
+    day rolls at LOCAL midnight however many UTC hours the day held, and
+    each record stores its own midnight's utc_offset_minutes."""
+    from zoneinfo import ZoneInfo
+
+    sydney = ZoneInfo("Australia/Sydney")
+    dst_day_midnight = datetime(2026, 10, 4, 0, 0, tzinfo=sydney).astimezone(UTC)
+    next_midnight = datetime(2026, 10, 5, 0, 0, tzinfo=sydney).astimezone(UTC)
+    assert (next_midnight - dst_day_midnight) == timedelta(hours=23), (
+        "2026-10-04 is Sydney's 23-hour spring-forward day"
+    )
+
+    clock = ManualClock()
+    clock.wall = dst_day_midnight
+    runtime = compose_runtime(
+        _energy_fleet_config(tmp_path / "energy-dst.sqlite3", timezone="Australia/Sydney"),
+        clock,
+    )
+    await runtime.actors[UNIT_ID].start()
+    pod = runtime.simulators[UNIT_ID]
+
+    pod.script_grid_power_w(-_ENERGY_STEP_W)
+    await _energy_poll_and_tick(runtime, clock, 0.0)
+    for _ in range(10):
+        await _energy_poll_and_tick(runtime, clock, _ENERGY_INTERVAL_S)
+    pod.script_grid_power_w(0)
+
+    live = runtime.energy_accountant
+    assert live is not None
+    today = live.today_summary()
+    assert today.utc_offset_minutes == 600, "Oct 4 midnight is still AEST (+10)"
+    assert today.units[UNIT_ID].grid_import_kwh == pytest.approx(1.0)
+
+    # Jump across the local midnight that arrives only 23 wall hours later.
+    await _energy_poll_and_tick(
+        runtime, clock, (next_midnight - dst_day_midnight).total_seconds() - 10 * _ENERGY_INTERVAL_S
+    )
+    assert live.live_day is not None and live.live_day.isoformat() == "2026-10-05"
+    rolled = live.today_summary()
+    assert rolled.utc_offset_minutes == 660, "Oct 5 midnight is AEDT (+11)"
+    days = await runtime.facade.get_energy_days(principal=OPERATOR, limit=8)
+    assert days["days"][0]["date"] == "2026-10-04"
+    assert days["days"][0]["utc_offset_minutes"] == 600

@@ -746,3 +746,110 @@ async def test_no_socket_is_ever_opened(simulator: Any, monkeypatch: pytest.Monk
     clock.advance(0.1)
     assert_follows_direction(await measured_battery_watts(pod, transport), 400)
     await transport.close()
+
+
+# --- energy scorecard (E6): the totals block accumulates from the scripted CT --
+#
+# DESIGN_ENERGY_SCORECARD section 9 family 8: the simulator's grid and load
+# counter pairs ACCUMULATE from the scripted CT words exactly the way the
+# charge/discharge pair accumulates from the applied objective
+# (`_accumulate` precedent, DEFERRED_FINDINGS item 3's reference model) --
+# deterministic, seeded statics as the base, watt-seconds over the injected
+# clock, low-word-first uint32 x 0.1 served words.
+
+_TOTALS_BASE = 0x4101
+
+
+def _totals_counts(registers: tuple[int, ...]) -> tuple[int, ...]:
+    """The six uint32 counts of the served totals block, low word first."""
+    return tuple(
+        (int(registers[pair * 2 + 1]) << 16) | int(registers[pair * 2]) for pair in range(6)
+    )
+
+
+async def test_scripted_grid_ct_accumulates_into_the_grid_counter_pairs(
+    simulator: Any,
+) -> None:
+    """36 s at -10,000 W is exactly 0.1 kWh: one counter quantum per interval,
+    buy pair for imports (negative grid), sell pair for exports."""
+    pod, _transport, clock = build_unit(simulator)
+    pod.script_grid_power_w(-10_000)
+    before = _totals_counts(pod.read(_TOTALS_BASE, 12))
+
+    for _ in range(10):
+        clock.advance(36.0)
+        pod.poll()
+    after = _totals_counts(pod.read(_TOTALS_BASE, 12))
+
+    deltas = [later - earlier for earlier, later in zip(before, after, strict=True)]
+    assert deltas[0] == 10, "pair 0 (vendor grid pair A) accrued 10 x 0.1 kWh"
+    assert deltas[1] == 0, "the export pair does not move while importing"
+    assert deltas[4] == 0 and deltas[5] == 0, "no battery objective was applied"
+
+    pod.script_grid_power_w(10_000)
+    export_before = _totals_counts(pod.read(_TOTALS_BASE, 12))
+    clock.advance(36.0)
+    pod.poll()
+    export_after = _totals_counts(pod.read(_TOTALS_BASE, 12))
+    export_deltas = [
+        later - earlier for earlier, later in zip(export_before, export_after, strict=True)
+    ]
+    assert export_deltas[0] == 0
+    assert export_deltas[1] == 1, "pair 1 (vendor grid pair B) accrued the export"
+
+
+async def test_scripted_load_ct_accumulates_into_the_load_counter(simulator: Any) -> None:
+    pod, _transport, clock = build_unit(simulator)
+    pod.script_load_power_w(5_000)
+    before = _totals_counts(pod.read(_TOTALS_BASE, 12))
+
+    clock.advance(72.0)  # 5000 W x 72 s = 360000 Ws = exactly 0.1 kWh
+    pod.poll()
+    after = _totals_counts(pod.read(_TOTALS_BASE, 12))
+
+    deltas = [later - earlier for earlier, later in zip(before, after, strict=True)]
+    assert deltas[2] == 1, "the load counter accrued exactly one 0.1 kWh quantum"
+    assert deltas[0] == 0 and deltas[1] == 0
+
+
+async def test_idle_ct_words_never_accumulate(simulator: Any) -> None:
+    """The default scripted CT words are 0 W: the seeded statics stand still,
+    so the pinned register images of a quiet pod are unchanged."""
+    pod, _transport, clock = build_unit(simulator)
+    before = _totals_counts(pod.read(_TOTALS_BASE, 12))
+    for _ in range(5):
+        clock.advance(36.0)
+        pod.poll()
+    after = _totals_counts(pod.read(_TOTALS_BASE, 12))
+    assert before == after
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "fragment"),
+    [
+        ({"identity": ""}, "identity"),
+        ({"identity": "  "}, "identity"),
+        ({"identity": 42}, "identity"),
+        ({"bic_count": 0}, "bic_count"),
+        ({"bic_count": 7}, "bic_count"),
+        ({"bic_count": True}, "bic_count"),
+        ({"seed": "7"}, "seed"),
+        ({"seed": 1.5}, "seed"),
+        ({"watchdog_timeout_s": 0}, "watchdog"),
+        ({"watchdog_timeout_s": -1.0}, "watchdog"),
+        ({"watchdog_timeout_s": float("nan")}, "watchdog"),
+        ({"watchdog_timeout_s": True}, "watchdog"),
+        ({"cell_poll_interval_s": 0}, "cell_poll"),
+        ({"cell_poll_interval_s": float("inf")}, "cell_poll"),
+        ({"cell_poll_interval_s": "5"}, "cell_poll"),
+    ],
+)
+def test_constructor_validates_every_commissioning_shape(
+    simulator: Any, kwargs: dict[str, Any], fragment: str
+) -> None:
+    """DEFERRED_FINDINGS item 4's open half: the constructor-validation matrix.
+    Every malformed shape is refused at construction -- a pod built from it
+    could never present a coherent register bank."""
+    clock = FakeMonotonicClock()
+    with pytest.raises((TypeError, ValueError), match=fragment):
+        simulator.SimulatedEnergyPod(clock=clock, **kwargs)
