@@ -175,9 +175,11 @@
 @media (min-width: 78rem) {
   /* The four-column row: the lead is the framed first column again. Equal
      tracks, deliberately (the round-2 law above); auto-fit so a two-pod site
-     collapses to three honest columns instead of leaving a hole. */
+     collapses to three honest columns instead of leaving a hole — the 18rem
+     floor is measured so FOUR tracks fit the borrowed width (a 19rem floor
+     leaves room for three and wraps the fourth to a lonely second row). */
   .flow-diagram {
-    grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
   }
 
   .flow-phase--fleet {
