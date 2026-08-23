@@ -11,7 +11,6 @@
   gap: 1rem;
   max-width: 46rem;
   margin: 0 auto;
-  padding: 1rem;
 }
 
 /* --- the four facts -------------------------------------------------------- */
@@ -167,15 +166,6 @@
   cursor: pointer;
 }
 
-.now-controls button:focus-visible,
-.stop-ack button:focus-visible,
-.refetch-error button:focus-visible,
-.load-error button:focus-visible,
-.dialog-actions button:focus-visible {
-  outline: 3px solid #2c5282;
-  outline-offset: 2px;
-}
-
 .now-controls button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
@@ -252,20 +242,12 @@
   color: #9b2c2c;
 }
 
-/* --- dialogs: a real layer, not inline markup -------------------------------- */
+/* --- dialogs: the shared layer (styles.css `.dialog-backdrop`) + this view's
+       panel. The panel rules are scoped to the view so the Batteries view's
+       own `.dialog` panel (a different visual contract) can never collide
+       with them — both files are plain global CSS once bundled. ----------- */
 
-.dialog-backdrop {
-  position: fixed;
-  inset: 0;
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
-  padding: 3rem 1rem 2rem;
-  background: rgb(35 30 20 / 55%);
-  z-index: 40;
-}
-
-.dialog {
+.now-view .dialog {
   width: min(30rem, 100%);
   max-height: min(34rem, calc(100vh - 5rem));
   overflow: auto;
@@ -276,13 +258,13 @@
   box-shadow: 0 12px 32px rgb(40 32 18 / 25%);
 }
 
-.dialog h3 {
+.now-view .dialog h3 {
   margin: 0 0 0.75rem;
   font-size: 1.1rem;
   color: #3f3a30;
 }
 
-.dialog h4 {
+.now-view .dialog h4 {
   margin: 0.9rem 0 0.4rem;
   font-size: 0.9rem;
   letter-spacing: 0.04em;
@@ -290,12 +272,12 @@
   color: #78716c;
 }
 
-.dialog ul {
+.now-view .dialog ul {
   margin: 0 0 0.5rem;
   padding-left: 1.1rem;
 }
 
-.dialog p {
+.now-view .dialog p {
   margin: 0.35rem 0;
 }
 
@@ -304,14 +286,14 @@
   color: #57534e;
 }
 
-.dialog-actions {
+.now-view .dialog-actions {
   display: flex;
   justify-content: flex-end;
   gap: 0.6rem;
   margin-top: 1rem;
 }
 
-.dialog-actions button {
+.now-view .dialog-actions button {
   font: inherit;
   padding: 0.35rem 1.1rem;
   border: 1px solid #b8b2a7;
@@ -322,14 +304,9 @@
 }
 
 /* The destructive confirmations are unmistakable. */
-.dialog-actions button:last-child {
+.now-view .dialog-actions button:last-child {
   font-weight: 700;
   letter-spacing: 0.02em;
-}
-
-.dialog:focus-visible {
-  outline: 3px solid #2c5282;
-  outline-offset: 2px;
 }
 
 /* --- dispatch form ----------------------------------------------------------- */
@@ -355,7 +332,6 @@
 }
 
 .dispatch-fields input[type="text"]:focus-visible {
-  outline: 3px solid #2c5282;
   outline-offset: 1px;
 }
 
@@ -420,7 +396,6 @@
 }
 
 .stop-ack input:focus-visible {
-  outline: 3px solid #2c5282;
   outline-offset: 1px;
 }
 

@@ -601,7 +601,7 @@ describe("NowView — current request card", () => {
     expect(screen.getByText("The request could not be completed")).toBeInTheDocument();
 
     api.client.getSnapshot.mockResolvedValue(snapshotEnvelope([ACTIVE_MID]));
-    await user.click(screen.getByRole("button", { name: /retry/i }));
+    await user.click(screen.getByRole("button", { name: /try again/i }));
 
     expect(await screen.findByRole("group", { name: "Requested" })).toBeInTheDocument();
     expect(api.client.getSnapshot).toHaveBeenCalledTimes(2);

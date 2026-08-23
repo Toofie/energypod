@@ -115,7 +115,7 @@ function tickStepMs(rangeMs: number): number {
 function axisValues(unit: ChartUnit): (value: number) => string {
   switch (unit) {
     case "watts":
-      return (v) => `${Math.round(v / 100) / 10}k W`;
+      return (v) => `${Math.round(v / 100) / 10} kW`;
     case "volts":
       return (v) => `${v.toFixed(1)} V`;
     case "millivolts":

@@ -482,7 +482,7 @@ describe("FlowView — honesty", () => {
     const alert = await screen.findByRole("alert");
     expectVisibleText(alert, /network_error/);
     expectVisibleText(alert, /The EnergyPod service could not be reached/);
-    expect(screen.getByRole("button", { name: "Retry" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeVisible();
   });
 });
 

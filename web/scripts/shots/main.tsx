@@ -86,6 +86,10 @@ if (viewId === null || stateId === null) {
                 body: state.historyRefusal.body,
               },
             }),
+        ...(state.audit === undefined ? {} : { audit: state.audit }),
+        ...(state.schedule === undefined ? {} : { schedule: state.schedule }),
+        ...(state.energyDays === undefined ? {} : { energyDays: state.energyDays }),
+        ...(state.objectives === undefined ? {} : { objectives: state.objectives }),
       },
     );
     createRoot(root).render(

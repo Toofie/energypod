@@ -10,7 +10,6 @@
   gap: 1rem;
   max-width: 52rem;
   margin: 0 auto;
-  padding: 1rem;
 }
 
 .schedule-card {
@@ -468,6 +467,8 @@
   padding: 0.4rem 0.9rem;
 }
 
+/* The shell's shared clip utility (styles.css) — the night dialog's
+   acknowledgement label uses it. */
 .schedule-visually-hidden {
   position: absolute;
   width: 1px;

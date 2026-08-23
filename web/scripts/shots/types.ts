@@ -6,6 +6,7 @@
  * rendered from real wire shapes — the same factories the behavior suites
  * assert against, never a shape invented for the camera.
  */
+import type { WireAuditEvent } from "../../src/test/wire";
 import type { WireSnapshot } from "../../src/test/wire";
 
 /** One named, deterministic state of one view. */
@@ -35,4 +36,27 @@ export interface ShotStateDefinition {
    * for the not-commissioned shot: the view reads its honest 409 state.
    */
   readonly historyRefusal?: { status: number; body: Record<string, unknown> };
+  /**
+   * The seeded audit page (GET /api/v1/audit, built from the shared wire
+   * fixtures): present only for views that read the audit trail — absent
+   * means the seeded world answers an empty page (Activity's honest empty
+   * state is a real picture too).
+   */
+  readonly audit?: () => readonly WireAuditEvent[];
+  /**
+   * The seeded GET /api/v1/schedule 200 body (wire.ts `getScheduleOk`).
+   * Absent means the route refuses loudly — the Schedule view's honest
+   * not-commissioned state on camera.
+   */
+  readonly schedule?: () => Record<string, unknown>;
+  /**
+   * The seeded GET /api/v1/energy/days 200 body (wire.ts
+   * `getEnergyDaysOk`). Absent means the route refuses loudly.
+   */
+  readonly energyDays?: () => Record<string, unknown>;
+  /**
+   * The seeded GET /api/v1/objectives/observed 200 body (wire.ts
+   * `getObservedObjectivesOk`). Absent means the route refuses loudly.
+   */
+  readonly objectives?: () => Record<string, unknown>;
 }

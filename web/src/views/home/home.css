@@ -9,7 +9,6 @@
   gap: 1rem;
   max-width: 46rem;
   margin: 0 auto;
-  padding: 1rem;
 }
 
 /* The polite live region is visually quiet but never display:none, so screen
@@ -714,12 +713,8 @@
   cursor: pointer;
 }
 
-/* Keyboard visibility for every control. */
-.home-factor-reveal:focus-visible,
-.home-retry:focus-visible {
-  outline: 3px solid #2c5282;
-  outline-offset: 2px;
-}
+/* Keyboard visibility rides the shell's one global focus ring
+   (styles.css `:focus-visible`); nothing view-local overrides its color. */
 
 @media (prefers-reduced-motion: no-preference) {
   .home-card {

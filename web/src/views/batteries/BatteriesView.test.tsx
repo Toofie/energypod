@@ -906,7 +906,7 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("group", { name: "MID" })).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: /retry/i }));
+    await user.click(screen.getByRole("button", { name: /try again/i }));
     expect(
       await screen.findByRole("group", { name: "MID" }),
     ).toBeInTheDocument();

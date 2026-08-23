@@ -236,7 +236,7 @@ export function AppShell({ views = {} }: AppShellProps): ReactElement {
               <span>{data.snapshotError.code}</span> — <span>{data.snapshotError.message}</span>
             </p>
             <button type="button" onClick={data.retrySnapshot}>
-              Retry
+              Try again
             </button>
           </div>
         )}

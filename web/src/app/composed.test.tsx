@@ -1521,7 +1521,7 @@ describe("Composed console — the measured-data heartbeat", () => {
     const failureAlert = screen.getByText("network_error").closest('[role="alert"]');
     expect(failureAlert).not.toBeNull();
     expect(failureAlert?.textContent ?? "").toContain("The EnergyPod service could not be reached");
-    expect(within(failureAlert as HTMLElement).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(within(failureAlert as HTMLElement).getByRole("button", { name: "Try again" })).toBeInTheDocument();
 
     harness.snapshotRefusal = null;
     harness.world = worldIntentAt(4180, { requested: 1200, authorized: 1200, measured: 640 });

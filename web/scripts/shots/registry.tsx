@@ -6,10 +6,24 @@
  * page's manifest and needs no changes.
  */
 import type { ShellView } from "../../src/app/views";
+import { ActivityView } from "../../src/views/activity/ActivityView";
+import { BatteriesView } from "../../src/views/batteries/BatteriesView";
 import { FlowView } from "../../src/views/flow/FlowView";
 import { HistoryView } from "../../src/views/history/HistoryView";
+import { HomeView } from "../../src/views/home/HomeView";
+import { InsightsView } from "../../src/views/insights/InsightsView";
+import { NowView } from "../../src/views/now/NowView";
+import { ObjectivesView } from "../../src/views/objectives/ObjectivesView";
+import { ScheduleView } from "../../src/views/schedule/ScheduleView";
+import { ACTIVITY_STATES } from "./states/activity";
+import { BATTERIES_STATES } from "./states/batteries";
 import { FLOW_STATES } from "./states/flow";
 import { HISTORY_STATES } from "./states/history";
+import { HOME_STATES } from "./states/home";
+import { INSIGHTS_STATES } from "./states/insights";
+import { NOW_STATES } from "./states/now";
+import { OBJECTIVES_STATES } from "./states/objectives";
+import { SCHEDULE_STATES } from "./states/schedule";
 import type { ShotStateDefinition } from "./types";
 
 /** One shootable view: the real component plus its state matrix. */
@@ -44,6 +58,13 @@ export const SHOT_VIEWPORTS: readonly ShotViewport[] = [
 ];
 
 export const SHOT_VIEWS: readonly ShotViewDefinition[] = [
+  { id: "home", label: "Home", Component: HomeView, states: HOME_STATES },
+  { id: "batteries", label: "Batteries", Component: BatteriesView, states: BATTERIES_STATES },
   { id: "flow", label: "Flow", Component: FlowView, states: FLOW_STATES },
   { id: "history", label: "History", Component: HistoryView, states: HISTORY_STATES },
+  { id: "now", label: "Now", Component: NowView, states: NOW_STATES },
+  { id: "schedule", label: "Schedule", Component: ScheduleView, states: SCHEDULE_STATES },
+  { id: "activity", label: "Activity", Component: ActivityView, states: ACTIVITY_STATES },
+  { id: "insights", label: "Insights", Component: InsightsView, states: INSIGHTS_STATES },
+  { id: "objectives", label: "Objectives", Component: ObjectivesView, states: OBJECTIVES_STATES },
 ];

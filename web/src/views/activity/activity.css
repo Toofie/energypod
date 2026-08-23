@@ -1,25 +1,38 @@
 /* Activity view styles — calm household console, never an engineering panel.
  * Color is always accompanied by text; stale values are dimmed, not hidden;
- * motion is gentle and disabled under prefers-reduced-motion. */
+ * motion is gentle and disabled under prefers-reduced-motion.
+ *
+ * The palette is the shell's own token family (styles.css `:root`) — the same
+ * ink, lines, and surfaces every view shares, so switching to Activity from
+ * Flow or History never swaps color worlds. Focus rings ride the shell's one
+ * global `:focus-visible` rule. */
 
 .activity-view {
   max-width: 46rem;
   margin: 0 auto;
-  padding: 1.25rem 1rem 3rem;
   display: flex;
   flex-direction: column;
   gap: 1rem;
 }
 
+/* The view's own title repeats the shell's h1 exactly ("Activity"): the
+ * region keeps its accessible name (the h2 stays, labelled-by keeps working),
+ * and the operator reads the word once. */
 .activity-view__header h2 {
-  margin: 0;
-  font-size: 1.5rem;
-  letter-spacing: 0.01em;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .activity-view__intro {
-  margin: 0.25rem 0 0;
-  color: #5c6470;
+  margin: 0;
+  color: var(--ink-soft);
   font-size: 0.95rem;
 }
 
@@ -27,7 +40,7 @@
 
 .activity-notice {
   border: 1px solid #e3c98f;
-  background: #fdf6e7;
+  background: var(--warn-surface);
   border-radius: 0.75rem;
   padding: 0.75rem 1rem;
   display: flex;
@@ -39,12 +52,12 @@
 .activity-notice__title {
   margin: 0;
   font-weight: 600;
-  color: #6d5518;
+  color: var(--warn);
 }
 
 .activity-notice__body {
   margin: 0;
-  color: #5c6470;
+  color: var(--ink-soft);
   font-size: 0.9rem;
 }
 
@@ -55,16 +68,16 @@
   font-size: 0.9rem;
   padding: 0.4rem 0.9rem;
   border-radius: 999px;
-  border: 1px solid #9db2c8;
-  background: #ffffff;
-  color: #243447;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
   cursor: pointer;
 }
 
 .activity-notice__retry:hover:not(:disabled),
 .activity-error__retry:hover:not(:disabled),
 .activity-load-more:hover:not(:disabled) {
-  background: #f2f7fb;
+  border-color: var(--focus);
 }
 
 .activity-notice__retry:disabled,
@@ -94,29 +107,20 @@
   font-size: 0.85rem;
   padding: 0.3rem 0.8rem;
   border-radius: 999px;
-  border: 1px solid #c8d0da;
-  background: #ffffff;
-  color: #37414e;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--ink);
   cursor: pointer;
 }
 
 .activity-chip:hover {
-  background: #f2f7fb;
+  border-color: var(--focus);
 }
 
 .activity-chip[aria-pressed="true"] {
-  background: #243447;
-  border-color: #243447;
+  background: var(--ink);
+  border-color: var(--ink);
   color: #ffffff;
-}
-
-.activity-chip:focus-visible,
-.activity-notice__retry:focus-visible,
-.activity-error__retry:focus-visible,
-.activity-load-more:focus-visible,
-.activity-entry__toggle:focus-visible {
-  outline: 2px solid #2f6fb2;
-  outline-offset: 2px;
 }
 
 /* Loading skeleton ---------------------------------------------------------- */
@@ -129,7 +133,7 @@
 
 .activity-loading__text {
   margin: 0;
-  color: #5c6470;
+  color: var(--ink-soft);
   font-size: 0.9rem;
 }
 
@@ -145,8 +149,8 @@
 .activity-loading__row {
   height: 4.25rem;
   border-radius: 0.75rem;
-  border: 1px solid #e2e7ee;
-  background: linear-gradient(100deg, #f4f6f9 40%, #e9edf3 50%, #f4f6f9 60%);
+  border: 1px solid var(--line);
+  background: linear-gradient(100deg, var(--surface) 40%, var(--line) 50%, var(--surface) 60%);
   background-size: 200% 100%;
   animation: activity-shimmer 1.6s ease-in-out infinite;
 }
@@ -182,9 +186,9 @@
 }
 
 .activity-entry {
-  border: 1px solid #e2e7ee;
+  border: 1px solid var(--line);
   border-radius: 0.75rem;
-  background: #ffffff;
+  background: var(--card);
   padding: 0.75rem 0.9rem;
   display: flex;
   flex-direction: column;
@@ -192,8 +196,8 @@
 }
 
 .activity-entry--stale {
-  border-color: #dcd3c0;
-  background: #fdfbf6;
+  border-color: #d9cfae;
+  background: #fdfaf1;
 }
 
 .activity-entry__head {
@@ -206,14 +210,14 @@
 
 .activity-entry__kind {
   font-weight: 600;
-  color: #243447;
+  color: var(--ink);
 }
 
 .activity-entry__unit {
   font-size: 0.78rem;
   font-weight: 600;
   letter-spacing: 0.04em;
-  color: #33587a;
+  color: var(--active);
   border: 1px solid #c9d8e6;
   border-radius: 0.4rem;
   padding: 0.05rem 0.4rem;
@@ -221,23 +225,23 @@
 
 .activity-entry__age {
   margin-left: auto;
-  color: #6b7480;
+  color: var(--ink-soft);
   font-size: 0.85rem;
 }
 
 .activity-entry--stale .activity-entry__age {
-  color: #8a6d2f;
+  color: var(--warn);
   font-weight: 600;
 }
 
 .activity-entry__who {
   margin: 0;
-  color: #5c6470;
+  color: var(--ink-soft);
   font-size: 0.9rem;
 }
 
 .activity-entry__principal {
-  color: #243447;
+  color: var(--ink);
   font-weight: 600;
 }
 
@@ -256,13 +260,13 @@
 }
 
 .activity-entry__fact dt {
-  color: #6b7480;
+  color: var(--ink-soft);
   font-size: 0.82rem;
 }
 
 .activity-entry__fact dd {
   margin: 0;
-  color: #243447;
+  color: var(--ink);
 }
 
 .activity-entry__technical {
@@ -277,19 +281,19 @@
   font-size: 0.82rem;
   padding: 0.25rem 0.7rem;
   border-radius: 999px;
-  border: 1px solid #c8d0da;
-  background: #f7f9fb;
-  color: #37414e;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink);
   cursor: pointer;
 }
 
 .activity-entry__toggle:hover {
-  background: #eef3f8;
+  border-color: var(--focus);
 }
 
 .activity-entry__detail {
   font-size: 0.82rem;
-  color: #5c6470;
+  color: var(--ink-soft);
 }
 
 .activity-entry__codes code {
@@ -303,7 +307,7 @@
 /* Empty / filtered empty -------------------------------------------------------- */
 
 .activity-empty {
-  border: 1px dashed #d4dae2;
+  border: 1px dashed #cdd4dd;
   border-radius: 0.75rem;
   padding: 1.5rem 1.25rem;
   text-align: center;
@@ -315,30 +319,30 @@
 .activity-empty__title {
   margin: 0;
   font-size: 1.05rem;
-  color: #243447;
+  color: var(--ink);
 }
 
 .activity-empty__body,
 .activity-empty__first {
   margin: 0;
-  color: #5c6470;
+  color: var(--ink-soft);
   font-size: 0.9rem;
 }
 
 .activity-filtered-empty {
   margin: 0;
-  border: 1px dashed #d4dae2;
+  border: 1px dashed #cdd4dd;
   border-radius: 0.75rem;
   padding: 1.25rem;
   text-align: center;
-  color: #5c6470;
+  color: var(--ink-soft);
 }
 
 /* Errors ------------------------------------------------------------------------ */
 
 .activity-error {
-  border: 1px solid #ddb6b6;
-  background: #fdf3f3;
+  border: 1px solid #e5bcb6;
+  background: #fdf3f2;
   border-radius: 0.75rem;
   padding: 0.75rem 1rem;
   display: flex;
@@ -350,14 +354,14 @@
 .activity-error__title {
   margin: 0;
   font-weight: 600;
-  color: #6d3030;
+  color: var(--no);
 }
 
 .activity-error__code,
 .activity-error__message,
 .activity-error__request {
   margin: 0;
-  color: #5c6470;
+  color: var(--ink-soft);
   font-size: 0.9rem;
 }
 

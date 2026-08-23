@@ -1838,7 +1838,7 @@ export function NowView({ client }: NowViewProps) {
               setSnapshotNonce((nonce) => nonce + 1);
             }}
           >
-            Retry
+            Try again
           </button>
         </div>
       ) : snapshot === null ? (
@@ -2092,7 +2092,7 @@ export function NowView({ client }: NowViewProps) {
               setSnapshotNonce((nonce) => nonce + 1);
             }}
           >
-            Retry
+            Try again
           </button>
         </div>
       ) : null}

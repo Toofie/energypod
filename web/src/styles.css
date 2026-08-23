@@ -399,6 +399,24 @@ button:disabled {
   white-space: nowrap;
 }
 
+/*
+ * The console's one clip utility: an element that stays in the accessibility
+ * tree (a region label, a heading) but never paints. Views use it for their
+ * own title when it repeats the shell's h1 exactly — the operator reads the
+ * word once, the section keeps its accessible name.
+ */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
 .urgent-announcements {
   border-left: 4px solid var(--no);
   background: #fdf3f2;
@@ -433,6 +451,31 @@ button:disabled {
 main h1 {
   font-size: 1.35rem;
   margin: 0.5rem 0 1rem;
+}
+
+/*
+ * --- the view-column rhythm ------------------------------------------------
+ * The shell owns the gutter (its own padding) and the h1; every view aligns
+ * its column to the h1's left edge (no view-level side padding) and centers
+ * its own measure. The reading views (Home, Now, Activity, Insights) hold
+ * 46rem, the editor/data views (Schedule, Batteries, History, Objectives)
+ * hold 52–60rem, and Flow owns its wide stage (its CSS breaks it out past
+ * the shell column at the four-column breakpoint).
+ */
+
+/* --- the shared dialog layer ------------------------------------------------
+ * One overlay treatment for every dialog in the console (Now's dialogs and
+ * Batteries' acknowledgement dialog both mount inside this layer; the panel
+ * styles stay per-view). */
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 3rem 1rem 2rem;
+  background: rgb(35 30 20 / 55%);
+  z-index: 40;
 }
 
 /* The last known picture stays visible while disconnected — dimmed, not gone. */

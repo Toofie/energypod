@@ -817,7 +817,7 @@ export function FlowView({ client }: FlowViewProps) {
           </p>
           <p>{failure?.message ?? "The flow picture could not be loaded."}</p>
           <button type="button" onClick={retry}>
-            Retry
+            Try again
           </button>
         </div>
       </section>

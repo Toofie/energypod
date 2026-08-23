@@ -22,7 +22,7 @@
 import { ApiClientError } from "../../src/api/client";
 import type { ApiClient, StreamEvent } from "../../src/api/client";
 import { auditPage, health, snapshotFrame } from "../../src/test/wire";
-import type { WireSnapshot } from "../../src/test/wire";
+import type { WireAuditEvent, WireSnapshot } from "../../src/test/wire";
 
 /** The harness client: the full ApiClient surface plus the readiness gate. */
 export type SeededClient = ApiClient & { readonly ready: Promise<void> };
@@ -54,26 +54,49 @@ export function seededClient(
     connection?: "live" | "lost";
     history?: () => Record<string, unknown>;
     historyRefusal?: { status: number; body: Record<string, unknown> };
+    audit?: () => readonly WireAuditEvent[];
+    schedule?: () => Record<string, unknown>;
+    energyDays?: () => Record<string, unknown>;
+    objectives?: () => Record<string, unknown>;
   } = {},
 ): SeededClient {
   const lost = options.connection === "lost";
   let snapshotRead = false;
   let streamFrameDelivered = false;
   /**
-   * The History view reads history instead of the stream (the historian
-   * publishes no bus event by design — polling IS the update path), so the
-   * gate accepts EITHER consumption path: snapshot + first stream frame, or
-   * snapshot + one settled history read (resolved OR refused — the honest
-   * not-commissioned/error states are settled pictures too).
+   * Readiness is consumption-shaped, not snapshot-shaped: different views
+   * enter through different doors. The snapshot views (Home, Batteries, Now,
+   * Flow) need their world + the first stream frame; the REST-first views
+   * (Activity's audit, Insights' ledger, Objectives' window, Schedule's plan,
+   * History's historian) may never open a stream at all. The gate settles
+   * once the view has consumed ONE data read and EITHER a second consumption
+   * event (another read, or the first stream frame) OR a short grace period
+   * has passed — a stream-less, single-read view still settles, and the
+   * frozen world guarantees the grace adds only time, never a different
+   * picture.
    */
+  let dataReads = 0;
   let historySettled = false;
   let streamOpens = 0;
   let resolveReady: () => void = () => {};
   const ready = new Promise<void>((resolve) => {
     resolveReady = resolve;
   });
+  let readyTimer: ReturnType<typeof setTimeout> | null = null;
+  const countDataRead = (): void => {
+    dataReads += 1;
+    if (dataReads === 1 && readyTimer === null) {
+      readyTimer = setTimeout(() => {
+        resolveReady();
+      }, 2500);
+    }
+    maybeReady();
+  };
   const maybeReady = (): void => {
-    if (snapshotRead && (streamFrameDelivered || historySettled)) {
+    if (dataReads >= 1 && (streamFrameDelivered || dataReads >= 2 || historySettled)) {
+      if (readyTimer !== null) {
+        clearTimeout(readyTimer);
+      }
       resolveReady();
     }
   };
@@ -82,15 +105,23 @@ export function seededClient(
     ready,
     getSnapshot: async () => {
       snapshotRead = true;
-      maybeReady();
+      countDataRead();
       return structuredClone(world);
     },
-    refreshSnapshot: async () => structuredClone(world),
+    refreshSnapshot: async () => {
+      // The Now view's fresh-read path (it bypasses the coalesced read by
+      // design): it proves the same consumption getSnapshot does.
+      countDataRead();
+      return structuredClone(world);
+    },
     getHealth: async () => health(),
     getUnitDetail: async () => {
       throw absent("a unit detail");
     },
-    getAudit: async () => auditPage([]),
+    getAudit: async () => {
+      countDataRead();
+      return auditPage(options.audit === undefined ? [] : options.audit());
+    },
     postIntent: async () => {
       throw absent("a dispatch");
     },
@@ -119,21 +150,42 @@ export function seededClient(
       throw absent("the night toggle");
     },
     getSchedule: async () => {
-      throw absent("the schedule plan");
+      try {
+        if (options.schedule === undefined) {
+          throw absent("the schedule plan");
+        }
+        return structuredClone(options.schedule()) as Record<string, unknown>;
+      } finally {
+        countDataRead();
+      }
     },
     putSchedule: async () => {
       throw absent("a schedule publish");
     },
     getEnergyDays: async () => {
-      throw absent("the energy ledger");
+      try {
+        if (options.energyDays === undefined) {
+          throw absent("the energy ledger");
+        }
+        return structuredClone(options.energyDays()) as Record<string, unknown>;
+      } finally {
+        countDataRead();
+      }
     },
     getObservedObjectives: async () => {
-      throw absent("the observed-objectives window");
+      try {
+        if (options.objectives === undefined) {
+          throw absent("the observed-objectives window");
+        }
+        return structuredClone(options.objectives()) as Record<string, unknown>;
+      } finally {
+        countDataRead();
+      }
     },
     getPlantHistory: (() => {
       const settle = (): void => {
         historySettled = true;
-        maybeReady();
+        countDataRead();
       };
       if (options.historyRefusal !== undefined) {
         const { status, body } = options.historyRefusal;

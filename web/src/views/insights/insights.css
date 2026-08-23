@@ -7,11 +7,21 @@
   flex-direction: column;
   gap: 0.7rem;
   max-width: 46rem;
+  margin: 0 auto;
 }
 
-.insights-view h2 {
-  margin: 0;
-  font-size: 1.25rem;
+/* The view's own title repeats the shell's h1 exactly: the region keeps its
+ * accessible name, the operator reads the word once. */
+.insights-view > h2 {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 .insights-intro {
@@ -213,6 +223,5 @@
 .insights-load-more:focus-visible,
 .insights-retry:focus-visible,
 .insights-crosscheck summary:focus-visible {
-  outline: 3px solid #2c5282;
   outline-offset: 2px;
 }

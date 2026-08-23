@@ -355,9 +355,9 @@ const BADGE_LABELS: Record<string, string> = {
   armed_idle: "Armed",
   active: "Active",
   inhibited: "Inhibited",
-  boot: "Starting",
+  boot: "Starting up",
   stopping: "Stopping",
-  disconnected: "Offline",
+  disconnected: "No contact",
 };
 
 // --- per-unit request figures (the honest resolution order) ------------------
@@ -1554,7 +1554,7 @@ export function HomeView({ client }: HomeViewProps) {
             now.
           </p>
           <button type="button" className="home-retry" onClick={retry}>
-            Retry
+            Try again
           </button>
         </section>
       </div>

@@ -338,14 +338,14 @@ const CELL_IMBALANCE_WARNING_MV = 50;
 
 const LIFECYCLE_WORDS: Record<string, string> = {
   boot: "Starting up",
-  disarmed: "Standby",
+  disarmed: "Disarmed",
   armed: "Armed",
   armed_idle: "Armed and idle",
   observe_only: "Observe only",
   active: "Active",
   inhibited: "Inhibited",
   stopping: "Stopping",
-  disconnected: "Disconnected",
+  disconnected: "No contact",
 };
 
 /** Audit `event_type` values the service writes (see wire.ts AUDIT_EVENT_TYPES). */
@@ -1726,35 +1726,37 @@ function AcknowledgeDialog({
   };
 
   return (
-    <div
-      ref={dialogRef}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="inhibit-ack-title"
-      className="dialog"
-      onKeyDown={handleKeyDown}
-    >
-      <h2 id="inhibit-ack-title">Acknowledge inhibit on {unitId}</h2>
-      <p>
-        <b>Reason:</b> {reasonText}
-      </p>
-      <p>
-        Acknowledging clears the latched inhibit. Re-arming the unit is a separate deliberate
-        step.
-      </p>
-      {error !== null && (
-        <div role="alert" className="dialog-error">
-          <p>{error.code}</p>
-          <p>{error.message}</p>
+    <div className="dialog-backdrop">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="inhibit-ack-title"
+        className="dialog"
+        onKeyDown={handleKeyDown}
+      >
+        <h2 id="inhibit-ack-title">Acknowledge inhibit on {unitId}</h2>
+        <p>
+          <b>Reason:</b> {reasonText}
+        </p>
+        <p>
+          Acknowledging clears the latched inhibit. Re-arming the unit is a separate deliberate
+          step.
+        </p>
+        {error !== null && (
+          <div role="alert" className="dialog-error">
+            <p>{error.code}</p>
+            <p>{error.message}</p>
+          </div>
+        )}
+        <div className="dialog-actions">
+          <button type="button" onClick={onCancel} disabled={pending}>
+            Cancel
+          </button>
+          <button type="button" onClick={onConfirm} disabled={pending}>
+            Confirm acknowledgement
+          </button>
         </div>
-      )}
-      <div className="dialog-actions">
-        <button type="button" onClick={onCancel} disabled={pending}>
-          Cancel
-        </button>
-        <button type="button" onClick={onConfirm} disabled={pending}>
-          Confirm acknowledgement
-        </button>
       </div>
     </div>
   );
@@ -2226,7 +2228,7 @@ export function BatteriesView({
             <p>{snapshotError.code}</p>
             <p>{snapshotError.message}</p>
             <button type="button" onClick={retrySnapshot}>
-              Retry
+              Try again
             </button>
           </div>
         </div>
