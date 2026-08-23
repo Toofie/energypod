@@ -166,7 +166,12 @@ class ForeignObjectiveSettings:
     # commissioning: lhs+mid together while a full rhs floated), so the
     # signature is a synchronized GROUP -- never a lone pod.
     expected_min_units: int = 2
-    expected_autonomy_band_w: tuple[int, int] = (-2600, 300)
+    # The commissioned EXPECTED autonomy envelope (the live-write example's
+    # documented value): -2600 deep self-charge to the +1000 recalibrated
+    # evening CT-following edge (config rev 5, 2026-08-23).  This default is
+    # LIVE on observe-only deployments (an absent policy block composes it
+    # verbatim), so it must carry the commissioned value, never a stale one.
+    expected_autonomy_band_w: tuple[int, int] = (-2600, 1000)
 
     def __post_init__(self) -> None:
         interval = self.sample_interval_s

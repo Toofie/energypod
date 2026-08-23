@@ -133,7 +133,10 @@ class RecoverySettings:
 
     actuation_coherence_cycles: int = 4
     actuation_coherence_min_movement_w: int = 150
-    expected_autonomy_band_w: tuple[int, int] = (-2600, 300)
+    # The commissioned EXPECTED autonomy envelope (the live-write example's
+    # documented value; live on observe-only deployments, which compose this
+    # default verbatim when no policy block is configured).
+    expected_autonomy_band_w: tuple[int, int] = (-2600, 1000)
     unresponsive_attempts: int = 3
     unexpected_autonomy_min_interval_s: float = 60.0
 

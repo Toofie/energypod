@@ -243,9 +243,17 @@ class PolicyConfig(_FrozenModel):
     actuation_coherence_min_movement_w: PositiveStrictInt = 150
     # P1 iii companion (unexpected-autonomy evidence): the commissioned
     # EXPECTED autonomous battery-power envelope -- negative self-charge up to
-    # a small positive float.  Measured power outside this band while no
-    # intent claims the unit is timestamped evidence, never a block.
-    expected_autonomy_band_w: tuple[StrictInt, StrictInt] = (-2600, 300)
+    # the recalibrated positive evening edge.  Measured power outside this
+    # band while no intent claims the unit is timestamped evidence, never a
+    # block.  The positive edge is the documented commissioned value (+1000,
+    # config rev 5, 2026-08-23 evening): the original +300 was commissioned
+    # from DAYTIME float evidence only, before the fleet's evening behavior
+    # had ever been observed; lhs's own firmware then held a steady benign
+    # 695-914 W CT-following discharge (99 -> 76% SOC, imbalance closing),
+    # so +1000 keeps ~10-17% margin over the observed legitimate hold while
+    # staying below the ±1.2 kW anomaly class -- mirroring the -2600 negative
+    # edge's commissioning margin over the observed -2.27 kW deep self-charge.
+    expected_autonomy_band_w: tuple[StrictInt, StrictInt] = (-2600, 1000)
     # Night-writer detector (API_CONTRACTS "Night-writer detector"): the
     # zero-extra-frames foreign-objective watch's knobs, all defaulted so an
     # unchanged policy keeps the pinned posture.  Detection only: no control

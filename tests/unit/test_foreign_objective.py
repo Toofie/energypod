@@ -235,7 +235,10 @@ def test_settings_defaults_are_the_pinned_contract_values(api: Any) -> None:
     assert settings.handback_grace_s == 12.0
     assert settings.expected_charge_w is None, "strict until the writer is commissioned"
     assert settings.expected_min_units == 2, "a synchronized pair, never a lone pod"
-    assert settings.expected_autonomy_band_w == (-2600, 300)
+    # The commissioned rev-5 envelope (the live-write example's documented
+    # value): this default is LIVE on observe-only deployments, which compose
+    # it verbatim when no policy block is configured.
+    assert settings.expected_autonomy_band_w == (-2600, 1000)
 
 
 @pytest.mark.parametrize(

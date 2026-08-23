@@ -636,7 +636,35 @@ def test_policy_carries_the_recovery_detection_defaults() -> None:
     assert policy is not None
     assert policy.actuation_coherence_cycles == 4
     assert policy.actuation_coherence_min_movement_w == 150
-    assert tuple(policy.expected_autonomy_band_w) == (-2600, 300)
+    assert tuple(policy.expected_autonomy_band_w) == (-2600, 1000)
+
+
+def test_expected_autonomy_band_default_is_the_commissioned_rev5_envelope() -> None:
+    """The default MUST be the documented commissioned value, never a stale
+    one: the +300 edge predated the first evening observation, and the
+    2026-08-23 rev-5 recalibration (+1000, after lhs's benign 695-914 W
+    firmware CT-following discharge) is what config.live-write-example.yaml
+    ships.  The default is also LIVE on observe-only deployments through the
+    application-layer twins (an absent policy block composes them verbatim),
+    so a stale value here silently mis-classes evening autonomy as
+    unexpected."""
+    parsed = _validate(_valid_config())
+
+    policy = parsed.policy
+    assert policy is not None
+    low, high = policy.expected_autonomy_band_w
+    assert (low, high) == (-2600, 1000), (
+        "align the default with the documented commissioned envelope "
+        "(config.live-write-example.yaml policy.expected_autonomy_band_w)"
+    )
+    # The observe-only twins carry the same commissioned envelope: an absent
+    # policy block composes these verbatim, so they may never drift from the
+    # config default.
+    from energypod.application.foreign_objective import ForeignObjectiveSettings
+    from energypod.application.recovery import RecoverySettings
+
+    assert ForeignObjectiveSettings().expected_autonomy_band_w == (low, high)
+    assert RecoverySettings().expected_autonomy_band_w == (low, high)
 
 
 def test_recovery_detection_keys_are_commissionable() -> None:
