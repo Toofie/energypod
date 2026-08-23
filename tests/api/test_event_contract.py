@@ -1028,7 +1028,7 @@ async def test_window_events_are_transitions_never_heartbeats() -> None:
     store = _PlanStore()
     store.plan = SchedulePlan(version=1, timezone="Australia/Brisbane", entries=(entry,))
 
-    async def get() -> Any:
+    async def get_plan() -> Any:
         return store.get()
 
     submissions: list[dict[str, Any]] = []
@@ -1039,7 +1039,7 @@ async def test_window_events_are_transitions_never_heartbeats() -> None:
 
     intents = FakeIntents()
     runner = modules.scheduling.ScheduleRunner(
-        store=SimpleNamespace(get=get),
+        store=SimpleNamespace(get_plan=get_plan),
         evaluator=modules.scheduling.ScheduleEvaluator(intent_ttl_s=10.0),
         clock=clock,
         submit=submit,

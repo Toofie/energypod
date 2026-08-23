@@ -698,7 +698,7 @@ class RunnerClock:
 class RunnerStore:
     plan: Any = None
 
-    async def get(self) -> Any:
+    async def get_plan(self) -> Any:
         return self.plan
 
 
@@ -982,7 +982,9 @@ async def test_runner_carries_per_unit_watts_verbatim_onto_the_intent() -> None:
 
     await runner.tick()
 
-    assert submit.submissions[0]["watts"] == 6_000
+    # Exactly one watt form on the submit port, as on REST dispatch: the
+    # per-unit map (the facade derives the fleet total as the sum).
+    assert submit.submissions[0]["watts"] is None
     assert submit.submissions[0]["watts_by_unit"] == {"lhs": 2_000, "mid": 2_000, "rhs": 2_000}
     opened = next(e for e in bus.events if e["type"] == "schedule_window.opened")
     assert opened["payload"]["watts_by_unit"] == {"lhs": 2_000, "mid": 2_000, "rhs": 2_000}

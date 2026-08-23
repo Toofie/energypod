@@ -690,3 +690,102 @@ def test_expected_autonomy_band_must_span_the_self_charge_region() -> None:
         payload["policy"]["expected_autonomy_band_w"] = bad
         with pytest.raises(ValidationError, match="expected_autonomy_band_w"):
             _validate(payload)
+
+
+# --- DESIGN_SCHEDULES §3/B5: the schedule config block ---------------------------
+
+
+def _assert_schedule_rule(payload: dict[str, Any], *, message_contains: str | None = None) -> Any:
+    """Validate a payload whose schedule block must be refused by its own rule."""
+    with pytest.raises(ValidationError) as error:
+        ControllerConfig.model_validate(payload)
+    schedule_errors = [
+        item for item in error.value.errors() if item["loc"] and item["loc"][0] == "schedule"
+    ]
+    assert schedule_errors, f"expected a schedule error, got {error.value.errors()!r}"
+    if message_contains is not None:
+        assert message_contains.lower() in str(schedule_errors[0]["msg"]).lower(), schedule_errors
+    return error
+
+
+def test_schedule_block_is_absent_by_default() -> None:
+    parsed = ControllerConfig.model_validate(_valid_config())
+    assert parsed.schedule is None, "no schedule block means the surface is entirely absent"
+
+
+def test_a_present_schedule_block_carries_the_day_default() -> None:
+    payload = _valid_config()
+    payload["schedule"] = {}
+    parsed = ControllerConfig.model_validate(payload)
+    assert parsed.schedule is not None
+    assert parsed.schedule.allowed_windows_local == (("06:00", "20:00"),)
+    assert parsed.schedule.intent_ttl_s == 10.0
+
+
+def test_a_widened_night_policy_validates_and_is_spelled_canonically() -> None:
+    payload = _valid_config()
+    payload["schedule"] = {
+        "allowed_windows_local": [["00:00", "06:00"], ["06:00", "20:00"]],
+        "intent_ttl_s": 12.0,
+    }
+    parsed = ControllerConfig.model_validate(payload)
+    assert parsed.schedule is not None
+    assert parsed.schedule.allowed_windows_local == (
+        ("00:00", "06:00"),
+        ("06:00", "20:00"),
+    )
+    assert parsed.schedule.intent_ttl_s == 12.0
+
+
+@pytest.mark.parametrize(
+    ("windows", "message"),
+    [
+        ([], "allowed_windows_local"),
+        ([["06:00", "06:00"]], "zero-length"),
+        ([["6:00", "20:00"]], "HH:MM"),
+        ([["06:00"]], "field required"),
+    ],
+)
+def test_malformed_allowed_windows_are_refused(windows: list[Any], message: str) -> None:
+    payload = _valid_config()
+    payload["schedule"] = {"allowed_windows_local": windows}
+    _assert_schedule_rule(payload, message_contains=message)
+
+
+@pytest.mark.parametrize("ttl", [0.0, -1.0, 301.0])
+def test_schedule_intent_ttl_must_stay_inside_the_commissioned_bounds(ttl: float) -> None:
+    payload = _valid_config()
+    payload["schedule"] = {"intent_ttl_s": ttl}
+    # 0/-1 fall at the field bound; 301 falls at the commissioned cap.
+    _assert_schedule_rule(payload, message_contains="intent_ttl_s" if ttl > 1 else None)
+
+
+def test_schedule_intent_ttl_must_exceed_the_control_period() -> None:
+    payload = _valid_config()
+    payload["schedule"] = {"intent_ttl_s": 0.10}  # <= control_period_s 0.40
+    _assert_schedule_rule(payload, message_contains="control_period")
+
+
+def test_the_schedule_block_has_no_enabled_key() -> None:
+    """The plan IS the state: a second master switch would be a second way to
+    be silently off (the invisible-starvation failure class)."""
+    payload = _valid_config()
+    payload["schedule"] = {"enabled": True}
+    with pytest.raises(ValidationError) as error:
+        ControllerConfig.model_validate(payload)
+    assert any(
+        item["type"] == "extra_forbidden" and item["loc"][0] == "schedule"
+        for item in error.value.errors()
+    )
+
+
+def test_excess_charging_yield_to_schedule_defaults_true() -> None:
+    payload = _valid_config()
+    payload["excess_charging"] = {"enabled": False}
+    parsed = ControllerConfig.model_validate(payload)
+    assert parsed.excess_charging is not None
+    assert parsed.excess_charging.yield_to_schedule is True
+    payload["excess_charging"] = {"enabled": False, "yield_to_schedule": False}
+    parsed_off = ControllerConfig.model_validate(payload)
+    assert parsed_off.excess_charging is not None
+    assert parsed_off.excess_charging.yield_to_schedule is False

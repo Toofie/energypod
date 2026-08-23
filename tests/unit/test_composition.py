@@ -2502,3 +2502,227 @@ async def test_supervision_drives_the_recovery_monitor_every_cycle(tmp_path: Pat
         assert session.seen("lifespan.shutdown.complete"), f"shutdown failed: {session.events!r}"
     finally:
         await session.close()
+
+
+# --- DESIGN_SCHEDULES §2/§5 B5: the composed schedule surface --------------------
+
+
+def _schedule_payload(
+    database: Path,
+    *,
+    windows: list[list[str]] | None = None,
+    ttl_s: float = 10.0,
+    excess: dict[str, Any] | None = None,
+    write_enabled: bool = False,
+) -> dict[str, Any]:
+    payload = _write_enabled_payload(database) if write_enabled else _config_payload(database)
+    payload["schedule"] = {
+        "allowed_windows_local": windows or [["06:00", "20:00"]],
+        "intent_ttl_s": ttl_s,
+    }
+    if excess is not None:
+        payload["excess_charging"] = excess
+    return payload
+
+
+def compose_schedule(
+    database: Path,
+    *,
+    clock: Any | None = None,
+    announce: Callable[[str], None] | None = None,
+    windows: list[list[str]] | None = None,
+    ttl_s: float = 10.0,
+    excess: dict[str, Any] | None = None,
+    write_enabled: bool = False,
+) -> Any:
+    config = _validate(
+        _schedule_payload(
+            database, windows=windows, ttl_s=ttl_s, excess=excess, write_enabled=write_enabled
+        )
+    )
+    return _compose_with(config, simulate=True, clock=clock, announce=announce)
+
+
+async def test_a_present_schedule_block_composes_the_surface(tmp_path: Path) -> None:
+    runtime = compose_schedule(tmp_path / "sched.sqlite3")
+
+    assert runtime.schedule_surface is not None
+    assert runtime.schedule_runner is not None
+    assert runtime.schedule_surface.policy.posture == "yield"
+    assert runtime.schedule_surface.policy.wire_windows() == [["06:00", "20:00"]]
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert "schedule_state" in snapshot
+    projection = snapshot["schedule_state"]
+    assert projection["active"] is False
+    assert projection["reason_codes"] == ["no_plan"]
+    assert projection["posture"] == "yield"
+
+
+async def test_an_absent_schedule_block_composes_nothing_and_refuses_both_routes(
+    tmp_path: Path,
+) -> None:
+    announced: list[str] = []
+    runtime = compose(tmp_path / "no-sched.sqlite3", simulate=True, announce=announced.append)
+    assert runtime.schedule_surface is None
+    assert runtime.schedule_runner is None
+
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    assert "schedule_state" not in snapshot, "absent block = byte-identical snapshot"
+
+    bearer = {"Authorization": f"Bearer {announced[0]}"}
+    status, body = await _asgi_request(runtime.app, "GET", "/api/v1/schedule", headers=bearer)
+    assert status == 409
+    assert body["code"] == "schedule_not_commissioned"
+    status, put_body = await _asgi_request(
+        runtime.app,
+        "PUT",
+        "/api/v1/schedule",
+        headers={**bearer, "Idempotency-Key": "absent-1"},
+        json_body={"expected_version": None, "timezone": "Australia/Brisbane", "entries": []},
+    )
+    assert status == 409
+    assert put_body["code"] == "schedule_not_commissioned"
+
+
+async def test_the_schedule_routes_serve_the_policy_when_composed(tmp_path: Path) -> None:
+    announced: list[str] = []
+    runtime = compose_schedule(tmp_path / "sched-routes.sqlite3", announce=announced.append)
+    bearer = {"Authorization": f"Bearer {announced[0]}"}
+
+    status, view = await _asgi_request(runtime.app, "GET", "/api/v1/schedule", headers=bearer)
+
+    assert status == 200, view
+    assert view["plan"] is None
+    assert view["policy"] == {
+        "posture": "yield",
+        "allowed_windows_local": [["06:00", "20:00"]],
+        "intent_ttl_s": 10.0,
+    }
+    assert view["acknowledged_night_windows"] is False
+    assert view["next_action"] is None
+
+
+async def test_the_runner_ticks_before_the_adviser_in_the_fleet_cycle(tmp_path: Path) -> None:
+    """DESIGN_SCHEDULES §2 ordering, pinned: the schedule's claim is a
+    published fact and the adviser is the opportunist — the runner ticks
+    BEFORE the adviser step so a yield resolves within one cycle."""
+    runtime = compose_schedule(
+        tmp_path / "sched-order.sqlite3",
+        clock=ScriptedClock(),
+        excess={"enabled": False},
+        write_enabled=True,
+    )
+    assert runtime.excess_adviser is not None
+    order: list[str] = []
+    runner_tick = runtime.schedule_runner.tick
+    adviser_tick = runtime.excess_adviser.tick
+
+    async def traced_schedule() -> None:
+        order.append("schedule")
+        await runner_tick()
+
+    async def traced_adviser() -> Any:
+        order.append("adviser")
+        return await adviser_tick()
+
+    runtime.schedule_runner.tick = traced_schedule  # type: ignore[method-assign]
+    runtime.excess_adviser.tick = traced_adviser  # type: ignore[method-assign]
+
+    session = _LifespanSession(runtime.app)
+    session.send("lifespan.startup")
+    await session.pump_until(lambda: order.count("adviser") >= 2, message="two fleet cycles")
+    await session.close()
+
+    assert order.index("schedule") < order.index("adviser"), "schedule first, adviser second"
+    from itertools import pairwise
+
+    assert all(earlier == "schedule" for earlier, later in pairwise(order) if later == "adviser"), (
+        "every adviser tick follows a schedule tick in the same cycle"
+    )
+
+
+async def test_a_published_window_runs_the_full_composed_path(tmp_path: Path) -> None:
+    """Publish (per-battery watts) -> runner opens the window -> a live
+    SCHEDULE intent with per-unit targets -> the projection says so -> the
+    window ends and the closing transition publishes."""
+    clock = ScriptedClock()  # 2026-08-21 12:00 UTC = Friday 22:00 Brisbane
+    announced: list[str] = []
+    runtime = compose_schedule(
+        tmp_path / "sched-live.sqlite3",
+        clock=clock,
+        announce=announced.append,
+        windows=[["20:00", "00:00"]],  # a night-granting partition site
+    )
+    bearer = {**{"Authorization": f"Bearer {announced[0]}"}, "Idempotency-Key": "publish-1"}
+
+    status, published = await _asgi_request(
+        runtime.app,
+        "PUT",
+        "/api/v1/schedule",
+        headers=bearer,
+        json_body={
+            "expected_version": None,
+            "timezone": "Australia/Brisbane",
+            "night_posture": "PARTITION_ACKNOWLEDGED",
+            "entries": [
+                {
+                    "entry_id": "night-charge",
+                    "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+                    "start_local": "21:00",
+                    "end_local": "23:59",
+                    "action": "charge",
+                    "watts_by_unit": {"mid": 700, "rhs": 800},
+                    "unit_ids": ["mid", "rhs"],
+                    "effective_from": "2020-01-01",
+                    "effective_until": "2035-12-31",
+                    "priority": 0,
+                    "enabled": True,
+                }
+            ],
+        },
+    )
+    assert status == 200, published
+    assert published["version"] == 1
+    assert published["acknowledged_night_windows"] is True
+
+    session = _LifespanSession(runtime.app)
+    session.send("lifespan.startup")
+    try:
+        await session.pump_until(
+            lambda: runtime.schedule_runner.held_intent_id is not None,
+            message="the runner opens the published window",
+        )
+        active = await _settle(runtime.intents.active(runtime.clock.monotonic()))
+        schedule_intents = [intent for intent in active if intent.source.value == "schedule"]
+        assert len(schedule_intents) == 1, "exactly one live SCHEDULE intent"
+        live = schedule_intents[0]
+        assert dict(live.watts_by_unit or {}) == {"mid": 700, "rhs": 800}
+        assert live.watts == 1500
+        assert live.actor_identity == "energypod:schedule-runner"
+
+        snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+        projection = snapshot["schedule_state"]
+        assert projection["active"] is True
+        assert projection["entry_id"] == "night-charge"
+        assert projection["version"] == 1
+        assert projection["ends_at"].startswith("2026-08-21T23:59")
+        assert projection["reason_codes"] == ["window_open"]
+
+        # The clock rolls past the window end: non-renewal + the closing event.
+        clock.elapsed_s += 2 * 3600 + 1800  # 14:30 UTC = 00:30 Saturday
+        await session.pump_until(
+            lambda: runtime.schedule_runner.held_intent_id is None,
+            message="the window ends by non-renewal",
+        )
+        remaining = await _settle(runtime.intents.active(runtime.clock.monotonic()))
+        assert all(intent.source.value != "schedule" for intent in remaining)
+        published_events = await _bus_events(runtime)
+        closing = [e for e in published_events if e["type"] == "schedule_window.closing"]
+        assert closing and closing[-1]["payload"]["reason"] == "window_ended"
+        opened = [e for e in published_events if e["type"] == "schedule_window.opened"]
+        assert len(opened) == 1, "opened is a transition, never a renewal heartbeat"
+        replaced = [e for e in published_events if e["type"] == "schedule.replaced"]
+        assert len(replaced) == 1
+        assert replaced[0]["payload"]["diff"]["added"] == ["night-charge"]
+    finally:
+        await session.close()

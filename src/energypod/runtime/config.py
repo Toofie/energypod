@@ -387,6 +387,59 @@ class ExcessChargingConfig(_FrozenModel):
     min_acceleration_w: PositiveStrictInt = 100
     exit_hysteresis_w: NonNegativeStrictInt = 50
     intent_ttl_s: PositiveFiniteFloat = 10.0
+    # DESIGN_SCHEDULES §4 (yield_to_schedule, default true): while a published
+    # schedule claims the adviser's target battery, the adviser stands down on
+    # that battery only — per unit, never fleet-wide.  The flag exists so the
+    # opt-out (today's behavior: the adviser outranks schedules and starves
+    # them invisibly) is an explicit, auditable commissioning choice.
+    yield_to_schedule: StrictBool = True
+
+
+def _valid_policy_wall(value: str) -> str:
+    """Validate one "HH:MM" civil wall clock through the canonical parser."""
+    from energypod.application.scheduling import parse_hhmm
+
+    return parse_hhmm(value).strftime("%H:%M")
+
+
+class ScheduleConfig(_FrozenModel):
+    """API_CONTRACTS "Schedule" + DESIGN_SCHEDULES §3 (the block-presence
+    doctrine, symmetric with ``excess_charging``).
+
+    A PRESENT block composes the whole surface — both REST routes, the
+    ``ScheduleRunner`` in the fleet cycle, and the ``schedule_state``
+    snapshot projection.  An ABSENT block composes NOTHING: byte-identical
+    behavior, and both routes answer 409 ``schedule_not_commissioned``.  A
+    schedule can never act on a site that did not commission scheduling.
+
+    There is deliberately NO ``enabled`` key: the plan IS the state (an
+    empty plan is off; an entry's own ``enabled`` flag is its pause), and a
+    second master switch would be a second way to be silently off.  The
+    ``allowed_windows_local`` check is a PUBLISH gate only, never an
+    evaluator gate: a plan already in the store before a config NARROWING
+    still evaluates (the config revision is the operator's act; the next
+    publish is the one refused).
+    """
+
+    allowed_windows_local: tuple[tuple[NonEmpty, NonEmpty], ...] = (("06:00", "20:00"),)
+    intent_ttl_s: PositiveFiniteFloat = 10.0
+
+    @field_validator("allowed_windows_local")
+    @classmethod
+    def validate_windows(cls, values: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
+        cleaned: list[tuple[str, str]] = []
+        for start_raw, end_raw in values:
+            start = _valid_policy_wall(start_raw)
+            end = _valid_policy_wall(end_raw)
+            if start == end:
+                raise ValueError(
+                    "allowed_windows_local pairs must not be zero-length (a window that "
+                    "commands no minute is ambiguous)"
+                )
+            cleaned.append((start, end))
+        if not cleaned:
+            raise ValueError("allowed_windows_local must name at least one window")
+        return tuple(cleaned)
 
 
 class ControllerConfig(_FrozenModel):
@@ -405,6 +458,9 @@ class ControllerConfig(_FrozenModel):
     # Declared LAST so its commissioning validator below sees the already
     # validated mode, timing, and policy fields through ``info.data``.
     excess_charging: ExcessChargingConfig | None = None
+    # DESIGN_SCHEDULES §3/B5: declared last beside ``excess_charging`` so its
+    # commissioning validator sees the already-validated timing.
+    schedule: ScheduleConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -554,6 +610,29 @@ class ControllerConfig(_FrozenModel):
                 "the entry and exit thresholds from oscillating"
             )
         return excess
+
+    @field_validator("schedule")
+    @classmethod
+    def validate_schedule(
+        cls, schedule: ScheduleConfig | None, info: ValidationInfo
+    ) -> ScheduleConfig | None:
+        """The commissioning gates for a PRESENT schedule block
+        (DESIGN_SCHEDULES §3 — the same TTL bounds as the adviser's)."""
+        if schedule is None:
+            return schedule
+        timing = info.data.get("timing")
+        if timing is not None and schedule.intent_ttl_s <= timing.control_period_s:
+            raise ValueError(
+                "schedule.intent_ttl_s must exceed timing.control_period_s: "
+                "the runner renews exactly once per fleet cycle"
+            )
+        if not 0 < schedule.intent_ttl_s <= 300:
+            raise ValueError(
+                "schedule.intent_ttl_s must stay inside (0, 300] seconds — the "
+                "REST dispatch cap; a schedule window may not out-live ordinary "
+                "intents"
+            )
+        return schedule
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:

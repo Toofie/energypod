@@ -54,6 +54,12 @@ from energypod.domain import DataQuality, Direction, IntentSource, UnitLifecycle
 _HIGHER_PRIORITY_SOURCES: frozenset[IntentSource] = frozenset(
     {IntentSource.EMERGENCY_STOP, IntentSource.MANUAL, IntentSource.AGENT}
 )
+# DESIGN_SCHEDULES §4 (yield_to_schedule, default true): a live SCHEDULE
+# intent claiming the adviser's target is a yield trigger exactly like the
+# MANUAL/AGENT path — without it the arbiter ranks OPTIMIZER above SCHEDULE,
+# the adviser keeps renewing, and a deliberately published daytime schedule
+# is starved invisibly.  The flag exists so the opt-out is explicit.
+_YIELD_TO_SCHEDULE_SOURCES: frozenset[IntentSource] = frozenset({IntentSource.SCHEDULE})
 
 _CONTROLLABLE_LIFECYCLES: frozenset[UnitLifecycle] = frozenset(
     {UnitLifecycle.ARMED_IDLE, UnitLifecycle.ACTIVE}
@@ -263,6 +269,7 @@ class ExcessChargeAdviser:
         intents: _IntentPort,
         submit: _SubmitPort,
         participation: _ParticipationPort | None = None,
+        yield_to_schedule: bool = True,
     ) -> None:
         self._settings = settings
         self._policy = policy
@@ -271,6 +278,13 @@ class ExcessChargeAdviser:
         self._intents = intents
         self._submit = submit
         self._participation = participation
+        # DESIGN_SCHEDULES §4: the adviser's own setting, because it is the
+        # adviser's own behavior — one extra source in the yield set.
+        self._yield_sources: frozenset[IntentSource] = (
+            _HIGHER_PRIORITY_SOURCES | _YIELD_TO_SCHEDULE_SOURCES
+            if yield_to_schedule
+            else _HIGHER_PRIORITY_SOURCES
+        )
         # Hysteresis state: which intent id the adviser currently holds and
         # whether it is intervening (inside the hysteresis band).
         self._held_intent_id: str | None = None
@@ -354,19 +368,20 @@ class ExcessChargeAdviser:
             return self._idle(bound_w, ("no_acceleration_over_autonomy",), evidence, fleet_export_w)
         return await self._renew(target, achievable_w, bound_w, evidence, fleet_export_w)
 
-    @staticmethod
-    def _target_claimed(target: str | None, active: tuple[Any, ...]) -> bool:
+    def _target_claimed(self, target: str | None, active: tuple[Any, ...]) -> bool:
         """Whether a higher-priority live intent claims the adviser's target.
 
         An emergency stop dominates every unit regardless of its own scope, so
         any live stop claims the target outright.  With no target there is
-        nothing to claim and no advisory work this tick regardless.
+        nothing to claim and no advisory work this tick regardless.  A live
+        SCHEDULE intent counts exactly like MANUAL/AGENT while
+        ``yield_to_schedule`` is on (§4) and not at all when it is off.
         """
         for intent in active:
             source = getattr(intent, "source", None)
             if source is IntentSource.EMERGENCY_STOP:
                 return True
-            if source not in _HIGHER_PRIORITY_SOURCES or target is None:
+            if source not in self._yield_sources or target is None:
                 continue
             claimed = getattr(intent, "selected_unit_ids", None)
             if claimed is not None and target in frozenset(claimed):

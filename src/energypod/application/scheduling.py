@@ -316,9 +316,13 @@ class SchedulePolicy:
 
 
 class ScheduleStorePort(Protocol):
-    """The plan repository read (one singleton row; no cache to invalidate)."""
+    """The plan repository read (one singleton row; no cache to invalidate).
 
-    async def get(self) -> SchedulePlan | None: ...
+    The composed surface control implements this beside its facade port, so
+    the runner and the facade read the same singleton through one object.
+    """
+
+    async def get_plan(self) -> SchedulePlan | None: ...
 
 
 class ScheduleClockPort(Protocol):
@@ -442,7 +446,7 @@ class ScheduleRunner:
 
     async def tick(self) -> None:
         """One evaluation: maintain the held intent, update the projection."""
-        plan = await self._store.get()
+        plan = await self._store.get_plan()
         self._plan = plan
         now_mono = float(self._clock.monotonic())
         wall = self._clock.wall_now()
@@ -511,7 +515,10 @@ class ScheduleRunner:
         result = await self._submit(
             unit_ids=sorted(evaluated.unit_ids),
             direction=evaluated.direction,
-            watts=evaluated.watts,
+            # Exactly one watt form on the submit port, as on REST dispatch:
+            # the per-unit map when the entry was published per battery (the
+            # facade derives the fleet total as the sum), else the scalar.
+            watts=None if evaluated.watts_by_unit is not None else evaluated.watts,
             ttl_s=evaluated.duration_s,
             watts_by_unit=(
                 None if evaluated.watts_by_unit is None else dict(evaluated.watts_by_unit)

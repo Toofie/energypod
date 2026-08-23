@@ -1088,3 +1088,127 @@ async def test_projection_hysteresis_walks_the_pinned_lifecycle(excess: Any, api
     assert rig.controller.state().hysteresis_state == "entering", (
         "exiting persists exactly until the next tick re-evaluates"
     )
+
+
+# --- DESIGN_SCHEDULES §4: the adviser's yield_to_schedule -----------------------
+
+
+async def test_the_adviser_yields_to_a_schedule_intent_by_default(excess: Any, api: Any) -> None:
+    """A live SCHEDULE intent claiming the adviser's target is a yield trigger
+    exactly like the MANUAL/AGENT path (the arbiter alone would rank OPTIMIZER
+    above SCHEDULE and starve the schedule invisibly)."""
+    grids = {"lhs": 0.0, "mid": 0.0, "rhs": 1_000.0}
+    observations = FakeObservations(latest=make_fleet(api, grids))
+    intents = FakeIntents()
+    submit = FakeSubmit()
+    clock = FakeClock()
+    adviser = excess.ExcessChargeAdviser(
+        settings=make_settings(excess),
+        policy=make_policy(api),
+        clock=clock,
+        observations=observations,
+        intents=intents,
+        submit=submit,
+    )
+
+    active = await adviser.tick()
+    assert active.action == "propose"
+
+    intents.entries.append(manual_intent(source="SCHEDULE", expires_at_mono=130.0))
+    clock.now = 110.0
+    yielding = await adviser.tick()
+    assert yielding.action == "withdraw"
+    assert "yielding_to_higher_priority" in yielding.reason_codes
+    assert submit.submissions[-1]["watts"] > 0, "yield is a removal, never a zero submission"
+
+    clock.now = 111.0
+    withheld = await adviser.tick()
+    assert withheld.action == "idle"
+    assert "yielding_to_higher_priority" in withheld.reason_codes
+
+    clock.now = 131.0  # the schedule window's claim has lapsed
+    observations.latest = make_fleet(
+        api, grids, **{f"{unit}__captured_at_mono": 131.0 for unit in grids}
+    )
+    resumed = await adviser.tick()
+    assert resumed.action == "propose", "re-entry requires claim expiry AND re-qualification"
+    assert resumed.target_unit_id == "mid"
+
+
+async def test_a_schedule_claiming_another_unit_leaves_the_adviser_running(
+    excess: Any, api: Any
+) -> None:
+    """The yield is PER UNIT (the adviser's scope is exactly one unit): a
+    schedule claiming lhs does not stand the adviser down on mid."""
+    grids = {"lhs": 0.0, "mid": 0.0, "rhs": 1_000.0}
+    observations = FakeObservations(latest=make_fleet(api, grids))
+    intents = FakeIntents()
+    submit = FakeSubmit()
+    clock = FakeClock()
+    adviser = excess.ExcessChargeAdviser(
+        settings=make_settings(excess),
+        policy=make_policy(api),
+        clock=clock,
+        observations=observations,
+        intents=intents,
+        submit=submit,
+    )
+
+    await adviser.tick()
+    intents.entries.append(
+        manual_intent(source="SCHEDULE", unit_ids=("lhs",), expires_at_mono=130.0)
+    )
+    clock.now = 110.0
+    observations.latest = make_fleet(
+        api, grids, **{f"{unit}__captured_at_mono": 110.0 for unit in grids}
+    )
+    decision = await adviser.tick()
+
+    assert decision.action == "renew"
+    assert decision.target_unit_id == "mid"
+    assert "yielding_to_higher_priority" not in decision.reason_codes
+
+
+async def test_yield_to_schedule_false_is_todays_explicit_opt_out(excess: Any, api: Any) -> None:
+    """With the flag off, the adviser keeps renewing against the schedule
+    claim — the arbiter ranks OPTIMIZER above SCHEDULE, so the schedule is
+    starved; the flag exists so that choice is explicit, never forgotten."""
+    grids = {"lhs": 0.0, "mid": 0.0, "rhs": 1_200.0}
+    observations = FakeObservations(latest=make_fleet(api, grids))
+    intents = FakeIntents()
+    submit = FakeSubmit()
+    clock = FakeClock()
+    adviser = excess.ExcessChargeAdviser(
+        settings=make_settings(excess),
+        policy=make_policy(api),
+        clock=clock,
+        observations=observations,
+        intents=intents,
+        submit=submit,
+        yield_to_schedule=False,
+    )
+
+    await adviser.tick()
+    intents.entries.append(manual_intent(source="SCHEDULE", expires_at_mono=130.0))
+    clock.now = 110.0
+    observations.latest = make_fleet(
+        api, grids, **{f"{unit}__captured_at_mono": 110.0 for unit in grids}
+    )
+    decision = await adviser.tick()
+
+    assert decision.action == "renew"
+    assert decision.target_unit_id == "mid"
+
+
+def test_the_adviser_defaults_to_yielding(excess: Any, api: Any) -> None:
+    adviser = excess.ExcessChargeAdviser(
+        settings=make_settings(excess),
+        policy=make_policy(api),
+        clock=FakeClock(),
+        observations=FakeObservations(),
+        intents=FakeIntents(),
+        submit=FakeSubmit(),
+    )
+    from energypod.domain import IntentSource
+
+    assert IntentSource.SCHEDULE in adviser._yield_sources

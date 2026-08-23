@@ -105,8 +105,16 @@ from energypod.application.recovery import (
     RecoverySettings,
 )
 from energypod.application.safety import SafetyKernel
+from energypod.application.scheduling import (
+    ScheduleEvaluator,
+    SchedulePolicy,
+    ScheduleRunner,
+    ScheduleSurfaceControl,
+    parse_hhmm,
+)
 from energypod.application.service import (
     EXCESS_ECONOMICS_ACK_EVENT_ID,
+    SCHEDULE_NIGHT_ACK_EVENT_ID,
     EnergyServiceFacade,
 )
 from energypod.domain import (
@@ -231,6 +239,14 @@ def decision_requests_cell_refresh(decision: Any) -> bool:
 # special authority anywhere.
 _EXCESS_ADVISER_PRINCIPAL_SUBJECT = "energypod:excess-adviser"
 _EXCESS_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
+
+# DESIGN_SCHEDULES §2: the composed automation principal the schedule runner
+# submits under — the adviser pattern exactly.  Audit attribution separates
+# the runner's rows by principal plus the ``schedule`` source tag; the
+# principal is non-interactive, site-bound, and holds nothing beyond what an
+# ordinary dispatch needs.
+_SCHEDULE_RUNNER_PRINCIPAL_SUBJECT = "energypod:schedule-runner"
+_SCHEDULE_RUNNER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 
 
 class Clock(Protocol):
@@ -1565,6 +1581,22 @@ class _AdvisoryPrincipal:
     site_id: str
 
 
+@dataclass(slots=True)
+class _ScheduleRunnerPrincipal:
+    """The composed schedule automation principal (DESIGN_SCHEDULES §2).
+
+    ``energypod:schedule-runner``: observe + dispatch only, non-interactive,
+    site-bound — the adviser principal's exact shape, so the runner's
+    ``intent_accepted`` rows are attributable distinct from every console,
+    agent, and adviser writer.
+    """
+
+    subject: str
+    scopes: frozenset[str]
+    interactive: bool
+    site_id: str
+
+
 def _announce_dev_credential_to_stdout(token: str) -> None:
     """The default startup sink: print the token once (API_CONTRACTS)."""
     print(f"energypod simulate: development principal bearer token: {token}")
@@ -1683,6 +1715,7 @@ class _Supervision:
         intents: _AsyncIntentRepository | None = None,
         observations: _AsyncObservationRepository | None = None,
         recovery: RecoveryMonitor | None = None,
+        schedule_runner: ScheduleRunner | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -1699,6 +1732,9 @@ class _Supervision:
         # DESIGN_EXCESS_ACTIVATION §2: the projection controller driven
         # post-tick by this loop (its single writer).
         self._excess_controller = excess_controller
+        # DESIGN_SCHEDULES §2: the schedule runner, ticked once per fleet
+        # cycle AFTER the polls and BEFORE the adviser step (pinned below).
+        self._schedule_runner = schedule_runner
         # Self-healing awareness layer (R4): the passive detection monitor
         # driven once per fleet cycle, plus the two ports it reads through.
         self._intents_port = intents
@@ -1863,6 +1899,20 @@ class _Supervision:
                     self._observe_recovery(authorized, tuple(outcomes)),
                     timeout=self._interval_s,
                 )
+            if self._schedule_runner is not None:
+                # DESIGN_SCHEDULES §2 (ordering pinned): one bounded schedule
+                # tick per fleet cycle, AFTER the polls and recovery pass and
+                # BEFORE the adviser step and the kernel tick — the schedule's
+                # claim is a published fact and the adviser is the
+                # opportunist, so evaluating the schedule first means the
+                # adviser's same-tick yield check already sees the schedule's
+                # intent and a yield resolves within one cycle with no
+                # double-claim noise.  A runner failure is survivable per
+                # cycle exactly like an advisory failure; the held intent's
+                # TTL lapse plus the firmware watchdog are the designed
+                # hand-back, and the runner never halts the fleet.
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self._schedule_runner.tick(), timeout=self._interval_s)
             if self._adviser is not None:
                 # API_CONTRACTS "Excess-solar accelerated charging
                 # (advisory)": one bounded advisory renewal per fleet cycle,
@@ -2363,6 +2413,12 @@ class ComposedRuntime:
     # participation flag, the acknowledgement latch, the frozen state view,
     # and the state_changed publication the fleet loop drives).
     excess_controller: ExcessAdviserController | None = None
+    # DESIGN_SCHEDULES §2/§5: composed only when the ``schedule`` block is
+    # PRESENT — the surface control the facade projects through (policy,
+    # plan store, night-acknowledgement latch, projection read) and the
+    # runner the fleet loop ticks.  None otherwise (block-absent doctrine).
+    schedule_surface: ScheduleSurfaceControl | None = None
+    schedule_runner: ScheduleRunner | None = None
 
 
 def _simulator_pod(
@@ -2722,6 +2778,27 @@ def _build_runtime(
             config_enabled=excess_config.enabled,
             bus=bus,
         )
+    # --- schedule surface control (DESIGN_SCHEDULES §3: block PRESENT composes) ---
+    # Built BEFORE the facade (the facade projects and publishes through it),
+    # and the runner is bound AFTER the facade exists (the runner submits
+    # through the facade's internal schedule twin).  The once-ever night
+    # acknowledgement boot-loads from the durable store — one keyed existence
+    # check, never an audit scan (the exact NET_BILLED mechanics).
+    schedule_surface: ScheduleSurfaceControl | None = None
+    schedule_config = config.schedule
+    if schedule_config is not None:
+        schedule_surface = ScheduleSurfaceControl(
+            policy=SchedulePolicy(
+                allowed_windows_local=tuple(
+                    (parse_hhmm(start), parse_hhmm(end))
+                    for start, end in schedule_config.allowed_windows_local
+                ),
+                intent_ttl_s=float(schedule_config.intent_ttl_s),
+                timezone=config.site.timezone,
+            ),
+            store=schedule_store,
+            acknowledged_night_windows=audit_store.contains_event(SCHEDULE_NIGHT_ACK_EVENT_ID),
+        )
     facade = _ComposedFacade(
         site_id=config.site.site_id,
         clock=resolved_clock,
@@ -2734,6 +2811,7 @@ def _build_runtime(
         actors={unit_id: _ActorCommandHandle(actor) for unit_id, actor in actors.items()},
         recovery=recovery_monitor,
         excess=excess_controller,
+        schedules=schedule_surface,
     )
 
     # --- excess-solar advisory composition ---------------------------------
@@ -2776,8 +2854,58 @@ def _build_runtime(
             intents=intent_port,
             submit=_submit_advisory_intent,
             participation=excess_controller.participation_verdict,
+            # DESIGN_SCHEDULES §4: the commissioned yield choice reaches the
+            # adviser's own claim check (default true).
+            yield_to_schedule=excess_config.yield_to_schedule,
         )
         excess_controller.bind_adviser(excess_adviser)
+
+    # --- schedule runner composition (DESIGN_SCHEDULES §2) ------------------
+    schedule_runner: ScheduleRunner | None = None
+    if schedule_config is not None and schedule_surface is not None:
+        # The runner is composed exactly when the block is PRESENT, under the
+        # composed automation principal, driving the facade's internal
+        # schedule submission (never REST/MCP).  Everything downstream is the
+        # ordinary intent path — the arbiter ranks SCHEDULE lowest, per unit,
+        # and the kernel/actor/watchdog treat the runner's intent exactly like
+        # any manual request.  The runner reads the plan through the surface
+        # control (one repository singleton; a publish lands within one cycle)
+        # and the projection is its single writer.
+        runner_principal = _ScheduleRunnerPrincipal(
+            subject=_SCHEDULE_RUNNER_PRINCIPAL_SUBJECT,
+            scopes=_SCHEDULE_RUNNER_PRINCIPAL_SCOPES,
+            interactive=False,
+            site_id=config.site.site_id,
+        )
+
+        async def _submit_schedule_drive(
+            *,
+            unit_ids: Any,
+            direction: Any,
+            watts: Any,
+            ttl_s: Any,
+            watts_by_unit: Any = None,
+        ) -> Any:
+            return await facade.submit_schedule_intent(
+                unit_ids=unit_ids,
+                direction=direction,
+                watts=watts,
+                ttl_s=ttl_s,
+                watts_by_unit=watts_by_unit,
+                principal=runner_principal,
+            )
+
+        schedule_runner = ScheduleRunner(
+            store=schedule_surface,
+            evaluator=ScheduleEvaluator(intent_ttl_s=float(schedule_config.intent_ttl_s)),
+            clock=resolved_clock,
+            submit=_submit_schedule_drive,
+            intents=intent_port,
+            bus=bus,
+            posture=schedule_surface.policy.posture,
+            initial_plan=schedule_store.get(),
+        )
+        schedule_surface.bind_runner(schedule_runner)
 
     def mcp_server_factory(*, principal: Any) -> FastMCP:
         # MCP is read-only by default: dispatch needs explicit configuration
@@ -2839,6 +2967,7 @@ def _build_runtime(
         excess_controller=excess_controller,
         intents=intent_port,
         observations=observation_port,
+        schedule_runner=schedule_runner,
         recovery=recovery_monitor,
     )
     global _LAST_SUPERVISION
@@ -2866,6 +2995,8 @@ def _build_runtime(
         recovery=recovery_monitor,
         excess_adviser=excess_adviser,
         excess_controller=excess_controller,
+        schedule_surface=schedule_surface,
+        schedule_runner=schedule_runner,
     )
 
 
