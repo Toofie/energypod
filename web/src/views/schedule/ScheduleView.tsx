@@ -29,7 +29,11 @@
  *   PARTITION_ACKNOWLEDGED, one resend with `night_posture`. It is never
  *   shown pre-emptively.
  * - Every refusal renders inline verbatim (code + message), with the
- *   server's per-entry errors mapped onto the offending rows by entry id.
+ *   server's per-entry errors mapped onto the offending rows by entry id —
+ *   and, when the STRICT wire schema refuses before the facade ever runs
+ *   (pydantic loc paths like body.entries.0.effective_from), those paths map
+ *   onto the offending row by index, or name the field path in the banner.
+ *   A 422 never renders as a bare "Request validation failed".
  * - A 409 `schedule_not_commissioned` renders the honest not-commissioned
  *   state (the excess tile's own wording) — the nav keeps the view visible;
  *   a deployment that did not commission scheduling says so here rather than
@@ -440,42 +444,120 @@ function asRefusal(error: unknown): ScheduleRefusal {
   };
 }
 
+/** The server-error lines a 422 resolves to: inline row lines plus banner lines. */
+export interface ServerRefusalRows {
+  /** Inline lines keyed by the draft row's local key. */
+  byRowKey: Map<string, string[]>;
+  /** Lines naming no row (plan-level or wire-path errors), for the banner. */
+  plain: string[];
+}
+
 /**
- * The per-entry server errors a 422 carries, mapped by entry id. The service
- * nests them under `details.errors` (rest.py's replace_schedule handler,
- * landed with B4); `entries` is read alongside it defensively — the doc pins
- * the shape, the row mapping must survive either spelling.
+ * Render one pydantic `location` path ("body.entries.0.days.0") as a plain
+ * field path: "entries[0].days[0]" — the leading "body" is dropped, numeric
+ * segments become indices. Null when the path is not a usable list.
  */
-function serverEntryErrors(refusal: ScheduleRefusal): Record<string, string[]> {
-  const mapped: Record<string, string[]> = {};
+function locationPathText(location: unknown): string | null {
+  if (!Array.isArray(location)) {
+    return null;
+  }
+  const parts: string[] = [];
+  for (const segment of location) {
+    if (typeof segment === "number" && Number.isInteger(segment)) {
+      const previous = parts.pop();
+      parts.push(`${previous ?? "entries"}[${segment}]`);
+    } else if (typeof segment === "string" && segment !== "") {
+      parts.push(parts.length === 0 ? segment : `${parts[parts.length - 1]!}.${segment}`);
+    } else {
+      return null;
+    }
+  }
+  if (parts.length === 0) {
+    return null;
+  }
+  const path = parts[parts.length - 1]!;
+  return path === "body" ? null : path.replace(/^body\./, "");
+}
+
+/**
+ * Map a 422's `details.errors` onto the editor's rows. Two spellings arrive
+ * here, one per refusing layer:
+ *
+ * - The FACADE's per-entry validation (the friendly path that should run):
+ *   rows naming `entry_id` (+ optional `field`/`message`) — mapped onto the
+ *   row whose name matches, and onto the banner by name when no row matches.
+ * - The REST layer's STRICT wire-schema validation (pydantic — reached only
+ *   on contract drift): rows carrying a `location` path like
+ *   ["body","entries",0,"effective_from"]. The wire entry list IS the draft
+ *   list in order, so an entries-indexed path maps onto that draft row's
+ *   inline line; a path naming no entry (["body","timezone"]) or an index
+ *   outside the draft becomes a banner line naming the field path plainly.
+ *
+ * Either way the operator sees the offending row or the named field — never
+ * just "Request validation failed".
+ */
+function serverRefusalRows(refusal: ScheduleRefusal, draft: ScheduleDraft | null): ServerRefusalRows {
+  const byRowKey = new Map<string, string[]>();
+  const plain: string[] = [];
   const details = refusal.details;
   const rows = Array.isArray(details?.errors)
     ? (details?.errors as unknown[])
     : Array.isArray(details?.entries)
       ? (details?.entries as unknown[])
       : [];
+  const rowKeyByIndex = (index: number): string | null => {
+    const row = draft?.entries[index];
+    return row === undefined ? null : row.key;
+  };
+  const pushRow = (key: string, line: string): void => {
+    byRowKey.set(key, [...(byRowKey.get(key) ?? []), line]);
+  };
   for (const row of rows) {
     if (row === null || typeof row !== "object") {
       continue;
     }
     const record = row as Record<string, unknown>;
-    if (typeof record.entry_id !== "string") {
-      // A plan-level error (entry_id null) has no row to sit on; the envelope
-      // itself renders it verbatim.
-      continue;
-    }
     const message =
-      typeof record.message === "string"
+      typeof record.message === "string" && record.message !== ""
         ? record.message
         : typeof record.detail === "string"
           ? record.detail
-          : "";
+          : "did not validate";
+    const location = Array.isArray(record.location) ? record.location : null;
+    if (location !== null) {
+      // The strict REST layer's pydantic loc path.
+      const path = locationPathText(location);
+      if (path === null) {
+        continue;
+      }
+      const line = `${path}: ${message}`;
+      const entryIndex = location[0] === "body" && location[1] === "entries" ? location[2] : undefined;
+      const rowKey = typeof entryIndex === "number" ? rowKeyByIndex(entryIndex) : null;
+      if (rowKey !== null) {
+        pushRow(rowKey, line);
+      } else {
+        plain.push(line);
+      }
+      continue;
+    }
+    if (typeof record.entry_id !== "string") {
+      // A plan-level error (entry_id null) has no row to sit on; name it in
+      // the banner rather than hiding behind the generic message.
+      const field = typeof record.field === "string" && record.field !== "" ? record.field : "plan";
+      plain.push(`${field}: ${message}`);
+      continue;
+    }
     const field = typeof record.field === "string" ? record.field : "";
-    const text = message === "" ? "did not validate" : message;
-    const line = field === "" ? text : `${field}: ${text}`;
-    mapped[record.entry_id] = [...(mapped[record.entry_id] ?? []), line];
+    const line = field === "" ? message : `${field}: ${message}`;
+    const rowKey =
+      draft?.entries.find((entry) => entry.entryId.trim() === record.entry_id)?.key ?? null;
+    if (rowKey !== null) {
+      pushRow(rowKey, line);
+    } else {
+      plain.push(`${record.entry_id}: ${line}`);
+    }
   }
-  return mapped;
+  return { byRowKey, plain };
 }
 
 // --- the night-posture dialog (the NET_BILLED pattern, refusal-routed) -------------
@@ -623,7 +705,7 @@ export function ScheduleView({ client }: ScheduleViewProps): JSX.Element {
   const [knownUnits, setKnownUnits] = useState<string[]>([]);
   const [publishing, setPublishing] = useState(false);
   const [publishRefusal, setPublishRefusal] = useState<ScheduleRefusal | null>(null);
-  const [serverErrors, setServerErrors] = useState<Record<string, string[]>>({});
+  const [serverRows, setServerRows] = useState<ServerRefusalRows>({ byRowKey: new Map(), plain: [] });
   const [nightDialog, setNightDialog] = useState<{ refusal: ScheduleRefusal } | null>(null);
   const [conflict, setConflict] = useState<ScheduleRefusal | null>(null);
   const [notice, setNotice] = useState("");
@@ -863,7 +945,7 @@ export function ScheduleView({ client }: ScheduleViewProps): JSX.Element {
         return;
       }
       setPublishRefusal(null);
-      setServerErrors({});
+      setServerRows({ byRowKey: new Map(), plain: [] });
       setConflict(null);
       setNotice("");
       // The client-side pre-check mirrors the server's containment rule: a
@@ -942,7 +1024,7 @@ export function ScheduleView({ client }: ScheduleViewProps): JSX.Element {
             return;
           }
           setPublishRefusal(refusal);
-          setServerErrors(serverEntryErrors(refusal));
+          setServerRows(serverRefusalRows(refusal, draft));
         });
     },
     [
@@ -1086,15 +1168,19 @@ export function ScheduleView({ client }: ScheduleViewProps): JSX.Element {
       )}
       {publishRefusal !== null && (
         <div role="alert" className="schedule-refusal">
-          <p className="schedule-refusal-plain">{publishRefusalSentence(publishRefusal, draft)}</p>
+          <p className="schedule-refusal-plain">
+            {publishRefusalSentence(publishRefusal, draft, serverRows)}
+          </p>
           <p className="schedule-refusal-verbatim">
             <code>{publishRefusal.code}</code> — <span>{publishRefusal.message}</span>
           </p>
-          {offendingLines(publishRefusal).map((line) => (
-            <p key={line} className="schedule-refusal-offending">
-              {line}
-            </p>
-          ))}
+          {offendingLines(publishRefusal)
+            .concat(serverRows.plain)
+            .map((line) => (
+              <p key={line} className="schedule-refusal-offending">
+                {line}
+              </p>
+            ))}
         </div>
       )}
 
@@ -1106,7 +1192,7 @@ export function ScheduleView({ client }: ScheduleViewProps): JSX.Element {
             knownUnits={knownUnits}
             errors={rowErrors.get(row.key) ?? null}
             guard={guards.get(row.key) ?? null}
-            serverLines={serverErrors[row.entryId.trim()] ?? []}
+            serverLines={serverRows.byRowKey.get(row.key) ?? []}
             posture={policy.posture}
             windowsText={windowsText}
             onChange={(patch) => updateEntry(row.key, patch)}
@@ -1536,13 +1622,30 @@ function perBatteryDraftMap(row: DraftEntry): Record<string, number> | null {
   return Object.keys(map).length > 0 ? map : null;
 }
 
-/** The plain sentence for a refused publish; the envelope renders beside it. */
-function publishRefusalSentence(refusal: ScheduleRefusal, draft: ScheduleDraft | null): string {
+/**
+ * The plain sentence for a refused publish; the envelope renders beside it.
+ * A validation refusal names WHERE its reasons rendered (the offending rows,
+ * the field paths below, or both) — it never points at highlights that are
+ * absent, and never collapses to a bare "Request validation failed".
+ */
+function publishRefusalSentence(
+  refusal: ScheduleRefusal,
+  draft: ScheduleDraft | null,
+  serverRows: ServerRefusalRows,
+): string {
   if (refusal.code === "schedule_window_not_allowed") {
     return "The commissioned windows refuse part of this plan — trim the offending entries to the allowed windows, or make the partition choice in config (stand the external writers down, widen the policy, restart), then acknowledge once.";
   }
   if (refusal.code === "validation_error") {
-    return "The service refused the plan — the highlighted entries carry the reasons.";
+    const highlighted = serverRows.byRowKey.size > 0;
+    const plain = serverRows.plain.length > 0;
+    if (highlighted && plain) {
+      return "The service refused the request — the highlighted entries and the field paths below carry the reasons.";
+    }
+    if (highlighted) {
+      return "The service refused the plan — the highlighted entries carry the reasons.";
+    }
+    return "The service refused the request — the field paths below name the reasons.";
   }
   if (refusal.code === "schedule_not_commissioned") {
     return "Scheduling is not commissioned in this deployment's config.";

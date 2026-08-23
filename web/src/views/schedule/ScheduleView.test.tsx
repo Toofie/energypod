@@ -594,6 +594,10 @@ describe("ScheduleView — publishing", () => {
     expect(entries[0]!.entry_id).toBe("Day charge");
     expect(entries[0]!.action).toBe("charge");
     expect(entries[0]!.enabled).toBe(true);
+    // The optional date range is OMITTED when unset (DESIGN_SCHEDULES §1) —
+    // never invented, never a sentinel date.
+    expect(entries[0]!.effective_from).toBeUndefined();
+    expect(entries[0]!.effective_until).toBeUndefined();
 
     // Optimistic adoption of the 200: the stored plan becomes the draft base.
     await waitFor(() => {
@@ -779,6 +783,68 @@ describe("ScheduleView — publishing", () => {
     await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
 
     expect(await within(entryCards()[0]!).findByText(/Server: end_local: window must outlast its start/i)).toBeVisible();
+    expect(screen.getByText("validation_error")).toBeVisible();
+  });
+
+  it("maps a strict wire-schema 422's location paths onto the offending row, and names plan-level fields plainly", async () => {
+    // The REST layer's pydantic refusal (contract drift defense): details
+    // carry loc paths, not entry ids — an entries-indexed path lands on that
+    // draft row; anything else names its field path in the banner.
+    const put = vi.fn(() =>
+      Promise.reject(
+        refusalError("validation_error", {
+          message: "Request validation failed",
+          details: {
+            errors: [
+              {
+                location: ["body", "entries", 0, "effective_from"],
+                message: "Field required",
+                type: "missing",
+              },
+              {
+                location: ["body", "entries", 0, "days", 1],
+                message: "Input should be 'mon', 'tue', 'wed', 'thu', 'fri', 'sat' or 'sun'",
+                type: "literal_error",
+              },
+              {
+                location: ["body", "timezone"],
+                message: "Input should be a valid string",
+                type: "string_type",
+              },
+            ],
+          },
+        }),
+      ),
+    );
+    const harness = installHarness({
+      get: vi.fn(() => Promise.resolve(getScheduleOk({ plan: planWith([DAY_CHARGE_ENTRY]) }))),
+      put,
+    });
+    renderEditable(harness);
+    await waitFor(() => expect(entryCards()).toHaveLength(1));
+    const card = entryCards()[0]!;
+    const lhs = within(card).getByLabelText("Watts for lhs");
+    await userEvent.clear(lhs);
+    await userEvent.type(lhs, "2400");
+
+    await userEvent.click(screen.getByRole("button", { name: /Publish changes/i }));
+    await waitFor(() => expect(put).toHaveBeenCalledTimes(1));
+
+    // Both entries-indexed paths land on the row their index names.
+    expect(
+      await within(entryCards()[0]!).findByText(/Server: entries\[0\]\.effective_from: Field required/i),
+    ).toBeVisible();
+    expect(
+      within(entryCards()[0]!).getByText(/Server: entries\[0\]\.days\[1\]/i),
+    ).toBeVisible();
+    // The plan-level path has no row — the banner names it plainly, and the
+    // sentence names BOTH places rather than pointing at absent highlights.
+    expect(screen.getByText(/timezone: Input should be a valid string/i)).toBeVisible();
+    expect(
+      screen.getByText(
+        /The service refused the request — the highlighted entries and the field paths below carry the reasons/i,
+      ),
+    ).toBeVisible();
     expect(screen.getByText("validation_error")).toBeVisible();
   });
 });
