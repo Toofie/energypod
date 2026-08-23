@@ -353,9 +353,16 @@ excess_charging:
 # default) the solar-surplus adviser outrank it per battery, and a window
 # opening under one simply WAITS.
 #
-# schedule:
-#   # The allowed command windows, local civil time ("HH:MM" pairs; a pair
-#   # may cross midnight). The UNION of the pairs is what a schedule may
-#   # command. OMITTED = the day-only YIELD default shown here.
-#   allowed_windows_local: [["06:00", "20:00"]]
-#   intent_ttl_s: 10.0
+# COMMISSIONED 2026-08-24 (operator request): the block below is live — the
+# routes, runner, and snapshot projection compose, the console editor is
+# enabled, and an EMPTY plan commands nothing until the operator publishes
+# one. The posture stays the day-only YIELD default: schedules may command
+# 06:00-20:00 local; night remains with the site's external writer
+# applications until an explicit PARTITION grant (config revision + the
+# one-time acknowledgement).
+schedule:
+  # The allowed command windows, local civil time ("HH:MM" pairs; a pair
+  # may cross midnight). The UNION of the pairs is what a schedule may
+  # command. OMITTED = the day-only YIELD default shown here.
+  allowed_windows_local: [["06:00", "20:00"]]
+  intent_ttl_s: 10.0
