@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Protocol
 
-import yaml  # type: ignore[import-untyped]  # types-PyYAML is not pinned yet
+import yaml
 from pydantic import ValidationError
 
 from energypod.runtime.config import ControllerConfig
