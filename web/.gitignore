@@ -1,0 +1,7 @@
+# The screenshot harness's output (dev tooling — regenerated per design round,
+# never committed). See scripts/screenshot.mjs.
+.design-shots/
+
+# Playwright browser binaries, in case PLAYWRIGHT_BROWSERS_PATH points into
+# the tree (the default install lands in the OS user cache instead).
+.ms-playwright/

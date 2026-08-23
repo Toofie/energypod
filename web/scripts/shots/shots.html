@@ -1,0 +1,26 @@
+<!doctype html>
+<!--
+  The screenshot harness's host page (dev tooling only — never part of a build).
+
+  Served by the harness's own Vite dev server (scripts/screenshot.mjs starts
+  it in middleware mode; `vite build` never sees this file because it is not
+  index.html and no build input names it).
+
+  Two modes, chosen by query string:
+    ?manifest           → mounts nothing; exposes window.__shotsManifest()
+    ?view=flow&state=x  → mounts that view's state through the real component
+  Readiness for Playwright: <html data-shots-ready="true"> flips only after
+  the mounted view has consumed the seeded snapshot AND its first stream frame
+  AND the fonts have settled AND two animation frames have painted.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EnergyPod console — screenshot harness</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>

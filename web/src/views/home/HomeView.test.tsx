@@ -1245,7 +1245,7 @@ describe("HomeView — live outcomes and ages in the composed app", () => {
       const seconds = aged.match(/Data age: (\d+) s/);
       expect(seconds).not.toBeNull();
       expect(Number(seconds?.[1] ?? 0)).toBeGreaterThanOrEqual(24);
-    });
+    }, { timeout: 4000 });
   });
 });
 

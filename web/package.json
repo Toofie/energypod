@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "shots": "node scripts/screenshot.mjs"
   },
   "dependencies": {
     "react": "19.2.8",
@@ -18,10 +19,12 @@
     "@testing-library/jest-dom": "6.9.1",
     "@testing-library/react": "16.3.0",
     "@testing-library/user-event": "14.6.1",
+    "@types/node": "26.2.0",
     "@types/react": "19.2.2",
     "@types/react-dom": "19.2.1",
     "@vitejs/plugin-react": "5.1.1",
     "jsdom": "27.0.0",
+    "playwright": "^1.62.1",
     "typescript": "5.9.3",
     "vite": "8.2.1",
     "vitest": "3.2.4"
