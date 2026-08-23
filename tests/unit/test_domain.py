@@ -619,6 +619,102 @@ def test_observation_rejects_undeclared_protocol_fields() -> None:
         models.Observation(**_observation_kwargs(models, signed_setpoint_watts=-1_000))
 
 
+# --- energy scorecard: six advisory cumulative fields (E1) ----------------------
+#
+# DESIGN_ENERGY_SCORECARD section 5 + API_CONTRACTS "Energy scorecard": the
+# observation gains six ADVISORY cumulative-energy fields, None when the
+# cold-ring totals block was not served, with quality-map keys joining
+# ADVISORY_QUALITY_FIELDS (the twelve-key map extends to eighteen).
+
+_CT_QUALITY_FIELDS = ("grid_power_w", "load_power_w")
+_ENERGY_QUALITY_FIELDS = (
+    "energy_grid_a_kwh",
+    "energy_grid_b_kwh",
+    "energy_load_kwh",
+    "energy_pv_kwh",
+    "energy_charge_kwh",
+    "energy_discharge_kwh",
+)
+
+
+def _energy_kwargs(models: ModuleType, **overrides: Any) -> dict[str, Any]:
+    values: dict[str, Any] = dict(
+        energy_grid_a_kwh=9709.2,
+        energy_grid_b_kwh=3187.7,
+        energy_load_kwh=3789.4,
+        energy_pv_kwh=0.0,
+        energy_charge_kwh=3567.2,
+        energy_discharge_kwh=5678.9,
+        grid_power_w=-1736.0,
+        load_power_w=1701.0,
+        quality=_quality(models)
+        | {
+            name: models.DataQuality.GOOD for name in (*_CT_QUALITY_FIELDS, *_ENERGY_QUALITY_FIELDS)
+        },
+    )
+    values.update(overrides)
+    return values
+
+
+def test_observation_carries_six_advisory_energy_fields() -> None:
+    models = _models()
+    observation = models.Observation(**_observation_kwargs(models, **_energy_kwargs(models)))
+
+    assert observation.energy_grid_a_kwh == pytest.approx(9709.2)
+    assert observation.energy_discharge_kwh == pytest.approx(5678.9)
+    assert observation.safety_data_complete, "energy fields are advisory, not safety inputs"
+    assert set(models.Observation.ADVISORY_QUALITY_FIELDS) == {
+        *_CT_QUALITY_FIELDS,
+        *_ENERGY_QUALITY_FIELDS,
+    }
+    assert models.Observation.REQUIRED_SAFETY_QUALITY_FIELDS.isdisjoint(_ENERGY_QUALITY_FIELDS)
+
+
+def test_energy_fields_default_to_none_without_the_totals_block() -> None:
+    """A poll that did not serve the totals block keeps fully qualified safety
+    telemetry -- absent cumulative evidence is never zero and never refuses."""
+    models = _models()
+    observation = models.Observation(**_observation_kwargs(models))
+    for field in _ENERGY_QUALITY_FIELDS:
+        assert getattr(observation, field) is None
+    assert observation.safety_data_complete
+
+
+@pytest.mark.parametrize(
+    "advisory",
+    [
+        (*_CT_QUALITY_FIELDS, *_ENERGY_QUALITY_FIELDS[:5]),  # seventeen keys
+        (*_CT_QUALITY_FIELDS, *_ENERGY_QUALITY_FIELDS, "invented"),  # nineteen keys
+    ],
+)
+def test_partial_energy_quality_maps_are_refused(advisory: tuple[str, ...]) -> None:
+    """Exactly the ten-, twelve-, or eighteen-key shapes decode; a partial
+    energy extension (seventeen or nineteen keys) is a malformed quality map."""
+    models = _models()
+    quality = _quality(models) | {name: models.DataQuality.GOOD for name in advisory}
+    with pytest.raises((TypeError, ValueError)):
+        models.Observation(**_observation_kwargs(models, quality=quality))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("energy_grid_a_kwh", -0.1),
+        ("energy_load_kwh", math.nan),
+        ("energy_charge_kwh", math.inf),
+        ("energy_pv_kwh", True),
+    ],
+)
+def test_energy_fields_reject_malformed_values(field: str, value: object) -> None:
+    """Cumulative counters are finite non-negative kWh (uint32 x 0.1 on the
+    wire); anything else is refused rather than coerced."""
+    models = _models()
+    kwargs = _energy_kwargs(models)
+    kwargs["quality"] = dict(kwargs["quality"])
+    with pytest.raises((TypeError, ValueError)):
+        models.Observation(**_observation_kwargs(models, **{**kwargs, field: value}))
+
+
 # --- per-unit direction breakdown on audit facts (2026-08-24) ------------------
 #
 # Concurrent cycles compose several intents whose units may run DIFFERENT

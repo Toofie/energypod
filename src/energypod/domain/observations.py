@@ -73,7 +73,30 @@ class Observation(BaseModel):
     # fail-closed bound, never through the safety-critical completeness set,
     # so a deployment whose read plan does not serve the PCS block keeps fully
     # qualified observations for ordinary control.
-    ADVISORY_QUALITY_FIELDS: ClassVar[frozenset[str]] = frozenset({"grid_power_w", "load_power_w"})
+    #
+    # API_CONTRACTS "Energy scorecard" (DESIGN_ENERGY_SCORECARD section 5):
+    # the six cumulative-energy words (cold-ring totals block 0x4101,
+    # field-mapping S2.7) join the same ADVISORY set -- quality-map keys, so
+    # the twelve-key shape extends to eighteen by the same mechanism -- while
+    # staying OUTSIDE every safety completeness set: an unserved energy block
+    # must never refuse power.  The grid pair keeps NEUTRAL A/B names until
+    # the ``grid_counter_roles`` config gate licenses vendor labels (A-1).
+    # The advisory set grows by feature, never by partial extension: the CT
+    # pair (excess-solar) and then the six cumulative-energy words (the energy
+    # scorecard).  Producers keep emitting every key they know, so the
+    # twelve-key shape stays valid alongside the eighteen-key one.
+    CT_QUALITY_FIELDS: ClassVar[frozenset[str]] = frozenset({"grid_power_w", "load_power_w"})
+    ENERGY_QUALITY_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "energy_grid_a_kwh",
+            "energy_grid_b_kwh",
+            "energy_load_kwh",
+            "energy_pv_kwh",
+            "energy_charge_kwh",
+            "energy_discharge_kwh",
+        }
+    )
+    ADVISORY_QUALITY_FIELDS: ClassVar[frozenset[str]] = CT_QUALITY_FIELDS | ENERGY_QUALITY_FIELDS
     # SYNC_RESILIENCE_AUDIT B1 (2026-08-24): the system controller's SOC word
     # (0x0100+17) is ADVISORY telemetry too.  The tiered read plan serves its
     # block once per process and merges it from cache thereafter, so its
@@ -122,6 +145,19 @@ class Observation(BaseModel):
     ctrl_mode_w: int | None = None
     work_mode_w: int | None = None
     run_mode_w: int | None = None
+    # Advisory cumulative energy (DESIGN_ENERGY_SCORECARD section 5): the six
+    # low-word-first uint32 x 0.1 kWh counters of the totals block 0x4101, in
+    # vendor pair order.  The GRID PAIR names are deliberately NEUTRAL (A/B):
+    # the pair ORDER is vendor-confirmed but which pair accumulates imports
+    # and which exports is evidence-open (field-mapping S5 A-1) -- renaming to
+    # bought/sold happens only behind the ``grid_counter_roles`` config gate.
+    # ``None`` when the poll did not serve the totals block; never zero-filled.
+    energy_grid_a_kwh: float | None = None
+    energy_grid_b_kwh: float | None = None
+    energy_load_kwh: float | None = None
+    energy_pv_kwh: float | None = None
+    energy_charge_kwh: float | None = None
+    energy_discharge_kwh: float | None = None
     expected_cell_count: int | None = None
     cell_voltages_v: tuple[float, ...]
     cell_captured_at_mono: float | None = None
@@ -201,6 +237,23 @@ class Observation(BaseModel):
             raise ValueError("measurement must be finite")
         return value
 
+    @field_validator(
+        "energy_grid_a_kwh",
+        "energy_grid_b_kwh",
+        "energy_load_kwh",
+        "energy_pv_kwh",
+        "energy_charge_kwh",
+        "energy_discharge_kwh",
+    )
+    @classmethod
+    def _cumulative_energy(cls, value: float | None) -> float | None:
+        # Cumulative counters decode from uint32 x 0.1 words: finite and
+        # non-negative, with ``bool`` refused by strict mode alongside every
+        # other coercion.
+        if value is not None and (not math.isfinite(value) or value < 0):
+            raise ValueError("cumulative energy must be finite and non-negative")
+        return value
+
     @field_validator("dynamic_charge_limit_w", "dynamic_discharge_limit_w")
     @classmethod
     def _nonnegative_measurement(cls, value: float | None) -> float | None:
@@ -233,12 +286,18 @@ class Observation(BaseModel):
     @classmethod
     def _quality(cls, value: Mapping[str, DataQuality]) -> Mapping[str, DataQuality]:
         copied = dict(value)
-        # Exactly the ten safety-critical fields, or those plus the two
-        # advisory CT fields: the wire decoder always emits the twelve-key
-        # shape (MISSING for unserved sources), while older producers and the
-        # ten-field test fixtures keep the original shape.  Anything else is a
-        # malformed quality map, not a partial view to forgive.
-        allowed = (cls.QUALITY_FIELDS, cls.QUALITY_FIELDS | cls.ADVISORY_QUALITY_FIELDS)
+        # Exactly the ten safety-critical fields, those plus the two advisory
+        # CT fields, or those plus the full advisory set (the CT pair and the
+        # six cumulative-energy fields -- DESIGN_ENERGY_SCORECARD section 5):
+        # the wire decoder always emits every key it knows the plan may serve
+        # (MISSING for unserved sources), while older producers and the
+        # ten-field test fixtures keep the original shapes.  A partial
+        # advisory extension is a malformed quality map, not a view to forgive.
+        allowed = (
+            cls.QUALITY_FIELDS,
+            cls.QUALITY_FIELDS | cls.CT_QUALITY_FIELDS,
+            cls.QUALITY_FIELDS | cls.ADVISORY_QUALITY_FIELDS,
+        )
         if set(copied) not in allowed:
             raise ValueError("quality must contain exactly the declared telemetry fields")
         if any(type(item) is not DataQuality for item in copied.values()):

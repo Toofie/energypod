@@ -116,13 +116,14 @@ _REQUIRED_BLOCKS: tuple[int, ...] = (
 )
 
 # The PCS live block 0x1000 became advisory-CONSUMED with the excess-solar
-# contract (grid_power_w at +17, load_power_w at +20 — PROTOCOL_EVIDENCE 4c);
-# it no longer belongs in the unconsumed set below.
+# contract (grid_power_w at +17, load_power_w at +20 — PROTOCOL_EVIDENCE 4c),
+# and the cumulative-energy block 0x4101 became advisory-CONSUMED with the
+# energy scorecard (DESIGN_ENERGY_SCORECARD §5, E1: six neutral cumulative
+# fields); neither belongs in the unconsumed set below.
 _UNCONSUMED_BLOCKS: tuple[int, ...] = (
     0x1060,
     0x2000,
     0x2060,
-    _TOTALS_BASE,
     _BALANCE_BASE,
 )
 
@@ -335,10 +336,11 @@ def test_all_high_confidence_fields_decode_on_every_captured_unit(
     assert observation.temperatures_complete is True
 
     # Coherent captures qualify across the whole declared quality surface.
-    # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the wire
-    # decoder always emits the twelve-key quality shape — the ten safety
-    # fields plus the two advisory CT fields (MISSING when the PCS block is
-    # unserved by the read plan).
+    # API_CONTRACTS "Excess-solar accelerated charging (advisory)" +
+    # "Energy scorecard": the wire decoder emits the EIGHTEEN-key quality
+    # shape when the poll served the PCS and totals blocks — the ten safety
+    # fields plus the two advisory CT fields plus the six advisory cumulative
+    # energy fields.
     assert set(observation.quality) == set(Observation.QUALITY_FIELDS) | set(
         Observation.ADVISORY_QUALITY_FIELDS
     )
@@ -664,9 +666,11 @@ def test_unconsumed_plan_blocks_do_not_influence_the_observation(
 ) -> None:
     """T-UNIT-WIRE-018A / decode consumes only its stated sources / S1.
 
-    The deployed plan also reads PCS live/detail and DCDC live/detail blocks
-    plus the ambiguous energy and balance blocks; the observation consumes
-    none of them, so their absence must leave the decode bit-identical.
+    The deployed plan also reads the PCS detail and DCDC live/detail blocks
+    plus the ambiguous balance block; the observation consumes none of them,
+    so their absence must leave the decode bit-identical.  (The cumulative
+    energy block 0x4101 left this set with the energy scorecard, E1 — its six
+    advisory fields are now decoded.)
     """
     baseline = _decode_unit(wire_decode, capture, "MID")
 
@@ -775,11 +779,15 @@ def test_negative_dynamic_limit_fails_closed(
 def test_ambiguous_energy_and_balance_words_stay_out_of_the_observation(
     wire_decode: Any, capture: Any
 ) -> None:
-    """T-UNIT-WIRE-023 / field-mapping S5 A-1,A-15 / S1.
+    """T-UNIT-WIRE-023 / field-mapping S5 A-1,A-15 / S1, superseded shape.
 
-    Energy-counter role labels and balance-word bits are ambiguous; the
-    observation has no channel for them and their contents must not influence
-    any decoded value.
+    The energy-scorecard design (DESIGN_ENERGY_SCORECARD §5, E1) decodes the
+    six cumulative counters as ADVISORY observation fields, but the GRID
+    PAIR's ROLE labels stay out: the pair decodes under NEUTRAL A/B names
+    exactly because which pair is buy and which is sell is evidence-open
+    (field-mapping A-1).  Balance-word bits remain undecoded, and scrambling
+    the totals block changes exactly the six energy fields — no other value,
+    no quality judgment.
     """
     baseline = _decode_unit(wire_decode, capture, "MID")
 
@@ -788,11 +796,30 @@ def test_ambiguous_energy_and_balance_words_stay_out_of_the_observation(
     scrambled[_BALANCE_BASE] = tuple(0x5555 for _ in scrambled[_BALANCE_BASE])
     scrambled_observation = _decode_unit(wire_decode, capture, "MID", blocks=scrambled)
 
-    assert scrambled_observation == baseline
-    ambiguous = {"energy", "balance"}
+    assert scrambled_observation != baseline, "the six energy fields are decoded values now"
+    assert scrambled_observation.energy_grid_a_kwh != baseline.energy_grid_a_kwh
+    for field in (
+        "system_soc_pct",
+        "bms_soc_pct",
+        "battery_watts",
+        "grid_power_w",
+        "load_power_w",
+        "debug_mode_w",
+        "run_mode_w",
+        "cell_voltages_v",
+        "temperatures_c",
+        "active_faults",
+        "active_warnings",
+        "quality",
+    ):
+        assert getattr(scrambled_observation, field) == getattr(baseline, field), field
+    # NEUTRAL naming: no observation field names a grid role.
+    role_tags = ("buy", "sell", "import", "export")
     assert not {
-        field for field in Observation.model_fields if any(tag in field for tag in ambiguous)
-    }
+        field
+        for field in Observation.model_fields
+        if field.startswith("energy_") and any(tag in field for tag in role_tags)
+    }, "the grid pair must stay neutrally named until the roles key licenses labels"
 
 
 def test_decode_leaves_the_served_blocks_untouched(wire_decode: Any, capture: Any) -> None:
@@ -892,16 +919,17 @@ def test_missing_pcs_block_leaves_grid_and_load_missing_but_qualifying(
 def test_quality_map_carries_the_advisory_field_set(wire_decode: Any, capture: Any) -> None:
     """T-UNIT-WIRE-028 / ADVISORY_QUALITY_FIELDS shape / S1.
 
-    The decoder always emits the twelve-key quality shape (ten safety-critical
-    plus the two advisory fields); the domain accepts exactly the ten-field or
-    the twelve-field shape and nothing else.
+    The decoder always emits the twelve-key CT-advisory quality shape when the
+    totals block was not served, and the EIGHTEEN-key shape when it was (the
+    energy scorecard's six cumulative fields, E1); the domain accepts exactly
+    the ten-, twelve-, or eighteen-field shape and nothing else.
     """
     observation = _decode_unit(wire_decode, capture, "MID")
 
     assert set(observation.quality) == set(Observation.QUALITY_FIELDS) | {
         "grid_power_w",
         "load_power_w",
-    }
+    } | set(_ENERGY_FIELDS)
     assert hasattr(Observation, "ADVISORY_QUALITY_FIELDS")
 
 
@@ -933,11 +961,12 @@ def test_mode_words_decode_as_advisory_fields(
     assert observation.work_mode_w == blocks[_SYSTEM_BASE][2]
     assert observation.run_mode_w == blocks[_PCS_LIVE_BASE][2]
     # Advisory doctrine: the mode words never join the quality map, whose
-    # twelve-key shape is unchanged.
+    # key set is the safety ten plus the advisory CT pair plus (when the
+    # totals block was served) the six energy fields.
     assert set(observation.quality) == set(Observation.QUALITY_FIELDS) | {
         "grid_power_w",
         "load_power_w",
-    }
+    } | set(_ENERGY_FIELDS)
 
 
 def test_nonzero_debug_mode_word_marks_the_vendor_dispatch_precondition_failed(
@@ -978,4 +1007,192 @@ def test_mode_words_absent_blocks_stay_none_and_change_nothing(
     assert observation.ctrl_mode_remote is None
     # The PCS live block IS part of the primary plan: its runMode still reads.
     assert observation.run_mode_w == _blocks_of(capture, "MID")[_PCS_LIVE_BASE][2]
+    assert observation.safety_data_complete is True
+
+
+# --- energy scorecard: the six cumulative advisory fields (E1) ------------------
+#
+# DESIGN_ENERGY_SCORECARD section 5 + API_CONTRACTS "Energy scorecard": the
+# cold-ring cumulative-energy block 0x4101 (12 registers, field-mapping S2.7,
+# vendor decode SysControl.cs:779-784) decodes as six low-word-first
+# uint32 x 0.1 kWh pairs in VENDOR ORDER -- grid pair (NEUTRAL A/B names: the
+# pair ORDER is vendor-confirmed, the buy/sell ROLE labels are evidence-open,
+# A-1), load, PV, BMS charge, BMS discharge (the charge/discharge role labels
+# ARE capture-confirmed).  All six are ADVISORY: quality-map keys, but never
+# inside a safety completeness set -- an unserved energy block must never
+# refuse power.
+
+_ENERGY_FIELDS: tuple[str, ...] = (
+    "energy_grid_a_kwh",
+    "energy_grid_b_kwh",
+    "energy_load_kwh",
+    "energy_pv_kwh",
+    "energy_charge_kwh",
+    "energy_discharge_kwh",
+)
+
+# Spot engineering values transcribed from field-mapping S2.7 (the same live
+# capture this file decodes) -- they guard the recomputed expectations against
+# an indexing error in either direction.
+_ENERGY_SPOT: dict[str, tuple[float, ...]] = {
+    "MID": (9709.2, 3187.7, 3789.4, 0.0, 3567.2, 5678.9),
+    "RHS": (2346.2, 5175.1, 2018.8, 0.0, 2103.7, 6351.9),
+    "LHS": (6960.5, 4256.7, 4881.0, 6.2, 4654.8, 6156.9),
+}
+
+
+def _energy_expectations(blocks: Mapping[int, Sequence[int]]) -> tuple[float, ...]:
+    """Recompute the six pairs from the served totals words (mapping S2.7)."""
+    words = blocks[_TOTALS_BASE]
+    return tuple(
+        float(((int(words[pair * 2 + 1]) & 0xFFFF) << 16 | (int(words[pair * 2]) & 0xFFFF)) * 0.1)
+        for pair in range(6)
+    )
+
+
+@pytest.mark.parametrize("unit_key", _UNIT_KEYS)
+def test_energy_totals_decode_six_pairs_low_word_first_scaled_x01(
+    wire_decode: Any, capture: Any, unit_key: str
+) -> None:
+    """T-UNIT-WIRE-030 / field-mapping S2.7 (SysControl.cs:779-784) / S0.
+
+    Every captured unit served the totals block, so all six cumulative fields
+    decode with GOOD quality, recomputed here from the served words -- the
+    low-address word is the LOW word of each uint32 count, scaled x 0.1 kWh,
+    in vendor pair order.
+    """
+    blocks = _blocks_of(capture, unit_key)
+    observation = _decode_unit(wire_decode, capture, unit_key)
+    expected = _energy_expectations(blocks)
+
+    for field, value in zip(_ENERGY_FIELDS, expected, strict=True):
+        assert getattr(observation, field) == pytest.approx(value), field
+        assert observation.quality[field] is DataQuality.GOOD, field
+
+    # Spot guard against a pair-index swap in either direction (S2.7 table).
+    for field, value in zip(_ENERGY_FIELDS, _ENERGY_SPOT[unit_key], strict=True):
+        assert getattr(observation, field) == pytest.approx(value), field
+
+    # The charge/discharge pair is byte-identical to the BMS block's own
+    # energy words (mapping S2.7 cross-block check) -- a decode that sourced
+    # them anywhere else breaks this identity.
+    bms = blocks[_BMS_BASE]
+    charge = ((int(bms[16]) & 0xFFFF) << 16 | (int(bms[15]) & 0xFFFF)) * 0.1
+    discharge = ((int(bms[18]) & 0xFFFF) << 16 | (int(bms[17]) & 0xFFFF)) * 0.1
+    assert observation.energy_charge_kwh == pytest.approx(charge)
+    assert observation.energy_discharge_kwh == pytest.approx(discharge)
+
+
+def test_energy_fields_carry_the_neutral_ab_grid_naming(wire_decode: Any, capture: Any) -> None:
+    """T-UNIT-WIRE-031 / DESIGN_ENERGY_SCORECARD S5 neutral naming / S1.
+
+    The grid pair renders under NEUTRAL A/B names until the pinning evidence
+    (A-1) licenses vendor labels through the ``grid_counter_roles`` config
+    gate; the load/PV/charge/discharge fields carry their confirmed names.
+    """
+    observation = _decode_unit(wire_decode, capture, "MID")
+
+    for field in _ENERGY_FIELDS:
+        assert hasattr(observation, field), field
+    for absent in (
+        "energy_grid_buy_kwh",
+        "energy_grid_sell_kwh",
+        "energy_grid_import_kwh",
+        "energy_grid_export_kwh",
+        "energy_bought_kwh",
+        "energy_sold_kwh",
+    ):
+        assert absent not in Observation.model_fields, absent
+
+
+def test_absent_totals_block_decodes_six_nones_with_missing_quality(
+    wire_decode: Any, capture: Any
+) -> None:
+    """T-UNIT-WIRE-032 / honest MISSING per source / S0.
+
+    A poll without the totals block (the cold ring serves it once per ~108 s
+    rotation) reports every cumulative field honestly MISSING -- never
+    zero-filled -- and the observation STILL qualifies for ordinary control.
+    """
+    blocks = _blocks_of(capture, "RHS")
+    del blocks[_TOTALS_BASE]
+    observation = _decode_unit(wire_decode, capture, "RHS", blocks=blocks)
+
+    for field in _ENERGY_FIELDS:
+        assert getattr(observation, field) is None, field
+        assert observation.quality[field] is DataQuality.MISSING, field
+    assert observation.safety_data_complete is True, (
+        "an unserved energy block must never refuse power"
+    )
+
+
+def test_energy_quality_keys_extend_the_advisory_map_to_eighteen(
+    wire_decode: Any, capture: Any
+) -> None:
+    """T-UNIT-WIRE-033 / ADVISORY_QUALITY_FIELDS extension / S1.
+
+    The twelve-key quality map extends to eighteen by the same mechanism the
+    CT pair used; the domain accepts exactly the ten-, twelve-, and
+    eighteen-key shapes, and the energy fields stay outside every safety
+    completeness set.
+    """
+    observation = _decode_unit(wire_decode, capture, "MID")
+
+    assert set(Observation.ADVISORY_QUALITY_FIELDS) == {
+        "grid_power_w",
+        "load_power_w",
+        *_ENERGY_FIELDS,
+    }
+    assert set(observation.quality) == (
+        set(Observation.QUALITY_FIELDS) | set(Observation.ADVISORY_QUALITY_FIELDS)
+    )
+    assert Observation.REQUIRED_SAFETY_QUALITY_FIELDS.isdisjoint(_ENERGY_FIELDS)
+    assert set(Observation.QUALITY_FIELDS).isdisjoint(_ENERGY_FIELDS)
+
+
+def test_crafted_totals_words_pin_the_pair_arithmetic(wire_decode: Any, capture: Any) -> None:
+    """T-UNIT-WIRE-034 / low-word-first uint32 x 0.1 / S0.
+
+    Crafted words pin the composition arithmetic independent of the capture:
+    a count above one 16-bit word must combine BOTH words (low first), and a
+    truncated block must decode only the pairs it fully served.
+    """
+    blocks = _blocks_of(capture, "MID")
+    # Counts: 0x0001F400 = 128000 -> 12800.0 kWh (exercises the high word);
+    # 1 -> 0.1; 0x0000FFFF = 65535 -> 6553.5; 62 -> 6.2 (the LHS PV noise
+    # value); 0x00012345 = 74565 -> 7456.5; 0x000ABCDE = 703710 -> 70371.0.
+    counts = (0x0001F400, 0x00000001, 0x0000FFFF, 0x0000003E, 0x00012345, 0x000ABCDE)
+    words: list[int] = []
+    for count in counts:
+        words.extend((count & 0xFFFF, (count >> 16) & 0xFFFF))
+    blocks[_TOTALS_BASE] = tuple(words)
+    observation = _decode_unit(wire_decode, capture, "MID", blocks=blocks)
+
+    expected = (12800.0, 0.1, 6553.5, 6.2, 7456.5, 70371.0)
+    for field, value in zip(_ENERGY_FIELDS, expected, strict=True):
+        assert getattr(observation, field) == pytest.approx(value), field
+
+
+@pytest.mark.parametrize("served_words", [11, 10, 9])
+def test_truncated_totals_block_decodes_only_fully_served_pairs(
+    wire_decode: Any, capture: Any, served_words: int
+) -> None:
+    """T-UNIT-WIRE-035 / truncated block / S0.
+
+    A pair whose high word the block did not serve is MISSING, never decoded
+    from a partial word pair; every fully served pair still decodes.
+    """
+    blocks = _blocks_of(capture, "MID")
+    words = blocks[_TOTALS_BASE][:served_words]
+    blocks[_TOTALS_BASE] = tuple(words)
+    observation = _decode_unit(wire_decode, capture, "MID", blocks=blocks)
+
+    fully_served_pairs = served_words // 2
+    for index, field in enumerate(_ENERGY_FIELDS):
+        if index < fully_served_pairs:
+            assert getattr(observation, field) is not None, field
+            assert observation.quality[field] is DataQuality.GOOD, field
+        else:
+            assert getattr(observation, field) is None, field
+            assert observation.quality[field] is DataQuality.MISSING, field
     assert observation.safety_data_complete is True

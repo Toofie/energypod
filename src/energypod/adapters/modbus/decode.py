@@ -29,8 +29,16 @@ Fail-closed contract (pinned by ``tests/unit/test_wire_decode.py``):
   4c) decode as signed unscaled watts and ALWAYS appear in the quality map,
   MISSING when the block was not served; they stay outside the
   safety-critical completeness set.
-- The ambiguous families (energy-counter role labels S5 A-1, balance words
-  S5 A-15) have no channel in the observation and are never read here.
+- The six cumulative-energy pairs (totals block 0x4101, field-mapping S2.7)
+  decode as low-word-first uint32 x 0.1 kWh ADVISORY fields
+  (DESIGN_ENERGY_SCORECARD section 5): the GRID PAIR under NEUTRAL A/B names
+  (the pair order is vendor-confirmed; the buy/sell ROLE labels are
+  evidence-open, S5 A-1, and are never applied here), the load/PV and the
+  capture-confirmed charge/discharge pair under their vendor names.  All six
+  quality keys are always emitted, MISSING for unserved pairs, and stay
+  outside the safety-critical completeness set.
+- The balance words (S5 A-15) stay ambiguous with no channel in the
+  observation and are never read here.
 """
 
 from __future__ import annotations
@@ -53,6 +61,13 @@ _CELL_TEMPERATURE_BASE = 0x523C
 _RTU_ID_BASE = 0x8106
 _DEVICE_PARAMETERS_BASE = 0x8102
 _DEBUG_MODE_BLOCK_BASE = 0x8100
+# Cumulative energy totals, field-mapping S2.7 (SysControl.cs:773 read,
+# :779-784 decode): six low-word-first uint32 x 0.1 kWh pairs in vendor order
+# -- grid pair (NEUTRAL A/B: the pair ORDER is confirmed, the buy/sell ROLE
+# labels are evidence-open, S5 A-1), load, PV, BMS charge, BMS discharge.
+_ENERGY_TOTALS_BLOCK_BASE = 0x4101
+_ENERGY_PAIR_COUNT = 6
+_KWH_PER_COUNT = 0.1
 
 # PCS live block advisory offsets, PROTOCOL_EVIDENCE 4c (SysControl.cs:500
 # and :503): the per-pod CT external-grid power at +17 and the load power at
@@ -180,6 +195,32 @@ def _decode_temperatures(
     if expected_count is None or len(temperatures) != expected_count:
         return temperatures, DataQuality.BAD
     return temperatures, DataQuality.GOOD
+
+
+def decode_energy_totals(
+    block: Sequence[int] | None,
+) -> tuple[tuple[float | None, DataQuality], ...]:
+    """Decode the six cumulative-energy pairs of the totals block 0x4101.
+
+    Field-mapping S2.7 (SysControl.cs:779-784): every pair is a low-word-first
+    ``uint32`` count scaled x 0.1 kWh, in vendor order -- grid pair (NEUTRAL
+    A/B naming; the buy/sell role labels are evidence-open, S5 A-1), load, PV,
+    BMS charge, BMS discharge.  A pair whose block the poll did not serve (or
+    served only partially) is ``(None, MISSING)`` -- never zero-filled.  This
+    is the one implementation of the pair arithmetic: the live wire decode and
+    the simulator's composed decode both call it, so the reference model
+    cannot drift from production.
+    """
+    decoded: list[tuple[float | None, DataQuality]] = []
+    for pair in range(_ENERGY_PAIR_COUNT):
+        low = _served_word(block, pair * 2)
+        high = _served_word(block, pair * 2 + 1)
+        if low is None or high is None:
+            decoded.append((None, DataQuality.MISSING))
+            continue
+        counts = (high << 16) | low
+        decoded.append((float(counts) * _KWH_PER_COUNT, DataQuality.GOOD))
+    return tuple(decoded)
 
 
 def _decode_fault_blocks(
@@ -318,6 +359,21 @@ def decode_observation(
     work_mode_w = _served_word(system, _WORK_MODE_OFFSET)
     run_mode_w = _served_word(pcs_live, _PCS_RUN_MODE_OFFSET)
 
+    # Advisory cumulative energy (DESIGN_ENERGY_SCORECARD section 5): the
+    # cold-ring totals block.  All six quality keys are ALWAYS emitted --
+    # MISSING when the poll did not serve the block or served a partial pair
+    # -- exactly like the CT pair: the quality map is the honest inventory of
+    # what this poll saw, and an unserved energy block never refuses power.
+    energy_totals = decode_energy_totals(blocks.get(_ENERGY_TOTALS_BLOCK_BASE))
+    (
+        (energy_grid_a_kwh, energy_grid_a_quality),
+        (energy_grid_b_kwh, energy_grid_b_quality),
+        (energy_load_kwh, energy_load_quality),
+        (energy_pv_kwh, energy_pv_quality),
+        (energy_charge_kwh, energy_charge_quality),
+        (energy_discharge_kwh, energy_discharge_quality),
+    ) = energy_totals
+
     quality: dict[str, DataQuality] = {
         "system_soc_pct": system_soc_quality,
         "bms_soc_pct": bms_soc_quality,
@@ -331,6 +387,12 @@ def decode_observation(
         "temperatures_c": temperature_quality,
         "grid_power_w": grid_power_quality,
         "load_power_w": load_power_quality,
+        "energy_grid_a_kwh": energy_grid_a_quality,
+        "energy_grid_b_kwh": energy_grid_b_quality,
+        "energy_load_kwh": energy_load_quality,
+        "energy_pv_kwh": energy_pv_quality,
+        "energy_charge_kwh": energy_charge_quality,
+        "energy_discharge_kwh": energy_discharge_quality,
     }
 
     # Fail-closed downgrade: with identity, profile, topology or fault-block
@@ -376,6 +438,12 @@ def decode_observation(
         ctrl_mode_w=ctrl_mode_w,
         work_mode_w=work_mode_w,
         run_mode_w=run_mode_w,
+        energy_grid_a_kwh=energy_grid_a_kwh,
+        energy_grid_b_kwh=energy_grid_b_kwh,
+        energy_load_kwh=energy_load_kwh,
+        energy_pv_kwh=energy_pv_kwh,
+        energy_charge_kwh=energy_charge_kwh,
+        energy_discharge_kwh=energy_discharge_kwh,
         active_faults=fault_codes,
         active_warnings=warning_codes,
         quality=quality,
