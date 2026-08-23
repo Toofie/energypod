@@ -260,6 +260,11 @@ class PolicyConfig(_FrozenModel):
     # says so, and every sustained beyond-class charge without PV evidence
     # escalates.
     foreign_objective_expected_charge_w: Annotated[StrictInt, Field(ge=1, le=50000)] | None = None
+    # How many units must hold the synchronized in-class charge for the
+    # expected-writer recognition (the scheduler charges the batteries it
+    # chooses -- observed live: a synchronized pair while a full third
+    # floated).  A lone pod never qualifies.
+    foreign_objective_expected_min_units: Annotated[StrictInt, Field(ge=2, le=50)] = 2
     debug_modes_enabled: StrictBool
 
     @field_validator("threshold_provenance")

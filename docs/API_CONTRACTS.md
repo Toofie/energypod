@@ -1270,16 +1270,19 @@ alarm on the pods' normal autonomy (the operator's consistent direction).
      charge sample classifies quiet as `expected_nightly_charge` when ALL hold:
      `foreign_objective_expected_charge_w` is commissioned; `P` is in-band AND within the
      expected magnitude class (`0.8 ×` .. `1.2 ×` the commissioned figure — the scheduled
-     −2500 W × 3-unit charge, whatever small regulation drift the served words carry); and
-     the pattern is FLEET-SYNCHRONIZED — every OTHER configured unit's most recent recorded
-     sample is within the sync horizon (`max(5 × foreign_objective_sample_interval_s, 300 s)`
-     of this sample's time) and is itself a charge inside the same expected class. The
-     synchronization is the discriminator: the pods' own self-charge is per-pod and
-     PV-correlated, while the site scheduler starts one identical charge on every battery at
-     the same moment. A sample recognized here never escalates under either pattern rule
-     below, whatever its run-mode word reads (the scheduler's writes put the PCS into Remote
-     PQ mode exactly like any writer's). An expected charge on only SOME of the fleet — the
-     wrong signature for the known writer — does NOT qualify and escalates normally.
+     −2500 W charge, whatever small regulation drift the served words carry); and the
+     pattern is SYNCHRONIZED across at least `foreign_objective_expected_min_units` units
+     (default 2, counting this one): that many units' most recent recorded samples lie
+     within the sync horizon (`max(5 × foreign_objective_sample_interval_s, 300 s)` of this
+     sample's time) and are themselves charges inside the same expected class. The
+     synchronized GROUP is the discriminator: the pods' own self-charge is per-pod and
+     PV-correlated, while the site scheduler starts identical charges on multiple
+     batteries at the same moment — and it charges the batteries it chooses, not
+     necessarily every one (observed live at commissioning, 2026-08-24 00:00 AEST: lhs and
+     mid held −2500 W together while a full rhs floated — a 2-of-3 nightly charge). A
+     LONE pod's charge never qualifies. A sample recognized here never escalates under
+     either pattern rule below, whatever its run-mode word reads (the scheduler's writes
+     put the PCS into Remote PQ mode exactly like any writer's).
   6. In-band nonzero otherwise: quiet evidence `pod_autonomy_objective_observed`, UNLESS a
      pattern rule escalates (both require `foreign_objective_sustained_samples` CONSECUTIVE
      qualifying samples; any non-qualifying sample resets the streak):
@@ -1353,7 +1356,9 @@ alarm on the pods' normal autonomy (the operator's consistent direction).
   `foreign_objective_handback_grace_s: 12.0` (1..300),
   `foreign_objective_expected_charge_w: 2500 on the live-write example, `None` by default —
   the strict posture until the operator commissions the site's own scheduled writer as
-  expected).
+  expected — and `foreign_objective_expected_min_units: 2` (2..50): how many units must
+  hold the synchronized charge for the expected-writer recognition (2 = a synchronized
+  pair; a lone pod never qualifies).
 - **Supervision driving.** One bounded, fully suppressed observation pass per fleet cycle,
   after the polls and the recovery pass and before the schedule runner: the pass reads each
   unit's fresh observation (poll-failed units contribute nothing), the live claim set, and

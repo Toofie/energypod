@@ -293,6 +293,12 @@ policy:
   # external_writer latch are unchanged (arming mid-charge follows the
   # ADD-1 pod-autonomy doctrine; arming after the 06:00 clear is ordinary).
   foreign_objective_expected_charge_w: 2500
+  # How many units must hold the synchronized -2500 W charge for the
+  # recognition.  The scheduler charges the batteries it chooses: at the
+  # 2026-08-24 00:00 commissioning observation lhs and mid charged together
+  # while a full rhs (98% SOC) floated -- a synchronized PAIR is the known
+  # writer's minimum footprint, and a lone pod never qualifies.
+  foreign_objective_expected_min_units: 2
   debug_modes_enabled: false
 
 authentication:

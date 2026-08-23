@@ -711,6 +711,7 @@ def test_policy_carries_the_foreign_objective_defaults() -> None:
     assert policy.foreign_objective_self_charge_class_w == 1000
     assert policy.foreign_objective_handback_grace_s == 12.0
     assert policy.foreign_objective_expected_charge_w is None
+    assert policy.foreign_objective_expected_min_units == 2
 
 
 def test_foreign_objective_keys_are_commissionable() -> None:
@@ -722,6 +723,7 @@ def test_foreign_objective_keys_are_commissionable() -> None:
             "foreign_objective_self_charge_class_w": 1500,
             "foreign_objective_handback_grace_s": 30.0,
             "foreign_objective_expected_charge_w": 2500,
+            "foreign_objective_expected_min_units": 3,
         }
     )
 
@@ -733,6 +735,7 @@ def test_foreign_objective_keys_are_commissionable() -> None:
     assert parsed.policy.foreign_objective_self_charge_class_w == 1500
     assert parsed.policy.foreign_objective_handback_grace_s == 30.0
     assert parsed.policy.foreign_objective_expected_charge_w == 2500
+    assert parsed.policy.foreign_objective_expected_min_units == 3
 
 
 @pytest.mark.parametrize(
@@ -748,6 +751,8 @@ def test_foreign_objective_keys_are_commissionable() -> None:
         ("foreign_objective_handback_grace_s", 301.0),
         ("foreign_objective_expected_charge_w", 0),
         ("foreign_objective_expected_charge_w", 50001),
+        ("foreign_objective_expected_min_units", 1),
+        ("foreign_objective_expected_min_units", 51),
     ],
 )
 def test_foreign_objective_keys_are_bounded(key: str, bad: Any) -> None:
@@ -762,8 +767,9 @@ def test_foreign_objective_keys_are_bounded(key: str, bad: Any) -> None:
 
 def test_the_live_write_example_documents_the_detector_keys() -> None:
     """The deployed example (the live controller's own config) documents the
-    five keys -- the four defaults plus the site's own scheduled night writer
-    commissioned as the expected charge -- so the detector's posture is
+    six keys -- the four defaults, the site's own scheduled night writer
+    commissioned as the expected charge, and its minimum synchronized-group
+    size -- so the detector's posture is
     visible to the operator reading their configuration."""
     text = (
         Path(__file__)
@@ -779,6 +785,7 @@ def test_the_live_write_example_documents_the_detector_keys() -> None:
         ("foreign_objective_self_charge_class_w", "1000"),
         ("foreign_objective_handback_grace_s", "12.0"),
         ("foreign_objective_expected_charge_w", "2500"),
+        ("foreign_objective_expected_min_units", "2"),
     ):
         assert re.search(rf"^\s*{key}:\s*{value}\s*$", text, re.MULTILINE), key
 

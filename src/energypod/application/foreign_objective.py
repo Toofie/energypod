@@ -161,6 +161,11 @@ class ForeignObjectiveSettings:
     # nightly charge (None = the strict posture: nothing is expected, every
     # sustained beyond-class charge without PV evidence escalates).
     expected_charge_w: int | None = None
+    # How many units must hold the synchronized charge for the recognition:
+    # the scheduler charges the batteries it chooses (observed live at
+    # commissioning: lhs+mid together while a full rhs floated), so the
+    # signature is a synchronized GROUP -- never a lone pod.
+    expected_min_units: int = 2
     expected_autonomy_band_w: tuple[int, int] = (-2600, 300)
 
     def __post_init__(self) -> None:
@@ -188,6 +193,8 @@ class ForeignObjectiveSettings:
             type(self.expected_charge_w) is not int or not 1 <= self.expected_charge_w <= 50000
         ):
             raise ValueError("expected_charge_w must be between 1 and 50000 watts")
+        if type(self.expected_min_units) is not int or not 2 <= self.expected_min_units <= 50:
+            raise ValueError("expected_min_units must be between 2 and 50 units")
         low, high = self.expected_autonomy_band_w
         if not low < high or low > 0 or high < 0:
             raise ValueError(
@@ -583,12 +590,15 @@ class ForeignObjectiveMonitor:
     def _is_expected_nightly(self, record: _UnitRecord, sample: ObjectiveSample) -> bool:
         """Whether this charge sample is the site's own scheduled writer.
 
-        The commissioned figure, the magnitude class, and FLEET
-        SYNCHRONIZATION: every OTHER configured unit's most recent recorded
-        sample is inside the sync horizon and is itself a charge inside the
-        same expected class.  The pods' own self-charge is per-pod and
-        PV-correlated; the scheduler starts one identical charge on every
-        battery at the same moment.
+        The commissioned figure, the magnitude class, and a SYNCHRONIZED
+        GROUP: at least ``expected_min_units`` units (this one included) hold
+        a charge inside the same expected class, each corroborated by its
+        most recent recorded sample inside the sync horizon.  The pods' own
+        self-charge is per-pod and PV-correlated; the scheduler starts
+        identical charges on multiple batteries at the same moment -- and it
+        charges the batteries it chooses, not necessarily every one, so a
+        synchronized pair (or larger group) is the signature and a lone pod
+        never qualifies.
         """
         band = self._settings.expected_class_band_w()
         if band is None:
@@ -597,17 +607,19 @@ class ForeignObjectiveMonitor:
         if not class_low <= sample.active_w <= class_high:
             return False
         horizon = self._settings.sync_horizon_s()
+        corroborating = 1  # this sample itself
         for other_id, other_samples in self._samples.items():
-            if other_id == record.unit_id:
+            if corroborating >= self._settings.expected_min_units:
+                break
+            if other_id == record.unit_id or not other_samples:
                 continue
-            if not other_samples:
-                return False
             latest = other_samples[-1]
             if sample.observed_at_mono - latest.observed_at_mono > horizon:
-                return False
+                continue
             if not class_low <= latest.active_w <= class_high:
-                return False
-        return True
+                continue
+            corroborating += 1
+        return corroborating >= self._settings.expected_min_units
 
     def _prune(self, record: _UnitRecord) -> None:
         newest = record.samples[-1].observed_at_mono if record.samples else None

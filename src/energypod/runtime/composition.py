@@ -2479,6 +2479,7 @@ def _foreign_objective_settings(config: ControllerConfig) -> ForeignObjectiveSet
         self_charge_class_w=configured.foreign_objective_self_charge_class_w,
         handback_grace_s=float(configured.foreign_objective_handback_grace_s),
         expected_charge_w=configured.foreign_objective_expected_charge_w,
+        expected_min_units=configured.foreign_objective_expected_min_units,
         expected_autonomy_band_w=(band_low, band_high),
     )
 

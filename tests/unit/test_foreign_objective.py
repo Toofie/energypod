@@ -234,6 +234,7 @@ def test_settings_defaults_are_the_pinned_contract_values(api: Any) -> None:
     assert settings.self_charge_class_w == 1000
     assert settings.handback_grace_s == 12.0
     assert settings.expected_charge_w is None, "strict until the writer is commissioned"
+    assert settings.expected_min_units == 2, "a synchronized pair, never a lone pod"
     assert settings.expected_autonomy_band_w == (-2600, 300)
 
 
@@ -251,6 +252,8 @@ def test_settings_defaults_are_the_pinned_contract_values(api: Any) -> None:
         ("handback_grace_s", 301.0),
         ("expected_charge_w", 0),
         ("expected_charge_w", 50001),
+        ("expected_min_units", 1),
+        ("expected_min_units", 51),
     ],
 )
 def test_settings_reject_out_of_bounds_knobs(api: Any, field_name: str, value: Any) -> None:
@@ -845,9 +848,10 @@ async def test_without_a_commissioned_expectation_every_sustained_charge_escalat
 
 
 async def test_the_sync_horizon_expires_and_the_expectation_lapses(api: Any) -> None:
-    """A unit whose latest recorded charge is older than the sync horizon no
-    longer corroborates the fleet pattern: the expectation lapses and the
-    sustained-charge rule takes over (interval 1 s -> horizon 300 s)."""
+    """When fewer than the commissioned minimum of units corroborate inside
+    the sync horizon, the expectation lapses and the sustained-charge rule
+    takes over: a PAIR still corroborates (the known writer's footprint), a
+    LONE charge escalates (interval 1 s -> horizon 300 s)."""
     audit = RecordingAudit()
     clock = ManualClock()
     mon = monitor(
@@ -866,17 +870,63 @@ async def test_the_sync_horizon_expires_and_the_expectation_lapses(api: Any) -> 
             await cycle(mon, unit, active_w=-2500, captured_at_mono=now, grid_power_w=-100.0)
     assert audit.appended == []
     # lhs's writer stops (its words go zero -- nothing records); mid/rhs keep
-    # charging past the horizon.
-    for index, now in enumerate((1400.0, 1401.0, 1402.0)):
+    # charging as the synchronized pair: still the known writer's footprint.
+    for now in (1400.0, 1401.0, 1402.0, 1403.0):
         clock.now = now
         await cycle(mon, "lhs", active_w=0, captured_at_mono=now)
         for unit in ("mid", "rhs"):
             await cycle(mon, unit, active_w=-2500, captured_at_mono=now, grid_power_w=-100.0)
+    assert audit.appended == [], "a synchronized pair is the expected writer"
+
+    # rhs's writer stops too: mid is now alone and its last corroboration
+    # (rhs's 1404.0 sample) ages past the horizon -- the expectation lapses
+    # and the sustained-charge rule escalates on mid's next streak.
+    for index, now in enumerate((1800.0, 1801.0, 1802.0, 1803.0)):
+        clock.now = now
+        await cycle(mon, "rhs", active_w=0, captured_at_mono=now)
+        await cycle(mon, "mid", active_w=-2500, captured_at_mono=now, grid_power_w=-100.0)
         if index < 2:
             assert audit.appended == [], f"inside the horizon ({now})"
 
     escalated = {event.unit_id for event in audit.of_type(CLASS_FOREIGN)}
-    assert escalated == {"mid", "rhs"}, "the uncorroborated charges escalated"
+    assert escalated == {"mid"}, "the lone uncorroborated charge escalated"
+
+
+async def test_a_synchronized_pair_is_expected_while_a_third_floats(api: Any) -> None:
+    """THE commissioning-night shape, observed live 2026-08-24 00:00 AEST:
+    the scheduler charges lhs and mid together at -2500 W while a full rhs
+    floats with zero words.  The synchronized PAIR is the known writer's
+    signature -- quiet expected evidence on both charging units, no matter
+    that a third configured unit never joins."""
+    audit, bus = RecordingAudit(), RecordingBus()
+    clock = ManualClock()
+    mon = monitor(
+        api,
+        units=("lhs", "mid", "rhs"),
+        audit=audit,
+        bus=bus,
+        clock=clock,
+        interval_s=1.0,
+        sustained_samples=3,
+        expected_charge_w=2500,
+    )
+    for minute in range(10):
+        now = 1000.0 + minute
+        clock.now = now
+        for unit in ("lhs", "mid"):
+            await cycle(mon, unit, active_w=-2500, captured_at_mono=now, grid_power_w=-1500.0)
+        await cycle(mon, "rhs", active_w=0, captured_at_mono=now)
+
+    for unit in ("lhs", "mid"):
+        entry = session_of(mon, unit)
+        counts = entry["classification_counts"]
+        # The very first sample of the first-sampled unit cannot corroborate
+        # a group yet; every sample after that is the expected writer.
+        assert counts[CLASS_EXPECTED_NIGHTLY] >= 9, (unit, entry)
+        assert counts[CLASS_FOREIGN] == 0, (unit, entry)
+        assert entry["foreign_active"] is False, (unit, entry)
+    assert session_of(mon, "rhs")["sample_count"] == 0
+    assert audit.appended == [] and bus.published == []
 
 
 # --- the session record and its read surfaces ---------------------------------------
