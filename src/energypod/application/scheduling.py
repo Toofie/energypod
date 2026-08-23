@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any
+from datetime import datetime, time, timedelta
+from typing import Any, Final, Literal, Protocol
 from zoneinfo import ZoneInfo
 
 from energypod.domain.intents import Direction, IntentSource
@@ -195,3 +196,475 @@ def schedule_wire_plan(plan: SchedulePlan) -> dict[str, Any]:
 
 
 _WIRE_DAYS: tuple[str, ...] = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+# --- the night-writer posture policy (DESIGN_SCHEDULES §3, as pure logic) -------
+#
+# The allowed windows are POLICY WALLS: local civil "HH:MM" pairs, no zone of
+# their own, union = the allowed command set.  "Night" is any civil second
+# outside DAY_DEFAULT (06:00-20:00) — independent of how the operator narrows
+# or widens the policy, so the acknowledgement and the console copy always
+# mean the same thing by "night".
+
+DAY_DEFAULT: Final[tuple[time, time]] = (time(6, 0), time(20, 0))
+
+_SECONDS_PER_DAY = 86_400
+
+
+def parse_hhmm(value: str) -> time:
+    """Parse one policy wall clock "HH:MM" (minute precision, 00:00-23:59)."""
+    if not isinstance(value, str):
+        raise ScheduleValidationError("allowed window bounds must be HH:MM civil times")
+    parts = value.split(":")
+    if len(parts) != 2 or not all(part.isdigit() and len(part) == 2 for part in parts):
+        raise ScheduleValidationError("allowed window bounds must be HH:MM civil times")
+    hour, minute = int(parts[0]), int(parts[1])
+    if hour > 23 or minute > 59:
+        raise ScheduleValidationError("allowed window bounds must be HH:MM civil times")
+    return time(hour, minute)
+
+
+def _second_of_day(value: time) -> int:
+    return value.hour * 3600 + value.minute * 60 + value.second
+
+
+def _covers(second: int, start: int, end: int) -> bool:
+    """Whether one civil second lies inside [start, end), wrapping midnight."""
+    if start < end:
+        return start <= second < end
+    return second >= start or second < end
+
+
+def _union_covers(second: int, windows: tuple[tuple[time, time], ...]) -> bool:
+    return any(_covers(second, _second_of_day(a), _second_of_day(b)) for a, b in windows)
+
+
+def window_inside_union(start: time, end: time, windows: tuple[tuple[time, time], ...]) -> bool:
+    """Whether every civil second of [start, end) lies inside the union.
+
+    A crossing window (start > end) is judged as its two halves — the head to
+    midnight and the tail from midnight — exactly the split the facade's
+    containment gate names offending entries by.
+    """
+    head_end = _SECONDS_PER_DAY if end < start else _second_of_day(end)
+    if not all(_union_covers(second, windows) for second in range(_second_of_day(start), head_end)):
+        return False
+    # A crossing window's tail (from midnight to ``end``) is judged too: the
+    # window lies inside the union only when BOTH halves do.
+    tail_covered = end >= start or all(
+        _union_covers(second, windows) for second in range(0, _second_of_day(end))
+    )
+    return tail_covered
+
+
+def covers_night(windows: tuple[tuple[time, time], ...]) -> bool:
+    """Whether the allowed union covers any civil second outside DAY_DEFAULT."""
+    day_start, day_end = _second_of_day(DAY_DEFAULT[0]), _second_of_day(DAY_DEFAULT[1])
+    return any(
+        _union_covers(second, windows)
+        for second in range(_SECONDS_PER_DAY)
+        if not day_start <= second < day_end
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulePolicy:
+    """The commissioned posture facts of a PRESENT ``schedule:`` block.
+
+    ``timezone`` is the site zone the policy walls are rendered against in
+    operator copy; the windows themselves are civil walls with no zone of
+    their own.
+    """
+
+    allowed_windows_local: tuple[tuple[time, time], ...]
+    intent_ttl_s: float
+    timezone: str
+
+    def __post_init__(self) -> None:
+        if not self.allowed_windows_local:
+            raise ScheduleValidationError("allowed_windows_local must not be empty")
+        for start, end in self.allowed_windows_local:
+            if start == end:
+                raise ScheduleValidationError("allowed windows must not be zero-length")
+        if not math.isfinite(self.intent_ttl_s) or self.intent_ttl_s <= 0:
+            raise ScheduleValidationError("intent TTL must be a finite positive number")
+
+    @property
+    def posture(self) -> str:
+        """Derived, read-only, never stored: ``partition`` when the allowed
+        set grants any night second, else the shipped day-only ``yield``."""
+        return "partition" if covers_night(self.allowed_windows_local) else "yield"
+
+    def wire_windows(self) -> list[list[str]]:
+        return [
+            [start.strftime("%H:%M"), end.strftime("%H:%M")]
+            for start, end in self.allowed_windows_local
+        ]
+
+    def contains_entry(self, entry: ScheduleEntry) -> bool:
+        """The §3 containment rule: the entry's window (split across midnight
+        when it crosses) lies entirely inside the allowed union."""
+        return window_inside_union(entry.start_local, entry.end_local, self.allowed_windows_local)
+
+    def entry_is_night(self, entry: ScheduleEntry) -> bool:
+        """Whether any civil second of the entry's window falls in the night
+        (outside DAY_DEFAULT) — the one-time acknowledgement's trigger."""
+        return not window_inside_union(entry.start_local, entry.end_local, (DAY_DEFAULT,))
+
+
+# --- the evaluation loop (DESIGN_SCHEDULES §2) ----------------------------------
+
+
+class ScheduleStorePort(Protocol):
+    """The plan repository read (one singleton row; no cache to invalidate)."""
+
+    async def get(self) -> SchedulePlan | None: ...
+
+
+class ScheduleClockPort(Protocol):
+    def monotonic(self) -> float: ...
+
+    def wall_now(self) -> datetime: ...
+
+
+class ScheduleSubmitPort(Protocol):
+    """The composition-internal facade twin (source pinned to SCHEDULE)."""
+
+    async def __call__(
+        self,
+        *,
+        unit_ids: Any,
+        direction: Any,
+        watts: Any,
+        ttl_s: Any,
+        watts_by_unit: Any = None,
+    ) -> Any: ...
+
+
+class ScheduleIntentPort(Protocol):
+    async def active(self, now_mono: float) -> tuple[Any, ...]: ...
+
+    async def remove(self, intent_id: str) -> None: ...
+
+
+class ScheduleBusPort(Protocol):
+    async def publish(self, body: Mapping[str, Any]) -> int: ...
+
+
+# The projection's ONE pinned reason vocabulary (DESIGN_SCHEDULES §5).
+REASON_NO_PLAN: Final[str] = "no_plan"
+REASON_NO_WINDOW_OPEN: Final[str] = "no_window_open"
+REASON_WINDOW_OPEN: Final[str] = "window_open"
+REASON_WAITING: Final[str] = "waiting_for_higher_priority"
+REASON_WINDOW_ENDED: Final[str] = "window_ended"
+REASON_PLAN_CHANGED: Final[str] = "plan_changed"
+
+WINDOW_OPENED_EVENT: Final[str] = "schedule_window.opened"
+WINDOW_CLOSING_EVENT: Final[str] = "schedule_window.closing"
+
+# The sources ranked above SCHEDULE in the arbiter's pinned order; a window
+# whose every unit such a source claims is WAITING (honesty only — the runner
+# never checks claims to decide control).
+_HIGHER_THAN_SCHEDULE: Final[frozenset[IntentSource]] = frozenset(
+    {
+        IntentSource.EMERGENCY_STOP,
+        IntentSource.MANUAL,
+        IntentSource.AGENT,
+        IntentSource.OPTIMIZER,
+    }
+)
+
+ScheduleAction = Literal["idle", "submit", "renew", "remove"]
+ClosingReason = Literal["window_ended", "plan_replaced", "no_plan"]
+
+
+class ScheduleRunner:
+    """Exactly one live SCHEDULE intent, keyed ``(plan.version, entry_id)``.
+
+    Per tick (DESIGN_SCHEDULES §2): read the plan through the repository port,
+    evaluate at the clock's wall instant in the plan's zone, and maintain the
+    held intent — submit on open, remove-then-submit renewal while the window
+    holds (the adviser's exact discipline, so never two live), remove on
+    window end / entry disable / plan change.  The runner is the LOWEST-
+    priority source and never special-cases arbitration: no claim checks and
+    no withdrawals against higher sources — a window that opens under one
+    WAITS, keeps renewing, and is represented the cycle after the claimer
+    lapses.  Window end is non-renewal; the intent TTL plus the firmware
+    watchdog are the designed hand-back (and the fail-safe if this runner
+    dies mid-window).  A tick failure is survivable per cycle and never halts
+    the fleet; the composition wraps ``tick`` accordingly.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: ScheduleStorePort,
+        evaluator: ScheduleEvaluator,
+        clock: ScheduleClockPort,
+        submit: ScheduleSubmitPort,
+        intents: ScheduleIntentPort,
+        bus: ScheduleBusPort | None = None,
+        posture: str = "yield",
+        initial_plan: SchedulePlan | None = None,
+    ) -> None:
+        self._store = store
+        self._evaluator = evaluator
+        self._clock = clock
+        self._submit = submit
+        self._intents = intents
+        self._bus = bus
+        self._posture = posture
+        # Held-intent state: the live intent id plus the window key it serves.
+        self._held_intent_id: str | None = None
+        self._held_key: tuple[int, str] | None = None
+        self._held_entry: ScheduleEntry | None = None
+        self._held_ends_at: datetime | None = None
+        self._plan: SchedulePlan | None = initial_plan
+        # The projection's tick-derived fields (single writer: this runner).
+        # The boot frame is honest about what boot knows — the plan from a
+        # synchronous store read and NO window held — and the first tick (one
+        # fleet cycle later) replaces it.
+        self._last_action: ScheduleAction = "idle"
+        self._last_reasons: tuple[str, ...] = (
+            (REASON_NO_WINDOW_OPEN,) if initial_plan is not None else (REASON_NO_PLAN,)
+        )
+        self._last_tick_wall = clock.wall_now()
+
+    @property
+    def held_intent_id(self) -> str | None:
+        """The live schedule intent id, or None while holding nothing.
+
+        The projection derives ``active`` from THIS fact — never a lifecycle
+        guess — so it can never claim inactive while a schedule intent is
+        live.
+        """
+        return self._held_intent_id
+
+    async def tick(self) -> None:
+        """One evaluation: maintain the held intent, update the projection."""
+        plan = await self._store.get()
+        self._plan = plan
+        now_mono = float(self._clock.monotonic())
+        wall = self._clock.wall_now()
+        if plan is None:
+            action = await self._close_held(reason="no_plan")
+            self._record(action, (REASON_NO_PLAN,), wall)
+            return
+        evaluated = self._evaluator.evaluate(schedule=plan, at=wall, now_monotonic=now_mono)
+        if evaluated is None:
+            if self._held_intent_id is None:
+                self._record("idle", (REASON_NO_WINDOW_OPEN,), wall)
+                return
+            # A publish that landed mid-window removed the matching entry;
+            # the window merely ended; either way the command stops now.
+            reason: ClosingReason = (
+                "plan_replaced"
+                if self._held_key is not None and self._held_key[0] != plan.version
+                else "window_ended"
+            )
+            action = await self._close_held(
+                reason=reason,
+                projection_reason=REASON_PLAN_CHANGED
+                if reason == "plan_replaced"
+                else REASON_WINDOW_ENDED,
+            )
+            self._record(
+                action,
+                (REASON_PLAN_CHANGED if reason == "plan_replaced" else REASON_WINDOW_ENDED,),
+                wall,
+            )
+            return
+        entry = self._entry_for(plan, evaluated.entry_id)
+        ends_at = window_end(entry, wall.astimezone(ZoneInfo(plan.timezone)))
+        key = (plan.version, evaluated.entry_id)
+        if self._held_key == key and self._held_intent_id is not None:
+            await self._remove_held()
+            await self._submit_window(plan, evaluated, entry, ends_at, announce=False)
+            action = "renew"
+        else:
+            if self._held_intent_id is not None:
+                await self._remove_held()
+            await self._submit_window(plan, evaluated, entry, ends_at, announce=True)
+            action = "submit"
+        reasons: tuple[str, ...] = (REASON_WINDOW_OPEN,)
+        if await self._waiting_for_higher_priority(evaluated.unit_ids, now_mono):
+            reasons = (REASON_WINDOW_OPEN, REASON_WAITING)
+        self._record(action, reasons, wall, entry=entry, ends_at=ends_at)
+
+    # --- internals -------------------------------------------------------
+
+    def _entry_for(self, plan: SchedulePlan, entry_id: str) -> ScheduleEntry:
+        for entry in plan.entries:
+            if entry.entry_id == entry_id:
+                return entry
+        raise ScheduleValidationError(f"evaluated entry {entry_id!r} is absent from the plan")
+
+    async def _submit_window(
+        self,
+        plan: SchedulePlan,
+        evaluated: ScheduleIntent,
+        entry: ScheduleEntry,
+        ends_at: datetime,
+        *,
+        announce: bool,
+    ) -> None:
+        result = await self._submit(
+            unit_ids=sorted(evaluated.unit_ids),
+            direction=evaluated.direction,
+            watts=evaluated.watts,
+            ttl_s=evaluated.duration_s,
+            watts_by_unit=(
+                None if evaluated.watts_by_unit is None else dict(evaluated.watts_by_unit)
+            ),
+        )
+        submitted = result.get("intent_id") if isinstance(result, Mapping) else None
+        # Exactly one live SCHEDULE intent, ever: the held slot flips to the
+        # submission's own id only on success, so a failed renewal lapses by
+        # TTL (the designed hand-back) and the next tick re-submits.
+        self._held_intent_id = submitted if isinstance(submitted, str) else None
+        self._held_key = (plan.version, evaluated.entry_id)
+        self._held_entry = entry
+        self._held_ends_at = ends_at
+        if announce:
+            # "opened" is a TRANSITION, not a heartbeat: it publishes on the
+            # first submit for a window key only — renewals ride the
+            # snapshot's countdowns, never the event stream.
+            await self._publish(
+                WINDOW_OPENED_EVENT,
+                {
+                    "entry_id": evaluated.entry_id,
+                    "version": plan.version,
+                    "action": evaluated.direction.value,
+                    **(
+                        {"watts": int(evaluated.watts)}
+                        if evaluated.watts_by_unit is None
+                        else {
+                            "watts": int(evaluated.watts),
+                            "watts_by_unit": dict(sorted(evaluated.watts_by_unit.items())),
+                        }
+                    ),
+                    "unit_ids": sorted(evaluated.unit_ids),
+                    "ends_at": ends_at.isoformat(),
+                },
+            )
+
+    async def _remove_held(self) -> None:
+        """Remove the held intent by id (never a stop triple, no event)."""
+        held = self._held_intent_id
+        self._held_intent_id = None
+        if held is None:
+            return
+        # Removal is opportunistic churn control, never the safety path: an
+        # intent the store no longer knows (already expired and evicted) must
+        # not fail the tick — the TTL lapse is the designed hand-back.
+        with contextlib.suppress(Exception):
+            await self._intents.remove(held)
+
+    async def _close_held(
+        self, *, reason: ClosingReason, projection_reason: str | None = None
+    ) -> ScheduleAction:
+        """Remove the held intent and publish the closing transition."""
+        entry_id = self._held_key[1] if self._held_key is not None else None
+        version = self._held_key[0] if self._held_key is not None else None
+        unit_ids = sorted(self._held_entry.unit_ids) if self._held_entry is not None else []
+        closing = self._held_intent_id is not None
+        await self._remove_held()
+        self._held_key = None
+        self._held_entry = None
+        self._held_ends_at = None
+        if closing:
+            await self._publish(
+                WINDOW_CLOSING_EVENT,
+                {"entry_id": entry_id, "version": version, "unit_ids": unit_ids, "reason": reason},
+            )
+        return "remove" if closing else "idle"
+
+    async def _waiting_for_higher_priority(self, unit_ids: frozenset[str], now_mono: float) -> bool:
+        """Honesty only: every unit claimed by a higher-priority live intent.
+
+        A read failure omits the code (unknown is not waiting); the answer
+        NEVER gates the submit/remove above — waiting is the arbiter's job.
+        """
+        try:
+            active = await self._intents.active(now_mono)
+        except Exception:
+            return False
+        if not active:
+            return False
+        claimed: set[str] = set()
+        for intent in active:
+            source = getattr(intent, "source", None)
+            if source not in _HIGHER_THAN_SCHEDULE:
+                continue
+            selected = getattr(intent, "selected_unit_ids", None)
+            if selected:
+                claimed.update(unit for unit in selected if unit in unit_ids)
+        return bool(unit_ids) and set(unit_ids) <= claimed
+
+    async def _publish(self, event_type: str, payload: Mapping[str, Any]) -> None:
+        if self._bus is None:
+            return
+        with contextlib.suppress(Exception):
+            await self._bus.publish({"type": event_type, "payload": dict(payload)})
+
+    def _record(
+        self,
+        action: ScheduleAction,
+        reasons: tuple[str, ...],
+        wall: datetime,
+        *,
+        entry: ScheduleEntry | None = None,
+        ends_at: datetime | None = None,
+    ) -> None:
+        self._last_action = action
+        self._last_reasons = reasons
+        self._last_tick_wall = wall
+        if ends_at is not None:
+            self._held_ends_at = ends_at
+        elif action != "renew" and action != "submit":
+            self._held_ends_at = None
+        if entry is not None:
+            self._held_entry = entry
+
+    # --- the projection (single writer: this runner, post-tick) ----------
+
+    def state_payload(self) -> dict[str, Any]:
+        """The ``schedule_state`` snapshot projection (DESIGN_SCHEDULES §5).
+
+        ``active`` derives from ``held_intent_id``, never a lifecycle guess,
+        so it can never claim inactive while a schedule intent is live; the
+        countdowns are computed at read time so they stay fresh between
+        ticks on the console's snapshot cadence.
+        """
+        wall = self._clock.wall_now()
+        ends_at = self._held_ends_at
+        ends_in_s = max(0, int((ends_at - wall).total_seconds())) if ends_at is not None else None
+        return {
+            "version": None if self._plan is None else self._plan.version,
+            "active": self._held_intent_id is not None,
+            "entry_id": self._held_key[1] if self._held_key is not None else None,
+            "held_intent_id": self._held_intent_id,
+            "ends_at": ends_at.isoformat() if ends_at is not None else None,
+            "ends_in_s": ends_in_s,
+            "next": self._next_action_payload(wall),
+            "posture": self._posture,
+            "last_action": self._last_action,
+            "last_tick_at": self._last_tick_wall.isoformat(),
+            "reason_codes": list(self._last_reasons),
+        }
+
+    def _next_action_payload(self, wall: datetime) -> dict[str, Any] | None:
+        """The next occurrence AFTER the running window (or after now)."""
+        plan = self._plan
+        if plan is None:
+            return None
+        search_from = wall if self._held_ends_at is None else max(wall, self._held_ends_at)
+        found = next_start(plan, search_from)
+        if found is None:
+            return None
+        entry, starts_at = found
+        return {
+            **schedule_wire_entry(entry),
+            "starts_at": starts_at.isoformat(),
+            "starts_in_s": max(0, int((starts_at - wall).total_seconds())),
+        }

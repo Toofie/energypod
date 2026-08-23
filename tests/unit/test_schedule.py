@@ -673,3 +673,422 @@ def test_window_end_of_a_cross_midnight_tail_ends_today() -> None:
 
     assert head == datetime(2026, 1, 6, 2, 0, tzinfo=zone)
     assert tail == datetime(2026, 1, 6, 2, 0, tzinfo=zone)
+
+
+# --- DESIGN_SCHEDULES §2 B2: the ScheduleRunner state machine -------------------
+
+from dataclasses import dataclass, field  # noqa: E402
+
+
+@dataclass
+class RunnerClock:
+    mono: float = 50.0
+    wall: datetime = field(
+        default_factory=lambda: datetime(2026, 1, 5, 9, 30, tzinfo=ZoneInfo("Australia/Brisbane"))
+    )
+
+    def monotonic(self) -> float:
+        return self.mono
+
+    def wall_now(self) -> datetime:
+        return self.wall
+
+
+@dataclass
+class RunnerStore:
+    plan: Any = None
+
+    async def get(self) -> Any:
+        return self.plan
+
+
+@dataclass
+class RunnerSubmit:
+    submissions: list[dict[str, Any]] = field(default_factory=list)
+    fail: bool = False
+
+    async def __call__(
+        self,
+        *,
+        unit_ids: Any,
+        direction: Any,
+        watts: Any,
+        ttl_s: Any,
+        watts_by_unit: Any = None,
+    ) -> dict[str, Any]:
+        if self.fail:
+            raise OSError("submit unavailable")
+        self.submissions.append(
+            {
+                "unit_ids": list(unit_ids),
+                "direction": getattr(direction, "value", direction),
+                "watts": watts,
+                "ttl_s": ttl_s,
+                "watts_by_unit": dict(watts_by_unit) if watts_by_unit else None,
+            }
+        )
+        return {"intent_id": f"schedule-{len(self.submissions)}"}
+
+
+@dataclass
+class RunnerIntents:
+    live: list[Any] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+
+    async def active(self, now_mono: float) -> tuple[Any, ...]:
+        return tuple(self.live)
+
+    async def remove(self, intent_id: str) -> None:
+        self.removed.append(intent_id)
+
+
+@dataclass
+class RunnerBus:
+    events: list[dict[str, Any]] = field(default_factory=list)
+
+    async def publish(self, body: Any) -> int:
+        self.events.append(dict(body))
+        return len(self.events)
+
+
+def _make_runner(
+    *,
+    plan: Any = None,
+    clock: RunnerClock | None = None,
+    submit: RunnerSubmit | None = None,
+    intents: RunnerIntents | None = None,
+    bus: RunnerBus | None = None,
+    ttl_s: float = 10.0,
+) -> tuple[Any, RunnerStore, RunnerClock, RunnerSubmit, RunnerIntents, RunnerBus]:
+    scheduling = _helpers()
+    store = RunnerStore(plan=plan)
+    runner_clock = clock or RunnerClock()
+    runner_submit = submit or RunnerSubmit()
+    runner_intents = intents or RunnerIntents()
+    runner_bus = bus or RunnerBus()
+    runner = scheduling.ScheduleRunner(
+        store=store,
+        evaluator=scheduling.ScheduleEvaluator(intent_ttl_s=ttl_s),
+        clock=runner_clock,
+        submit=runner_submit,
+        intents=runner_intents,
+        bus=runner_bus,
+    )
+    return runner, store, runner_clock, runner_submit, runner_intents, runner_bus
+
+
+def _monday_window(**overrides: Any) -> Any:
+    values: dict[str, Any] = {
+        "entry_id": "day-charge",
+        "days": frozenset({Weekday.MONDAY}),
+        "start": time(9, 0),
+        "end": time(17, 0),
+        "watts": 3_000,
+        "units": frozenset({"lhs", "mid", "rhs"}),
+    }
+    values.update(overrides)
+    return _entry(**values)
+
+
+async def test_runner_opens_a_window_and_submits_one_schedule_intent() -> None:
+    plan = _plan(_monday_window(), version=3)
+    runner, *_rig = _make_runner(plan=plan)
+
+    await runner.tick()
+
+    submit = _rig[2]
+    assert len(submit.submissions) == 1
+    assert submit.submissions[0]["direction"] == "charge"
+    assert submit.submissions[0]["watts"] == 3_000
+    assert submit.submissions[0]["ttl_s"] == 10.0
+    assert runner.held_intent_id == "schedule-1"
+    state = runner.state_payload()
+    assert state["active"] is True
+    assert state["entry_id"] == "day-charge"
+    assert state["version"] == 3
+    assert state["last_action"] == "submit"
+    assert state["reason_codes"] == ["window_open"]
+    assert state["ends_at"] is not None and state["ends_in_s"] > 0
+
+
+async def test_runner_publishes_window_opened_with_the_entry_facts() -> None:
+    plan = _plan(_monday_window(), version=2)
+    runner, _store, _clock, _submit, _intents, bus = _make_runner(plan=plan)
+
+    await runner.tick()
+
+    opened = [event for event in bus.events if event["type"] == "schedule_window.opened"]
+    assert len(opened) == 1
+    assert opened[0]["payload"]["entry_id"] == "day-charge"
+    assert opened[0]["payload"]["version"] == 2
+    assert opened[0]["payload"]["action"] == "charge"
+    assert opened[0]["payload"]["watts"] == 3_000
+    assert opened[0]["payload"]["unit_ids"] == ["lhs", "mid", "rhs"]
+    assert opened[0]["payload"]["ends_at"].startswith("2026-01-05T17:00")
+
+
+async def test_runner_renews_by_remove_then_submit_with_exactly_one_live() -> None:
+    plan = _plan(_monday_window(), version=3)
+    runner, _store, _clock, submit, intents, bus = _make_runner(plan=plan)
+
+    await runner.tick()
+    await runner.tick()
+    await runner.tick()
+
+    # The named invariant: one held intent at a time; every renewal removes
+    # the previous id BEFORE submitting the fresh one.
+    assert len(submit.submissions) == 3
+    assert intents.removed == ["schedule-1", "schedule-2"]
+    assert runner.held_intent_id == "schedule-3"
+    assert runner.state_payload()["last_action"] == "renew"
+    # "opened" publishes on the FIRST submit for a window key only.
+    assert len([e for e in bus.events if e["type"] == "schedule_window.opened"]) == 1
+
+
+async def test_runner_closes_the_window_at_window_end_by_removal_only() -> None:
+    plan = _plan(_monday_window(), version=3)
+    runner, store, clock, submit, _intents, bus = _make_runner(plan=plan)
+    await runner.tick()
+    assert submit.submissions
+
+    clock.wall = datetime(2026, 1, 5, 17, 0, tzinfo=ZoneInfo("Australia/Brisbane"))
+    await runner.tick()
+
+    state = runner.state_payload()
+    assert runner.held_intent_id is None
+    assert state["active"] is False
+    assert state["last_action"] == "remove"
+    assert state["reason_codes"] == ["window_ended"]
+    closing = [event for event in bus.events if event["type"] == "schedule_window.closing"]
+    assert len(closing) == 1
+    assert closing[0]["payload"]["reason"] == "window_ended"
+    assert closing[0]["payload"]["entry_id"] == "day-charge"
+    assert len(submit.submissions) == 1
+
+
+async def test_runner_reports_no_plan_and_closes_with_reason_no_plan() -> None:
+    plan = _plan(_monday_window(), version=1)
+    runner, store, _clock, _submit, _intents, bus = _make_runner(plan=plan)
+    await runner.tick()
+
+    store.plan = None
+    await runner.tick()
+
+    state = runner.state_payload()
+    assert state["active"] is False
+    assert state["reason_codes"] == ["no_plan"]
+    closing = [event for event in bus.events if event["type"] == "schedule_window.closing"]
+    assert closing[-1]["payload"]["reason"] == "no_plan"
+
+
+async def test_runner_rekeys_when_a_publish_lands_mid_window() -> None:
+    plan = _plan(_monday_window(), version=1)
+    runner, store, clock, submit, _intents, bus = _make_runner(plan=plan)
+    await runner.tick()
+
+    edited = _monday_window(watts=2_400)
+    store.plan = _plan(edited, version=2)
+    clock.mono += 1.0
+    await runner.tick()
+
+    # A same-entry watts edit takes effect the same tick: the version inside
+    # the key forces the remove-and-resubmit.
+    assert len(submit.submissions) == 2
+    assert submit.submissions[-1]["watts"] == 2_400
+    assert runner.state_payload()["version"] == 2
+
+
+async def test_runner_names_plan_changed_when_a_publish_removes_the_running_entry() -> None:
+    plan = _plan(_monday_window(), version=1)
+    runner, store, _clock, _submit, _intents, bus = _make_runner(plan=plan)
+    await runner.tick()
+
+    store.plan = _plan(
+        _monday_window(entry_id="other", start=time(20, 0), end=time(21, 0)), version=2
+    )
+    await runner.tick()
+
+    state = runner.state_payload()
+    assert state["active"] is False
+    assert state["reason_codes"] == ["plan_changed"]
+    closing = [event for event in bus.events if event["type"] == "schedule_window.closing"]
+    assert closing[-1]["payload"]["reason"] == "plan_replaced"
+
+
+async def test_runner_waits_under_a_higher_priority_intent_without_withdrawing() -> None:
+    from types import SimpleNamespace
+
+    from energypod.domain import IntentSource
+
+    plan = _plan(_monday_window(), version=1)
+    runner, _store, _clock, submit, intents, _bus = _make_runner(plan=plan)
+    # A manual intent claims every unit of the window, live through the tick.
+    intents.live = [
+        SimpleNamespace(
+            id="manual-1",
+            source=IntentSource.MANUAL,
+            selected_unit_ids=frozenset({"lhs", "mid", "rhs"}),
+        )
+    ]
+
+    await runner.tick()
+
+    # The window OPENS regardless — the runner never checks claims to decide
+    # control — and the projection says honestly that it is waiting.
+    assert len(submit.submissions) == 1
+    assert runner.state_payload()["reason_codes"] == [
+        "window_open",
+        "waiting_for_higher_priority",
+    ]
+
+
+async def test_runner_waiting_never_fires_when_only_one_unit_is_claimed() -> None:
+    from types import SimpleNamespace
+
+    from energypod.domain import IntentSource
+
+    plan = _plan(_monday_window(), version=1)
+    runner, _store, _clock, _submit, _intents, _bus = _make_runner(plan=plan)
+    runner._intents.live = [
+        SimpleNamespace(
+            id="manual-1",
+            source=IntentSource.MANUAL,
+            selected_unit_ids=frozenset({"lhs"}),
+        )
+    ]
+
+    await runner.tick()
+
+    assert runner.state_payload()["reason_codes"] == ["window_open"]
+
+
+async def test_runner_carries_per_unit_watts_verbatim_onto_the_intent() -> None:
+    entry = ScheduleEntry(
+        entry_id="per-battery",
+        days=frozenset({Weekday.MONDAY}),
+        start_local=time(9, 0),
+        end_local=time(17, 0),
+        action=Direction.CHARGE,
+        watts=6_000,
+        unit_ids=frozenset({"lhs", "mid", "rhs"}),
+        effective_from=date(2026, 1, 1),
+        effective_until=date(2026, 12, 31),
+        priority=10,
+        enabled=True,
+        watts_by_unit={"lhs": 2_000, "mid": 2_000, "rhs": 2_000},
+    )
+    plan = _plan(entry, version=5)
+    runner, _store, _clock, submit, _intents, bus = _make_runner(plan=plan)
+
+    await runner.tick()
+
+    assert submit.submissions[0]["watts"] == 6_000
+    assert submit.submissions[0]["watts_by_unit"] == {"lhs": 2_000, "mid": 2_000, "rhs": 2_000}
+    opened = next(e for e in bus.events if e["type"] == "schedule_window.opened")
+    assert opened["payload"]["watts_by_unit"] == {"lhs": 2_000, "mid": 2_000, "rhs": 2_000}
+
+
+async def test_a_dead_runner_hands_back_by_ttl_lapse() -> None:
+    """The fail-safe: if the runner stops ticking mid-window, nothing renews
+    and the intent dies by its own TTL (the watchdog hand-back)."""
+    plan = _plan(_monday_window(), version=1)
+    runner, _store, _clock, submit, _intents, _bus = _make_runner(plan=plan, ttl_s=10.0)
+
+    await runner.tick()
+
+    submission = submit.submissions[0]
+    assert submission["ttl_s"] == 10.0
+    # No further tick happens: the projection keeps its last honest frame,
+    # and the store's own TTL semantics are the hand-back.
+    state = runner.state_payload()
+    assert state["active"] is True
+    assert state["last_action"] == "submit"
+
+
+async def test_runner_survives_a_failed_submission_and_resubmits_next_tick() -> None:
+    plan = _plan(_monday_window(), version=1)
+    submit = RunnerSubmit(fail=True)
+    runner, _store, _clock, submit, _intents, _bus = _make_runner(plan=plan, submit=submit)
+
+    with pytest.raises(OSError):
+        await runner.tick()
+
+    submit.fail = False
+    await runner.tick()
+    assert runner.held_intent_id == "schedule-1"
+
+
+async def test_runner_boot_frame_is_honest_before_the_first_tick() -> None:
+    scheduling = _helpers()
+    plan = _plan(_monday_window(), version=7)
+    store = RunnerStore(plan=plan)
+    clock = RunnerClock(wall=datetime(2026, 1, 5, 8, 0, tzinfo=ZoneInfo("Australia/Brisbane")))
+    runner = scheduling.ScheduleRunner(
+        store=store,
+        evaluator=scheduling.ScheduleEvaluator(intent_ttl_s=10.0),
+        clock=clock,
+        submit=RunnerSubmit(),
+        intents=RunnerIntents(),
+        initial_plan=plan,
+    )
+
+    state = runner.state_payload()
+
+    assert state["active"] is False
+    assert state["version"] == 7
+    assert state["reason_codes"] == ["no_window_open"]
+    assert state["next"]["entry_id"] == "day-charge"
+    assert state["next"]["starts_at"].startswith("2026-01-05T09:00")
+    assert state["posture"] == "yield"
+
+
+# --- DESIGN_SCHEDULES §3 B2/B5: the posture policy as pure logic ---------------
+
+
+def test_day_default_is_the_shipped_yield_posture() -> None:
+    scheduling = _helpers()
+    policy = scheduling.SchedulePolicy(
+        allowed_windows_local=(scheduling.DAY_DEFAULT,),
+        intent_ttl_s=10.0,
+        timezone="Australia/Brisbane",
+    )
+    assert policy.posture == "yield"
+    assert policy.wire_windows() == [["06:00", "20:00"]]
+
+
+def test_any_night_second_in_the_allowed_set_is_the_partition_posture() -> None:
+    scheduling = _helpers()
+    policy = scheduling.SchedulePolicy(
+        allowed_windows_local=(
+            (scheduling.parse_hhmm("05:00"), scheduling.parse_hhmm("08:00")),
+            scheduling.DAY_DEFAULT,
+        ),
+        intent_ttl_s=10.0,
+        timezone="Australia/Brisbane",
+    )
+    assert policy.posture == "partition"
+
+
+def test_containment_judges_crossing_windows_as_both_halves() -> None:
+    scheduling = _helpers()
+    day = (scheduling.DAY_DEFAULT,)
+    policy = scheduling.SchedulePolicy(
+        allowed_windows_local=day, intent_ttl_s=10.0, timezone="Australia/Brisbane"
+    )
+    # A window crossing OUT of the allowed union is refused even though both
+    # of its endpoints sit inside it.
+    inside = scheduling.parse_hhmm
+    assert policy.contains_entry(_entry(start=inside("07:00"), end=inside("19:00")))
+    assert not policy.contains_entry(_entry(start=inside("19:00"), end=inside("07:00")))
+    # A night-granting policy contains the night entry and is partition.
+    night_policy = scheduling.SchedulePolicy(
+        allowed_windows_local=(
+            (inside("00:00"), inside("06:00")),
+            scheduling.DAY_DEFAULT,
+        ),
+        intent_ttl_s=10.0,
+        timezone="Australia/Brisbane",
+    )
+    assert night_policy.contains_entry(_entry(start=inside("00:01"), end=inside("05:59")))
+    assert night_policy.entry_is_night(_entry(start=inside("00:01"), end=inside("05:59")))
+    assert not policy.entry_is_night(_entry(start=inside("07:00"), end=inside("19:00")))
