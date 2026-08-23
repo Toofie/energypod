@@ -41,6 +41,28 @@
   color: #3f3a30;
 }
 
+/* --- The next-scheduled-action card (renders only when the feature is
+       composed — see NextScheduleCard) ------------------------------------- */
+
+.home-card--schedule .home-schedule-status {
+  margin: 0 0 0.4rem;
+  color: #3f3a30;
+}
+
+.home-card--schedule .home-schedule-posture {
+  margin: 0;
+  font-size: 0.88rem;
+  color: #78716c;
+}
+
+.home-card--schedule .home-schedule-status[data-state="running"] strong {
+  color: #276749;
+}
+
+.home-card--schedule .home-schedule-status[data-state="waiting"] strong {
+  color: #5f4a24;
+}
+
 /* --- Question 1: safety + connection ------------------------------------ */
 
 .home-fleet-line {

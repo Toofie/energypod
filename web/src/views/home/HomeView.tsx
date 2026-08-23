@@ -88,8 +88,19 @@ import {
 } from "../../app/fleet";
 import { UnitHealthTag } from "../../app/unitHealth";
 import { isPlaneSnapshot } from "../../app/SharedDataPlane";
+import {
+  applyWindowClosing,
+  applyWindowOpened,
+  localTimeOfInstant,
+  toScheduleReplacedEvent,
+  toScheduleState,
+  toScheduleWindowClosingEvent,
+  toScheduleWindowOpenedEvent,
+  type ScheduleState,
+} from "../../app/schedule";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../../lib/format";
+import { NextScheduleCard, toScheduleFacts, type ScheduleFacts } from "./NextScheduleCard";
 import { SolarSurplusTile } from "./SolarSurplusTile";
 import "./home.css";
 
@@ -198,6 +209,12 @@ interface SnapshotView {
    * here) — the tile renders nothing and nothing else changes.
    */
   adviserState: AdviserState | null;
+  /**
+   * The snapshot's top-level `schedule_state` projection (PENDING-BACKEND,
+   * feature-detected): null when the field is absent — the schedules feature
+   * is not composed here, and Home's schedule card renders nothing at all.
+   */
+  scheduleState: ScheduleState | null;
 }
 
 function readPowerFigure(value: unknown): PowerFigureView | null {
@@ -275,6 +292,10 @@ function readSnapshot(value: unknown): SnapshotView | null {
     // Feature detection: an absent `adviser_state` (today's backend) is null —
     // the excess-solar feature is not composed here and its tile stays hidden.
     adviserState: isRecord(record.adviser_state) ? toAdviserState(record.adviser_state) : null,
+    // Feature detection: an absent `schedule_state` (today's backend) is null
+    // — the schedules feature is not composed here, and Home's schedule card
+    // renders nothing at all.
+    scheduleState: isRecord(record.schedule_state) ? toScheduleState(record.schedule_state) : null,
   };
 }
 
@@ -691,12 +712,26 @@ export function HomeView({ client }: HomeViewProps) {
    * a deferred state updater — so they read this and keep it current.
    */
   const adviserRef = useRef<AdviserState | null>(null);
+  /**
+   * The schedule projection by reference (the adviserRef pattern): the frame
+   * handlers below patch it synchronously — a card swap cannot wait for React
+   * to run a deferred updater.
+   */
+  const scheduleRef = useRef<ScheduleState | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [announcement, setAnnouncement] = useState("");
   const [urgentNotice, setUrgentNotice] = useState("");
   const [expandedFactors, setExpandedFactors] = useState<Record<string, boolean>>({});
   const [reloadNonce, setReloadNonce] = useState(0);
+  /**
+   * The schedules facts Home reads once the projection proves the feature is
+   * composed: the commissioned policy (the card's posture line) and the plan
+   * (the running window's own entry figures). Null until read or after a
+   * failed read — the card omits its extras rather than guessing.
+   */
+  const [scheduleFacts, setScheduleFacts] = useState<ScheduleFacts | null>(null);
+  const [scheduleFactsNonce, setScheduleFactsNonce] = useState(0);
   /**
    * The monotonic moment each unit's latest `observation.published` landed.
    * The service snapshots once per connection, so these per-cycle frames are
@@ -765,6 +800,7 @@ export function HomeView({ client }: HomeViewProps) {
       capturedAtRef.current = monotonicNowMs();
       setSnapshot(parsed);
       adviserRef.current = parsed.adviserState;
+      scheduleRef.current = parsed.scheduleState;
       lastSequenceRef.current = incoming;
       return true;
     };
@@ -1041,6 +1077,47 @@ export function HomeView({ client }: HomeViewProps) {
         // exists so the quietness is explicit.
         return;
       }
+      if (frame.type === "schedule_window.opened") {
+        // A scheduled window started (§6 W-C): the card swaps to "running"
+        // NOW, from the frame alone — no poll. The window's intent rides the
+        // ordinary request paths; the announcement is the transition moment.
+        const opened = toScheduleWindowOpenedEvent(frame.payload);
+        if (opened !== null) {
+          const next = applyWindowOpened(scheduleRef.current, opened, Date.now());
+          scheduleRef.current = next;
+          setSnapshot((prior) => (prior === null ? prior : { ...prior, scheduleState: next }));
+          const endsAt = opened.endsAt === null ? "" : localTimeOfInstant(opened.endsAt);
+          setAnnouncement(
+            `Scheduled window ${opened.entryId} opened — running${
+              endsAt === "" ? "" : ` until ${endsAt}`
+            }.`,
+          );
+        }
+        return;
+      }
+      if (frame.type === "schedule_window.closing") {
+        // The window's command ended: the card stops claiming a running
+        // window immediately; the intent lifecycle's own frames carry the
+        // request's end from here.
+        const closing = toScheduleWindowClosingEvent(frame.payload);
+        if (closing !== null) {
+          const next = applyWindowClosing(scheduleRef.current, closing);
+          scheduleRef.current = next;
+          setSnapshot((prior) => (prior === null ? prior : { ...prior, scheduleState: next }));
+          setAnnouncement(`Scheduled window ${closing.entryId} ended.`);
+        }
+        return;
+      }
+      if (frame.type === "schedule.replaced") {
+        // A publish landed (this console or another's): the plan is the
+        // projection's input, so the world re-reads and the card follows the
+        // next snapshot; the plan facts (posture line) re-read too.
+        if (toScheduleReplacedEvent(frame.payload) !== null) {
+          setScheduleFactsNonce((nonce) => nonce + 1);
+          refetchSnapshot();
+        }
+        return;
+      }
       if (frame.type === "excess_adviser.state_changed") {
         // The adviser's own frame (feature-detected): the payload patches the
         // tile's projection — watt figures refresh on EVERY frame, heartbeats
@@ -1247,6 +1324,32 @@ export function HomeView({ client }: HomeViewProps) {
     };
   }, [client, reloadNonce]);
 
+  // The schedules facts read: ONLY once the snapshot's projection proves the
+  // feature is composed (an absent projection never reads — a deployment
+  // without the config block answers 409, and nothing on Home changes). A
+  // publish (schedule.replaced) re-reads so the posture line stays current.
+  const scheduleComposed = snapshot?.scheduleState != null;
+  useEffect(() => {
+    if (!scheduleComposed) {
+      return undefined;
+    }
+    let cancelled = false;
+    client
+      .getSchedule()
+      .then((body) => {
+        if (!cancelled) {
+          setScheduleFacts(toScheduleFacts(body));
+        }
+      })
+      .catch(() => {
+        // The card still renders from the projection; the posture line is
+        // omitted rather than guessed.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, scheduleComposed, scheduleFactsNonce]);
+
   const retry = useCallback(() => {
     setFailure(null);
     setSnapshot(null);
@@ -1266,7 +1369,11 @@ export function HomeView({ client }: HomeViewProps) {
   // its latest observation instead (the healthy sawtooth).
   const needsAgeTick =
     (snapshot?.units.some((unit) => unit.telemetry_age_s !== null) ?? false) ||
-    Object.keys(observations).length > 0;
+    Object.keys(observations).length > 0 ||
+    // A schedule countdown on screen ticks too ("starts in", "ends in") — the
+    // same once-a-second clock, never an animation.
+    (snapshot?.scheduleState?.active === true && snapshot.scheduleState.endsInS !== null) ||
+    (snapshot?.scheduleState?.active !== true && snapshot?.scheduleState?.next?.startsInS != null);
   const nowMs = useTickingNow(needsAgeTick);
   const ageTickS = Math.max(0, (nowMs - capturedAtRef.current) / 1000);
   /** A unit's displayed data age: from its own last observation once seen. */
@@ -1471,7 +1578,11 @@ export function HomeView({ client }: HomeViewProps) {
         <h2 id={nextHeadingId}>What happens next?</h2>
         {nextAction === null ? (
           <p className="home-next-none">
-            No planned action — nothing is scheduled for the pods right now.
+            {snapshot.scheduleState !== null
+              ? // The schedules feature owns the "scheduled" wording when it
+                // is composed; this card answers for live requests only.
+                "No request is running right now."
+              : "No planned action — nothing is scheduled for the pods right now."}
           </p>
         ) : (
           <p className="home-next-action">
@@ -1479,6 +1590,15 @@ export function HomeView({ client }: HomeViewProps) {
           </p>
         )}
       </section>
+
+      {/* The schedules card: the feature's one-glance answer on Home. Renders
+          nothing at all while the snapshot carries no schedule_state (the
+          feature detection — the backend half is not composed). */}
+      <NextScheduleCard
+        schedule={snapshot.scheduleState}
+        facts={scheduleFacts}
+        nowMs={nowMs}
+      />
 
       <section className="home-card" aria-labelledby={limitingHeadingId}>
         <h2 id={limitingHeadingId}>Is anything limiting operation?</h2>

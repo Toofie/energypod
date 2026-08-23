@@ -82,10 +82,19 @@ import {
   adviserState,
   excessAdviserStateChanged,
   excessChargingToggleOk,
+  getScheduleOk,
+  scheduleEntry,
+  schedulePlan,
+  schedulePolicy,
+  scheduleReplaced,
+  scheduleState as wireScheduleState,
+  scheduleWindowClosing,
+  scheduleWindowOpened,
   telemetrySummary,
   unitHealthChanged,
   unitUnexpectedAutonomy,
   type WireAdviserState,
+  type WireScheduleState,
   type WireTelemetrySummary,
 } from "../../test/wire";
 import { HomeView, HEALTH_POLL_MS } from "./HomeView";
@@ -145,6 +154,11 @@ interface FleetView {
    * backend does; solar-surplus tests attach it explicitly.
    */
   adviser_state?: WireAdviserState;
+  /**
+   * The schedules projection (PENDING-BACKEND, feature-detected): absent from
+   * today's wire by default; schedule-card tests attach it explicitly.
+   */
+  schedule_state?: WireScheduleState;
 }
 
 interface HealthReport {
@@ -274,6 +288,7 @@ interface ClientSetup {
   getHealth?: () => Promise<HealthReport>;
   openEvents?: StreamFactory;
   postExcessCharging?: ApiClient["postExcessCharging"];
+  getSchedule?: ApiClient["getSchedule"];
 }
 
 /** Builds the mocked client; the cast only bridges this suite's local wire types. */
@@ -293,6 +308,10 @@ function installClient(setup: ClientSetup = {}): ApiClient {
       setup.postExcessCharging ??
         (() => Promise.reject(new Error("not used by HomeView"))),
     ),
+    // The schedules facts read: answered only when the card is composed (the
+    // view never reads it otherwise); the default carries the day-only policy
+    // and no plan, and tests override it per state.
+    getSchedule: setup.getSchedule ?? vi.fn(() => Promise.resolve(getScheduleOk({}))),
     openEvents: vi.fn(setup.openEvents ?? liveStream(snapshot)),
   };
   const typedClient = client as unknown as ApiClient;
@@ -2454,5 +2473,310 @@ describe("HomeView — the per-unit recovery health badge", () => {
     expect(screen.queryByText(/uncommanded activity/i)).toBeNull();
     // And no announcement was spent on it: the polite region stays as it was.
     expect(screen.queryByText(/uncommanded/i)).toBeNull();
+  });
+});
+
+// --- the next-scheduled-action card (§6 W-C) ----------------------------------
+//
+// Feature-detected exactly like the solar tile: no `schedule_state` in the
+// snapshot, no card. The running state does not duplicate the request figures
+// (a running window's intent rides the ordinary request paths); the next
+// state carries the pure next-occurrence object's own figures; countdowns
+// are snapshot-derived and ticked locally; the posture line states the
+// commissioned windows from the policy read, never a guessed DAY_DEFAULT.
+
+const SCHEDULE_REGION = /next scheduled action/i;
+
+function scheduleWorld(state: Partial<WireScheduleState>): FleetView {
+  return { ...fleet(allUnits("disarmed")), schedule_state: wireScheduleState(state) };
+}
+
+describe("HomeView — the next-scheduled-action card", () => {
+  it("renders nothing at all while the snapshot carries no schedule_state (feature detection)", async () => {
+    const getSchedule = vi.fn(() => Promise.resolve(getScheduleOk({})));
+    installClient({ snapshot: fleet(allUnits("disarmed")), getSchedule });
+    renderHome();
+    await dataLanded();
+
+    expect(screen.queryByRole("region", { name: SCHEDULE_REGION })).toBeNull();
+    // The card's facts read never ran: an absent projection never reads.
+    expect(getSchedule).not.toHaveBeenCalled();
+    // The old empty sentence stands verbatim when the feature is absent.
+    expect(screen.getByText(/No planned action — nothing is scheduled/i)).toBeVisible();
+  });
+
+  it("shows the next occurrence with its own figures and a starts-in countdown", async () => {
+    installClient({
+      snapshot: scheduleWorld({
+        active: false,
+        entry_id: null,
+        held_intent_id: null,
+        ends_at: null,
+        ends_in_s: null,
+        reason_codes: ["no_window_open"],
+        next: {
+          entry_id: "Night Charge",
+          days: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+          start_local: "00:01",
+          end_local: "05:59",
+          action: "charge",
+          watts_by_unit: { lhs: 2500, mid: 2500, rhs: 2500 },
+          unit_ids: ["lhs", "mid", "rhs"],
+          starts_at: "2026-08-24T00:01:00+10:00",
+          starts_in_s: 3600,
+        },
+      }),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SCHEDULE_REGION });
+
+    expect(region).toHaveTextContent(/Next: Night Charge/);
+    expect(region).toHaveTextContent(/2,500 W per battery \(lhs, mid, rhs\)/);
+    expect(region).toHaveTextContent(/starts 00:01, in 1 h\./);
+    // The posture line states the commissioned windows from the policy read
+    // (the read lands just after the card renders).
+    await waitFor(() => {
+      expect(region).toHaveTextContent(
+        /Schedules run 06:00–20:00 local — day-only; the night window stays with the site's other applications\./,
+      );
+    });
+  });
+
+  it("running now: names the window and its end, and points at the request cards instead of duplicating them", async () => {
+    installClient({
+      snapshot: scheduleWorld({
+        active: true,
+        entry_id: "Night Charge",
+        ends_at: "2026-08-24T05:59:00+10:00",
+        ends_in_s: 2743,
+        reason_codes: ["window_open"],
+        next: null,
+      }),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SCHEDULE_REGION });
+
+    expect(region).toHaveTextContent(/Night Charge is running now — ends in 45 min \(at 05:59\)/);
+    expect(region).toHaveTextContent(/rides the normal request path/i);
+    // No per-battery watts are restated as the card's own figures.
+    expect(region.textContent ?? "").not.toMatch(/2,500 W/);
+  });
+
+  it("waiting: a manual request holding the batteries is said plainly", async () => {
+    installClient({
+      snapshot: scheduleWorld({
+        active: true,
+        entry_id: "Night Charge",
+        ends_at: "2026-08-24T05:59:00+10:00",
+        ends_in_s: 2743,
+        reason_codes: ["waiting_for_higher_priority"],
+        next: null,
+      }),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SCHEDULE_REGION });
+
+    expect(region).toHaveTextContent(
+      /Night Charge is waiting — a manual request holds its batteries\. It takes over the moment the other request ends\./,
+    );
+  });
+
+  it.each([
+    [
+      "no plan published yet",
+      getScheduleOk({ plan: null }),
+      /No schedules yet — add one in Schedule\./,
+    ],
+    [
+      "a plan whose every entry is paused",
+      getScheduleOk({ plan: schedulePlan([scheduleEntry({ enabled: false })]) }),
+      /Nothing is coming up — every schedule is paused or past its date range\./,
+    ],
+  ])("honest empty (%s) plus the posture line", async (_name, body, expected) => {
+    installClient({
+      snapshot: scheduleWorld({
+        active: false,
+        entry_id: null,
+        held_intent_id: null,
+        ends_at: null,
+        ends_in_s: null,
+        reason_codes: ["no_window_open"],
+        next: null,
+      }),
+      getSchedule: vi.fn(() => Promise.resolve(body as unknown as Record<string, unknown>)),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SCHEDULE_REGION });
+
+    await waitFor(() => {
+      expect(region).toHaveTextContent(expected);
+    });
+    expect(region).toHaveTextContent(/Schedules run 06:00–20:00 local/);
+  });
+
+  it("states the partition posture when the config granted the night window", async () => {
+    installClient({
+      snapshot: scheduleWorld({
+        active: false,
+        entry_id: null,
+        held_intent_id: null,
+        ends_at: null,
+        ends_in_s: null,
+        reason_codes: ["no_window_open"],
+        next: null,
+      }),
+      getSchedule: vi.fn(() =>
+        Promise.resolve(
+          getScheduleOk({
+            policy: schedulePolicy({ posture: "partition", allowed_windows_local: [["20:00", "06:00"]] }),
+          }) as unknown as Record<string, unknown>,
+        ),
+      ),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SCHEDULE_REGION });
+
+    await waitFor(() => {
+      expect(region).toHaveTextContent(
+        /Schedules run 20:00–06:00 local — night granted to the controller by config\./,
+      );
+    });
+  });
+
+  it("keeps the card honest when the policy read fails: the card stays, the posture line goes", async () => {
+    installClient({
+      snapshot: scheduleWorld({
+        active: false,
+        entry_id: null,
+        held_intent_id: null,
+        ends_at: null,
+        ends_in_s: null,
+        reason_codes: ["no_window_open"],
+        next: null,
+      }),
+      getSchedule: vi.fn(() => Promise.reject(new Error("not reachable"))),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SCHEDULE_REGION });
+
+    await waitFor(() => {
+      expect(region).toHaveTextContent(/No schedules yet — add one in Schedule\./);
+    });
+    expect(region.textContent ?? "").not.toMatch(/Schedules run/);
+  });
+
+  it("hands the scheduled wording to the card: the requests card says requests only", async () => {
+    installClient({
+      snapshot: scheduleWorld({
+        active: false,
+        entry_id: null,
+        held_intent_id: null,
+        ends_at: null,
+        ends_in_s: null,
+        reason_codes: ["no_window_open"],
+        next: null,
+      }),
+    });
+    renderHome();
+    await screen.findByRole("region", { name: SCHEDULE_REGION });
+
+    expect(screen.getByText(/No request is running right now\./)).toBeVisible();
+    expect(screen.queryByText(/nothing is scheduled for the pods/i)).toBeNull();
+  });
+
+  it("a window_opened frame flips the card to running without a poll, and closing ends it", async () => {
+    const snapshot = scheduleWorld({
+      active: false,
+      entry_id: null,
+      held_intent_id: null,
+      ends_at: null,
+      ends_in_s: null,
+      reason_codes: ["no_window_open"],
+      next: null,
+    });
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    const getSnapshot = vi.fn(() => Promise.resolve(snapshot));
+    installClient({ snapshot, getSnapshot, openEvents: channel.openEvents });
+    renderHome();
+    await screen.findByRole("region", { name: SCHEDULE_REGION });
+    const readsBefore = getSnapshot.mock.calls.length;
+
+    channel.push(scheduleWindowOpened(43, { entry_id: "Night Charge", version: 4 }) as unknown as StreamFrame);
+    const region = screen.getByRole("region", { name: SCHEDULE_REGION });
+    await waitFor(() => {
+      expect(region).toHaveTextContent(/Night Charge is running now/);
+    });
+    // The transition moved from the frame alone: no refetch ran for it.
+    expect(getSnapshot.mock.calls.length).toBe(readsBefore);
+    await waitFor(() => {
+      expect(screen.getByText(/Scheduled window Night Charge opened/i)).toBeVisible();
+    });
+
+    channel.push(scheduleWindowClosing(44, { entry_id: "Night Charge", version: 4 }) as unknown as StreamFrame);
+    await waitFor(() => {
+      expect(region).toHaveTextContent(/window just ended/);
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/Scheduled window Night Charge ended\./)).toBeVisible();
+    });
+  });
+
+  it("a schedule.replaced frame re-reads the world and the plan facts", async () => {
+    const snapshot = scheduleWorld({
+      active: false,
+      entry_id: null,
+      held_intent_id: null,
+      ends_at: null,
+      ends_in_s: null,
+      reason_codes: ["no_window_open"],
+      next: null,
+    });
+    const channel = liveChannel([snapshotFrame(snapshot)]);
+    const getSnapshot = vi.fn(() => Promise.resolve(snapshot));
+    const getSchedule = vi.fn(() => Promise.resolve(getScheduleOk({})));
+    installClient({ snapshot, getSnapshot, getSchedule, openEvents: channel.openEvents });
+    renderHome();
+    await screen.findByRole("region", { name: SCHEDULE_REGION });
+    const readsBefore = getSnapshot.mock.calls.length;
+    const scheduleReadsBefore = getSchedule.mock.calls.length;
+
+    channel.push(scheduleReplaced(43, { version: 5, added: ["Night Charge"] }) as unknown as StreamFrame);
+    await waitFor(() => {
+      expect(getSnapshot.mock.calls.length).toBeGreaterThan(readsBefore);
+    });
+    await waitFor(() => {
+      expect(getSchedule.mock.calls.length).toBeGreaterThan(scheduleReadsBefore);
+    });
+  });
+
+  it("ticks the countdown down between snapshots (snapshot-derived, client-recomputed)", async () => {
+    vi.useFakeTimers({
+      shouldAdvanceTime: true,
+      toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date", "performance"],
+    });
+    try {
+      installClient({
+        snapshot: scheduleWorld({
+          active: true,
+          entry_id: "Night Charge",
+          ends_at: "2026-08-24T05:59:00+10:00",
+          ends_in_s: 70,
+          reason_codes: ["window_open"],
+          next: null,
+        }),
+      });
+      renderHome();
+      const region = await screen.findByRole("region", { name: SCHEDULE_REGION });
+      expect(region).toHaveTextContent(/ends in 1 min/);
+
+      act(() => {
+        vi.advanceTimersByTime(30_000);
+      });
+      await waitFor(() => {
+        expect(region).toHaveTextContent(/ends in 4[0-9] s \(at 05:59\)/);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
