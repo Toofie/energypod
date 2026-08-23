@@ -1153,7 +1153,6 @@ def test_a_present_night_block_composes_with_the_pinned_defaults() -> None:
     assert block.demand_exit_hysteresis_w == 200
     assert block.hold_rate_w == 100
     assert block.demand_scope == "fleet"
-    assert block.demand_response == "hold", "the designed posture is the default"
     assert block.pacing == "cap_first"
     assert block.assumed_capacity_wh is None
     assert block.demand_telemetry_max_age_s == 3.0
@@ -1208,37 +1207,27 @@ def test_night_rate_cap_must_not_exceed_the_static_unit_charge_limit() -> None:
 
 
 def test_night_hold_rate_must_be_a_positive_charge_below_the_cap() -> None:
-    """§2.4's pin: the hold is a small POSITIVE charge — zero hands the pod
-    back to matching autonomy, the opposite of the operator's intent."""
+    """§2.4's pin: `hold_rate_w` is the EVIDENCE-FAILURE fallback rate — a
+    small POSITIVE charge a missing/bad/stale demand word holds at (the
+    stand-down answers measured demand only).  Zero hands the pod back to
+    matching autonomy on exactly the evidence it cannot see; the cap is no
+    fallback at all."""
     _assert_night_rule(_night_config(hold_rate_w=0), message_contains="hold_rate_w")
     _assert_night_rule(_night_config(hold_rate_w=2500), message_contains="hold_rate_w")
 
 
-def test_the_demand_response_posture_is_one_of_the_two_commissioned_words() -> None:
-    """`demand_response` selects the demand posture: `hold` (the designed
-    default — a small positive charge whose objective replaces pod autonomy)
-    or `standby` (the operator's preference — measured demand stands units
-    down entirely).  The fail-closed rate `hold_rate_w` is required under
-    BOTH, so its own validation never lapses under `standby`."""
-    parsed = _validate(_night_config(demand_response="standby"))
-    assert parsed.night_charging is not None
-    assert parsed.night_charging.demand_response == "standby"
-
-    _assert_night_rule(_night_config(demand_response="pause"), message_contains="demand_response")
-
-
-def test_standby_still_requires_the_positive_fail_closed_rate() -> None:
-    """Standby is a response to MEASURED demand, never to missing data: bad
-    evidence HOLDS at `hold_rate_w` under both postures, so a standby block
-    with a zero (or cap-equal) hold rate is refused exactly like a hold
-    block's."""
-    _assert_night_rule(
-        _night_config(demand_response="standby", hold_rate_w=0),
-        message_contains="hold_rate_w",
-    )
-    _assert_night_rule(
-        _night_config(demand_response="standby", hold_rate_w=2500),
-        message_contains="hold_rate_w",
+def test_the_night_block_has_no_demand_posture_selector() -> None:
+    """The operator's no-compatibility directive: the measured stand-down is
+    THE demand behavior.  A `demand_response` key is refused as an UNKNOWN
+    key — no selector, no default, no deprecated alias."""
+    with pytest.raises(ValidationError) as caught:
+        _validate(_night_config(demand_response="hold"))
+    night_errors = [
+        item for item in caught.value.errors() if item["loc"] and item["loc"][0] == "night_charging"
+    ]
+    assert night_errors, f"expected a night_charging error, got {caught.value.errors()!r}"
+    assert all(item["type"] == "extra_forbidden" for item in night_errors), (
+        "the selector is gone entirely: an unknown key, never a known-but-refused one"
     )
 
 
@@ -1352,9 +1341,6 @@ def test_the_live_write_examples_night_block_validates_as_documented() -> None:
     assert parsed.night_charging is not None
     assert parsed.night_charging.enabled is False
     assert parsed.night_charging.pacing == "cap_first"
-    assert parsed.night_charging.demand_response == "standby", (
-        "the example ships the operator's preferred demand posture"
-    )
     assert parsed.schedule is not None
     assert parsed.schedule.allowed_windows_local == (("00:00", "20:00"),)
 

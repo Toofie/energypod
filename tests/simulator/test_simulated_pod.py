@@ -1113,24 +1113,25 @@ async def test_the_scripted_night_runs_the_full_strategy(tmp_path: Any) -> None:
         assert _targets(pacing) == {"mid": 2_500, "lhs": 2_500}, "cap_first Docker parity"
 
         # The EV arrives: 500 + 500 + 300 = 1300 W of house load, and every
-        # participating battery drops to the small positive hold.
+        # participating battery STANDS DOWN (zero-watt non-participation —
+        # the operator's directive, the one demand behavior).
         _script_load(runtime, {"mid": 500, "rhs": 300, "lhs": 500})
         await session.pump_until(
-            lambda: _state(runtime)["phase"] == "holding_on_demand",
-            message="the demand hold never engaged",
+            lambda: _state(runtime)["phase"] == "standing_by_on_demand",
+            message="the demand stand-down never engaged",
         )
-        held = _state(runtime)
-        assert held["demand_w"] == 1_300
-        assert "demand_above_threshold" in held["reason_codes"]
-        assert _targets(held) == {"mid": 100, "lhs": 100}, "a small POSITIVE charge"
+        stood_down = _state(runtime)
+        assert stood_down["demand_w"] == 1_300
+        assert "demand_above_threshold" in stood_down["reason_codes"]
+        assert _targets(stood_down) == {}, "stood down: nothing charges"
 
         # Into the hysteresis band (900 W: above the 800 W exit bound): the
-        # hold must NOT release.
+        # stand-down must NOT release.
         _script_load(runtime, {"mid": 400, "rhs": 200, "lhs": 300})
         for _ in range(24):
             await asyncio.sleep(0)
         band = _state(runtime)
-        assert band["phase"] == "holding_on_demand", "the band never flaps"
+        assert band["phase"] == "standing_by_on_demand", "the band never flaps"
         assert band["demand_w"] == 900
 
         # Demand falls below the exit bound: pacing resumes.

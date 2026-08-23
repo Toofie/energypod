@@ -30,15 +30,14 @@ EV charges. They will decommission it once ours matches it. This design
 replaces it with a `NightChargeAdviser`: a strategy layer that computes a
 per-battery charge plan each tick inside a commissioned window (reach the 95%
 SOC ceiling by window end at ≤ the per-unit cap), submits ordinary short-TTL
-`OPTIMIZER` charge intents through the existing internal advisory path,
-answers measured site demand above a threshold per the commissioned POSTURE —
-`hold` keeps every battery in the submission at a small positive charge rate
-(the held objective replaces the pods' own load-matching autonomy, so
-batteries neither drain nor cycle); `standby` (the operator's later stated
-preference, §1) stands the measured holds down entirely (zero-watt
-non-participation, the pod back on its own autonomy) — resumes pacing when
-demand falls (with hysteresis; fail-closed to HOLD on bad evidence under BOTH
-postures), and lets batteries already at the ceiling sit out.
+`OPTIMIZER` charge intents through the existing internal advisory path, and
+stands every battery down to zero-watt non-participation while MEASURED site
+demand exceeds a threshold (the operator's directive, §1 — the pod returns
+to its own autonomy until demand subsides or the window ends), resumes
+pacing when demand falls (with hysteresis), holds at a small positive
+fallback rate on bad evidence (fail-closed — the stand-down answers
+measured demand, never missing data), and lets batteries already at the
+ceiling sit out.
 Nothing else moves: the arbiter, allocator, SafetyKernel, actor, and
 authority path are unchanged in role; a night charge is an ordinary intent
 judged by everything exactly as a manual request is.
@@ -50,9 +49,9 @@ The operator's words, and the mechanism each becomes:
 | Their words | The mechanism |
 |---|---|
 | "force-charges the batteries at 2.5 kW all the way up to full each night between midnight and 6 a.m." | Per-battery CHARGE intents in a commissioned civil-time window (`window_local`, default `00:00–06:00` site time), each unit's rate ≤ `rate_cap_w` (default 2500, the per-battery static cap — the ask sits exactly at it). "Full" is the SOC charge ceiling `policy.max_soc_pct` (95%), not 100%. |
-| "If demand goes high, like over 1,000 W, it drops to a very low charge rate" | The DEMAND RULE (§2.4): while measured site demand exceeds `demand_threshold_w` (default 1000), every participating battery drops to `hold_rate_w` (default 100 W, a small positive charge) — under the original `hold` posture. |
-| "I prefer it to move into standby mode, then return to an active or enabled state after the night charging period or when demand subsides" (the operator's later preference, 2026-08-24) | The DEMAND POSTURE (§2.4): `demand_response: standby` — a MEASURED demand stand-down is zero-watt non-participation (excluded from the submission; the TTL lapse plus watchdog hand the pod back to its own autonomy), resuming when demand falls below threshold − hysteresis OR the window ends. Fail-closed stays posture-invariant: bad evidence HOLDS at `hold_rate_w` under both postures — standby answers measured demand, never missing data. |
-| "so the battery doesn't drain during that time — I don't want energy going in and out of the battery while the EV is charging" | The point of the hold is not the watts — it is the OBJECTIVE. While any intent is renewed, the PQ objective REPLACES the pod's own CT-following autonomy (the beat-autonomy doctrine, inverted for night use). The pods autonomously load-match in the evening and WILL discharge into house/EV load unless held (NIGHT_LOAD_INVESTIGATION §1.1: 0–536 W per pod, uncommanded). A held 100 W charge objective means: not discharging, not cycling, still inching up. Demand spikes are met by the GRID. |
+| "If demand goes high, like over 1,000 W, it drops to a very low charge rate" | The DEMAND RULE (§2.4): while measured site demand exceeds `demand_threshold_w` (default 1000), every participating battery STANDS DOWN — zero-watt non-participation, back on its own autonomy. |
+| "I prefer it to move into standby mode, then return to an active or enabled state after the night charging period or when demand subsides" (the operator's ruling, 2026-08-24 — this is THE behavior, no selector) | The MEASURED demand stand-down (§2.4): excluded from the submission; the TTL lapse plus watchdog hand the pod back to its own autonomy; charging resumes when demand falls below threshold − hysteresis OR the window ends. Fail-closed is the safety doctrine, not a posture: bad evidence HOLDS at `hold_rate_w` (the evidence-failure fallback alone) — the stand-down answers measured demand, never missing data. |
+| "so the battery doesn't drain during that time — I don't want energy going in and out of the battery while the EV is charging" | The point of a held objective is not the watts — it is the OBJECTIVE. While any intent is renewed, the PQ objective REPLACES the pod's own CT-following autonomy (the beat-autonomy doctrine, inverted for night use). The pods autonomously load-match in the evening and WILL discharge into house/EV load unless held (NIGHT_LOAD_INVESTIGATION §1.1: 0–536 W per pod, uncommanded). Under the stand-down directive this guarantee is DELIBERATELY suspended for MEASURED demand events (the row above) and preserved everywhere else — above all in the fail-closed hold, where a held `hold_rate_w` objective means: not discharging blind, not cycling, still inching up while the evidence is missing. |
 | "we pay off-peak rates then" | The window is a civil-time fact in config; the import cost itself is the operator's tariff question (§6 — the scorecard prices it when the tariff keys exist). |
 
 Tonight's measured context this is designed against (2026-08-23 evening
@@ -182,47 +181,43 @@ control-rate under the PCS-block promotion, gaps/failures never interpolated.
   is the exact outcome the operator refused). The hold-on-bad-evidence state
   is loudly visible (`demand_evidence_stale` etc. on the tile), so it can
   never be a silent never-charges.
-- **Threshold and hold rate.** Engage the hold when `demand_w >
+- **Threshold and the ONE response.** Engage when `demand_w >
   demand_threshold_w` (default 1000, the operator's own figure; the ~109 W
-  fleet standby floor is far below it — no false holds on an idle night).
-  While held, every participating unit's target becomes `hold_rate_w`
-  (default 100 W; a small positive charge — never zero, never a discharge;
-  zero-watt/idle submissions are refused by the standing doctrine and would
-  hand the pod back to matching autonomy, the opposite of the intent).
+  fleet standby floor is far below it — no false engages on an idle night).
+  The response to a MEASURED engage is the STAND-DOWN (the operator's
+  directive 2026-08-24, the one behavior — there is deliberately NO
+  posture selector): zero-watt non-participation — the unit is EXCLUDED
+  from the submission (the 6abd869/d2163a5 doctrine; the facade refuses a
+  zero-watt per-unit target, so exclusion is the only honest spelling),
+  the remove-then-submit renewal drops it, and the TTL lapse plus the
+  ~3.5-4.0 s watchdog hand the pod back to its own autonomy until demand
+  falls below the exit bound OR the window ends (non-renewal, exactly the
+  window-end hand-back). The stand-down state is its own phase word
+  (`standing_by_on_demand`, fleet and unit) with the `demand_above_threshold`
+  code. HONEST TRADE, stated as such: during a stand-down the pod's own
+  load-matching autonomy serves part of the house demand, so a battery MAY
+  discharge into the spike — the operator's chosen behavior, replacing the
+  original design's positive-charge hold.
 - **Hysteresis (no flapping).** Resume pacing only when
   `demand_w < demand_threshold_w − demand_exit_hysteresis_w` (default 200;
   validated `0 < hysteresis < threshold`). A load oscillating around 1000 W
-  must not toggle the rate every tick — each toggle rides the kernel's ramp
-  limiter and re-prices the projection. The hold latch is adviser state,
-  reset at window open and window close.
-- **What the hold does mechanically.** The renewed hold objective replaces
-  pod autonomy (§1): the battery neither discharges into the EV load nor
-  cycles; the grid meets the spike. When demand falls back below the exit
-  bound, the tick recomputes the paced rate (under `even` pacing the pause
-  has already raised `required_w` — self-correcting).
-- **The response posture — `demand_response: hold | standby` (the
-  operator's choice, 2026-08-24).** The DECISION (threshold, hysteresis,
-  latch, fail-closed polarity) is posture-invariant; the RESPONSE is
-  commissioned. `hold` (the original design, and the code default) keeps
-  every held unit IN the submission at `hold_rate_w` — the no-cycling
-  guarantee above. `standby` (the operator's stated preference, the shipped
-  example's setting) stands a MEASURED demand hold down entirely:
-  zero-watt non-participation — the unit is EXCLUDED from the submission
-  (the 6abd869/d2163a5 doctrine; the facade refuses a zero-watt per-unit
-  target, so exclusion is the only honest spelling), the remove-then-submit
-  renewal drops it, and the TTL lapse plus the ~3.5-4.0 s watchdog hand the
-  pod back to its own autonomy until demand falls below the exit bound OR
-  the window ends (non-renewal, exactly the window-end hand-back). The
-  stand-by state is its own phase word (`standing_by_on_demand`, fleet and
-  unit) with the same `demand_above_threshold` code. HONEST TRADE, stated
-  as such: during a stand-by the pod's own load-matching autonomy serves
-  part of the house demand, so a battery MAY discharge into the spike —
-  the operator's chosen posture, the exact behavior the hold exists to
-  prevent. The fail-closed polarity is therefore POSTURE-INVARIANT: a
-  missing/bad/stale word (fleet scope: the rollup; per_phase: the unit's
-  own word) HOLDS at `hold_rate_w` under BOTH postures — standby is a
-  response to MEASURED demand, never to missing data — so `hold_rate_w`
-  stays required and validated under both.
+  must not toggle the stand-down every tick — each toggle rides the
+  kernel's ramp limiter and re-prices the projection. The hold latch is
+  adviser state, reset at window open and window close.
+- **What resuming does mechanically.** When demand falls back below the
+  exit bound, the tick recomputes the paced rate and the unit rejoins the
+  submission (under `even` pacing the pause has already raised
+  `required_w` — self-correcting).
+- **`hold_rate_w` — the EVIDENCE-FAILURE fallback alone, never a demand
+  behavior.** The fail-closed arm above (missing/bad/stale ⇒ HOLD at
+  `hold_rate_w`) is the one behavior that still charges at a held rate:
+  a small POSITIVE charge (default 100 W; never zero, never a discharge —
+  zero-watt/idle submissions are refused by the standing doctrine and
+  would hand the pod back to matching autonomy on exactly the evidence it
+  cannot see). This is the SAFETY DOCTRINE, not backward compatibility:
+  the stand-down answers MEASURED demand, never missing data, so a stale
+  word must never silently free-run a fleet into autonomy drain during an
+  EV night — it holds, loudly, until a GOOD word returns.
 
 ### 2.5 The tick
 
@@ -281,10 +276,8 @@ night_charging:
   rate_cap_w: 2500                      # ≤ policy.max_unit_charge_w (validated)
   demand_threshold_w: 1000
   demand_exit_hysteresis_w: 200         # < demand_threshold_w (validated)
-  hold_rate_w: 100                      # 0 < hold < rate_cap_w (validated)
+  hold_rate_w: 100                      # the evidence-failure fallback (validated)
   demand_scope: "fleet"                 # fleet | per_phase
-  demand_response: "standby"            # hold | standby (the operator's pick;
-                                        #   fail-closed HOLDS at hold_rate_w either way)
   pacing: "cap_first"                   # cap_first | even (Docker parity default)
   assumed_capacity_wh:                  # REQUIRED iff pacing: even
     {lhs: 5000, mid: 5000, rhs: 5000}
@@ -402,7 +395,7 @@ no new tier.
    convenient restart; then flip `enabled: true` in the config to make it
    standing (the excess two-step verbatim).
 5. **VERIFY one supervised night.** Watch `night_charge_state` (pacing →
-   `holding_on_demand` when the EV runs → resume → `complete`), the audit
+   `standing_by_on_demand` when the EV runs → resume → `complete`), the audit
    trail (`night-` intents accepted and authorized under
    `energypod:night-adviser` + `optimizer`), measured battery watts ≈
    commanded, and the scorecard's `grid_import_kwh`/charge figures against
@@ -521,7 +514,6 @@ mirror); `active` derives from `held_intent_id`, never a lifecycle guess:
   "rate_cap_w": 2500,
   "hold_rate_w": 100,
   "demand_scope": "fleet",
-  "demand_response": "standby",
   "demand_threshold_w": 1000,
   "demand_w": 412,
   "demand_evidence": "good",
@@ -541,10 +533,10 @@ mirror); `active` derives from `held_intent_id`, never a lifecycle guess:
 ```
 
 - **`phase` (fleet, ONE vocabulary)**: `idle` (outside the window, or
-  suspended/disabled), `holding_on_demand` (the demand rule engaged for any
-  participating unit under the `hold` posture, or fail-closed under either),
-  `standing_by_on_demand` (the `standby` posture: measured demand has stood
-  at least one unit down to zero-watt non-participation), `pacing` (at least
+  suspended/disabled), `holding_on_demand` (the FAIL-CLOSED evidence hold:
+  a missing/bad/stale word holding units at `hold_rate_w`),
+  `standing_by_on_demand` (measured demand has stood at least one unit down
+  to zero-watt non-participation), `pacing` (at least
   one unit charging at a planned rate), `complete` (window open; every
   participating target reached; nothing charging), `skipped_full` (window
   open; every unit sat out from the start). Precedence in that order except
@@ -588,17 +580,20 @@ same cadence the two existing runners produce; complementary by physics).
 
 ## 6. Economics and honesty
 
-- **The no-cycling guarantee.** Inside the window the strategy is
-  CHARGE-ONLY: it never submits a discharge, and the renewed objective
-  (paced rate or hold rate — both positive charges) replaces the pods' own
-  load-matching autonomy, so the batteries neither drain into the EV nor
-  cycle while it runs. Demand spikes are met by the GRID, not the batteries
-  — the operator's stated intent verbatim. The guarantee is bounded by the
-  renewal cadence: if the adviser dies mid-window, the TTL (≤ 300 s,
-  default 10 s) and the ~3.5–4.0 s watchdog hand the pod back to autonomy
-  for the gap — the designed fail-safe, stated as the gap it is. Window END
-  is exactly that hand-back, on purpose (daytime self-charge from PV
-  resumes).
+- **The no-cycling guarantee, restated under the stand-down directive.**
+  Inside the window the strategy is CHARGE-ONLY: it never submits a
+  discharge, and while it is PACING or FAIL-CLOSED-HELD the renewed
+  objective (a positive charge) replaces the pods' own load-matching
+  autonomy, so the batteries neither drain into the EV nor cycle. The
+  MEASURED demand stand-down is the one deliberate suspension: the pod is
+  handed back to its own autonomy for the demand event and MAY serve part
+  of the spike (the operator's directive, 2026-08-24, accepted as such);
+  bad evidence never takes that arm — it holds. The guarantee is bounded
+  by the renewal cadence: if the adviser dies mid-window, the TTL
+  (≤ 300 s, default 10 s) and the ~3.5–4.0 s watchdog hand the pod back to
+  autonomy for the gap — the designed fail-safe, stated as the gap it is.
+  Window END is exactly that hand-back, on purpose (daytime self-charge
+  from PV resumes).
 - **The import cost is the operator's tariff question.** The window charges
   real energy from the grid at the off-peak rate (tonight's fleet needs
   ≈ 1.6 kWh; a depleted fleet ≈ 3.75 kWh + losses). The scorecard's
@@ -700,8 +695,9 @@ case, feature detection), `web/src/views/activity/ActivityView.test.tsx`.
 - Exactly one live `night-` intent, ever (the held-id invariant is a named
   test); per-unit exclusion happens at SUBMISSION time, never by idle
   "placeholder" intents.
-- `hold_rate_w` is a POSITIVE charge; a zero hold hands the pod back to
-  matching autonomy — the opposite of the operator's intent — and the
+- `hold_rate_w` is the EVIDENCE-FAILURE fallback rate, a POSITIVE charge;
+  a zero fallback hands the pod back to matching autonomy on exactly the
+  evidence it cannot see — the opposite of the safety doctrine — and the
   config validation refuses it.
 - Absent-block behavior is byte-identical to today — the same discipline as
   every feature-detected surface before it.

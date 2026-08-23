@@ -550,19 +550,12 @@ class NightChargingConfig(_FrozenModel):
     rate_cap_w: PositiveStrictInt = 2500
     demand_threshold_w: PositiveStrictInt = 1000
     demand_exit_hysteresis_w: PositiveStrictInt = 200
+    # The EVIDENCE-FAILURE fallback rate alone (never a demand behavior):
+    # a missing/bad/stale demand word HOLDS at this small positive charge
+    # — the stand-down answers measured demand only, so bad evidence must
+    # never silently free-run the fleet into autonomy drain.
     hold_rate_w: PositiveStrictInt = 100
     demand_scope: Literal["fleet", "per_phase"] = "fleet"
-    # The demand-response posture (DESIGN_NIGHT_CHARGE §2.4): `hold` (the
-    # default — the designed behavior) keeps every held unit in the
-    # submission at `hold_rate_w`, whose renewed objective replaces the
-    # pod's load-matching autonomy; `standby` (the operator's stated
-    # preference) stands MEASURED demand holds down entirely — zero-watt
-    # non-participation, the pod back on its own autonomy until demand
-    # subsides or the window ends.  The fail-closed polarity is
-    # POSTURE-INVARIANT: missing/bad/stale evidence HOLDS at `hold_rate_w`
-    # under both (standby answers measured demand, never missing data), so
-    # `hold_rate_w` is required and validated under both postures.
-    demand_response: Literal["hold", "standby"] = "hold"
     pacing: Literal["cap_first", "even"] = "cap_first"
     # REQUIRED iff ``pacing: even`` (key set exactly the fleet units,
     # validated on ControllerConfig); a stray map under cap_first is refused
@@ -1051,11 +1044,11 @@ class ControllerConfig(_FrozenModel):
         if not 0 < night.hold_rate_w < night.rate_cap_w:
             raise ValueError(
                 "night_charging.hold_rate_w must be a positive charge strictly "
-                "below rate_cap_w: it is the demand rate under the `hold` posture "
-                "AND the fail-closed rate under both postures (missing/bad/stale "
-                "evidence holds, never stands by), so a zero hold hands the pod "
-                "back to matching autonomy — the opposite of the intent — and a "
-                "hold at the cap is no hold at all"
+                "below rate_cap_w: it is the EVIDENCE-FAILURE fallback rate alone "
+                "(a missing/bad/stale demand word holds at it — the stand-down "
+                "answers measured demand only), so a zero hold hands the pod back "
+                "to matching autonomy on exactly the evidence it cannot see — "
+                "and a hold at the cap is no hold at all"
             )
         if not 0 < night.demand_exit_hysteresis_w < night.demand_threshold_w:
             raise ValueError(
