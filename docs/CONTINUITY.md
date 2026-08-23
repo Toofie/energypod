@@ -741,6 +741,53 @@ direction, freshness, and watchdog timing per physical unit.
   all units armed_idle, no faults, mid's ±1.2 kW self-charge oscillation
   continues (pre-existing, unexplained, day-scope observation).
 
+- 2026-08-23 (per-unit watts): THE OPERATOR'S RULING IMPLEMENTED — "I asked
+  for each setting to be one thousand, not a total of 1,000." One dispatch
+  can now name a different watt target per battery, end to end
+  (074bc7b, 1b1816b, a943478, 1145de3, bf771f0). THE CONTRACT: (1)
+  PowerIntent.watts_by_unit — frozen map, keys == selected units, positive
+  ints, sum == watts (the fleet total), None on IDLE; scalar watts remains
+  fully supported and byte-identical in behavior. (2) Allocator: each target
+  is that unit's own CAP — capacity-weighted share clamped to the target,
+  clamping-released watts (chiefly targets above headroom) redistributed to
+  units still below their own targets, bounded by gap+headroom+total;
+  allocated == min(demand, sum of min(target, headroom)) exactly; every
+  prior invariant kept (unit-set equality, zero-watt non-participation,
+  export-cap composition, permutation-invariant ties, concentration
+  boundary now per-target); over-static-cap targets clamp, never error —
+  same doctrine as an over-cap scalar request. (3) Kernel matcher: a
+  proposal may never exceed the unit's own target (total bound kept).
+  (4) REST POST /api/v1/intents: exactly one of scalar watts or
+  watts_by_unit (key set == unit_ids, ints > 0); 422 on both/neither/
+  key-mismatch; facade derives watts = sum and carries the breakdown into
+  the stored intent, the intent_accepted audit fact set, the
+  intent.accepted payload, and the acceptance view. (5) Audit: every
+  control_decision row now carries authorized_watts_by_unit (per-unit
+  decision watts; null when no batch) and requested_watts_by_unit (the
+  intent's targets; null for scalar) — the fleet-row opacity fix; both are
+  optional fields, and the SQLite decode accepts pre-existing durable rows
+  missing them (unknown keys still refused); audit.appended bus payloads
+  carry both maps. SIMULATOR PROOF (deterministic, run twice identical;
+  real kernel+allocator+safety+actors over 3 simulated pods): {lhs:1200,
+  mid:400, rhs:800} with 2500 W static caps → authorized and measured
+  exactly 1200/400/800 after the ramp settles (400→800→1200 on lhs);
+  same targets with lhs capped at 1000 W → lhs 1000, others at targets,
+  authorized_active_w 2200 of requested 2400 (200 unallocated, never
+  forced); scalar 2400 → 800/800/800 capacity-weighted (unchanged);
+  {2400,100,100} → exactly 2400/100/100 (no unit exceeds its own setting).
+  Scoped families green: domain 132, allocation 60, kernel 27,
+  control-audit 29, rest-contract 73, facade 104, facade-audit-content 7,
+  repositories 23, composition 44, write-enabled-run 12, excess-charge 16
+  — 550 passed across the scoped set (ruff + ruff format + mypy strict
+  clean on every changed file). CONSOLE MIGRATION (web agent):
+  the dispatch form should now POST watts_by_unit {unit: perBatteryW for
+  each ticked unit} with NO watts key (mutually exclusive on the wire);
+  scalar watts stays valid. NOTE: tests/golden
+  test_healthy_dispatch_applies_exactly_the_authorized_setpoint fails at
+  HEAD BEFORE this work (single-unit control_decision rows now carry
+  unit_id per the earlier attribution feature; the golden pin still
+  expects None) — pre-existing, untouched here, needs its own small fix.
+
 - 2026-08-23 (allocator): GREEDY-ALLOCATION STARVATION FIXED AND
   LIVE-VERIFIED (4c41ed7, 58a03e6, d717deb). Root cause of "only one
   device powers": the operator's dispatches were single FLEET intents

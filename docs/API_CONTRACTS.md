@@ -16,6 +16,12 @@ These names are the test-first contract for the initial implementation.
 `PowerIntent` is immutable and contains id, source, selected unit ids, direction, non-negative watts
 (fleet total), duration, server-assigned acceptance monotonic time, server-assigned acceptance
 revision, and actor identity. Clients cannot choose ordering metadata. Idle must have zero watts.
+Optionally it carries `watts_by_unit`: one positive integer watt target per selected unit (frozen
+mapping, normalized keys) whose key set equals the selected units and whose values sum to exactly the
+fleet-total `watts`. `watts_by_unit` is a per-unit CAP on allocation, never a floor; IDLE intents
+carry `None`. A target above a unit's static cap is bounded by that policy headroom at allocation
+(clamped, shortfall unallocated) exactly as an over-cap scalar request is — it is never an
+acceptance error.
 
 `UnitSetpoint` is immutable and contains unit id, direction, non-negative watts, reactive vars,
 generation, intent id, and monotonic authorization expiry. Domain power is not constrained by a wire
@@ -63,6 +69,17 @@ zero-watt proposal while another runs below its own headroom. A request smaller 
 participating units cannot give each unit its first watt and concentrates instead by capacity
 priority (largest headroom first, ties by unit id). Ineligible units and units without usable
 headroom keep explicit zero-watt proposals.
+
+When the intent carries `watts_by_unit` (per-unit watt targets), every target is that unit's own
+CAP: the capacity-weighted share is clamped to the unit's target; the watts that clamping released
+— chiefly the shortfall of units whose target exceeds their headroom — are redistributed across
+units still below their own targets, bounded by each unit's remaining target-versus-allocation gap
+and headroom; a unit whose target is fully met stops absorbing redistribution. The fleet total
+never exceeds the request (nor the export cap when one applies), and the result is exactly
+`allocated = min(fleet demand, sum of per-unit serving capacities)` with `unallocated = watts -
+allocated`; every scalar-path invariant above (unit-set equality, zero-watt non-participation,
+permutation-invariant ties, export-cap composition, the concentration boundary — now per-target)
+is preserved unchanged. A scalar `watts` intent keeps the pure capacity-weighted behavior exactly.
 
 `SafetyKernel.evaluate(proposed_setpoints, current_observations, previous_observations, policy,
 now_mono) -> ControlDecision` is deterministic and side-effect free. Unknown, stale, invalid,
@@ -150,6 +167,15 @@ priority are rejected. Evaluation returns a short-lived schedule intent, never a
   hold that scope). It submits ordinary bounded, expiring intents and cannot arm, acknowledge stops
   or inhibits, change policy, or use debug/maintenance modes. Its audit view requires both
   `observe` and `audit:read`, matching the REST boundary.
+- `POST /api/v1/intents` carries exactly one watt form (the 2026-08-23 operator ruling: each
+  setting is that battery's own request): either scalar `watts` (integer > 0, the fleet total —
+  fully supported, unchanged) or `watts_by_unit` (a JSON object of one integer > 0 per unit id,
+  whose key set equals `unit_ids` exactly). Sending both, sending neither, a missing or extra key,
+  or a non-positive / non-integer value is a 422 before the service is reached. With
+  `watts_by_unit` the facade derives the fleet total as the sum of the targets, and the acceptance
+  view's `requested` projection and the `intent.accepted` payload carry the breakdown alongside the
+  total. Per-unit values are capped by each unit's static policy limit at allocation (never an
+  acceptance error), and per-unit proposals may never exceed the unit's own target.
 - `GET /api/v1/audit` accepts `after_sequence` (integer >= 0, default absent) passed through
   to the facade as the oldest-delivered cursor; pagination continues until `next_cursor` is
   null. `POST /api/v1/disarm` mirrors arm with the `arm` scope but does not require an
@@ -268,7 +294,11 @@ coordinator, the event bus, and per-unit actor handles.
   `acceptance_revision`, stores it through the intent repository, and returns the acceptance
   view (`intent_id`, `acceptance_revision`, `accepted_at_monotonic`, `status: accepted`,
   requested/authorized/measured projections). It never writes hardware and never publishes
-  authorization; only the kernel tick does that.
+  authorization; only the kernel tick does that. The watt form is exactly one of scalar `watts`
+  or `watts_by_unit` (one positive integer per selected unit, key set exactly the selection);
+  with the per-unit form the facade derives the fleet total as the sum and the stored intent,
+  `intent_accepted` audit fact set, and `intent.accepted` payload all carry the breakdown.
+  `submit_advisory_intent` (composition-internal) stays scalar-only.
 - `arm(principal, unit_ids)` arms exactly the requested qualified, disarmed units through
   their owning actors and reports per-unit outcomes; partial failure is visible, never
   silent. Arming is refused for unknown units, unqualified units, or units inhibited with a
@@ -499,6 +529,12 @@ eligible_charge_w = min(max_charge_from_export_w,
   the full observation-sequence map, both watt figures, the cycle and decision ids, the fingerprints
   — are unchanged on every row, and the kernel still rejects a factory event that attributes the
   wrong unit.
+- Every `control_decision` row carries the per-unit watt breakdowns (2026-08-23 fleet-row opacity
+  fix): `authorized_watts_by_unit` is the decision's per-unit authorized watts (unsigned; null when
+  no batch was minted, matching `authorized_active_w == 0`), and `requested_watts_by_unit` is the
+  intent's own target map (null for scalar fleet-total intents). `audit.appended` bus payloads
+  carry both maps too. Both fields are optional with null defaults, so durable rows written before
+  they existed keep decoding; an unknown payload key is still refused.
 - A decision held by a latched emergency stop correlates to the stop explicitly:
   `correlation_id = "emergency_stop:{stop_id}"` (other decisions keep
   `intent:{intent_id}:revision:{revision}`), so the Activity view names the stop on the row itself
