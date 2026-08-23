@@ -305,12 +305,37 @@ def test_missing_selected_unit_fails_closed(api: SimpleNamespace) -> None:
     assert_rejected(decision, api)
 
 
-def test_missing_previous_observation_fails_closed_for_nonzero_power(
-    api: SimpleNamespace,
-) -> None:
+def test_a_units_first_observation_is_its_own_baseline(api: SimpleNamespace) -> None:
+    """SYNC_RESILIENCE_AUDIT B3: no more one-cycle block after every restart.
+
+    After every controller restart the first tick holds exactly ONE fresh
+    observation per unit; the missing thing is our own second sample, and the
+    battery is readable and fine the whole time.  The first observation is
+    therefore its own baseline: every pair-derived check (order, sequence,
+    epoch, cell-sequence, soc_jump) is VACUOUS with no baseline, while every
+    value-judging check (quality, staleness, SOC bounds, cells, temperatures,
+    faults, dynamic limits) runs unchanged on the fresh observation."""
     decision = evaluate(api, previous_observations={})
-    assert_rejected(decision, api)
-    assert "previous_observation_missing" in reasons(decision)
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert "previous_observation_missing" not in reasons(decision)
+    assert all(setpoint.watts > 0 for setpoint in decision.setpoints)
+
+
+def test_first_observation_still_faces_every_value_check(api: SimpleNamespace) -> None:
+    """B3 removes only the comparison against a nonexistent baseline: a FIRST
+    observation with a genuine value violation still denies exactly as any
+    other would (class D untouched)."""
+    stale = make_observation(api, captured_at_mono=90.0, cell_captured_at_mono=90.0)
+    hot = make_observation(api, temperatures_c=(25.0, 46.0))
+    for observation in (stale, hot):
+        decision = evaluate(
+            api, current_observations={"mid": observation}, previous_observations={}
+        )
+        assert_rejected(decision, api)
+    assert "telemetry_stale" in reasons(
+        evaluate(api, current_observations={"mid": stale}, previous_observations={})
+    )
 
 
 @pytest.mark.parametrize(
@@ -1424,11 +1449,6 @@ REASON_CODE_CASES: tuple[pytest.Param, ...] = (
             previous_observations={},
         ),
         id="unit_policy_missing",
-    ),
-    pytest.param(
-        "previous_observation_missing",
-        lambda api: evaluate(api, previous_observations={}),
-        id="previous_observation_missing",
     ),
     pytest.param(
         "lifecycle_not_controllable",

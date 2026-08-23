@@ -282,9 +282,17 @@ class SafetyKernel:
     ) -> set[str]:
         if observation is None:
             return {"observation_missing"}
+        # SYNC_RESILIENCE_AUDIT B3 (2026-08-24): a unit's FIRST observation is
+        # its own baseline.  ``previous is None`` no longer denies -- after
+        # every restart the first tick holds exactly one fresh observation per
+        # unit, the battery is readable and fine, and the missing thing was
+        # our own second sample.  All PAIR-derived checks below are vacuous
+        # without a baseline and are simply skipped; every VALUE-judging check
+        # (quality, staleness, SOC bounds, cells, temperatures, faults,
+        # dynamic limits) applies to the first observation exactly as to any
+        # other.  A unit with NO observation at all is still denied above
+        # (``observation_missing``, class D).
         reasons: set[str] = set()
-        if previous is None:
-            reasons.add("previous_observation_missing")
         for field in self._required_quality:
             if observation.quality.get(field) is not DataQuality.GOOD:
                 reasons.add(f"quality_{field}")

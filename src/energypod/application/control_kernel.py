@@ -497,7 +497,6 @@ class ControlKernel:
             or not selected
             or not selected <= self._unit_ids
             or not selected <= current.keys()
-            or not selected <= previous.keys()
             or decision.status not in {DecisionStatus.AUTHORIZED, DecisionStatus.CLAMPED}
             or len(setpoints) != len(selected)
             or {getattr(item, "unit_id", None) for item in setpoints} != selected
@@ -561,24 +560,35 @@ class ControlKernel:
     def _evidence_is_coherent(
         selected: frozenset[str], current: dict[str, Any], previous: dict[str, Any]
     ) -> bool:
+        # SYNC_RESILIENCE_AUDIT B3 (2026-08-24): a unit's FIRST observation is
+        # its own baseline -- a selected unit with no previous observation
+        # (the first post-restart tick) is coherent on its current typing
+        # alone, because the pair-derived checks compare against a baseline
+        # that does not exist yet and are vacuous by construction.  Units
+        # that DO hold a previous observation keep the full pair checks.
         for unit_id in selected:
             current_item = current[unit_id]
-            previous_item = previous[unit_id]
+            previous_item = previous.get(unit_id)
             current_epoch = getattr(current_item, "connection_epoch", None)
-            previous_epoch = getattr(previous_item, "connection_epoch", None)
             current_sequence = getattr(current_item, "sequence", None)
-            previous_sequence = getattr(previous_item, "sequence", None)
             if (
                 getattr(current_item, "unit_id", None) != unit_id
-                or getattr(previous_item, "unit_id", None) != unit_id
                 or type(current_epoch) is not int
-                or type(previous_epoch) is not int
                 or type(current_sequence) is not int
-                or type(previous_sequence) is not int
                 or current_epoch < 0
+                or current_sequence < 0
+            ):
+                return False
+            if previous_item is None:
+                continue
+            previous_epoch = getattr(previous_item, "connection_epoch", None)
+            previous_sequence = getattr(previous_item, "sequence", None)
+            if (
+                getattr(previous_item, "unit_id", None) != unit_id
+                or type(previous_epoch) is not int
+                or type(previous_sequence) is not int
                 or previous_epoch < 0
                 or previous_sequence < 0
-                or current_sequence < 0
                 or (previous_epoch == current_epoch and current_sequence <= previous_sequence)
             ):
                 return False

@@ -143,6 +143,19 @@ protections are untouched and are the real guards: a jumped figure that crosses 
 implausible-data canary the jump check once served is carried by identity pinning (core-rate
 0x8106) and the decoder's 0-100 domain validation.
 
+#### First-observation baseline (SYNC_RESILIENCE_AUDIT B3, 2026-08-24)
+
+The `previous_observation_missing` deny reason is removed, and the kernel's `_eligible` /
+`_evidence_is_coherent` no longer require a previous observation for a selected unit: a unit's
+FIRST observation is its own baseline. All pair-derived checks (order, sequence, epoch,
+cell-sequence, SOC-jump) are vacuous when no baseline exists and are skipped; every value-judging
+check (quality, staleness, SOC bounds, cells, temperatures, faults, dynamic limits) applies to the
+first observation exactly as to any other. This removes the one-cycle block after every controller
+restart (boot → first poll → first tick previously rejected every active proposal because the
+missing thing was our own second sample, while the battery was readable and fresh). A unit with NO
+observation at all is still denied (`observation_missing`, class D), and units that do hold a
+previous observation keep the full pair-coherence checks.
+
 `IntentArbiter.arbitrate(intents, now_mono) -> CycleArbitration` removes expired intents and
 selects a PER-UNIT WINNER SET: for each unit, the highest-priority live intent claiming it wins
 that unit (priority order unchanged: emergency stop > manual > agent > optimizer > schedule;

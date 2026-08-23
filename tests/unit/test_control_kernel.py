@@ -418,7 +418,7 @@ async def test_exact_current_epoch_and_sequence_are_minted(api: Any):
     assert (cap.connection_epoch, cap.observation_sequence) == (41, 73)
 
 
-@pytest.mark.parametrize("missing", ["current", "previous"])
+@pytest.mark.parametrize("missing", ["current"])
 async def test_partial_selected_fleet_fails_closed(api: Any, missing: str):
     value = intent(api)
     current, previous = observation_pairs()
@@ -429,6 +429,39 @@ async def test_partial_selected_fleet_fails_closed(api: Any, missing: str):
     )
     await kernel.tick()
     assert audit.events and not auth.published and auth.revocations
+
+
+async def test_a_boot_composition_with_one_observation_per_unit_mints(api: Any):
+    """SYNC_RESILIENCE_AUDIT B3: the first post-restart tick must mint.
+
+    Boot -> first poll -> first tick historically found no previous pair, so
+    ``_eligible`` refused to mint and every active proposal was rejected for
+    one cycle although the battery was readable and fresh the whole time.  A
+    unit's FIRST observation is its own baseline: the pair-derived coherence
+    checks are vacuous without a baseline and the batch is minted on the
+    current observations alone."""
+    value = intent(api)
+    current, _previous = observation_pairs(value.unit_ids)
+    kernel, _, auth, audit, _, _ = make_kernel(
+        api, value, decision_for(api, value), current=current, previous={}
+    )
+    await kernel.tick()
+    assert_batch(api, auth.published[0], value)
+    assert audit.events
+
+
+async def test_a_mixed_boot_mints_for_every_selected_unit(api: Any):
+    """A unit still warming up (first observation) does not hold back the
+    units that already hold a previous pair, and vice versa: the eligibility
+    gate no longer requires a previous observation for ANY selected unit."""
+    value = intent(api)
+    current, previous = observation_pairs(value.unit_ids)
+    previous.pop("lhs")  # lhs holds its first observation; mid/rhs hold pairs
+    kernel, _, auth, _, _, _ = make_kernel(
+        api, value, decision_for(api, value), current=current, previous=previous
+    )
+    await kernel.tick()
+    assert_batch(api, auth.published[0], value)
 
 
 async def test_explicit_selected_subset_is_complete(api: Any):
