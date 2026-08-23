@@ -38,6 +38,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, AuditEvent, StreamEvent } from "../../api/client";
 import { toUnexpectedAutonomyEvent } from "../../app/fleet";
+import { objectiveReasonText, toForeignObjectiveEvent } from "../../app/objectives";
 import {
   localTimeOfInstant,
   toScheduleReplacedEvent,
@@ -129,6 +130,12 @@ const AUDIT_TYPE_ACKNOWLEDGEMENTS: readonly string[] = [
  */
 function kindOf(eventType: string): KindKey | "other" {
   if (eventType.startsWith("observation")) {
+    return "observations";
+  }
+  // The night-writer detector's alert fact is recorded evidence of what the
+  // battery was doing — the Observations family (the chip is a filter, never
+  // a tier; the entry's own wording carries the alert).
+  if (eventType === "foreign_objective_observed") {
     return "observations";
   }
   if (AUDIT_TYPE_DECISIONS.includes(eventType)) {
@@ -289,6 +296,34 @@ function autonomyEntryFromFrame(frame: StreamEvent): AuditEvent | null {
 }
 
 /**
+ * A `foreign_objective.observed` frame as the night-writer detector's
+ * ALERT-TIER timeline entry: another writer is commanding this battery. The
+ * entry carries the objective's words and the detector's one-word reason (in
+ * plain words in the line, raw under the disclosure); the event fires exactly
+ * once per (episode, reason), so one row is one real alert — the continuous
+ * evidence lives in the Objectives view, and the durable audit fact of the
+ * same episode arrives separately as an `audit.appended` row with its own
+ * event_id (the two never dedupe; they are two facts).
+ */
+function foreignObjectiveEntryFromFrame(frame: StreamEvent): AuditEvent | null {
+  const event = toForeignObjectiveEvent(frame.payload);
+  if (event === null) {
+    return null;
+  }
+  return {
+    event_type: "foreign_objective_observed",
+    unit_id: event.unitId,
+    occurred_at: typeof frame.occurred_at === "string" ? frame.occurred_at : "",
+    sequence: typeof frame.sequence === "number" ? frame.sequence : 0,
+    active_w: event.activeW,
+    reactive_var: event.reactiveVar,
+    reason: event.reason ?? undefined,
+    lifecycle: event.lifecycle ?? undefined,
+    run_mode_w: event.runModeW ?? undefined,
+  } as unknown as AuditEvent;
+}
+
+/**
  * A `schedule.replaced` frame as a QUIET timeline entry (§6 W-D): one row per
  * publish, the plain diff the payload carries ("Schedule v2→v3 — added Night
  * Charge, removed old-evening"). Informational only — publishing is an
@@ -424,6 +459,11 @@ function headlineFor(eventType: string): string {
       // Quiet-tier evidence (the awareness layer's recorder): the headline is
       // the whole alarm budget this entry ever gets.
       return "Uncommanded activity";
+    case "foreign_objective_observed":
+      // The night-writer detector's ALERT TIER: another writer is commanding
+      // this battery. The headline states it plainly; the line below carries
+      // the evidence (the objective's words and the pattern reason).
+      return "Commanded by something else";
     case "schedule_replaced":
       // Quiet informational (§6 W-D): a publish is an operator act, and the
       // diff below is the whole story.
@@ -550,6 +590,20 @@ function decidedLine(event: AuditEvent, stopId: string | null): string | null {
  * cycle says the stop held it, never "power allowed". */
 function happenedLine(event: AuditEvent, stopId: string | null): string | null {
   const eventType = eventTypeOf(event);
+  if (eventType === "foreign_objective_observed") {
+    // The alert tier's evidence line: the objective's own words with the
+    // detector's pattern reason in plain words. A bus frame carries the words
+    // (active_w/reason); the durable audit row of the same episode does not
+    // (its payload is the audit summary), so it gets the honest figureless
+    // line — the Objectives view carries the full window either way.
+    const active = numberField(event, "active_w");
+    const reason = stringField(event, "reason");
+    const reasonText = reason === undefined ? "" : ` — ${objectiveReasonText(reason)}`;
+    if (active !== undefined) {
+      return `Another writer is commanding this battery: ${formatWatts(active)}${reasonText}`;
+    }
+    return `Another writer's objective was recorded${reasonText}`;
+  }
   if (kindOf(eventType) === "observations") {
     const telemetrySequence = numberField(event, "telemetry_sequence");
     return telemetrySequence !== undefined
@@ -784,6 +838,13 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
               // Quiet-tier evidence, never an alarm: the timeline entry is
               // the whole console surface for this frame.
               const entry = autonomyEntryFromFrame(frame);
+              if (entry !== null) {
+                appendLiveEntry(entry);
+              }
+            } else if (frame.type === "foreign_objective.observed") {
+              // The night-writer detector's ALERT TIER: one row per real
+              // alert (the backend fires exactly once per episode+reason).
+              const entry = foreignObjectiveEntryFromFrame(frame);
               if (entry !== null) {
                 appendLiveEntry(entry);
               }

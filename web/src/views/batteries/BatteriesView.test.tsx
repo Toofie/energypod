@@ -36,7 +36,7 @@
  *   reads defensively: a separate test pins the behaviour when the snapshot
  *   does not expose it at all.
  */
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Mock } from "vitest";
@@ -67,7 +67,11 @@ import {
   withEnergyToday,
   withHealth,
   withInhibit,
+  withObjective,
   withSnapshotIntent,
+  type WireLastObjective,
+  foreignObjectiveObserved,
+  lastObjectiveObserved,
   type WireEnergyToday,
   type WireSnapshot,
   type WireUnitDetail,
@@ -1901,5 +1905,161 @@ describe("BatteriesView — the energy scorecard's per-unit figures (DESIGN_ENER
     const summary = await screen.findByRole("tabpanel");
     expect(summary.textContent).toContain("Grid counter A: not available");
     expect(summary.textContent).toContain("Battery discharged: not available");
+  });
+});
+
+describe("BatteriesView — the night-writer detector's quiet per-unit line", () => {
+  /** A pushable stream: the opening burst, then test-pushed frames. */
+  function liveChannel(initial: readonly StreamEvent[]): {
+    stream: AsyncIterable<StreamEvent>;
+    push(frame: StreamEvent): void;
+  } {
+    const queue: StreamEvent[] = [...initial];
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    return {
+      stream: {
+        async *[Symbol.asyncIterator](): AsyncGenerator<StreamEvent, void, unknown> {
+          while (true) {
+            while (queue.length > 0) {
+              const next = queue.shift();
+              if (next !== undefined) {
+                yield next;
+              }
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        },
+      },
+      push: (frame) => {
+        queue.push(frame);
+        notify();
+      },
+    };
+  }
+
+  /** A snapshot whose MID carries the given observed-objective summary. */
+  function objectiveSnapshot(objective: WireLastObjective | null): WireSnapshot {
+    return {
+      ...HEALTHY_SNAPSHOT,
+      units: HEALTHY_SNAPSHOT.units.map((unit) =>
+        unit.unit_id === "MID" ? withObjective(unit, objective) : unit,
+      ),
+    };
+  }
+
+  it("renders the quiet line ONLY where the detector classified an external writer", async () => {
+    const state = objectiveSnapshot(
+      lastObjectiveObserved({
+        observed_at: "2026-08-23T23:40:00+10:00",
+        active_w: -2400,
+        reason: "sustained_charge_without_pv_evidence",
+      }),
+    );
+    renderView(healthyClient(state, fleetEvents(state)));
+    const midCard = await screen.findByRole("group", { name: "MID" });
+    expect(within(midCard).getByRole("note").textContent).toBe(
+      "Commanded by something else: -2,400 W at 23:40 (an external charge pattern — sustained charging while the site imported, with no solar surplus)",
+    );
+    // The other cards, whose units carry no summary, stay silent.
+    const rhsCard = await screen.findByRole("group", { name: "RHS" });
+    expect(within(rhsCard).queryByText(/Commanded by something else/)).toBeNull();
+  });
+
+  it.each([
+    [
+      "in-band pod autonomy (quiet evidence, never a card fact)",
+      lastObjectiveObserved({
+        observed_at: "2026-08-24T05:58:00+10:00",
+        active_w: -540,
+        classification: "pod_autonomy_objective_observed",
+        reason: null,
+      }),
+    ],
+    [
+      "the site's expected nightly charge (the KNOWN writer, quiet by the amendment)",
+      lastObjectiveObserved({
+        observed_at: "2026-08-24T05:58:00+10:00",
+        active_w: -2500,
+        classification: "expected_nightly_charge",
+        reason: null,
+      }),
+    ],
+    [
+      "our own handback grace (our lapsed command's residue)",
+      lastObjectiveObserved({
+        observed_at: "2026-08-23T14:02:00+10:00",
+        active_w: -900,
+        classification: "handback_grace",
+        reason: null,
+      }),
+    ],
+    [
+      "an unknown future classification word (not the backend's foreign assertion)",
+      lastObjectiveObserved({ classification: "future_word", active_w: -2400 }),
+    ],
+  ] as const)("never badges or lines the card for %s", async (_name, objective) => {
+    const state = objectiveSnapshot(objective);
+    renderView(healthyClient(state, fleetEvents(state)));
+    await screen.findByRole("group", { name: "MID" });
+    expect(screen.queryByText(/Commanded by something else/)).toBeNull();
+  });
+
+  it("renders nothing new when the snapshot carries no field at all (feature-absent)", async () => {
+    renderView(healthyClient(HEALTHY_SNAPSHOT, HEALTHY_EVENTS));
+    await screen.findByRole("group", { name: "MID" });
+    expect(screen.queryByText(/Commanded by something else/)).toBeNull();
+    expect(screen.queryByText(/Observed objective/)).toBeNull();
+  });
+
+  it("carries the recorded sample in the Summary tab — the one battery-facing place in-band autonomy is visible", async () => {
+    const state = objectiveSnapshot(
+      lastObjectiveObserved({
+        observed_at: "2026-08-24T05:58:00+10:00",
+        active_w: -540,
+        classification: "pod_autonomy_objective_observed",
+        reason: null,
+      }),
+    );
+    renderView(healthyClient(state, fleetEvents(state)));
+    await screen.findByRole("group", { name: "MID" });
+    await userEvent.click(screen.getByRole("button", { name: "MID" }));
+    // The row's label and figure render as separate nodes (the label is
+    // bolded); the assertion targets the row's own paragraph, whole.
+    const label = await screen.findByText("Observed objective:");
+    expect(label.closest("p")?.textContent).toBe(
+      "Observed objective: -540 W held by the pod's own self-charge at 05:58",
+    );
+  });
+
+  it("moves the quiet line the moment the alert-tier frame lands (no poll wait)", async () => {
+    const channel = liveChannel(fleetEvents(HEALTHY_SNAPSHOT));
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(HEALTHY_SNAPSHOT);
+    client.openEvents.mockReturnValue(channel.stream);
+    renderView(client);
+    await screen.findByRole("group", { name: "MID" });
+    expect(screen.queryByText(/Commanded by something else/)).toBeNull();
+    await act(async () => {
+      channel.push(
+        foreignObjectiveObserved(4200, {
+          unit_id: "MID",
+          observed_at: "2026-08-23T23:40:00+10:00",
+          active_w: -2400,
+          reason: "sustained_charge_without_pv_evidence",
+        }),
+      );
+    });
+    expect(
+      await screen.findByText(
+        "Commanded by something else: -2,400 W at 23:40 (an external charge pattern — sustained charging while the site imported, with no solar surplus)",
+      ),
+    ).toBeInTheDocument();
   });
 });

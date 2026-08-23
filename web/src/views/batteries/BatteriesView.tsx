@@ -73,6 +73,15 @@ import {
   type WattsByUnit,
 } from "../../app/fleet";
 import {
+  commandedBySomeoneElseText,
+  isForeignObjective,
+  objectiveFromForeignEvent,
+  observedObjectiveDetailText,
+  toForeignObjectiveEvent,
+  toUnitObjective,
+  type UnitObjective,
+} from "../../app/objectives";
+import {
   GRID_COUNTER_A_LABEL,
   GRID_COUNTER_B_LABEL,
   PV_READTHROUGH_NOTE,
@@ -168,6 +177,14 @@ interface ViewUnit {
    * card's health badge renders nothing at all).
    */
   health: UnitHealth | null;
+  /**
+   * The night-writer detector's per-unit summary (PENDING, feature-detected):
+   * the most recent recorded sample of the served objective; null when the
+   * snapshot carries none. The card's quiet line renders ONLY on the
+   * detector's foreign classification — in-band autonomy is evidence, not a
+   * card fact (the detail panel and the Objectives view carry it).
+   */
+  objective: UnitObjective | null;
 }
 
 /** The GET /api/v1/units/{id} projection, parsed just as defensively. */
@@ -652,6 +669,7 @@ function parseUnit(record: Record<string, unknown>): ViewUnit | null {
     telemetry: parseTelemetry(record.telemetry),
     inhibit,
     health: toUnitHealth(record),
+    objective: toUnitObjective(record.last_objective_observed),
   };
 }
 
@@ -828,6 +846,17 @@ function FleetCard({
         authorizedWatts={unit.authorized_power?.watts ?? null}
         measuredWatts={unit.measured_watts}
       />
+      {/* The night-writer detector's quiet line: ONLY where the detector
+          classified an external writer. A quiet note, never a badge and never
+          a banner — the operator reads the evidence (the pattern reason is
+          the detector's own, in plain words). In-band pod autonomy renders
+          NOTHING here by design: it is evidence for the Objectives view, not
+          a card fact. */}
+      {isForeignObjective(unit.objective) && (
+        <p role="note" className="objective-foreign">
+          {commandedBySomeoneElseText(unit.objective)}
+        </p>
+      )}
       <p>
         <b>Availability:</b> {availabilityWord(unit.lifecycle)}
       </p>
@@ -1043,6 +1072,15 @@ function SummaryPanel({
         <b>Communications:</b> last telemetry {ageText(unit.telemetry_age_s)}, quality{" "}
         {unit.quality}; last observation {observationText(observation)}
       </p>
+      {/* The night-writer detector's recorded sample — the DETAIL surface, the
+          one battery-facing place in-band autonomy is visible at all (it
+          never badges, never cards; the Objectives view carries the window).
+          Absent (no recorded sample) renders the honest nothing. */}
+      {unit.objective !== null && (
+        <p className="objective-detail">
+          <b>Observed objective:</b> {observedObjectiveDetailText(unit.objective)}
+        </p>
+      )}
       <p>
         <b>Recent trend:</b> no trend history is available from the API yet
       </p>
@@ -1770,6 +1808,25 @@ export function BatteriesView({
     );
   }, []);
 
+  /**
+   * The night-writer detector's alert frame (foreign_objective.observed): the
+   * unit's observed-objective summary moves NOW, state-locally, so the quiet
+   * line follows the alert — no refetch, no announcement (the periodic
+   * snapshot read carries the detector's own summary once composed).
+   */
+  const patchObjective = useCallback((unitId: string, objective: UnitObjective): void => {
+    setFleet((previous) =>
+      previous === null
+        ? previous
+        : {
+            ...previous,
+            units: previous.units.map((unit) =>
+              unit.unit_id === unitId ? { ...unit, objective } : unit,
+            ),
+          },
+    );
+  }, []);
+
   useEffect(() => {
     if (fleet === null || fleetReady) {
       return;
@@ -1959,6 +2016,15 @@ export function BatteriesView({
                   remediationHint: null,
                 });
               }
+            } else if (frame.type === "foreign_objective.observed") {
+              // The night-writer detector's ALERT TIER: the quiet line moves
+              // NOW from the frame (the event type is the detector's foreign
+              // assertion); quiet evidence never publishes — it reaches this
+              // view only through the snapshot's own summary.
+              const detection = toForeignObjectiveEvent(frame.payload);
+              if (detection !== null) {
+                patchObjective(detection.unitId, objectiveFromForeignEvent(detection));
+              }
             } else if (frame.type === "audit.appended") {
               // The Events tab is a LIVE surface: a durable fact the backend
               // just appended lands on the timeline now, not at the next
@@ -2002,7 +2068,7 @@ export function BatteriesView({
     return () => {
       cancelled = true;
     };
-  }, [applySnapshot, client, streamOn, consumeFigures, patchHealth]);
+  }, [applySnapshot, client, streamOn, consumeFigures, patchHealth, patchObjective]);
 
   const retrySnapshot = (): void => {
     setPhase("loading");

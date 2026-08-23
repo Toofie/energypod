@@ -616,3 +616,17 @@
   border-top: 1px dashed #d6d0c4;
   padding-top: 0.4rem;
 }
+
+/* The night-writer detector's quiet foreign-objective note on a unit entry:
+   ONLY where the detector classified an external writer — a caution, not an
+   alarm (the imbalance warning's amber family); in-band autonomy never
+   renders here. */
+.home-objective-foreign {
+  margin: 0.2rem 0 0;
+  border: 1px solid #b3892f;
+  border-radius: 0.5rem;
+  padding: 0.3rem 0.55rem;
+  background: #fdf8ee;
+  font-weight: 600;
+  font-size: 0.9rem;
+}

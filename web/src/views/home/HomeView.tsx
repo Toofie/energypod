@@ -90,6 +90,14 @@ import { UnitHealthTag } from "../../app/unitHealth";
 import { isPlaneSnapshot } from "../../app/SharedDataPlane";
 import { toEnergyToday, type EnergyToday } from "../../app/energy";
 import {
+  commandedBySomeoneElseText,
+  isForeignObjective,
+  objectiveFromForeignEvent,
+  toForeignObjectiveEvent,
+  toUnitObjective,
+  type UnitObjective,
+} from "../../app/objectives";
+import {
   applyWindowClosing,
   applyWindowOpened,
   localTimeOfInstant,
@@ -200,6 +208,14 @@ interface UnitView {
    * unit line's health badge renders nothing at all).
    */
   health: UnitHealth | null;
+  /**
+   * The night-writer detector's per-unit summary (PENDING, feature-detected):
+   * the most recent recorded sample of the served objective; null when the
+   * snapshot carries none. The unit line's quiet foreign-objective note
+   * renders ONLY on the detector's foreign classification — in-band autonomy
+   * never appears on Home (it is evidence, not a household fact).
+   */
+  objective: UnitObjective | null;
 }
 
 interface SnapshotView {
@@ -276,6 +292,7 @@ function readUnit(value: unknown): UnitView | null {
     measured_watts: typeof record.measured_watts === "number" ? record.measured_watts : null,
     telemetry: readTelemetrySoc(record.telemetry),
     health: toUnitHealth(record),
+    objective: toUnitObjective(record.last_objective_observed),
   };
 }
 
@@ -1089,6 +1106,31 @@ export function HomeView({ client }: HomeViewProps) {
         // exists so the quietness is explicit.
         return;
       }
+      if (frame.type === "foreign_objective.observed") {
+        // The night-writer detector's ALERT TIER (the backend's evidence
+        // class, not a console shout): the unit's observed-objective summary
+        // moves NOW, state-locally, so the quiet foreign-objective note
+        // follows the frame — no refetch, no announcement. Quiet evidence
+        // never publishes; it reaches Home only through the snapshot's own
+        // summary (and never renders here at all — in-band autonomy is not a
+        // household fact).
+        const detection = toForeignObjectiveEvent(frame.payload);
+        if (detection !== null) {
+          const objective = objectiveFromForeignEvent(detection);
+          setSnapshot((previous) => {
+            if (previous === null) {
+              return previous;
+            }
+            return {
+              ...previous,
+              units: previous.units.map((unit) =>
+                unit.unit_id === detection.unitId ? { ...unit, objective } : unit,
+              ),
+            };
+          });
+        }
+        return;
+      }
       if (frame.type === "schedule_window.opened") {
         // A scheduled window started (§6 W-C): the card swaps to "running"
         // NOW, from the frame alone — no poll. The window's intent rides the
@@ -1701,6 +1743,15 @@ function UnitPowerEntry({
         authorizedWatts={figures.authorizedWatts}
         measuredWatts={unit.measured_watts}
       />
+      {/* The night-writer detector's quiet line on the unit entry: ONLY where
+          the detector classified an external writer — a line beside the
+          figures, never a badge. In-band pod autonomy renders NOTHING on Home
+          by design; the Objectives view carries the evidence window. */}
+      {isForeignObjective(unit.objective) && (
+        <p role="note" className="home-objective-foreign">
+          {commandedBySomeoneElseText(unit.objective)}
+        </p>
+      )}
       <div className="home-figures">
         <div className="home-figure" role="figure" aria-label="Requested">
           <span className="home-figure-label">Requested</span>

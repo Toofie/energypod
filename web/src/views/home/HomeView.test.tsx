@@ -98,7 +98,10 @@ import {
   telemetrySummary,
   unitHealthChanged,
   unitUnexpectedAutonomy,
+  foreignObjectiveObserved,
+  lastObjectiveObserved,
   type WireAdviserState,
+  type WireLastObjective,
   type WireEnergyToday,
   type WireScheduleState,
   type WireTelemetrySummary,
@@ -147,6 +150,12 @@ interface UnitView {
   health_state?: string | null;
   health_reasons?: readonly string[] | null;
   remediation_hint?: string | null;
+  /**
+   * The night-writer detector's per-unit summary (wire.ts `withObjective`):
+   * absent from the older wire — the feature detection the unit line's quiet
+   * foreign-objective note keys on.
+   */
+  last_objective_observed?: WireLastObjective | null;
 }
 
 interface FleetView {
@@ -2908,5 +2917,97 @@ describe("HomeView — the energy scorecard's Today card", () => {
     });
     expect(snapshotCalls).toBeGreaterThanOrEqual(2);
     expect(screen.getByText(/a new day began — today's energy figures have restarted/i)).toBeVisible();
+  });
+});
+
+describe("HomeView — the night-writer detector's quiet unit-line note", () => {
+  /** A fleet whose pod-mid carries the given observed-objective summary. */
+  function fleetWithObjective(objective: WireLastObjective | null): FleetView {
+    return fleet([
+      { ...unit({ unit_id: "pod-mid", lifecycle: "disarmed" }), last_objective_observed: objective },
+      unit({ unit_id: "pod-rhs", lifecycle: "disarmed" }),
+    ]);
+  }
+
+  it("renders the quiet note ONLY where the detector classified an external writer", async () => {
+    installClient({ snapshot: fleetWithObjective(lastObjectiveObserved()) });
+    renderHome();
+    const mid = await findUnitEntry(POWER_REGION, "pod-mid");
+    expect(within(mid).getByRole("note").textContent).toBe(
+      "Commanded by something else: -2,400 W at 23:40 (an external charge pattern — sustained charging while the site imported, with no solar surplus)",
+    );
+    const rhs = await findUnitEntry(POWER_REGION, "pod-rhs");
+    expect(within(rhs).queryByText(/Commanded by something else/)).toBeNull();
+  });
+
+  it.each([
+    [
+      "in-band pod autonomy (evidence, not a household fact)",
+      lastObjectiveObserved({
+        observed_at: "2026-08-24T05:58:00+10:00",
+        active_w: -540,
+        classification: "pod_autonomy_objective_observed",
+        reason: null,
+      }),
+    ],
+    [
+      "the site's expected nightly charge (the KNOWN writer, quiet by the amendment)",
+      lastObjectiveObserved({
+        observed_at: "2026-08-24T05:58:00+10:00",
+        active_w: -2500,
+        classification: "expected_nightly_charge",
+        reason: null,
+      }),
+    ],
+    [
+      "our own handback grace",
+      lastObjectiveObserved({
+        observed_at: "2026-08-23T14:02:00+10:00",
+        active_w: -900,
+        classification: "handback_grace",
+        reason: null,
+      }),
+    ],
+    [
+      "an unknown future classification word",
+      lastObjectiveObserved({ classification: "future_word", active_w: -2400 }),
+    ],
+  ] as const)("renders NOTHING on Home for %s", async (_name, objective) => {
+    installClient({ snapshot: fleetWithObjective(objective) });
+    renderHome();
+    await findUnitEntry(POWER_REGION, "pod-mid");
+    expect(screen.queryByText(/Commanded by something else/)).toBeNull();
+  });
+
+  it("renders nothing new when the snapshot carries no field at all (feature-absent)", async () => {
+    installClient({ snapshot: fleet([unit({ unit_id: "pod-mid", lifecycle: "disarmed" })]) });
+    renderHome();
+    await findUnitEntry(POWER_REGION, "pod-mid");
+    expect(screen.queryByText(/Commanded by something else/)).toBeNull();
+  });
+
+  it("moves the quiet note the moment the alert-tier frame lands", async () => {
+    const channel = liveChannel([]);
+    installClient({
+      snapshot: fleet([unit({ unit_id: "pod-mid", lifecycle: "disarmed" })]),
+      openEvents: channel.openEvents,
+    });
+    renderHome();
+    await findUnitEntry(POWER_REGION, "pod-mid");
+    expect(screen.queryByText(/Commanded by something else/)).toBeNull();
+    const alert = foreignObjectiveObserved(50, { unit_id: "pod-mid" });
+    await act(async () => {
+      channel.push({
+        type: alert.type,
+        sequence: alert.sequence,
+        occurred_at: alert.occurred_at,
+        payload: alert.payload,
+      });
+    });
+    expect(
+      await screen.findByText(
+        "Commanded by something else: -2,400 W at 23:40 (an external charge pattern — sustained charging while the site imported, with no solar surplus)",
+      ),
+    ).toBeInTheDocument();
   });
 });

@@ -217,3 +217,25 @@ button:focus-visible {
   font-size: 0.85rem;
   color: #78716c;
 }
+
+/* --- the night-writer detector's quiet surfaces (API_CONTRACTS.md
+   "Night-writer detector") -------------------------------------------- */
+
+/* The quiet per-unit line: ONLY where the detector classified an external
+   writer. A caution, not an alarm — the same amber family as the imbalance
+   early-warning line: the operator reads the evidence, the console does not
+   shout it. In-band autonomy never earns this line. */
+.objective-foreign {
+  border: 1px solid #b3892f;
+  border-radius: 0.5rem;
+  padding: 0.35rem 0.6rem;
+  background: #fdf8ee;
+  font-weight: 600;
+}
+
+/* The summary tab's recorded-sample row: plain text, no weight — this is the
+   one battery-facing place in-band autonomy is visible at all. */
+.objective-detail {
+  font-variant-numeric: tabular-nums;
+  color: #57534e;
+}

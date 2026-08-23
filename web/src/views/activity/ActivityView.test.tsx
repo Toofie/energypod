@@ -75,6 +75,7 @@ import {
   auditAppended,
   auditEvent,
   auditPage,
+  foreignObjectiveObserved,
   observationPublished,
   resyncRequired,
   scheduleReplaced,
@@ -189,6 +190,7 @@ const makeClient = (): ApiClient => ({
   getUnitDetail: vi.fn(),
   getAudit: vi.fn(),
   getEnergyDays: vi.fn(),
+  getObservedObjectives: vi.fn(),
   postIntent: vi.fn(),
   postIntentCancel: vi.fn(),
   postArm: vi.fn(),
@@ -1327,5 +1329,132 @@ describe("Activity view — schedule events (quiet informational)", () => {
       expect(channel).toBeDefined();
     });
     expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+  });
+});
+
+describe("Activity view — the night-writer detector's alert tier", () => {
+  /** A controllable shared stream, as the quiet-tier suite builds one. */
+  function streamChannel(): {
+    openEvents: () => AsyncGenerator<Record<string, unknown>, void, unknown>;
+    push(frame: Record<string, unknown>): void;
+  } {
+    const queue: Record<string, unknown>[] = [];
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    return {
+      openEvents: () =>
+        (async function* channel(): AsyncGenerator<Record<string, unknown>, void, unknown> {
+          while (true) {
+            while (queue.length > 0) {
+              const next = queue.shift();
+              if (next !== undefined) {
+                yield next;
+                if (next.type === "resync_required") {
+                  return;
+                }
+              }
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        })(),
+      push: (frame) => {
+        queue.push(frame);
+        notify();
+      },
+    };
+  }
+
+  it("appends the alert entry with the figure and the pattern reason in plain words", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push(
+      foreignObjectiveObserved(93, {
+        unit_id: "mid",
+        observed_at: "2026-08-23T23:40:00+10:00",
+        active_w: -2400,
+        reason: "sustained_charge_without_pv_evidence",
+      }) as unknown as Record<string, unknown>,
+    );
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("Commanded by something else");
+    expect(items[0]!.textContent).toContain("mid");
+    expect(items[0]!.textContent).toContain(
+      "Another writer is commanding this battery: -2,400 W — an external charge pattern — sustained charging while the site imported, with no solar surplus",
+    );
+  });
+
+  it("keeps the entry under the Observations filter — recorded evidence, not a decision class", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push(
+      foreignObjectiveObserved(93, { unit_id: "mid", active_w: -2400 }) as unknown as Record<
+        string,
+        unknown
+      >,
+    );
+    await screen.findAllByRole("listitem");
+    await userEvent.click(screen.getByRole("button", { name: "Observations" }));
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    await userEvent.click(screen.getByRole("button", { name: "Decisions" }));
+    expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+  });
+
+  it("renders the durable audit fact of the same episode with the honest figureless line", async () => {
+    // The REST history path: the episode's audit row (event_type
+    // foreign_objective_observed) carries the audit summary, not the
+    // objective's words — it renders the alert headline without inventing a
+    // figure; the Objectives view carries the full evidence window.
+    client.getAudit = vi.fn().mockResolvedValue(
+      auditPage(
+        [
+          auditEvent({
+            sequence: 91,
+            event_type: "foreign_objective_observed",
+            unit_id: "mid",
+            result: "observed",
+            reason_codes: ["sustained_charge_without_pv_evidence"],
+          }),
+        ],
+        null,
+      ),
+    );
+    renderView();
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toContain("Commanded by something else");
+    expect(items[0]!.textContent).toContain("Another writer's objective was recorded");
+  });
+
+  it("ignores an unusable alert frame (no unit id) — nothing is invented", async () => {
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([], null));
+    const channel = streamChannel();
+    client.openEvents = vi.fn(channel.openEvents) as unknown as typeof client.openEvents;
+    renderView();
+    expect(await screen.findByText("Nothing here yet")).toBeVisible();
+
+    channel.push({
+      type: "foreign_objective.observed",
+      sequence: 93,
+      occurred_at: "2026-08-23T23:40:12Z",
+      payload: { active_w: -2400, reason: "outside_autonomy_band" },
+    });
+    await waitFor(() => {
+      expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+    });
   });
 });
