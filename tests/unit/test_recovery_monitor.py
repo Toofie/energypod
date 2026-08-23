@@ -1,0 +1,791 @@
+"""Contract tests for the self-healing awareness layer (recovery monitor).
+
+``energypod.application.recovery`` is the detection layer accepted from
+docs/POD_RECOVERY_RESEARCH.md ladder rung R4 plus the promoted P1 items vi
+(actuation-coherence watchdog) and iii (objective echo read-back): the fleet's
+batteries self-heal from command-state, communication, and estimation problems
+by design, so what the controller owes the operator is DETECTION -- of
+self-healing in progress (quiet, informational), of ambiguous anomalous
+behavior (evidence capture), and of self-healing FAILURE (the firmware-wedge
+class that historically required a physical power cycle).
+
+The monitor is passive by construction: it appends audit facts and publishes
+bus events, and it NEVER writes, latches, blocks, or refuses anything.  All
+health states are derived reads recomputed from the latest cycle facts; boot
+starts every unit ``healthy``-by-observation.
+
+The production module is imported lazily so this red-phase suite collects
+cleanly; every missing contract surfaces as an ordinary test failure.
+"""
+
+from __future__ import annotations
+
+import importlib
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+
+@dataclass
+class ManualClock:
+    now: float = 1000.0
+    wall: datetime = field(default_factory=lambda: datetime(2026, 8, 24, 6, 0, 0, tzinfo=UTC))
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def wall_now(self) -> datetime:
+        return self.wall
+
+
+class RecordingAudit:
+    def __init__(self) -> None:
+        self.appended: list[Any] = []
+        self.failing = False
+
+    async def append(self, event: Any) -> None:
+        if self.failing:
+            raise OSError("audit store unavailable")
+        self.appended.append(event)
+
+
+class RecordingBus:
+    def __init__(self) -> None:
+        self.published: list[dict[str, Any]] = []
+        self.failing = False
+
+    async def publish(self, body: dict[str, Any]) -> int:
+        if self.failing:
+            raise OSError("event bus unavailable")
+        self.published.append(dict(body))
+        return len(self.published)
+
+    def of_type(self, event_type: str) -> list[dict[str, Any]]:
+        return [body for body in self.published if body.get("type") == event_type]
+
+
+def observation(
+    *,
+    battery_watts: float | None = 0.0,
+    cell_imbalance_v: float | None = 0.020,
+    soc_pct: float | None = 99.0,
+    debug_mode_w: int | None = 0,
+    ctrl_mode_w: int | None = 1,
+    work_mode_w: int | None = 6,
+    run_mode_w: int | None = 3,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        battery_watts=battery_watts,
+        cell_imbalance_v=cell_imbalance_v,
+        authoritative_soc_pct=soc_pct,
+        debug_mode_w=debug_mode_w,
+        ctrl_mode_w=ctrl_mode_w,
+        work_mode_w=work_mode_w,
+        run_mode_w=run_mode_w,
+    )
+
+
+@pytest.fixture
+def api() -> Any:
+    try:
+        module = importlib.import_module("energypod.application.recovery")
+    except ImportError as error:
+        pytest.fail(f"the recovery monitor contract is not implemented: {error}", pytrace=False)
+    return module
+
+
+def monitor(
+    api: Any,
+    *,
+    units: tuple[str, ...] = ("mid",),
+    coherence_cycles: int = 4,
+    min_movement_w: int = 150,
+    band: tuple[int, int] = (-2600, 300),
+    unresponsive_attempts: int = 3,
+    autonomy_interval_s: float = 60.0,
+    clock: ManualClock | None = None,
+    audit: RecordingAudit | None = None,
+    bus: RecordingBus | None = None,
+) -> Any:
+    resolved_clock = clock if clock is not None else ManualClock()
+    return api.RecoveryMonitor(
+        unit_ids=frozenset(units),
+        settings=api.RecoverySettings(
+            actuation_coherence_cycles=coherence_cycles,
+            actuation_coherence_min_movement_w=min_movement_w,
+            expected_autonomy_band_w=band,
+            unresponsive_attempts=unresponsive_attempts,
+            unexpected_autonomy_min_interval_s=autonomy_interval_s,
+        ),
+        clock=resolved_clock,
+        audit=audit if audit is not None else RecordingAudit(),
+        bus=bus if bus is not None else RecordingBus(),
+        process_instance_id="recovery-test-process",
+        process_origin_mono=resolved_clock.now,
+        configuration_version=4,
+    )
+
+
+async def idle_cycle(
+    mon: Any,
+    unit: str = "mid",
+    *,
+    battery_watts: float | None = 0.0,
+    cell_imbalance_v: float | None = 0.020,
+    authorized_watts: int = 0,
+    authorized_direction: str | None = None,
+    claimed: bool = False,
+    lifecycle: str = "disarmed",
+    inhibit_latched: bool = False,
+    inhibit_reason: str | None = None,
+) -> Any:
+    """Drive one supervised cycle exactly as the runtime fleet loop does."""
+    return await mon.observe_cycle(
+        unit,
+        authorized_watts=authorized_watts,
+        authorized_direction=authorized_direction,
+        claimed=claimed,
+        lifecycle=lifecycle,
+        inhibit_latched=inhibit_latched,
+        inhibit_reason=inhibit_reason,
+        observation=observation(battery_watts=battery_watts, cell_imbalance_v=cell_imbalance_v),
+        now_mono=mon._clock.now,
+    )
+
+
+async def state_of(mon: Any, unit: str = "mid") -> Any:
+    states = await mon.unit_health_states()
+    return states[unit]
+
+
+# --- the coherence watchdog (P1 vi) --------------------------------------------
+
+
+async def test_authorized_but_still_cycles_trigger_exactly_once(api: Any) -> None:
+    """THE incident signature (2026-08-23 22:11Z silent actuation loss): the
+    kernel authorizes real watts, the measured battery power never leaves the
+    pre-command baseline.  After the configured streak of consecutive
+    still cycles the monitor raises ONE ``actuation_incoherent`` audit fact,
+    one ``actuation.incoherent`` bus event, and one control-readiness health
+    reason -- and never repeats while the episode persists."""
+    audit, bus = RecordingAudit(), RecordingBus()
+    clock = ManualClock()
+    mon = monitor(api, audit=audit, bus=bus, clock=clock)
+
+    # Pre-command baseline: the pod self-charges uncommanded at -637 W.
+    await idle_cycle(mon, battery_watts=-637.0, authorized_watts=0)
+
+    findings = None
+    triggered = False
+    for cycle in range(1, 6):
+        clock.now += 1.5
+        findings = await idle_cycle(
+            mon,
+            battery_watts=-637.0,  # the wedge: measured never moves
+            authorized_watts=1000,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+        triggered = triggered or findings.coherence_trigger
+        if cycle < 4:
+            assert findings.coherence_trigger is False, (
+                f"cycle {cycle} must not alarm before the configured streak"
+            )
+    assert triggered, "the configured streak of still cycles must alarm exactly once"
+
+    # One more still cycle: the alarm never repeats inside the episode.
+    clock.now += 1.5
+    again = await idle_cycle(
+        mon,
+        battery_watts=-637.0,
+        authorized_watts=1000,
+        authorized_direction="discharge",
+        claimed=True,
+        lifecycle="active",
+    )
+    assert again.coherence_trigger is False
+
+    incoherent = [e for e in audit.appended if e.event_type == "actuation_incoherent"]
+    assert len(incoherent) == 1, "exactly one audit fact per incoherent episode"
+    (event,) = incoherent
+    assert event.unit_id == "mid"
+    assert event.authorized_active_w == 1000
+    assert "authorized_not_actuating" in event.reason_codes
+    assert len(bus.of_type("actuation.incoherent")) == 1
+    payload = bus.of_type("actuation.incoherent")[0]["payload"]
+    assert payload["unit_id"] == "mid"
+    assert payload["authorized_watts"] == 1000
+    assert payload["measured_watts"] == -637.0
+
+    health = await state_of(mon)
+    assert health.state == api.HealthState.ACTUATION_INCOHERENT
+    assert "authorized_not_actuating" in health.reasons
+
+
+async def test_a_coherent_cycle_re_arms_the_alarm(api: Any) -> None:
+    """Throttle semantics: re-arm only after a coherent cycle or a control
+    state change.  Movement reaching the authorized figure closes the episode
+    and returns health to derived-from-observation; a LATER silent streak
+    alarms again."""
+    audit, bus = RecordingAudit(), RecordingBus()
+    clock = ManualClock()
+    mon = monitor(api, audit=audit, bus=bus, clock=clock)
+
+    await idle_cycle(mon, battery_watts=-637.0)
+    for _ in range(4):
+        clock.now += 1.5
+        await idle_cycle(
+            mon,
+            battery_watts=-637.0,
+            authorized_watts=1000,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+    assert len([e for e in audit.appended if e.event_type == "actuation_incoherent"]) == 1
+
+    # The pod starts actuating: measured reaches the commanded figure.
+    clock.now += 1.5
+    await idle_cycle(
+        mon,
+        battery_watts=+1120.0,
+        authorized_watts=1000,
+        authorized_direction="discharge",
+        claimed=True,
+        lifecycle="active",
+    )
+    health = await state_of(mon)
+    assert health.state is not api.HealthState.ACTUATION_INCOHERENT
+    assert health.state == api.HealthState.HEALTHY
+
+    # It wedges again: a fresh episode alarms exactly once more.
+    for _ in range(4):
+        clock.now += 1.5
+        await idle_cycle(
+            mon,
+            battery_watts=+1120.0,  # pinned at the new baseline, command lost
+            authorized_watts=1000,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+    assert len([e for e in audit.appended if e.event_type == "actuation_incoherent"]) == 2
+    assert len(bus.of_type("actuation.incoherent")) == 2
+
+
+async def test_authorization_ending_re_arms_without_an_alarm(api: Any) -> None:
+    """A control state change (the intent expiring, authority dropping to
+    zero) closes the episode silently: the uncommanded pod drifting back to
+    its self-charge baseline must never be read as a fresh defect."""
+    audit, bus = RecordingAudit(), RecordingBus()
+    clock = ManualClock()
+    mon = monitor(api, audit=audit, bus=bus, clock=clock)
+
+    await idle_cycle(mon, battery_watts=-637.0)
+    for _ in range(3):  # one cycle short of the streak
+        clock.now += 1.5
+        await idle_cycle(
+            mon, battery_watts=-637.0, authorized_watts=500, claimed=True, lifecycle="active"
+        )
+    # The intent expires: the pod returns to autonomy, no authority anywhere.
+    clock.now += 1.5
+    await idle_cycle(mon, battery_watts=-637.0, authorized_watts=0)
+    for _ in range(4):
+        clock.now += 1.5
+        await idle_cycle(mon, battery_watts=-690.0, authorized_watts=0)
+    assert [e for e in audit.appended if e.event_type == "actuation_incoherent"] == []
+    health = await state_of(mon)
+    assert health.state == api.HealthState.SELF_HEALING  # in-band self-charge
+
+
+async def test_tiny_setpoints_never_false_trigger(api: Any) -> None:
+    """The absolute movement floor keeps tiny setpoints out of court: a 100 W
+    command on a healthy pod moves ~100 W -- below the 150 W floor, so the
+    cycle is inconclusive and never accumulates toward an alarm; the same
+    tiny command on a dead-silent pod still alarms (movement ~0 is below the
+    proportional band too)."""
+    audit = RecordingAudit()
+    clock = ManualClock()
+    mon = monitor(api, audit=audit, clock=clock)
+
+    await idle_cycle(mon, battery_watts=-637.0)
+    for cycle in range(1, 7):
+        clock.now += 1.5
+        findings = await idle_cycle(
+            mon,
+            battery_watts=-537.0,  # the pod delivers its ~100 W command
+            authorized_watts=100,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+        assert findings.coherence_trigger is False, f"healthy tiny setpoint alarmed at {cycle}"
+    assert [e for e in audit.appended if e.event_type == "actuation_incoherent"] == []
+    assert (await state_of(mon)).state == api.HealthState.HEALTHY
+
+    silent = monitor(api, audit=audit, clock=clock)
+    await idle_cycle(silent, battery_watts=-637.0)
+    triggered = False
+    for _ in range(4):
+        clock.now += 1.5
+        findings = await idle_cycle(
+            silent,
+            battery_watts=-637.0,  # nothing moves at all
+            authorized_watts=100,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+        triggered = triggered or findings.coherence_trigger
+    assert triggered, "a fully silent pod must alarm even under a tiny setpoint"
+
+
+async def test_partial_movement_stays_inconclusive_not_alarmed(api: Any) -> None:
+    """Between the proportional band and the absolute floor the monitor
+    refuses to conclude: a 2000 W authorization moving 300 W is neither
+    confident actuation nor confident stillness, so no alarm fires (the
+    watchdog is for the silent-loss wedge class, not partial delivery --
+    mid legitimately delivers 75-87% of charge commands under solar
+    self-charge offset)."""
+    audit = RecordingAudit()
+    clock = ManualClock()
+    mon = monitor(api, audit=audit, clock=clock)
+
+    await idle_cycle(mon, battery_watts=0.0)
+    for _ in range(8):
+        clock.now += 1.5
+        await idle_cycle(
+            mon,
+            battery_watts=300.0,
+            authorized_watts=2000,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+    assert [e for e in audit.appended if e.event_type == "actuation_incoherent"] == []
+
+
+# --- the objective echo read-back (P1 iii) -------------------------------------
+
+
+async def test_the_echo_classification_rides_the_episode_evidence(api: Any) -> None:
+    """On the coherence trigger the caller performs one bounded fresh read of
+    the served objective and hands the classification back; the monitor
+    records it, audits it as an ``objective_echo`` fact carrying the read
+    value, and includes it on the health reasons and the bus payload."""
+    audit, bus = RecordingAudit(), RecordingBus()
+    clock = ManualClock()
+    mon = monitor(api, audit=audit, bus=bus, clock=clock)
+
+    await idle_cycle(mon, battery_watts=-637.0)
+    for _ in range(4):
+        clock.now += 1.5
+        await idle_cycle(
+            mon,
+            battery_watts=-637.0,
+            authorized_watts=250,
+            authorized_direction="charge",
+            claimed=True,
+            lifecycle="active",
+        )
+    await mon.record_incoherence_echo(
+        "mid", classification=api.ECHO_MATCHES_WRITE, served_active_w=-250, served_reactive_var=0
+    )
+
+    echoes = [e for e in audit.appended if e.event_type == "objective_echo"]
+    assert len(echoes) == 1
+    (echo,) = echoes
+    assert echo.unit_id == "mid"
+    assert echo.reason_codes == (api.ECHO_MATCHES_WRITE,)
+    assert echo.authorized_active_w == -250  # charge signs negative on the audit trail
+
+    health = await state_of(mon)
+    assert api.ECHO_MATCHES_WRITE in health.reasons
+    payload = bus.of_type("actuation.incoherent")[-1]["payload"]
+    assert payload["echo_classification"] == api.ECHO_MATCHES_WRITE
+    assert payload["served_active_w"] == -250
+
+
+async def test_the_unreadable_echo_is_honest_evidence(api: Any) -> None:
+    """A failing echo read is itself classification: ``echo_unreadable``
+    records that the discriminator could not run, never guesses."""
+    audit = RecordingAudit()
+    mon = monitor(api, audit=audit, clock=ManualClock())
+    await idle_cycle(mon, battery_watts=-637.0)
+    for _ in range(4):
+        await idle_cycle(
+            mon,
+            battery_watts=-637.0,
+            authorized_watts=800,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+    await mon.record_incoherence_echo(
+        "mid", classification=api.ECHO_UNREADABLE, served_active_w=None, served_reactive_var=None
+    )
+    (echo,) = [e for e in audit.appended if e.event_type == "objective_echo"]
+    assert echo.reason_codes == (api.ECHO_UNREADABLE,)
+    assert (await state_of(mon)).remediation_hint is None, (
+        "an unreadable echo is not pod-side proof; no terminal guidance"
+    )
+
+
+# --- the unresponsiveness classifier (R4) ---------------------------------------
+
+
+async def test_read_timeouts_reach_not_responding_with_terminal_guidance(api: Any) -> None:
+    """The firmware-wedge signature: the gateway path is fine (no connect
+    failures) but reads time out for K consecutive attempts.  The unit
+    derives ``not_responding`` and the R5 honest-terminal remediation hint --
+    remote recovery is exhausted (R1 resync already retries by construction),
+    a physical restart is required."""
+    bus = RecordingBus()
+    mon = monitor(api, bus=bus, clock=ManualClock())
+
+    for attempt in range(1, 4):
+        mon.record_read_outcome("mid", api.READ_FAILED)
+        await idle_cycle(mon, battery_watts=None)
+        states = await mon.unit_health_states()
+        if attempt < 3:
+            assert states["mid"].state != api.HealthState.NOT_RESPONDING
+    states = await mon.unit_health_states()
+    assert states["mid"].state == api.HealthState.NOT_RESPONDING
+    assert states["mid"].remediation_hint is not None
+    assert "physical restart" in states["mid"].remediation_hint
+
+    # A healthy read clears the streak and the state.
+    mon.record_read_outcome("mid", api.READ_OK)
+    await idle_cycle(mon, battery_watts=-637.0)
+    assert (await state_of(mon)).state == api.HealthState.SELF_HEALING
+
+
+async def test_connect_failures_derive_unreachable(api: Any) -> None:
+    """TCP connect failure is the gateway class, not the pod-wedge class:
+    the unit derives ``unreachable`` (and it outranks read timeouts), with
+    no physical-restart guidance -- the pod behind the gateway may be fine."""
+    mon = monitor(api, clock=ManualClock())
+    for _ in range(3):
+        mon.record_read_outcome("mid", api.READ_FAILED)
+    mon.record_read_outcome("mid", api.CONNECT_FAILED)
+    await idle_cycle(mon, battery_watts=None)
+    health = await state_of(mon)
+    assert health.state == api.HealthState.UNREACHABLE
+    assert health.remediation_hint is None
+
+
+async def test_foreign_writer_and_inhibited_derive_from_the_existing_latch(api: Any) -> None:
+    """The existing arm-preflight latch is the source of truth: a latched
+    ``external_writer`` inhibit derives ``foreign_writer``; any other inhibit
+    derives ``inhibited``.  Nothing new latches here."""
+    mon = monitor(api, clock=ManualClock())
+    await idle_cycle(
+        mon, battery_watts=-637.0, inhibit_latched=True, inhibit_reason="external_writer"
+    )
+    assert (await state_of(mon)).state == api.HealthState.FOREIGN_WRITER
+
+    await idle_cycle(
+        mon, battery_watts=-637.0, lifecycle="inhibited", inhibit_reason="write_failed"
+    )
+    assert (await state_of(mon)).state == api.HealthState.INHIBITED
+    assert "write_failed" in (await state_of(mon)).reasons
+
+
+async def test_self_healing_is_quiet_and_informational(api: Any) -> None:
+    """Every trusted self-recovery pattern derives ``self_healing`` with a
+    name: requalification after an inhibit, top-of-charge cell balancing, and
+    in-band autonomy self-charge.  Each is evidence-only -- no audit fact, no
+    alarm-tier event, and health stays informational."""
+    bus = RecordingBus()
+    audit = RecordingAudit()
+    mon = monitor(api, bus=bus, audit=audit, clock=ManualClock())
+
+    # Requalifying after an inhibit (the actor collects stable samples again).
+    await idle_cycle(
+        mon, battery_watts=-637.0, lifecycle="observe_only", inhibit_reason="write_failed"
+    )
+    health = await state_of(mon)
+    assert health.state == api.HealthState.SELF_HEALING
+    assert "requalifying_after_inhibit" in health.reasons
+
+    # Cell balancing: the operator's 50 mV early-warning line.
+    await idle_cycle(mon, battery_watts=0.0, cell_imbalance_v=0.054)
+    health = await state_of(mon)
+    assert health.state == api.HealthState.SELF_HEALING
+    assert "cell_balancing" in health.reasons
+
+    # Autonomy-band self-charge: uncommanded, in the commissioned band.
+    await idle_cycle(mon, battery_watts=-2270.0, cell_imbalance_v=0.020)
+    health = await state_of(mon)
+    assert health.state == api.HealthState.SELF_HEALING
+    assert "autonomous_self_charge" in health.reasons
+
+    # Quiet: informational states never emit detection events.
+    assert bus.of_type("actuation.incoherent") == []
+    assert [e for e in audit.appended if e.event_type == "unexpected_autonomy"] == []
+
+
+async def test_classification_precedence_is_pinned(api: Any) -> None:
+    """unreachable > not_responding > foreign_writer > inhibited >
+    actuation_incoherent > self_healing > healthy."""
+    mon = monitor(api, clock=ManualClock())
+    await idle_cycle(mon, battery_watts=-637.0, lifecycle="observe_only", inhibit_reason="x")
+    assert (await state_of(mon)).state == api.HealthState.SELF_HEALING
+
+    # An active wedge while requalifying: the wedge outranks self-healing.
+    for _ in range(4):
+        await idle_cycle(
+            mon,
+            battery_watts=-637.0,
+            authorized_watts=900,
+            claimed=True,
+            lifecycle="active",
+        )
+    assert (await state_of(mon)).state == api.HealthState.ACTUATION_INCOHERENT
+
+    # An inhibit outranks the wedge verdict.
+    await idle_cycle(
+        mon,
+        battery_watts=-637.0,
+        authorized_watts=900,
+        claimed=True,
+        lifecycle="inhibited",
+        inhibit_reason="write_failed",
+    )
+    assert (await state_of(mon)).state == api.HealthState.INHIBITED
+
+    # The external-writer latch outranks every other inhibit.
+    await idle_cycle(
+        mon,
+        battery_watts=-637.0,
+        authorized_watts=900,
+        claimed=True,
+        lifecycle="inhibited",
+        inhibit_latched=True,
+        inhibit_reason="external_writer",
+    )
+    assert (await state_of(mon)).state == api.HealthState.FOREIGN_WRITER
+
+    # Unresponsiveness outranks the latch, and unreachability outranks it all.
+    for _ in range(3):
+        mon.record_read_outcome("mid", api.READ_FAILED)
+    await idle_cycle(
+        mon, battery_watts=None, inhibit_latched=True, inhibit_reason="external_writer"
+    )
+    assert (await state_of(mon)).state == api.HealthState.NOT_RESPONDING
+    mon.record_read_outcome("mid", api.CONNECT_FAILED)
+    await idle_cycle(mon, battery_watts=None)
+    assert (await state_of(mon)).state == api.HealthState.UNREACHABLE
+
+
+async def test_transitions_publish_unit_health_changed(api: Any) -> None:
+    """Every health-state transition publishes exactly one ``unit.health_changed``
+    bus event naming the unit, the from/to states, and the reasons; staying in
+    a state publishes nothing."""
+    bus = RecordingBus()
+    mon = monitor(api, bus=bus, units=("mid", "rhs"), clock=ManualClock())
+    await idle_cycle(mon, battery_watts=-637.0)
+    # Boot is healthy-by-observation; in-band self-charge is the first change.
+    transitions = bus.of_type("unit.health_changed")
+    assert len(transitions) == 1
+    assert transitions[0]["payload"] == {
+        "unit_id": "mid",
+        "from": "healthy",
+        "to": "self_healing",
+        "reasons": ["autonomous_self_charge"],
+    }
+
+    # Another cycle in the same state: silence.
+    await idle_cycle(mon, battery_watts=-640.0)
+    assert len(bus.of_type("unit.health_changed")) == 1
+
+    # The sibling unit never moved: it still published its boot observation.
+    states = await mon.unit_health_states()
+    assert states["rhs"].state == api.HealthState.HEALTHY
+
+
+# --- the unexpected-autonomy evidence recorder (mid's ±1.2 kW mystery) ----------
+
+
+async def test_out_of_band_uncommanded_power_is_timestamped_evidence(api: Any) -> None:
+    """Measured battery power outside the commissioned autonomy band while no
+    intent claims the unit appends one ``unexpected_autonomy`` audit fact
+    carrying the measured watts, SOC, and mode words -- and at most one per
+    unit per 60 s.  Pure evidence: no block, no alarm-tier event, health stays
+    healthy/self_healing."""
+    audit, bus = RecordingAudit(), RecordingBus()
+    clock = ManualClock()
+    mon = monitor(api, audit=audit, bus=bus, clock=clock)
+
+    # mid's standing unexplained oscillation: +1200 W discharging, unclaimed.
+    await idle_cycle(mon, battery_watts=1200.0)
+    events = [e for e in audit.appended if e.event_type == "unexpected_autonomy"]
+    assert len(events) == 1
+    (event,) = events
+    assert event.unit_id == "mid"
+    assert event.authorized_active_w == 0
+    assert "outside_expected_autonomy_band" in event.reason_codes
+
+    # Throttled: the next cycles inside the window record nothing more.
+    for _ in range(5):
+        clock.now += 1.5
+        await idle_cycle(mon, battery_watts=1180.0)
+    assert len([e for e in audit.appended if e.event_type == "unexpected_autonomy"]) == 1
+
+    # Beyond the window, still out of band: exactly one more.
+    clock.now += 61.0
+    await idle_cycle(mon, battery_watts=-3100.0)
+    assert len([e for e in audit.appended if e.event_type == "unexpected_autonomy"]) == 2
+
+    # The bus carries the full figures for diagnosis, quiet-tier.
+    payload = bus.of_type("unit.unexpected_autonomy")[0]["payload"]
+    assert payload == {
+        "unit_id": "mid",
+        "measured_watts": 1200.0,
+        "soc_pct": 99.0,
+        "debug_mode_w": 0,
+        "ctrl_mode_w": 1,
+        "work_mode_w": 6,
+        "run_mode_w": 3,
+    }
+
+    # And the state stays informational.
+    assert (await state_of(mon)).state == api.HealthState.HEALTHY
+
+
+async def test_expected_autonomy_and_claimed_units_never_record(api: Any) -> None:
+    """In-band self-charge records nothing (that is the pod being healthy),
+    and a claimed unit's measured power is commanded, not autonomous."""
+    audit = RecordingAudit()
+    mon = monitor(api, audit=audit, clock=ManualClock())
+
+    await idle_cycle(mon, battery_watts=-2270.0)  # deep in-band self-charge
+    await idle_cycle(mon, battery_watts=290.0)  # small positive float, in band
+    await idle_cycle(
+        mon,
+        battery_watts=1200.0,
+        claimed=True,
+        authorized_watts=1000,
+        authorized_direction="discharge",
+        lifecycle="active",
+    )
+    assert [e for e in audit.appended if e.event_type == "unexpected_autonomy"] == []
+
+
+# --- the honest terminal guidance (R5 rail) -------------------------------------
+
+
+async def test_pod_side_wedge_carries_the_physical_restart_hint(api: Any) -> None:
+    """Echo-matches-our-write while incoherent: the transport and the write
+    path are proven fine, so the defect is pod-side and remote recovery is
+    exhausted -- the R5 physical-restart guidance with the vendor-app
+    checklist reference appears on the health view."""
+    mon = monitor(api, clock=ManualClock())
+    await idle_cycle(mon, battery_watts=-637.0)
+    for _ in range(4):
+        await idle_cycle(
+            mon, battery_watts=-637.0, authorized_watts=1000, claimed=True, lifecycle="active"
+        )
+    assert (await state_of(mon)).remediation_hint is None, (
+        "before the echo discriminates, no terminal claim is made"
+    )
+    await mon.record_incoherence_echo(
+        "mid", classification=api.ECHO_MATCHES_WRITE, served_active_w=1000, served_reactive_var=0
+    )
+    hint = (await state_of(mon)).remediation_hint
+    assert hint is not None and "physical restart" in hint
+    assert "MiniES" in hint  # the vendor-app checklist reference
+
+
+async def test_objective_not_served_points_at_the_mode_checklist(api: Any) -> None:
+    """Echo-zero-while-authorized: the objective is not being served at all,
+    the mode/autonomy conflict class -- the hint names the vendor-app mode
+    checklist, not a physical restart."""
+    mon = monitor(api, clock=ManualClock())
+    await idle_cycle(mon, battery_watts=-637.0)
+    for _ in range(4):
+        await idle_cycle(
+            mon, battery_watts=-637.0, authorized_watts=1000, claimed=True, lifecycle="active"
+        )
+    await mon.record_incoherence_echo(
+        "mid",
+        classification=api.ECHO_OBJECTIVE_NOT_SERVED,
+        served_active_w=0,
+        served_reactive_var=0,
+    )
+    hint = (await state_of(mon)).remediation_hint
+    assert hint is not None
+    assert "Normal Mode" in hint and "Remote" in hint
+    assert "physical restart" not in hint
+
+
+async def test_a_resurfaced_foreign_writer_needs_no_restart_guidance(api: Any) -> None:
+    """Echo-nonzero-but-not-ours: the existing external_writer semantics own
+    the remediation (find the other writer); the monitor contributes no
+    terminal hint."""
+    mon = monitor(api, clock=ManualClock())
+    await idle_cycle(mon, battery_watts=-637.0)
+    for _ in range(4):
+        await idle_cycle(
+            mon, battery_watts=-637.0, authorized_watts=1000, claimed=True, lifecycle="active"
+        )
+    await mon.record_incoherence_echo(
+        "mid", classification=api.ECHO_EXTERNAL_WRITER, served_active_w=-900, served_reactive_var=0
+    )
+    assert (await state_of(mon)).remediation_hint is None
+
+
+# --- passivity and failure honesty ----------------------------------------------
+
+
+async def test_detection_failures_never_propagate(api: Any) -> None:
+    """Observability must never gate control: a failing audit store or bus is
+    suppressed on every detection path, and the derived state still moves."""
+    audit, bus = RecordingAudit(), RecordingBus()
+    audit.failing = bus.failing = True
+    mon = monitor(api, audit=audit, bus=bus, clock=ManualClock())
+
+    await idle_cycle(mon, battery_watts=1200.0)  # evidence recorder, stores down
+    await idle_cycle(mon, battery_watts=-637.0)
+    for _ in range(4):
+        await idle_cycle(
+            mon, battery_watts=-637.0, authorized_watts=900, claimed=True, lifecycle="active"
+        )
+    await mon.record_incoherence_echo(
+        "mid", classification=api.ECHO_MATCHES_WRITE, served_active_w=900, served_reactive_var=0
+    )
+    assert (await state_of(mon)).state == api.HealthState.ACTUATION_INCOHERENT
+
+
+async def test_settings_and_units_are_validated(api: Any) -> None:
+    with pytest.raises(ValueError, match="actuation_coherence_cycles"):
+        api.RecoverySettings(actuation_coherence_cycles=0)
+    with pytest.raises(ValueError, match="actuation_coherence_min_movement_w"):
+        api.RecoverySettings(actuation_coherence_min_movement_w=0)
+    with pytest.raises(ValueError, match="unresponsive_attempts"):
+        api.RecoverySettings(unresponsive_attempts=0)
+    with pytest.raises(ValueError, match="unexpected_autonomy_min_interval_s"):
+        api.RecoverySettings(unexpected_autonomy_min_interval_s=0)
+    with pytest.raises(ValueError, match="expected_autonomy_band_w"):
+        api.RecoverySettings(expected_autonomy_band_w=(300, -2600))
+    with pytest.raises(ValueError, match="unit_ids"):
+        monitor(api, units=())
+    unknown = monitor(api)
+    with pytest.raises(LookupError):
+        await unknown.observe_cycle(
+            "ghost",
+            authorized_watts=0,
+            authorized_direction=None,
+            claimed=False,
+            lifecycle="disarmed",
+            inhibit_latched=False,
+            inhibit_reason=None,
+            observation=observation(),
+            now_mono=1000.0,
+        )
+    with pytest.raises(LookupError):
+        unknown.record_read_outcome("ghost", api.READ_OK)
