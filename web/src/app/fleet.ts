@@ -353,6 +353,204 @@ export function patchAdviserState(
   return toAdviserState(payload, current);
 }
 
+// --- per-unit recovery health (the self-healing awareness layer, R4) ----------
+
+/**
+ * The derived recovery vocabulary the backend serves per unit
+ * (energypod.application.recovery `HealthState`, lowercase StrEnum values on
+ * the wire). Classification precedence is the backend's own; the console only
+ * renders it.
+ */
+export type HealthState =
+  | "healthy"
+  | "self_healing"
+  | "actuation_incoherent"
+  | "not_responding"
+  | "unreachable"
+  | "foreign_writer"
+  | "inhibited";
+
+/** The wire vocabulary, as a runtime checklist (an unknown state is dropped). */
+export const HEALTH_STATES: readonly HealthState[] = [
+  "healthy",
+  "self_healing",
+  "actuation_incoherent",
+  "not_responding",
+  "unreachable",
+  "foreign_writer",
+  "inhibited",
+];
+
+/**
+ * One unit's derived recovery view (API_CONTRACTS.md "Self-healing awareness
+ * layer (recovery detection)"): the state, its reason codes, and the honest
+ * terminal remediation hint — non-null ONLY where remote recovery is
+ * genuinely exhausted. A null `UnitHealth` (not a "healthy" one) means the
+ * field was absent or unusable: the feature is not speaking, and every
+ * health-derived surface renders nothing.
+ */
+export interface UnitHealth {
+  state: HealthState;
+  /** The backend's own reason codes (`health_reasons`); empty when none. */
+  reasons: string[];
+  /**
+   * Rendered VERBATIM where non-null — the wedge-class honest terminal, never
+   * re-worded or truncated by the console.
+   */
+  remediationHint: string | null;
+}
+
+function toHealthReasons(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((code): code is string => typeof code === "string" && code !== "");
+}
+
+/**
+ * Narrow one snapshot unit's health fields. Null when `health_state` is
+ * absent, null, or outside the vocabulary — the feature-absent answer (no
+ * monitor wired, or its projection failed): no state is ever fabricated, and
+ * null never means "healthy".
+ */
+export function toUnitHealth(raw: unknown): UnitHealth | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const state = raw.health_state;
+  if (
+    typeof state !== "string" ||
+    !(HEALTH_STATES as readonly string[]).includes(state)
+  ) {
+    return null;
+  }
+  return {
+    state: state as HealthState,
+    reasons: toHealthReasons(raw.health_reasons),
+    remediationHint:
+      typeof raw.remediation_hint === "string" && raw.remediation_hint !== ""
+        ? raw.remediation_hint
+        : null,
+  };
+}
+
+/**
+ * Apply one event-derived health patch onto a unit's current health. The bus
+ * transitions carry the state and reasons but NOT the remediation hint (that
+ * is the snapshot projection's own field), so a patch for the SAME state
+ * keeps the hint the snapshot delivered while a state change resets it — an
+ * event never erases the honest terminal guidance the wire already gave.
+ */
+export function applyHealthPatch(current: UnitHealth | null, patch: UnitHealth): UnitHealth {
+  return {
+    state: patch.state,
+    reasons: patch.reasons,
+    remediationHint:
+      current !== null && current.state === patch.state ? current.remediationHint : patch.remediationHint,
+  };
+}
+
+/**
+ * The `unit.health_changed` payload (recovery.py `observe_cycle`):
+ * `{unit_id, from, to, reasons}` — published exactly once per transition.
+ * Null when unusable; `to` must be in the vocabulary (an unknown state is
+ * never rendered).
+ */
+export function toHealthChangedEvent(
+  payload: unknown,
+): { unitId: string; from: string; to: HealthState; reasons: string[] } | null {
+  if (!isRecord(payload) || typeof payload.unit_id !== "string" || payload.unit_id === "") {
+    return null;
+  }
+  const to = payload.to;
+  if (typeof to !== "string" || !(HEALTH_STATES as readonly string[]).includes(to)) {
+    return null;
+  }
+  return {
+    unitId: payload.unit_id,
+    from: typeof payload.from === "string" ? payload.from : "",
+    to: to as HealthState,
+    reasons: toHealthReasons(payload.reasons),
+  };
+}
+
+/**
+ * The `actuation.incoherent` payload (recovery.py `_incoherent_payload`, plus
+ * the echo follow-up's discriminator fields). The episode's opening frame
+ * carries the figures; ONE follow-up frame of the same type carries
+ * `echo_classification` / `served_active_w` / `served_reactive_var` once the
+ * objective echo read-back classifies — every figure nullable on the wire,
+ * never zero-filled here.
+ */
+export interface ActuationIncoherentEvent {
+  unitId: string;
+  cycles: number | null;
+  authorizedWatts: number | null;
+  authorizedDirection: string | null;
+  measuredWatts: number | null;
+  baselineWatts: number | null;
+  movementWatts: number | null;
+  echoClassification: string | null;
+  servedActiveW: number | null;
+  servedReactiveVar: number | null;
+}
+
+function optionalFinite(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+export function toActuationIncoherentEvent(payload: unknown): ActuationIncoherentEvent | null {
+  if (!isRecord(payload) || typeof payload.unit_id !== "string" || payload.unit_id === "") {
+    return null;
+  }
+  return {
+    unitId: payload.unit_id,
+    cycles: optionalFinite(payload.cycles),
+    authorizedWatts: optionalFinite(payload.authorized_watts),
+    authorizedDirection: typeof payload.authorized_direction === "string" ? payload.authorized_direction : null,
+    measuredWatts: optionalFinite(payload.measured_watts),
+    baselineWatts: optionalFinite(payload.baseline_watts),
+    movementWatts: optionalFinite(payload.movement_watts),
+    echoClassification:
+      typeof payload.echo_classification === "string" && payload.echo_classification !== ""
+        ? payload.echo_classification
+        : null,
+    servedActiveW: optionalFinite(payload.served_active_w),
+    servedReactiveVar: optionalFinite(payload.served_reactive_var),
+  };
+}
+
+/**
+ * The `unit.unexpected_autonomy` payload (recovery.py
+ * `_record_unexpected_autonomy`) — QUIET-TIER EVIDENCE, not an alarm: the
+ * figures the backend pins per out-of-band uncommanded observation. Every
+ * figure nullable; nothing is ever derived beyond what the wire carries.
+ */
+export interface UnexpectedAutonomyEvent {
+  unitId: string;
+  measuredWatts: number | null;
+  socPct: number | null;
+  debugModeW: number | null;
+  ctrlModeW: number | null;
+  workModeW: number | null;
+  runModeW: number | null;
+}
+
+export function toUnexpectedAutonomyEvent(payload: unknown): UnexpectedAutonomyEvent | null {
+  if (!isRecord(payload) || typeof payload.unit_id !== "string" || payload.unit_id === "") {
+    return null;
+  }
+  return {
+    unitId: payload.unit_id,
+    measuredWatts: optionalFinite(payload.measured_watts),
+    socPct: optionalFinite(payload.soc_pct),
+    debugModeW: optionalFinite(payload.debug_mode_w),
+    ctrlModeW: optionalFinite(payload.ctrl_mode_w),
+    workModeW: optionalFinite(payload.work_mode_w),
+    runModeW: optionalFinite(payload.run_mode_w),
+  };
+}
+
 /**
  * The per-unit grid-tie row the Home tile and the Batteries figures share, in
  * the design contract's own wording ("mid: grid +620 W export · load 340 W"):
@@ -390,6 +588,14 @@ export interface UnitModel {
    */
   inhibitLatched: boolean | null;
   inhibitCause: string | null;
+  /**
+   * The unit's derived recovery health when the self-healing awareness layer
+   * speaks (snapshot `health_state` in the vocabulary); null when the fields
+   * are absent or unusable — the feature detection. Null never means
+   * "healthy": a healthy unit carries `state: "healthy"` and renders nothing
+   * by design.
+   */
+  health: UnitHealth | null;
 }
 
 /**
@@ -440,6 +646,31 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Apply one unit's health patch to a whole snapshot (a state-local transition
+ * from a bus frame — never a refetch). Unknown unit ids change nothing; the
+ * merge rule is `applyHealthPatch` (a same-state patch keeps the snapshot's
+ * remediation hint, a state change resets it).
+ */
+export function patchUnitHealth(
+  snapshot: FleetSnapshot | null,
+  unitId: string,
+  patch: UnitHealth,
+): FleetSnapshot | null {
+  if (snapshot === null) {
+    return null;
+  }
+  let changed = false;
+  const units = snapshot.units.map((unit) => {
+    if (unit.unitId !== unitId) {
+      return unit;
+    }
+    changed = true;
+    return { ...unit, health: applyHealthPatch(unit.health, patch) };
+  });
+  return changed ? { ...snapshot, units } : snapshot;
+}
+
 function toLifecycle(value: unknown): Lifecycle {
   // An unrecognized lifecycle is never presented optimistically: a unit whose
   // state we cannot name is treated as having no contact.
@@ -475,6 +706,7 @@ function toUnit(raw: unknown): UnitModel | null {
     measuredWatts: typeof raw.measured_watts === "number" ? raw.measured_watts : null,
     inhibitLatched: typeof raw.inhibit_latched === "boolean" ? raw.inhibit_latched : null,
     inhibitCause: typeof raw.inhibit_cause === "string" ? raw.inhibit_cause : null,
+    health: toUnitHealth(raw),
   };
 }
 

@@ -54,6 +54,15 @@ export interface UnitSnapshot {
   requested_power: PowerFlow;
   authorized_power: PowerFlow | null;
   measured_watts: number | null;
+  /**
+   * The self-healing awareness layer's derived per-unit fields
+   * (API_CONTRACTS.md "Self-healing awareness layer (recovery detection)"):
+   * nulls when no monitor is wired or its projection fails. Absent on the
+   * older wire — the feature detection the shell keys on.
+   */
+  health_state?: string | null;
+  health_reasons?: string[] | null;
+  remediation_hint?: string | null;
 }
 
 export interface Snapshot {
@@ -104,12 +113,26 @@ export interface UnitDetail {
   quality: Record<string, string> | null;
 }
 
+/** One per-unit recovery row in the health view's `units` block (the
+ * awareness layer's derived state; `reasons` — not `health_reasons` — is the
+ * key inside this block). */
+export interface HealthUnit {
+  unit_id: string;
+  health_state: string | null;
+  reasons: string[] | null;
+  remediation_hint: string | null;
+}
+
 /** Wire shape from the facade: liveness, dependency readiness, and control
- * readiness are three separate facts, each with its own reason list. */
+ * readiness are three separate facts, each with its own reason list. The
+ * optional `units` block is the awareness layer's per-unit recovery view;
+ * absent while the layer is not composed (the console's render source for
+ * unit health remains the snapshot fields plus the bus transitions). */
 export interface Health {
   liveness: { ok: boolean };
   service_readiness: { ready: boolean; reasons: string[] };
   control_readiness: { ready: boolean; reasons: string[] };
+  units?: HealthUnit[];
 }
 
 export interface AuditEvent {

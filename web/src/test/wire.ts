@@ -90,6 +90,18 @@ export const EMERGENCY_STOP_ACKNOWLEDGED = "emergency_stop.acknowledged" as cons
 export const INHIBIT_ACKNOWLEDGED = "inhibit.acknowledged" as const;
 
 /**
+ * The self-healing awareness layer's bus vocabulary (2026-08-24,
+ * energypod.application.recovery): one `unit.health_changed` per state
+ * transition, one `actuation.incoherent` per watchdog episode (plus one
+ * echo-classified follow-up frame of the same type), and the QUIET-TIER
+ * `unit.unexpected_autonomy` evidence payload — never an alarm vocabulary
+ * entry.
+ */
+export const UNIT_HEALTH_CHANGED = "unit.health_changed" as const;
+export const ACTUATION_INCOHERENT = "actuation.incoherent" as const;
+export const UNIT_UNEXPECTED_AUTONOMY = "unit.unexpected_autonomy" as const;
+
+/**
  * The excess-solar adviser's state announcement (DESIGN_EXCESS_ACTIVATION.md
  * §2): published only when the semantic state tuple changes, plus a 30 s
  * `"heartbeat": true` republish while enabled. PENDING-BACKEND — the backend
@@ -112,6 +124,9 @@ export const PUBLISHED_EVENT_TYPES: readonly string[] = [
   EMERGENCY_STOP_LATCHED,
   EMERGENCY_STOP_ACKNOWLEDGED,
   INHIBIT_ACKNOWLEDGED,
+  UNIT_HEALTH_CHANGED,
+  ACTUATION_INCOHERENT,
+  UNIT_UNEXPECTED_AUTONOMY,
 ];
 
 // Stream frames the REST relay builds itself (rest.py); only `snapshot` and
@@ -613,6 +628,149 @@ export function excessAdviserStateChanged(
   );
 }
 
+/**
+ * The derived recovery vocabulary the monitor serves (recovery.py
+ * `HealthState`, lowercase StrEnum values) — the only `health_state` values
+ * the wire ever carries.
+ */
+export const HEALTH_STATE_VALUES: readonly string[] = [
+  "healthy",
+  "self_healing",
+  "actuation_incoherent",
+  "not_responding",
+  "unreachable",
+  "foreign_writer",
+  "inhibited",
+];
+
+/** The self-healing reason codes the classifier derives (recovery.py). */
+export const HEALTH_REASON_CODES: readonly string[] = [
+  "gateway_unreachable",
+  "reads_timing_out",
+  "external_writer_latched",
+  "inhibited",
+  "authorized_not_actuating",
+  "requalifying_after_inhibit",
+  "cell_balancing",
+  "autonomous_self_charge",
+];
+
+/** The objective-echo classifications (recovery.py; `external_writer` rides
+ * the existing latch vocabulary as its classification). */
+export const ECHO_CLASSIFICATIONS: readonly string[] = [
+  "echo_matches_write",
+  "external_writer",
+  "objective_not_served",
+  "echo_unreadable",
+];
+
+/**
+ * One `unit.health_changed` frame exactly as the monitor publishes it on a
+ * derived-state transition (recovery.py `observe_cycle`):
+ * `{unit_id, from, to, reasons}` — the console's live transition source.
+ */
+export function unitHealthChanged(
+  sequence: number,
+  transition: {
+    unit_id?: string;
+    from?: string;
+    to: string;
+    reasons?: readonly string[];
+  },
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<{ unit_id: string; from: string; to: string; reasons: string[] }> {
+  return frame(
+    UNIT_HEALTH_CHANGED,
+    sequence,
+    {
+      unit_id: transition.unit_id ?? "mid",
+      from: transition.from ?? "healthy",
+      to: transition.to,
+      reasons: [...(transition.reasons ?? [])],
+    },
+    occurredAt,
+  );
+}
+
+/**
+ * One `actuation.incoherent` frame (recovery.py `_incoherent_payload`). The
+ * episode's opening frame carries the watchdog figures; passing `echo`
+ * produces the follow-up frame the objective echo read-back publishes once it
+ * classifies — same type, plus the discriminator fields. The payload's
+ * figures are nullable on the wire (no usable measurement yet); explicit
+ * nulls are preserved.
+ */
+export function actuationIncoherent(
+  sequence: number,
+  detection: {
+    unit_id?: string;
+    cycles?: number | null;
+    authorized_watts?: number | null;
+    authorized_direction?: string | null;
+    measured_watts?: number | null;
+    baseline_watts?: number | null;
+    movement_watts?: number | null;
+    echo?: {
+      classification: string;
+      served_active_w?: number | null;
+      served_reactive_var?: number | null;
+    };
+  } = {},
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<Record<string, unknown>> {
+  const payload: Record<string, unknown> = {
+    unit_id: detection.unit_id ?? "mid",
+    cycles: detection.cycles === undefined ? 4 : detection.cycles,
+    authorized_watts:
+      detection.authorized_watts === undefined ? 1000 : detection.authorized_watts,
+    authorized_direction: detection.authorized_direction === undefined ? "discharge" : detection.authorized_direction,
+    measured_watts: detection.measured_watts === undefined ? 12 : detection.measured_watts,
+    baseline_watts: detection.baseline_watts === undefined ? 8 : detection.baseline_watts,
+    movement_watts: detection.movement_watts === undefined ? 4 : detection.movement_watts,
+  };
+  if (detection.echo !== undefined) {
+    payload.echo_classification = detection.echo.classification;
+    payload.served_active_w = detection.echo.served_active_w ?? 1000;
+    payload.served_reactive_var = detection.echo.served_reactive_var ?? 0;
+  }
+  return frame(ACTUATION_INCOHERENT, sequence, payload, occurredAt);
+}
+
+/**
+ * One `unit.unexpected_autonomy` frame (recovery.py
+ * `_record_unexpected_autonomy`): the quiet-tier evidence payload — the
+ * measured watts and the mode words, throttled to one per unit per 60 s.
+ * Every figure nullable on the wire.
+ */
+export function unitUnexpectedAutonomy(
+  sequence: number,
+  evidence: {
+    unit_id?: string;
+    measured_watts?: number | null;
+    soc_pct?: number | null;
+    debug_mode_w?: number | null;
+    ctrl_mode_w?: number | null;
+    work_mode_w?: number | null;
+    run_mode_w?: number | null;
+  } = {},
+  occurredAt: string = DEFAULT_OCCURRED_AT,
+): EventFrame<Record<string, unknown>> {
+  return frame(
+    UNIT_UNEXPECTED_AUTONOMY,
+    sequence,
+    {
+      unit_id: evidence.unit_id ?? "mid",
+      measured_watts: evidence.measured_watts === undefined ? 1411.2 : evidence.measured_watts,
+      soc_pct: evidence.soc_pct === undefined ? 10 : evidence.soc_pct,
+      debug_mode_w: evidence.debug_mode_w === undefined ? null : evidence.debug_mode_w,
+      ctrl_mode_w: evidence.ctrl_mode_w === undefined ? 1 : evidence.ctrl_mode_w,
+      work_mode_w: evidence.work_mode_w === undefined ? 7 : evidence.work_mode_w,
+      run_mode_w: evidence.run_mode_w === undefined ? 0 : evidence.run_mode_w,
+    },
+    occurredAt,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Stream frames the REST relay builds (rest.py)
 // ---------------------------------------------------------------------------
@@ -690,6 +848,18 @@ export interface WireUnitSnapshot {
    */
   readonly inhibit_latched?: boolean;
   readonly inhibit_cause?: string | null;
+  /**
+   * The self-healing awareness layer's derived per-unit fields (2026-08-24,
+   * service.py `_health_projection`): `health_state` (the vocabulary above),
+   * `health_reasons`, and `remediation_hint` — non-null only where remote
+   * recovery is genuinely exhausted. The keys are ALWAYS emitted once the
+   * recovery port is composed, with nulls when the projection is absent;
+   * before that composition (and in the older snapshots) the keys are absent
+   * entirely — the feature detection. Attach with `withHealth`.
+   */
+  readonly health_state?: string | null;
+  readonly health_reasons?: readonly string[] | null;
+  readonly remediation_hint?: string | null;
 }
 
 /** The documented latch exposure: cause class, latched flag, reason code. */
@@ -727,6 +897,29 @@ export function withInhibit(
       latched: inhibit.latched ?? true,
       reason_code: inhibit.reason_code ?? null,
     },
+  };
+}
+
+/**
+ * Attach the recovery-health fields to a snapshot unit, exactly as the
+ * composed facade projects them: the state, its reasons, and the remediation
+ * hint (null unless the wedge class is proven). Explicit nulls are preserved;
+ * an omitted state defaults to the nulls the facade emits for an absent
+ * projection (the feature-present, state-absent answer).
+ */
+export function withHealth(
+  unit: WireUnitSnapshot,
+  health: {
+    state?: string | null;
+    reasons?: readonly string[] | null;
+    remediation_hint?: string | null;
+  } = {},
+): WireUnitSnapshot {
+  return {
+    ...unit,
+    health_state: health.state === undefined ? null : health.state,
+    health_reasons: health.reasons === undefined ? null : [...(health.reasons ?? [])],
+    remediation_hint: health.remediation_hint === undefined ? null : health.remediation_hint,
   };
 }
 
@@ -1255,11 +1448,27 @@ export function emptyUnitDetail(unitId: string): WireUnitDetail {
   };
 }
 
-/** The health envelope exactly as the facade serializes it (three facts). */
+/**
+ * One per-unit recovery row in the health view's `units` block
+ * (service.py `health`, composed with the recovery port): the derived state,
+ * its reasons (`reasons`, not `health_reasons`, inside this block), and the
+ * remediation hint.
+ */
+export interface WireHealthUnit {
+  readonly unit_id: string;
+  readonly health_state: string | null;
+  readonly reasons: readonly string[] | null;
+  readonly remediation_hint: string | null;
+}
+
+/** The health envelope exactly as the facade serializes it (three facts,
+ * plus the awareness layer's per-unit recovery block when composed). */
 export function health(
   spec: {
     service_readiness?: { ready?: boolean; reasons?: string[] };
     control_readiness?: { ready?: boolean; reasons?: string[] };
+    /** The recovery block; omit it entirely for a not-composed facade. */
+    units?: readonly WireHealthUnit[];
   } = {},
 ): Health {
   const service = spec.service_readiness ?? {};
@@ -1274,7 +1483,8 @@ export function health(
       ready: control.ready ?? false,
       reasons: control.reasons ?? ["no_unit_armed"],
     },
-  };
+    ...(spec.units === undefined ? {} : { units: [...spec.units] }),
+  } as unknown as Health;
 }
 
 // ---------------------------------------------------------------------------
