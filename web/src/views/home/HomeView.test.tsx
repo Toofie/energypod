@@ -77,7 +77,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
 import type { ApiClient } from "../../api/client";
 import { ADVISER_REASON_CODES } from "../../app/fleet";
-import { adviserState, telemetrySummary, type WireAdviserState, type WireTelemetrySummary } from "../../test/wire";
+import {
+  adviserState,
+  excessChargingToggleOk,
+  telemetrySummary,
+  type WireAdviserState,
+  type WireTelemetrySummary,
+} from "../../test/wire";
 import { HomeView, HEALTH_POLL_MS } from "./HomeView";
 
 vi.mock("../../api/client", async (importOriginal) => {
@@ -255,6 +261,7 @@ interface ClientSetup {
   getSnapshot?: () => Promise<FleetView>;
   getHealth?: () => Promise<HealthReport>;
   openEvents?: StreamFactory;
+  postExcessCharging?: ApiClient["postExcessCharging"];
 }
 
 /** Builds the mocked client; the cast only bridges this suite's local wire types. */
@@ -270,6 +277,10 @@ function installClient(setup: ClientSetup = {}): ApiClient {
     postEmergencyStop: vi.fn(() => Promise.reject(new Error("not used by HomeView"))),
     postStopAcknowledgement: vi.fn(() => Promise.reject(new Error("not used by HomeView"))),
     postInhibitAcknowledgement: vi.fn(() => Promise.reject(new Error("not used by HomeView"))),
+    postExcessCharging: vi.fn(
+      setup.postExcessCharging ??
+        (() => Promise.reject(new Error("not used by HomeView"))),
+    ),
     openEvents: vi.fn(setup.openEvents ?? liveStream(snapshot)),
   };
   const typedClient = client as unknown as ApiClient;
@@ -1860,5 +1871,314 @@ describe("HomeView — the solar-surplus tile", () => {
     const status = within(region).getByText(/Export reading unavailable/);
     expect(status).toHaveTextContent(/Export figure: not available\./);
     expect(status.textContent ?? "").not.toMatch(/0 W/);
+  });
+});
+
+// --- the excess-charging toggle (§3's guarded confirmation) -------------------
+//
+// The tile's footer is the feature's front door: the current state and its
+// origin (the honest "until restart" marker), a switch that never flips
+// directly — it opens the typed-confirmation dialog — and the FIRST enable's
+// one-time net-billing acknowledgement (the exact assertion, a required
+// checkbox, sent as "economics": "NET_BILLED", never asked again). Refusals
+// render their envelopes inline; the 200's adviser_state is adopted
+// optimistically. Disable asks for the EXCESS confirmation only.
+
+function refuse(
+  status: number,
+  code: string,
+  message: string,
+  details: Record<string, unknown> | null = null,
+): ApiClientError {
+  return new ApiClientError({ status, code, message, details, request_id: "req-excess-1" });
+}
+
+describe("HomeView — the excess-charging toggle", () => {
+  it.each([
+    [{ enabled: true, enabled_origin: "config" } as Partial<WireAdviserState>, "On (config)"],
+    [{ enabled: true, enabled_origin: "runtime" } as Partial<WireAdviserState>, "On — until restart"],
+    [{ enabled: false, enabled_origin: "config" } as Partial<WireAdviserState>, "Off (config)"],
+    [{ enabled: false, enabled_origin: "runtime" } as Partial<WireAdviserState>, "Off — until restart"],
+  ])("shows the current state and origin ($enabled_origin, enabled $enabled)", async (fixture, expected) => {
+    installClient({
+      snapshot: { ...fleet([unit({ unit_id: "pod-mid" })]), adviser_state: adviserState(fixture) },
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SOLAR_REGION });
+    expect(region).toHaveTextContent(`Excess charging: ${expected}`);
+    // The runtime origin is the honest transience marker: a restart re-reads
+    // the commissioned config, and the console says so.
+    if (fixture.enabled_origin === "runtime") {
+      expect(region).toHaveTextContent(/the config's own setting takes over at restart/);
+    }
+  });
+
+  it("first enable: EXCESS and the net-billing acknowledgement are both required, and the acknowledgement is sent", async () => {
+    const user = userEvent.setup();
+    // The trial's boot state: composed but suspended, never acknowledged.
+    const offUnacked = adviserState({
+      enabled: false,
+      enabled_origin: "config",
+      acknowledged_economics: false,
+      active: false,
+      hysteresis_state: "inactive",
+      commanded_charge_w: 0,
+      held_intent_id: null,
+      reason_codes: ["economics_acknowledgement_required"],
+    });
+    const enabledByToggle = adviserState({
+      enabled: true,
+      enabled_origin: "runtime",
+      acknowledged_economics: true,
+    });
+    const postExcessCharging = vi.fn(() => Promise.resolve(excessChargingToggleOk(enabledByToggle)));
+    installClient({
+      snapshot: { ...fleet(solarUnits()), adviser_state: offUnacked },
+      postExcessCharging,
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SOLAR_REGION });
+
+    // The switch opens the dialog; it never flips directly.
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn on charging from solar surplus/i });
+    // The exact assertion is stated, with its required checkbox (the label
+    // carries the assertion verbatim).
+    expect(within(dialog).getByText(/One-time confirmation — the net-billing assumption/i)).toBeVisible();
+    expect(within(dialog).getByLabelText(/This site's billing nets across phases/i)).not.toBeChecked();
+    const confirm = within(dialog).getByRole("button", { name: "Turn on" });
+    expect(confirm).toBeDisabled();
+
+    // EXCESS alone is not enough while the acknowledgement is unchecked.
+    await user.type(within(dialog).getByLabelText(/Type EXCESS/i), "EXCESS");
+    expect(confirm).toBeDisabled();
+    await user.click(within(dialog).getByRole("checkbox"));
+    expect(confirm).toBeEnabled();
+
+    await user.click(confirm);
+    // The acknowledgement rides the first enable ever (P3) — and only it.
+    await waitFor(() => {
+      expect(postExcessCharging).toHaveBeenCalledWith("enable", { economics: "NET_BILLED" });
+    });
+
+    // The 200's adviser_state is adopted optimistically: the dialog closes and
+    // the tile speaks the post-toggle state (origin runtime = until restart).
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(region).toHaveTextContent("Excess charging: On — until restart");
+    expect(screen.getByRole("switch")).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("the acknowledgement is captured once: a later enable never asks again and never re-sends economics", async () => {
+    const user = userEvent.setup();
+    // Disabled at runtime, but the site HAS captured the net-billing fact.
+    const offAcked = adviserState({
+      enabled: false,
+      enabled_origin: "runtime",
+      acknowledged_economics: true,
+      active: false,
+      hysteresis_state: "inactive",
+      commanded_charge_w: 0,
+      held_intent_id: null,
+      reason_codes: ["no_export_headroom"],
+      fleet_export_w: 900,
+    });
+    const postExcessCharging = vi.fn(() =>
+      Promise.resolve(excessChargingToggleOk(adviserState({ enabled: true, enabled_origin: "runtime" }))),
+    );
+    installClient({
+      snapshot: { ...fleet(solarUnits()), adviser_state: offAcked },
+      postExcessCharging,
+    });
+    renderHome();
+    await screen.findByRole("region", { name: SOLAR_REGION });
+
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn on charging from solar surplus/i });
+    // No acknowledgement step the second time — captured once, never re-prompted.
+    expect(within(dialog).queryByRole("checkbox")).toBeNull();
+    const confirm = within(dialog).getByRole("button", { name: "Turn on" });
+    expect(confirm).toBeDisabled();
+    await user.type(within(dialog).getByLabelText(/Type EXCESS/i), "EXCESS");
+    expect(confirm).toBeEnabled();
+    await user.click(confirm);
+    await waitFor(() => {
+      // No economics key: the site's captured fact already satisfies P3.
+      expect(postExcessCharging).toHaveBeenCalledWith("enable", {});
+    });
+  });
+
+  it("disable asks only for the typed EXCESS confirmation", async () => {
+    const user = userEvent.setup();
+    const onByConfig = adviserState({ enabled: true, enabled_origin: "config" });
+    const offByToggle = adviserState({
+      enabled: false,
+      enabled_origin: "runtime",
+      acknowledged_economics: true,
+      active: false,
+      hysteresis_state: "inactive",
+      commanded_charge_w: 0,
+      held_intent_id: null,
+      reason_codes: ["no_export_headroom"],
+      fleet_export_w: 700,
+    });
+    const postExcessCharging = vi.fn(() => Promise.resolve(excessChargingToggleOk(offByToggle)));
+    installClient({
+      snapshot: { ...fleet(solarUnits()), adviser_state: onByConfig },
+      postExcessCharging,
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SOLAR_REGION });
+    expect(region).toHaveTextContent("Excess charging: On (config)");
+
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn off charging from solar surplus/i });
+    // Stopping is the safety-positive direction: no acknowledgement step.
+    expect(within(dialog).queryByRole("checkbox")).toBeNull();
+    const confirm = within(dialog).getByRole("button", { name: "Turn off" });
+    expect(confirm).toBeDisabled();
+    await user.type(within(dialog).getByLabelText(/Type EXCESS/i), "EXCESS");
+    expect(confirm).toBeEnabled();
+    await user.click(confirm);
+    await waitFor(() => {
+      expect(postExcessCharging).toHaveBeenCalledWith("disable", {});
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(region).toHaveTextContent("Excess charging: Off — until restart");
+    expect(screen.getByRole("switch")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("renders the not-commissioned refusal inline and keeps the dialog open", async () => {
+    const user = userEvent.setup();
+    const postExcessCharging = vi.fn(() =>
+      Promise.reject(
+        refuse(
+          409,
+          "excess_charging_not_commissioned",
+          "The excess_charging block is not composed on this deployment",
+        ),
+      ),
+    );
+    installClient({
+      snapshot: {
+        ...fleet(solarUnits()),
+        adviser_state: adviserState({
+          enabled: true,
+          acknowledged_economics: true,
+          active: false,
+          reason_codes: ["no_export_headroom"],
+        }),
+      },
+      postExcessCharging,
+    });
+    renderHome();
+    await screen.findByRole("region", { name: SOLAR_REGION });
+
+    // A deployment whose block vanished between snapshot and toggle: the
+    // refusal names the honest state — nothing to turn off there either.
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn off/i });
+    await user.type(within(dialog).getByLabelText(/Type EXCESS/i), "EXCESS");
+    await user.click(within(dialog).getByRole("button", { name: "Turn off" }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveTextContent(/not commissioned in this deployment's config/);
+    expect(alert).toHaveTextContent(/excess_charging_not_commissioned/);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("routes the economics-required refusal into the acknowledgement step", async () => {
+    const user = userEvent.setup();
+    // The console's state says the fact is captured, but the site's durable
+    // record says otherwise (a restart, another console): the refusal IS the
+    // routing — the acknowledgement step appears inside the same dialog.
+    const postExcessCharging = vi.fn(() =>
+      Promise.reject(
+        refuse(
+          409,
+          "economics_acknowledgement_required",
+          "The net-billing acknowledgement must be captured before the first enable",
+          { acknowledgement: "NET_BILLED" },
+        ),
+      ),
+    );
+    installClient({
+      snapshot: {
+        ...fleet(solarUnits()),
+        adviser_state: adviserState({
+          enabled: false,
+          acknowledged_economics: true,
+          active: false,
+          reason_codes: ["no_export_headroom"],
+        }),
+      },
+      postExcessCharging,
+    });
+    renderHome();
+    await screen.findByRole("region", { name: SOLAR_REGION });
+
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn on/i });
+    // The stale local flag showed no acknowledgement step…
+    expect(within(dialog).queryByRole("checkbox")).toBeNull();
+    await user.type(within(dialog).getByLabelText(/Type EXCESS/i), "EXCESS");
+    await user.click(within(dialog).getByRole("button", { name: "Turn on" }));
+
+    // …the refusal brings it in, with its plain sentence.
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveTextContent(/net-billing confirmation is required before the first enable/);
+    expect(within(dialog).getByRole("checkbox")).toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      holding: "a unit active under another intent",
+      details: { reasons: ["unit_active_under_intent"], unit_ids: ["pod-mid"], stop_ids: [] },
+      sentence: /Cannot enable while a request is still active on pod-mid — finish or cancel the request on pod-mid first\./,
+    },
+    {
+      holding: "a latched stop",
+      details: { reasons: ["latched_stop_holds"], unit_ids: [], stop_ids: ["stop-7"] },
+      sentence: /Cannot enable while an emergency stop holds the fleet \(stop-7\) — acknowledge the stop first\./,
+    },
+  ])("names what holds a refused enable: $holding", async ({ details, sentence }) => {
+    const user = userEvent.setup();
+    const postExcessCharging = vi.fn(() =>
+      Promise.reject(
+        refuse(
+          409,
+          "excess_enable_refused",
+          "The fleet is not in a state where excess charging can start",
+          details,
+        ),
+      ),
+    );
+    installClient({
+      snapshot: {
+        ...fleet(solarUnits()),
+        adviser_state: adviserState({
+          enabled: false,
+          acknowledged_economics: true,
+          active: false,
+          reason_codes: ["no_export_headroom"],
+        }),
+      },
+      postExcessCharging,
+    });
+    renderHome();
+    await screen.findByRole("region", { name: SOLAR_REGION });
+
+    await user.click(screen.getByRole("switch"));
+    const dialog = screen.getByRole("dialog", { name: /Turn on/i });
+    await user.type(within(dialog).getByLabelText(/Type EXCESS/i), "EXCESS");
+    await user.click(within(dialog).getByRole("button", { name: "Turn on" }));
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert).toHaveTextContent(sentence);
+    expect(alert).toHaveTextContent(/excess_enable_refused/);
+    // The refused enable leaves the toggle exactly where it was.
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
 });

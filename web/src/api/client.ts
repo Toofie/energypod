@@ -205,6 +205,20 @@ export interface ApiClient {
     unitId: string,
     idempotencyKey?: string,
   ): Promise<Record<string, unknown>>;
+  /**
+   * The excess-solar activation toggle (POST /api/v1/excess-charging,
+   * DESIGN_EXCESS_ACTIVATION.md §3): `{action, confirmation: "EXCESS"}` — the
+   * typed confirmation is required for BOTH actions — plus
+   * `"economics": "NET_BILLED"` on the first enable ever (the net-billing
+   * acknowledgement, captured once). The 200 carries the post-toggle
+   * `adviser_state` for optimistic adoption; refusals reject with the
+   * envelope (409 excess_charging_not_commissioned /
+   * economics_acknowledgement_required / excess_enable_refused).
+   */
+  postExcessCharging(
+    action: "enable" | "disable",
+    options?: { economics?: "NET_BILLED"; idempotencyKey?: string },
+  ): Promise<Record<string, unknown>>;
   openEvents(afterSequence?: number): AsyncIterable<StreamEvent>;
 }
 
@@ -501,6 +515,19 @@ export function createApiClient(token: string): ApiClient {
           idempotencyKey: withKey(idempotencyKey),
         },
       ),
+    postExcessCharging: (action, options = {}) => {
+      const body: Record<string, unknown> = { action, confirmation: "EXCESS" };
+      if (options.economics !== undefined) {
+        // Consulted only on the first enable ever; the client sends it exactly
+        // when the operator confirmed the net-billing acknowledgement.
+        body.economics = options.economics;
+      }
+      return request<Record<string, unknown>>("/api/v1/excess-charging", {
+        method: "POST",
+        body,
+        idempotencyKey: withKey(options.idempotencyKey),
+      });
+    },
     openEvents: (afterSequence?: number) =>
       streamEvents(eventsUrl(afterSequence), fetchEventsTicket),
   };

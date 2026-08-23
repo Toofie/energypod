@@ -333,6 +333,7 @@ export function sharedClient(plane: SharedDataPlane, real: ApiClient): ApiClient
       real.postStopAcknowledgement(stopId, idempotencyKey),
     postInhibitAcknowledgement: (unitId, idempotencyKey) =>
       real.postInhibitAcknowledgement(unitId, idempotencyKey),
+    postExcessCharging: (action, options) => real.postExcessCharging(action, options),
     openEvents: () => plane.subscribe(),
   };
 }

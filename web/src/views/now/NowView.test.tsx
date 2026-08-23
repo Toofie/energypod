@@ -60,6 +60,7 @@ const api = vi.hoisted(() => {
     postEmergencyStop: vi.fn(),
     postStopAcknowledgement: vi.fn(),
     postInhibitAcknowledgement: vi.fn(),
+    postExcessCharging: vi.fn(),
     openEvents: vi.fn(),
   };
   return { createApiClient: vi.fn(), client };

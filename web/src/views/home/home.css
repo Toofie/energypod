@@ -267,6 +267,123 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* The guarded toggle (the tile's footer): current state + origin, and the
+   switch that opens the typed-confirmation dialog — never a direct flip. */
+.home-solar-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.8rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid #e7e2d6;
+}
+
+.home-solar-toggle-state {
+  margin: 0;
+  color: #57534e;
+}
+
+.home-solar-switch {
+  font: inherit;
+  padding: 0.3rem 0.9rem;
+  border: 1px solid #b8b2a7;
+  border-radius: 999px;
+  background: #fffefb;
+  color: #57534e;
+  cursor: pointer;
+}
+
+.home-solar-switch.is-on {
+  border-color: #9ae6b4;
+  background: #f0fff4;
+  color: #276749;
+}
+
+/* The typed-confirmation dialog (arm / emergency-stop pattern). */
+.home-solar-dialog {
+  margin-top: 0.8rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid #d6d3d1;
+  border-radius: 0.7rem;
+  background: #fffdf9;
+}
+
+.home-solar-dialog h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  color: #3f3a30;
+}
+
+.home-solar-dialog p {
+  margin: 0 0 0.5rem;
+  color: #57534e;
+}
+
+.home-solar-ack {
+  padding: 0.6rem 0.75rem;
+  border-left: 3px solid #d69e2e;
+  background: #fdf6e9;
+  border-radius: 0 0.4rem 0.4rem 0;
+}
+
+.home-solar-ack p {
+  margin: 0 0 0.4rem;
+}
+
+.home-solar-ack-check {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.home-solar-ack-check p,
+.home-solar-ack-check {
+  margin-bottom: 0;
+}
+
+.home-solar-typed {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.home-solar-typed input {
+  font: inherit;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid #b8b2a7;
+  border-radius: 0.4rem;
+  max-width: 14rem;
+}
+
+.home-solar-refusal {
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid #9b2c2c;
+  background: #fdf0ef;
+  border-radius: 0 0.4rem 0.4rem 0;
+}
+
+.home-solar-refusal p {
+  margin: 0 0 0.25rem;
+}
+
+.home-solar-refusal code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.home-solar-dialog-actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 0.7rem;
+}
+
+.home-solar-confirm:not(:disabled) {
+  border-color: #9ae6b4;
+  background: #f0fff4;
+  color: #276749;
+}
+
 /* --- Question 3: reserve ------------------------------------------------ */
 
 .home-reserve-total {

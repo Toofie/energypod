@@ -393,6 +393,7 @@ function installClient(setup: ShellSetup = {}): { getSnapshot: ReturnType<typeof
         (() => Promise.reject(new Error("not used by AppShell"))),
     ),
     postInhibitAcknowledgement: vi.fn(() => Promise.reject(new Error("not used by AppShell"))),
+    postExcessCharging: vi.fn(() => Promise.reject(new Error("not used by AppShell"))),
     openEvents: vi.fn(
       setup.openEvents ??
         (() => {

@@ -191,6 +191,7 @@ const makeClient = (): ApiClient => ({
   postEmergencyStop: vi.fn(),
   postStopAcknowledgement: vi.fn(),
   postInhibitAcknowledgement: vi.fn(),
+  postExcessCharging: vi.fn(),
   openEvents: vi.fn(async function* () {}),
 });
 

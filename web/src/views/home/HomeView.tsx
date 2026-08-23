@@ -1324,6 +1324,14 @@ export function HomeView({ client }: HomeViewProps) {
           gridPowerW: unit.telemetry?.gridPowerW ?? null,
           loadPowerW: unit.telemetry?.loadPowerW ?? null,
         }))}
+        client={client}
+        onAdopt={(adopted) => {
+          // A toggle 200's own post-toggle projection, adopted optimistically;
+          // the next snapshot or excess_adviser.state_changed frame confirms.
+          setSnapshot((previous) =>
+            previous === null ? previous : { ...previous, adviserState: adopted },
+          );
+        }}
       />
 
       <section className="home-card" aria-labelledby={reserveHeadingId}>

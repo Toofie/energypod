@@ -871,6 +871,23 @@ export function withAdviserState(world: WireSnapshot, state: WireAdviserState): 
   return { ...world, adviser_state: state };
 }
 
+/**
+ * The guarded toggle's 200 body (§3), either action: the feature id, the
+ * post-toggle participation facts, `persisted: false` spelled anyway (the
+ * contract states the non-persistence policy on every response), and the full
+ * §1 projection for optimistic adoption. PENDING-BACKEND.
+ */
+export function excessChargingToggleOk(state: WireAdviserState): Record<string, unknown> {
+  return {
+    feature: "excess_charging",
+    enabled: state.enabled,
+    enabled_origin: state.enabled_origin,
+    persisted: false,
+    acknowledged_economics: state.acknowledged_economics,
+    adviser_state: state,
+  };
+}
+
 export function snapshot(
   units: readonly WireUnitSnapshot[],
   spec: { site_id?: string; snapshot_sequence?: number; captured_at?: string } = {},
