@@ -56,6 +56,13 @@ reactive limit (zero by default), blocking fault codes, and debug-mode enable (f
 `FleetAllocator.allocate(intent, observations, policy) -> ProposedSetpoints` deterministically
 allocates a fleet-total request across selected units using direction-specific headroom, without
 reversing direction or multiplying the request, and with an exact sum after capacity clamping.
+When headroom is scarce the request is distributed capacity-weighted across every participating
+unit: proportional to each unit's remaining direction headroom, as an exact integer
+largest-remainder split with a one-watt participation floor, so no participating unit is left at a
+zero-watt proposal while another runs below its own headroom. A request smaller than the number of
+participating units cannot give each unit its first watt and concentrates instead by capacity
+priority (largest headroom first, ties by unit id). Ineligible units and units without usable
+headroom keep explicit zero-watt proposals.
 
 `SafetyKernel.evaluate(proposed_setpoints, current_observations, previous_observations, policy,
 now_mono) -> ControlDecision` is deterministic and side-effect free. Unknown, stale, invalid,
