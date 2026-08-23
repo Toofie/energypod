@@ -117,8 +117,8 @@
  *   (its dock capped to the lead's 24 rem so every bus on screen draws at
  *   the same scale); three columns here would be 60 px cards — too narrow
  *   for the words.
- * - 70–78 rem — the lead band with the three phases in one row.
- * - ≥78 rem — all four in ONE row, equal tracks (the round-2 law: the bus is
+ * - 70–81 rem — the lead band with the three phases in one row.
+ * - ≥81 rem — all four in ONE row, equal tracks (the round-2 law: the bus is
  *   aspect-locked, so unequal tracks would drop the rows out of alignment),
  *   the view borrowing 11 rem of the shell's side margins so the columns are
  *   wide enough for the two-register figure (the word a label line, the
@@ -178,7 +178,7 @@
   }
 }
 
-@media (min-width: 78rem) {
+@media (min-width: 81rem) {
   /* The four-column row: the lead is the framed first column again. Equal
      tracks, deliberately (the round-2 law above); auto-fit so a two-pod site
      collapses to three honest columns instead of leaving a hole — the 18rem
@@ -197,14 +197,16 @@
     max-width: none;
   }
 
-  /* The flow view is the console's wide stage: at four-across it borrows the
-     shell's side margins (never past the viewport) so the columns are wide
-     enough for their words — the reading column of the story and the
-     commands widens with it, one measure for the whole page. */
+  /* The flow view is the console's wide stage: at four-across it steps past
+     the shell's 72rem column into its side margins (78rem, symmetrically —
+     the breakout margin goes negative by exactly the overhang, so the view
+     stays centered and never past the viewport at this band's 81rem floor)
+     so the columns are wide enough for their words; the story and the
+     commands widen with it, one measure for the whole page. */
   .flow-view {
     max-width: none;
-    width: min(78rem, calc(100% + 11rem));
-    margin-inline: auto;
+    width: 78rem;
+    margin-inline: calc((100% - 78rem) / 2);
   }
 }
 
@@ -562,13 +564,13 @@
   font-weight: 700;
 }
 
-/* THE TWO-REGISTER FIGURE (≥78 rem only): the word steps down to a label
+/* THE TWO-REGISTER FIGURE (≥81 rem only): the word steps down to a label
    line and the figure steps forward as the datum — the number is what the
    homeowner scans; the word names it. The lead's datum stays a full step
    larger than the phases' (1.1 vs 0.95 rem, both 700), so the lead's figures
    still read bigger at a glance. The separator hides (each part carries its
    own lines) and the fleet Home's scope suffix becomes a small third line. */
-@media (min-width: 78rem) {
+@media (min-width: 81rem) {
   .flow-node-figure {
     display: grid;
     gap: 0.08rem;
