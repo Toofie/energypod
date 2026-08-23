@@ -363,9 +363,7 @@ async def test_arm_refusals_name_their_distinct_conditions(contract: Any) -> Non
     # The latch dominates: a latched unit is refused for the latch (the
     # privileged acknowledgement is the only exit), never folded into the
     # qualification or lifecycle words.
-    latched, _, _, _, _ = make_actor(
-        contract, blocking_fault_codes=frozenset({"Stack_Fault0_3"})
-    )
+    latched, _, _, _, _ = make_actor(contract, blocking_fault_codes=frozenset({"Stack_Fault0_3"}))
     await ready_actor(latched)
     await latched.accept_observation(
         ObservationRecord(sequence=2, active_faults=("Stack_Fault0_3",))
