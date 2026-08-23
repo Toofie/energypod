@@ -1921,3 +1921,60 @@ async def test_cancel_intent_endpoint_cancels_the_active_intent(tmp_path: Path) 
     )
     assert status == 404, body
     assert body["code"] == "intent_not_found"
+
+
+async def test_suppressed_heartbeat_failures_are_audited_and_logged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """W5 (2026-08-23): the fleet loop survives a failing heartbeat per cycle,
+    but total actuation loss must never be invisible -- every suppressed
+    failure is audited as heartbeat_failed for its unit and named in the
+    process log, while supervision keeps running."""
+    runtime = compose(tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock())
+    actor = runtime.actors[UNIT_IDS[0]]
+    original = actor.heartbeat_once
+    heartbeats = itertools.count()
+
+    async def failing_heartbeat() -> None:
+        if next(heartbeats) >= 1:
+            raise OSError("gateway write stalled")
+        await original()
+
+    monkeypatch.setattr(actor, "heartbeat_once", failing_heartbeat)
+    baseline = set(asyncio.all_tasks())
+    session = _LifespanSession(runtime.app)
+    try:
+        session.send("lifespan.startup")
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete")
+            or session.seen("lifespan.startup.failed"),
+            message="the application lifespan never reported supervision startup",
+        )
+        assert session.seen("lifespan.startup.complete"), session.events
+
+        def suppressed_rows() -> list[Any]:
+            return [
+                event
+                for event in runtime.audit.recent(limit=16)
+                if getattr(event, "event_type", None) == "heartbeat_failed"
+            ]
+
+        await session.pump_until(
+            lambda: len(suppressed_rows()) >= 2,
+            message="a failing heartbeat must be audited every suppressed cycle",
+        )
+        rows = suppressed_rows()
+        assert {row.unit_id for row in rows} == {UNIT_IDS[0]}
+        assert all(row.result == "suppressed" for row in rows)
+        # Supervision survived the failures: the fleet task is still running.
+        assert any(
+            task.get_name() == "energypod-supervision:fleet-cycle"
+            for task in asyncio.all_tasks() - baseline - {session.app_task}
+        ), "a suppressed per-cycle heartbeat failure must never halt supervision"
+    finally:
+        await session.close()
+
+    captured = capsys.readouterr()
+    assert "HEARTBEAT FAILURE" in captured.out and UNIT_IDS[0] in captured.out, (
+        "the process log must name the unit whose heartbeat was suppressed"
+    )
