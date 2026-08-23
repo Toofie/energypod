@@ -41,13 +41,16 @@ from typing import Any, Literal, Protocol, TypeGuard
 from energypod.domain import DataQuality, Direction, IntentSource, UnitLifecycle
 
 # The arbiter's own priority (emergency stop > manual > agent > optimizer >
-# schedule > idle) already displaces the adviser — live-verified 2026-08-23,
-# when a console manual intent superseded an in-flight agent intent
-# mid-window.  The adviser ADDITIONALLY yields on its own so it never spams
-# renewals while an operator or agent holds the fleet: while any of these
-# sources is active fleet-wide it withdraws by removal (never a stop triple)
-# and does not re-post until that intent has expired AND the entry
-# hysteresis re-qualifies.
+# schedule > idle) already displaces the adviser per unit — live-verified
+# 2026-08-23, when a console manual intent superseded an in-flight agent
+# intent mid-window.  The adviser ADDITIONALLY yields on its own so it never
+# spams renewals against a claim it cannot win: since concurrent operations
+# (2026-08-24) the yield is PER UNIT — a higher-priority intent claiming the
+# adviser's own target (its scope is one unit) withdraws it by removal (never
+# a stop triple) and it does not re-post until that claim has expired AND the
+# entry hysteresis re-qualifies, while a claim on a DIFFERENT unit leaves the
+# advisory charge running in the same cycle.  A live emergency stop dominates
+# every unit and always stands the adviser down.
 _HIGHER_PRIORITY_SOURCES: frozenset[IntentSource] = frozenset(
     {IntentSource.EMERGENCY_STOP, IntentSource.MANUAL, IntentSource.AGENT}
 )
@@ -188,13 +191,18 @@ class ExcessChargeAdviser:
         latest = await self._observations.all_latest()
         bound_w = eligible_export_charge_w(latest, self._policy, now_mono)
         active = await self._intents.active(now_mono)
-        if any(getattr(intent, "source", None) in _HIGHER_PRIORITY_SOURCES for intent in active):
-            # Operator precedence first: withdraw by removal (never a stop
-            # triple), keep the reason on the decision, and reset the
-            # hysteresis so re-entry must clear the ENTRY threshold again
-            # once the higher-priority intent has expired.
-            return await self._withdraw(bound_w, ("yielding_to_higher_priority",))
         target = self._select_target(latest)
+        if self._target_claimed(target, active):
+            # Operator precedence, PER UNIT (2026-08-24 concurrent operations):
+            # a higher-priority intent claiming the adviser's own target (its
+            # whole scope is one unit) displaces it for that tick -- withdraw
+            # by removal (never a stop triple), keep the reason on the
+            # decision, and reset the hysteresis so re-entry must clear the
+            # ENTRY threshold again once the claim has expired.  A claim on a
+            # DIFFERENT unit no longer stands the adviser down: the arbiter
+            # runs both in one cycle now.  A live emergency stop claims every
+            # unit (it dominates the whole cycle), so it always yields.
+            return await self._withdraw(bound_w, ("yielding_to_higher_priority",))
         achievable_w = self._achievable_w(bound_w, target, latest)
         entry_w = self._settings.assumed_autonomous_charge_w + self._settings.min_acceleration_w
         exit_w = self._settings.assumed_autonomous_charge_w + self._settings.exit_hysteresis_w
@@ -218,6 +226,25 @@ class ExcessChargeAdviser:
             # less would SLOW charging, so autonomy is left untouched.
             return self._idle(bound_w, ("no_acceleration_over_autonomy",))
         return await self._renew(target, achievable_w, bound_w)
+
+    @staticmethod
+    def _target_claimed(target: str | None, active: tuple[Any, ...]) -> bool:
+        """Whether a higher-priority live intent claims the adviser's target.
+
+        An emergency stop dominates every unit regardless of its own scope, so
+        any live stop claims the target outright.  With no target there is
+        nothing to claim and no advisory work this tick regardless.
+        """
+        for intent in active:
+            source = getattr(intent, "source", None)
+            if source is IntentSource.EMERGENCY_STOP:
+                return True
+            if source not in _HIGHER_PRIORITY_SOURCES or target is None:
+                continue
+            claimed = getattr(intent, "selected_unit_ids", None)
+            if claimed is not None and target in frozenset(claimed):
+                return True
+        return False
 
     # --- internals -------------------------------------------------------
 

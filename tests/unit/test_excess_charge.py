@@ -292,12 +292,18 @@ def make_adviser(
     return adviser, fake_intents, fake_submit, fake_clock
 
 
-def manual_intent(*, expires_at_mono: float = 130.0) -> Any:
+def manual_intent(
+    *,
+    expires_at_mono: float = 130.0,
+    unit_ids: tuple[str, ...] = ("mid",),
+    source: str = "MANUAL",
+) -> Any:
     from energypod.domain import IntentSource
 
     return SimpleNamespace(
         id="manual-1",
-        source=IntentSource.MANUAL,
+        source=getattr(IntentSource, source),
+        selected_unit_ids=frozenset(unit_ids),
         expires_at_mono=expires_at_mono,
     )
 
@@ -627,3 +633,72 @@ async def test_bound_collapse_withdraws_by_non_renewal_never_by_a_stop(
         "the adviser never submits zero watts or an idle intent: hand-back is by non-renewal"
     )
     assert all(entry["direction"] == "charge" for entry in submit.submissions)
+
+
+# --- per-unit yield under concurrent arbitration (2026-08-24) -------------------
+#
+# Concurrency changed the precedence rule's SHAPE, not its strength: an
+# operator intent now displaces the adviser only on the units IT CLAIMS.  The
+# adviser targets exactly one unit, so a manual intent claiming a DIFFERENT
+# battery no longer stops the advisory charge -- the arbiter runs both in one
+# cycle -- while a manual claim on the adviser's OWN target (or any live
+# emergency stop, which dominates every unit) still withdraws it.
+
+
+async def test_adviser_proceeds_while_a_manual_intent_claims_another_unit(
+    excess: Any, api: Any
+) -> None:
+    """Scenario D of the concurrency proof: an operator discharge on rhs while
+    the adviser accelerates mid's charge -- both proceed, one cycle each."""
+    grids = {"lhs": 0.0, "mid": 0.0, "rhs": 1_000.0}
+    intents = FakeIntents()
+    intents.entries.append(manual_intent(unit_ids=("rhs",), expires_at_mono=999.0))
+    adviser, fake_intents, submit, _clock = make_adviser(
+        excess, api, make_fleet(api, grids), intents=intents
+    )
+    assert fake_intents.entries
+
+    entry = await adviser.tick()
+
+    assert entry.action == "propose"
+    assert entry.target_unit_id == "mid"
+    assert submit.submissions[-1]["unit_ids"] == ["mid"]
+    assert "yielding_to_higher_priority" not in entry.reason_codes
+
+
+async def test_adviser_yields_when_its_target_unit_is_claimed(excess: Any, api: Any) -> None:
+    """The adviser's whole scope (one unit) claimed by a manual intent means
+    withdraw for that tick -- per-unit yield, exactly the erosion the arbiter
+    would apply anyway, plus the adviser's own anti-spam standdown."""
+    grids = {"lhs": 0.0, "mid": 0.0, "rhs": 1_000.0}
+    intents = FakeIntents()
+    intents.entries.append(manual_intent(unit_ids=("mid", "lhs"), expires_at_mono=999.0))
+    adviser, _fake_intents, submit, _clock = make_adviser(
+        excess, api, make_fleet(api, grids), intents=intents
+    )
+
+    decision = await adviser.tick()
+
+    assert decision.action in {"withdraw", "idle"}
+    assert "yielding_to_higher_priority" in decision.reason_codes
+    assert submit.submissions == []
+
+
+async def test_adviser_stands_down_while_any_emergency_stop_is_live(excess: Any, api: Any) -> None:
+    """An emergency stop dominates every unit (the arbiter gives it the whole
+    cycle), so the adviser withdraws outright rather than renewing against a
+    latched stop -- regardless of the stop's own unit scope."""
+    grids = {"lhs": 0.0, "mid": 0.0, "rhs": 1_000.0}
+    intents = FakeIntents()
+    intents.entries.append(
+        manual_intent(unit_ids=("rhs",), expires_at_mono=999.0, source="EMERGENCY_STOP")
+    )
+    adviser, _fake_intents, submit, _clock = make_adviser(
+        excess, api, make_fleet(api, grids), intents=intents
+    )
+
+    decision = await adviser.tick()
+
+    assert decision.action in {"withdraw", "idle"}
+    assert "yielding_to_higher_priority" in decision.reason_codes
+    assert submit.submissions == []
