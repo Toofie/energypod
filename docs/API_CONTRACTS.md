@@ -451,7 +451,10 @@ coordinator, the event bus, and per-unit actor handles.
   units a live intent still claims so an ended request's figures never linger — and is `null`
   when that row minted no batch, the window holds no decision, or the audit read fails (never an
   older row, never a fabricated figure). The per-unit `requested_power` scalars are unchanged and
-  keep projecting the intent's own fleet total for every covered unit.
+  keep projecting the intent's own fleet total for every covered unit. The snapshot additionally
+  carries a top-level `adviser_state` projection when the `excess_charging` block is composed
+  ("Adviser state projection" under the excess-solar section) — absent otherwise, never
+  null-standing-in-for-absent.
 - `unit_detail(principal, unit_id)` (REST `GET /api/v1/units/{unit_id}`, `observe` scope)
   returns the full latest observation projection for one unit: identity (`device_identity`),
   `protocol_profile`, `connection_epoch`, telemetry and cell sequences and capture times, all
@@ -826,8 +829,117 @@ default) means export bounding is not armed, and the bound for an optimizer char
 | `exit_hysteresis_w` | int ≥ 0 | `50` | exit margin; strictly below `min_acceleration_w` (validated) |
 | `intent_ttl_s` | float > 0 | `10.0` | adviser intent TTL; ≤ 300 s and > `control_period_s` (validated) |
 
-Configuration gates: `excess_charging.enabled: true` is refused unless `mode: write_enabled` AND
-a `policy` block is present (an observe-only composition structurally never actuates; an adviser
-there is dead code refused at validation time), and every cross-validation above holds. The
-default — no block, or `enabled: false` — composes no adviser, adds no policy export triple,
-promotes no register tier, and changes nothing else.
+Configuration gates (activation package, 2026-08-25): the cross-validations above bind whenever
+the `excess_charging` block is PRESENT, and a present block is refused unless `mode:
+write_enabled` AND a `policy` block is present (an observe-only composition structurally never
+actuates; an adviser there is dead code refused at validation time). Composition semantics: a
+PRESENT block (gates validated) composes the machinery — the policy export triple, the PCS-block
+read-tier promotion, the adviser object, and the snapshot's `adviser_state` projection — with
+`enabled` gating PARTICIPATION only (`true` participates at boot, subject to the
+economics-acknowledgement latch below; an explicit `false` composes suspended and is enableable at
+runtime through the activation toggle). An ABSENT block composes nothing — no adviser, no export
+triple, no tier promotion, no `adviser_state` — exactly as before, and the activation toggle
+answers `excess_charging_not_commissioned`. The PCS promotion while suspended is the budgeted
+cost (steady plan ≤ 8 windows + probe, inside the commissioned control period) that keeps the
+per-phase grid/load figures live in the console whether or not the adviser participates.
+
+### Adviser state projection (`adviser_state`) — activation package, 2026-08-25
+
+The snapshot (REST and the event stream's first frame) carries a top-level `adviser_state` beside
+`intent` — the same feature-detected addition pattern. The key is ABSENT when the
+`excess_charging` block is absent (nothing composed) and PRESENT whenever the block is present
+and its gates validated, including while suspended. `health` is unchanged.
+
+```json
+"adviser_state": {
+  "enabled": true,
+  "enabled_origin": "runtime",
+  "acknowledged_economics": true,
+  "active": true,
+  "hysteresis_state": "holding",
+  "target_unit_id": "mid",
+  "commanded_charge_w": 1400,
+  "eligible_export_charge_w": 1600,
+  "fleet_export_w": 1800,
+  "export_evidence": "good",
+  "charge_cap_w": 2500,
+  "held_intent_id": "opt-3f9c21",
+  "last_action": "renew",
+  "last_tick_at": "2026-08-25T11:04:31+10:00",
+  "reason_codes": ["export_headroom_available"]
+}
+```
+
+- `enabled` — participating this process; `enabled_origin` is `"config"` (the boot-composed value,
+  untouched) or `"runtime"` (last changed by the toggle — the honest "until restart" marker).
+- `active` — an adviser intent is live right now; derived from `held_intent_id` (never a lifecycle
+  guess), equivalently `hysteresis_state == "holding"`.
+- `hysteresis_state` — `"inactive"` (disabled by config, disabled at runtime, or suspended on the
+  pending acknowledgement) / `"entering"` (enabled, evaluating entry, including the post-yield
+  re-qualification wait) / `"holding"` (intervening) / `"exiting"` (the last tick withdrew;
+  persists until the next tick). The projection is tick-granular; `last_tick_at` says when.
+- `commanded_charge_w` — the last tick's proposed watts (the achievable min); 0 when not
+  commanding. `eligible_export_charge_w` — the deterministic bound from the last tick.
+- `fleet_export_w` — Σ `grid_power_w` over every fleet unit (positive = export); NULL when any
+  unit's grid evidence is missing/bad/stale — one unreadable phase is never treated as zero
+  export. `export_evidence` is the fleet rollup (`good|missing|bad|stale`) under the bound's own
+  fail-closed rules.
+- `charge_cap_w` — the composed `max_charge_from_export_w`.
+- `last_action` — the domain action vocabulary verbatim (`idle|propose|renew|withdraw`).
+- `reason_codes` — ONE pinned vocabulary (the implemented decision codes kept verbatim, plus the
+  projection-level states): `disabled_by_config`, `disabled_by_runtime`,
+  `economics_acknowledgement_required`, `export_evidence_missing`, `export_evidence_bad`,
+  `export_evidence_stale`, `no_export_headroom`, `no_acceleration_over_autonomy`,
+  `below_exit_hysteresis`, `no_eligible_target`, `yielding_to_higher_priority`,
+  `export_headroom_available`.
+- The projection has ONE writer (the fleet loop's post-tick update; the toggle flips only the
+  participation flag and the next tick observes it), so it can never claim inactive while an
+  adviser intent is still live.
+
+### Activation events — `excess_adviser.state_changed`
+
+The bus publishes the same projection vocabulary when the semantic state tuple changes —
+`(enabled, enabled_origin, acknowledged_economics, active, hysteresis_state, target_unit_id,
+export_evidence, reason_codes)`; the watt figures ride every publication but are NOT triggers
+(while holding, commanded watts re-price with export every tick, and that cadence already reaches
+consoles through the snapshot cadence and the decision/audit frames). While `enabled`, a full
+payload republishes every 30 s with `"heartbeat": true`; while disabled there is no heartbeat.
+Payload: every `adviser_state` field except `charge_cap_w`/`last_action`/`last_tick_at`, plus
+`"heartbeat": bool`. The toggle itself publishes no dedicated event — the resulting state change
+does, and the REST 200 carries the projection for optimistic adoption.
+
+### Activation surface — the guarded runtime toggle
+
+`POST /api/v1/excess-charging` mirrors the inhibit-acknowledgement guarded-confirmation pattern
+applied to a feature gate: Bearer auth with the `arm` scope (an `enable` additionally requires an
+INTERACTIVE principal — the arm/disarm asymmetry, enabling being control-adjacent and disabling
+safety-positive), an `Idempotency-Key` header, a typed confirmation, audit, and publication.
+Body: `{"action": "enable"|"disable", "confirmation": "EXCESS", "economics": "NET_BILLED"?}` —
+`economics` is optional and consulted only on the first enable ever (below). Response 200:
+`{"feature", "enabled", "enabled_origin", "persisted": false, "acknowledged_economics",
+"adviser_state"}` — `persisted` is always false and spelled anyway. Every call is audited as
+`excess_charging_toggled` (result `enabled`/`disabled`/`noop`) on the atomic commit-then-audit
+pattern; refusal envelopes:
+
+- 422 `validation_error` — unknown action, wrong/missing confirmation, `economics` present but
+  not exactly `"NET_BILLED"`.
+- 409 `excess_charging_not_commissioned` — no `excess_charging` block; there is nothing to toggle.
+- 409 `economics_acknowledgement_required` — `enable` with no captured acknowledgement on this
+  site and no `economics` field.
+- 409 `excess_enable_refused` — `enable` while any unit is ACTIVE under another intent
+  (`unit_active_under_intent`) or a latched stop holds (`latched_stop_holds`); `details` names the
+  units and stop ids. Latched inhibits do NOT refuse (the selector skips those units honestly).
+  `disable` is never refused.
+
+Pinned policies: (1) runtime state does NOT persist — boot composes from the config file, the
+config stays the source of truth, a restart while enabled-in-config re-enables, and a runtime
+disable is operational only until reboot (`enabled_origin: "runtime"` marks it); (2) the
+net-billing confirmation is captured ONCE as the explicit audit fact
+`excess_charging_economics_acknowledged` (durable, never re-prompted, loaded at boot) and is
+required before the FIRST enable ever succeeds on a site — a first enable either carries
+`"economics": "NET_BILLED"` or is refused; a site without the captured fact composes SUSPENDED
+with reason `economics_acknowledgement_required` (even a config `enabled: true` cannot
+participate without it; the append is durable-first, and an audit failure refuses the enable);
+(3) the toggle flips PARTICIPATION only — it can never change `max_charge_from_export_w`, relax a
+commissioning gate, promote a tier, or change the mode — and the adviser still yields to every
+higher-priority source, unchanged.
