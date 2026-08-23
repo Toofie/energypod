@@ -869,6 +869,31 @@ direction, freshness, and watchdog timing per physical unit.
   Co-Authored-By trailer (auto-committed clean merge; amending would
   rewrite 8 descendant commits from concurrent agents — left intact).
 
+- 2026-08-23 (concurrency): CONCURRENT PER-BATTERY OPERATIONS DELIVERED
+  AND LIVE-VERIFIED (00ad829..a0a81a7, 766 tests across 12 families). The
+  single-winner arbiter became a PER-UNIT winner set: each battery runs
+  its highest-priority active claimant (priority order unchanged; same-
+  priority ties per unit by newest revision); one kernel cycle composes
+  all winners into ONE batch/audit row (multi-intent rows are cycle-level
+  with directions_by_unit; single-intent rows byte-identical to legacy);
+  safety's fleet-wide mixed_directions rejection is replaced by per-unit
+  coherence with PER-DIRECTION fleet limits, and every per-unit deny
+  reason zeroes only its own unit (non-participation doctrine extended) —
+  fail-closed when no unit can participate. The excess adviser yields per
+  unit. LIVE-VERIFIED with the operator's exact scenario: mid charge 2000
+  authorized/measured (~-1810) WHILE rhs discharge 1000 authorized/
+  measured (~+1180) simultaneously for the full 60 s, 23 composed
+  multi-direction decision rows, clean TTL return, no hazards. Simulator
+  deterministic (SHA-pinned, twice) across overlap/stop/yield/regression
+  scenarios. Controller restarted on the build (writemode20); boot
+  disarmed — re-arm required. CONSOLE FOLLOW-UP QUEUED: N coexisting
+  request cards (no card supersedes another's units), per-unit directions
+  in cards from authorization.granted/audit maps, Activity rows with
+  intent_id null correlate via cycle correlation id. Note: during
+  verification the operator's own standing 1000 W/unit discharge was
+  outranked per-unit by the newer verification intents — per-unit
+  revision precedence working as designed.
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
