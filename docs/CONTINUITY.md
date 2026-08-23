@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-26 (Australia/Brisbane; the energy scorecard backend wave)
+Last updated: 2026-08-24 (Australia/Brisbane; the six-workstream round — live-refresh, polish, excess, night standby, providers, MCP)
 
 ## Purpose
 
@@ -348,6 +348,52 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-24 (six-workstream round — LIVE-REFRESH FIXED, THE STANDBY
+  POSTURE, THE PROVIDERS LAYER BORN, THE MCP READ SURFACE COMPLETE):
+  dispatched as six parallel agents against the operator's round
+  brief; all six landed on master with the tree clean. (1) CONSOLE
+  LIVE-REFRESH (4b94ee3): Batteries cleared its disconnected notice on
+  the plane's cached replay and froze data ages — now stale-replay
+  guarded with capture-marker + 1 s ticking display age; Objectives
+  re-reads on foreign-objective alerts (was mount-only); Activity's
+  connection-loss path was structurally unreachable (shell never passed
+  the prop) — self-detects now, ages tick; Schedule's "Next" countdown
+  runs down from starts_in_s. Home/Flow/History/Now/Insights and the
+  SharedDataPlane core audited clean. (2) POLISH (7755bd1): one rhythm
+  and one status vocabulary across all nine views, the two-view dialog
+  CSS collision fixed, "Try again" copy unified, 66-shot matrix
+  evidence; 782/782 web tests. (3) EXCESS VERIFIED (fd2acf3): surplus
+  math, neediest-non-full-BMS-SOC target selection, and safety
+  interplay all confirmed correct; the typed gate now accepts the
+  operator's lowercase "excess" (wire literal unchanged) — reaches the
+  deployed console on the next rebuild. (4) NIGHT STANDBY (29f8bf2):
+  `demand_response: hold | standby` — measured demand >1000 W stands
+  the unit down entirely (zero-watt non-participation, resume <800 W
+  or window end, new `standing_by_on_demand` phase); fail-closed on
+  missing/stale evidence still holds under BOTH postures; example
+  config ships standby. 2193 scoped tests. (5) ADVISORY PROVIDERS
+  (7b4ca4f..554b9e6): `src/energypod/adapters/providers/` — the four
+  reserved ports, normalized forecast model, rate-budgeted async HTTP
+  base with honest staleness, Open-Meteo (keyless) + Solcast (Bearer,
+  key by env reference) adapters, historian load baseline, config
+  tariff, forecast-vs-recorded-surplus cross-check, registry; advisory-
+  only pinned by architecture-fitness and composition tests; live-
+  verified API references captured (Open-Meteo azimuth 0°=South;
+  Solcast `period` param, 10 req/day free). Config present-but-off.
+  (6) MCP READ SURFACE (8703416): `get_unit_detail`, `get_schedule`,
+  `get_observed_objectives` reusing facade projections; the agent-loop
+  contract encoded in served tool descriptions and pinned by test.
+  House check at dispatch: backend 2157 → 2306 passed after the round,
+  web 773 → 782, ruff + strict mypy clean, controller untouched
+  (/healthz ok). OPEN: console rebuild to ship fd2acf3+4b94ee3 to the
+  deployed image; console vocabulary for `standing_by_on_demand`;
+  Solcast key registration; tariff/wholesale source ADR; the first
+  forecast-consuming adviser (registry deliberately unwired — the
+  anticipatory-excess item); MCP `cancel_intent`; Objectives evidence
+  table at 390 px; standby live cutover = set `demand_response:
+  "standby"` in the live config + restart (the 7-step Docker cutover
+  sequence is unchanged).
 
 - 2026-08-24 (plant-history console W1–W3 — THE OVERNIGHT PROGRAM
   COMPLETE): the History view shipped (86909f2 wire model + read client,
