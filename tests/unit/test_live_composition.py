@@ -1493,3 +1493,46 @@ async def test_the_system_overview_block_rides_the_cold_ring_not_a_once_per_proc
         "the steady plan must stay inside the commissioned cadence budget "
         "(<= 9 windows: 7 core + one tier window + one cold window)"
     )
+
+
+async def test_the_live_tiered_decode_serves_the_objective_words_with_an_honest_clock() -> None:
+    """API_CONTRACTS "Night-writer detector" on the LIVE decode path: the
+    detail block rides the cold ring, and between rotations the merged decode
+    carries the CACHED words with their ORIGINAL capture clock -- so the
+    detector can tell a fresh serving from a stale ride-along."""
+    bank = dict(_register_banks_by_host()["192.168.1.11"])
+    detail_window = (0x1060, 32)
+    # The night writer's words: -2400 W active (word 0xF650), +300 var.
+    bank[0x1060 + 17] = -2400 & 0xFFFF
+    bank[0x1060 + 18] = 300 & 0xFFFF
+
+    strategy = _live_decode_strategy(bank, promote_pcs_live_block=False)
+    await strategy.advance()  # cycle 1: bootstrap plan
+    served_cycle: int | None = None
+    observation = None
+    for cycle in range(2, 90):
+        await strategy.advance()
+        plan = strategy.read_plan()
+        blocks = {window: tuple(bank[window[0] + i] for i in range(window[1])) for window in plan}
+        decoded = strategy.decode(blocks, UnitLifecycle.DISARMED)
+        if detail_window in plan:
+            served_cycle = cycle
+            observation = decoded
+            break
+
+    assert served_cycle is not None, "the cold ring must eventually serve the detail block"
+    assert observation is not None
+    assert observation.served_active_objective_w == -2400
+    assert observation.served_reactive_objective_var == 300
+    captured = observation.objective_captured_at_mono
+
+    # Between rotations the words ride from cache: same values, SAME capture
+    # clock -- never a fabricated fresh serving.
+    for _ in range(3):
+        await strategy.advance()
+        plan = strategy.read_plan()
+        assert detail_window not in plan
+        blocks = {window: tuple(bank[window[0] + i] for i in range(window[1])) for window in plan}
+        cached = strategy.decode(blocks, UnitLifecycle.DISARMED)
+        assert cached.served_active_objective_w == -2400
+        assert cached.objective_captured_at_mono == captured
