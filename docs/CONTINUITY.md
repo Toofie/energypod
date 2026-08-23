@@ -349,6 +349,75 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-24 (recovery): THE SELF-HEALING AWARENESS LAYER LANDED (b20058d,
+  8f840ea, 6da8541, 7b491b3 + docs) — detection and honest surfacing of the
+  fleet's self-recovery states, per the accepted research ladder (R4/R5
+  "buildable now" + promoted P1 vi/iii; docs/POD_RECOVERY_RESEARCH.md).  The
+  operator's principle implemented verbatim: the batteries self-heal
+  (watchdog reversion, autonomy resumption, balancing, SOC re-estimation,
+  stable-sample requalification — all trusted); the system's job is DETECTION
+  of self-healing in progress (quiet), ambiguous behavior (evidence), and
+  self-healing FAILURE (the firmware-wedge class that needed a physical
+  power cycle).  PASSIVE by construction — audit facts + bus events only, no
+  new write paths (0x8000/standby/write-scope excluded, separate
+  authorization per the research).  Components:
+  (1) ACTUATION-COHERENCE WATCHDOG (P1 vi): supervision peeks each unit's
+  about-to-be-consumed authority before the heartbeats and compares the
+  polled measured watts against the PRE-COMMAND baseline of the
+  authorization episode; movement >= max(50% of authorized, the 150 W floor)
+  is confidently actuating, below min(...) confidently still, the dead zone
+  between refuses to conclude (tiny setpoints never false-trigger; a silent
+  pod still alarms).  4 consecutive still cycles -> ONE actuation_incoherent
+  audit + actuation.incoherent bus event per episode (re-arm: a coherent
+  cycle or the authorization ending).  This catches the 22:11Z silent-loss
+  and publish-fence signatures in ~6 s at the 1.5 s cadence.  Known pinned
+  limit: mid-flight loss under an UNCHANGED command (pinned at a delivered
+  level) is movement-indistinguishable from delivery and is NOT this
+  watchdog's case.
+  (2) OBJECTIVE ECHO READ-BACK (P1 iii): on the coherence trigger ONLY, one
+  bounded fresh read of the served objective (0x1060+17/+18) through the
+  owning actor's mailbox, classified against our last applied objective:
+  echo_matches_write (pod-side wedge -> the R5 "physical restart required"
+  hint), objective_not_served (mode/autonomy conflict -> the vendor-app
+  Normal-Mode/Remote checklist hint), external_writer (rides the existing
+  vocabulary), echo_unreadable (honest).  Audited as objective_echo with the
+  read value.
+  (3) UNRESPONSIVENESS CLASSIFIER (R4): derived per-unit health_state
+  (NO latching; boot healthy-by-observation) with precedence unreachable
+  (TCP connect fails, gateway class) > not_responding (K=3 consecutive read
+  timeouts while the path connects — the wedge signature, carries the R5
+  physical-restart remediation_hint) > foreign_writer (existing latch) >
+  inhibited > actuation_incoherent > self_healing (requalifying_after_inhibit
+  / cell_balancing >50 mV / autonomous_self_charge in band — quiet,
+  informational) > healthy.  Transitions publish unit.health_changed.
+  Snapshot units carry health_state/health_reasons/remediation_hint; /health
+  carries a per-unit units block and control_readiness gains
+  "{unit}:actuation_incoherent".
+  (4) UNEXPECTED-AUTONOMY EVIDENCE RECORDER: measured watts outside
+  expected_autonomy_band_w [-2600, 300] while NO intent claims the unit ->
+  one unexpected_autonomy audit + unit.unexpected_autonomy bus payload per
+  unit per 60 s carrying measured watts + SOC + the four mode words.  Pure
+  evidence (mid's ±1.2 kHz oscillation is now timestamped); NOT a block, NOT
+  an alarm tier, state stays healthy/self_healing.
+  Config keys (policy, defaulted): actuation_coherence_cycles 4,
+  actuation_coherence_min_movement_w 150, expected_autonomy_band_w
+  [-2600, 300] (validated to span the self-charge region); live-write
+  example documents all three.  Bus vocabulary additions:
+  unit.health_changed, actuation.incoherent, unit.unexpected_autonomy.
+  Contract-first, stepwise: config 4 red -> green; monitor family NEW (20
+  red -> green); facade 5 red -> green (120 family); write-enabled replay 5
+  red scenarios + 1 composition lifespan supervision-driving scenario ->
+  green (19 family, 47 composition); the replay double models the wedge
+  class (writes ACK, battery power never moves; readback reflect/zero/
+  foreign).  Monitor semantics fixed en route (steady delivery must read
+  coherent forever — baseline is pre-command for the whole episode).
+  Families + neighbors green (~430 across recovery/composition/write-
+  enabled/actor/facade/config/golden/simulator/e2e/event-bus/REST boundary);
+  ruff + ruff format + MYPYPATH=src mypy strict clean (46 files).  CONSOLE
+  FOLLOW-UP (web agent, feature-detected): consume unit.health_changed +
+  the snapshot/health health_state fields; render remediation_hint where
+  present; unexpected_autonomy is quiet-tier evidence, not an alarm.
+
 - 2026-08-24 (backend polish): THREE SMALL ITEMS LANDED (f49c522, e5856cc,
   f7f1750). (1) SNAPSHOT PER-UNIT INTENT FIGURES (the console's precise
   proposal; closes the cold-load structural gap the web hook documents in

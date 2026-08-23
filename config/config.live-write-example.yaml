@@ -198,6 +198,40 @@ policy:
   # {"confirmation":"ARM","takeover":"ACKNOWLEDGE"} (audited, never
   # persisted).
   autonomous_charge_signature_max_w: 2500
+  # ---------------------------------------------------------------------------
+  # SELF-HEALING AWARENESS LAYER (2026-08-24 recovery research R4, promoted
+  # P1 vi/iii) — DETECTION ONLY.  No control path consumes these keys; the
+  # batteries' own self-recovery (watchdog reversion, autonomy resumption,
+  # cell balancing, SOC re-estimation, stable-sample requalification) is
+  # trusted by design, and what the controller owes the operator is honest
+  # detection of self-healing in progress, of ambiguous behavior, and of the
+  # firmware-wedge class that historically required a physical power cycle.
+  # ---------------------------------------------------------------------------
+  # Actuation-coherence watchdog: this many CONSECUTIVE cycles of authorized
+  # watts with the measured battery power never moving alarm once
+  # (actuation_incoherent audit + actuation.incoherent event + the
+  # unit's health_state / control-readiness reason).  At the 1.50 s control
+  # period, 4 cycles = ~6 s — the 22:11Z silent actuation loss and the
+  # publish-fence wedge took 6+ MINUTES of operator staring to notice.
+  # Re-arms only after a coherent cycle or the authorization ending.
+  actuation_coherence_cycles: 4
+  # The absolute movement floor: a cycle whose measured movement is BELOW
+  # min(50% of the authorized figure, this floor) is "confidently still"
+  # (wedge signature), one at or ABOVE max(...) is "confidently actuating",
+  # and the dead zone between refuses to conclude — which is exactly what
+  # keeps tiny setpoints out of court (a healthy 100 W command moves less
+  # than 150 W and so can never accumulate a streak, while a fully silent
+  # pod still alarms).
+  actuation_coherence_min_movement_w: 150
+  # The commissioned EXPECTED autonomous battery-power envelope: negative
+  # self-charge (measured ~-520..-560 W daytime CT-following, up to ~-2.27 kW
+  # deep self-charge) to a small positive float.  Measured power OUTSIDE this
+  # band while no intent claims the unit is timestamped evidence
+  # (unexpected_autonomy audit, at most one per unit per 60 s, carrying the
+  # measured watts + SOC + mode words) — turning mid's standing unexplained
+  # ±1.2 kW oscillation into diagnosable evidence.  NEVER a block, never an
+  # alarm-tier state: health stays healthy/self_healing.
+  expected_autonomy_band_w: [-2600, 300]
   debug_modes_enabled: false
 
 authentication:

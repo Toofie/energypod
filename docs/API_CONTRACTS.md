@@ -464,7 +464,10 @@ coordinator, the event bus, and per-unit actor handles.
 - `health(principal)` separates `liveness` (process-up), `service_readiness` (repositories and
   coordinator responsive), and `control_readiness` (every unit qualified and at least one
   armed, with blocking reasons listed per unit). Readiness never fabricates optimism: an
-  unknown unit state is a reason, not an assumption.
+  unknown unit state is a reason, not an assumption. The report additionally carries a
+  per-unit `units` recovery block from the self-healing awareness layer — see
+  "Self-healing awareness layer" for `{unit_id, health_state, reasons, remediation_hint}`
+  and the `actuation_incoherent` control-readiness reason.
 - `recent_audit(principal, limit)` is a bounded, newest-first read over the durable audit
   repository with a stable cursor; it never mutates.
 - `submit_intent(...)` validates and accepts one intent with a server-assigned monotonic
@@ -710,6 +713,92 @@ eligible_charge_w = min(max_charge_from_export_w,
   word alone NEVER refuses. A fresh-confirmed non-Remote still refuses; two consecutive failed
   refresh reads refuse (genuinely unreadable, class D). The debug-mode half of the gate is
   unchanged — its word rides the control-rate core and is judged as decoded.
+
+## Self-healing awareness layer (recovery detection)
+
+`energypod.application.recovery` (2026-08-24, accepted from
+docs/POD_RECOVERY_RESEARCH.md ladder rung R4 plus the promoted P1 items vi and iii). The
+batteries self-heal from command-state, communication, and estimation problems by design;
+this layer is the operator's honest visibility into that self-healing and its failure. It
+is PASSIVE by construction: audit facts and bus events only — no write path, no latch, no
+block, no refusal originates here (the actor's `external_writer` latch remains the only
+latching mechanism and is only ever READ). No new register writes exist: `0x8000`, standby
+cycling, and anything touching the write scope are excluded and need separate operator
+authorization per the research.
+
+- **Actuation-coherence watchdog (P1 vi)**: per unit, per fleet cycle, supervision peeks
+  the authority the heartbeat is about to consume and compares the polled measured battery
+  power against the PRE-COMMAND baseline of the authorization episode. A cycle is
+  confidently ACTUATING when movement ≥ max(50% of the authorized figure,
+  `actuation_coherence_min_movement_w`), confidently STILL when movement is below
+  min(same two), and INCONCLUSIVE in the dead zone between (which keeps tiny setpoints out
+  of court while a fully silent pod still alarms). `actuation_coherence_cycles` consecutive
+  still cycles raise exactly ONE `actuation_incoherent` audit fact plus one
+  `actuation.incoherent` bus event per episode — throttled until a coherent cycle or the
+  authorization ending re-arms it. Known limit, pinned: a mid-flight loss under an
+  UNCHANGED command (the pod pinned at a level it already delivered) is indistinguishable
+  from delivery by movement and is not this watchdog's case.
+- **Objective echo read-back (P1 iii, vendor precedent `DebugModeRead`-after-write)**: on
+  the coherence trigger ONLY (never per heartbeat), one bounded fresh read of the served
+  objective (IoT `0x1060+17/+18`, the arm-preflight readback window) through the owning
+  actor's serialized mailbox, classified against the last objective that actor applied:
+  `echo_matches_write` (transport fine — the incoherence is pod-side, the wedge
+  signature), `objective_not_served` (readback zero while authorized — mode/autonomy
+  conflict), `external_writer` (a foreign nonzero objective, riding the existing
+  vocabulary), or `echo_unreadable` (the discriminator could not run; never guessed).
+  Audited as `objective_echo` with the read value, and carried on the health reasons, the
+  detection event payload, and the remediation hint.
+- **Unresponsiveness classifier (R4)**: per unit, a DERIVED `health_state` recomputed
+  from the latest cycle facts (no latching beyond existing mechanisms; boot is
+  `healthy`-by-observation). Vocabulary, in classification precedence order:
+  `unreachable` (a TCP connect failure — the gateway class; the pod behind it may be
+  fine), `not_responding` (K=3 consecutive read failures while the path connects — the
+  firmware-wedge signature), `foreign_writer` (the existing latched
+  `external_writer` inhibit), `inhibited` (any other inhibit/latched state),
+  `actuation_incoherent` (the watchdog verdict, reasons carrying the echo
+  classification), `self_healing` (quiet and informational:
+  `requalifying_after_inhibit`, `cell_balancing` above the 50 mV operator early-warning
+  line, `autonomous_self_charge` — uncommanded, in the commissioned band), `healthy`.
+  Transitions publish exactly one `unit.health_changed` bus event
+  (`{unit_id, from, to, reasons}`).
+- **Unexpected-autonomy evidence recorder**: measured battery power outside
+  `expected_autonomy_band_w` while NO intent claims the unit appends one
+  `unexpected_autonomy` audit fact per unit per 60 s (figures pinned in the request
+  fingerprint: measured watts, SOC, mode words, the band) and one quiet-tier
+  `unit.unexpected_autonomy` bus payload carrying the same figures
+  (`{unit_id, measured_watts, soc_pct, debug_mode_w, ctrl_mode_w, work_mode_w,
+  run_mode_w}`). Pure evidence: no block, no alarm tier, health stays
+  healthy/self_healing. A claim-state read failure treats every unit as claimed
+  (fail-safe for evidence).
+- **Honest terminal guidance (R5 rail)**: `remediation_hint` appears on the health view
+  only where remote recovery is genuinely exhausted — `not_responding`, and
+  `actuation_incoherent` once the echo classifies `echo_matches_write` ("pod not
+  responding — remote recovery exhausted; physical restart required", with the vendor
+  MiniES-app post-restart checklist and the research reference). `objective_not_served`
+  carries the vendor-app mode checklist instead (check Debug Mode = Normal Mode and
+  SysControlMode = Remote, then re-dispatch); `external_writer` and unknown echoes carry
+  no terminal hint.
+- **Surfacing**: every snapshot unit carries `health_state: str | null`,
+  `health_reasons: [str] | null`, `remediation_hint: str | null` (nulls when no monitor
+  is wired or its projection fails — detection never gates a read, and no state is ever
+  fabricated). `health()` carries a per-unit `units` block
+  (`{unit_id, health_state, reasons, remediation_hint}`) and its `control_readiness`
+  gains `"<unit>:actuation_incoherent"` — a unit authorizing without actuating is not
+  ready to act. The bus vocabulary additions are `unit.health_changed`,
+  `actuation.incoherent`, and `unit.unexpected_autonomy`.
+- **Config keys** (`policy` block; all defaulted, so unchanged configurations keep
+  today's behavior — detection only, no control path consumes them):
+  `actuation_coherence_cycles: 4`, `actuation_coherence_min_movement_w: 150`,
+  `expected_autonomy_band_w: [-2600, 300]` (a strictly ascending integer pair whose
+  bounds span the pods' negative self-charge to small positive float region). The K=3
+  read-failure streak and the 60 s evidence throttle are module constants
+  (`energypod.application.recovery`).
+- **Supervision driving**: the fleet cycle peeks the authority before the heartbeats,
+  classifies every bounded poll outcome (`TransportConnectionError` → gateway class;
+  any other escaped failure → read-failure streak; any success clears both), and runs one
+  bounded, fully suppressed detection pass per unit after the polls and before the kernel
+  tick — detection can never delay renewal or control, and every audit/bus failure inside
+  the monitor is itself suppressed.
 
 ## Control-decision audit attribution
 
