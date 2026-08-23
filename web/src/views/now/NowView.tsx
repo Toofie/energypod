@@ -36,6 +36,13 @@
  * event updates the picture immediately, and the refreshed snapshot — adopted
  * only when its sequence advances — is the world that wins.
  *
+ * Engaged stops as state (2026-08-23 incident fix): the amended snapshot
+ * contract adds `active_stops`, and while a stop is engaged this view renders
+ * arm/disarm/charge/discharge DISABLED with the stop named — never silently
+ * absent. A snapshot carrying the field is authoritative; while the backend
+ * sends none, the latch frames hold the state instead (feature detection: an
+ * absent field is "no information", an empty array is "nothing engaged").
+ *
  * Freshness truth (src/energypod/api/rest.py + runtime/composition.py): the
  * service sends its snapshot frame exactly once per connection and then one
  * `observation.published` frame per telemetry append. The "…s ago" figure on
@@ -76,11 +83,29 @@ interface WireUnit {
   measured_watts: number | null;
 }
 
+/**
+ * One engaged emergency stop, exactly as the amended snapshot contract's
+ * `active_stops` array carries it (`null` unit ids = fleet-wide).
+ */
+interface WireActiveStop {
+  stop_id: string;
+  latched_at: string;
+  principal: string;
+  reason_codes: string[];
+  unit_ids: string[] | null;
+}
+
 interface WireSnapshot {
   site_id: string;
   snapshot_sequence: number;
   captured_at: string;
   units: WireUnit[];
+  /**
+   * The snapshot's engaged stops, or null while the backend sends no
+   * `active_stops` at all (the feature detection: null never means "no stops
+   * engaged", an empty array does).
+   */
+  active_stops: WireActiveStop[] | null;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -112,6 +137,30 @@ function asUnit(value: unknown): WireUnit | null {
   };
 }
 
+/**
+ * The `active_stops` array: null when the field is absent (today's backend —
+ * feature detection), the narrowed stops when it is present.
+ */
+function asActiveStops(value: unknown): WireActiveStop[] | null {
+  if (!Array.isArray(value)) return null;
+  const stops: WireActiveStop[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry) || typeof entry.stop_id !== "string" || entry.stop_id === "") continue;
+    stops.push({
+      stop_id: entry.stop_id,
+      latched_at: typeof entry.latched_at === "string" ? entry.latched_at : "",
+      principal: typeof entry.principal === "string" ? entry.principal : "",
+      reason_codes: Array.isArray(entry.reason_codes)
+        ? entry.reason_codes.filter((code): code is string => typeof code === "string")
+        : [],
+      unit_ids: Array.isArray(entry.unit_ids)
+        ? entry.unit_ids.filter((id): id is string => typeof id === "string")
+        : null,
+    });
+  }
+  return stops;
+}
+
 function asSnapshot(value: unknown): WireSnapshot | null {
   if (!isRecord(value) || !Array.isArray(value.units)) return null;
   if (typeof value.site_id !== "string" || typeof value.snapshot_sequence !== "number") {
@@ -127,6 +176,7 @@ function asSnapshot(value: unknown): WireSnapshot | null {
     snapshot_sequence: value.snapshot_sequence,
     captured_at: typeof value.captured_at === "string" ? value.captured_at : "",
     units,
+    active_stops: asActiveStops(value.active_stops),
   };
 }
 
@@ -494,6 +544,16 @@ export function NowView({ client }: NowViewProps) {
   const [expiry, setExpiry] = useState<ExpiryMarker | null>(null);
   const [liveRefusal, setLiveRefusal] = useState<LiveRefusal | null>(null);
   const [latchedStop, setLatchedStop] = useState<LatchedStop | null>(null);
+  /**
+   * Engaged emergency stops as the bus announced them (`emergency_stop.latched`
+   * sets one, `emergency_stop.acknowledged` retires it). A snapshot that
+   * carries `active_stops` replaces this list wholesale; while the backend
+   * sends no such field, the frames are the only live latch signal this view
+   * has — the controls it holds are disabled and say why, never silently dead.
+   */
+  const [heldStops, setHeldStops] = useState<WireActiveStop[]>([]);
+  /** A latch the bus just announced that the newest adopted picture predates. */
+  const pendingStopIdRef = useRef<string | null>(null);
   const [revokedNotice, setRevokedNotice] = useState<string | null>(null);
   const [inhibitNotice, setInhibitNotice] = useState<string | null>(null);
 
@@ -550,6 +610,17 @@ export function NowView({ client }: NowViewProps) {
       capturedAtRef.current = monotonicNowMs();
       setSnapshot(wire);
       setLoadFailed(null);
+      if (wire.active_stops !== null) {
+        // A snapshot that carries the field is authoritative about engaged
+        // stops — except when it predates a latch the bus just announced (a
+        // read already in flight when the frame landed): that latch stands
+        // until the read the frame triggered arrives and carries it.
+        const pending = pendingStopIdRef.current;
+        const carried =
+          pending !== null && wire.active_stops.some((stop) => stop.stop_id === pending);
+        const stopsFromSnapshot = wire.active_stops;
+        setHeldStops((previous) => (pending !== null && !carried ? previous : stopsFromSnapshot));
+      }
       return true;
     },
     [],
@@ -722,8 +793,10 @@ export function NowView({ client }: NowViewProps) {
           );
         }
         setExpiry(null);
+        const frameStopId =
+          payload !== null && typeof payload.stop_id === "string" ? payload.stop_id : "";
         setLatchedStop({
-          stopId: payload !== null && typeof payload.stop_id === "string" ? payload.stop_id : null,
+          stopId: frameStopId === "" ? null : frameStopId,
           reason: payload !== null && typeof payload.reason === "string" ? payload.reason : null,
           degraded:
             payload !== null && Array.isArray(payload.degraded)
@@ -731,6 +804,22 @@ export function NowView({ client }: NowViewProps) {
               : [],
           unitIds,
         });
+        // The same latch as a control-holding fact: arm/disarm/charge/discharge
+        // are held with the stop named until it is acknowledged.
+        if (frameStopId !== "") {
+          pendingStopIdRef.current = frameStopId;
+        }
+        setHeldStops((previous) => [
+          ...previous.filter((stop) => stop.stop_id !== frameStopId),
+          {
+            stop_id: frameStopId,
+            latched_at:
+              typeof frame.occurred_at === "string" ? frame.occurred_at : "",
+            principal: payload !== null && typeof payload.principal === "string" ? payload.principal : "",
+            reason_codes: [],
+            unit_ids: unitIds,
+          },
+        ]);
         refetchSnapshot();
       } else if (type === "authorization.revoked") {
         // The runtime publishes this for every unit that still held authority
@@ -767,9 +856,16 @@ export function NowView({ client }: NowViewProps) {
         // of the grant.
         refetchSnapshot();
       } else if (type === "emergency_stop.acknowledged") {
-        // Another operator (or the system) cleared the latch: the notice goes
-        // and the refreshed snapshot decides where the fleet stands now.
+        // Another operator (or the system) cleared the latch: the notice goes,
+        // the held controls are released, and the refreshed snapshot decides
+        // where the fleet stands now.
         setLatchedStop(null);
+        const ackedStopId =
+          payload !== null && typeof payload.stop_id === "string" ? payload.stop_id : "";
+        if (ackedStopId !== "" && pendingStopIdRef.current === ackedStopId) {
+          pendingStopIdRef.current = null;
+        }
+        setHeldStops((previous) => previous.filter((stop) => stop.stop_id !== ackedStopId));
         refetchSnapshot();
       } else if (type === "inhibit.acknowledged") {
         // Clearing the latch changes no lifecycle: the unit re-qualifies through
@@ -958,6 +1054,27 @@ export function NowView({ client }: NowViewProps) {
     remainingSeconds !== null ? `${formatSeconds(remainingSeconds)} left` : "Not available";
 
   const controlReasons = health?.control_readiness.reasons ?? [];
+
+  // --- the engaged-stop hold ---------------------------------------------------
+  //
+  // A snapshot that carries `active_stops` is authoritative; while the backend
+  // sends no such field, the bus frames are. Either way the held controls are
+  // rendered disabled WITH the stop named — never silently gone.
+
+  const snapshotStops = snapshot?.active_stops ?? null;
+  const heldStopsNow = snapshotStops ?? heldStops;
+  const heldStop = heldStopsNow[0] ?? null;
+  const heldFromSnapshot = snapshotStops !== null;
+  const heldName =
+    heldStop === null ? null : heldStop.stop_id === "" ? "an emergency stop" : heldStop.stop_id;
+  const heldReason =
+    heldName === null
+      ? null
+      : `Held by emergency stop ${heldName} — ${
+          heldFromSnapshot
+            ? "acknowledge on the banner to release"
+            : "acknowledge the stop to release"
+        }`;
 
   // --- dialog plumbing -----------------------------------------------------------
 
@@ -1271,36 +1388,61 @@ export function NowView({ client }: NowViewProps) {
           ))}
 
           <div className="now-controls">
-            {armableUnits.length > 0 ? (
-              <button
-                type="button"
-                onClick={() => {
-                  // The arm gate is a safety question answered by current state:
-                  // refresh the snapshot and the readiness reasons before the
-                  // checklist renders, so a latch that appeared mid-session is
-                  // visible instead of green-lit from mount-time data.
-                  refreshReadiness();
-                  setDialog({ kind: "arm" });
-                }}
-              >
-                Arm
-              </button>
-            ) : null}
-            {armedUnits.length > 0 ? (
-              <button type="button" onClick={() => setDialog({ kind: "disarm" })}>
-                Disarm
-              </button>
-            ) : null}
-            {armedUnits.length > 0 ? (
-              <button type="button" onClick={() => openDispatchDialog("charge")}>
-                Charge
-              </button>
-            ) : null}
-            {armedUnits.length > 0 ? (
-              <button type="button" onClick={() => openDispatchDialog("discharge")}>
-                Discharge
-              </button>
-            ) : null}
+            {heldStop !== null ? (
+              <>
+                {/* While a stop holds the fleet, every control stays on screen
+                    and says why it cannot be used — vanishing buttons are the
+                    defect that left an operator with nothing to click. */}
+                <p id="now-held-reason" role="status" className="held-reason">
+                  {heldReason}
+                </p>
+                <button type="button" disabled aria-describedby="now-held-reason">
+                  Arm
+                </button>
+                <button type="button" disabled aria-describedby="now-held-reason">
+                  Disarm
+                </button>
+                <button type="button" disabled aria-describedby="now-held-reason">
+                  Charge
+                </button>
+                <button type="button" disabled aria-describedby="now-held-reason">
+                  Discharge
+                </button>
+              </>
+            ) : (
+              <>
+                {armableUnits.length > 0 ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      // The arm gate is a safety question answered by current state:
+                      // refresh the snapshot and the readiness reasons before the
+                      // checklist renders, so a latch that appeared mid-session is
+                      // visible instead of green-lit from mount-time data.
+                      refreshReadiness();
+                      setDialog({ kind: "arm" });
+                    }}
+                  >
+                    Arm
+                  </button>
+                ) : null}
+                {armedUnits.length > 0 ? (
+                  <button type="button" onClick={() => setDialog({ kind: "disarm" })}>
+                    Disarm
+                  </button>
+                ) : null}
+                {armedUnits.length > 0 ? (
+                  <button type="button" onClick={() => openDispatchDialog("charge")}>
+                    Charge
+                  </button>
+                ) : null}
+                {armedUnits.length > 0 ? (
+                  <button type="button" onClick={() => openDispatchDialog("discharge")}>
+                    Discharge
+                  </button>
+                ) : null}
+              </>
+            )}
             {units.length > 0 ? (
               <button type="button" onClick={() => setDialog({ kind: "stop" })}>
                 Emergency stop

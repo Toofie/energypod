@@ -135,6 +135,15 @@
   cursor: not-allowed;
 }
 
+/* The named reason a latch holds the controls: on the same row as the buttons
+ * it explains, so "disabled" is never a mystery. */
+.held-reason {
+  flex-basis: 100%;
+  margin: 0 0 0.2rem;
+  font-size: 0.92rem;
+  color: #9b2c2c;
+}
+
 /* Emergency stop is deliberately the heaviest control on the page. */
 .now-controls button:last-child {
   border-color: #e53e3e;

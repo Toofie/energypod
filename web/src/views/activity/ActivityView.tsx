@@ -360,10 +360,59 @@ function headlineFor(eventType: string): string {
   }
 }
 
+/**
+ * The decision reason code that means "an engaged emergency stop is holding
+ * every cycle at 0 W" (safety.py: the kernel authorizes the zero setpoints a
+ * latched stop leaves behind). The stop-holding cycles must never read as an
+ * ordinary "power allowed" grant.
+ */
+const STOP_AUTHORIZED = "stop_authorized";
+
+/** A decision row the stop is holding: the honest line, with the stop named. */
+function stopHeldLine(stopId: string | null): string {
+  return stopId === null
+    ? "Emergency stop active — all power held at 0 W"
+    : `Emergency stop ${stopId} active — all power held at 0 W`;
+}
+
+function isStopHeldDecision(event: AuditEvent): boolean {
+  return (
+    eventTypeOf(event) === "control_decision" &&
+    reasonCodesOf(event).includes(STOP_AUTHORIZED)
+  );
+}
+
+/**
+ * The id of the newest latched stop in the loaded timeline. The audit
+ * `emergency_stop` row carries the stop id as its `intent_id`, so the
+ * stop-holding decision rows can name the stop that held them. Null when no
+ * stop row is loaded — the honest line then names no id, never an invented
+ * one.
+ */
+function newestStopId(events: AuditEvent[]): string | null {
+  let best: { sequence: number; stopId: string } | null = null;
+  for (const event of events) {
+    if (eventTypeOf(event) !== "emergency_stop" || stringField(event, "result") !== "latched") {
+      continue;
+    }
+    const stopId = stringField(event, "intent_id");
+    if (stopId === undefined) {
+      continue;
+    }
+    const sequence = sequenceOf(event, 0);
+    if (best === null || sequence > best.sequence) {
+      best = { sequence, stopId };
+    }
+  }
+  return best === null ? null : best.stopId;
+}
+
 /** What was decided, from the decision status (`result`) and the signed watt
  * figures the audit record carries. Charge figures are negative on the wire;
- * the household sees magnitudes with the direction named in words. */
-function decidedLine(event: AuditEvent): string | null {
+ * the household sees magnitudes with the direction named in words. A cycle a
+ * latched stop held at 0 W says the stop held it — never "allowed 0 W of the
+ * 0 W requested". */
+function decidedLine(event: AuditEvent, stopId: string | null): string | null {
   const eventType = eventTypeOf(event);
   const result = stringField(event, "result");
   if (result === undefined) {
@@ -373,6 +422,9 @@ function decidedLine(event: AuditEvent): string | null {
     const requested = numberField(event, "requested_active_w");
     const authorized = numberField(event, "authorized_active_w");
     if (requested !== undefined && authorized !== undefined) {
+      if (isStopHeldDecision(event)) {
+        return stopHeldLine(stopId);
+      }
       return result === "clamped"
         ? `Reduced to ${Math.abs(authorized)} W of the ${Math.abs(requested)} W requested`
         : `Allowed ${Math.abs(authorized)} W of the ${Math.abs(requested)} W requested`;
@@ -403,14 +455,18 @@ function decidedLine(event: AuditEvent): string | null {
 /** What happened. The audit record's own `result`, in words — a missing
  * result is named as missing, never a fabricated measurement. A live
  * observation entry has no result at all: what happened is that a reading
- * landed, named with the telemetry sequence the frame carries. */
-function happenedLine(event: AuditEvent): string | null {
+ * landed, named with the telemetry sequence the frame carries. A stop-held
+ * cycle says the stop held it, never "power allowed". */
+function happenedLine(event: AuditEvent, stopId: string | null): string | null {
   const eventType = eventTypeOf(event);
   if (kindOf(eventType) === "observations") {
     const telemetrySequence = numberField(event, "telemetry_sequence");
     return telemetrySequence !== undefined
       ? `Latest reading received (telemetry sequence ${telemetrySequence})`
       : "Latest reading received";
+  }
+  if (isStopHeldDecision(event)) {
+    return stopHeldLine(stopId);
   }
   const result = stringField(event, "result");
   if (result === undefined) {
@@ -717,6 +773,9 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
       timeline.some((event) => stringField(event, "unit_id") === undefined),
     [timeline],
   );
+  /** The newest latched stop the loaded timeline names: stop-held decision
+   * rows say which stop held them instead of "power allowed". */
+  const newestLatchedStopId = useMemo(() => newestStopId(timeline), [timeline]);
 
   const toggleKind = useCallback((id: KindKey) => {
     setKindFilter((previous) => (previous === id ? null : id));
@@ -817,6 +876,7 @@ export function ActivityView({ client, connection = "connected" }: ActivityViewP
                   key={identityOf(event)}
                   event={event}
                   now={now}
+                  latchedStopId={newestLatchedStopId}
                 />
               ))}
             </ol>
@@ -975,7 +1035,16 @@ function ActivityError({
 
 /** One timeline entry: who requested it, what was decided, what happened,
  * and why — plain language first, raw codes behind a disclosure. */
-function ActivityEntry({ event, now }: { event: AuditEvent; now: number }) {
+function ActivityEntry({
+  event,
+  now,
+  latchedStopId,
+}: {
+  event: AuditEvent;
+  now: number;
+  /** The newest latched stop the loaded timeline names (see newestStopId). */
+  latchedStopId: string | null;
+}) {
   const [detailOpen, setDetailOpen] = useState(false);
   const eventType = eventTypeOf(event);
   const unitId = stringField(event, "unit_id");
@@ -983,8 +1052,8 @@ function ActivityEntry({ event, now }: { event: AuditEvent; now: number }) {
   const age = ageText(occurredAt, now);
   const stale = isStale(occurredAt, now);
   const who = principalName(event);
-  const decided = decidedLine(event);
-  const happened = happenedLine(event);
+  const decided = decidedLine(event, latchedStopId);
+  const happened = happenedLine(event, latchedStopId);
   const codes = reasonCodesOf(event);
   const why = whyLine(codes);
   const detailId = `activity-detail-${sequenceOf(event, 0)}`;

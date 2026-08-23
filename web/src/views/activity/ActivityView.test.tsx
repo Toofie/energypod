@@ -283,6 +283,70 @@ describe("Activity view", () => {
     expect(entry.getByText("power_clamped")).toBeVisible();
   });
 
+  it("renders a stop-held decision cycle honestly, naming the stop — never 'power allowed' at 0 W", async () => {
+    // The 2026-08-23 incident shape: while a stop latched, the kernel audited
+    // every cycle as authorized-at-0 W with reason stop_authorized, and the
+    // timeline read "Power allowed / Allowed 0 W of the 0 W requested".
+    const stopHeldDecision = auditEvent({
+      sequence: 63,
+      event_type: "control_decision",
+      unit_id: null,
+      occurred_at: minutesAgo(1),
+      principal: PRINCIPAL,
+      result: "authorized",
+      reason_codes: ["stop_authorized"],
+      requested_active_w: 0,
+      authorized_active_w: 0,
+    });
+    client.getAudit = vi
+      .fn()
+      .mockResolvedValue(auditPage([stopHeldDecision, emergencyStop], null));
+
+    renderView();
+
+    const items = await screen.findAllByRole("listitem");
+    expect(items).toHaveLength(2);
+    const decision = within(items[0] as HTMLElement);
+
+    // Both lines say the stop held the power, with the stop named (the
+    // emergency_stop row's own id is the only stop id on the wire).
+    expect(
+      decision.getAllByText("Emergency stop stop-17 active — all power held at 0 W"),
+    ).toHaveLength(2);
+    // The dishonest grants never appear.
+    expect(decision.queryByText("Power allowed")).toBeNull();
+    expect(decision.queryByText(/Allowed \d+ W of the \d+ W requested/)).toBeNull();
+    // The raw reason code stays available behind the disclosure.
+    const user = userEvent.setup();
+    await user.click(decision.getByRole("button", { name: "Show technical detail" }));
+    expect(decision.getByText("stop_authorized")).toBeVisible();
+  });
+
+  it("renders the stop-held line without inventing an id when no stop row is loaded", async () => {
+    const stopHeldDecision = auditEvent({
+      sequence: 63,
+      event_type: "control_decision",
+      unit_id: null,
+      occurred_at: minutesAgo(1),
+      principal: PRINCIPAL,
+      result: "authorized",
+      reason_codes: ["stop_authorized"],
+      requested_active_w: 0,
+      authorized_active_w: 0,
+    });
+    // The page holds only the decision: an older stop may simply be beyond
+    // the loaded page, so the line names no id rather than a guessed one.
+    client.getAudit = vi.fn().mockResolvedValue(auditPage([stopHeldDecision], null));
+
+    renderView();
+
+    const decision = within((await screen.findAllByRole("listitem"))[0] as HTMLElement);
+    expect(
+      decision.getAllByText("Emergency stop active — all power held at 0 W"),
+    ).toHaveLength(2);
+    expect(decision.queryByText("Power allowed")).toBeNull();
+  });
+
   it("paginates with the audit cursor and stops when the cursor is null", async () => {
     const getAudit = vi
       .fn()

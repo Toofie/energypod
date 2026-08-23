@@ -93,6 +93,16 @@ type SnapshotEnvelope = {
   snapshot_sequence: number;
   captured_at: string;
   units: UnitView[];
+  /** The amended snapshot contract's engaged stops (PENDING backend field). */
+  active_stops?: ActiveStopEnvelope[];
+};
+
+type ActiveStopEnvelope = {
+  stop_id: string;
+  latched_at: string;
+  principal: string;
+  reason_codes: string[];
+  unit_ids: string[] | null;
 };
 
 function snapshotEnvelope(units: UnitView[], sequence = 41): SnapshotEnvelope {
@@ -101,6 +111,27 @@ function snapshotEnvelope(units: UnitView[], sequence = 41): SnapshotEnvelope {
     snapshot_sequence: sequence,
     captured_at: "2026-08-22T12:00:00+10:00",
     units,
+  };
+}
+
+/** A snapshot world whose active_stops name one engaged stop. */
+function withActiveStop(
+  envelope: SnapshotEnvelope,
+  stopId: string,
+  sequence = envelope.snapshot_sequence,
+): SnapshotEnvelope {
+  return {
+    ...envelope,
+    snapshot_sequence: sequence,
+    active_stops: [
+      {
+        stop_id: stopId,
+        latched_at: "2026-08-22T23:14:24Z",
+        principal: "operator:home",
+        reason_codes: ["operator_requested"],
+        unit_ids: null,
+      },
+    ],
   };
 }
 
@@ -1088,13 +1119,20 @@ describe("NowView — latches arriving over the stream", () => {
     expect(alert).toHaveTextContent(/stop-11-1001\.000000/);
     expect(alert).toHaveTextContent(/MID/);
 
-    // No unit may present as armed or dispatchable while the latch holds.
+    // No unit may present as armed or dispatchable while the latch holds —
+    // but the controls stay on screen, disabled with the stop named (never
+    // silently dead: a vanished button left the operator nothing to read).
     await waitFor(() => {
-      expect(screen.queryByRole("button", { name: /^disarm/i })).toBeNull();
+      expect(screen.getByRole("button", { name: /^disarm/i })).toBeDisabled();
     });
-    expect(screen.queryByRole("button", { name: /^charge/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /^discharge/i })).toBeNull();
-    expect(screen.queryByRole("button", { name: /^arm\b/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /^charge/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^discharge/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^arm\b/i })).toBeDisabled();
+    expect(
+      screen.getByText(/held by emergency stop stop-11-1001\.000000/i),
+    ).toBeInTheDocument();
+    // Stopping is always possible: the stop control itself stays usable.
+    expect(screen.getByRole("button", { name: /emergency stop/i })).toBeEnabled();
     // The latched fleet is acknowledgeable, unit by unit.
     expect(screen.getByRole("button", { name: /acknowledge MID/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /acknowledge RHS/i })).toBeInTheDocument();
@@ -1139,7 +1177,7 @@ describe("NowView — latches arriving over the stream", () => {
       },
     });
     await waitFor(() => {
-      expect(screen.queryByRole("button", { name: /^disarm/i })).toBeNull();
+      expect(screen.getByRole("button", { name: /^disarm/i })).toBeDisabled();
     });
     expect(screen.getByRole("button", { name: /acknowledge MID/i })).toBeInTheDocument();
 
@@ -1233,6 +1271,104 @@ describe("NowView — latches arriving over the stream", () => {
     });
     expect(screen.queryByRole("button", { name: /^arm\b/i })).toBeNull();
     expect(screen.getByRole("button", { name: /acknowledge LHS/i })).toBeInTheDocument();
+  });
+});
+
+// --- controls held by a snapshot-reported emergency stop -----------------------
+//
+// The amended snapshot contract's active_stops (2026-08-23 incident fix): a
+// console opened mid-latch learns the stop from the world itself, and the
+// controls it holds are disabled WITH the stop named — never silently dead.
+
+describe("NowView — controls held by a snapshot-reported emergency stop", () => {
+  const STOP_ID = "stop-5-3753.297000";
+
+  it("disables arm, disarm, charge and discharge with the stop named; the stop control stays usable", async () => {
+    const stopped = withActiveStop(
+      snapshotEnvelope([
+        { ...DISARMED_MID, lifecycle: "inhibited" },
+        { ...ARMED_RHS, lifecycle: "inhibited" },
+      ]),
+      STOP_ID,
+    );
+    api.client.getSnapshot.mockResolvedValue(stopped);
+    api.client.openEvents.mockImplementation(() =>
+      liveStream([{ type: "snapshot", sequence: stopped.snapshot_sequence, data: stopped }]),
+    );
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    // The hold is on the record: the reason names the stop and points at the
+    // shell's latch banner, where the release lives.
+    expect(
+      await screen.findByText(
+        `Held by emergency stop ${STOP_ID} — acknowledge on the banner to release`,
+      ),
+    ).toBeInTheDocument();
+
+    for (const name of [/^arm\b/i, /^disarm/i, /^charge/i, /^discharge/i]) {
+      const button = screen.getByRole("button", { name });
+      expect(button).toBeDisabled();
+      // The disabled control explains itself to assistive technology too.
+      expect(describedText(button)).toContain(STOP_ID);
+    }
+    // Stopping is always possible.
+    expect(screen.getByRole("button", { name: /emergency stop/i })).toBeEnabled();
+  });
+
+  it("releases the hold when the acknowledgement clears it in an advancing snapshot", async () => {
+    const held = withActiveStop(
+      snapshotEnvelope([{ ...ARMED_MID, lifecycle: "inhibited" }]),
+      STOP_ID,
+    );
+    const recovered = snapshotEnvelope([DISARMED_MID], 45);
+    const channel = liveChannel([
+      { type: "snapshot", sequence: held.snapshot_sequence, data: held },
+    ]);
+    let acknowledged = false;
+    api.client.getSnapshot.mockImplementation(() =>
+      Promise.resolve(acknowledged ? recovered : held),
+    );
+    api.client.openEvents.mockImplementation(() => channel.openEvents());
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+    expect(screen.getByRole("button", { name: /^arm\b/i })).toBeDisabled();
+
+    // The acknowledgement (another session, the banner, or this one): the
+    // frame retires the hold immediately, and the refreshed, newer snapshot
+    // confirms a world with no engaged stops.
+    acknowledged = true;
+    channel.push({
+      type: "emergency_stop.acknowledged",
+      sequence: 44,
+      occurred_at: "2026-08-22T12:00:20+10:00",
+      payload: { principal: "operator-7", stop_id: STOP_ID },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: /^arm\b/i })).toBeEnabled();
+    });
+    expect(screen.getByRole("button", { name: /^arm\b/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^discharge/i })).toBeNull();
+    expect(screen.queryByText(/Held by emergency stop/)).toBeNull();
+  });
+
+  it("feature-detects: an inhibited fleet with no active_stops field is never guessed into a stop hold", async () => {
+    // Today's backend sends no active_stops; an inhibited lifecycle alone must
+    // not fabricate a named stop (the reason would name an id nobody knows).
+    const snap = snapshotEnvelope([{ ...DISARMED_MID, lifecycle: "inhibited" }]);
+    api.client.getSnapshot.mockResolvedValue(snap);
+    api.client.openEvents.mockImplementation(() =>
+      liveStream([{ type: "snapshot", sequence: 41, data: snap }]),
+    );
+    renderNow();
+    await screen.findByRole("group", { name: "Requested" });
+
+    expect(screen.queryByText(/Held by emergency stop/)).toBeNull();
+    // Inhibited units are not armable or dispatchable — the controls are
+    // simply absent, exactly as before the contract lands.
+    expect(screen.queryByRole("button", { name: /^arm\b/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^discharge/i })).toBeNull();
   });
 });
 
