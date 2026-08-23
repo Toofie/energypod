@@ -232,6 +232,20 @@ class PolicyConfig(_FrozenModel):
     # strict preflight: every nonzero objective this process did not write is
     # foreign.
     autonomous_charge_signature_max_w: PositiveStrictInt | None = None
+    # Self-healing awareness layer (2026-08-24 recovery research R4, promoted
+    # P1 vi): the actuation-coherence watchdog's commissioning knobs -- how
+    # many consecutive authorized-but-still cycles alarm, and the absolute
+    # movement floor below which a cycle is judged "not moving" (and above
+    # which tiny setpoints are never concluded against; see
+    # energypod.application.recovery).  Detection only: no control path
+    # consumes these.
+    actuation_coherence_cycles: PositiveStrictInt = 4
+    actuation_coherence_min_movement_w: PositiveStrictInt = 150
+    # P1 iii companion (unexpected-autonomy evidence): the commissioned
+    # EXPECTED autonomous battery-power envelope -- negative self-charge up to
+    # a small positive float.  Measured power outside this band while no
+    # intent claims the unit is timestamped evidence, never a block.
+    expected_autonomy_band_w: tuple[StrictInt, StrictInt] = (-2600, 300)
     debug_modes_enabled: StrictBool
 
     @field_validator("threshold_provenance")
@@ -261,6 +275,32 @@ class PolicyConfig(_FrozenModel):
         if len(set(cleaned)) != len(cleaned):
             raise ValueError("blocking warning codes must be unique")
         return cleaned
+
+    @field_validator("expected_autonomy_band_w")
+    @classmethod
+    def validate_autonomy_band(cls, values: tuple[int, int]) -> tuple[int, int]:
+        """The band must span the pods' own self-charge region.
+
+        The commissioned envelope is negative self-charge (~-520 W daytime
+        CT-following up to ~-2.6 kW deep charge) to a small positive float, so
+        a well-formed band is a strictly ascending integer pair whose lower
+        bound is at or below zero and whose upper bound is at or above zero:
+        it brackets the uncommanded operating region instead of excluding it.
+        """
+        low, high = values
+        if not low < high:
+            raise ValueError("expected_autonomy_band_w must be strictly ascending (low, high)")
+        if low > 0:
+            raise ValueError(
+                "expected_autonomy_band_w lower bound must be at or below zero: the pods "
+                "self-charge with negative battery power"
+            )
+        if high < 0:
+            raise ValueError(
+                "expected_autonomy_band_w upper bound must be at or above zero: an idle pod "
+                "floats near zero watts"
+            )
+        return (low, high)
 
     @model_validator(mode="after")
     def validate_ranges(self) -> Self:

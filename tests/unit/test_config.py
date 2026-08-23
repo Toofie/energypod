@@ -574,3 +574,74 @@ def test_excess_charging_intent_ttl_is_bounded() -> None:
     not_renewable = _valid_config()
     not_renewable["excess_charging"] = _excess_payload(intent_ttl_s=0.20)
     _assert_excess_rule(not_renewable, message_contains="control_period_s")
+
+
+# --- self-healing awareness layer (2026-08-24 recovery research, R4/P1 vi+iii) ---
+
+
+def test_policy_carries_the_recovery_detection_defaults() -> None:
+    """The actuation-coherence watchdog and the autonomy band commission with
+    pinned defaults, so an unchanged policy keeps today's behavior while the
+    keys stay explicit on the live-write example."""
+    parsed = _validate(_valid_config())
+
+    policy = parsed.policy
+    assert policy is not None
+    assert policy.actuation_coherence_cycles == 4
+    assert policy.actuation_coherence_min_movement_w == 150
+    assert tuple(policy.expected_autonomy_band_w) == (-2600, 300)
+
+
+def test_recovery_detection_keys_are_commissionable() -> None:
+    """Every key overrides cleanly; the band accepts the commissioned signed
+    pair spelling."""
+    payload = _valid_config()
+    payload["policy"].update(
+        {
+            "actuation_coherence_cycles": 6,
+            "actuation_coherence_min_movement_w": 200,
+            "expected_autonomy_band_w": [-3000, 500],
+        }
+    )
+
+    parsed = _validate(payload)
+
+    assert parsed.policy is not None
+    assert parsed.policy.actuation_coherence_cycles == 6
+    assert parsed.policy.actuation_coherence_min_movement_w == 200
+    assert tuple(parsed.policy.expected_autonomy_band_w) == (-3000, 500)
+
+
+def test_actuation_coherence_keys_must_be_positive() -> None:
+    """A zero or negative streak/door threshold is a commissioning error: the
+    watchdog would alarm on its first ambiguous cycle or never clear."""
+    for key, bad in (
+        ("actuation_coherence_cycles", 0),
+        ("actuation_coherence_cycles", -4),
+        ("actuation_coherence_min_movement_w", 0),
+        ("actuation_coherence_min_movement_w", -150),
+    ):
+        payload = _valid_config()
+        payload["policy"][key] = bad
+        with pytest.raises(ValidationError, match=key):
+            _validate(payload)
+
+
+def test_expected_autonomy_band_must_span_the_self_charge_region() -> None:
+    """The band is the commissioned EXPECTED autonomous envelope: negative
+    self-charge up to a small positive float.  A pair that does not span zero,
+    is not ascending, or is not exactly two integers is refused."""
+    for bad in (
+        [300, -2600],  # descending
+        [-2600, -2600],  # not strictly ascending
+        [100, 200],  # no self-charge region: the pods charge themselves negative
+        [-300, -100],  # no float region: idle pods sit near zero
+        [1, 2, 3],  # not a pair
+        [-2600],  # not a pair
+        [-2600.5, 300],  # not integers
+        ["-2600", 300],  # not integers
+    ):
+        payload = _valid_config()
+        payload["policy"]["expected_autonomy_band_w"] = bad
+        with pytest.raises(ValidationError, match="expected_autonomy_band_w"):
+            _validate(payload)
