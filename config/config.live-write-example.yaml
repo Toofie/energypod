@@ -282,6 +282,17 @@ policy:
   # evidence and can never classify foreign.  12 s covers the observed
   # hand-back with margin.
   foreign_objective_handback_grace_s: 12.0
+  # The site's OWN scheduled night writer, commissioned as the EXPECTED
+  # nightly charge: the existing Docker solution charges ALL THREE batteries
+  # at 2500 W per unit from 00:00 to 06:00 nightly.  A fleet-SYNCHRONIZED
+  # in-band charge inside 0.8x..1.2x of this figure classifies quiet as
+  # expected_nightly_charge — evidence with a clear characterization, never
+  # the alert tier (an expected writer, not an intruder; a partial-fleet or
+  # off-magnitude charge still escalates normally).  Setting this key does
+  # NOT sanction the writer: the arm-time sole-writer preflight and its
+  # external_writer latch are unchanged (arming mid-charge follows the
+  # ADD-1 pod-autonomy doctrine; arming after the 06:00 clear is ordinary).
+  foreign_objective_expected_charge_w: 2500
   debug_modes_enabled: false
 
 authentication:

@@ -235,6 +235,12 @@ class RecordingEnergyService:
                     "min_active_w": -2400,
                     "typical_active_w": -2400,
                     "max_active_w": -2400,
+                    "classification_counts": {
+                        "pod_autonomy_objective_observed": 0,
+                        "expected_nightly_charge": 0,
+                        "handback_grace": 0,
+                        "foreign_objective_observed": 641,
+                    },
                     "foreign_episode_count": 1,
                     "foreign_active": True,
                     "foreign_reason": "sustained_charge_without_pv_evidence",

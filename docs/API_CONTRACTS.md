@@ -1111,12 +1111,22 @@ night-window characterization. PASSIVE by construction, exactly like the awarene
 audit facts, bus events, and in-memory evidence records only — no write path, no latch, no
 block, no refusal originates here.
 
+**Motivation note (correcting the record).** The 2026-08-23 census closed "day shift is
+clean" and queued this detector against a 7.3 h unverified overnight window; the later
+night-load investigation's "no external writer" conclusion was drawn from EVENING sampling
+and arm-moment latches only — a pre-midnight window — and is superseded: the site's existing
+Docker solution charges ALL THREE batteries at 2,500 W per unit from 00:00 to 06:00 nightly.
+That writer is KNOWN and EXPECTED. This detector is the component that actually observes the
+night window, and its classification treats that writer as an expected pattern (quiet-tier
+evidence with a clear characterization), not an intruder.
+
 **Honest limits of the signature (stated up front, B6/ADD-1 doctrine).** The served-objective
 words alone CANNOT distinguish an external charge command from the pod's own self-charge:
 the night writers historically CHARGE (negative objectives), and negative objectives sit
 INSIDE the commissioned autonomy band — the pods' own firmware holds ~-520..-700 W daytime
-CT-following self-charge and up to ~-2.27 kW deep self-charge on the same register. So the
-detector records EVERY nonzero sample as timestamped evidence (unit, active/reactive words,
+CT-following self-charge and up to ~-2.27 kW deep self-charge on the same register, and the
+nightly −2500 W scheduled charge sits barely inside the band's −2600 edge. So the detector
+records EVERY nonzero sample as timestamped evidence (unit, active/reactive words,
 mode words, our lifecycle/claim state) and drives the ALERT tier from pattern rules on top;
 plain in-band float/self-charge never alerts. EVIDENCE first, alert second, and never a false
 alarm on the pods' normal autonomy (the operator's consistent direction).
@@ -1158,9 +1168,23 @@ alarm on the pods' normal autonomy (the operator's consistent direction).
   4. `P` outside the commissioned band: `foreign_objective_observed`, reason
      `outside_autonomy_band` — the same envelope the unexpected-autonomy recorder and the
      arm-time preflight consume, on the FIRST qualifying sample.
-  5. In-band nonzero: quiet evidence `pod_autonomy_objective_observed`, UNLESS a pattern rule
-     escalates (both require `foreign_objective_sustained_samples` CONSECUTIVE qualifying
-     samples; any non-qualifying sample resets the streak):
+  5. **The expected nightly charge (the site's own scheduled writer), recognized FIRST.** A
+     charge sample classifies quiet as `expected_nightly_charge` when ALL hold:
+     `foreign_objective_expected_charge_w` is commissioned; `P` is in-band AND within the
+     expected magnitude class (`0.8 ×` .. `1.2 ×` the commissioned figure — the scheduled
+     −2500 W × 3-unit charge, whatever small regulation drift the served words carry); and
+     the pattern is FLEET-SYNCHRONIZED — every OTHER configured unit's most recent recorded
+     sample is within the sync horizon (`max(5 × foreign_objective_sample_interval_s, 300 s)`
+     of this sample's time) and is itself a charge inside the same expected class. The
+     synchronization is the discriminator: the pods' own self-charge is per-pod and
+     PV-correlated, while the site scheduler starts one identical charge on every battery at
+     the same moment. A sample recognized here never escalates under either pattern rule
+     below, whatever its run-mode word reads (the scheduler's writes put the PCS into Remote
+     PQ mode exactly like any writer's). An expected charge on only SOME of the fleet — the
+     wrong signature for the known writer — does NOT qualify and escalates normally.
+  6. In-band nonzero otherwise: quiet evidence `pod_autonomy_objective_observed`, UNLESS a
+     pattern rule escalates (both require `foreign_objective_sustained_samples` CONSECUTIVE
+     qualifying samples; any non-qualifying sample resets the streak):
      - `sustained_remote_mode_objective` — every one of the last N consecutive samples held a
        nonzero in-band objective while the advisory run-mode word read `1` ("Remote PQ Power",
        the vendor's written-objective state, GlobalFun.cs:178-188). The pod's own CT-following
@@ -1172,7 +1196,7 @@ alarm on the pods' normal autonomy (the operator's consistent direction).
        PV evidence per sample is the SAME observation's advisory `grid_power_w > 0` (the site
        is exporting — surplus PV plausible); import or absent means no evidence. Site PV is
        never presented as measured (DESIGN_ENERGY_SCORECARD doctrine).
-  6. **Deliberate refinement, recorded:** the blanket "any positive-discharge objective at an
+  7. **Deliberate refinement, recorded:** the blanket "any positive-discharge objective at an
      hour with no PV evidence" rule was considered and REFUSED — the 2026-08-23 lhs evidence
      (a steady uncommanded +695..914 W hold after dark in Matching Load mode; config rev 5
      widened the band's positive edge to +1000 for exactly that behavior) proves in-band
@@ -1198,24 +1222,40 @@ alarm on the pods' normal autonomy (the operator's consistent direction).
   `{as_of, last, window_s, units: [{unit_id, first_seen_at|null, last_seen_at|null,
   sample_count, charge_sample_count, discharge_sample_count, min_active_w|nul,
   typical_active_w|null (the LOWER median of the in-window recorded samples),
-  max_active_w|null, foreign_episode_count, foreign_active, foreign_reason|null,
+  max_active_w|null, classification_counts ({pod_autonomy_objective_observed,
+  expected_nightly_charge, handback_grace, foreign_objective_observed} -> in-window counts),
+  foreign_episode_count, foreign_active, foreign_reason|null,
   last_objective_observed|nul}]}`. `sample_count` counts NONZERO recorded samples only
-  (zeros are not samples); the sign counts split them by the active word's sign. Pure read:
-  no mutation exists on this surface.
+  (zeros are not samples); the sign counts split them by the active word's sign. The nightly
+  writer's characterization — synchronized first-seen across units, the six-hour last-seen
+  span, the magnitude class, and the `expected_nightly_charge` count — is exactly what this
+  surface hands the night-partition decision. Pure read: no mutation exists on this surface.
 - **Snapshot and health.** Every snapshot unit and every `health()` units entry carries
-  `last_objective_observed`: null before any recorded sample, else
-  `{observed_at, active_w, reactive_var, classification, reason}`. The detector composes
+  `last_objective_observed`: null before any recorded sample, else the COMPACT
+  `{observed_at, active_w, reactive_var, classification, reason}` (the endpoint's per-unit
+  `last_objective_observed` is the full evidence record). The detector composes
   ALWAYS — no config block exists for it, observe-only included — so the key is never absent,
   only null. `health_state` and `control_readiness` gain NO vocabulary from this feature.
 - **Discrimination note.** The arm-time sole-writer preflight and its `external_writer` LATCH
   are untouched: this detector observes and reports; the latch remains the enforcement point.
+  Concretely for the nightly writer: arming AFTER the 06:00 clear is an ordinary sole-writer
+  arm; arming MID-CHARGE (03:00, a −2500 W objective on the wire) is judged entirely by the
+  standing ADD-1 doctrine — with the commissioned `autonomous_charge_signature_max_w: 2500`
+  the readback classifies `pod_autonomy` and the arm PROCEEDS by beat-autonomy (our renewal
+  replaces the scheduled writer's objective — coordinate, don't fight), while a discharge,
+  reactive, or beyond-signature objective latches `external_writer` exactly as before. The
+  detector's quiet `expected_nightly_charge` classification changes none of that: expected is
+  not sanctioned, it is characterized.
 - **Config keys** (`policy` block, all defaulted — an absent policy block uses the pinned
   defaults so observe-only deployments detect with the same eyes; detection only, no control
   path consumes them):
   `foreign_objective_sample_interval_s: 30.0` (1..3600, the MINIMUM spacing between recorded
   samples), `foreign_objective_sustained_samples: 3` (1..100),
   `foreign_objective_self_charge_class_w: 1000` (1..50000),
-  `foreign_objective_handback_grace_s: 12.0` (1..300).
+  `foreign_objective_handback_grace_s: 12.0` (1..300),
+  `foreign_objective_expected_charge_w: 2500 on the live-write example, `None` by default —
+  the strict posture until the operator commissions the site's own scheduled writer as
+  expected).
 - **Supervision driving.** One bounded, fully suppressed observation pass per fleet cycle,
   after the polls and the recovery pass and before the schedule runner: the pass reads each
   unit's fresh observation (poll-failed units contribute nothing), the live claim set, and

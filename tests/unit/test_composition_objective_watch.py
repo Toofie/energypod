@@ -170,6 +170,72 @@ async def test_supervision_samples_and_escalates_a_scripted_foreign_objective(
         await session.close()
 
 
+async def test_the_commissioned_nightly_writer_stays_quiet_and_characterized(
+    tmp_path: Path,
+) -> None:
+    """The site's OWN scheduled writer (config.live-write-example: all
+    batteries at -2500 W, 00:00-06:00): with the expectation commissioned,
+    the fleet-synchronized charge classifies quiet as expected_nightly_charge
+    through the composed loop -- the session record characterizes it and the
+    alert tier stays silent."""
+    runtime = compose_write_enabled(
+        tmp_path / "expected.sqlite3",
+        simulate=True,
+        clock=ScriptedClock(),
+        policy_overrides={
+            "maximum_cell_imbalance_v": 0.50,
+            **_objective_policy_overrides(),
+            "foreign_objective_expected_charge_w": 2500,
+        },
+    )
+    session = _LifespanSession(runtime.app)
+    try:
+        session.send("lifespan.startup")
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete")
+            or session.seen("lifespan.startup.failed"),
+            message="the application lifespan never reported supervision startup",
+        )
+        assert session.seen("lifespan.startup.complete"), f"startup failed: {session.events!r}"
+        await session.pump_until(
+            lambda: all(
+                actor.lifecycle.value in {"disarmed", "observe_only"}
+                for actor in runtime.actors.values()
+            ),
+            message="the simulated fleet never reached its uncommanded lifecycle",
+        )
+        for pod in runtime.simulators.values():
+            pod.script_objective(-2500, 0)
+        # Hold well past the sustained threshold: the expectation must hold.
+        for _ in range(300):
+            await asyncio.sleep(0)
+
+        view = runtime.foreign_objective.window_payload(last_hours=24)
+        for entry in view["units"]:
+            assert entry["sample_count"] >= 3, entry
+            assert entry["min_active_w"] == -2500
+            assert entry["foreign_active"] is False, entry
+            assert (
+                entry["classification_counts"]["expected_nightly_charge"] == entry["sample_count"]
+            ), entry
+        assert _detector_events(runtime) == []
+        alerts = [
+            body
+            for body in await _bus_events(runtime, limit=256)
+            if body["type"] == "foreign_objective.observed"
+        ]
+        assert alerts == []
+
+        session.send("lifespan.shutdown")
+        await session.pump_until(
+            lambda: session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed"),
+            message="the application lifespan never reported supervision shutdown",
+        )
+    finally:
+        await session.close()
+
+
 async def test_a_unit_claimed_by_our_own_intent_is_never_sampled(tmp_path: Path) -> None:
     """Our own intent serving: while the claim is live the detector does not
     sample the unit at all -- the words on the wire are ours -- and the

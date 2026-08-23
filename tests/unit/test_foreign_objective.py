@@ -37,6 +37,7 @@ import pytest
 CLASS_POD_AUTONOMY = "pod_autonomy_objective_observed"
 CLASS_FOREIGN = "foreign_objective_observed"
 CLASS_HANDBACK = "handback_grace"
+CLASS_EXPECTED_NIGHTLY = "expected_nightly_charge"
 REASON_OUTSIDE_BAND = "outside_autonomy_band"
 REASON_REACTIVE = "reactive_objective_observed"
 REASON_REMOTE_MODE = "sustained_remote_mode_objective"
@@ -130,6 +131,7 @@ def monitor(
     sustained_samples: int = 3,
     self_charge_class_w: int = 1000,
     handback_grace_s: float = 12.0,
+    expected_charge_w: int | None = None,
     band: tuple[int, int] = (-2600, 300),
     clock: ManualClock | None = None,
     audit: RecordingAudit | None = None,
@@ -143,6 +145,7 @@ def monitor(
             sustained_samples=sustained_samples,
             self_charge_class_w=self_charge_class_w,
             handback_grace_s=handback_grace_s,
+            expected_charge_w=expected_charge_w,
             expected_autonomy_band_w=band,
         ),
         clock=resolved_clock,
@@ -210,6 +213,7 @@ def test_settings_defaults_are_the_pinned_contract_values(api: Any) -> None:
     assert settings.sustained_samples == 3
     assert settings.self_charge_class_w == 1000
     assert settings.handback_grace_s == 12.0
+    assert settings.expected_charge_w is None, "strict until the writer is commissioned"
     assert settings.expected_autonomy_band_w == (-2600, 300)
 
 
@@ -225,6 +229,8 @@ def test_settings_defaults_are_the_pinned_contract_values(api: Any) -> None:
         ("self_charge_class_w", 50001),
         ("handback_grace_s", 0.0),
         ("handback_grace_s", 301.0),
+        ("expected_charge_w", 0),
+        ("expected_charge_w", 50001),
     ],
 )
 def test_settings_reject_out_of_bounds_knobs(api: Any, field_name: str, value: Any) -> None:
@@ -667,6 +673,181 @@ async def test_a_remote_mode_break_resets_the_remote_streak(api: Any) -> None:
     assert audit.of_type(CLASS_FOREIGN) == [], "streak of one after the break"
 
 
+# --- the expected nightly charge (the site's own scheduled writer) ------------------
+
+
+async def test_the_synchronized_nightly_charge_is_expected_and_quiet(api: Any) -> None:
+    """THE known writer: the site's Docker solution charges ALL THREE
+    batteries at -2500 W from 00:00 to 06:00.  A FLEET-SYNCHRONIZED in-band
+    charge inside the commissioned magnitude class classifies quiet as
+    ``expected_nightly_charge`` -- characterized evidence, never the alert
+    tier -- however long it holds and whatever the run-mode word says (the
+    scheduler's own writes put the PCS into Remote PQ mode like any
+    writer's)."""
+    audit, bus = RecordingAudit(), RecordingBus()
+    clock = ManualClock()
+    mon = monitor(
+        api,
+        units=("lhs", "mid", "rhs"),
+        audit=audit,
+        bus=bus,
+        clock=clock,
+        interval_s=1.0,
+        sustained_samples=3,
+        expected_charge_w=2500,
+    )
+    for minute in range(8):
+        now = 1000.0 + minute
+        clock.now = now
+        for unit in ("lhs", "mid", "rhs"):
+            await cycle(
+                mon,
+                unit,
+                active_w=-2500,
+                captured_at_mono=now,
+                grid_power_w=-1500.0,
+                run_mode_w=1,
+                now_mono=now,
+            )
+
+    for unit in ("lhs", "mid", "rhs"):
+        entry = session_of(mon, unit)
+        assert entry["last_objective_observed"]["classification"] == CLASS_EXPECTED_NIGHTLY
+        assert entry["classification_counts"][CLASS_EXPECTED_NIGHTLY] == 8, unit
+        assert entry["foreign_active"] is False, unit
+    assert audit.appended == [] and bus.published == []
+
+
+async def test_an_expected_class_charge_without_fleet_sync_still_escalates(api: Any) -> None:
+    """Synchronization is the discriminator: the same -2400 W charge on ONE
+    battery is the wrong signature for the known writer (the scheduler starts
+    all three at once), so the sustained-charge rule escalates normally."""
+    audit = RecordingAudit()
+    clock = ManualClock()
+    mon = monitor(
+        api,
+        units=("lhs", "mid", "rhs"),
+        audit=audit,
+        clock=clock,
+        interval_s=1.0,
+        sustained_samples=3,
+        expected_charge_w=2500,
+    )
+    for now in (1000.0, 1001.0, 1002.0):
+        clock.now = now
+        await cycle(
+            mon,
+            "mid",
+            active_w=-2400,
+            captured_at_mono=now,
+            grid_power_w=-1500.0,
+            run_mode_w=None,
+            now_mono=now,
+        )
+
+    (event,) = audit.of_type(CLASS_FOREIGN)
+    assert event.unit_id == "mid"
+    assert REASON_SUSTAINED_CHARGE in event.reason_codes
+
+
+async def test_an_off_magnitude_charge_is_not_the_expected_writer(api: Any) -> None:
+    """A synchronized charge OUTSIDE the 0.8x..1.2x magnitude class of the
+    commissioned figure is not the site's scheduler: it escalates."""
+    audit = RecordingAudit()
+    clock = ManualClock()
+    mon = monitor(
+        api,
+        units=("lhs", "mid", "rhs"),
+        audit=audit,
+        clock=clock,
+        interval_s=1.0,
+        sustained_samples=3,
+        expected_charge_w=2500,
+    )
+    for now in (1000.0, 1001.0, 1002.0):
+        clock.now = now
+        for unit in ("lhs", "mid", "rhs"):
+            await cycle(
+                mon,
+                unit,
+                active_w=-1500,
+                captured_at_mono=now,
+                grid_power_w=-1500.0,
+                run_mode_w=None,
+                now_mono=now,
+            )
+
+    assert len(audit.of_type(CLASS_FOREIGN)) == 3, "every unit's off-magnitude charge"
+
+
+async def test_without_a_commissioned_expectation_every_sustained_charge_escalates(
+    api: Any,
+) -> None:
+    """The strict default: until the operator commissions the expected writer
+    (``foreign_objective_expected_charge_w``), a synchronized nightly charge
+    is simply a sustained beyond-class charge without PV evidence."""
+    audit = RecordingAudit()
+    clock = ManualClock()
+    mon = monitor(
+        api,
+        units=("lhs", "mid", "rhs"),
+        audit=audit,
+        clock=clock,
+        interval_s=1.0,
+        sustained_samples=3,
+        expected_charge_w=None,
+    )
+    for now in (1000.0, 1001.0, 1002.0):
+        clock.now = now
+        for unit in ("lhs", "mid", "rhs"):
+            await cycle(
+                mon,
+                unit,
+                active_w=-2500,
+                captured_at_mono=now,
+                grid_power_w=-1500.0,
+                run_mode_w=None,
+                now_mono=now,
+            )
+
+    assert len(audit.of_type(CLASS_FOREIGN)) == 3
+
+
+async def test_the_sync_horizon_expires_and_the_expectation_lapses(api: Any) -> None:
+    """A unit whose latest recorded charge is older than the sync horizon no
+    longer corroborates the fleet pattern: the expectation lapses and the
+    sustained-charge rule takes over (interval 1 s -> horizon 300 s)."""
+    audit = RecordingAudit()
+    clock = ManualClock()
+    mon = monitor(
+        api,
+        units=("lhs", "mid", "rhs"),
+        audit=audit,
+        clock=clock,
+        interval_s=1.0,
+        sustained_samples=3,
+        expected_charge_w=2500,
+    )
+    # The fleet holds the expected charge together.
+    for now in (1000.0, 1001.0, 1002.0):
+        clock.now = now
+        for unit in ("lhs", "mid", "rhs"):
+            await cycle(mon, unit, active_w=-2500, captured_at_mono=now, grid_power_w=-100.0)
+    assert audit.appended == []
+    # lhs's writer stops (its words go zero -- nothing records); mid/rhs keep
+    # charging past the horizon.
+    for index, now in enumerate((1400.0, 1401.0, 1402.0)):
+        clock.now = now
+        await cycle(mon, "lhs", active_w=0, captured_at_mono=now)
+        for unit in ("mid", "rhs"):
+            await cycle(mon, unit, active_w=-2500, captured_at_mono=now, grid_power_w=-100.0)
+        if index < 2:
+            assert audit.appended == [], f"inside the horizon ({now})"
+
+    escalated = {event.unit_id for event in audit.of_type(CLASS_FOREIGN)}
+    assert escalated == {"mid", "rhs"}, "the uncorroborated charges escalated"
+
+
 # --- the session record and its read surfaces ---------------------------------------
 
 
@@ -700,6 +881,12 @@ async def test_the_session_record_accumulates_the_characterization(api: Any) -> 
     # one foreign episode; the closing -500 quiet sample closed it again.
     assert entry["foreign_episode_count"] == 1
     assert entry["foreign_active"] is False
+    assert entry["classification_counts"] == {
+        CLASS_POD_AUTONOMY: 4,
+        CLASS_EXPECTED_NIGHTLY: 0,
+        CLASS_HANDBACK: 0,
+        CLASS_FOREIGN: 1,
+    }
     assert entry["last_objective_observed"]["active_w"] == -500
 
 
@@ -796,6 +983,7 @@ def test_the_window_payload_shape_is_exactly_the_pinned_one(api: Any) -> None:
         "min_active_w",
         "typical_active_w",
         "max_active_w",
+        "classification_counts",
         "foreign_episode_count",
         "foreign_active",
         "foreign_reason",
@@ -803,6 +991,12 @@ def test_the_window_payload_shape_is_exactly_the_pinned_one(api: Any) -> None:
     }
     assert empty["first_seen_at"] is None
     assert empty["foreign_active"] is False
+    assert empty["classification_counts"] == {
+        CLASS_POD_AUTONOMY: 0,
+        CLASS_EXPECTED_NIGHTLY: 0,
+        CLASS_HANDBACK: 0,
+        CLASS_FOREIGN: 0,
+    }
     assert empty["last_objective_observed"] is None
 
 
