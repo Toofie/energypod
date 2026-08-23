@@ -79,6 +79,11 @@ From the 32-agent Milestone A implementation review (all P0/P1 were fixed in
    non-serializable values fail the publish.
 2. EventBus: future/negative cursors produce a silently dead iterator with no
    resync marker.
+   Status: FIXED 2026-08-23 — negative and non-int cursors are rejected
+   input; a cursor ahead of the live edge (desynchronized client, e.g.
+   carried from another process instance) gets an explicit
+   `future_cursor` resync marker naming the live snapshot and then
+   continues from the live edge.
 3. EventBus: abandoned subscriptions are never reclaimed (O(capacity) drain
    per publish forever).
 4. EventBus: envelope accepts non-string keys / non-mapping payloads; in-memory

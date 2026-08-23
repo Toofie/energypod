@@ -24,6 +24,7 @@ from typing import Any, Protocol
 _RESYNC_TYPE = "resync"
 _RESYNC_STALE_CURSOR = "retention_window_exceeded"
 _RESYNC_SLOW_CONSUMER = "slow_subscriber"
+_RESYNC_FUTURE_CURSOR = "future_cursor"
 # The bus overwrites these envelope fields on every publication; a caller
 # supplying them is untrusted input, exactly like a forged audit sequence.
 _SERVER_ASSIGNED_KEYS = frozenset({"sequence", "occurred_at"})
@@ -54,7 +55,8 @@ def _build_envelope(body: Mapping[str, Any], *, sequence: int, occurred_at: str)
     # subscriber), and a caller mutating or aliasing its payload after publish
     # can never reach the retention window or another subscriber's queue.  The
     # retained copy is exactly the wire shape.
-    return json.loads(json.dumps(envelope, ensure_ascii=False, allow_nan=False))
+    detached: dict[str, Any] = json.loads(json.dumps(envelope, ensure_ascii=False, allow_nan=False))
+    return detached
 
 
 def _resync_marker(reason: str, snapshot_sequence: int) -> dict[str, Any]:
@@ -230,6 +232,18 @@ class EventBus:
         if after_sequence is None:
             # A cursor-less subscription is live-only; it never replays.
             return self._sequence, (), None
+        if isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
+            raise TypeError("after_sequence must be an integer or None")
+        if after_sequence < 0:
+            raise ValueError("after_sequence must be a non-negative integer")
+        if after_sequence > self._sequence:
+            # A cursor ahead of the live edge names history that does not
+            # exist: the client's view is desynchronized (for example carried
+            # over from another process instance).  Saying nothing would
+            # silently suppress every event up to the fabricated sequence, so
+            # the subscriber is told to resynchronize from the live snapshot
+            # instead and then continues from the live edge.
+            return self._sequence, (), (_RESYNC_FUTURE_CURSOR, self._sequence)
         if self._window:
             oldest = self._window[0]["sequence"]
             if after_sequence < oldest - 1:

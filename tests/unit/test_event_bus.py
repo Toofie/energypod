@@ -670,3 +670,47 @@ async def test_nested_non_serializable_payload_fails_the_publish(bus_module: Any
     with pytest.raises((TypeError, ValueError)):
         await bus.publish({"type": "observation.updated", "payload": {"cause": object()}})
     assert bus.snapshot_sequence() == 0, "a failed publication consumes no sequence"
+
+
+async def test_future_cursor_gets_an_explicit_resync_marker_not_a_dead_stream(
+    bus_module: Any,
+) -> None:
+    # Deferred P2 (implementation review 2026-08-22): a cursor ahead of the
+    # live edge used to produce a silently dead iterator.  It is a
+    # desynchronized client (its sequence can only come from another process
+    # instance): the first delivery is an explicit marker naming the live
+    # snapshot, and the stream continues from the live edge.
+    bus = make_bus(bus_module, retention=8, queue_capacity=8)
+    await publish_events(bus, start=0, count=2)
+    iterator = bus.subscribe(after_sequence=99)
+    marker = await next_event(iterator)
+    assert is_resync_marker(marker), f"expected a discontinuity marker, got {marker!r}"
+    assert marker["reason"] == "future_cursor"
+    assert marker["snapshot_sequence"] == 2
+    await publish_event(bus, "observation.updated", {"index": 2})
+    event = await next_event(iterator)
+    assert event is not _EXHAUSTED and event["sequence"] == 3
+    await close_subscription(iterator)
+
+
+async def test_an_empty_bus_still_flags_a_future_cursor(bus_module: Any) -> None:
+    # Sequence 0 live edge: any positive cursor is fabricate history.
+    bus = make_bus(bus_module)
+    iterator = bus.subscribe(after_sequence=1)
+    marker = await next_event(iterator)
+    assert is_resync_marker(marker), f"expected a discontinuity marker, got {marker!r}"
+    assert marker["snapshot_sequence"] == 0
+    await close_subscription(iterator)
+
+
+@pytest.mark.parametrize("cursor", [-1, -100])
+def test_negative_cursors_are_rejected_input(bus_module: Any, cursor: int) -> None:
+    bus = make_bus(bus_module)
+    with pytest.raises(ValueError):
+        bus.subscribe(after_sequence=cursor)
+
+
+def test_boolean_cursors_are_rejected_input(bus_module: Any) -> None:
+    bus = make_bus(bus_module)
+    with pytest.raises(TypeError):
+        bus.subscribe(after_sequence=True)  # type: ignore[arg-type]
