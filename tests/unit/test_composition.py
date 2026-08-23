@@ -55,6 +55,7 @@ from energypod.domain.audit import AuditEvent
 from energypod.domain.authorization import AuthorizationBatch, AuthorizedSetpoint
 from energypod.runtime.config import ControllerConfig
 from energypod.simulator import SimulatorTransport
+from tests.unit.test_event_bus import close_subscription, drain
 
 UNIT_IDS = ("mid", "rhs")
 UNIT_IDENTITIES = {"mid": "BEP-MID", "rhs": "BEP-RHS"}
@@ -843,6 +844,107 @@ def _actors_stopped(runtime: Any) -> bool:
         actor.lifecycle in {UnitLifecycle.STOPPING, UnitLifecycle.DISCONNECTED}
         for actor in runtime.actors.values()
     )
+
+
+# --- intent lifecycle and grant events on the composed bus ---------------------
+#
+# 2026-08-23 observability root cause: an intent whose TTL lapsed published
+# nothing at all -- the kernel's no-winner revoke publishes only while a unit
+# still holds a capability, which is never true at expiry -- and authority
+# grants were store-only, so the console's request cards never saw either
+# transition.  The console consumes `intent.expired` and
+# `authorization.granted` by those exact names.
+
+
+async def _bus_events(runtime: Any, *, limit: int = 64) -> list[dict[str, Any]]:
+    iterator = runtime.event_bus.subscribe(after_sequence=0)
+    try:
+        return await drain(iterator, limit)
+    finally:
+        await close_subscription(iterator)
+
+
+def _short_lived_intent(api: Any = None) -> PowerIntent:
+    del api
+    return PowerIntent(
+        id="short-lived-1",
+        source=IntentSource.MANUAL,
+        selected_unit_ids=frozenset(UNIT_IDS),
+        direction=Direction.DISCHARGE,
+        watts=1200,
+        duration_s=5.0,
+        accepted_at_mono=0.0,
+        acceptance_revision=21,
+        actor_identity="person:operator",
+    )
+
+
+async def test_expired_intents_publish_on_the_event_bus_exactly_once(
+    tmp_path: Path,
+) -> None:
+    runtime = compose(tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock())
+    intent = _short_lived_intent()
+    await _settle(runtime.intents.add(intent))
+    assert await _settle(runtime.intents.active(4.0))
+
+    # The kernel's no-winner tick is the live trigger: its own intent read
+    # crosses the TTL boundary, so the expiry the fleet actually acted on is
+    # the one the bus carries.
+    runtime.clock.elapsed_s = 10.0
+    assert await runtime.kernel.tick() is None
+
+    (event,) = [event for event in await _bus_events(runtime) if event["type"] == "intent.expired"]
+    assert event["payload"] == {
+        "intent_id": "short-lived-1",
+        "source": "manual",
+        "direction": "discharge",
+        "watts": 1200,
+        "unit_ids": sorted(UNIT_IDS),
+    }
+
+    # The transition fires once: later reads, ticks, and snapshots never
+    # re-announce an already-published expiry.
+    sequence_after = runtime.event_bus.snapshot_sequence()
+    await _settle(runtime.intents.active(11.0))
+    await runtime.kernel.tick()
+    assert runtime.event_bus.snapshot_sequence() == sequence_after
+
+
+async def test_removed_intents_never_publish_an_expiry(tmp_path: Path) -> None:
+    """A cancelled or acknowledged intent leaves by removal, not by TTL: the
+    bus must not announce an expiry for an intent that was deliberately
+    taken out of the store."""
+    runtime = compose(tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock())
+    intent = _short_lived_intent()
+    await _settle(runtime.intents.add(intent))
+    assert await _settle(runtime.intents.active(4.0))
+    await _settle(runtime.intents.remove(intent.id))
+    runtime.clock.elapsed_s = 10.0
+    await _settle(runtime.intents.active(10.0))
+    assert not any(event["type"] == "intent.expired" for event in await _bus_events(runtime))
+
+
+async def test_published_authorizations_announce_the_grant_on_the_bus(
+    tmp_path: Path,
+) -> None:
+    """Symmetry with authorization.revoked: a batch that lands in the store is
+    announced as authorization.granted with the cycle, generation, and units
+    it carries authority for."""
+    runtime = compose_write_enabled(
+        tmp_path / "fleet.sqlite3", simulate=True, clock=ScriptedClock()
+    )
+    epoch = (await runtime.generation_coordinator.snapshot()).epoch
+    batch = _authorization_batch(generation=epoch, issued_at=0.0)
+    await _settle(runtime.authorizations.publish(batch))
+
+    (event,) = [
+        item for item in await _bus_events(runtime) if item["type"] == "authorization.granted"
+    ]
+    assert event["payload"] == {
+        "cycle_id": batch.cycle_id,
+        "generation": epoch,
+        "unit_ids": sorted(UNIT_IDS),
+    }
 
 
 async def test_lifespan_starts_and_stops_supervision(tmp_path: Path) -> None:

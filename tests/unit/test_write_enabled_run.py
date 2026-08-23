@@ -58,6 +58,7 @@ from energypod.adapters.modbus import (
 from energypod.application.actor import EnergyPodActor, InhibitCause
 from energypod.domain import DecisionStatus, UnitLifecycle
 from energypod.runtime.config import ControllerConfig
+from tests.unit.test_event_bus import close_subscription, drain
 
 # --- the commissioned unit, as pinned by the 2026-08-22 captures and trial -----
 #
@@ -1301,3 +1302,91 @@ async def test_post_stop_intent_expiry_cannot_fence_every_later_cycle(
         await _shutdown_actors(runtime)
 
     _assert_replay_safety(journal)
+
+
+async def test_intent_lifecycle_and_grant_events_reach_the_console_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """W1 (2026-08-23 observability): the console consumes ``intent.expired``,
+    ``authorization.granted``, and watt-bearing ``audit.appended`` events by
+    those exact names.  A driving control loop must publish all three: the
+    grant when authority lands, the watt figures on every control-decision
+    audit append, and exactly one expiry when the intent's TTL lapses."""
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, _banks = _install_replay_transport(monkeypatch, clock)
+    runtime = _build(_validate(_config_payload(mode="write_enabled")), clock)
+
+    try:
+        actor = runtime.actors[_UNIT_ID]
+        await actor.start()
+        await _qualify(runtime, clock)
+        await _arm(runtime)
+        clock.advance(_CONTROL_PERIOD_S)
+        await actor.poll_once()
+        await runtime.facade.submit_intent(
+            unit_ids=[_UNIT_ID],
+            direction="charge",
+            watts=_CHARGE_W,
+            ttl_s=1.2,
+            reason="lifecycle events regression",
+            principal=OPERATOR,
+            idempotency_key="lifecycle-dispatch-1",
+            request_id="lifecycle-dispatch-1-request",
+        )
+        intent_id = next(
+            event["payload"]["intent_id"]
+            for event in await _drain_bus(runtime)
+            if event["type"] == "intent.accepted"
+        )
+
+        # The driving cycle: authority granted, watts on the audit stream.
+        clock.advance(_CONTROL_PERIOD_S)
+        await actor.poll_once()
+        await runtime.kernel.tick()
+        await actor.heartbeat_once()
+        events = await _drain_bus(runtime)
+        (grant,) = [e for e in events if e["type"] == "authorization.granted"]
+        assert grant["payload"]["unit_ids"] == [_UNIT_ID]
+        assert (
+            grant["payload"]["generation"]
+            == (await runtime.generation_coordinator.snapshot()).epoch
+        )
+        decisions = [
+            e
+            for e in events
+            if e["type"] == "audit.appended" and e["payload"]["event_type"] == "control_decision"
+        ]
+        assert decisions, "the control decision must reach the console stream"
+        assert decisions[-1]["payload"]["requested_active_w"] == -_CHARGE_W
+        assert decisions[-1]["payload"]["authorized_active_w"] == -_CHARGE_W
+
+        # The TTL lapse publishes exactly one intent.expired, never more.
+        clock.advance(_CONTROL_PERIOD_S * 2 + 0.05)
+        await actor.poll_once()
+        assert await runtime.kernel.tick() is None
+        events = await _drain_bus(runtime)
+        expiries = [e for e in events if e["type"] == "intent.expired"]
+        assert [e["payload"]["intent_id"] for e in expiries] == [intent_id]
+        assert expiries[0]["payload"]["unit_ids"] == [_UNIT_ID]
+        # No further tick ever re-announces the lapse.
+        published = runtime.event_bus.snapshot_sequence()
+        await runtime.kernel.tick()
+        after = runtime.event_bus.subscribe(after_sequence=published)
+        try:
+            followups = await drain(after, 16)
+        finally:
+            await close_subscription(after)
+        assert not [e for e in followups if e["type"] == "intent.expired"]
+    finally:
+        await _shutdown_actors(runtime)
+
+    _assert_replay_safety(journal)
+
+
+async def _drain_bus(runtime: Any) -> list[dict[str, Any]]:
+    iterator = runtime.event_bus.subscribe(after_sequence=0)
+    try:
+        return await drain(iterator, 256)
+    finally:
+        await close_subscription(iterator)
