@@ -23,7 +23,14 @@ export type ShellView = ComponentType<ShellViewProps>;
 /** The injection map the shell is handed (main.tsx assigns real views into it). */
 export type ViewRegistry = Partial<Record<ViewId, ShellView>>;
 
-export type ViewId = "home" | "batteries" | "now" | "schedule" | "activity" | "insights";
+export type ViewId =
+  | "home"
+  | "batteries"
+  | "now"
+  | "schedule"
+  | "activity"
+  | "insights"
+  | "objectives";
 
 export interface ViewDescriptor {
   id: ViewId;
@@ -38,6 +45,7 @@ export const VIEWS: readonly ViewDescriptor[] = [
   { id: "schedule", label: "Schedule" },
   { id: "activity", label: "Activity" },
   { id: "insights", label: "Insights" },
+  { id: "objectives", label: "Objectives" },
 ];
 
 /**
@@ -54,5 +62,10 @@ export const VIEWS: readonly ViewDescriptor[] = [
  * landed (DESIGN_ENERGY_SCORECARD.md §8 W-B), under the same pinned decision:
  * the link is always offered and the view answers a not-commissioned
  * deployment honestly.
+ *
+ * "Objectives" was promoted out of this list when the night-writer detector's
+ * evidence view landed (API_CONTRACTS.md "Night-writer detector"): its read
+ * surface composes ALWAYS (no config block exists), so the link is always
+ * offered and always has an answer once the detector's backend half lands.
  */
 export const PLANNED_VIEWS: readonly string[] = ["Energy flow", "Plan history"];

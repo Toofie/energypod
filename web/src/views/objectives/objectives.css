@@ -1,0 +1,116 @@
+/* Objectives view — the night-writer detector's evidence table. An evidence
+   surface, not an alarm surface: plain rows, one honest caution tone on a
+   unit the detector currently classifies foreign (never a badge's weight). */
+
+.objectives-view {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  max-width: 60rem;
+}
+
+.objectives-intro {
+  margin: 0;
+  color: #57534e;
+}
+
+/* The pinned honesty note: the signature's own limit, always visible. */
+.objectives-honesty {
+  margin: 0;
+  border: 1px solid #b3892f;
+  border-radius: 0.5rem;
+  padding: 0.45rem 0.65rem;
+  background: #fdf8ee;
+  color: #57534e;
+  font-size: 0.9rem;
+}
+
+.objectives-window {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.objectives-window-option {
+  border: 1px solid #d6d3d1;
+  border-radius: 999px;
+  background: #fff;
+  padding: 0.25rem 0.8rem;
+  cursor: pointer;
+}
+
+.objectives-window-option[aria-pressed="true"] {
+  border-color: #1c1917;
+  background: #1c1917;
+  color: #fff;
+}
+
+.objectives-loading {
+  margin: 0;
+  color: #78716c;
+}
+
+.objectives-caption {
+  margin: 0;
+  color: #78716c;
+  font-size: 0.9rem;
+}
+
+.objectives-empty {
+  margin: 0;
+  color: #57534e;
+}
+
+.objectives-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+
+.objectives-table-caption {
+  caption-side: top;
+  text-align: left;
+  font-weight: 600;
+  padding-bottom: 0.35rem;
+}
+
+.objectives-table th,
+.objectives-table td {
+  border: 1px solid #e7e5e4;
+  padding: 0.4rem 0.55rem;
+  text-align: left;
+  vertical-align: top;
+  font-size: 0.92rem;
+}
+
+.objectives-table thead th {
+  background: #fafaf9;
+  font-size: 0.85rem;
+}
+
+/* A unit the detector currently classifies foreign: the one caution tone on
+   this view — a tint, never a badge (the row's own words say why). */
+.objectives-table tbody tr[data-foreign-now="true"] {
+  background: #fdf8ee;
+}
+
+.objectives-error {
+  border: 1px solid #dc2626;
+  border-radius: 0.5rem;
+  padding: 0.5rem 0.7rem;
+  background: #fef2f2;
+}
+
+.objectives-error-title {
+  margin: 0 0 0.25rem;
+  font-weight: 600;
+}
+
+.objectives-error-code,
+.objectives-error-message,
+.objectives-error-request {
+  margin: 0.15rem 0;
+}
+
+.objectives-retry {
+  margin-top: 0.35rem;
+}

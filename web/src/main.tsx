@@ -16,6 +16,7 @@ import { BatteriesView } from "./views/batteries/BatteriesView";
 import { HomeView } from "./views/home/HomeView";
 import { InsightsView } from "./views/insights/InsightsView";
 import { NowView } from "./views/now/NowView";
+import { ObjectivesView } from "./views/objectives/ObjectivesView";
 import { ScheduleView } from "./views/schedule/ScheduleView";
 import "./styles.css";
 
@@ -26,6 +27,7 @@ const views: ViewRegistry = {
   schedule: ScheduleView,
   activity: ActivityView,
   insights: InsightsView,
+  objectives: ObjectivesView,
 } satisfies Partial<Record<ViewId, ShellView>>;
 
 const container = document.getElementById("root");
