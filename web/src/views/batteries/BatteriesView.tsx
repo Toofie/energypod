@@ -62,6 +62,8 @@ import type {
   AuditPage,
   StreamEvent,
 } from "../../api/client";
+import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
+import type { WattsByUnit } from "../../app/fleet";
 import {
   formatMillivolts,
   formatPercent,
@@ -752,6 +754,10 @@ function FleetCard({
 
 interface UnitDetailProps {
   unit: ViewUnit;
+  /** The whole fleet snapshot: a shared requested figure is a fleet total. */
+  units: ViewUnit[];
+  requestedByUnit: WattsByUnit | null;
+  authorizedByUnit: WattsByUnit | null;
   observation: ObservationTrack | undefined;
   siteId: string;
   capturedAt: string;
@@ -770,11 +776,17 @@ interface UnitDetailProps {
 
 function SummaryPanel({
   unit,
+  units,
+  requestedByUnit,
+  authorizedByUnit,
   observation,
   detailData,
   detailPhase,
 }: {
   unit: ViewUnit;
+  units: ViewUnit[];
+  requestedByUnit: WattsByUnit | null;
+  authorizedByUnit: WattsByUnit | null;
   observation: ObservationTrack | undefined;
   detailData: UnitDetailView | null;
   detailPhase: DetailPhase;
@@ -799,6 +811,36 @@ function SummaryPanel({
         : `${detailData.deviceIdentity}${
             detailData.protocolProfile === null ? "" : `, profile ${detailData.protocolProfile}`
           }`;
+  // The requested figure is the battery's OWN target whenever a per-unit
+  // source exists (the shared tracker's map — the intent's `watts_by_unit`,
+  // seeded live by the decision summaries and cold by the snapshot `intent`
+  // block). The snapshot's per-unit `requested_power` repeats the intent's
+  // FLEET TOTAL once per covered unit (service.py `_requested_power`), so a
+  // figure several batteries share is stated AS the fleet total, never as
+  // this battery's request; a figure no other battery shares is this
+  // battery's own (one battery's fleet total IS its per-battery figure).
+  const mappedRequested = requestedByUnit !== null ? requestedByUnit[unit.unit_id] : undefined;
+  const requestLive = requested.direction !== "idle" || requested.watts > 0;
+  const sharingRequest = requestLive
+    ? units.filter(
+        (other) =>
+          other.requested_power.direction === requested.direction &&
+          other.requested_power.watts === requested.watts,
+      ).length
+    : 1;
+  const requestedFigureText =
+    mappedRequested !== undefined
+      ? `${directionWord(requested.direction).toLowerCase()} ${formatWatts(mappedRequested)}`
+      : sharingRequest > 1
+        ? `${directionWord(requested.direction).toLowerCase()} — fleet total ${formatWatts(
+            requested.watts,
+          )} across ${sharingRequest} batteries (this battery's own share is not available from this snapshot)`
+        : `${directionWord(requested.direction).toLowerCase()} ${formatWatts(requested.watts)}`;
+  // The allowance is genuinely per-unit on the wire; the decision's map wins
+  // when present (it is the same figure, captured at the decision itself).
+  const mappedAuthorized =
+    authorizedByUnit !== null ? authorizedByUnit[unit.unit_id] : undefined;
+  const allowedWatts = mappedAuthorized ?? allowed?.watts ?? null;
   return (
     <div>
       <p>
@@ -810,18 +852,21 @@ function SummaryPanel({
         {soh === null ? "" : `; state of health ${formatPercent(soh)}`}
       </p>
       <p>
-        <b>Power:</b> requested {directionWord(requested.direction).toLowerCase()}{" "}
-        {formatWatts(requested.watts)}; allowed{" "}
-        {allowed === null
+        <b>Power:</b> requested {requestedFigureText}; allowed{" "}
+        {allowed === null && allowedWatts === null
           ? "none recorded"
-          : `${directionWord(allowed.direction).toLowerCase()} ${formatWatts(allowed.watts)}`}
+          : `${directionWord(allowed?.direction ?? requested.direction).toLowerCase()} ${
+              allowedWatts === null ? "no data" : formatWatts(allowedWatts)
+            }`}
         ; delivering {actual}
       </p>
       <p>
         <b>Limits:</b>{" "}
-        {allowed === null
+        {allowed === null && allowedWatts === null
           ? "No authorized power recorded"
-          : `Allowed ${directionWord(allowed.direction).toLowerCase()} up to ${formatWatts(allowed.watts)}`}
+          : `Allowed ${directionWord(allowed?.direction ?? requested.direction).toLowerCase()} up to ${
+              allowedWatts === null ? "no data" : formatWatts(allowedWatts)
+            }`}
       </p>
       <p>
         <b>Device limits (dynamic):</b>{" "}
@@ -1154,6 +1199,9 @@ function DetailsPanel({
 
 function UnitDetail({
   unit,
+  units,
+  requestedByUnit,
+  authorizedByUnit,
   observation,
   siteId,
   capturedAt,
@@ -1232,6 +1280,9 @@ function UnitDetail({
         {tab === "summary" && (
           <SummaryPanel
             unit={unit}
+            units={units}
+            requestedByUnit={requestedByUnit}
+            authorizedByUnit={authorizedByUnit}
             observation={observation}
             detailData={detailData}
             detailPhase={detailPhase}
@@ -1423,17 +1474,33 @@ export function BatteriesView({
   const cursorRef = useRef<number | undefined>(undefined);
   const streamStartedRef = useRef(false);
   const openerRef = useRef<HTMLElement | null>(null);
+  /**
+   * The live request's per-unit figures — the ONE shared tracker
+   * (web/src/app/useUnitIntentFigures.ts): the intent's own `watts_by_unit`
+   * and the decision's `authorized_watts_by_unit` from the stream, seeded for
+   * a cold load by the snapshot's `intent` block when the backend sends one
+   * (feature-detected; an absent block keeps the snapshot fallbacks). The
+   * Summary figures below render a battery's OWN target from it and state a
+   * shared snapshot figure AS the fleet total — never one battery's request.
+   */
+  const unitFigures = useUnitIntentFigures();
+  const adoptFigures = unitFigures.adoptSnapshot;
+  const consumeFigures = unitFigures.consumeEvent;
 
-  const applySnapshot = useCallback((raw: unknown): void => {
-    const parsed = parseSnapshot(raw);
-    if (parsed === null) {
-      return;
-    }
-    setFleet(parsed);
-    if (!streamStartedRef.current) {
-      cursorRef.current = parsed.sequence;
-    }
-  }, []);
+  const applySnapshot = useCallback(
+    (raw: unknown): void => {
+      const parsed = parseSnapshot(raw);
+      if (parsed === null) {
+        return;
+      }
+      adoptFigures(raw);
+      setFleet(parsed);
+      if (!streamStartedRef.current) {
+        cursorRef.current = parsed.sequence;
+      }
+    },
+    [adoptFigures],
+  );
 
   const loadSnapshot = useCallback(async (): Promise<boolean> => {
     try {
@@ -1553,6 +1620,10 @@ export function BatteriesView({
               return;
             }
             setStreamLost(false);
+            // Every frame feeds the shared per-unit figure tracker (its own
+            // no-ops carry most kinds): acceptances and control-decision
+            // audits move the maps, request-ending frames clear their units.
+            consumeFigures(frame);
             if (frame.type === "resync_required") {
               const recovery = frame.snapshot_sequence;
               if (typeof recovery === "number") {
@@ -1593,7 +1664,7 @@ export function BatteriesView({
     return () => {
       cancelled = true;
     };
-  }, [applySnapshot, client, streamOn]);
+  }, [applySnapshot, client, streamOn, consumeFigures]);
 
   const retrySnapshot = (): void => {
     setPhase("loading");
@@ -1743,6 +1814,9 @@ export function BatteriesView({
           <UnitDetail
             key={detailUnit.unit_id}
             unit={detailUnit}
+            units={units}
+            requestedByUnit={unitFigures.requestedByUnit}
+            authorizedByUnit={unitFigures.authorizedByUnit}
             observation={observations[detailUnit.unit_id]}
             siteId={fleet?.siteId ?? ""}
             capturedAt={fleet?.capturedAt ?? ""}

@@ -50,6 +50,7 @@ import {
   type StreamEvent,
 } from "../../api/client";
 import {
+  auditAppended,
   auditEvent,
   auditPage,
   emptyUnitDetail,
@@ -60,6 +61,7 @@ import {
   unitDetail,
   unitSnapshot,
   withInhibit,
+  withSnapshotIntent,
   type WireSnapshot,
   type WireUnitDetail,
   type WireUnitSnapshot,
@@ -329,6 +331,120 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     expect(mid).toHaveTextContent(/950\s*W/);
     expect(mid).not.toHaveTextContent(/2,?400/);
     expect(mid).not.toHaveTextContent(/-950/);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Per-unit request truth (the 2026-08-23 false-Limited defect family)
+  // ---------------------------------------------------------------------------
+  //
+  // The snapshot's per-unit `requested_power` repeats the intent's FLEET TOTAL
+  // once per covered unit, so a shared figure is never this battery's own
+  // request: without per-unit figures it is labelled AS the fleet total, and
+  // with them (the shared tracker's maps, seeded live by the decision
+  // summaries or cold by the snapshot `intent` block) the exact per-battery
+  // figure renders. The allowance is genuinely per-unit on the wire either way.
+
+  /** Three active batteries repeating one intent's 3,000 W total. */
+  function sharedTotalWorld(): WireSnapshot {
+    return snapshot(
+      [
+        unitSnapshot({
+          unit_id: "MID",
+          lifecycle: "active",
+          telemetry_age_s: 2,
+          requested_power: { direction: "discharge", watts: 3000 },
+          authorized_power: { direction: "discharge", watts: 1000 },
+          measured_watts: 990,
+        }),
+        unitSnapshot({
+          unit_id: "RHS",
+          lifecycle: "active",
+          telemetry_age_s: 3,
+          requested_power: { direction: "discharge", watts: 3000 },
+          authorized_power: { direction: "discharge", watts: 1000 },
+          measured_watts: 980,
+        }),
+        unitSnapshot({
+          unit_id: "LHS",
+          lifecycle: "active",
+          telemetry_age_s: 4,
+          requested_power: { direction: "discharge", watts: 3000 },
+          authorized_power: { direction: "discharge", watts: 1000 },
+          measured_watts: 970,
+        }),
+      ],
+      { snapshot_sequence: 4100, captured_at: CAPTURED_AT },
+    );
+  }
+
+  it("labels the snapshot's repeated figure as the fleet total — never this battery's own request", async () => {
+    const user = userEvent.setup();
+    const state = sharedTotalWorld();
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(state);
+    client.openEvents.mockReturnValue(openStream(fleetEvents(state)));
+    renderView(client);
+
+    await user.click(await screen.findByRole("button", { name: "MID" }));
+    const summary = await screen.findByRole("tabpanel");
+    await waitFor(() => {
+      expect(summary).toHaveTextContent(
+        /requested discharging — fleet total 3,000 W across 3 batteries/i,
+      );
+    });
+    // The allowance IS per-unit on the wire: 1,000 W for this battery.
+    expect(summary).toHaveTextContent(/allowed discharging 1,000 W/i);
+    expect(summary.textContent ?? "").not.toMatch(/requested discharging 3,000 W/);
+  });
+
+  it("renders the exact per-battery figure once the snapshot carries its intent block (cold load)", async () => {
+    const user = userEvent.setup();
+    const state = withSnapshotIntent(sharedTotalWorld(), {
+      requested_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+      authorized_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+      directions_by_unit: { MID: "discharge", RHS: "discharge", LHS: "discharge" },
+    });
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(state);
+    client.openEvents.mockReturnValue(openStream(fleetEvents(state)));
+    renderView(client);
+
+    await user.click(await screen.findByRole("button", { name: "MID" }));
+    const summary = await screen.findByRole("tabpanel");
+    await waitFor(() => {
+      expect(summary).toHaveTextContent(/requested discharging 1,000 W/i);
+    });
+    expect(summary.textContent ?? "").not.toMatch(/fleet total/);
+    expect(summary).toHaveTextContent(/allowed discharging 1,000 W/i);
+  });
+
+  it("picks the exact per-battery figure up from the kernel's decision summaries on the stream", async () => {
+    const user = userEvent.setup();
+    const state = sharedTotalWorld();
+    const events = [
+      ...fleetEvents(state),
+      // The cycle's own maps: each unit's winning target, authorized in full.
+      auditAppended(4104, {
+        event_type: "control_decision",
+        result: "authorized",
+        requested_active_w: 3000,
+        authorized_active_w: 3000,
+        requested_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        authorized_watts_by_unit: { MID: 1000, RHS: 1000, LHS: 1000 },
+        directions_by_unit: { MID: "discharge", RHS: "discharge", LHS: "discharge" },
+      }),
+    ];
+    const client = makeClient();
+    client.getSnapshot.mockResolvedValue(state);
+    client.openEvents.mockReturnValue(openStream(events));
+    renderView(client);
+
+    await user.click(await screen.findByRole("button", { name: "MID" }));
+    const summary = await screen.findByRole("tabpanel");
+    await waitFor(() => {
+      expect(summary).toHaveTextContent(/requested discharging 1,000 W/i);
+    });
+    expect(summary.textContent ?? "").not.toMatch(/fleet total/);
   });
 
   // ---------------------------------------------------------------------------
