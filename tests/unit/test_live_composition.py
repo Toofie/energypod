@@ -1377,6 +1377,66 @@ async def test_pcs_live_block_is_promoted_to_the_control_rate_core_for_excess_ch
         )
 
 
+async def test_a_cell_deny_promotes_the_cell_window_into_the_next_plan() -> None:
+    """SYNC_RESILIENCE_AUDIT B4: deny-triggered cell tier promotion.
+
+    The cell window normally rides the every-3rd-cycle tier, so a cell-bound
+    deny judges a window up to ~3 s old while the live battery may already
+    have recovered.  A deny therefore schedules the 0x5200 window into the
+    VERY NEXT poll regardless of the ``cycle % 3`` phase -- one promoted
+    cycle (the hint is consumed by the plan), the steady plan stays inside
+    the commissioned budget (<= 9 windows plus the probe), and the deny is
+    then re-evaluated on FRESH battery data: a recovered window authorizes,
+    a persisting violation keeps denying.
+    """
+    bank = _register_banks_by_host()["192.168.1.11"]
+    cell_window = (0x5200, 60)
+
+    strategy = _live_decode_strategy(bank, promote_pcs_live_block=False)
+    await strategy.advance()  # cycle 1: cells by phase
+    assert cell_window in strategy.read_plan()
+    await strategy.advance()  # cycle 2: no cells by phase
+    assert cell_window not in strategy.read_plan()
+
+    strategy.request_cell_refresh()
+    await strategy.advance()  # cycle 3: no cells by phase -- promoted
+    promoted = strategy.read_plan()
+    assert cell_window in promoted, "a cell deny must promote the window past the phase"
+    assert len(promoted) <= 9, (
+        "the promoted plan must stay inside the commissioned cadence budget "
+        "(8 -> 9 windows, ~1.0 s at the 0.1 s inter-frame gap, inside the 1.5 s "
+        "control period / 1.60 s renewal budget)"
+    )
+
+    await strategy.advance()  # cycle 4: cells by phase (4 % 3 == 1)
+    assert cell_window in strategy.read_plan()
+    await strategy.advance()  # cycle 5: the hint was consumed -- phase rules again
+    assert cell_window not in strategy.read_plan(), "the promotion lasts exactly one cycle"
+    await strategy.advance()  # cycle 6: still phase-ruled
+    assert cell_window not in strategy.read_plan()
+    await strategy.advance()  # cycle 7: cells by phase
+    strategy.request_cell_refresh()  # a duplicate hint must not double the window
+    plan = strategy.read_plan()
+    assert plan.count(cell_window) == 1
+
+
+def test_the_fleet_loop_promotes_cells_for_every_cell_derived_deny() -> None:
+    """The supervisor promotes the cell window from the tick's decision
+    reasons: every cell-derived deny code schedules the fresh re-read."""
+    module = _composition()
+    reasons = getattr(module, "CELL_DENY_REASONS", None)
+    promote = getattr(module, "decision_requests_cell_refresh", None)
+    if reasons is None or promote is None:  # pragma: no cover - red-phase pin
+        pytest.fail("the composition does not yet expose the cell-deny promotion contract")
+    assert reasons == frozenset(
+        {"cell_voltage_low", "cell_voltage_high", "cell_imbalance", "cell_count_invalid"}
+    )
+    assert promote(SimpleNamespace(reason_codes=("safety_checks_passed",))) is False
+    assert promote(SimpleNamespace(reason_codes=("cell_voltage_low",))) is True
+    assert promote(SimpleNamespace(reason_codes=("power_clamped", "cell_imbalance"))) is True
+    assert promote(None) is False
+
+
 async def test_the_system_overview_block_rides_the_cold_ring_not_a_once_per_process_read() -> None:
     """SYNC_RESILIENCE_AUDIT B5 + the SOC-incident read-plan follow-up.
 

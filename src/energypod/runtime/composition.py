@@ -189,6 +189,27 @@ _DEV_PRINCIPAL_SCOPES = frozenset(
     {"observe", "audit:read", "dispatch", "arm", "stop", "stop:acknowledge"}
 )
 
+# SYNC_RESILIENCE_AUDIT B4 (2026-08-24): the cell-derived deny reasons whose
+# decision promotes the 0x5200 window into the next poll of every unit's
+# actor, so the deny is re-evaluated on FRESH cell data at most one cycle
+# later (the window otherwise rides the every-3rd-cycle tier and may judge a
+# cached window up to ~3 s old).  ``cell_count_invalid`` is included: it is
+# judged on the same served window.
+CELL_DENY_REASONS: frozenset[str] = frozenset(
+    {"cell_voltage_low", "cell_voltage_high", "cell_imbalance", "cell_count_invalid"}
+)
+
+
+def decision_requests_cell_refresh(decision: Any) -> bool:
+    """Whether a tick's decision carries any cell-derived deny reason (B4)."""
+    if decision is None:
+        return False
+    codes = getattr(decision, "reason_codes", None)
+    return isinstance(codes, tuple | list | set | frozenset) and bool(
+        set(codes) & CELL_DENY_REASONS
+    )
+
+
 # API_CONTRACTS "Excess-solar accelerated charging (advisory)": the composed
 # automation principal the excess-charge adviser submits under.  Audit
 # attribution relies on principal plus the ``optimizer`` source tag — local
@@ -1180,6 +1201,21 @@ class _LiveDecodeTelemetry:
         self._cycle = 0
         self._slow_cache: dict[int, tuple[tuple[int, ...], float]] = {}
         self._cell_meta: tuple[float, int] | None = None
+        # B4 (SYNC_RESILIENCE_AUDIT): one-shot deny-triggered promotion of
+        # the cell window, set through ``request_cell_refresh()`` by the
+        # owning actor after a cell-derived deny, consumed by the next
+        # ``read_plan()``.
+        self._cell_refresh_requested = False
+
+    def request_cell_refresh(self) -> None:
+        """Promote the cell window into the NEXT plan regardless of phase.
+
+        A cell-bound deny may have judged a cached window up to ~3 s old
+        while the live battery already recovered; the promoted poll
+        re-evaluates the deny on fresh cells (and an honest fresh capture
+        clock advances with it).  Exactly one promoted cycle.
+        """
+        self._cell_refresh_requested = True
 
     async def advance(self) -> None:
         """Probe the served layout so this cycle's plan follows the wire."""
@@ -1254,7 +1290,14 @@ class _LiveDecodeTelemetry:
         if self._promote_pcs_live_block:
             core_bases.add(_PCS_LIVE_BLOCK_BASE)
         plan = [(base, by_base[base]) for base in sorted(core_bases) if base in by_base]
-        if _CELL_VOLTAGE_BASE in by_base and self._cycle % 3 == 1:
+        cell_due = _CELL_VOLTAGE_BASE in by_base and self._cycle % 3 == 1
+        if self._cell_refresh_requested:
+            # B4: a cell-derived deny promoted this cycle; the hint is
+            # consumed here so the promotion lasts exactly one cycle (a
+            # persisting fresh violation re-denies and the loop re-sets it).
+            self._cell_refresh_requested = False
+            cell_due = _CELL_VOLTAGE_BASE in by_base
+        if cell_due:
             plan.append((_CELL_VOLTAGE_BASE, by_base[_CELL_VOLTAGE_BASE]))
         cold = sorted(base for base in by_base if base not in core_bases | {_CELL_VOLTAGE_BASE})
         if cold and self._cycle % 8 == 0:
@@ -1718,7 +1761,20 @@ class _Supervision:
             # and the durable audit write is transactional — and letting the
             # TimeoutError end this task makes the watcher halt the fleet with
             # evidence instead of the loop wedging silently forever.
-            await asyncio.wait_for(self._kernel.tick(), timeout=self._interval_s)
+            decision = await asyncio.wait_for(self._kernel.tick(), timeout=self._interval_s)
+            if decision_requests_cell_refresh(decision):
+                # B4 (SYNC_RESILIENCE_AUDIT): the decision carried a
+                # cell-derived deny, so each unit's NEXT telemetry cycle
+                # includes the cell window regardless of the tier phase --
+                # the deny is then re-judged on fresh battery data (a
+                # recovered window authorizes; a persisting violation
+                # re-denies and re-promotes).  Reason codes are per-decision,
+                # not per-unit, so every actor is flagged; the promoted plan
+                # stays inside the commissioned cadence budget (8 -> 9
+                # windows ~1.0 s at the 0.1 s inter-frame gap, inside the
+                # 1.5 s control period / 1.60 s renewal budget).
+                for actor in self._actors:
+                    actor.request_cell_refresh()
 
     async def _bounded_poll(self, actor: EnergyPodActor) -> None:
         with contextlib.suppress(Exception, asyncio.TimeoutError):

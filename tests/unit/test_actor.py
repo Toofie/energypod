@@ -271,6 +271,7 @@ def make_actor(
     authorizations: FakeAuthorizationRepository | None = None,
     blocking_fault_codes: frozenset[str] | None = None,
     mode_refresh_window: tuple[int, int] | None = None,
+    telemetry: Any | None = None,
 ) -> tuple[Any, FakeClock, SpyTransport, FakeObservationRepository, FakeAuthorizationRepository]:
     test_clock = clock or FakeClock()
     test_transport = transport or SpyTransport()
@@ -294,6 +295,7 @@ def make_actor(
         heartbeat_safety_margin_s=0.2,
         blocking_fault_codes=blocking_fault_codes,
         mode_refresh_window=mode_refresh_window,
+        telemetry=telemetry,
     )
     return actor, test_clock, test_transport, observation_repo, authorization_repo
 
@@ -357,6 +359,39 @@ async def test_mode_word_refresh_without_a_wired_window_fails_closed(contract: A
 
     with pytest.raises(RuntimeError, match="mode refresh window"):
         await actor.refresh_mode_words()
+    await actor.shutdown()
+
+
+async def test_cell_refresh_request_reaches_the_next_polls_telemetry_plan(contract: Any) -> None:
+    """SYNC_RESILIENCE_AUDIT B4: the fleet loop flags the actor after a
+    cell-derived deny; the actor's NEXT poll forwards the hint to its
+    telemetry strategy (sole transport ownership unchanged) and consumes it
+    -- exactly one promoted cycle, then the tier phase rules again."""
+    hints: list[bool] = []
+
+    class RecordingTelemetry:
+        async def advance(self) -> None:
+            return None
+
+        def request_cell_refresh(self) -> None:
+            hints.append(True)
+
+        def read_plan(self) -> tuple[tuple[int, int], ...]:
+            return ()
+
+        def decode(self, blocks: Any, lifecycle: Any) -> Any:
+            return ObservationRecord()
+
+    actor, _, _, _, _ = make_actor(contract, telemetry=RecordingTelemetry())
+    await actor.start()
+
+    await actor.poll_once()
+    assert hints == [], "no hint before any request"
+    actor.request_cell_refresh()
+    await actor.poll_once()
+    assert hints == [True], "the requested poll forwards the hint exactly once"
+    await actor.poll_once()
+    assert hints == [True], "the hint is consumed by one poll"
     await actor.shutdown()
 
 

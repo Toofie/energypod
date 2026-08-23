@@ -708,6 +708,18 @@ with one rotation-phase change: the default ring now visits the SYSTEM OVERVIEW 
 B5's cold-ring move) and the PCS block at cycle 16, so the advisory mode words and system SOC
 appear within seconds of boot instead of at the ring's tail.
 
+**Deny-triggered cell promotion (SYNC_RESILIENCE_AUDIT B4, 2026-08-24).** A control decision
+carrying any cell-derived deny reason (`cell_voltage_low`, `cell_voltage_high`, `cell_imbalance`,
+`cell_count_invalid`) promotes the 0x5200 cell window into the NEXT telemetry cycle of every
+unit's actor, regardless of the every-3rd-cycle phase: the deny is then re-evaluated on FRESH
+battery data at most one cycle later, so a violation that recovered in the live battery (a load
+sag that lifted) authorizes instead of denying on the cached window, while a PERSISTENT fresh
+violation keeps denying — the 2026-08-23 LHS 54 mV manual fresh-read confirmation, automated.
+The promotion lasts exactly one cycle (a persisting deny re-promotes); the promoted plan is
+≤ 9 windows plus the probe (~1.0 s at the 0.1 s inter-frame gap), inside the 1.5 s control
+period and the 1.60 s renewal budget of the commissioned write-enabled timing. `cell_data_stale`
+(15 s) and the whole-poll failure path are untouched: genuinely unreadable stays fail-closed.
+
 ### Beat-autonomy hysteresis
 
 While renewed, the adviser's objective REPLACES the pod's own self-consumption (its CT-following

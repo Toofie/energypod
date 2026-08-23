@@ -47,6 +47,12 @@
 #     operation budget (2.40 s) and the renewal cadence budget (1.60 s) both
 #     fit strictly inside the 3.00 s device command expiry, and the 0.50 s
 #     write timeout fits strictly inside the 1.00 s control period.
+#   - Read-plan budget against that cadence (SYNC_RESILIENCE_AUDIT B4/B5):
+#     steady polls read 7 core windows + the probe; the every-3rd-cycle cell
+#     window makes 8; a cell-deny re-verification promotes cells onto any
+#     cycle (9 windows ~1.0 s at the 0.1 s inter-frame gap), and the cold
+#     ring adds one window every 8th cycle — every shape fits inside the
+#     1.50 s control period and the 1.60 s renewal budget below.
 #   - The database path stays on the /var/lib/energypod data volume so
 #     `energypod db backup`/`restore` see one durable store, and is distinct
 #     from the observe-only deployment's database.

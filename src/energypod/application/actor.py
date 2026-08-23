@@ -173,6 +173,9 @@ class EnergyPodActor:
         # this actor) makes any nonzero readback foreign: a fresh process
         # cannot inherit provenance.
         self._applied_objective: tuple[int, int] | None = None
+        # B4 (SYNC_RESILIENCE_AUDIT): one-shot cell-tier promotion hint,
+        # consumed by the next poll.
+        self._cell_refresh_requested = False
 
         self._mailbox: asyncio.PriorityQueue[tuple[int, int, _Message]] = asyncio.PriorityQueue()
         self._sequence = itertools.count()
@@ -509,6 +512,15 @@ class EnergyPodActor:
                 self._essential_address, self._essential_count
             )
         await telemetry.advance()
+        if self._cell_refresh_requested:
+            # B4 (SYNC_RESILIENCE_AUDIT): the fleet loop flagged this unit
+            # after a cell-derived deny; forward the hint to the strategy and
+            # consume it -- exactly one promoted cycle, then the tier phase
+            # rules again unless the fresh read still denies.
+            self._cell_refresh_requested = False
+            hint = getattr(telemetry, "request_cell_refresh", None)
+            if callable(hint):
+                hint()
         essential = (self._essential_address, self._essential_count)
         blocks: dict[tuple[int, int], tuple[int, ...]] = {}
         for window in (essential, *telemetry.read_plan()):
@@ -518,6 +530,20 @@ class EnergyPodActor:
         observation = telemetry.decode(blocks, self.lifecycle)
         await self._accept_observation_owned(observation)
         return blocks[essential]
+
+    def request_cell_refresh(self) -> None:
+        """Schedule this unit's NEXT telemetry cycle to include 0x5200 (B4).
+
+        Set by the fleet loop after a control decision carried a cell-derived
+        deny reason for this unit's fleet: the cell window normally rides the
+        every-3rd-cycle tier, so the deny may have judged a stale cached
+        window.  The promoted poll re-evaluates the deny on FRESH battery
+        data (steady plan 8 -> 9 windows, ~1.0 s at the 0.1 s inter-frame
+        gap, inside the 1.5 s control period / 1.60 s renewal budget).  The
+        flag is consumed by exactly one poll and never bypasses a fresh
+        violation: a persisting fresh violation re-denies and re-promotes.
+        """
+        self._cell_refresh_requested = True
 
     async def _refresh_mode_words_owned(self) -> tuple[int, int]:
         """The B5 bounded fresh read of (ctrlMode, workMode) served words."""
