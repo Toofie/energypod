@@ -13,3 +13,4 @@ web/dist/
 .mutmut-cache
 html/
 var/
+varopenapi.json
