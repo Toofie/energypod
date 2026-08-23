@@ -789,3 +789,170 @@ def test_excess_charging_yield_to_schedule_defaults_true() -> None:
     parsed_off = ControllerConfig.model_validate(payload)
     assert parsed_off.excess_charging is not None
     assert parsed_off.excess_charging.yield_to_schedule is False
+
+
+# --- DESIGN_ENERGY_SCORECARD section 7 (E7): the energy_scorecard block ----------
+
+
+def _assert_energy_rule(payload: dict[str, Any], *, message_contains: str | None = None) -> Any:
+    """Validate a payload whose energy_scorecard block must be refused."""
+    with pytest.raises(ValidationError) as error:
+        ControllerConfig.model_validate(payload)
+    energy_errors = [
+        item
+        for item in error.value.errors()
+        if item["loc"] and item["loc"][0] == "energy_scorecard"
+    ]
+    assert energy_errors, f"expected an energy_scorecard error, got {error.value.errors()!r}"
+    if message_contains is not None:
+        assert message_contains.lower() in str(energy_errors[0]["msg"]).lower(), energy_errors
+    return error
+
+
+def test_energy_scorecard_block_is_absent_by_default() -> None:
+    parsed = ControllerConfig.model_validate(_valid_config())
+    assert parsed.energy_scorecard is None, "no block means the surface is entirely absent"
+
+
+def test_a_present_energy_block_carries_the_pinned_defaults() -> None:
+    payload = _valid_config()
+    payload["energy_scorecard"] = {}
+    parsed = ControllerConfig.model_validate(payload)
+
+    assert parsed.energy_scorecard is not None
+    assert parsed.energy_scorecard.grid_source == "integrated"
+    assert parsed.energy_scorecard.grid_counter_roles == "unpinned"
+    assert parsed.energy_scorecard.integration_max_gap_s == 10.0
+    assert parsed.energy_scorecard.min_day_coverage_pct == 95.0
+    assert parsed.energy_scorecard.tariff is None, "absent tariff = kWh only, no money"
+
+
+def test_the_commissioned_spellings_validate_and_round_trip() -> None:
+    payload = _valid_config()
+    payload["energy_scorecard"] = {
+        "grid_source": "device_counter",
+        "grid_counter_roles": "vendor_labels",
+        "integration_max_gap_s": 12.5,
+        "min_day_coverage_pct": 90.0,
+        "tariff": {
+            "currency": "AUD",
+            "import_cents_per_kwh": 28.0,
+            "export_cents_per_kwh": 9.0,
+        },
+    }
+    parsed = ControllerConfig.model_validate(payload)
+
+    assert parsed.energy_scorecard is not None
+    assert parsed.energy_scorecard.grid_source == "device_counter"
+    assert parsed.energy_scorecard.grid_counter_roles == "vendor_labels"
+    assert parsed.energy_scorecard.tariff is not None
+    assert parsed.energy_scorecard.tariff.currency == "AUD"
+
+
+def test_device_counter_is_refused_while_the_roles_are_unpinned() -> None:
+    """The structural A-1 gate: the role-open counter pair must never become
+    the display source -- pinning the roles first is the operator's act."""
+    payload = _valid_config()
+    payload["energy_scorecard"] = {"grid_source": "device_counter"}
+    _assert_energy_rule(payload, message_contains="unpinned")
+
+
+@pytest.mark.parametrize("roles", ["vendor_labels", "swapped"])
+def test_a_pinned_roles_value_validates_at_config_time(roles: str) -> None:
+    """Config validation accepts a pinned roles value -- the DURABLE pinning
+    fact is the composition root's keyed boot check (the excess-economics
+    precedent), pinned in the composition family."""
+    payload = _valid_config()
+    payload["energy_scorecard"] = {"grid_counter_roles": roles}
+    parsed = ControllerConfig.model_validate(payload)
+    assert parsed.energy_scorecard is not None
+    assert parsed.energy_scorecard.grid_counter_roles == roles
+
+
+@pytest.mark.parametrize("gap", [0.0, -10.0, 0.40, 60.5])
+def test_integration_gap_must_exceed_the_control_period_and_stay_le_60(gap: float) -> None:
+    """The CT stream samples once per control cycle: a gap at or below it
+    would exclude every interval; above 60 s is an outage, not a cadence."""
+    payload = _valid_config()
+    payload["energy_scorecard"] = {"integration_max_gap_s": gap}
+    _assert_energy_rule(payload)
+
+
+def test_integration_gap_just_above_the_control_period_validates() -> None:
+    payload = _valid_config()
+    payload["energy_scorecard"] = {"integration_max_gap_s": 0.41}
+    parsed = ControllerConfig.model_validate(payload)
+    assert parsed.energy_scorecard is not None
+    assert parsed.energy_scorecard.integration_max_gap_s == 0.41
+
+
+@pytest.mark.parametrize("coverage", [0.0, -1.0, 100.5])
+def test_min_day_coverage_must_stay_inside_zero_to_one_hundred(coverage: float) -> None:
+    payload = _valid_config()
+    payload["energy_scorecard"] = {"min_day_coverage_pct": coverage}
+    _assert_energy_rule(payload)
+
+
+@pytest.mark.parametrize(
+    "tariff",
+    [
+        {"currency": "AU", "import_cents_per_kwh": 28.0, "export_cents_per_kwh": 9.0},
+        {"currency": "DOLLARS", "import_cents_per_kwh": 28.0, "export_cents_per_kwh": 9.0},
+        {"currency": "AUD", "import_cents_per_kwh": -1.0, "export_cents_per_kwh": 9.0},
+        {"currency": "AUD", "import_cents_per_kwh": 28.0, "export_cents_per_kwh": -9.0},
+        {"currency": "AUD"},
+    ],
+)
+def test_malformed_tariff_keys_are_refused(tariff: dict[str, Any]) -> None:
+    payload = _valid_config()
+    payload["energy_scorecard"] = {"tariff": tariff}
+    _assert_energy_rule(payload)
+
+
+def test_the_energy_block_has_no_enabled_key() -> None:
+    """The schedules doctrine: a second master switch is a second way to be
+    silently off.  Decommissioning is removing the block; the scorecard is
+    advisory-only and needs no gate to start accumulating evidence."""
+    payload = _valid_config()
+    payload["energy_scorecard"] = {"enabled": True}
+    with pytest.raises(ValidationError) as error:
+        ControllerConfig.model_validate(payload)
+    assert any(
+        item["type"] == "extra_forbidden" and item["loc"][0] == "energy_scorecard"
+        for item in error.value.errors()
+    )
+
+
+def test_unknown_energy_keys_are_refused() -> None:
+    payload = _valid_config()
+    payload["energy_scorecard"] = {"integration_max_gap_s": 10.0, "surplus_source": "hoped"}
+    with pytest.raises(ValidationError) as error:
+        ControllerConfig.model_validate(payload)
+    assert any(
+        item["type"] == "extra_forbidden" and item["loc"][0] == "energy_scorecard"
+        for item in error.value.errors()
+    )
+
+
+def test_the_live_write_examples_energy_block_validates_as_documented() -> None:
+    """DESIGN_ENERGY_SCORECARD section 7 / E7: the live-write example's
+    commissioned block — advisory defaults, roles unpinned, the passive A-1
+    cross-check from day one — parses cleanly, so what the operator reads is
+    what the controller will compose."""
+    from pathlib import Path
+
+    import yaml
+
+    example = Path(__file__).resolve().parents[2] / "config" / "config.live-write-example.yaml"
+    document = yaml.safe_load(example.read_text(encoding="utf-8"))
+    assert isinstance(document, dict), "the example must stay one YAML document"
+    assert "energy_scorecard" in document, "the scorecard block is commissioned"
+
+    payload = _valid_config()
+    payload["energy_scorecard"] = document["energy_scorecard"]
+    parsed = ControllerConfig.model_validate(payload)
+
+    assert parsed.energy_scorecard is not None
+    assert parsed.energy_scorecard.grid_source == "integrated"
+    assert parsed.energy_scorecard.grid_counter_roles == "unpinned"
+    assert parsed.energy_scorecard.tariff is None

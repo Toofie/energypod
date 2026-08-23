@@ -405,6 +405,20 @@ Cell-voltage registers are raw millivolts; prior code's `×0.001 V` presentation
 
 All six fields are low-word-first `uint32 ×0.1`: grid buy, grid sell, load consumption, PV production, BMS charge, and BMS discharge, in that order. This is **Confirmed by vendor code**.
 
+**Role-label caveat (field-mapping §5 A-1; the energy scorecard's protocol,
+`DESIGN_ENERGY_SCORECARD.md` §3).** The pair ORDER above is confirmed, and
+capture 2 confirmed the charge/discharge ROLE labels (only the
+discharge-labeled counters moved during confirmed discharge). The GRID
+buy/sell ROLE labels remain open: which of `0x4101+0/1` and `0x4101+2/3`
+accumulates imports is A-1's remaining question. From the scorecard's
+commissioning (2026-08-26) the block decodes into advisory observation
+fields under NEUTRAL names (`energy_grid_a_kwh` / `energy_grid_b_kwh`), both
+grid pairs are RECORDED daily into each `EnergyDayRecord.counter_cross_check`
+beside the controller's own CT integration (the passive P-A1 evidence
+stream), and no product surface applies vendor role labels until the
+operator lands the pinning evidence and sets `grid_counter_roles` — the
+deterministic `energy-counter-roles-pinned` audit fact gates that boot.
+
 ### Legacy-specific corrections
 
 | Fact | Classification | Correct interpretation |

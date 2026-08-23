@@ -384,3 +384,75 @@ schedule:
   # command. OMITTED = the day-only YIELD default shown here.
   allowed_windows_local: [["06:00", "20:00"]]
   intent_ttl_s: 10.0
+
+# ---------------------------------------------------------------------------
+# THE DAILY ENERGY SCORECARD (DESIGN_ENERGY_SCORECARD; advisory-only).
+#
+# A PRESENT block composes the daily energy account: the accountant tick in
+# the fleet cycle (one bounded step after the polls, beside the excess
+# adviser's projection update — it consumes observations and never blocks),
+# the `energy_today` snapshot key, GET /api/v1/energy/days, the
+# energy.day_rolled bus transition, the per-unit cumulative readthroughs,
+# and the SQLite day ledger (schema version 2: energy_day + the durable
+# live-day baseline, so counter deltas survive restarts by design — the
+# device kept counting). An ABSENT block composes nothing: byte-identical
+# snapshot, 409 energy_scorecard_not_commissioned on the route, no energy
+# decode. There is deliberately NO `enabled` key — the scorecard is
+# ADVISORY-ONLY (no safety interaction, no writes, no read-plan cadence
+# change; the energy block already rides the cold ring and the PCS live
+# block already rides the core), so no operator gate is needed to start
+# accumulating evidence. Decommissioning is removing the block.
+#
+# THE A-1 GRID-PAIR PROTOCOL (why bought/sold come from OUR OWN integration
+# of the per-pod CT grid word, not the vendor's grid counters): the 0x4101
+# counter DECODE and the charge/discharge ROLE labels are capture-confirmed,
+# but WHICH grid pair accumulates imports vs exports is evidence-open
+# (field-mapping A-1). Until pinned, both pairs decode under NEUTRAL A/B
+# names and are RECORDED every day into the record's counter_cross_check
+# beside the integrated figures — the passive pinning evidence (a day
+# discriminates at >= the coverage threshold, no counter reset, and both
+# integrated sides >= 0.5 kWh; the verdict tolerance is max(0.5 kWh, 5%)).
+# Pinning NEVER self-applies: `grid_counter_roles: vendor_labels|swapped`
+# boots only when the durable energy-counter-roles-pinned audit fact exists
+# (record the operator's P-A1 confirmation first), and only then may
+# `grid_source: device_counter` be commissioned (the unpinned pair is
+# refused as a display source — the strictly-more-complete source after
+# pinning, the integration staying as the cross-check).
+#
+# Honesty rules the accountant owns: gaps above integration_max_gap_s are
+# EXCLUDED from the integration and the coverage fraction (never
+# interpolated); a day below min_day_coverage_pct renders PARTIAL with its
+# percentage; a decreasing cumulative is a counter RESET (the day
+# re-baselines, flags counter_reset:<metric>, and is audited
+# energy_counter_reset_observed); site PV is never presented as measured
+# (the pod inputs are unwired — the solar story is exported + captured
+# surplus); the day rolls at site-timezone midnight with each record naming
+# its zone and its own utc_offset_minutes.
+#
+# COMMISSIONED 2026-08-26 (the operator decision 1, DESIGN section 11):
+# the block below is live with the pinned defaults — advisory-only, roles
+# unpinned, the passive A-1 cross-check accumulating from day one.
+energy_scorecard:
+  # integrated = our own zero-order-hold integration of the per-pod CT grid
+  #   word (0x1000+17, the control-grade PCS view ONLY) at the control rate.
+  #   device_counter = the vendor grid pairs, REFUSED while the roles are
+  #   unpinned (see the A-1 protocol above).
+  grid_source: integrated
+  # unpinned (neutral A/B naming + the passive cross-check) | vendor_labels
+  #   | swapped (both pinned values additionally require the durable
+  #   energy-counter-roles-pinned audit fact at boot).
+  grid_counter_roles: unpinned
+  # An inter-sample spacing above this is a GAP (zero energy, zero coverage,
+  # never interpolated). Must exceed timing.control_period_s and stay
+  # <= 60 s.
+  integration_max_gap_s: 10.0
+  # A day whose worst-unit coverage falls below this renders PARTIAL with
+  # its percentage, never a quiet full number. (0, 100].
+  min_day_coverage_pct: 95.0
+  # OPTIONAL money. Absent (as commissioned) = kWh only, no figures; the
+  # rates are the operator's own, labeled as theirs, and ride the wire as
+  # the null `tariff` key until supplied:
+  # tariff:
+  #   currency: "AUD"            # ISO 4217
+  #   import_cents_per_kwh: 28.0
+  #   export_cents_per_kwh: 9.0

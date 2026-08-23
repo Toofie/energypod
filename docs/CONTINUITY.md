@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-26 (Australia/Brisbane)
+Last updated: 2026-08-26 (Australia/Brisbane; the energy scorecard backend wave)
 
 ## Purpose
 
@@ -348,6 +348,85 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-26 (scorecard backend): THE DAILY ENERGY SCORECARD BACKEND
+  IMPLEMENTED (E1-E7; 7697aed, 0e8db09, 2fd879f, 89c1925, f7f80f0,
+  f3938cb, + this pass) against the accepted contract
+  docs/DESIGN_ENERGY_SCORECARD.md (00e1b2b) + API_CONTRACTS "Energy
+  scorecard" — backend half only; the console agent built W-A..W-C in
+  parallel against the same shapes. The docs govern every shape; nothing
+  below deviates. (1) DECODE (E1): the six 0x4101 counters decode as
+  ADVISORY Observation fields (low-word-first uint32 x 0.1, vendor pair
+  order) under NEUTRAL grid A/B names — the pair ORDER is confirmed, the
+  buy/sell ROLE labels are A-1-open; quality keys join ADVISORY_QUALITY_
+  FIELDS (12 -> 18 key shapes; 10/12/18 the only legal maps) and stay
+  outside every safety completeness set; decode_totals_block is the ONE
+  implementation shared by the wire decode and the simulator. (2) THE
+  ACCOUNTANT (E2, application/energy.py over domain/energy.py):
+  zero-order-hold CT integration over observation capture times, sign-split
+  import/export, gaps above integration_max_gap_s EXCLUDED never
+  interpolated, per-unit/day coverage sampled/elapsed with worst-unit fleet
+  rollup; device-counter daily deltas where a DECREASING cumulative is a
+  reset (re-baseline + counter_reset:<metric> flag + the
+  energy_counter_reset_observed audit fact); day roll at site-timezone
+  midnight on the first observation whose local date advances (DST days
+  keep their own utc_offset_minutes; persist + publish energy.day_rolled
+  exactly once + audit energy_day_recorded with the fleet summary + ONE
+  promoted 0x4101 read via actor.request_energy_refresh — the B4
+  precedent); charged_from_surplus over adviser-active ticks on MEASURED
+  battery watts; the A-1 passive verdict (vendor_labels|swapped|
+  undiscriminating|null under max(0.5 kWh, 5%)) REPORTED never applied; the
+  durable live-day baseline (wall-time anchored) so a mid-day restart
+  re-baselines with the outage as a gap. (3) LEDGER (E3): EnergyLedger
+  Repository port + memory/SQLite adapters; schema_version 2 (energy_day
+  keyed by date — insert-once, records immutable; energy_baseline keyed by
+  unit); the v1->v2 migration is in-place and row-preserving. (4)
+  COMPOSITION (E4): a PRESENT energy_scorecard block composes the accountant
+  tick into the fleet cycle AFTER the polls BESIDE the adviser projection
+  update (the attribution predicate READS the projection), the snapshot's
+  energy_today (in-progress record + SITE-LOCAL as_of always carrying its
+  offset + the null-when-absent tariff), the six per-unit readthroughs, and
+  the A-1 BOOT GATE: grid_counter_roles vendor_labels|swapped boots only
+  when the durable energy-counter-roles-pinned fact exists (keyed existence
+  check); an ABSENT block composes NOTHING (byte-identical snapshot, no
+  energy decode — the 12-key quality shape, 409 on the route). (5) REST+MCP
+  (E5): GET /api/v1/energy/days (observe, limit 1..31 default 8, newest-
+  LAST, 409 energy_scorecard_not_commissioned, NO mutation — POST/PUT/DELETE
+  all 405) + the observe-scoped get_energy_days MCP ride-along. (6)
+  SIMULATOR+GOLDEN (E6): the totals grid/load pairs ACCUMULATE from the
+  scripted CT words (the _accumulate precedent); the DEFERRED golden
+  energy/SOC scenario consumed (DEFERRED_FINDINGS 3): import/export/mixed
+  days + a fresh-accountant-over-the-ledger restart + the 23-hour Sydney
+  DST day, every kWh EXACT (36 s at 10 kW = one 0.1 kWh quantum); the
+  simulator constructor matrix (item 4's open half) landed. (7) CONFIG+DOCS
+  (E7): the section-7 validation matrix (gap > control period and <= 60,
+  coverage in (0,100], device_counter refused while unpinned, tariff keys,
+  NO enabled key), the commissioned block in the live-write example, the
+  API_CONTRACTS wire pins (fleet shape = per-unit minus metric_flags plus
+  worst-unit coverage; consistent_with vocabulary incl. null; as_of
+  offset-carrying; immutable records; limit-only paging; the tariff key),
+  and the PROTOCOL_EVIDENCE A-1 role-label caveat. VERIFICATION: scoped
+  contract-first red->green per family (wire 7 new, accountant 26,
+  repositories 3 + db-cli schema pins, composition 6 + the live-composition
+  12-key pin, events 1, REST 9, MCP 1, simulator 4 + the 15-case ctor
+  matrix, golden 2); FULL SUITE green; ruff + format + MYPYPATH=src mypy
+  strict clean each commit. COMMISSIONED live 2026-08-26 (the operator
+  decision 1): the block added to the controller config (advisory defaults,
+  roles unpinned — the passive A-1 counter cross-check accumulates from day
+  one; no operator gate needed, no safety interaction), controller
+  restarted (boot disarmed), read-only verification: the snapshot carries
+  energy_today under the neutral A/B naming, the ledger is accumulating,
+  fleet state otherwise unchanged, log clean. CONSOLE: the wire shapes are
+  pinned in API_CONTRACTS (the console's wire.ts fixtures match; two
+  fixture-helper notes — their sumOf/worstCoverage null out when ANY unit
+  is null where the backend fleet sums skip nulls, and the TS
+  consistent_with type omits null — are display-side only and documented).
+  OPERATOR DECISIONS REMAIN (DESIGN section 11): the A-1 pinning path
+  (passive verdicts accrue; ~3 discriminating days before a
+  recommendation), the source promotion AFTER pinning (grid_source:
+  device_counter + grid_counter_roles — the durable fact must be recorded
+  first; no surface writes it yet, so it is a deliberate operator/CLI act),
+  and the optional tariff keys.
 
 - 2026-08-26 (scorecard design): THE NEXT FEATURE SELECTED AND DESIGNED —
   docs only, no code. PRODUCT_NEXT's 2026-08-23 next-3 is fully delivered

@@ -938,11 +938,31 @@ section pins the wire-facing shapes.
   `{"days": [EnergyDayRecord...], "grid_counter_roles": "unpinned|vendor_labels|swapped",
   "solar_production_measured": false}`; answers 409 `energy_scorecard_not_commissioned`
   when the config block is absent. There is deliberately NO mutation on this surface.
+  Paging is limit-only (no cursor): a day record is IMMUTABLE — the accountant
+  finalizes a site-day exactly once and the ledger insert is first-writer-wins —
+  so there is no revision marker and `energy.day_rolled` carries each date
+  exactly once.
 - Snapshot top-level `energy_today` (feature-detected: absent key when the block is
   absent) = the in-progress day's record plus `as_of`. Bus event `energy.day_rolled`
   (the completed record) is a rollover TRANSITION only — never a heartbeat. Audit
   facts: `energy_day_recorded`, `energy_counter_reset_observed`, and — when the
   operator lands the active pinning protocol — `energy_counter_roles_pinned`.
+- Wire pins added with the implementation (2026-08-26, the console-coordination
+  pass): the `fleet` block is exactly the per-unit metric shape MINUS
+  `metric_flags` plus the worst-unit rollup (the five sums +
+  `charged_from_surplus_kwh` + `coverage_pct`); `counter_cross_check
+  .consistent_with` is `"vendor_labels" | "swapped" | "undiscriminating" |
+  null` (null = the day could not discriminate: low coverage, a sub-0.5 kWh
+  side, a grid-pair reset, or neither ordering fits the tolerance);
+  `energy_today.as_of` is ALWAYS the site-local ISO string carrying its UTC
+  offset (e.g. `2026-08-26T14:03:00+10:00`); and both `energy_today` and the
+  days body carry `"tariff"` — `null` when the optional config keys are absent
+  (kWh-only, no money figures anywhere), otherwise `{"currency": "AUD",
+  "import_cents_per_kwh": 28.0, "export_cents_per_kwh": 9.0}` (the operator's
+  own rates, labeled as theirs). The per-unit energy readthroughs
+  (`energy_grid_a_kwh` .. `energy_discharge_kwh`, neutral A/B naming) ride the
+  snapshot telemetry summary and the unit-detail projection ONLY when the
+  block is composed.
 - Config block `energy_scorecard:` (block-presence doctrine: PRESENT composes the
   accountant into the fleet loop + snapshot key + route; ABSENT is byte-identical with
   409; no `enabled` key — decommissioning removes the block): `grid_source:
