@@ -1056,8 +1056,6 @@ def test_the_live_write_examples_energy_block_validates_as_documented() -> None:
     assert parsed.energy_scorecard.tariff is None
 
 
-
-
 # --- off-peak night charge (DESIGN_NIGHT_CHARGE §3.1 + API_CONTRACTS
 # --- "Off-peak night charge") ---------------------------------------------------
 #
