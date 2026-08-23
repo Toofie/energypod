@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from energypod.application.excess_charge import ExcessChargingRefusal
+from energypod.application.night_charge import NightChargingRefusal
 from energypod.application.service import DegradedReport
 
 from .conftest import (
@@ -1415,6 +1416,191 @@ def test_excess_charging_refusals_map_to_their_structured_envelopes(
             f"{API}/excess-charging",
             json={"action": "enable", "confirmation": "EXCESS"},
             headers=_mutation_headers("operator-token", key="refuse-1"),
+        )
+
+    _assert_error(response, 409, refusal.code)
+    assert response.json()["details"] == expected_details
+
+
+# --- DESIGN_NIGHT_CHARGE §3.4-4 B4: the guarded night REST toggle ----------------
+
+
+class _RefusingNightService(RecordingEnergyService):
+    def __init__(self, refusal: NightChargingRefusal) -> None:
+        super().__init__()
+        self.refusal = refusal
+
+    async def set_night_charging(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("set_night_charging", kwargs))
+        raise self.refusal  # type: ignore[misc]
+
+
+def test_night_charging_toggle_answers_the_200_contract_body(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    payload = {
+        "action": "enable",
+        "confirmation": "NIGHT",
+        "night_posture": "PARTITION_ACKNOWLEDGED",
+    }
+    with _client(service, authenticator) as client:
+        missing_key = client.post(
+            f"{API}/night-charging", json=payload, headers=_auth("operator-token")
+        )
+        accepted = client.post(
+            f"{API}/night-charging",
+            json=payload,
+            headers=_mutation_headers("operator-token", key="night-enable-1"),
+        )
+        replay = client.post(
+            f"{API}/night-charging",
+            json=payload,
+            headers=_mutation_headers("operator-token", key="night-enable-1"),
+        )
+        disable = client.post(
+            f"{API}/night-charging",
+            json={"action": "disable", "confirmation": "NIGHT"},
+            headers=_mutation_headers("operator-token", key="night-disable-1"),
+        )
+
+    _assert_error(missing_key, 400, "idempotency_key_required")
+    assert accepted.status_code == 200, accepted.text
+    body = accepted.json()
+    assert body["feature"] == "night_charging"
+    assert body["enabled"] is True
+    assert body["enabled_origin"] == "runtime"
+    assert body["persisted"] is False, "the non-persistence policy rides every response"
+    assert body["acknowledged_partition"] is True
+    assert body["night_charge_state"]["enabled"] is True
+    assert replay.status_code == 200 and replay.json() == body
+    assert disable.status_code == 200 and disable.json()["enabled"] is False
+    calls = [values for name, values in service.calls if name == "set_night_charging"]
+    assert len(calls) == 2, "one call per distinct key; the replay never re-reaches the service"
+    assert calls[0]["action"] == "enable"
+    assert calls[0]["confirmation"] == "NIGHT"
+    assert calls[0]["night_posture"] == "PARTITION_ACKNOWLEDGED"
+    assert calls[0]["principal"].interactive is True
+    assert calls[1]["night_posture"] is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"action": "pause", "confirmation": "NIGHT"},
+        {"action": "enable"},
+        {"action": "enable", "confirmation": "EXCESS"},
+        {"action": "enable", "confirmation": "NIGHT", "night_posture": "YIELDED"},
+        {"action": "disable", "confirmation": "night"},
+    ],
+)
+def test_night_charging_toggle_validates_its_literals(
+    service: RecordingEnergyService,
+    authenticator: FakeAuthenticator,
+    payload: dict[str, object],
+) -> None:
+    with _client(service, authenticator) as client:
+        response = client.post(
+            f"{API}/night-charging",
+            json=payload,
+            headers=_mutation_headers("operator-token", key="night-invalid"),
+        )
+
+    _assert_error(response, 422, "validation_error")
+    details = response.json()["details"]
+    assert details["errors"], "field errors ride the validation envelope"
+    assert not [values for name, values in service.calls if name == "set_night_charging"]
+
+
+def test_night_charging_toggle_requires_the_arm_scope(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    payload = {"action": "disable", "confirmation": "NIGHT"}
+    with _client(service, authenticator) as client:
+        viewer = client.post(
+            f"{API}/night-charging",
+            json=payload,
+            headers=_mutation_headers("viewer-token", key="night-v1"),
+        )
+        dispatcher = client.post(
+            f"{API}/night-charging",
+            json=payload,
+            headers=_mutation_headers("service-token", key="night-s1"),
+        )
+    _assert_error(viewer, 403, "insufficient_scope")
+    _assert_error(dispatcher, 403, "insufficient_scope")
+
+
+def test_night_charging_enable_demands_an_interactive_principal(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """The arm/disarm asymmetry: disable is safety-positive and stays open to
+    arm-scoped automation; enabling grants participation and needs the human."""
+    enable = {
+        "action": "enable",
+        "confirmation": "NIGHT",
+        "night_posture": "PARTITION_ACKNOWLEDGED",
+    }
+    disable = {"action": "disable", "confirmation": "NIGHT"}
+    with _client(service, authenticator) as client:
+        denied = client.post(
+            f"{API}/night-charging",
+            json=enable,
+            headers=_mutation_headers("noninteractive-operator-token", key="night-ni1"),
+        )
+        allowed = client.post(
+            f"{API}/night-charging",
+            json=disable,
+            headers=_mutation_headers("noninteractive-operator-token", key="night-ni2"),
+        )
+    _assert_error(denied, 403, "interactive_operator_required")
+    assert allowed.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("refusal", "expected_details"),
+    [
+        (
+            NightChargingRefusal(
+                "night_charging_not_commissioned",
+                "the night_charging feature is not composed on this site",
+            ),
+            {},
+        ),
+        (
+            NightChargingRefusal(
+                "night_acknowledgement_required",
+                "the one-time night-partition acknowledgement is required",
+                {"acknowledgement": "PARTITION_ACKNOWLEDGED"},
+            ),
+            {"acknowledgement": "PARTITION_ACKNOWLEDGED"},
+        ),
+        (
+            NightChargingRefusal(
+                "night_enable_refused",
+                "enabling requires a quiet fleet",
+                {
+                    "reasons": ["unit_active_under_intent", "latched_stop_holds"],
+                    "unit_ids": ["pod-a"],
+                    "stop_ids": ["stop-1-1"],
+                },
+            ),
+            {
+                "reasons": ["unit_active_under_intent", "latched_stop_holds"],
+                "unit_ids": ["pod-a"],
+                "stop_ids": ["stop-1-1"],
+            },
+        ),
+    ],
+)
+def test_night_charging_refusals_map_to_their_structured_envelopes(
+    authenticator: FakeAuthenticator, refusal: NightChargingRefusal, expected_details: dict
+) -> None:
+    service = _RefusingNightService(refusal)
+    with _client(service, authenticator) as client:
+        response = client.post(
+            f"{API}/night-charging",
+            json={"action": "enable", "confirmation": "NIGHT"},
+            headers=_mutation_headers("operator-token", key="night-refuse-1"),
         )
 
     _assert_error(response, 409, refusal.code)

@@ -451,6 +451,26 @@ class RecordingEnergyService:
             },
         }
 
+    async def set_night_charging(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("set_night_charging", kwargs))
+        enabled = kwargs["action"] == "enable"
+        return {
+            "feature": "night_charging",
+            "enabled": enabled,
+            "enabled_origin": "runtime",
+            "persisted": False,
+            "acknowledged_partition": True,
+            "night_charge_state": {
+                "enabled": enabled,
+                "enabled_origin": "runtime",
+                "acknowledged_partition": True,
+                "posture": "partition",
+                "active": False,
+                "phase": "idle",
+                "reason_codes": ["window_open"] if enabled else ["disabled_by_runtime"],
+            },
+        }
+
     async def get_schedule(self, *, principal: Any) -> dict[str, Any]:
         self.calls.append(("get_schedule", {"principal": principal}))
         if self.schedule_refusal is not None:

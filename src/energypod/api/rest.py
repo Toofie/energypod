@@ -34,6 +34,7 @@ from starlette.websockets import WebSocketDisconnect
 from energypod.application.energy import EnergyScorecardRefusal
 from energypod.application.excess_charge import ExcessChargingRefusal
 from energypod.application.history import PlantHistoryRefusal
+from energypod.application.night_charge import NightChargingRefusal
 from energypod.application.scheduling import SchedulePublishValidationError, ScheduleRefusal
 
 from .idempotency import IdempotencyConflictError, IdempotencyCoordinator, StoredResult
@@ -74,6 +75,7 @@ class EnergyService(Protocol):
     async def acknowledge_emergency_stop(self, **kwargs: Any) -> dict[str, Any]: ...
     async def acknowledge_inhibit(self, **kwargs: Any) -> dict[str, Any]: ...
     async def set_excess_charging(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def set_night_charging(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
     async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_energy_days(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -217,6 +219,20 @@ class ExcessChargingRequest(StrictRequest):
     action: Literal["enable", "disable"]
     confirmation: Literal["EXCESS"]
     economics: Literal["NET_BILLED"] | None = None
+
+
+class NightChargingRequest(StrictRequest):
+    """DESIGN_NIGHT_CHARGE §3.4-4: the guarded night activation toggle.
+
+    The excess toggle's shape with the night literals: the ``NIGHT``
+    confirmation always, and the optional ``night_posture`` consulted only
+    on the first enable ever — only ``"PARTITION_ACKNOWLEDGED"`` is valid,
+    anything else is a 422, never a silent ignore.
+    """
+
+    action: Literal["enable", "disable"]
+    confirmation: Literal["NIGHT"]
+    night_posture: Literal["PARTITION_ACKNOWLEDGED"] | None = None
 
 
 class ScheduleEntryRequest(StrictRequest):
@@ -926,6 +942,50 @@ def create_api_app(
             request=request,
             identity=identity,
             operation_name="set_excess_charging",
+            payload=payload,
+            status_code=200,
+            invoke=invoke,
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.post(f"{API_PREFIX}/night-charging")
+    async def set_night_charging(
+        body: NightChargingRequest,
+        request: Request,
+        identity: Principal = arm_dependency,
+    ) -> JSONResponse:
+        """DESIGN_NIGHT_CHARGE §3.4-4: the guarded night activation toggle.
+
+        The arm/disarm asymmetry, exactly like the excess toggle: enabling
+        grants participation — a control-adjacent act that needs an
+        interactive human — while disabling is safety-positive and stays open
+        to any arm-scoped principal.  The refusal envelopes map verbatim
+        (409 night_charging_not_commissioned / night_acknowledgement_required
+        / night_enable_refused).
+        """
+        if body.action == "enable" and not identity.interactive:
+            raise BoundaryError(
+                403,
+                "interactive_operator_required",
+                "Interactive operator required",
+            )
+        payload = body.model_dump(mode="json")
+
+        async def invoke() -> dict[str, Any]:
+            try:
+                return await service.set_night_charging(
+                    **payload,
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
+            except NightChargingRefusal as exc:
+                raise BoundaryError(409, exc.code, exc.message, exc.details) from exc
+
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="set_night_charging",
             payload=payload,
             status_code=200,
             invoke=invoke,

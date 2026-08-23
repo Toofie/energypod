@@ -440,6 +440,40 @@ async def test_excess_toggle_boundary_hardening() -> None:
     assert calls, "the authenticated toggle must reach the service"
 
 
+async def test_night_toggle_boundary_hardening() -> None:
+    """DESIGN_NIGHT_CHARGE B4: the night feature gate gets the same hardened
+    boundary as every mutation — bearer authentication before anything else,
+    the arm scope for both actions, an interactive principal for enable
+    only, and the Idempotency-Key always."""
+    from fastapi.testclient import TestClient
+
+    from energypod.api.rest import create_api_app
+
+    service = RecordingEnergyService()
+    app = create_api_app(
+        service=service,
+        authenticator=FakeAuthenticator(),
+        event_source=FakeEventSource(),
+    )
+    enable = {
+        "action": "enable",
+        "confirmation": "NIGHT",
+        "night_posture": "PARTITION_ACKNOWLEDGED",
+    }
+    with TestClient(app) as client:
+        anonymous = client.post("/api/v1/night-charging", json=enable)
+        accepted = client.post(
+            "/api/v1/night-charging",
+            json=enable,
+            headers={"Authorization": "Bearer operator-token", "Idempotency-Key": "nb1"},
+        )
+        assert anonymous.status_code == 401
+        assert anonymous.json()["code"] == "authentication_required"
+        assert accepted.status_code == 200, accepted.text
+    calls = [name for name, _ in service.calls if name == "set_night_charging"]
+    assert calls, "the authenticated toggle must reach the service"
+
+
 async def test_schedule_publish_boundary_hardening() -> None:
     """DESIGN_SCHEDULES §5: the whole-plan publish gets the same hardened
     boundary as every mutation — bearer before anything, dispatch scope plus
