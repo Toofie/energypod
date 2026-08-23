@@ -129,6 +129,20 @@ like `soc_disagreement_observed` — never a denial and never a qualification re
 `quality_bms_soc_pct` (the authoritative figure) keeps its full fail-closed gate: non-GOOD BMS
 SOC still denies and still blocks qualification.
 
+#### SOC-jump re-baseline (SYNC_RESILIENCE_AUDIT B2, 2026-08-24)
+
+The `soc_jump` deny reason is removed from the blocking set. Both endpoints of the comparison are
+honest fresh BMS reads; a > `max_soc_jump_pct` move between them is either a legitimate fast SOC
+move across our own abandoned-poll gap or the battery's own estimate resync (PROTOCOL_EVIDENCE
+13.17 records the observed large SOC jumps as an evidenced behavior of this fleet's BMS). The
+battery wins: the fresh figure STANDS and the jump surfaces as the informational reason code
+`soc_jump_observed`, carried ONLY on authorizing decisions — exactly the `soc_disagreement_observed`
+pattern — and the next cycle's baseline is the new figure (automatic re-sync). The absolute
+protections are untouched and are the real guards: a jumped figure that crosses `min_soc_pct` or
+`max_soc_pct` is denied BY THAT BOUND, evaluated on the fresh figure, in the safe direction. The
+implausible-data canary the jump check once served is carried by identity pinning (core-rate
+0x8106) and the decoder's 0-100 domain validation.
+
 `IntentArbiter.arbitrate(intents, now_mono) -> CycleArbitration` removes expired intents and
 selects a PER-UNIT WINNER SET: for each unit, the highest-priority live intent claiming it wins
 that unit (priority order unchanged: emergency stop > manual > agent > optimizer > schedule;

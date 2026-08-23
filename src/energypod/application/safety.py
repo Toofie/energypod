@@ -84,6 +84,7 @@ class SafetyKernel:
         expiries: dict[str, float] = {}
         divergence_observed = False
         system_soc_untrusted = False
+        soc_jump_observed = False
         for proposal in proposals:
             observation = current_observations.get(proposal.unit_id)
             previous = previous_observations.get(proposal.unit_id)
@@ -112,6 +113,14 @@ class SafetyKernel:
                 # and GOOD.  Advisory only -- the note rides authorizing
                 # decisions exactly like the divergence note.
                 system_soc_untrusted = True
+            if observation is not None and self._soc_jump_observed(observation, previous, policy):
+                # B2: a > ``max_soc_jump_pct`` move between two honest fresh
+                # BMS reads is the battery's own new word (its estimate
+                # resync, PROTOCOL_EVIDENCE 13.17) or a legitimate move
+                # across our own poll gap.  The fresh figure stands and the
+                # jump becomes an informational note; the next cycle's
+                # baseline is the new figure.
+                soc_jump_observed = True
             unit_reasons = self._deny_reasons(proposal, observation, previous, policy, now_mono)
             if not unit_reasons and getattr(proposal, "export_bounded", False):
                 # API_CONTRACTS "Excess-solar accelerated charging
@@ -194,6 +203,12 @@ class SafetyKernel:
             # Informational only (B1), same doctrine and same unreachable-on-
             # rejection path as the divergence note above.
             outcome_reasons.add("system_soc_untrusted")
+        if soc_jump_observed:
+            # Informational only (B2), same doctrine: unreachable on the
+            # whole-cycle rejection path, and a jump that crossed a bound is
+            # denied by the bound on the fresh figure -- the note never rides
+            # that rejected decision.
+            outcome_reasons.add("soc_jump_observed")
         status = DecisionStatus.CLAMPED if clamped else DecisionStatus.AUTHORIZED
         reason_codes = tuple(sorted(outcome_reasons)) or ("safety_checks_passed",)
         setpoints = tuple(
@@ -345,13 +360,18 @@ class SafetyKernel:
                 and observation.bms_soc_pct >= policy.max_soc_pct
             ):
                 reasons.add("soc_above_charge_ceiling")
-        if (
-            self._finite(observation.bms_soc_pct)
-            and previous is not None
-            and self._finite(previous.bms_soc_pct)
-            and abs(observation.bms_soc_pct - previous.bms_soc_pct) > policy.max_soc_jump_pct
-        ):
-            reasons.add("soc_jump")
+        # The SOC-jump check is gone from the deny set (SYNC_RESILIENCE_AUDIT
+        # B2, 2026-08-24): both endpoints are honest fresh BMS reads, so a
+        # > ``max_soc_jump_pct`` move is either a legitimate charge move
+        # across our own abandoned-poll gap or the BMS's own estimate resync
+        # (PROTOCOL_EVIDENCE 13.17).  The fresh figure stands and the jump
+        # surfaces as the informational ``soc_jump_observed`` note on
+        # authorizing decisions (``_soc_jump_observed``), with the next
+        # cycle's baseline the new figure.  The corruption canary the check
+        # once served is carried by identity pinning (core-rate 0x8106) and
+        # the decoder's 0-100 domain validation; the DANGEROUS direction --
+        # a jumped SOC crossing the floor or ceiling -- is still denied by
+        # those bounds, evaluated on the fresh figure above.
 
         cells = observation.cell_voltages_v
         expected = policy.expected_cell_count_by_unit.get(proposal.unit_id)
@@ -389,6 +409,32 @@ class SafetyKernel:
         if observation.active_warnings & policy.blocking_warning_codes:
             reasons.add("blocking_warning")
         return reasons
+
+    @staticmethod
+    def _soc_jump_observed(observation: Any, previous: Any | None, policy: Any) -> bool:
+        """Whether the fresh BMS SOC moved beyond ``max_soc_jump_pct``.
+
+        SYNC_RESILIENCE_AUDIT B2 (2026-08-24): the old ``soc_jump`` deny
+        turned the battery's own resync -- or a legitimate fast SOC move
+        across our abandoned-poll gap -- into a one-cycle block while the
+        battery stayed readable and fine.  The battery wins: the fresh figure
+        stands, the jump rides the decision as the informational
+        ``soc_jump_observed`` note, and the next cycle compares against the
+        new figure (automatic re-baseline).  The absolute protections are the
+        real guards and are untouched: a jumped figure that crosses the
+        discharge floor or charge ceiling is denied BY THAT BOUND on the
+        fresh value, in the safe direction.
+        """
+        if previous is None:
+            return False
+        current_soc = getattr(observation, "bms_soc_pct", None)
+        previous_soc = getattr(previous, "bms_soc_pct", None)
+        return (
+            SafetyKernel._finite(current_soc)
+            and SafetyKernel._finite(previous_soc)
+            and abs(float(cast(int | float, current_soc)) - float(cast(int | float, previous_soc)))
+            > policy.max_soc_jump_pct
+        )
 
     @staticmethod
     def _system_soc_untrusted(observation: Any) -> bool:

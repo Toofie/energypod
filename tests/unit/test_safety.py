@@ -509,10 +509,20 @@ def test_soc_directional_boundaries_are_exact(
         assert_rejected(decision, api)
 
 
-@pytest.mark.parametrize("delta, permitted", [(10.0, True), (10.001, False), (-10.001, False)])
+@pytest.mark.parametrize("delta, carries_note", [(10.0, False), (10.001, True), (-10.001, True)])
 def test_soc_jump_threshold_is_inclusive_and_direction_independent(
-    api: SimpleNamespace, delta: float, permitted: bool
+    api: SimpleNamespace, delta: float, carries_note: bool
 ) -> None:
+    """SYNC_RESILIENCE_AUDIT B2: the battery's own resync is not a denial.
+
+    Both endpoints are honest fresh BMS reads; the jump is either our poll
+    gap or the BMS's own estimate resync (PROTOCOL_EVIDENCE 13.17 records the
+    observed large SOC jumps).  The fresh figure STANDS: beyond the tolerance
+    the decision still authorizes and carries the informational
+    ``soc_jump_observed`` note -- the next cycle's baseline is the new figure
+    (automatic re-sync) -- and the absolute floor/ceiling bounds on the fresh
+    figure remain the real guards.
+    """
     observation = make_observation(
         api,
         system_soc_pct=50.0 + delta,
@@ -532,10 +542,38 @@ def test_soc_jump_threshold_is_inclusive_and_direction_independent(
         previous_observations={"mid": previous},
     )
 
-    if permitted:
-        assert decision.status is api.DecisionStatus.AUTHORIZED
-    else:
-        assert_rejected(decision, api)
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert ("soc_jump_observed" in reasons(decision)) is carries_note
+    assert "soc_jump" not in reasons(decision)
+    assert all(setpoint.watts > 0 for setpoint in decision.setpoints)
+
+
+def test_a_large_soc_jump_still_cannot_jump_past_a_bound(api: SimpleNamespace) -> None:
+    """A jump across a bound still blocks, in the SAFE direction (B2).
+
+    A battery that jumps its estimate to 96 % against a 90 % charge ceiling
+    must not charge -- the ceiling denies on the fresh figure exactly as it
+    would on any other, and the informational jump note never rides the
+    rejected decision."""
+    observation = make_observation(api, bms_soc_pct=96.0)
+    previous = make_observation(
+        api,
+        captured_at_mono=99.0,
+        sequence=6,
+        cell_captured_at_mono=99.0,
+        bms_soc_pct=85.0,
+    )
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(api, direction=api.Direction.CHARGE),
+        current_observations={"mid": observation},
+        previous_observations={"mid": previous},
+    )
+
+    assert_rejected(decision, api)
+    assert "soc_above_charge_ceiling" in reasons(decision)
+    assert "soc_jump" not in reasons(decision)
+    assert "soc_jump_observed" not in reasons(decision)
 
 
 @pytest.mark.parametrize("difference", [5.0, 5.001, -5.001, -40.0, 44.0])
@@ -604,6 +642,48 @@ def test_soc_divergence_note_boundary_is_inclusive_and_informational(
     assert decision.status is api.DecisionStatus.AUTHORIZED
     assert ("soc_disagreement_observed" in reasons(decision)) is carries_note
     assert "soc_disagreement" not in reasons(decision)
+
+
+def test_a_resyncing_battery_soc_re_baselines_instead_of_denying(
+    api: SimpleNamespace,
+) -> None:
+    """SYNC_RESILIENCE_AUDIT B2's exact incident shape: previous 40 %, current
+    55 % (a > 10-point move between two honest fresh BMS reads -- our poll
+    gap or the battery's own estimate resync).  The decision AUTHORIZES with
+    ``soc_jump_observed`` among the reason codes, and the next cycle compares
+    against the NEW figure: the battery's word wins."""
+    observation = make_observation(api, bms_soc_pct=55.0)
+    previous = make_observation(
+        api,
+        captured_at_mono=99.0,
+        sequence=6,
+        cell_captured_at_mono=99.0,
+        bms_soc_pct=40.0,
+    )
+    decision = evaluate(
+        api,
+        current_observations={"mid": observation},
+        previous_observations={"mid": previous},
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert "soc_jump_observed" in reasons(decision)
+    assert "soc_jump" not in reasons(decision)
+    # The re-baselined cycle: the same fresh figure against itself is quiet.
+    rebaselined = make_observation(
+        api,
+        captured_at_mono=99.0,
+        sequence=6,
+        cell_captured_at_mono=99.0,
+        bms_soc_pct=55.0,
+    )
+    settled = evaluate(
+        api,
+        current_observations={"mid": make_observation(api, bms_soc_pct=55.0)},
+        previous_observations={"mid": rebaselined},
+    )
+    assert settled.status is api.DecisionStatus.AUTHORIZED
+    assert "soc_jump_observed" not in reasons(settled)
 
 
 def test_soc_divergence_note_never_appears_on_a_rejected_decision(
@@ -711,19 +791,21 @@ def test_soc_bounds_are_judged_on_the_authoritative_bms_soc(
 
 
 @pytest.mark.parametrize(
-    ("system_now", "bms_now", "permitted"),
+    ("system_now", "bms_now", "carries_note"),
     [
         # A jumping system word with a steady BMS figure is not a jump: the
         # stale system SOC (frozen at its one-per-connection read) must not
         # trip the protection when the battery's own figure is coherent.
-        (61.0, 50.0, True),
-        # The BMS figure jumping beyond the tolerance still denies.
-        (50.0, 61.0, False),
-        (50.0, 39.999, False),
+        (61.0, 50.0, False),
+        # The BMS figure jumping beyond the tolerance is the battery's own
+        # new word (B2): the fresh figure stands and only the informational
+        # note rides the authorizing decision.
+        (50.0, 61.0, True),
+        (50.0, 39.999, True),
     ],
 )
 def test_soc_jump_is_judged_on_the_authoritative_bms_soc(
-    api: SimpleNamespace, system_now: float, bms_now: float, permitted: bool
+    api: SimpleNamespace, system_now: float, bms_now: float, carries_note: bool
 ) -> None:
     observation = make_observation(
         api,
@@ -744,11 +826,9 @@ def test_soc_jump_is_judged_on_the_authoritative_bms_soc(
         previous_observations={"mid": previous},
     )
 
-    if permitted:
-        assert decision.status is api.DecisionStatus.AUTHORIZED
-    else:
-        assert_rejected(decision, api)
-        assert "soc_jump" in reasons(decision)
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert ("soc_jump_observed" in reasons(decision)) is carries_note
+    assert "soc_jump" not in reasons(decision)
 
 
 @pytest.mark.parametrize(
@@ -1489,27 +1569,6 @@ REASON_CODE_CASES: tuple[pytest.Param, ...] = (
         id="soc_above_charge_ceiling",
     ),
     pytest.param(
-        "soc_jump",
-        lambda api: evaluate(
-            api,
-            current_observations={
-                "mid": make_observation(api, system_soc_pct=50.0, bms_soc_pct=61.0)
-            },
-            previous_observations={
-                "mid": make_observation(
-                    api,
-                    captured_at_mono=99.0,
-                    sequence=6,
-                    cell_captured_at_mono=99.0,
-                    cell_sequence=3,
-                    system_soc_pct=50.0,
-                    bms_soc_pct=50.0,
-                )
-            },
-        ),
-        id="soc_jump",
-    ),
-    pytest.param(
         "cell_count_invalid",
         lambda api: evaluate(
             api,
@@ -1688,16 +1747,9 @@ def test_simultaneous_denials_retain_every_independently_observed_cause(
             make_observation(api, active_faults=frozenset({"BMS_CRITICAL"})),
             make_observation(api, captured_at_mono=99.0, sequence=6),
         ),
-        (
-            make_observation(api, system_soc_pct=50.0, bms_soc_pct=61.0),
-            make_observation(
-                api,
-                captured_at_mono=99.0,
-                sequence=6,
-                system_soc_pct=50.0,
-                bms_soc_pct=50.0,
-            ),
-        ),
+        # B2 removed soc_jump from the deny set (the jump note is
+        # informational), so the independently-observed causes here stay the
+        # stale read, the blocking fault, and the charge ceiling.
         (
             make_observation(api, system_soc_pct=50.0, bms_soc_pct=95.0),
             make_observation(
