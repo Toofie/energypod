@@ -88,6 +88,7 @@ import {
 } from "../../app/fleet";
 import { UnitHealthTag } from "../../app/unitHealth";
 import { isPlaneSnapshot } from "../../app/SharedDataPlane";
+import { toEnergyToday, type EnergyToday } from "../../app/energy";
 import {
   applyWindowClosing,
   applyWindowOpened,
@@ -102,6 +103,7 @@ import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../../lib/format";
 import { NextScheduleCard, toScheduleFacts, type ScheduleFacts } from "./NextScheduleCard";
 import { SolarSurplusTile } from "./SolarSurplusTile";
+import { TodayCard } from "./TodayCard";
 import "./home.css";
 
 export interface HomeViewProps {
@@ -215,6 +217,12 @@ interface SnapshotView {
    * is not composed here, and Home's schedule card renders nothing at all.
    */
   scheduleState: ScheduleState | null;
+  /**
+   * The snapshot's top-level `energy_today` block (PENDING-BACKEND,
+   * feature-detected): null when the field is absent — the energy scorecard
+   * is not composed here, and Home's Today card renders nothing at all.
+   */
+  energyToday: EnergyToday | null;
 }
 
 function readPowerFigure(value: unknown): PowerFigureView | null {
@@ -296,6 +304,10 @@ function readSnapshot(value: unknown): SnapshotView | null {
     // — the schedules feature is not composed here, and Home's schedule card
     // renders nothing at all.
     scheduleState: isRecord(record.schedule_state) ? toScheduleState(record.schedule_state) : null,
+    // Feature detection: an absent `energy_today` (today's backend) is null —
+    // the energy scorecard is not composed here, and Home's Today card
+    // renders nothing at all.
+    energyToday: isRecord(record.energy_today) ? toEnergyToday(record.energy_today) : null,
   };
 }
 
@@ -1140,6 +1152,18 @@ export function HomeView({ client }: HomeViewProps) {
         }
         return;
       }
+      if (frame.type === "energy.day_rolled") {
+        // The scorecard's rollover TRANSITION (DESIGN_ENERGY_SCORECARD.md §6 —
+        // exactly one publication per site midnight, never a heartbeat): the
+        // completed day is history and today's card restarts from the new
+        // baseline. The snapshot's `energy_today` block is stale by
+        // definition, so the world is re-read and the Today card transitions
+        // with the refreshed snapshot; the announcement is the transition
+        // moment. (Insights appends the completed day from this same frame.)
+        refetchSnapshot();
+        setAnnouncement("A new day began — today's energy figures have restarted.");
+        return;
+      }
     };
 
     const onStreamLost = (): void => {
@@ -1524,6 +1548,12 @@ export function HomeView({ client }: HomeViewProps) {
           </ul>
         )}
       </section>
+
+      {/* The energy scorecard's Today card (DESIGN_ENERGY_SCORECARD.md §8 W-A):
+          today's energy account so far, directly after the powering question.
+          Renders nothing at all while the snapshot carries no energy_today
+          (feature detection — the backend half is not composed). */}
+      <TodayCard today={snapshot.energyToday} adviser={snapshot.adviserState} />
 
       {/* The solar-surplus tile: the excess-solar feature's one-glance story.
           Renders nothing at all while the snapshot carries no adviser_state

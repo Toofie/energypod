@@ -560,3 +560,59 @@
       box-shadow 200ms ease;
   }
 }
+
+/* --- the energy scorecard's Today card (DESIGN_ENERGY_SCORECARD.md §8 W-A) --- */
+
+.home-card--energy .home-energy-line {
+  margin: 0.2rem 0;
+  color: #3f3a30;
+}
+
+.home-card--energy .home-energy-line strong {
+  font-variant-numeric: tabular-nums;
+}
+
+.home-energy-line--surplus {
+  color: #4b5563;
+}
+
+.home-energy-marker {
+  margin: 0.5rem 0 0.2rem;
+  font-size: 0.92rem;
+  color: #78716c;
+  font-style: italic;
+}
+
+.home-energy-marker[data-partial="true"] {
+  color: #9a6700;
+}
+
+.home-energy-provenance {
+  margin: 0.2rem 0;
+  font-size: 0.88rem;
+  color: #78716c;
+}
+
+.home-energy-units {
+  margin: 0.5rem 0;
+  font-size: 0.92rem;
+}
+
+.home-energy-units summary {
+  cursor: pointer;
+  color: #2c5282;
+}
+
+.home-energy-units ul {
+  margin: 0.3rem 0 0;
+  padding-left: 1.1rem;
+  color: #57534e;
+}
+
+.home-energy-footnote {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+  color: #78716c;
+  border-top: 1px dashed #d6d0c4;
+  padding-top: 0.4rem;
+}

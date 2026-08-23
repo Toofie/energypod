@@ -82,6 +82,9 @@ import { NextScheduleCard } from "./NextScheduleCard";
 import {
   actuationIncoherent,
   adviserState,
+  energyDayRecord,
+  energyDayRolled,
+  energyToday,
   excessAdviserStateChanged,
   excessChargingToggleOk,
   getScheduleOk,
@@ -96,6 +99,7 @@ import {
   unitHealthChanged,
   unitUnexpectedAutonomy,
   type WireAdviserState,
+  type WireEnergyToday,
   type WireScheduleState,
   type WireTelemetrySummary,
 } from "../../test/wire";
@@ -161,6 +165,11 @@ interface FleetView {
    * today's wire by default; schedule-card tests attach it explicitly.
    */
   schedule_state?: WireScheduleState;
+  /**
+   * The energy scorecard's live-day block (PENDING-BACKEND, feature-detected):
+   * absent from today's wire by default; Today-card tests attach it explicitly.
+   */
+  energy_today?: WireEnergyToday;
 }
 
 interface HealthReport {
@@ -2803,5 +2812,101 @@ describe("HomeView — the next-scheduled-action card", () => {
     // the new figure and never runs from the stale base.
     rerender(view(t0, running(3600)));
     expect(region).toHaveTextContent(/ends in 1 h/);
+  });
+});
+
+describe("HomeView — the energy scorecard's Today card", () => {
+  const TODAY_REGION = /today \(so far\)/i;
+
+  /** A fleet snapshot carrying the pending energy_today block. */
+  function energyWorld(today: WireEnergyToday, snapshotSequence: number = SEQUENCE): FleetView {
+    return { ...fleet(allUnits("disarmed"), snapshotSequence), energy_today: today };
+  }
+
+  it("renders nothing at all while the snapshot carries no energy_today (feature detection)", async () => {
+    // Today's backend sends no energy_today: no card, no heading, no
+    // footnote — the Home view is exactly what it was before the feature.
+    installClient();
+    renderHome();
+    await dataLanded();
+    expect(screen.queryByRole("region", { name: TODAY_REGION })).toBeNull();
+    expect(screen.queryByRole("heading", { name: TODAY_REGION })).toBeNull();
+    expect(screen.queryByText(/solar panels are not measured/i)).toBeNull();
+  });
+
+  it("renders the day's account directly after the powering question, figures honest", async () => {
+    installClient({ snapshot: energyWorld(energyToday()) });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: TODAY_REGION });
+    // The §1 sentence block, from the record's own figures (the sentence
+    // carries <strong> figures, so the region's text is matched as a whole).
+    expect(region).toHaveTextContent(/bought from grid 8\.4 kWh/i);
+    expect(region).toHaveTextContent(/sold to grid 12\.9 kWh/i);
+    expect(region).toHaveTextContent(/charged 6\.2 kWh · discharged 4\.1 kWh · house load 14\.7 kWh/i);
+    expect(region).toHaveTextContent(/so far today — 98\.7% coverage/i);
+    // The A/B unpinned note rides the provenance line with the integrated grid
+    // source; no bought/sold role is ever assigned to either counter.
+    expect(region).toHaveTextContent(/grid figures measured by the controller/i);
+    expect(region).toHaveTextContent(/counter a and counter b until their roles are pinned/i);
+    expect(region.textContent ?? "").not.toMatch(/[AB]\s*(is|=)\s*(bought|sold)/i);
+    // The card sits after "What is powering the home?" (DESIGN §8 W-A) and
+    // before the reserve card.
+    const power = screen.getByRole("region", { name: POWER_REGION });
+    const reserve = screen.getByRole("region", { name: RESERVE_REGION });
+    expect(
+      Boolean(power.compareDocumentPosition(region) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+    expect(
+      Boolean(region.compareDocumentPosition(reserve) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+  });
+
+  it("transitions the card on energy.day_rolled: the world re-reads and the new day renders", async () => {
+    const first = energyWorld(energyToday({ date: "2026-08-26" }));
+    const second = energyWorld(
+      energyToday({
+        date: "2026-08-27",
+        units: {
+          mid: {
+            grid_import_kwh: 3.3,
+            grid_export_kwh: 7.7,
+            battery_charged_kwh: 9.9,
+            battery_discharged_kwh: 2.2,
+            load_kwh: 6.6,
+            charged_from_surplus_kwh: 4.4,
+            coverage_pct: 100,
+            metric_flags: [],
+          },
+        },
+      }),
+      44,
+    );
+    let snapshotCalls = 0;
+    const channel = liveChannel([snapshotFrame(first)]);
+    installClient({
+      snapshot: first,
+      getSnapshot: () => {
+        snapshotCalls += 1;
+        return Promise.resolve(snapshotCalls === 1 ? first : second);
+      },
+      openEvents: channel.openEvents,
+    });
+    renderHome();
+    const card = await screen.findByRole("region", { name: TODAY_REGION });
+    expect(card).toHaveTextContent(/charged 6\.2 kWh/i);
+
+    // The rollover TRANSITION (one publication per site midnight): the card
+    // must not keep yesterday's figures as today's. (The bus and snapshot
+    // sequence spaces are ONE numbering on the real wire — the fixture keeps
+    // them in step: snapshot 42, rollover 43, the refetched world 44.)
+    channel.push(
+      energyDayRolled(43, energyDayRecord({ date: "2026-08-26", kind: "complete" })),
+    );
+    await waitFor(() => {
+      expect(card).toHaveTextContent(/charged 9\.9 kWh/i);
+    });
+    expect(snapshotCalls).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText(/a new day began — today's energy figures have restarted/i)).toBeVisible();
   });
 });

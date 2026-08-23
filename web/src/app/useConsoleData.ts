@@ -57,6 +57,7 @@ import {
   type Lifecycle,
   type UnitHealth,
 } from "./fleet";
+import { toEnergyDayRolledEvent } from "./energy";
 import {
   applyWindowClosing,
   applyWindowOpened,
@@ -814,6 +815,25 @@ function applyEventFrame(
       // subscription; this case exists so the quietness is a pinned decision,
       // not an oversight.
       return false;
+    case "energy.day_rolled": {
+      // The scorecard's rollover TRANSITION (DESIGN_ENERGY_SCORECARD.md §6 —
+      // exactly one publication per site-timezone midnight, never a
+      // heartbeat): the completed day is now history and the live day's
+      // figures reset to the new baseline, so the snapshot's `energy_today`
+      // block is stale by definition — the world is re-read, the Today card
+      // and any loaded ledger follow the refresh. One polite line names the
+      // rolled day; views that hold their own ledger append to it from the
+      // same frame themselves.
+      const rolled = toEnergyDayRolledEvent(payloadOf(frame));
+      dispatch({
+        type: "polite",
+        text:
+          rolled === null || rolled.date === ""
+            ? "A new day began — the energy figures rolled over."
+            : `A new day began — ${rolled.date}'s energy figures are in Insights, and today's card has restarted.`,
+      });
+      return true;
+    }
     default:
       // observation.published, audit.appended refusals, ... are not
       // shell-level facts; subscribers that care read them through the feed.
