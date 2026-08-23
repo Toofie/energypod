@@ -685,6 +685,37 @@ direction, freshness, and watchdog timing per physical unit.
   quality masking sentinel-decode gaps (62,535 W headroom artifact).
   docs/DEFERRED_FINDINGS.md is now a live status ledger per entry.
 
+- 2026-08-23 (wave): THE FULL FIX QUEUE LANDED AND IS LIVE. The backend
+  agent completed 14 commits, and the controller restarted onto them
+  (writemode15, PID 10052). Publish-fence desync ROOT-CAUSED AND FIXED:
+  the kernel's _revoke revoked only through the repository, never the
+  coordinator — after any publish-then-revoke sequence the repository's
+  revoked_through equaled the coordinator epoch and every later mint was
+  fenced forever (granted+fenced audit pair per cycle, watts never
+  dispatched, zero errors — the 22:11Z silent-loss signature). Fix:
+  coordinator.advance_past() + repository revoked_through read; the kernel
+  reconciles after every revocation AND before every mint; fencing itself
+  untouched; red test reproduces the live failure exactly. Also landed:
+  snapshot active_stops (always present, ISO latched_at) + per-unit
+  inhibit fields — the console latch banner is now LIVE; intent.expired +
+  authorization.granted events + watt figures on audit.appended (the
+  console's feature-detected hooks light up); POST /api/v1/intents/cancel
+  (audited, idempotent, bus transition; console Cancel button UI still to
+  build); device-mode words (debug_mode 0x8100+0 promoted to control-rate
+  core, ctrl/work/run modes) decoded + exposed + dispatch gating with
+  device_debug_mode_active / device_mode_not_remote — positive evidence
+  only, read-only; per-unit attribution on single-unit control_decision
+  rows + emergency_stop:{stop_id} correlation on stop-held rows; every
+  suppressed heartbeat failure audited (heartbeat_failed) and logged.
+  All scoped families green (407 across the wave); ruff/mypy clean.
+  MERGE of the P2 worktree branch dispatched (conflicts expected in
+  rest.py/events.py). REMAINING NEXT: console Cancel button + per-request
+  panels consuming the new events (drop the 2.5 s interim poll); excess-
+  solar activation (fence fix + restart clear the technical gate — still
+  awaiting the operator's net-billing confirmation and the 500 W trial
+  cap); promoted-P1 contract cycle (Impl-10 commit-then-raise, simulator
+  register image, blanket GOOD quality).
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
