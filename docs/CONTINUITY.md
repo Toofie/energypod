@@ -768,6 +768,23 @@ direction, freshness, and watchdog timing per physical unit.
   control_decision rows should carry per-unit allocation breakdowns
   (Phase 1 needed fingerprint inference to reconstruct requests).
 
+- 2026-08-23 (merge-verified): P2 MERGE d097dcd DEFINITIVELY VERIFIED (582
+  scoped tests green at HEAD; zero textual conflicts; no branch fix
+  superseded — the wave's event work was in callers, not the bus).
+  Worktree and branch cleaned up after merge. FOUND (pre-existing, proven
+  at merge base): tests/unit/test_main_entry.py has TWO tests that hang
+  forever (test_supervision_failure_through_the_lifespan_exits_nonzero,
+  test_default_runner_exits_nonzero_when_supervision_fails_during_startup)
+  — the start-report startup rework completes the lifespan before the
+  first kernel tick, so their exploding-first-tick never lands in the
+  startup window and their parked receive() never returns. These explain
+  the earlier "full-suite stalls at 59%/wedges under load" reports (the
+  families themselves run in ~3 s isolated). QUEUED FIX: retime the
+  startup-window test harness (tick-once-before-ready or inject the
+  failure via the start-report path). Cosmetic: d097dcd lacks the
+  Co-Authored-By trailer (auto-committed clean merge; amending would
+  rewrite 8 descendant commits from concurrent agents — left intact).
+
 - 2026-08-22 (evening): CONTROL VERIFIED END TO END. Two live defects were
   found and fixed by in-process stall diagnostics with halt-evidence
   instrumentation: (1) the kernel treated a publish-time
