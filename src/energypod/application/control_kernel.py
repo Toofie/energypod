@@ -488,9 +488,12 @@ class ControlKernel:
         try:
             items = tuple(proposals)
             selected = self._selected_units(intent)
+            per_unit_targets = getattr(intent, "watts_by_unit", None)
         except (AttributeError, TypeError, ValueError):
             return False
         if not selected or len(items) != len(selected):
+            return False
+        if per_unit_targets is not None and set(per_unit_targets) != selected:
             return False
         seen: set[str] = set()
         total_watts = 0
@@ -507,6 +510,14 @@ class ControlKernel:
                 or watts < 0
             ):
                 return False
+            if per_unit_targets is not None:
+                # A per-unit intent makes every unit's target that unit's own
+                # cap (the 2026-08-23 operator ruling): a proposal may never
+                # exceed the target the operator named for THIS battery, even
+                # when the fleet total still fits.
+                target = per_unit_targets.get(unit_id)
+                if type(target) is not int or watts > target:
+                    return False
             # A zero-watt entry is legitimate for three reasons the domain
             # allocator contract pins: an IDLE intent carries all zeros, a
             # partially eligible fleet carries zero watts for selected units
@@ -517,8 +528,8 @@ class ControlKernel:
             # raised here and ended the fleet task). Zero watts is inherently
             # safe — the safety kernel rejects an all-zero active allocation
             # and `_eligible` never mints authority for a zero-watt setpoint —
-            # so the matcher enforces only unit-set, identity, direction, and
-            # total bounds.
+            # so the matcher enforces only unit-set, identity, direction,
+            # per-target, and total bounds.
             seen.add(unit_id)
             total_watts += watts
         if intent.direction is Direction.IDLE and total_watts != 0:

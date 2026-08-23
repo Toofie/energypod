@@ -41,6 +41,8 @@ class Intent:
     acceptance_revision: int = 17
     expires_at_mono: float = 110.0
     actor_identity: str = "operator-1"
+    # Per-unit watt targets (2026-08-23 operator ruling): each unit's own cap.
+    watts_by_unit: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -431,6 +433,82 @@ async def test_partially_eligible_fleet_mints_authority_only_for_participating_u
     authorized = next(cap for cap in batch.authorizations if cap.unit_id == "rhs")
     assert authorized.watts == outcome.setpoints[2].watts
     assert authorized.direction is value.direction
+
+
+def _per_unit_intent(api: Any, targets: dict[str, int]) -> Intent:
+    """One MANUAL intent whose per-unit targets sum to its fleet watts."""
+    return Intent(
+        "intent-per-unit",
+        api.IntentSource.MANUAL,
+        frozenset(targets),
+        api.Direction.DISCHARGE,
+        sum(targets.values()),
+        watts_by_unit=dict(targets),
+    )
+
+
+async def test_per_unit_intent_authorizes_each_unit_within_its_own_target(api: Any) -> None:
+    """A watts_by_unit intent mints per-unit authority at the unit's target.
+
+    The matcher must accept proposals at or below each unit's own target and
+    the published batch must carry each unit's target as its authorized watts
+    (the 2026-08-23 operator ruling: each setting is that battery's request).
+    """
+    value = _per_unit_intent(api, {"lhs": 300, "mid": 100, "rhs": 200})
+    at_targets = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        (
+            Setpoint("lhs", value.direction, 300, value.id),
+            Setpoint("mid", value.direction, 100, value.id),
+            Setpoint("rhs", value.direction, 200, value.id),
+        ),
+    )
+    kernel, history, auth, audit, allocator, _safety = make_kernel(api, value, at_targets)
+    allocator.output = tuple(
+        Proposal(unit, value.direction, watts, value.id, value.expires_at_mono)
+        for unit, watts in (("lhs", 300), ("mid", 100), ("rhs", 200))
+    )
+    decision = await kernel.tick()
+    assert decision is at_targets
+    assert history[-2:] == ["audit", "publish"]
+    (batch,) = auth.published
+    authorized = {cap.unit_id: cap.watts for cap in batch.authorizations}
+    assert authorized == {"lhs": 300, "mid": 100, "rhs": 200}
+
+
+async def test_proposal_exceeding_a_units_target_is_rejected_before_safety(api: Any) -> None:
+    """The matcher enforces the per-unit cap even when the fleet total fits.
+
+    mid's proposal of 250 W exceeds its 200 W target while the 750 W total also
+    breaks the fleet bound; the 500 W-into-500 W variant below isolates the
+    per-unit rule: the fleet total EQUALS the intent's watts, only mid's own
+    target is exceeded, and the confused allocator output must still be
+    rejected before safety evaluation mints anything from it.
+    """
+    value = _per_unit_intent(api, {"lhs": 150, "mid": 100, "rhs": 250})
+    over_total = tuple(
+        Proposal(unit, value.direction, watts, value.id, value.expires_at_mono)
+        for unit, watts in (("lhs", 300), ("mid", 150), ("rhs", 300))
+    )
+    over_one_target = tuple(
+        Proposal(unit, value.direction, watts, value.id, value.expires_at_mono)
+        for unit, watts in (("lhs", 150), ("mid", 250), ("rhs", 100))
+    )
+    outcome = Decision(
+        api.DecisionStatus.AUTHORIZED,
+        tuple(
+            Setpoint(unit, value.direction, watts, value.id)
+            for unit, watts in (("lhs", 150), ("mid", 250), ("rhs", 100))
+        ),
+    )
+    for proposals in (over_total, over_one_target):
+        kernel, _history, auth, audit, allocator, _safety = make_kernel(api, value, outcome)
+        allocator.output = proposals
+        with pytest.raises(ValueError, match="allocator output does not match"):
+            await kernel.tick()
+        assert auth.published == []
+        assert audit.events == []
+        assert auth.revocations
 
 
 async def test_single_unit_intent_with_zero_allocation_is_rejected_not_crashing(
