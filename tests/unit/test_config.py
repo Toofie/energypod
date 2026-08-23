@@ -1054,3 +1054,217 @@ def test_the_live_write_examples_energy_block_validates_as_documented() -> None:
     assert parsed.energy_scorecard.grid_source == "integrated"
     assert parsed.energy_scorecard.grid_counter_roles == "unpinned"
     assert parsed.energy_scorecard.tariff is None
+
+
+# --- off-peak night charge (DESIGN_NIGHT_CHARGE §3.1 + API_CONTRACTS
+# --- "Off-peak night charge") ---------------------------------------------------
+#
+# The block follows the block-presence doctrine: ABSENT composes nothing
+# (byte-identical), PRESENT composes the machinery with `enabled` gating
+# PARTICIPATION.  Every cross-validation binds to block-PRESENCE — a disabled
+# block that could never be enabled safely is refused at validation time —
+# and the PARTITION grant is one of them: commissioning night charge and
+# widening schedule.allowed_windows_local are ONE deliberate config revision.
+
+
+def _night_payload(**overrides: Any) -> dict[str, Any]:
+    """The commissioned §3.1 shape against the partition-granted schedule."""
+    payload: dict[str, Any] = {
+        "timezone": "Australia/Brisbane",
+        "window_local": [["00:00", "06:00"]],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _night_config(**overrides: Any) -> dict[str, Any]:
+    payload = _valid_config()
+    payload["schedule"] = {"allowed_windows_local": [["00:00", "20:00"]]}
+    payload["night_charging"] = _night_payload(**overrides)
+    return payload
+
+
+def _assert_night_rule(payload: dict[str, Any], *, message_contains: str) -> ValidationError:
+    """Refuse the block by its OWN commissioning rule, not by key ignorance
+    (the excess/schedule pattern: an unimplemented block answers
+    ``extra_forbidden`` at the top level, which would be a spurious pass)."""
+    with pytest.raises(ValidationError) as caught:
+        _validate(payload)
+    error = caught.value
+    night_errors = [
+        item for item in error.errors() if item["loc"] and item["loc"][0] == "night_charging"
+    ]
+    assert night_errors, f"expected a night_charging error, got {error.errors()!r}"
+    assert all(item["type"] != "extra_forbidden" for item in night_errors), (
+        "the night_charging block must be a known key refused by its commissioning rule, "
+        "not rejected as an unknown key"
+    )
+    assert message_contains.lower() in str(error).lower()
+    return error
+
+
+def test_night_charging_block_is_absent_by_default() -> None:
+    parsed = _validate(_valid_config())
+    assert getattr(parsed, "night_charging", "__missing__") is None, (
+        "no night_charging block means the feature is entirely absent"
+    )
+
+
+def test_a_present_night_block_composes_with_the_pinned_defaults() -> None:
+    """§3.1: every key carries its commissioned default except the REQUIRED
+    civil-time facts (timezone and the window's canonical spelling)."""
+    parsed = _validate(_night_config())
+
+    block = parsed.night_charging
+    assert block is not None
+    assert block.timezone == "Australia/Brisbane"
+    assert block.window_local == (("00:00", "06:00"),)
+    assert block.enabled is False, "suspended at boot is the default (the excess doctrine)"
+    assert block.rate_cap_w == 2500
+    assert block.demand_threshold_w == 1000
+    assert block.demand_exit_hysteresis_w == 200
+    assert block.hold_rate_w == 100
+    assert block.demand_scope == "fleet"
+    assert block.pacing == "cap_first"
+    assert block.assumed_capacity_wh is None
+    assert block.demand_telemetry_max_age_s == 3.0
+    assert block.intent_ttl_s == 10.0
+
+
+def test_the_timezone_is_a_required_iana_fact() -> None:
+    missing = _night_config()
+    del missing["night_charging"]["timezone"]
+    with pytest.raises(ValidationError, match="timezone"):
+        _validate(missing)
+
+    _assert_night_rule(_night_config(timezone="Not/AZone"), message_contains="IANA")
+
+
+@pytest.mark.parametrize(
+    ("windows", "message"),
+    [
+        ([], "window_local"),
+        ([["00:00", "00:00"]], "zero-length"),
+        ([["0:00", "06:00"]], "HH:MM"),
+        ([["00:00"]], "field required"),
+    ],
+)
+def test_malformed_night_windows_are_refused(windows: list[Any], message: str) -> None:
+    _assert_night_rule(_night_config(window_local=windows), message_contains=message)
+
+
+def test_a_cross_midnight_night_window_is_canonical_and_commissionable() -> None:
+    payload = _night_config(window_local=[["22:00", "04:00"]])
+    payload["schedule"] = {"allowed_windows_local": [["20:00", "06:00"]]}
+    parsed = _validate(payload)
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.window_local == (("22:00", "04:00"),)
+
+
+def test_a_disabled_night_block_still_requires_write_enabled_mode() -> None:
+    payload = _night_config(enabled=False)
+    payload["mode"] = "observe_only"
+    payload.pop("authentication", None)
+    _assert_night_rule(payload, message_contains="write_enabled")
+
+
+def test_a_disabled_night_block_still_requires_the_policy_block() -> None:
+    payload = _night_config(enabled=False)
+    payload.pop("policy")
+    _assert_night_rule(payload, message_contains="policy")
+
+
+def test_night_rate_cap_must_not_exceed_the_static_unit_charge_limit() -> None:
+    _assert_night_rule(_night_config(rate_cap_w=2501), message_contains="max_unit_charge_w")
+
+
+def test_night_hold_rate_must_be_a_positive_charge_below_the_cap() -> None:
+    """§2.4's pin: the hold is a small POSITIVE charge — zero hands the pod
+    back to matching autonomy, the opposite of the operator's intent."""
+    _assert_night_rule(_night_config(hold_rate_w=0), message_contains="hold_rate_w")
+    _assert_night_rule(_night_config(hold_rate_w=2500), message_contains="hold_rate_w")
+
+
+def test_night_hysteresis_must_sit_strictly_inside_the_threshold() -> None:
+    _assert_night_rule(_night_config(demand_exit_hysteresis_w=0), message_contains="hysteresis")
+    _assert_night_rule(_night_config(demand_exit_hysteresis_w=1000), message_contains="hysteresis")
+
+
+def test_night_demand_freshness_must_be_satisfiable_by_the_polling_loop() -> None:
+    # control 0.40 + essential read 0.10 = 0.50; the bound must EXCEED it.
+    _assert_night_rule(
+        _night_config(demand_telemetry_max_age_s=0.50), message_contains="control_period_s"
+    )
+
+
+@pytest.mark.parametrize("ttl", [0.20, 300.5])
+def test_night_intent_ttl_must_stay_inside_the_commissioned_bounds(ttl: float) -> None:
+    _assert_night_rule(
+        _night_config(intent_ttl_s=ttl),
+        message_contains="300" if ttl > 1 else "control_period_s",
+    )
+
+
+def test_even_pacing_requires_the_capacity_map_with_exactly_the_fleet_units() -> None:
+    payload = _night_config(
+        pacing="even", assumed_capacity_wh={"mid": 5000, "rhs": 5000, "lhs": 5000}
+    )
+    parsed = _validate(payload)
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.assumed_capacity_wh == {"mid": 5000, "rhs": 5000, "lhs": 5000}
+
+    _assert_night_rule(_night_config(pacing="even"), message_contains="assumed_capacity_wh")
+    wrong_keys = _night_config(
+        pacing="even", assumed_capacity_wh={"mid": 5000, "rhs": 5000, "lhs": 5000, "ghost": 5000}
+    )
+    _assert_night_rule(wrong_keys, message_contains="fleet")
+
+
+def test_cap_first_pacing_refuses_a_stray_capacity_map() -> None:
+    """`assumed_capacity_wh` present IFF `pacing: even` — a stray map under
+    cap_first is a configuration that lies about which pacing rule runs."""
+    _assert_night_rule(
+        _night_config(assumed_capacity_wh={"mid": 5000, "rhs": 5000, "lhs": 5000}),
+        message_contains="assumed_capacity_wh",
+    )
+
+
+def test_the_partition_grant_is_required_and_names_the_widening_path() -> None:
+    """§3.2: the schedule block must be PRESENT and its allowed union must
+    cover the night window ENTIRELY — one deliberate revision, both blocks."""
+    no_schedule = _valid_config()
+    no_schedule["night_charging"] = _night_payload()
+    _assert_night_rule(no_schedule, message_contains="allowed_windows_local")
+
+    day_only = _valid_config()
+    day_only["schedule"] = {"allowed_windows_local": [["06:00", "20:00"]]}
+    day_only["night_charging"] = _night_payload()
+    error = _assert_night_rule(day_only, message_contains="allowed_windows_local")
+    assert "widen" in str(error).lower(), "the refusal names the partition path"
+
+
+def test_the_partition_grant_joins_two_windows_that_cover_the_night() -> None:
+    """The UNION of the allowed pairs covers the night window — two day
+    windows plus the granted night hour are a legal partition grant."""
+    payload = _night_config(window_local=[["00:00", "06:00"]])
+    payload["schedule"] = {
+        "allowed_windows_local": [["00:00", "01:00"], ["01:00", "06:00"], ["06:00", "20:00"]]
+    }
+    parsed = _validate(payload)
+    assert parsed.night_charging is not None
+
+
+def test_a_partial_cover_is_refused() -> None:
+    payload = _night_config(window_local=[["00:00", "06:00"]])
+    payload["schedule"] = {"allowed_windows_local": [["00:00", "03:00"], ["06:00", "20:00"]]}
+    _assert_night_rule(payload, message_contains="allowed_windows_local")
+
+
+def test_unknown_night_keys_are_refused() -> None:
+    payload = _night_config(surprise=True)
+    with pytest.raises(ValidationError) as caught:
+        _validate(payload)
+    assert any(
+        item["type"] == "extra_forbidden" and item["loc"][0] == "night_charging"
+        for item in caught.value.errors()
+    )

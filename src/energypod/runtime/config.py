@@ -516,6 +516,70 @@ class EnergyScorecardConfig(_FrozenModel):
         return self
 
 
+class NightChargingConfig(_FrozenModel):
+    """DESIGN_NIGHT_CHARGE §3.1 + API_CONTRACTS "Off-peak night charge".
+
+    Block-presence doctrine, symmetric with ``excess_charging``/``schedule``:
+    a PRESENT block composes the adviser, the ``night_charge_state``
+    projection, the ``night_charge.state_changed`` events, the guarded toggle
+    route, and the PCS live-block promotion; an ABSENT block composes
+    NOTHING — byte-identical to today.  ``enabled`` defaults to ``false``
+    and gates PARTICIPATION only (the excess activation doctrine verbatim:
+    runtime state never persists, boot recomposes from this file).  The
+    cross-fleet relations (the cap inside the static unit charge limit, the
+    hold strictly between zero and the cap, the hysteresis band strictly
+    inside the threshold, a freshness bound the polling loop can satisfy, a
+    bounded renewable TTL, the capacity map exactly when the pacing rule
+    needs it, and the PARTITION grant against the schedule policy) are
+    validated on ``ControllerConfig``, where the blocks they relate to live.
+    """
+
+    # REQUIRED: the off-peak window is a civil-time fact the operator
+    # confirms (§8 item 1); there is no default zone to fall back to.
+    timezone: NonEmpty
+    window_local: tuple[tuple[NonEmpty, NonEmpty], ...] = (("00:00", "06:00"),)
+    enabled: StrictBool = False
+    rate_cap_w: PositiveStrictInt = 2500
+    demand_threshold_w: PositiveStrictInt = 1000
+    demand_exit_hysteresis_w: PositiveStrictInt = 200
+    hold_rate_w: PositiveStrictInt = 100
+    demand_scope: Literal["fleet", "per_phase"] = "fleet"
+    pacing: Literal["cap_first", "even"] = "cap_first"
+    # REQUIRED iff ``pacing: even`` (key set exactly the fleet units,
+    # validated on ControllerConfig); a stray map under cap_first is refused
+    # — the estimate only shapes pacing, never safety.
+    assumed_capacity_wh: dict[NonEmpty, PositiveStrictInt] | None = None
+    demand_telemetry_max_age_s: PositiveFiniteFloat = 3.0
+    intent_ttl_s: PositiveFiniteFloat = 10.0
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        value = _plain(value, label="timezone")
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone must be a valid IANA timezone") from exc
+        return value
+
+    @field_validator("window_local")
+    @classmethod
+    def validate_windows(cls, values: tuple[tuple[str, str], ...]) -> tuple[tuple[str, str], ...]:
+        cleaned: list[tuple[str, str]] = []
+        for start_raw, end_raw in values:
+            start = _valid_policy_wall(start_raw)
+            end = _valid_policy_wall(end_raw)
+            if start == end:
+                raise ValueError(
+                    "window_local pairs must not be zero-length (a window that "
+                    "commands no minute is ambiguous)"
+                )
+            cleaned.append((start, end))
+        if not cleaned:
+            raise ValueError("window_local must name at least one window")
+        return tuple(cleaned)
+
+
 class ControllerConfig(_FrozenModel):
     schema_version: Annotated[StrictInt, Field(ge=1)]
     revision: Annotated[StrictInt, Field(ge=1)]
@@ -539,6 +603,10 @@ class ControllerConfig(_FrozenModel):
     # declared last beside its siblings so its commissioning validator sees
     # the already-validated timing.
     energy_scorecard: EnergyScorecardConfig | None = None
+    # DESIGN_NIGHT_CHARGE §3.1 (B1): declared LAST of all so its commissioning
+    # validator sees the already-validated policy, timing, units, and the
+    # schedule block the PARTITION grant is judged against.
+    night_charging: NightChargingConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -741,6 +809,129 @@ class ControllerConfig(_FrozenModel):
                     "seconds: a wider spacing is an outage, not a sampling cadence"
                 )
         return scorecard
+
+    @field_validator("night_charging")
+    @classmethod
+    def validate_night_charging(
+        cls, night: NightChargingConfig | None, info: ValidationInfo
+    ) -> NightChargingConfig | None:
+        """DESIGN_NIGHT_CHARGE §3.1/§3.2: the commissioning gates for a
+        PRESENT night block (every gate binds to block-PRESENCE — a disabled
+        block that could never be enabled safely is refused, because the
+        runtime toggle can raise participation but never a cap, window,
+        pacing choice, or grant).
+
+        The PARTITION grant is the one deliberate-revision rule: the union of
+        a PRESENT ``schedule.allowed_windows_local`` must cover
+        ``night_charging.window_local`` ENTIRELY, so commissioning night
+        charge and granting the night partition are one config revision plus
+        one restart — the refusal names the widening path.
+        """
+        if night is None:
+            return night
+        values = info.data
+        if values.get("mode") is not ControllerMode.WRITE_ENABLED:
+            raise ValueError(
+                "night_charging requires mode write_enabled: an observe-only "
+                "composition can never actuate, so the night strategy is refused "
+                "at validation time whether enabled or explicitly disabled"
+            )
+        policy = values.get("policy")
+        if policy is None:
+            raise ValueError(
+                "night_charging requires a policy block: the charge plan derives "
+                "from the commissioned SOC ceiling and static charge limits"
+            )
+        if night.rate_cap_w > policy.max_unit_charge_w:
+            raise ValueError(
+                "night_charging.rate_cap_w must not exceed the policy "
+                "max_unit_charge_w: the night ask sits exactly at the per-unit "
+                "static cap and can never exceed it"
+            )
+        if not 0 < night.hold_rate_w < night.rate_cap_w:
+            raise ValueError(
+                "night_charging.hold_rate_w must be a positive charge strictly "
+                "below rate_cap_w: a zero hold hands the pod back to matching "
+                "autonomy — the opposite of the operator's intent — and a hold at "
+                "the cap is no hold at all"
+            )
+        if not 0 < night.demand_exit_hysteresis_w < night.demand_threshold_w:
+            raise ValueError(
+                "night_charging.demand_exit_hysteresis_w must be strictly positive "
+                "and strictly below demand_threshold_w: the hysteresis band is "
+                "what keeps a load oscillating around the threshold from toggling "
+                "the rate every tick"
+            )
+        timing = values.get("timing")
+        if timing is not None:
+            poll_bound = timing.control_period_s + timing.essential_read_timeout_s
+            if night.demand_telemetry_max_age_s <= poll_bound:
+                raise ValueError(
+                    "night_charging.demand_telemetry_max_age_s must exceed "
+                    "timing.control_period_s + timing.essential_read_timeout_s: a "
+                    "fresher demand word than the polling loop can ever serve "
+                    "would hold the fleet forever on stale evidence"
+                )
+            if night.intent_ttl_s <= timing.control_period_s:
+                raise ValueError(
+                    "night_charging.intent_ttl_s must exceed timing.control_period_s: "
+                    "the adviser renews exactly once per fleet cycle"
+                )
+        if not 0 < night.intent_ttl_s <= 300:
+            raise ValueError(
+                "night_charging.intent_ttl_s must stay inside (0, 300] seconds — the "
+                "REST dispatch cap; the adviser may not out-live ordinary intents"
+            )
+        fleet_units = {unit.unit_id for unit in values.get("units", ()) or ()}
+        if night.pacing == "even":
+            if night.assumed_capacity_wh is None:
+                raise ValueError(
+                    "night_charging.assumed_capacity_wh is required when pacing is "
+                    "'even': the deadline rule paces from the per-unit capacity "
+                    "estimate (the estimate only shapes pacing, never safety)"
+                )
+            if set(night.assumed_capacity_wh) != fleet_units:
+                raise ValueError(
+                    "night_charging.assumed_capacity_wh keys must be exactly the "
+                    "fleet units: a unit without an estimate has no deadline to "
+                    "pace and a stray key names no battery"
+                )
+        elif night.assumed_capacity_wh is not None:
+            raise ValueError(
+                "night_charging.assumed_capacity_wh must be present only when "
+                "pacing is 'even': cap_first paces from the cap alone and a stray "
+                "map misstates which pacing rule runs"
+            )
+        schedule = values.get("schedule")
+        if schedule is None:
+            raise ValueError(
+                "night_charging requires the PARTITION grant: a PRESENT "
+                "schedule block whose allowed_windows_local union covers the "
+                "night window entirely — widen schedule.allowed_windows_local "
+                "(one deliberate config revision, both blocks, then restart): "
+                "the night window belongs to the site's other writer "
+                "applications until the partition is granted"
+            )
+        from energypod.application.scheduling import parse_hhmm, window_inside_union
+
+        allowed = tuple(
+            (parse_hhmm(start), parse_hhmm(end)) for start, end in schedule.allowed_windows_local
+        )
+        uncovered = [
+            f"{start}-{end}"
+            for start, end in night.window_local
+            if not window_inside_union(parse_hhmm(start), parse_hhmm(end), allowed)
+        ]
+        if uncovered:
+            raise ValueError(
+                "night_charging.window_local is not covered by the union of "
+                "schedule.allowed_windows_local (" + ", ".join(uncovered) + ") — "
+                "widen schedule.allowed_windows_local to cover the night window "
+                "entirely (one deliberate config revision, both blocks, then "
+                "restart): the night window belongs to the site's other writer "
+                "applications until the partition is granted"
+            )
+        return night
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:
