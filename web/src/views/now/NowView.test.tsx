@@ -377,6 +377,29 @@ describe("NowView — current request card", () => {
     expect(fact("Actual").textContent ?? "").not.toMatch(/\d\.\d{3,}/);
   });
 
+  it("derives the per-battery expectation for a multi-unit request, with the total beside it", async () => {
+    // The wire carries the intent's scalar total in every covered unit's
+    // requested_power (service.py `_requested_power`), so three units at
+    // 3,000 W are one request the operator filed as "1,000 each". The
+    // Requested fact derives the split — "≈" because headroom weighting can
+    // shift a unit's share — instead of repeating the raw total per unit.
+    // A single-unit request keeps its plain figure (pinned by the tests
+    // above: "Charge · 1,500 W" for one unit).
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        { ...ACTIVE_MID, requested_power: { direction: "discharge", watts: 3000 } },
+        { ...ACTIVE_MID, unit_id: "RHS", requested_power: { direction: "discharge", watts: 3000 } },
+        { ...ACTIVE_MID, unit_id: "LHS", requested_power: { direction: "discharge", watts: 3000 } },
+      ]),
+    );
+
+    renderNow();
+
+    const requested = await screen.findByRole("group", { name: "Requested" });
+    expect(requested.textContent ?? "").toContain("Discharge");
+    expect(requested.textContent ?? "").toContain("≈1,000 W per battery (3,000 W total)");
+  });
+
   it("reports allowed as explicitly none when a live request has no authorization", async () => {
     // requested from an accepted intent, authorized_power still null (not yet
     // granted): the requested watts must never echo into the Allowed fact.
@@ -713,7 +736,7 @@ describe("NowView — dispatch", () => {
 
     const dialog = await openDispatch(user, /^charge/i);
 
-    const watts = within(dialog).getByLabelText(/watts/i);
+    const watts = within(dialog).getByLabelText(/watts per battery/i);
     await user.clear(watts);
     await user.type(watts, "1500");
     const minutes = within(dialog).getByLabelText(/minutes|duration|ttl/i);
@@ -724,8 +747,11 @@ describe("NowView — dispatch", () => {
 
     // One composed preview sentence carries the direction, the typed watts,
     // the selected unit, the limit, and the expiry: static helper copy cannot
-    // satisfy it because it contains the operator's own inputs.
+    // satisfy it because it contains the operator's own inputs. The watts are
+    // PER BATTERY (2026-08-23 operator ruling), so a single selected battery
+    // shows both figures as the same number — never an unexplained total.
     const preview = tightestText(dialog, /charge/i, /1,?500\s*W/, /MID/);
+    expect(preview).toContain("Each battery: up to 1,500 W · Total: 1,500 W");
     expect(preview).toMatch(/limit/i);
     expect(preview).toMatch(/5\s*min|300\s*s/i);
 
@@ -775,6 +801,102 @@ describe("NowView — dispatch", () => {
     expect(api.client.postIntent).toHaveBeenCalledWith(
       expect.objectContaining({ direction: "discharge", watts: 800, ttl_s: 300 }),
       // One idempotency key per operator action is part of the pinned call.
+      expect.any(String),
+    );
+  });
+
+  it("submits per-battery watts times the selected count as the payload's scalar fleet total", async () => {
+    // The operator's ruling verbatim: "I asked for each setting to be one
+    // thousand, not a total of 1,000." Three armed batteries at 1,000 W each
+    // submit 3,000 W — the backend contract stays the scalar fleet-total
+    // `watts`; only the form's meaning is per battery. watts_by_unit lands
+    // separately and is not pre-implemented.
+    const user = userEvent.setup();
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([ARMED_MID, ARMED_RHS, { ...ARMED_MID, unit_id: "LHS" }]),
+    );
+    api.client.postIntent.mockResolvedValue(ACCEPTED_CHARGE);
+    renderNow();
+
+    const dialog = await openDispatch(user, /^charge/i);
+    const watts = within(dialog).getByLabelText(/watts per battery/i);
+    await user.clear(watts);
+    await user.type(watts, "1000");
+
+    // The multiplication is on screen before any confirm.
+    expect(
+      within(dialog).getByText("1,000 W × 3 batteries selected = 3,000 W total"),
+    ).toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
+
+    expect(api.client.postIntent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        unit_ids: ["MID", "RHS", "LHS"],
+        direction: "charge",
+        watts: 3000,
+        ttl_s: 300,
+      }),
+      expect.any(String),
+    );
+  });
+
+  it("re-derives the live per-battery math as the unit selection changes", async () => {
+    const user = userEvent.setup();
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([ARMED_MID, ARMED_RHS, { ...ARMED_MID, unit_id: "LHS" }]),
+    );
+    renderNow();
+
+    const dialog = await openDispatch(user, /^discharge/i);
+    const watts = within(dialog).getByLabelText(/watts per battery/i);
+    await user.clear(watts);
+    await user.type(watts, "1000");
+
+    expect(
+      within(dialog).getByText("1,000 W × 3 batteries selected = 3,000 W total"),
+    ).toBeInTheDocument();
+
+    // Unticking one battery re-derives the total live: the figure beside
+    // Confirm is never a stale multiplication.
+    await user.click(within(dialog).getByRole("checkbox", { name: /RHS/ }));
+    expect(
+      within(dialog).getByText("1,000 W × 2 batteries selected = 2,000 W total"),
+    ).toBeInTheDocument();
+  });
+
+  it("refuses watts above the per-battery cap with the bound named, and accepts the boundary value", async () => {
+    const user = userEvent.setup();
+    renderArmed();
+    api.client.postIntent.mockResolvedValue(ACCEPTED_CHARGE);
+
+    const dialog = await openDispatch(user, /^charge/i);
+    const watts = within(dialog).getByLabelText(/watts per battery/i);
+
+    // The guidance names the per-battery bound up front.
+    expect(describedText(watts)).toMatch(/max 2,?500 W per battery/i);
+
+    await user.clear(watts);
+    await user.type(watts, "2501");
+    await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
+
+    // Over the cap: refused before any POST, with the bound named on the
+    // field itself — never silently clamped.
+    expect(
+      await within(dialog).findByText("Watts per battery are too high: the bound is 2,500 W per battery."),
+    ).toBeInTheDocument();
+    expect(api.client.postIntent).not.toHaveBeenCalled();
+
+    // The boundary itself is within the cap and posts as-is.
+    await user.clear(watts);
+    await user.type(watts, "2500");
+    await user.click(within(dialog).getByRole("button", { name: /confirm/i }));
+
+    await waitFor(() => {
+      expect(api.client.postIntent).toHaveBeenCalledTimes(1);
+    });
+    expect(api.client.postIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ watts: 2500, ttl_s: 300 }),
       expect.any(String),
     );
   });

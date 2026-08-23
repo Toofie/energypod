@@ -52,6 +52,17 @@
  * resumed connection's first snapshot carrying a LOWER sequence than the
  * picture on screen is a controller restart that renumbered the sequence
  * space — adopted, never refused, so a restart cannot freeze this view.
+ *
+ * Dispatch semantics (2026-08-23 operator ruling — "I asked for each setting
+ * to be one thousand, not a total of 1,000"): the dispatch form's watts field
+ * is PER BATTERY, never a fleet total. The multiplication is shown live
+ * before confirm ("1,000 W × 3 batteries selected = 3,000 W total"), the
+ * confirm preview states both figures plainly ("Each battery: up to 1,000 W ·
+ * Total: 3,000 W"), and the Requested fact derives the same per-battery
+ * expectation for a multi-unit request. The SUBMITTED payload keeps the
+ * backend contract exactly as it stands — the scalar fleet-total `watts`,
+ * per-battery × selected count; the `watts_by_unit` extension lands
+ * separately and is deliberately not pre-implemented here.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
@@ -247,6 +258,44 @@ function displayDirection(direction: string): string {
   if (normalized === "charge") return "Charge";
   if (normalized === "discharge") return "Discharge";
   return "Idle";
+}
+
+/**
+ * The Requested fact for the units carrying an active request.
+ *
+ * The wire carries the newest intent's SCALAR total in every covered unit's
+ * `requested_power.watts` (service.py `_requested_power` projects the intent's
+ * own figure, never a per-unit split), so a request covering several units
+ * reads on the wire as the same total repeated once per unit — the exact
+ * fleet-total reading the 2026-08-23 operator ruling rejected. Units carrying
+ * the identical direction and watts figure are the units one intent covers:
+ * for them the fact derives the per-battery expectation from the split —
+ * total ÷ covered units, marked "≈" because the allocator's headroom
+ * weighting can shift any unit's share — alongside the plain total. A
+ * single-unit request renders exactly as before: direction and its own
+ * figure, no derived phrasing.
+ */
+function requestedFactText(activeUnits: WireUnit[]): string {
+  const groups: { direction: string; watts: number; count: number }[] = [];
+  for (const unit of activeUnits) {
+    const figure = unit.requested_power;
+    const shared = groups.find(
+      (group) => group.direction === figure.direction && group.watts === figure.watts,
+    );
+    if (shared === undefined) {
+      groups.push({ direction: figure.direction, watts: figure.watts, count: 1 });
+    } else {
+      shared.count += 1;
+    }
+  }
+  return groups
+    .map((group) => {
+      if (group.count === 1) {
+        return `${displayDirection(group.direction)} · ${formatWatts(group.watts)}`;
+      }
+      return `${displayDirection(group.direction)} · ≈${formatWatts(group.watts / group.count)} per battery (${formatWatts(group.watts)} total)`;
+    })
+    .join("; ");
 }
 
 // Watt and second figures render through the shared display-precision module
@@ -524,6 +573,16 @@ type DispatchApiError = { error: ApiClientError; field: "watts" | "minutes" | nu
 
 /** UI-side bound mirroring the API's ttl_s <= 300 validation. */
 const MAX_DURATION_MINUTES = 5;
+
+/**
+ * UI-side per-battery bound mirroring the site policy's per-unit static
+ * dispatch cap (2500 W today). Shown as guidance on the field and enforced as
+ * a pre-submit guard, so an over-cap request is named and refused here before
+ * any POST — never silently rescaled. The wire carries no cap figure yet;
+ * this constant stands in until the server exposes one.
+ */
+const PER_UNIT_WATTS_CAP_W = 2500;
+
 const RECONNECT_DELAY_MS = 3000;
 
 export function NowView({ client }: NowViewProps) {
@@ -1006,15 +1065,9 @@ export function NowView({ client }: NowViewProps) {
     (unit): unit is WireUnit & { measured_watts: number } => unit.measured_watts !== null,
   );
 
-  const requestedText =
-    activeUnits.length > 0
-      ? activeUnits
-          .map(
-            (unit) =>
-              `${displayDirection(unit.requested_power.direction)} · ${formatWatts(unit.requested_power.watts)}`,
-          )
-          .join("; ")
-      : "None";
+  // The Requested fact derives the per-battery expectation for a multi-unit
+  // request (see requestedFactText); "None" is the honest no-request state.
+  const requestedText = activeUnits.length > 0 ? requestedFactText(activeUnits) : "None";
   const allowedText =
     authorizedUnits.length > 0
       ? authorizedUnits
@@ -1132,7 +1185,9 @@ export function NowView({ client }: NowViewProps) {
     const minutesValue = Number(dispatchMinutes.trim());
     const errors: FieldErrors = { watts: null, minutes: null };
     if (!Number.isFinite(wattsValue) || wattsValue <= 0) {
-      errors.watts = "Enter a positive number of watts (greater than 0).";
+      errors.watts = "Enter a positive number of watts per battery (greater than 0).";
+    } else if (wattsValue > PER_UNIT_WATTS_CAP_W) {
+      errors.watts = `Watts per battery are too high: the bound is ${formatWatts(PER_UNIT_WATTS_CAP_W)} per battery.`;
     }
     if (!Number.isFinite(minutesValue) || minutesValue <= 0) {
       errors.minutes = "Enter a duration of at least 1 minute.";
@@ -1158,10 +1213,14 @@ export function NowView({ client }: NowViewProps) {
       });
       return;
     }
+    // The form is per battery; the submitted watts stays the backend contract
+    // exactly as it stands — the scalar fleet-total figure the intent endpoint
+    // defines. Per-battery × selected count IS that total; the `watts_by_unit`
+    // extension lands separately and is not pre-implemented here.
     const body: Record<string, unknown> = {
       unit_ids: [...selectedUnitIds],
       direction,
-      watts: wattsValue,
+      watts: wattsValue * selectedUnitIds.length,
       ttl_s: Math.round(minutesValue * 60),
     };
     // One caller-supplied idempotency key per operator action: a retry of the
@@ -1243,27 +1302,42 @@ export function NowView({ client }: NowViewProps) {
   };
 
   // --- dispatch preview ----------------------------------------------------------
+  //
+  // The form is per battery (the 2026-08-23 operator ruling): the live math
+  // line shows the multiplication as it is typed and as units are ticked, and
+  // the confirm preview states both figures plainly — per battery and total —
+  // so the submitted scalar total is never a silent surprise.
 
   const wattsNumber = Number(dispatchWatts.trim());
   const minutesNumber = Number(dispatchMinutes.trim());
   const wattsValid = dispatchWatts.trim() !== "" && Number.isFinite(wattsNumber) && wattsNumber > 0;
   const minutesValid =
     dispatchMinutes.trim() !== "" && Number.isFinite(minutesNumber) && minutesNumber > 0;
+  const selectedCount = selectedUnitIds.length;
+  const batteryWord = selectedCount === 1 ? "battery" : "batteries";
+  /** The submitted scalar total: per-battery watts × selected count. */
+  const totalWatts = wattsValid ? wattsNumber * selectedCount : null;
+  const wattsMathText = wattsValid
+    ? `${formatWatts(wattsNumber)} × ${selectedCount} ${batteryWord} selected = ${formatWatts(totalWatts ?? 0)} total`
+    : `Enter the watts per battery to see the total for the ${selectedCount} ${batteryWord} selected.`;
   const dispatchDirection =
     dialog?.kind === "dispatch"
       ? displayDirection(dialog.direction)
       : dialog?.kind === "inhibit"
         ? "Inhibit"
         : "Control";
-  const previewUnits = selectedUnitIds.length > 0 ? selectedUnitIds.join(", ") : "no units";
-  const previewWatts = wattsValid ? formatWatts(wattsNumber) : "the watts you set";
+  const previewUnits = selectedCount > 0 ? selectedUnitIds.join(", ") : "no units";
+  const previewPerBattery = wattsValid ? `up to ${formatWatts(wattsNumber)}` : "the watts you set";
+  const previewTotal =
+    totalWatts !== null ? formatWatts(totalWatts) : "the watts you set × the batteries you select";
   const previewDuration = minutesValid
     ? `${dispatchMinutes.trim()} min`
     : "the duration you set";
-  const previewSentence = `${dispatchDirection} ${previewUnits} at ${previewWatts} for ${previewDuration}, subject to the site power limit, expiring ${previewDuration} after acceptance.`;
+  const previewSentence = `${dispatchDirection} ${previewUnits}. Each battery: ${previewPerBattery} · Total: ${previewTotal}. For ${previewDuration}, subject to the site power limit, expiring ${previewDuration} after acceptance.`;
 
   const wattsDescribedBy = [
     "now-dispatch-watts-hint",
+    "now-dispatch-watts-math",
     fieldErrors !== null && fieldErrors.watts !== null ? "now-dispatch-watts-error" : null,
     dispatchApiError !== null && dispatchApiError.field === "watts" ? "now-dispatch-watts-api" : null,
   ]
@@ -1643,7 +1717,7 @@ export function NowView({ client }: NowViewProps) {
           onDecline={closeDialog}
         >
           <div className="dispatch-fields">
-            <label htmlFor="now-dispatch-watts">Watts</label>
+            <label htmlFor="now-dispatch-watts">Watts per battery</label>
             <input
               id="now-dispatch-watts"
               type="text"
@@ -1653,7 +1727,14 @@ export function NowView({ client }: NowViewProps) {
               onChange={(event) => setDispatchWatts(event.target.value)}
             />
             <p id="now-dispatch-watts-hint" className="field-hint">
-              Positive watts (greater than 0).
+              Positive watts per battery (greater than 0), max{" "}
+              {formatWatts(PER_UNIT_WATTS_CAP_W)} per battery.
+            </p>
+            {/* The live math: per-battery × selected count, re-derived as the
+                operator types or ticks units — the submitted total is shown,
+                never silent. */}
+            <p id="now-dispatch-watts-math" className="field-hint">
+              {wattsMathText}
             </p>
             {fieldErrors !== null && fieldErrors.watts !== null ? (
               <p id="now-dispatch-watts-error" className="field-error">
