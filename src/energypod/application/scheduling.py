@@ -365,6 +365,18 @@ class ScheduleIntentPort(Protocol):
     async def remove(self, intent_id: str) -> None: ...
 
 
+class ScheduleObservationsPort(Protocol):
+    """The latest-observation read the disarmed-window honesty code needs.
+
+    Structural, like every runner port: composition wires the SAME observation
+    repository the fleet loop reads.  ``None`` (the default) keeps the
+    projection exactly as it is today — the runner then never says
+    ``units_disarmed``, so isolated compositions are unchanged.
+    """
+
+    async def all_latest(self) -> Mapping[str, Any]: ...
+
+
 class ScheduleBusPort(Protocol):
     async def publish(self, body: Mapping[str, Any]) -> int: ...
 
@@ -376,6 +388,19 @@ REASON_WINDOW_OPEN: Final[str] = "window_open"
 REASON_WAITING: Final[str] = "waiting_for_higher_priority"
 REASON_WINDOW_ENDED: Final[str] = "window_ended"
 REASON_PLAN_CHANGED: Final[str] = "plan_changed"
+# The 2026-08-23 live finding (the operator's own publish test): the runner
+# submitted every tick while the fleet sat disarmed, the pre-arm refusals were
+# audit-only (lifecycle_not_controllable), and the projection could not say
+# "window open but the units are disarmed" — the operator had to discover the
+# arm requirement by trying.  The word rides WITH ``window_open`` (like
+# ``waiting_for_higher_priority``) when NO unit of the window's scope is in a
+# controllable lifecycle, and outranks it: a disarmed unit claimed by a higher
+# source is disarmed first (the night strategy's own precedence).
+REASON_UNITS_DISARMED: Final[str] = "units_disarmed"
+
+# The lifecycles a unit can actuate from (the safety kernel's
+# ``lifecycle_not_controllable`` deny set, the night strategy's set).
+_CONTROLLABLE_LIFECYCLES: Final[frozenset[str]] = frozenset({"armed_idle", "active"})
 
 WINDOW_OPENED_EVENT: Final[str] = "schedule_window.opened"
 WINDOW_CLOSING_EVENT: Final[str] = "schedule_window.closing"
@@ -421,6 +446,7 @@ class ScheduleRunner:
         clock: ScheduleClockPort,
         submit: ScheduleSubmitPort,
         intents: ScheduleIntentPort,
+        observations: ScheduleObservationsPort | None = None,
         bus: ScheduleBusPort | None = None,
         posture: str = "yield",
         initial_plan: SchedulePlan | None = None,
@@ -430,6 +456,7 @@ class ScheduleRunner:
         self._clock = clock
         self._submit = submit
         self._intents = intents
+        self._observations = observations
         self._bus = bus
         self._posture = posture
         # Held-intent state: the live intent id plus the window key it serves.
@@ -505,7 +532,9 @@ class ScheduleRunner:
             await self._submit_window(plan, evaluated, entry, ends_at, announce=True)
             action = "submit"
         reasons: tuple[str, ...] = (REASON_WINDOW_OPEN,)
-        if await self._waiting_for_higher_priority(evaluated.unit_ids, now_mono):
+        if await self._fleet_disarmed(evaluated.unit_ids):
+            reasons = (REASON_WINDOW_OPEN, REASON_UNITS_DISARMED)
+        elif await self._waiting_for_higher_priority(evaluated.unit_ids, now_mono):
             reasons = (REASON_WINDOW_OPEN, REASON_WAITING)
         self._record(action, reasons, wall, entry=entry, ends_at=ends_at)
 
@@ -599,6 +628,33 @@ class ScheduleRunner:
                 {"entry_id": entry_id, "version": version, "unit_ids": unit_ids, "reason": reason},
             )
         return "remove" if closing else "idle"
+
+    async def _fleet_disarmed(self, unit_ids: frozenset[str]) -> bool:
+        """Honesty only: no unit of the window's scope can actuate right now.
+
+        The 2026-08-23 live finding: a window that opens over a disarmed fleet
+        submits (correctly — the claim is a published fact) but can never
+        actuate, and the pre-arm refusals were audit-only, so the operator had
+        to discover the arm requirement by trying.  This read-only check names
+        that state on the projection: ``units_disarmed`` when NO unit of the
+        window's scope is in a controllable lifecycle (a unit with no
+        observation yet is not controllable — boot is disarmed).  A read
+        failure omits the code (unknown is not disarmed); the answer NEVER
+        gates the submit/remove above — arming is the operator's act.
+        """
+        port = self._observations
+        if port is None or not unit_ids:
+            return False
+        try:
+            latest = await port.all_latest()
+        except Exception:
+            return False
+        for unit_id in unit_ids:
+            lifecycle = getattr(latest.get(unit_id), "lifecycle", None)
+            value = getattr(lifecycle, "value", lifecycle)
+            if value in _CONTROLLABLE_LIFECYCLES:
+                return False
+        return True
 
     async def _waiting_for_higher_priority(self, unit_ids: frozenset[str], now_mono: float) -> bool:
         """Honesty only: every unit claimed by a higher-priority live intent.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, date, datetime, time
+from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -771,6 +772,26 @@ class RunnerIntents:
 
 
 @dataclass
+class RunnerObservations:
+    """The latest-observation read the disarmed-window honesty code consumes.
+
+    ``lifecycles`` maps unit id to a lifecycle value (enum or its string);
+    ``fail`` models an unreadable repository.  A unit absent from the map has
+    published no observation — boot behavior.
+    """
+
+    lifecycles: dict[str, Any] = field(default_factory=dict)
+    fail: bool = False
+
+    async def all_latest(self) -> dict[str, Any]:
+        if self.fail:
+            raise OSError("observations unavailable")
+        return {
+            unit_id: SimpleNamespace(lifecycle=value) for unit_id, value in self.lifecycles.items()
+        }
+
+
+@dataclass
 class RunnerBus:
     events: list[dict[str, Any]] = field(default_factory=list)
 
@@ -785,6 +806,7 @@ def _make_runner(
     clock: RunnerClock | None = None,
     submit: RunnerSubmit | None = None,
     intents: RunnerIntents | None = None,
+    observations: RunnerObservations | None = None,
     bus: RunnerBus | None = None,
     ttl_s: float = 10.0,
 ) -> tuple[Any, RunnerStore, RunnerClock, RunnerSubmit, RunnerIntents, RunnerBus]:
@@ -800,6 +822,7 @@ def _make_runner(
         clock=runner_clock,
         submit=runner_submit,
         intents=runner_intents,
+        observations=observations,
         bus=runner_bus,
     )
     return runner, store, runner_clock, runner_submit, runner_intents, runner_bus
@@ -984,6 +1007,113 @@ async def test_runner_waiting_never_fires_when_only_one_unit_is_claimed() -> Non
             selected_unit_ids=frozenset({"lhs"}),
         )
     ]
+
+    await runner.tick()
+
+    assert runner.state_payload()["reason_codes"] == ["window_open"]
+
+
+# --- the disarmed-window reason (the 2026-08-23 live finding) ------------------
+#
+# The operator's own publish test: the window RAN while the fleet sat disarmed
+# (boot is disarmed, every restart re-arms nothing), the pre-arm refusals were
+# audit-only, and the projection could not say "window open but the units are
+# disarmed" — the arm requirement had to be discovered by trying.  The word
+# rides WITH window_open, exactly like waiting_for_higher_priority.
+
+
+async def test_a_window_over_a_disarmed_fleet_says_units_disarmed_and_submits() -> None:
+    plan = _plan(_monday_window(), version=1)
+    observations = RunnerObservations(
+        lifecycles={"lhs": "disarmed", "mid": "observe_only", "rhs": "inhibited"}
+    )
+    runner, _store, _clock, submit, _intents, _bus = _make_runner(
+        plan=plan, observations=observations
+    )
+
+    await runner.tick()
+
+    # The claim is still a published fact — the runner submits exactly as
+    # before — and the projection names WHY nothing can actuate: arm the units.
+    assert len(submit.submissions) == 1
+    assert runner.state_payload()["reason_codes"] == ["window_open", "units_disarmed"]
+
+
+async def test_units_disarmed_never_fires_while_one_unit_can_actuate() -> None:
+    from energypod.domain import UnitLifecycle
+
+    plan = _plan(_monday_window(), version=1)
+    observations = RunnerObservations(
+        lifecycles={
+            "lhs": UnitLifecycle.ARMED_IDLE,
+            "mid": UnitLifecycle.DISARMED,
+            # rhs has published no observation at all (boot); one controllable
+            # unit is enough to keep the code off.
+            "rhs": UnitLifecycle.ACTIVE,
+        }
+    )
+    runner, _store, _clock, _submit, _intents, _bus = _make_runner(
+        plan=plan, observations=observations
+    )
+
+    await runner.tick()
+
+    assert runner.state_payload()["reason_codes"] == ["window_open"]
+
+
+async def test_a_fleet_with_no_observations_yet_is_honestly_disarmed() -> None:
+    """Boot: the window opens before any poll has ever landed — the fleet
+    cannot actuate and the projection says so (every restart re-arms
+    nothing)."""
+    plan = _plan(_monday_window(), version=1)
+    observations = RunnerObservations(lifecycles={})
+    runner, _store, _clock, _submit, _intents, _bus = _make_runner(
+        plan=plan, observations=observations
+    )
+
+    await runner.tick()
+
+    assert runner.state_payload()["reason_codes"] == ["window_open", "units_disarmed"]
+
+
+async def test_units_disarmed_outranks_waiting_for_higher_priority() -> None:
+    """A disarmed unit claimed by a higher source is disarmed FIRST — the
+    operator's clearing act is the arm, not waiting out the claim (the night
+    strategy's own precedence)."""
+    from types import SimpleNamespace
+
+    from energypod.domain import IntentSource
+
+    plan = _plan(_monday_window(), version=1)
+    observations = RunnerObservations(
+        lifecycles={"lhs": "disarmed", "mid": "disarmed", "rhs": "disarmed"}
+    )
+    intents = RunnerIntents(
+        live=[
+            SimpleNamespace(
+                id="manual-1",
+                source=IntentSource.MANUAL,
+                selected_unit_ids=frozenset({"lhs", "mid", "rhs"}),
+            )
+        ]
+    )
+    runner, _store, _clock, _submit, _intents, _bus = _make_runner(
+        plan=plan, intents=intents, observations=observations
+    )
+
+    await runner.tick()
+
+    assert runner.state_payload()["reason_codes"] == ["window_open", "units_disarmed"]
+
+
+async def test_an_unreadable_observation_read_never_claims_disarmed() -> None:
+    """Unknown is not disarmed: a failing repository read omits the code
+    rather than naming a condition the runner cannot see."""
+    plan = _plan(_monday_window(), version=1)
+    observations = RunnerObservations(lifecycles={"lhs": "disarmed"}, fail=True)
+    runner, _store, _clock, _submit, _intents, _bus = _make_runner(
+        plan=plan, observations=observations
+    )
 
     await runner.tick()
 

@@ -3488,6 +3488,11 @@ def _build_runtime(
             clock=resolved_clock,
             submit=_submit_schedule_drive,
             intents=intent_port,
+            # The disarmed-window honesty read (the 2026-08-23 live finding):
+            # the SAME observation repository the fleet loop reads, so the
+            # projection can say "window open but the units are disarmed"
+            # instead of leaving the arm requirement audit-only.
+            observations=observation_port,
             bus=bus,
             posture=schedule_surface.policy.posture,
             initial_plan=schedule_store.get(),

@@ -2706,7 +2706,11 @@ async def test_a_published_window_runs_the_full_composed_path(tmp_path: Path) ->
         assert projection["entry_id"] == "night-charge"
         assert projection["version"] == 1
         assert projection["ends_at"].startswith("2026-08-21T23:59")
-        assert projection["reason_codes"] == ["window_open"]
+        # The composed path never armed the fleet, so the projection names the
+        # live 2026-08-23 finding honestly: the window holds its claim while
+        # every unit sits disarmed (the arm requirement is no longer
+        # audit-only).
+        assert projection["reason_codes"] == ["window_open", "units_disarmed"]
 
         # The clock rolls past the window end: non-renewal + the closing event.
         clock.elapsed_s += 2 * 3600 + 1800  # 14:30 UTC = 00:30 Saturday
