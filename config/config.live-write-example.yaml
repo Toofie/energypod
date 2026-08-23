@@ -57,7 +57,7 @@
 #     `energypod db backup`/`restore` see one durable store, and is distinct
 #     from the observe-only deployment's database.
 schema_version: 1
-revision: 5
+revision: 6
 mode: write_enabled
 
 site:
@@ -612,13 +612,13 @@ energy_scorecard:
 # Sizing at the defaults: ~200 B/row, 2,880 rows/battery/day, 14 days
 #   full resolution (~24 MB) + ~10.5 MB/year of hourly rollups.
 #
-# plant_history:
-#   # The sampling cadence: must exceed timing.control_period_s, <= 3600.
-#   # 30 s (default) = 2,880 rows/battery/day; 15 s doubles storage and
-#   # catches shorter transients; 60 s halves both.
-#   sample_interval_s: 30.0
-#   # The full-resolution retention window, 1..3650 days.
-#   retention_full_resolution_days: 14
-#   # Hourly rollup retention: 0 (default) = forever; a positive day
-#   # count bounds the rollup tier too.
-#   retention_rollup_days: 0
+plant_history:
+  # The sampling cadence: must exceed timing.control_period_s, <= 3600.
+  # 30 s (default) = 2,880 rows/battery/day; 15 s doubles storage and
+  # catches shorter transients; 60 s halves both.
+  sample_interval_s: 30.0
+  # The full-resolution retention window, 1..3650 days.
+  retention_full_resolution_days: 14
+  # Hourly rollup retention: 0 (default) = forever; a positive day
+  # count bounds the rollup tier too.
+  retention_rollup_days: 0

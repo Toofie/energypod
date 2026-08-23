@@ -349,6 +349,27 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-24 (plant-history COMMISSIONED): THE TELEMETRY HISTORIAN IS LIVE
+  on the real controller. One deliberate revision (5 → 6) uncommented the
+  `plant_history` block at commissioned defaults (30 s cadence, 14 d
+  full-res, hourly rollups forever); check-config clean; controller
+  restarted (writemode37, /tmp/writemode37.log; the process pair from
+  writemode36 — venv shim PID 13536 + base-python child 14808 owning 8080 —
+  stopped cleanly, port freed before relaunch). Verified live: healthz ok;
+  GET /api/v1/history composed (401 unauth — the route exists, observe
+  scope); snapshot `history_state` present with last_sample_at for all
+  three units; the database migrated in place to schema v3
+  (schema_version table [(1,3)]; telemetry_sample + telemetry_rollup_hourly
+  created beside the untouched energy tables); rows accumulate at exactly
+  +3/30 s tick (one per unit); the first captured rows record the real
+  night: lhs at −2242 W battery (the Docker writer's session), SOC 88%,
+  commanded triple NULL (nothing of ours), health self_healing — the
+  archaeology use-case working on its intended evidence from minute one.
+  Rollup rows 0 as expected (first hour still open). Night block unchanged:
+  present-but-off, posture partition, acknowledgement already latched (see
+  the night-charge entry's probe incident). Console history view (W1–W3)
+  queued behind the flow round-3 agent in web/.
+
 - 2026-08-24 (flow wow-loop, round-2 gate): ROUND 2 REVIEWED AND APPROVED AS
   THE BASELINE (d17a3f0, 82ad0bc, 7f32224; 716/716 web tests; 30-PNG
   gallery incl. a new tablet-768 viewport). Reviewed against fresh renders
