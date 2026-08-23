@@ -1641,6 +1641,12 @@ export function HomeView({ client }: HomeViewProps) {
             ))}
           </ul>
         )}
+        {/* The cheap cross-link to the live flow picture: the shell honors
+            `#view-<id>` hashes, so a plain anchor switches views (the same
+            href shape the nav itself uses). */}
+        <p className="home-flow-link">
+          <a href="#view-flow">See the live energy flow</a> — every phase, grid to battery to home.
+        </p>
       </section>
 
       {/* The energy scorecard's Today card (DESIGN_ENERGY_SCORECARD.md §8 W-A):

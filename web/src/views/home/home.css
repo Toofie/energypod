@@ -798,3 +798,16 @@
   font-weight: 600;
   font-size: 0.9rem;
 }
+
+/* The cheap cross-link to the Flow view from the powering question (a plain
+   #view-flow anchor — the shell honors the same hash the nav uses). */
+.home-flow-link {
+  margin: 0.6rem 0 0;
+  font-size: 0.85rem;
+  color: #78716c;
+}
+
+.home-flow-link a {
+  color: #1d5fa0;
+  font-weight: 600;
+}

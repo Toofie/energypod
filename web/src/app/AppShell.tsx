@@ -85,6 +85,23 @@ export function AppShell({ views = {} }: AppShellProps): ReactElement {
     setView(next);
   };
 
+  // The nav's hrefs are `#view-<id>` anchors; a hash arriving from anywhere —
+  // a view's own cross-link (Home's powering card points at the Flow view), a
+  // restored tab, a shared URL — switches the shell the same way a nav click
+  // does. Unknown hashes change nothing.
+  useEffect(() => {
+    const onHashChange = (): void => {
+      const id = window.location.hash.replace(/^#view-/, "");
+      if ((VIEWS as readonly { id: ViewId }[]).some((entry) => entry.id === id)) {
+        setView(id as ViewId);
+      }
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => {
+      window.removeEventListener("hashchange", onHashChange);
+    };
+  }, []);
+
   // Moving between views moves focus sensibly: to the new view's heading.
   useEffect(() => {
     if (session.phase === "active") {
