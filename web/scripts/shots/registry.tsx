@@ -22,9 +22,11 @@ export interface ShotViewDefinition {
 }
 
 /**
- * The capture matrix's viewport half: a desktop canvas and a phone. The
- * narrow width is the design's hardest constraint (390 px — a common phone
- * width), captured at 2x so the review sees phone-crisp text.
+ * The capture matrix's viewport half: a desktop canvas, a tablet, and a phone.
+ * The narrow width is the design's hardest constraint (390 px — a common phone
+ * width) and the tablet (768 px) exercises the diagram's two-column rhythm
+ * where the Whole-site lead takes the wider first track — both captured at 2x
+ * so the review sees crisp text.
  */
 export interface ShotViewport {
   readonly id: string;
@@ -35,6 +37,7 @@ export interface ShotViewport {
 
 export const SHOT_VIEWPORTS: readonly ShotViewport[] = [
   { id: "desktop-1440", width: 1440, height: 1000, deviceScaleFactor: 1 },
+  { id: "tablet-768", width: 768, height: 1030, deviceScaleFactor: 2 },
   { id: "narrow-390", width: 390, height: 844, deviceScaleFactor: 2 },
 ];
 
