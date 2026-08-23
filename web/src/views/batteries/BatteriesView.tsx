@@ -205,6 +205,17 @@ const AUDIT_LIMIT = 50;
  * freshness clock. */
 const GOOD_TELEMETRY_MAX_AGE_S = 30;
 
+/**
+ * The cell-imbalance EARLY-WARNING line (2026-08-23): the live policy's
+ * imbalance bound was operator-relaxed tenfold (0.050 V -> 0.500 V) so a wide
+ * spread stops vetoing fleet dispatch on its own — the absolute per-cell
+ * voltage bounds remain the real over/under-charge protection.  The console
+ * keeps the OLD 50 mV figure as the warning line: any unit spreading wider
+ * than it is called out per-unit here, so a drifting pack is never lost in
+ * the relaxed policy's silence.  Display-only — the kernel stays the authority.
+ */
+const CELL_IMBALANCE_WARNING_MV = 50;
+
 // ---------------------------------------------------------------------------
 // Plain-language mappings (words first, raw codes only on demand)
 // ---------------------------------------------------------------------------
@@ -353,6 +364,20 @@ function cardCellSpreadText(unit: ViewUnit): string {
     return `${formatMillivolts(spread)} spread`;
   }
   return `${formatMillivolts(spread)} across ${count} cells`;
+}
+
+/**
+ * The per-unit imbalance warning line: exactly the units whose measured
+ * spread crosses the early-warning line, with the measured figure.  Null for
+ * a unit with no spread reading or a spread inside the line — an absent
+ * datum never fabricates a warning.
+ */
+function cellImbalanceWarning(unit: ViewUnit): string | null {
+  const spread = unit.telemetry?.cellSpreadMv ?? null;
+  if (spread === null || spread <= CELL_IMBALANCE_WARNING_MV) {
+    return null;
+  }
+  return `Cell imbalance warning: ${formatMillivolts(spread)} spread (above the ${CELL_IMBALANCE_WARNING_MV} mV early-warning line; not blocking dispatch on its own)`;
 }
 
 /** Temperature row: the observed range, min to max. */
@@ -649,6 +674,7 @@ function FleetCard({
 }: FleetCardProps): JSX.Element {
   const telemetryAge = unit.telemetry_age_s;
   const dimmed = isStaleData(unit);
+  const imbalanceWarning = cellImbalanceWarning(unit);
   return (
     <div
       role="group"
@@ -678,6 +704,11 @@ function FleetCard({
       <p>
         <b>Cell spread:</b> {cardCellSpreadText(unit)}
       </p>
+      {imbalanceWarning !== null && (
+        <p role="note" className="cell-imbalance-warning">
+          {imbalanceWarning}
+        </p>
+      )}
       <p>
         <b>Data age:</b> {ageText(telemetryAge)}
         {dimmed ? " (stale)" : ""}

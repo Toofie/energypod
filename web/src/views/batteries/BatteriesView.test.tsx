@@ -420,6 +420,53 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     expect(lhs).not.toHaveTextContent(/\d+\s*W/);
   });
 
+  it("warns per-unit when the cell spread crosses the 50 mV early-warning line, and stays silent under it or without a reading", async () => {
+    // The 2026-08-23 policy relaxation: imbalance no longer blocks dispatch on
+    // its own, so the console keeps the OLD 50 mV gate visible as a warning —
+    // exactly the units whose spread crosses it, with the measured figure
+    // (LHS 53.999... mV is the live figure that vetoed the fleet that day).
+    const spread: WireSnapshot = snapshot(
+      [
+        unitSnapshot({
+          unit_id: "MID",
+          lifecycle: "disarmed",
+          telemetry_age_s: 2,
+          measured_watts: 0,
+          telemetry: telemetrySummary({ cell_spread_mv: 22 }),
+        }),
+        unitSnapshot({
+          unit_id: "RHS",
+          lifecycle: "disarmed",
+          telemetry_age_s: 3,
+          measured_watts: 0,
+          telemetry: telemetrySummary({ cell_spread_mv: 53.99999999999983 }),
+        }),
+        // No observation at all: a missing spread never fabricates a warning.
+        unitSnapshot({
+          unit_id: "LHS",
+          lifecycle: "observe_only",
+          telemetry_age_s: 4,
+          measured_watts: null,
+          telemetry: null,
+        }),
+      ],
+      { snapshot_sequence: 4600, captured_at: CAPTURED_AT },
+    );
+    renderView(healthyClient(spread, fleetEvents(spread)));
+
+    const mid = await screen.findByRole("group", { name: "MID" });
+    expect(mid).toHaveTextContent(/cell spread:\s*22\s*mV across 60 cells/i);
+    expect(mid).not.toHaveTextContent(/cell imbalance warning/i);
+
+    const rhs = screen.getByRole("group", { name: "RHS" });
+    expect(rhs).toHaveTextContent(
+      /cell imbalance warning:\s*54\s*mV spread \(above the 50 mV early-warning line; not blocking dispatch on its own\)/i,
+    );
+
+    const lhs = screen.getByRole("group", { name: "LHS" });
+    expect(lhs).not.toHaveTextContent(/cell imbalance warning/i);
+  });
+
   it("renders every telemetry figure at the two-decimal display bound: a raw eight-decimal fixture never reaches the operator", async () => {
     const user = userEvent.setup();
     // The wire can carry float-decoded telemetry at full precision; the

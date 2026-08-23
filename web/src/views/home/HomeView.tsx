@@ -56,7 +56,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health, StreamEvent } from "../../api/client";
-import { formatPercent, formatSeconds, formatWatts } from "../../lib/format";
+import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../../lib/format";
 import "./home.css";
 
 export interface HomeViewProps {
@@ -124,9 +124,11 @@ interface PowerFigureView {
   watts: number;
 }
 
-/** The snapshot's nullable telemetry block — the reserve question needs SOC. */
+/** The snapshot's nullable telemetry block — the reserve question needs SOC;
+ * the limiting question needs the cell spread for the imbalance warning. */
 interface TelemetrySummaryView {
   socPct: number | null;
+  cellSpreadMv: number | null;
 }
 
 interface UnitView {
@@ -159,16 +161,18 @@ function readPowerFigure(value: unknown): PowerFigureView | null {
   };
 }
 
-/** The telemetry block's SOC, read defensively; absent stays null. */
+/** The telemetry block's own fields, read defensively; absent stays null. */
 function readTelemetrySoc(value: unknown): TelemetrySummaryView | null {
   if (value === null || typeof value !== "object") {
     return null;
   }
   const record = value as Record<string, unknown>;
   const soc = record.soc_pct;
+  const spread = record.cell_spread_mv;
   return {
     socPct:
       typeof soc === "number" && Number.isFinite(soc) && soc >= 0 && soc <= 100 ? soc : null,
+    cellSpreadMv: typeof spread === "number" && Number.isFinite(spread) ? spread : null,
   };
 }
 
@@ -387,11 +391,24 @@ function plainLanguage(raw: string): string {
     text = "is not qualified yet — its readiness checks have not passed, so it cannot be armed.";
   } else if (code === "no_unit_armed") {
     text = "No pod is armed yet, so none can act when the home needs power.";
+  } else if (code.includes("cell_imbalance")) {
+    text =
+      "is flagged for cell imbalance — its cell voltages spread wider than the early-warning line, so a power request may be held back.";
   } else {
     text = "is being held back by the safety system.";
   }
   return unit === "" ? text : `${unit} ${text}`;
 }
+
+/**
+ * The cell-imbalance early-warning line (2026-08-23): the live policy's
+ * imbalance bound was operator-relaxed tenfold (0.050 V -> 0.500 V) so spread
+ * alone no longer vetoes dispatch — the absolute per-cell voltage bounds
+ * remain the real protection.  The console keeps the OLD 50 mV figure as the
+ * warning line so the operator always sees the condition that used to block
+ * (and still would, past the relaxed bound), per-unit, with the figure.
+ */
+const CELL_IMBALANCE_WARNING_MV = 50;
 
 function collectFactors(units: UnitView[], health: Health | null): LimitingFactor[] {
   const factors: LimitingFactor[] = [];
@@ -421,6 +438,13 @@ function collectFactors(units: UnitView[], health: Health | null): LimitingFacto
       add(
         `${unit.unit_id}:telemetry_missing`,
         `${unit.unit_id} is not sending telemetry, so its state cannot be confirmed right now.`,
+      );
+    }
+    const spread = unit.telemetry?.cellSpreadMv ?? null;
+    if (spread !== null && spread > CELL_IMBALANCE_WARNING_MV) {
+      add(
+        `${unit.unit_id}:cell_imbalance`,
+        `${unit.unit_id} cell imbalance warning: ${formatMillivolts(spread)} spread is above the ${CELL_IMBALANCE_WARNING_MV} mV early-warning line — not blocking dispatch on its own, but the pack needs attention.`,
       );
     }
   }

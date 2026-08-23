@@ -581,6 +581,54 @@ describe("HomeView", () => {
     expect(within(latched).getByText("pod-mid:inhibit_latched")).toBeVisible();
   });
 
+  it("lists a per-unit cell imbalance warning factor when a pod's spread crosses the 50 mV early-warning line", async () => {
+    // The 2026-08-23 policy relaxation: imbalance no longer blocks dispatch on
+    // its own, so the limiting card keeps the OLD 50 mV line visible as a
+    // per-unit warning with the measured figure — the operator always sees
+    // the condition that used to block (pod-lhs 54 mV is the live figure
+    // that vetoed the fleet that day). A pod under the line stays silent.
+    const snapshot = fleet([
+      unit({ unit_id: "pod-mid", telemetry: telemetrySummary({ cell_spread_mv: 22 }) }),
+      unit({ unit_id: "pod-rhs", telemetry: telemetrySummary({ cell_spread_mv: 32 }) }),
+      unit({
+        unit_id: "pod-lhs",
+        telemetry: telemetrySummary({ cell_spread_mv: 53.99999999999983 }),
+      }),
+    ]);
+    installClient({ snapshot });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: LIMITING_REGION });
+    expectVisibleText(
+      region,
+      /pod-lhs cell imbalance warning: 54 mV spread is above the 50 mV early-warning line/i,
+    );
+    expect(region.textContent ?? "").not.toMatch(/pod-(mid|rhs) cell imbalance/);
+  });
+
+  it("renders a cell_imbalance reason code from readiness in plain language, not as a raw code", async () => {
+    const health: HealthReport = {
+      liveness: { ok: true },
+      service_readiness: { ready: true, reasons: [] },
+      control_readiness: {
+        ready: false,
+        reasons: ["pod-lhs:cell_imbalance"],
+      },
+    };
+    const snapshot = fleet([
+      unit({ unit_id: "pod-mid" }),
+      unit({ unit_id: "pod-rhs" }),
+      unit({ unit_id: "pod-lhs", lifecycle: "inhibited" }),
+    ]);
+    installClient({ snapshot, getHealth: () => Promise.resolve(health) });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: LIMITING_REGION });
+    expectVisibleText(region, /pod-lhs/i);
+    expectVisibleText(region, /cell imbalance/i);
+    expect(within(region).queryByText("pod-lhs:cell_imbalance")).toBeNull();
+  });
+
   describe("fleet badge", () => {
     it.each([
       {

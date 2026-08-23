@@ -182,3 +182,15 @@ button:focus-visible {
   gap: 0.5rem;
   justify-content: flex-end;
 }
+
+/* The per-unit cell-imbalance early-warning line (2026-08-23 policy
+   relaxation): the old 50 mV gate stays visible as a warning after the
+   imbalance bound itself stopped blocking dispatch.  Same amber warning
+   family as the disconnected notice — a caution, not an alarm. */
+.cell-imbalance-warning {
+  border: 1px solid #b3892f;
+  border-radius: 0.5rem;
+  padding: 0.35rem 0.6rem;
+  background: #fdf8ee;
+  font-weight: 600;
+}
