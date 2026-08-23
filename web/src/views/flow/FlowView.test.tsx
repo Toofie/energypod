@@ -556,6 +556,144 @@ describe("FlowView — live updates", () => {
   });
 });
 
+// --- the pinned diagram structure (the polish round's visual pins) --------------------
+
+describe("FlowView — the pinned diagram structure", () => {
+  it("puts the Whole-site column first in DOM and reading order", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("mid", { grid_power_w: -412, load_power_w: 340, battery_watts: -1900 }),
+        unit("rhs", { grid_power_w: 0, load_power_w: 120, battery_watts: 0 }),
+      ]),
+    );
+
+    renderFlow();
+
+    await screen.findByRole("group", { name: /power flow by phase/i });
+    const diagram = document.body.querySelector(".flow-diagram");
+    expect(diagram).not.toBeNull();
+    const columns = diagram?.querySelectorAll(":scope > .flow-phase") ?? [];
+    expect(columns.length).toBe(3);
+    // The glance path is story → whole site → phase detail; the fleet column
+    // leads the DOM (and so the screen reader's speech) before any phase.
+    expect(columns[0]?.getAttribute("aria-label")).toBe("Whole site");
+    expect(columns[1]?.getAttribute("aria-label")).toMatch(/Phase mid/);
+    expect(columns[2]?.getAttribute("aria-label")).toMatch(/Phase rhs/);
+  });
+
+  it("renders every idle slot as a hollow ring and every gap as a dotted stub", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("mid", { soc_pct: 100, grid_power_w: 0, load_power_w: 0, battery_watts: 0 }),
+        unit("rhs", { soc_pct: 100, grid_power_w: 0, load_power_w: 0, battery_watts: 0 }),
+      ]),
+    );
+
+    renderFlow();
+
+    await screen.findByText(/Nothing is flowing/i);
+    // 3 columns × 3 idle slots (grid, battery, and a measured 0 W house) = 9
+    // rings, and no ribbon or dotted stub anywhere.
+    expect(document.body.querySelectorAll(".flow-idle-ring").length).toBe(9);
+    expect(document.body.querySelectorAll(".flow-stub-track").length).toBe(0);
+    expect(document.body.querySelectorAll(".flow-stub-unknown").length).toBe(0);
+  });
+
+  it("words an absent datum with a dotted stub — never a zero-filled ribbon", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([unit("mid", { grid_power_w: -412, load_power_w: null, battery_watts: null })]),
+    );
+
+    renderFlow();
+
+    expect((await screen.findAllByText("Importing 412 W")).length).toBe(2); // mid + the fleet
+    // mid's column: one ribbon (the grid import) and two dotted unknowns
+    // (battery, house); the fleet column mirrors the same split.
+    const columns = document.body.querySelectorAll(".flow-phase");
+    expect(columns.length).toBe(2);
+    expect(columns[1]?.querySelectorAll(".flow-stub-track").length).toBe(1);
+    expect(columns[1]?.querySelectorAll(".flow-stub-unknown").length).toBe(2);
+    expect(columns[0]?.querySelectorAll(".flow-stub-unknown").length).toBe(2);
+    expect(columns[0]?.querySelectorAll(".flow-stub-track").length).toBe(1);
+  });
+
+  it("splits the fleet's both-directions slots into two half-slot stubs", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("lhs", { grid_power_w: 300, load_power_w: 100, battery_watts: 800 }),
+        unit("mid", { grid_power_w: -1500, load_power_w: 200, battery_watts: -1900 }),
+      ]),
+    );
+
+    renderFlow();
+
+    await screen.findByText(/discharging 800 W while mid is charging 1,900 W/i);
+    // The fleet column: the grid slot AND the battery slot both split (import
+    // beside export, discharge beside charge), the house slot does not — five
+    // ribbons where a single column would draw three, and each side carries
+    // its own width instead of one max-width both-headed lie.
+    const fleet = document.body.querySelector(".flow-phase--fleet");
+    expect(fleet).not.toBeNull();
+    expect(fleet?.querySelectorAll(".flow-stub-track").length).toBe(5);
+  });
+
+  it("dims a disconnected phase, dots its stubs, and keeps its last-known words", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit(
+          "mid",
+          { soc_pct: 45, grid_power_w: -540, load_power_w: null, battery_watts: -600 },
+          { lifecycle: "disconnected" },
+        ),
+        unit("rhs", { soc_pct: 80, grid_power_w: -330, load_power_w: 330, battery_watts: 0 }),
+      ]),
+    );
+
+    renderFlow();
+
+    const down = await screen.findByLabelText(/Phase mid — grid: Importing 540 W/);
+    expect(down.className).toContain("flow-phase--down");
+    expectVisibleText(down, /No contact — these figures are the last known/);
+    expectVisibleText(down, /Charging 600 W/);
+    // The arrows stop claiming a live flow they cannot vouch for; the words stay.
+    expect(down.querySelectorAll(".flow-stub-unknown").length).toBe(3);
+    expect(down.querySelectorAll(".flow-stub-track").length).toBe(0);
+  });
+
+  it("pulses the battery ring of a phase commanded but not yet moving", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit(
+          "mid",
+          { soc_pct: 45, grid_power_w: -340, load_power_w: 340, battery_watts: 0 },
+          {
+            lifecycle: "active",
+            requested_power: { direction: "charge", watts: 2000 },
+            authorized_power: { direction: "charge", watts: 2000 },
+          },
+        ),
+      ]),
+    );
+
+    renderFlow();
+
+    expect(await screen.findByText("mid — commanded 2,000 W charge, not moving yet")).toBeVisible();
+    // No gold flow is drawn until watts are measured — the battery's idle ring
+    // pulses (mid's and the fleet's are both idle; only the commanded phase's
+    // pulses), and it is the battery's ring, not any other slot's.
+    expect(document.body.querySelectorAll(".flow-idle-ring").length).toBe(2);
+    const pulsing = document.body.querySelectorAll(".flow-idle-ring--pulse");
+    expect(pulsing.length).toBe(1);
+    expect(pulsing[0]?.closest("g")?.classList.contains("flow-stub--battery")).toBe(true);
+  });
+});
+
 // --- helpers ---------------------------------------------------------------------------
 
 /** A visible text match inside a scope (the wording itself, not an ancestor). */

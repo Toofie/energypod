@@ -196,6 +196,28 @@ export function fleetFlow(units: FlowUnit[]): FleetFlow {
 
 // --- sign-to-words (the discipline: no raw sign ever reaches the operator) ------
 
+/**
+ * One worded piece of a figure line: the direction word plus the magnitude it
+ * words ("Importing", 412). The diagram renders every figure from these parts
+ * so the number tick (§c motion) can tween the magnitude while the word — the
+ * worded truth — swaps instantly on a state change, never rolls.
+ */
+export interface FlowFigurePart {
+  readonly word: string;
+  readonly watts: number | null;
+}
+
+/**
+ * The operator's worded line from parts, exactly as the pinned text functions
+ * render it ("Importing 412 W", "Charging 3,800 W · Discharging 800 W"). The
+ * one join every figure renders through — the diagram invents no formatting.
+ */
+export function figurePartsText(parts: readonly FlowFigurePart[]): string {
+  return parts
+    .map((part) => (part.watts === null ? part.word : `${part.word} ${formatWatts(part.watts)}`))
+    .join(" · ");
+}
+
 /** The grid's one-word direction for a phase, from the signed figure. */
 export type GridFlow = "import" | "export" | "idle" | "unknown";
 
@@ -222,31 +244,46 @@ export function batteryFlowDirection(batteryWatts: number | null): BatteryFlow {
   return batteryWatts < 0 ? "charge" : "idle";
 }
 
-/** The grid figure in words: "Importing 412 W" / "Exporting 300 W" / "Idle". */
-export function gridFlowText(gridPowerW: number | null): string {
+/** The grid figure as parts (the single source the pinned text composes from). */
+export function gridFigureParts(gridPowerW: number | null): FlowFigurePart[] {
   if (gridPowerW === null) {
-    return "not available";
+    return [{ word: "not available", watts: null }];
   }
   if (gridPowerW > 0) {
-    return `Exporting ${formatWatts(gridPowerW)}`;
+    return [{ word: "Exporting", watts: gridPowerW }];
   }
-  return gridPowerW < 0 ? `Importing ${formatWatts(Math.abs(gridPowerW))}` : "Idle";
+  return gridPowerW < 0 ? [{ word: "Importing", watts: Math.abs(gridPowerW) }] : [{ word: "Idle", watts: null }];
+}
+
+/** The battery figure as parts. */
+export function batteryFigureParts(batteryWatts: number | null): FlowFigurePart[] {
+  if (batteryWatts === null) {
+    return [{ word: "not available", watts: null }];
+  }
+  if (batteryWatts > 0) {
+    return [{ word: "Discharging", watts: batteryWatts }];
+  }
+  return batteryWatts < 0 ? [{ word: "Charging", watts: Math.abs(batteryWatts) }] : [{ word: "Idle", watts: null }];
+}
+
+/** The house figure as parts: "Using 340 W" — a measured 0 W stays honest. */
+export function houseFigureParts(loadPowerW: number | null): FlowFigurePart[] {
+  return loadPowerW === null ? [{ word: "not available", watts: null }] : [{ word: "Using", watts: loadPowerW }];
+}
+
+/** The grid figure in words: "Importing 412 W" / "Exporting 300 W" / "Idle". */
+export function gridFlowText(gridPowerW: number | null): string {
+  return figurePartsText(gridFigureParts(gridPowerW));
 }
 
 /** The battery figure in words: "Charging 1,900 W" / "Discharging 800 W" / "Idle". */
 export function batteryFlowText(batteryWatts: number | null): string {
-  if (batteryWatts === null) {
-    return "not available";
-  }
-  if (batteryWatts > 0) {
-    return `Discharging ${formatWatts(batteryWatts)}`;
-  }
-  return batteryWatts < 0 ? `Charging ${formatWatts(Math.abs(batteryWatts))}` : "Idle";
+  return figurePartsText(batteryFigureParts(batteryWatts));
 }
 
 /** The house figure in words: "Using 340 W" — a measured 0 W stays honest. */
 export function houseFlowText(loadPowerW: number | null): string {
-  return loadPowerW === null ? "not available" : `Using ${formatWatts(loadPowerW)}`;
+  return figurePartsText(houseFigureParts(loadPowerW));
 }
 
 /** The battery's charge reading beside its flow figure; "" when absent. */
@@ -254,46 +291,64 @@ export function socText(socPct: number | null): string {
   return socPct === null ? "" : `${formatPercent(socPct)} charged`;
 }
 
-/** The fleet's grid figure in words — BOTH sides when the phases pull apart. */
-export function fleetGridText(fleet: FleetFlow): string {
+/** The fleet's grid figure as parts — BOTH sides when the phases pull apart. */
+export function fleetGridFigureParts(fleet: FleetFlow): FlowFigurePart[] {
   if (fleet.gridReporting === 0) {
-    return "not available";
+    return [{ word: "not available", watts: null }];
   }
-  const parts: string[] = [];
+  const parts: FlowFigurePart[] = [];
   if (fleet.importW !== null && fleet.importW > 0) {
-    parts.push(`Importing ${formatWatts(fleet.importW)}`);
+    parts.push({ word: "Importing", watts: fleet.importW });
   }
   if (fleet.exportW !== null && fleet.exportW > 0) {
-    parts.push(`Exporting ${formatWatts(fleet.exportW)}`);
+    parts.push({ word: "Exporting", watts: fleet.exportW });
   }
-  return parts.length > 0 ? parts.join(" · ") : "Idle";
+  return parts.length > 0 ? parts : [{ word: "Idle", watts: null }];
+}
+
+/** The fleet's battery figure as parts — BOTH sides when phases disagree. */
+export function fleetBatteryFigureParts(fleet: FleetFlow): FlowFigurePart[] {
+  if (fleet.batteryReporting === 0) {
+    return [{ word: "not available", watts: null }];
+  }
+  const parts: FlowFigurePart[] = [];
+  if (fleet.chargingW !== null && fleet.chargingW > 0) {
+    parts.push({ word: "Charging", watts: fleet.chargingW });
+  }
+  if (fleet.dischargingW !== null && fleet.dischargingW > 0) {
+    parts.push({ word: "Discharging", watts: fleet.dischargingW });
+  }
+  return parts.length > 0 ? parts : [{ word: "Idle", watts: null }];
+}
+
+/** The fleet's house figure as parts. */
+export function fleetHouseFigureParts(fleet: FleetFlow): FlowFigurePart[] {
+  return fleet.houseW === null ? [{ word: "not available", watts: null }] : [{ word: "Using", watts: fleet.houseW }];
+}
+
+/** The fleet house figure's scope suffix; "" when every phase reports a load. */
+export function fleetHouseScope(fleet: FleetFlow): string {
+  if (fleet.houseW === null) {
+    return "";
+  }
+  return fleet.loadReporting === fleet.unitCount || fleet.unitCount === 0
+    ? ""
+    : ` — across the ${fleet.loadReporting} of ${fleet.unitCount} phases reporting`;
+}
+
+/** The fleet's grid figure in words — BOTH sides when the phases pull apart. */
+export function fleetGridText(fleet: FleetFlow): string {
+  return figurePartsText(fleetGridFigureParts(fleet));
 }
 
 /** The fleet's battery figure in words — BOTH sides when phases disagree. */
 export function fleetBatteryText(fleet: FleetFlow): string {
-  if (fleet.batteryReporting === 0) {
-    return "not available";
-  }
-  const parts: string[] = [];
-  if (fleet.chargingW !== null && fleet.chargingW > 0) {
-    parts.push(`Charging ${formatWatts(fleet.chargingW)}`);
-  }
-  if (fleet.dischargingW !== null && fleet.dischargingW > 0) {
-    parts.push(`Discharging ${formatWatts(fleet.dischargingW)}`);
-  }
-  return parts.length > 0 ? parts.join(" · ") : "Idle";
+  return figurePartsText(fleetBatteryFigureParts(fleet));
 }
 
 /** The fleet's house figure in words, with its scope named when partial. */
 export function fleetHouseText(fleet: FleetFlow): string {
-  if (fleet.houseW === null) {
-    return "not available";
-  }
-  const scope =
-    fleet.loadReporting === fleet.unitCount || fleet.unitCount === 0
-      ? ""
-      : ` — across the ${fleet.loadReporting} of ${fleet.unitCount} phases reporting`;
-  return `Using ${formatWatts(fleet.houseW)}${scope}`;
+  return `${figurePartsText(fleetHouseFigureParts(fleet))}${fleetHouseScope(fleet)}`;
 }
 
 // --- the arrow geometry (magnitude made visible; purely decorative) -------------

@@ -1,11 +1,21 @@
 /*
- * Energy Flow view styling — the console's most legible view. The diagram is
- * the centerpiece: one column per phase plus a fleet column, three nodes
- * (Grid / Battery / Home) under a bus whose stub arrows are proportional to
- * watts. Color always rides with a word (the node figures carry every fact as
- * text); motion is limited to nothing but what CSS transitions the browser
- * gives stroke widths by default, and reduced motion is honored globally by
- * styles.css.
+ * Energy Flow view styling — the console's most legible view, per the
+ * accepted design brief (docs/FLOW_DESIGN_BRIEF.md). The diagram is the
+ * centerpiece: the Whole-site fleet column first, then one column per phase,
+ * each a rail (the phase conductor) with three stub slots dropping to docked
+ * node cards.
+ *
+ * DIRECTION IS NEVER COLOR-ALONE: the word + the arrowhead + the proportional
+ * width carry it on three redundant channels (the colorblind-safe
+ * construction); color only names the NODE FAMILY — grid --active, battery
+ * --armed, home --ink-soft — and every arrowhead is one neutral --ink.
+ *
+ * MOTION: exactly four things move (the march, the stroke-width transition,
+ * the number tick's 300 ms tween, the commanded-not-moving pulse), each
+ * duration pinned by the brief; everything else that changes renders as a
+ * fresh stub with a 150 ms fade-in. styles.css globally kills animation and
+ * transition under prefers-reduced-motion, and the march overlay is
+ * additionally HIDDEN there (frozen dashes would read as a broken line).
  */
 
 .flow-view {
@@ -79,10 +89,17 @@
   background: #f4f8ff;
 }
 
+/* A phase with no contact: the whole column dims — the last-known figures
+   stay, dimmed, never gone (the shell's standing rule). */
+.flow-phase--down {
+  opacity: 0.6;
+}
+
 .flow-phase-name {
   margin: 0;
-  font-size: 1rem;
-  letter-spacing: 0.02em;
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--ink-soft);
 }
@@ -95,6 +112,13 @@
   margin: 0;
   font-size: 0.8rem;
   color: var(--warn);
+}
+
+/* The bus docks to its node cards — no gap beyond 0.25 rem, so each arrowhead
+   visually reaches its node. */
+.flow-dock {
+  display: grid;
+  gap: 0.25rem;
 }
 
 /* The bus is decorative duplication (aria-hidden): the worded figures below
@@ -110,6 +134,124 @@
   stroke-width: 3;
   stroke-linecap: round;
 }
+
+/* --- the stubs (the three-channel direction discipline) ---------------------- */
+
+/* Every stub rests at 0.92 and enters with a 150 ms fade — a fresh stub on a
+   geometry change (an aim flip, a fleet slot splitting); a magnitude change
+   keeps the element so the stroke-width transition breathes it instead. */
+.flow-stub {
+  opacity: 0.92;
+  animation: flow-stub-in 150ms ease-out;
+}
+
+@keyframes flow-stub-in {
+  from {
+    opacity: 0;
+  }
+}
+
+/* The ribbon's track: the node family's color at a dimmed rest, so the march
+   overlay — the same color, bright, 55% of the width — reads as a texture
+   moving along it. */
+.flow-stub-track {
+  opacity: 0.45;
+  transition: stroke-width 400ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* MOTION #1 — the march (the aliveness cue). Each stub's own draw direction
+   runs source → target, so one negative-offset keyframe marches every stub in
+   its arrowhead's direction; the inline animation-duration maps speed to
+   magnitude (3200 − 1600 × share ms: the largest flow on screen cycles in
+   1.6 s, the smallest in 3.2 s). */
+.flow-stub-march {
+  stroke-dasharray: 8 12;
+  stroke-linecap: round;
+  transition: stroke-width 400ms cubic-bezier(0.2, 0, 0, 1);
+  animation: flow-march 3200ms linear infinite;
+}
+
+@keyframes flow-march {
+  to {
+    stroke-dashoffset: -40;
+  }
+}
+
+/* Color names the node family — never the direction. */
+.flow-stub--grid .flow-stub-track,
+.flow-stub--grid .flow-stub-march {
+  stroke: var(--active);
+}
+
+.flow-stub--battery .flow-stub-track,
+.flow-stub--battery .flow-stub-march {
+  stroke: var(--armed);
+}
+
+.flow-stub--home .flow-stub-track,
+.flow-stub--home .flow-stub-march {
+  stroke: var(--ink-soft);
+}
+
+/* Idle (measured 0 W): a hollow 7 px ring in the node family's color —
+   connected, nothing moving. Never a dashed line (that reads "a weak flow"). */
+.flow-idle-ring {
+  fill: none;
+  stroke-width: 2;
+}
+
+.flow-stub--grid .flow-idle-ring {
+  stroke: var(--active);
+}
+
+.flow-stub--battery .flow-idle-ring {
+  stroke: var(--armed);
+}
+
+.flow-stub--home .flow-idle-ring {
+  stroke: var(--ink-soft);
+}
+
+/* MOTION #4 — the commanded-not-moving pulse: the one honest way to say "we
+   asked; nothing has happened yet" without drawing a fake flow. */
+.flow-idle-ring--pulse {
+  animation: flow-pulse 1600ms ease-in-out infinite;
+}
+
+@keyframes flow-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* Unknown ("not available"): a 1.5 px dotted stub — presence without a claim. */
+.flow-stub-unknown {
+  stroke: var(--ink-soft);
+  stroke-width: 1.5;
+  stroke-dasharray: 1 7;
+  stroke-linecap: round;
+}
+
+/* Reduced motion: the overlay is HIDDEN, never frozen mid-march (static dashes
+   read as a broken line). styles.css already killed the animation globally. */
+@media (prefers-reduced-motion: reduce) {
+  .flow-stub-march {
+    opacity: 0;
+  }
+}
+
+/* While disconnected, the march stops everywhere — a moving diagram claiming
+   liveness while disconnected is dishonest. */
+.flow-view[data-connection="lost"] .flow-stub-march {
+  opacity: 0;
+  animation: none;
+}
+
+/* --- the node cards ---------------------------------------------------------- */
 
 .flow-nodes {
   display: grid;
@@ -133,6 +275,31 @@
   background: #fffaf0;
 }
 
+/* The cards are the hit surfaces: hovering or keyboard-focusing one raises its
+   stub to full opacity and tints the card's border with the node family's
+   color — the one linkage cue between card and stroke. No tooltips: every
+   number is already on screen as text. */
+.flow-node--grid:hover,
+.flow-node--grid:focus-visible {
+  border-color: var(--active);
+}
+
+.flow-node--battery:hover,
+.flow-node--battery:focus-visible {
+  border-color: var(--armed);
+}
+
+.flow-node--home:hover,
+.flow-node--home:focus-visible {
+  border-color: var(--ink-soft);
+}
+
+.flow-phase:has(.flow-node--grid:hover, .flow-node--grid:focus-visible) .flow-stub--grid,
+.flow-phase:has(.flow-node--battery:hover, .flow-node--battery:focus-visible) .flow-stub--battery,
+.flow-phase:has(.flow-node--home:hover, .flow-node--home:focus-visible) .flow-stub--home {
+  opacity: 1;
+}
+
 .flow-node-name {
   font-size: 0.72rem;
   font-weight: 700;
@@ -153,6 +320,7 @@
   font-size: 0.95rem;
   font-weight: 600;
   line-height: 1.25;
+  font-variant-numeric: tabular-nums;
 }
 
 .flow-node-extra {
