@@ -98,14 +98,25 @@
 
 /* --- the diagram ------------------------------------------------------------ */
 /*
- * The column rhythm: one column per phase plus the Whole-site lead, gutters
- * 0.75 rem everywhere. The lead is unmistakable at EVERY width:
- * - phones (<40 rem) stack it first — the only sane order one column wide;
- * - in between (40–64 rem) it spans the full first row as a lead band, its
- *   dock capped and centered so the bus never over-stretches, with the phases
- *   gridded two-up (three-up once they fit) beneath it;
- * - desktops (≥64 rem) lay all four out in ONE row — fleet first at ~1.26fr —
- *   never the wrapped 3+1 the round-1 max-width produced.
+ * THE FIT LADDER (round 3): the worded figure's longest single word is
+ * "Discharging" (82 px at 0.95 rem) — a card narrower than that cannot hold
+ * its own words, and at round 2's widths the figures rendered wider than
+ * their cards, the glyphs stamping over the card borders into the gutters
+ * (measured: 21 px past the edge on the lead's Grid card at 1440). The
+ * ladder's every rung guarantees the cards' content box ≥ the longest word:
+ *
+ * - <45 rem — one column: the phone stack, the full bus metaphor (approved).
+ * - 45–70 rem — the lead spans the first row as a band, the phases pair
+ *   beneath it, and the LAST phase completes the page as a band of its own
+ *   (its dock capped to the lead's 24 rem so every bus on screen draws at
+ *   the same scale); three columns here would be 60 px cards — too narrow
+ *   for the words.
+ * - 70–78 rem — the lead band with the three phases in one row.
+ * - ≥78 rem — all four in ONE row, equal tracks (the round-2 law: the bus is
+ *   aspect-locked, so unequal tracks would drop the rows out of alignment),
+ *   the view borrowing 11 rem of the shell's side margins so the columns are
+ *   wide enough for the two-register figure (the word a label line, the
+ *   figure the larger datum — see .flow-fig-* below).
  */
 .flow-diagram {
   display: grid;
@@ -114,7 +125,7 @@
   align-items: stretch;
 }
 
-@media (min-width: 40rem) {
+@media (min-width: 45rem) {
   .flow-diagram {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -131,24 +142,44 @@
     width: 100%;
     max-width: 24rem;
   }
+
+  /* The odd phase out completes the page as a band of its own — the same
+     centered 24 rem dock as the lead's, never a half-width orphan beside a
+     hole. (A two-pod site simply never leaves the pair.) */
+  .flow-diagram > .flow-phase:last-child {
+    grid-column: 1 / -1;
+    justify-items: center;
+  }
+
+  .flow-diagram > .flow-phase:last-child .flow-dock {
+    width: 100%;
+    max-width: 24rem;
+  }
 }
 
-@media (min-width: 48rem) {
+@media (min-width: 70rem) {
   .flow-diagram {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
-}
 
-@media (min-width: 64rem) {
-  .flow-diagram {
-    /* Equal tracks, deliberately: the bus is an aspect-locked SVG, so columns
-       of different widths render buses of different heights and the node rows
-       could never land at the same y. The lead's presence is its frame, its
-       tint, its type scale and its position — not a wider track. */
-    grid-template-columns: repeat(auto-fit, minmax(12.5rem, 1fr));
+  .flow-diagram > .flow-phase:last-child {
+    grid-column: auto;
+    justify-items: stretch;
   }
 
-  /* Back to the four-column row: the lead is the framed first column again. */
+  .flow-diagram > .flow-phase:last-child .flow-dock {
+    max-width: none;
+  }
+}
+
+@media (min-width: 78rem) {
+  /* The four-column row: the lead is the framed first column again. Equal
+     tracks, deliberately (the round-2 law above); auto-fit so a two-pod site
+     collapses to three honest columns instead of leaving a hole. */
+  .flow-diagram {
+    grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+  }
+
   .flow-phase--fleet {
     grid-column: auto;
     justify-items: stretch;
@@ -156,6 +187,16 @@
 
   .flow-phase--fleet .flow-dock {
     max-width: none;
+  }
+
+  /* The flow view is the console's wide stage: at four-across it borrows the
+     shell's side margins (never past the viewport) so the columns are wide
+     enough for their words — the reading column of the story and the
+     commands widens with it, one measure for the whole page. */
+  .flow-view {
+    max-width: none;
+    width: min(78rem, calc(100% + 11rem));
+    margin-inline: auto;
   }
 }
 
@@ -405,6 +446,27 @@
   gap: 0.4rem;
 }
 
+/* The one-column band trims its insets a shade (0.75 rem column padding,
+   0.3 rem card gutters) so even the vocabulary's widest word — "Discharging",
+   82 px at 0.95 rem — clears its card's content box at a 390 px phone; and
+   the lead's figure matches the phases' size there (still the heavier weight,
+   still the framed first card): a 94 px card cannot hold a 99 px word at the
+   lead's 1.1 rem, and the lead's presence at this width is its frame, its
+   tint and its name — never an overflowing glyph. */
+@media (max-width: 44.99rem) {
+  .flow-phase {
+    padding-inline: 0.75rem;
+  }
+
+  .flow-nodes {
+    gap: 0.3rem;
+  }
+
+  .flow-phase.flow-phase--fleet .flow-node-figure {
+    font-size: 0.95rem;
+  }
+}
+
 /*
  * Every card reserves the same three bands — name, a two-line figure zone,
  * the SoC zone — so the figure's first line and the SoC line land at the same
@@ -465,6 +527,23 @@
   min-height: 2.75rem;
   font-variant-numeric: tabular-nums;
   overflow-wrap: break-word;
+  /* The card's own measure, taken: an auto-width span sizes to its longest
+     unbreakable string and stamps over the card's borders (the round-2
+     defect). At 100% the phrase wraps at its spaces INSIDE the card; only a
+     single word wider than the card could leave it, and the fit ladder
+     guarantees the cards are always wider than the longest word. */
+  width: 100%;
+}
+
+/* The figure's parts: the direction word and its magnitude render as sibling
+   spans (the pinned reading unchanged — "Importing 412 W"). Below the
+   four-across breakpoint they run inline exactly as one phrase; at ≥77 rem
+   they promote to two typographic registers. */
+.flow-fig-word,
+.flow-fig-num,
+.flow-fig-sep,
+.flow-fig-scope {
+  font-variant-numeric: tabular-nums;
 }
 
 /* The lead's figures are a step up in size and weight — the whole-site
@@ -475,23 +554,75 @@
   font-weight: 700;
 }
 
+/* THE TWO-REGISTER FIGURE (≥78 rem only): the word steps down to a label
+   line and the figure steps forward as the datum — the number is what the
+   homeowner scans; the word names it. The lead's datum stays a full step
+   larger than the phases' (1.1 vs 0.95 rem, both 700), so the lead's figures
+   still read bigger at a glance. The separator hides (each part carries its
+   own lines) and the fleet Home's scope suffix becomes a small third line. */
+@media (min-width: 78rem) {
+  .flow-node-figure {
+    display: grid;
+    gap: 0.08rem;
+  }
+
+  .flow-fig-part {
+    display: grid;
+    gap: 0.08rem;
+  }
+
+  .flow-fig-sep {
+    display: none;
+  }
+
+  .flow-fig-word {
+    font-size: 0.75rem;
+    font-weight: 600;
+    line-height: 1.35;
+  }
+
+  .flow-fig-num {
+    font-size: 0.95rem;
+    font-weight: 700;
+    line-height: 1.3;
+  }
+
+  .flow-phase--fleet .flow-fig-num {
+    font-size: 1.1rem;
+  }
+
+  .flow-fig-scope {
+    display: block;
+    margin-top: 0.1rem;
+    font-size: 0.72rem;
+    font-weight: 500;
+    line-height: 1.35;
+  }
+}
+
 /* The SoC zone: a real hierarchy for the figure the homeowner actually scans
    — the percentage large and weight-forward in the battery family's gold, the
-   "charged" word small and quiet beside it, a slim honest meter underneath
-   (the same SOC datum, drawn once, no animation). Grid and Home reserve the
-   band empty. Never italic. */
+   "charged" word small and quiet beneath it, a slim honest meter underneath
+   (the same SOC datum, drawn once, no animation). The phrase STACKS (the
+   percentage over the word) and the meter spans the card's own content box:
+   at round 2 the one-line "100% charged" (96 px) rode nowrap on 60–70 px
+   cards and its gold meter crossed the card's border into the neighbour's
+   zone — the widest the band can ever be is now the card itself. Grid and
+   Home reserve the band empty. Never italic. */
 .flow-node-extra {
-  min-height: 1.9rem;
+  min-height: 2.2rem;
   display: grid;
   gap: 0.28rem;
   align-content: start;
   justify-items: center;
   font-style: normal;
+  width: 100%;
 }
 
 .flow-soc {
+  display: grid;
+  justify-items: center;
   line-height: 1.3;
-  white-space: nowrap;
 }
 
 .flow-soc-pct {

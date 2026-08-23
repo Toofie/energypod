@@ -40,11 +40,11 @@
  * changes. The view never mints its own client (one socket per session) and
  * never invents a figure the wire did not carry.
  */
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, StreamEvent } from "../../api/client";
-import { formatPercent } from "../../lib/format";
+import { formatPercent, formatWatts } from "../../lib/format";
 import { isPlaneSnapshot } from "../../app/SharedDataPlane";
 import { usePrefersReducedMotion } from "../../app/usePrefersReducedMotion";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
@@ -55,7 +55,6 @@ import {
   batteryFlowDirection,
   batteryFlowText,
   commandRows,
-  figurePartsText,
   FLOW_SOLAR_FOOTNOTE,
   fleetBatteryFigureParts,
   fleetFlow,
@@ -447,14 +446,50 @@ function useTickedWatts(parts: readonly FlowFigurePart[], animate: boolean): num
   return display.length === parts.length ? display : parts.map((part) => part.watts ?? 0);
 }
 
-/** One worded figure line, its magnitudes ticking between snapshots. */
-function FlowFigure({ parts }: { parts: readonly FlowFigurePart[] }): string {
+/**
+ * One worded figure line, its magnitudes ticking between snapshots.
+ *
+ * Rendered as PARTS — the direction word and its magnitude in sibling spans —
+ * so the widest thing in the card is always a wrap point, never an unbreakable
+ * string: the card's own measure wraps "Importing / 412 W" while the words and
+ * figures stay exactly the pinned `figurePartsText` reading ("Importing 412
+ * W", "Charging 3,800 W · Discharging 800 W" — the separator rides between the
+ * parts). The desktop's four-across band promotes the two into typographic
+ * registers (flow.css ≥77rem): the word a small label line, the figure the
+ * larger datum line — the number is what the homeowner scans, the word names
+ * it, and neither ever reaches past its card's edge again.
+ */
+function FlowFigure({
+  parts,
+  suffix = "",
+}: {
+  parts: readonly FlowFigurePart[];
+  suffix?: string;
+}): ReactNode {
   const reducedMotion = usePrefersReducedMotion();
   const display = useTickedWatts(parts, !reducedMotion);
-  const shown = parts.map((part, index) =>
-    part.watts === null ? part : { word: part.word, watts: display[index] ?? part.watts },
+  return (
+    <>
+      {parts.map((part, index) => {
+        const watts = part.watts === null ? null : (display[index] ?? part.watts);
+        return (
+          <Fragment key={`${index}-${part.word}`}>
+            {index === 0 ? null : <span className="flow-fig-sep"> · </span>}
+            <span className="flow-fig-part">
+              <span className="flow-fig-word">{part.word}</span>
+              {watts === null ? null : (
+                <>
+                  {" "}
+                  <span className="flow-fig-num">{formatWatts(watts)}</span>
+                </>
+              )}
+            </span>
+          </Fragment>
+        );
+      })}
+      {suffix !== "" ? <span className="flow-fig-scope">{suffix}</span> : null}
+    </>
   );
-  return figurePartsText(shown);
 }
 
 /**
@@ -496,8 +531,7 @@ function FlowNode({
     <div className={`flow-node flow-node--${tone}`} data-tone={tone} tabIndex={0}>
       <span className="flow-node-name">{name}</span>
       <span className="flow-node-figure">
-        <FlowFigure parts={parts} />
-        {suffix !== "" ? suffix : null}
+        <FlowFigure parts={parts} suffix={suffix} />
       </span>
       {/* The SoC band is RESERVED in every card — empty for Grid and Home —
           so the same rows land at the same y across all four columns whether

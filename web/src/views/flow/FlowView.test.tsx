@@ -189,7 +189,7 @@ describe("FlowView — rendering per state", () => {
     // Idle says Idle, never a zero dressed up as a flow: grid and battery
     // figures across the three phases plus the fleet column.
     expect((await screen.findAllByText("Idle")).length).toBe(8);
-    expect(screen.getAllByText("Using 0 W").length).toBe(4);
+    expect(screen.getAllByText(figureLine("Using 0 W")).length).toBe(4);
     // The SoC wording renders verbatim (the percentage is its own styled run,
     // so the pin matches the composed line, not one text node).
     const socLine = (_: string, element: Element | null): boolean =>
@@ -214,8 +214,8 @@ describe("FlowView — rendering per state", () => {
         "All the batteries are charging 5,700 W in total from the grid, the house using 810 W.",
       ),
     ).toBeVisible();
-    expect(screen.getAllByText("Importing 2,000 W").length).toBe(3);
-    expect(screen.getAllByText("Charging 1,900 W").length).toBe(3);
+    expect(screen.getAllByText(figureLine("Importing 2,000 W")).length).toBe(3);
+    expect(screen.getAllByText(figureLine("Charging 1,900 W")).length).toBe(3);
     expect(screen.getByLabelText(/Phase mid — grid: Importing 2,000 W/)).toBeVisible();
     expect(screen.getByLabelText(/Whole site/i)).toBeVisible();
     // The fleet column words its sums, never a netted import/export figure.
@@ -242,8 +242,12 @@ describe("FlowView — rendering per state", () => {
         "lhs is discharging 800 W while mid and rhs are charging 3,800 W in total, the house using 410 W, importing 2,700 W on mid and rhs while exporting 300 W on lhs.",
       ),
     ).toBeVisible();
-    expect(screen.getAllByText("Discharging 800 W").length).toBe(1); // the lhs node
-    expect(screen.getAllByText("Exporting 300 W").length).toBe(1); // the lhs grid node
+    // The lhs node, and the fleet's own second figure part (the fleet words BOTH
+    // sides — its composed line is pinned just below).
+    expect(screen.getAllByText(figureLine("Discharging 800 W")).length).toBe(2);
+    // The lhs grid node, and the fleet's second figure part (its composed line
+    // is pinned just below).
+    expect(screen.getAllByText(figureLine("Exporting 300 W")).length).toBe(2);
     // The fleet column words BOTH sides — never a netted figure.
     const fleet = screen.getByLabelText(/Whole site/i);
     expectVisibleText(fleet, /Importing 2,700 W · Exporting 300 W/);
@@ -505,19 +509,21 @@ describe("FlowView — live updates", () => {
 
     renderFlow();
 
-    expect((await screen.findAllByText("Importing 412 W")).length).toBe(2); // mid + fleet
-    expect(screen.getAllByText("Charging 1,900 W").length).toBe(2);
+    expect((await screen.findAllByText(figureLine("Importing 412 W"))).length).toBe(2); // mid + fleet
+    expect(screen.getAllByText(figureLine("Charging 1,900 W")).length).toBe(2);
 
     // The shell's measured-data heartbeat republishes the refreshed snapshot
     // to this view's subscription: sequence 42 advances the picture.
     channel.push({ type: "snapshot", sequence: 42, data: second });
 
     await waitFor(() => {
-      expect(screen.getByText("Importing 520 W")).toBeVisible();
+      expect(screen.getAllByText(figureLine("Importing 520 W")).length).toBe(2); // mid + the fleet's part
+      // The 300 ms number tick may still be mid-tween on the sibling figure,
+      // so the old magnitude's disappearance is part of the same wait.
+      expect(screen.queryByText(figureLine("Importing 412 W"))).toBeNull();
     });
-    expect(screen.getByText("Charging 2,100 W")).toBeVisible();
-    expect(screen.getByText("Exporting 300 W")).toBeVisible();
-    expect(screen.queryByText("Importing 412 W")).toBeNull();
+    expect(screen.getAllByText(figureLine("Charging 2,100 W")).length).toBe(2); // mid + the fleet's part
+    expect(screen.getAllByText(figureLine("Exporting 300 W")).length).toBe(2); // rhs + the fleet's part
 
     // One client, one stream: the view never minted a second socket.
     expect(api.createApiClient).not.toHaveBeenCalled();
@@ -533,18 +539,18 @@ describe("FlowView — live updates", () => {
     const channel = liveChannel([]);
 
     renderFlow();
-    await screen.findAllByText("Importing 412 W");
+    await screen.findAllByText(figureLine("Importing 412 W"));
 
     channel.push({ type: "snapshot", sequence: 42, data: second });
     await waitFor(() => {
       // mid's node and the fleet's grid figure (the only phase importing).
-      expect(screen.getAllByText("Importing 520 W").length).toBe(2);
+      expect(screen.getAllByText(figureLine("Importing 520 W")).length).toBe(2);
     });
 
     // A republished frame behind the adopted sequence must not rewind it.
     channel.push({ type: "snapshot", sequence: 41, data: stale });
     await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(screen.getAllByText("Importing 520 W").length).toBe(2);
+    expect(screen.getAllByText(figureLine("Importing 520 W")).length).toBe(2);
   });
 
   it("shows the disconnected state and keeps the last known picture", async () => {
@@ -556,7 +562,7 @@ describe("FlowView — live updates", () => {
     renderFlow();
 
     expect(await screen.findByText(/Connection lost — showing the last known picture/i)).toBeVisible();
-    expect(screen.getAllByText("Importing 412 W").length).toBe(2);
+    expect(screen.getAllByText(figureLine("Importing 412 W")).length).toBe(2);
   });
 });
 
@@ -613,7 +619,7 @@ describe("FlowView — the pinned diagram structure", () => {
 
     renderFlow();
 
-    expect((await screen.findAllByText("Importing 412 W")).length).toBe(2); // mid + the fleet
+    expect((await screen.findAllByText(figureLine("Importing 412 W"))).length).toBe(2); // mid + the fleet
     // mid's column: one ribbon (the grid import) and two dotted unknowns
     // (battery, house); the fleet column mirrors the same split.
     const columns = document.body.querySelectorAll(".flow-phase");
@@ -793,6 +799,18 @@ describe("FlowView — the pinned diagram structure", () => {
     expect(pulsing[0]?.closest("g")?.classList.contains("flow-stub--battery")).toBe(true);
   });
 });
+
+/** The figure line as it renders (the word and its figure are sibling styled
+ * runs inside one part span, so the pin matches the composed line, leaf-most —
+ * the part itself, never an ancestor that merely contains it). */
+function figureLine(text: string): (_: string, element: Element | null) => boolean {
+  const normalize = (value: string | null): string => (value ?? "").replace(/\s+/g, " ").trim();
+  return (_: string, element: Element | null): boolean => {
+    if (element === null) return false;
+    if (normalize(element.textContent) !== text) return false;
+    return !Array.from(element.children).some((child) => normalize(child.textContent) === text);
+  };
+}
 
 // --- helpers ---------------------------------------------------------------------------
 
