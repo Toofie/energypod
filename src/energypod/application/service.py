@@ -13,6 +13,19 @@ authorizations, then fence every affected actor (cancelling any in-flight
 nonzero heartbeat write), then request the bounded zero through those actors,
 and only then audit and publish.  A degraded dependency anywhere in that
 sequence may turn the response into an error, but it never removes a step.
+
+Mutation atomicity (Impl-10, one doctrine for every facade mutation): a
+mutation whose effect has an exact inverse and enables power (``arm``,
+``submit_intent``, ``submit_advisory_intent``) is atomic with its audit -- a
+failed call leaves nothing armed or stored (compensated, and the compensation
+audited).  A mutation with no inverse (``acknowledge_inhibit``,
+``acknowledge_emergency_stop``, the excess-charging economics acknowledgement)
+appends its durable record BEFORE touching state, so a failed append refuses
+with nothing consumed.  A safety-positive mutation (``disarm``,
+``cancel_intent``, ``emergency_stop``) never undoes or fails its completed
+stop work: a failed record is named in the response's ``degraded`` list or,
+for ``emergency_stop``'s error paths, carried on the error as a
+``DegradedReport`` (Impl-11/Impl-15).
 """
 
 from __future__ import annotations
@@ -238,6 +251,23 @@ class ActorHandle(Protocol):
 
 
 @dataclass(frozen=True)
+class DegradedReport:
+    """Impl-15: the one shape every degraded facade failure speaks.
+
+    Attached to the exception a facade mutation raises AFTER its safety work
+    committed (``emergency_stop`` completing its sequence behind a refused
+    store, or latching the known units of a request that named an unknown
+    one).  The report names the landed work's correlation id and the reason
+    codes for everything that degraded, so the guarded boundary can surface
+    both verbatim instead of a bare ``internal_error`` -- never a success
+    view's per-operation ``degraded`` list, which stays in the response.
+    """
+
+    stop_id: str | None = None
+    degraded: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class _LatchedStop:
     stop_id: str
     unit_ids: frozenset[str]
@@ -372,17 +402,22 @@ def _correlation_key(value: Any, name: str) -> str:
     return value
 
 
-def _attach_stop_id(error: BaseException, stop_id: str) -> None:
-    """Carry a latched stop's id on an error so it stays correlateable.
+def _attach_stop_id(error: BaseException, stop_id: str, *, degraded: Sequence[str] = ()) -> None:
+    """Carry a latched stop's id (and its degraded codes) on an error.
 
     ``emergency_stop`` completes its safety sequence before any caller-facing
     error surfaces; the guarded boundary must be able to register the id for
-    a later acknowledgement.  Slot-bound exceptions cannot carry the
-    attribute; the id is then simply unavailable to the caller, never
-    fabricated.
+    a later acknowledgement.  Impl-11: the degraded code set rides the same
+    channel as the uniform ``DegradedReport`` (Impl-15) so the error body can
+    say WHY the stop degraded, not only that it did.  Slot-bound exceptions
+    cannot carry the attributes; the id is then simply unavailable to the
+    caller, never fabricated.
     """
     with contextlib.suppress(AttributeError, TypeError):
         error.stop_id = stop_id  # type: ignore[attr-defined]
+        error.degraded_report = DegradedReport(  # type: ignore[attr-defined]
+            stop_id=stop_id, degraded=tuple(degraded)
+        )
 
 
 def _requested_power(unit_id: str, intents: Sequence[Any]) -> dict[str, Any]:
@@ -1039,26 +1074,43 @@ class EnergyServiceFacade:
                 raise ValueError("an emergency stop is released by acknowledgement, not cancelled")
         selected = sorted(getattr(target, "selected_unit_ids", ()) or ())
         await self._intents.remove(target.id)
-        await self._append_audit(
-            self._mutation_audit(
-                event_type="intent_cancelled",
-                subject=principal.subject,
-                result="cancelled",
-                request_id=request,
-                source=getattr(target, "source", None),
-                intent_id=target.id,
-                reason_codes=("cancelled",),
-                lifecycle=self._handle_lifecycle(selected[0])
-                if selected
-                else UnitLifecycle.DISARMED,
-                payload={"intent_id": target.id, "unit_ids": selected},
+        # Impl-10 (safety-positive family): the removal stands whatever the
+        # record does -- compensating a cancel by re-adding the intent would
+        # restart power the operator asked to stop.  A failed audit or
+        # publication is named in the response's ``degraded`` list instead of
+        # failing a cancellation that already happened, exactly like the
+        # emergency stop it descends from.
+        degraded: list[str] = []
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="intent_cancelled",
+                    subject=principal.subject,
+                    result="cancelled",
+                    request_id=request,
+                    source=getattr(target, "source", None),
+                    intent_id=target.id,
+                    reason_codes=("cancelled",),
+                    lifecycle=self._handle_lifecycle(selected[0])
+                    if selected
+                    else UnitLifecycle.DISARMED,
+                    payload={"intent_id": target.id, "unit_ids": selected},
+                )
+            )
+        except Exception:
+            degraded.append("audit_unavailable")
+        degraded.extend(
+            await self._publish_degraded(
+                "intent.cancelled",
+                {"principal": principal.subject, "intent_id": target.id, "unit_ids": selected},
             )
         )
-        await self._publish(
-            "intent.cancelled",
-            {"principal": principal.subject, "intent_id": target.id, "unit_ids": selected},
-        )
-        return {"intent_id": target.id, "status": "cancelled", "unit_ids": selected}
+        return {
+            "intent_id": target.id,
+            "status": "cancelled",
+            "unit_ids": selected,
+            "degraded": degraded,
+        }
 
     async def arm(
         self,
@@ -1078,6 +1130,13 @@ class EnergyServiceFacade:
         refused before any unit is touched; the acknowledgement is per-request
         and never persisted (boot stays observe-only, no provenance across
         restarts).
+
+        Impl-10 atomicity: arming has an exact inverse (disarm), so an arm
+        whose audit append fails never leaves an unaudited armed unit.  The
+        request stops arming at the failed append, every unit it DID arm is
+        disarmed again, each compensation lands as its own audited
+        ``unit_armed``/``rolled_back`` row, and the original failure surfaces
+        to the caller.
         """
         self._admit(principal, "arm", interactive=True)
         units = _validated_units(unit_ids)
@@ -1087,9 +1146,12 @@ class EnergyServiceFacade:
             raise ValueError("takeover acknowledgement must be the literal 'ACKNOWLEDGE'")
         takeover_acknowledged = takeover == "ACKNOWLEDGE"
         outcomes: list[dict[str, str]] = []
+        armed_units: list[str] = []
         for unit_id in units:
             outcome = await self._arm_one(unit_id, takeover_acknowledged=takeover_acknowledged)
             outcomes.append(outcome)
+            if outcome["status"] == "armed":
+                armed_units.append(unit_id)
             # ADD-1: the preflight classification is a first-class audit fact
             # -- an acknowledged takeover or a pod-autonomy arm must be
             # visible on the durable row's reason codes, not only its
@@ -1098,18 +1160,28 @@ class EnergyServiceFacade:
             classification_codes = (
                 (f"arm_{classification}",) if isinstance(classification, str) else ()
             )
-            await self._append_audit(
-                self._mutation_audit(
-                    event_type="unit_armed",
-                    subject=principal.subject,
-                    result=outcome["status"],
-                    request_id=request,
-                    reason_codes=(outcome["reason"], *classification_codes),
-                    unit_id=unit_id,
-                    lifecycle=self._handle_lifecycle(unit_id),
-                    payload=dict(outcome),
+            try:
+                await self._append_audit(
+                    self._mutation_audit(
+                        event_type="unit_armed",
+                        subject=principal.subject,
+                        result=outcome["status"],
+                        request_id=request,
+                        reason_codes=(outcome["reason"], *classification_codes),
+                        unit_id=unit_id,
+                        lifecycle=self._handle_lifecycle(unit_id),
+                        payload=dict(outcome),
+                    )
                 )
-            )
+            except Exception:
+                # Impl-10: the unit may already be physically armed while its
+                # audit cannot land -- an unaudited state change in an
+                # audit-first system.  Compensate every unit this request
+                # armed (the inverse exists), then surface the failure.
+                await self._compensate_failed_arm(
+                    armed_units, subject=principal.subject, request_id=request
+                )
+                raise
         await self._publish("unit.armed", {"principal": principal.subject, "units": outcomes})
         return {"units": outcomes}
 
@@ -1121,29 +1193,46 @@ class EnergyServiceFacade:
         idempotency_key: Any,
         request_id: Any,
     ) -> dict[str, Any]:
-        """Disarm the requested known units; partial refusal stays visible."""
+        """Disarm the requested known units; partial refusal stays visible.
+
+        Impl-10 (safety-positive family): disarming has an inverse but
+        compensating an audit failure with a re-arm would hand power back to a
+        unit the operator just stood down, so the disarm stands whatever the
+        record does.  A failed audit or publication is named per unit in the
+        response's ``degraded`` list and the loop keeps disarming the
+        remaining units -- the emergency-stop doctrine applied to the
+        smallest stop there is.
+        """
         self._admit(principal, "arm")
         units = _validated_units(unit_ids)
         _correlation_key(idempotency_key, "idempotency_key")
         request = _correlation_key(request_id, "request_id")
         outcomes: list[dict[str, str]] = []
+        degraded: list[str] = []
         for unit_id in units:
             outcome = await self._disarm_one(unit_id)
             outcomes.append(outcome)
-            await self._append_audit(
-                self._mutation_audit(
-                    event_type="unit_disarmed",
-                    subject=principal.subject,
-                    result=outcome["status"],
-                    request_id=request,
-                    reason_codes=(outcome["reason"],),
-                    unit_id=unit_id,
-                    lifecycle=self._handle_lifecycle(unit_id),
-                    payload=dict(outcome),
+            try:
+                await self._append_audit(
+                    self._mutation_audit(
+                        event_type="unit_disarmed",
+                        subject=principal.subject,
+                        result=outcome["status"],
+                        request_id=request,
+                        reason_codes=(outcome["reason"],),
+                        unit_id=unit_id,
+                        lifecycle=self._handle_lifecycle(unit_id),
+                        payload=dict(outcome),
+                    )
                 )
+            except Exception:
+                degraded.append(f"audit_unavailable:{unit_id}")
+        degraded.extend(
+            await self._publish_degraded(
+                "unit.disarmed", {"principal": principal.subject, "units": outcomes}
             )
-        await self._publish("unit.disarmed", {"principal": principal.subject, "units": outcomes})
-        return {"units": outcomes}
+        )
+        return {"units": outcomes, "degraded": degraded}
 
     async def emergency_stop(
         self,
@@ -1302,12 +1391,15 @@ class EnergyServiceFacade:
         # carries the stop id: the store-refused stop never latched (so the
         # operator correlates and re-issues it), while the unknown-unit stop
         # latched for the known units and stays acknowledgeable by id.
+        # Impl-11: both also carry the degraded code set in the uniform
+        # DegradedReport shape so the guarded boundary can say WHY the stop
+        # degraded, never only that it did.
         if store_error is not None:
-            _attach_stop_id(store_error, stop_id)
+            _attach_stop_id(store_error, stop_id, degraded=degraded)
             raise store_error
         if unknown:
             unknown_error = ValueError(f"unknown units requested for emergency stop: {unknown}")
-            _attach_stop_id(unknown_error, stop_id)
+            _attach_stop_id(unknown_error, stop_id, degraded=degraded)
             raise unknown_error
         return {
             "stop_id": stop_id,
@@ -1325,7 +1417,14 @@ class EnergyServiceFacade:
         idempotency_key: Any,
         request_id: Any,
     ) -> dict[str, Any]:
-        """Remove exactly one latched stop so it cannot relatch."""
+        """Remove exactly one latched stop so it cannot relatch.
+
+        Impl-10 (no inverse): a consumed latch can never be restored, so the
+        durable acknowledgement row lands BEFORE anything is consumed -- a
+        failed append refuses with the latch fully intact and the
+        acknowledgement retryable, and the row records the operator's
+        acknowledgement command against the latch exactly as it was issued.
+        """
         self._admit(principal, "stop:acknowledge")
         _correlation_key(idempotency_key, "idempotency_key")
         request = _correlation_key(request_id, "request_id")
@@ -1348,15 +1447,10 @@ class EnergyServiceFacade:
             )
             if not live:
                 raise LookupError(f"no latched emergency stop with id {stop_id!r}")
-        # A fleet-wide registry latch outranks the stored copy: if the intent
-        # was already removed out-of-band, the acknowledgement must still
-        # clear the latch rather than leave a registry entry no retry could
-        # ever satisfy.  Any other store failure propagates before the
-        # registry is consumed, leaving the latch for a retried call.
-        with contextlib.suppress(LookupError):
-            await self._intents.remove(stop_id)
-        self._latched_stops.pop(stop_id, None)
-        self._acknowledged_stops.add(stop_id)
+        # Impl-10 audit-first (no inverse): append before any consumption.  A
+        # store failure below then leaves the latch for a retried call (the
+        # durable row already records this command); the retry lands its own
+        # row and completes.
         await self._append_audit(
             self._mutation_audit(
                 event_type="stop_acknowledged",
@@ -1372,11 +1466,20 @@ class EnergyServiceFacade:
                 payload={"stop_id": stop_id, "unit_ids": sorted(record.unit_ids)},
             )
         )
-        await self._publish(
+        # A fleet-wide registry latch outranks the stored copy: if the intent
+        # was already removed out-of-band, the acknowledgement must still
+        # clear the latch rather than leave a registry entry no retry could
+        # ever satisfy.  Any other store failure propagates before the
+        # registry is consumed, leaving the latch for a retried call.
+        with contextlib.suppress(LookupError):
+            await self._intents.remove(stop_id)
+        self._latched_stops.pop(stop_id, None)
+        self._acknowledged_stops.add(stop_id)
+        degraded = await self._publish_degraded(
             "emergency_stop.acknowledged",
             {"principal": principal.subject, "stop_id": stop_id},
         )
-        return {"stop_id": stop_id, "status": "acknowledged"}
+        return {"stop_id": stop_id, "status": "acknowledged", "degraded": degraded}
 
     async def acknowledge_inhibit(
         self,
@@ -1386,7 +1489,16 @@ class EnergyServiceFacade:
         idempotency_key: Any,
         request_id: Any,
     ) -> dict[str, Any]:
-        """Clear exactly one unit's latched inhibit; never arm and never bypass recovery."""
+        """Clear exactly one unit's latched inhibit; never arm and never bypass recovery.
+
+        Impl-10 (no inverse): a cleared latch cannot be un-acknowledged, so
+        the durable row lands BEFORE the latch is touched -- a failed append
+        refuses with the latch intact and the acknowledgement retryable.  The
+        row records the operator's acknowledgement command against the latch
+        exactly as it was issued (``latch_cleared`` names whether there was a
+        latch to clear), and a mutation failure after the append leaves the
+        latch for a retried call, exactly like the stop acknowledgement.
+        """
         self._admit(principal, "arm", interactive=True)
         canonical_unit = _correlation_key(unit_id, "unit_id")
         _correlation_key(idempotency_key, "idempotency_key")
@@ -1395,27 +1507,29 @@ class EnergyServiceFacade:
         if handle is None:
             raise LookupError(f"no unit with id {canonical_unit!r}")
         latched = bool(getattr(handle, "inhibit_latched", False))
-        latch_cleared = False
-        if latched:
-            await handle.acknowledge_inhibit()
-            latch_cleared = True
         # A non-latched inhibit needs no acknowledgement: it recovers through
-        # stable qualifying samples, and a repeated call stays a no-op success.
+        # stable qualifying samples, and a repeated call stays a no-op success
+        # with its own row.
         await self._append_audit(
             self._mutation_audit(
                 event_type="inhibit_acknowledged",
                 subject=principal.subject,
                 result="acknowledged",
                 request_id=request,
-                reason_codes=("latch_cleared",) if latch_cleared else ("not_latched",),
+                reason_codes=("latch_cleared",) if latched else ("not_latched",),
                 unit_id=canonical_unit,
                 # Acknowledgement only clears the latch; the unit still needs
-                # stable samples to reach DISARMED, so report the unit as-is.
+                # stable samples to reach DISARMED, so the row reports the
+                # unit as it stood when the command was issued.
                 lifecycle=self._handle_lifecycle(canonical_unit),
-                payload={"latch_cleared": latch_cleared, "unit_id": canonical_unit},
+                payload={"latch_cleared": latched, "unit_id": canonical_unit},
             )
         )
-        await self._publish(
+        latch_cleared = False
+        if latched:
+            await handle.acknowledge_inhibit()
+            latch_cleared = True
+        degraded = await self._publish_degraded(
             "inhibit.acknowledged",
             {
                 "principal": principal.subject,
@@ -1427,6 +1541,7 @@ class EnergyServiceFacade:
             "unit_id": canonical_unit,
             "status": "acknowledged",
             "latch_cleared": latch_cleared,
+            "degraded": degraded,
         }
 
     async def set_excess_charging(
@@ -1942,6 +2057,62 @@ class EnergyServiceFacade:
             return {"unit_id": unit_id, "status": "refused", "reason": "actor_failure"}
         return {"unit_id": unit_id, "status": "disarmed", "reason": "disarmed"}
 
+    async def _compensate_failed_arm(
+        self, unit_ids: Sequence[str], *, subject: str, request_id: str
+    ) -> None:
+        """Impl-10: disarm every unit a failed arm request had armed, audited.
+
+        Each compensation is its own ``unit_armed``/``rolled_back`` row so the
+        durable trail says the unit was armed AND stood back down.  A
+        compensation failure -- the actor refusing the disarm, or the audit
+        append failing again -- never masks the original error and never
+        shields the remaining units from the sweep: the failure rides that
+        unit's row when the row can land at all.
+        """
+        for unit_id in unit_ids:
+            handle = self._actors.get(unit_id)
+            compensated = False
+            if handle is not None:
+                try:
+                    await handle.disarm()
+                    compensated = True
+                except Exception:
+                    compensated = False
+            with contextlib.suppress(Exception):
+                await self._append_audit(
+                    self._mutation_audit(
+                        event_type="unit_armed",
+                        subject=subject,
+                        result="rolled_back",
+                        request_id=request_id,
+                        reason_codes=(
+                            "audit_unavailable",
+                            "disarmed" if compensated else "disarm_failed",
+                        ),
+                        unit_id=unit_id,
+                        lifecycle=self._handle_lifecycle(unit_id),
+                        payload={
+                            "unit_id": unit_id,
+                            "status": "rolled_back",
+                            "reason": "audit_unavailable",
+                            **({} if compensated else {"disarm_failed": True}),
+                        },
+                    )
+                )
+
+    async def _publish_degraded(self, event_type: str, payload: Mapping[str, Any]) -> list[str]:
+        """Publish, degrading to an explicit code instead of a late failure.
+
+        Impl-10/Impl-15: for a mutation whose state change has committed AND
+        been durably recorded, a publication failure is degraded reporting --
+        never a caller-visible failure of an operation that already happened.
+        """
+        try:
+            await self._publish(event_type, payload)
+        except Exception:
+            return ["publish_unavailable"]
+        return []
+
     def _handle_lifecycle(self, unit_id: str) -> UnitLifecycle:
         handle = self._actors.get(unit_id)
         if handle is None:
@@ -2012,4 +2183,4 @@ class EnergyServiceFacade:
         return await self._events.publish({"type": event_type, "payload": dict(payload)})
 
 
-__all__ = ["EnergyServiceFacade"]
+__all__ = ["DegradedReport", "EnergyServiceFacade"]

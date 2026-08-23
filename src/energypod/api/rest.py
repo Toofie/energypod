@@ -688,10 +688,30 @@ def create_api_app(
                 # A degraded stop (store refused, unknown units) may still have
                 # latched known units; register its stop id so the exact-id
                 # acknowledgement endpoint stays usable for recovery.
-                degraded_stop_id = getattr(exc, "stop_id", None)
+                # API_CONTRACTS "Application service facade" (Impl-11): when
+                # the facade attached its uniform DegradedReport, the failure
+                # body carries the stop id AND the reason codes naming what
+                # degraded -- never a bare internal_error over a stop whose
+                # safety work landed.
+                report = getattr(exc, "degraded_report", None)
+                degraded_stop_id = getattr(report, "stop_id", None) or getattr(exc, "stop_id", None)
                 if isinstance(degraded_stop_id, str) and _valid_id(degraded_stop_id):
                     async with stop_lock:
                         known_stops[degraded_stop_id] = None
+                    degraded_codes = getattr(report, "degraded", None)
+                    raise BoundaryError(
+                        503,
+                        "emergency_stop_degraded",
+                        "The stop latched with degraded dependencies; acknowledge by stop id",
+                        details={
+                            "stop_id": degraded_stop_id,
+                            "degraded": (
+                                list(degraded_codes)
+                                if isinstance(degraded_codes, tuple | list)
+                                else []
+                            ),
+                        },
+                    ) from exc
                 raise
             stop_id = result.get("stop_id")
             if isinstance(stop_id, str) and _valid_id(stop_id):

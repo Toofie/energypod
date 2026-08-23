@@ -398,11 +398,17 @@ class FakeAuditRepository:
         self.recent_cursors: list[int | None] = []
         self.history = history
         self.failing = False
+        # Impl-10 compensation pin: fail exactly the first N append calls,
+        # then recover -- the primary row cannot land but the compensation
+        # rows must.
+        self.fail_first_appends = 0
+        self._append_calls = 0
 
     async def append(self, event: Any) -> None:
+        self._append_calls += 1
         if self.history is not None:
             self.history.append("audit")
-        if self.failing:
+        if self.failing or self._append_calls <= self.fail_first_appends:
             raise OSError("audit store unavailable")
         self.appended.append(event)
         self.events.insert(0, event)
@@ -513,6 +519,7 @@ class FakeActorHandle:
         inhibit_latched: bool = False,
         inhibit_cause: str | None = None,
         arm_error: BaseException | None = None,
+        disarm_error: BaseException | None = None,
         zero_error: BaseException | None = None,
         refresh_outcomes: tuple[tuple[int, int] | BaseException, ...] = (),
     ) -> None:
@@ -524,6 +531,7 @@ class FakeActorHandle:
         self.inhibit_latched = inhibit_latched
         self.inhibit_cause = inhibit_cause if inhibit_latched else None
         self.arm_error = arm_error
+        self.disarm_error = disarm_error
         self.zero_error = zero_error
         self.history = history
         # B5 (SYNC_RESILIENCE_AUDIT): the bounded fresh mode-word read the
@@ -561,6 +569,8 @@ class FakeActorHandle:
 
     async def disarm(self) -> None:
         self.history.append(f"disarm:{self.unit_id}")
+        if self.disarm_error is not None:
+            raise self.disarm_error
         self.lifecycle = self.disarmed_lifecycle
 
     async def acknowledge_inhibit(self) -> None:
@@ -720,6 +730,7 @@ def make_rig(
             inhibit_latched=spec.get("inhibit_latched", False),
             inhibit_cause=spec.get("inhibit_cause"),
             arm_error=spec.get("arm_error"),
+            disarm_error=spec.get("disarm_error"),
             zero_error=spec.get("zero_error"),
             refresh_outcomes=tuple(spec.get("refresh_outcomes", ())),
         )
@@ -2214,6 +2225,256 @@ async def test_disarm_is_the_arm_path_inverted_and_always_succeeds_for_known_uni
     assert_audited_and_published(rig, OPERATOR.subject)
 
 
+# --- facade mutation atomicity (Impl-10 / Impl-11 / Impl-15) ----------------
+
+
+async def test_arm_audit_failure_disarms_every_unit_the_request_armed(api: Any) -> None:
+    """Impl-10: an arm whose audit cannot land leaves no unaudited armed unit.
+
+    Arming has an exact inverse, so the failure compensates: the request stops
+    arming at the failed append, every unit it DID arm is disarmed again, each
+    compensation is its own audited ``unit_armed``/``rolled_back`` row, units
+    not yet visited are never touched, and the caller sees the failure.
+    """
+    rig = make_rig(api, units={"pod-a": {}, "pod-b": {}, "pod-c": {}})
+    rig.audit.fail_first_appends = 1
+
+    with pytest.raises(OSError):
+        await rig.facade.arm(
+            unit_ids=["pod-a", "pod-b", "pod-c"],
+            principal=OPERATOR,
+            idempotency_key="arm-key-a1",
+            request_id="request-a1",
+        )
+
+    assert rig.history.index("disarm:pod-a") > rig.history.index("arm:pod-a"), (
+        "the unit that armed before the audit failed must be stood back down"
+    )
+    assert "arm:pod-b" not in rig.history and "arm:pod-c" not in rig.history, (
+        "the request stops arming at the failed append"
+    )
+    for handle in rig.handles.values():
+        assert handle.lifecycle is not api.UnitLifecycle.ARMED_IDLE
+    (compensation,) = rig.audit.appended
+    assert compensation.event_type == "unit_armed"
+    assert compensation.result == "rolled_back"
+    assert compensation.unit_id == "pod-a"
+    assert compensation.reason_codes == ("audit_unavailable", "disarmed")
+    assert rig.bus.published == [], "a failed arm publishes nothing"
+
+
+async def test_arm_compensation_never_masks_the_original_failure(api: Any) -> None:
+    """The compensation sweep runs even when no further audit row can land,
+    and a unit whose compensating disarm fails is named on its row -- one
+    wedged unit never shields another from being stood down."""
+    rig = make_rig(
+        api,
+        units={
+            "pod-a": {},
+            "pod-b": {"disarm_error": RuntimeError("mailbox wedged")},
+            "pod-c": {},
+        },
+    )
+    rig.audit.failing = True
+
+    with pytest.raises(OSError):
+        await rig.facade.arm(
+            unit_ids=["pod-a", "pod-b", "pod-c"],
+            principal=OPERATOR,
+            idempotency_key="arm-key-a2",
+            request_id="request-a2",
+        )
+
+    assert [step for step in rig.history if step != "audit"] == ["arm:pod-a", "disarm:pod-a"], (
+        "the failure aborts the sweep at the first unit and still compensates it"
+    )
+    assert rig.audit.appended == [], "a fully failed audit leaves no rows, only the raise"
+
+
+async def test_arm_compensation_names_a_failed_disarm(api: Any) -> None:
+    rig = make_rig(api, units={"pod-a": {"disarm_error": RuntimeError("mailbox wedged")}})
+    rig.audit.fail_first_appends = 1
+
+    with pytest.raises(OSError):
+        await rig.facade.arm(
+            unit_ids=["pod-a"],
+            principal=OPERATOR,
+            idempotency_key="arm-key-a3",
+            request_id="request-a3",
+        )
+
+    (compensation,) = rig.audit.appended
+    assert compensation.reason_codes == ("audit_unavailable", "disarm_failed")
+    assert compensation.request_fingerprint != ""
+
+
+async def test_disarm_stands_and_names_the_failed_record(api: Any) -> None:
+    """Impl-10 (safety-positive family): an audit failure never undoes or
+    fails a completed disarm; the response names the degraded record per unit
+    and the loop keeps disarming the remaining units."""
+    rig = make_rig(
+        api,
+        units={"pod-a": {"lifecycle": api.UnitLifecycle.ARMED_IDLE}, "pod-b": {}},
+    )
+    rig.audit.failing = True
+
+    result = await rig.facade.disarm(
+        unit_ids=["pod-a", "pod-b"],
+        principal=OPERATOR,
+        idempotency_key="disarm-key-a1",
+        request_id="request-b1",
+    )
+
+    assert [unit["status"] for unit in result["units"]] == ["disarmed", "disarmed"]
+    assert result["degraded"] == ["audit_unavailable:pod-a", "audit_unavailable:pod-b"]
+    assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.DISARMED
+    assert rig.handles["pod-b"].lifecycle is api.UnitLifecycle.DISARMED
+    assert "disarm:pod-a" in rig.history and "disarm:pod-b" in rig.history
+
+
+async def test_disarm_publish_failure_degrades_without_failing(api: Any) -> None:
+    rig = make_rig(api)
+    rig.bus.failing = True
+
+    result = await rig.facade.disarm(
+        unit_ids=["pod-a"],
+        principal=OPERATOR,
+        idempotency_key="disarm-key-a2",
+        request_id="request-b2",
+    )
+
+    assert result["degraded"] == ["publish_unavailable"]
+    assert len(rig.audit.appended) == 1, "the audit row stands"
+
+
+async def test_cancel_intent_stands_and_names_the_failed_record(api: Any) -> None:
+    """Impl-10 (safety-positive family): a cancellation whose audit fails has
+    still removed the intent; the response says cancelled + degraded and the
+    kernel's next tick finds nothing to arbitrate."""
+    rig = make_rig(api)
+    accepted = await rig.facade.submit_intent(**submit_kwargs())
+    rig.audit.failing = True
+    appended_before = len(rig.audit.appended)
+
+    result = await rig.facade.cancel_intent(
+        intent_id=accepted["intent_id"],
+        principal=OPERATOR,
+        idempotency_key="cancel-key-a1",
+        request_id="request-c1",
+    )
+
+    assert result["status"] == "cancelled"
+    assert result["degraded"] == ["audit_unavailable"]
+    assert rig.intents.removed == [accepted["intent_id"]]
+    assert not await rig.intents.active(rig.clock.now), (
+        "power can never flow from a dispatch the caller cancelled"
+    )
+    assert len(rig.audit.appended) == appended_before
+
+
+async def test_acknowledge_inhibit_audit_failure_refuses_and_keeps_the_latch(
+    api: Any,
+) -> None:
+    """Impl-10 (no inverse): the durable row must land BEFORE the latch is
+    touched -- a failed append refuses with the latch intact and the
+    acknowledgement retryable."""
+    rig = make_rig(api, units={"pod-a": {"inhibit_latched": True}, "pod-b": {}})
+    rig.audit.failing = True
+
+    with pytest.raises(OSError):
+        await rig.facade.acknowledge_inhibit(
+            unit_id="pod-a",
+            principal=OPERATOR,
+            idempotency_key="inhibit-key-a1",
+            request_id="request-d1",
+        )
+
+    assert rig.handles["pod-a"].inhibit_latched is True, "nothing is consumed by the refusal"
+    assert "inhibit-ack:pod-a" not in rig.history
+    assert rig.bus.published == []
+
+    rig.audit.failing = False
+    retried = await rig.facade.acknowledge_inhibit(
+        unit_id="pod-a",
+        principal=OPERATOR,
+        idempotency_key="inhibit-key-a2",
+        request_id="request-d2",
+    )
+    assert retried["latch_cleared"] is True
+    assert retried["degraded"] == []
+    assert rig.handles["pod-a"].inhibit_latched is False
+
+
+async def test_acknowledge_stop_audit_failure_consumes_nothing(api: Any) -> None:
+    """Impl-10 (no inverse): a stop acknowledgement whose audit fails leaves
+    the latch fully consumable -- the snapshot still lists it, the stored
+    intent is untouched, and the retry after recovery acknowledges exactly
+    once."""
+    rig = make_rig(api)
+    stopped = await _stop(
+        rig.facade,
+        unit_ids=["pod-a", "pod-b"],
+        reason="halt before a degraded audit",
+        idempotency_key="stop-key-a1",
+        request_id="request-e1",
+    )
+    rig.audit.failing = True
+
+    with pytest.raises(OSError):
+        await rig.facade.acknowledge_emergency_stop(
+            stop_id=stopped["stop_id"],
+            principal=OPERATOR,
+            idempotency_key="ack-key-a1",
+            request_id="request-e2",
+        )
+
+    view = await rig.facade.snapshot(principal=OPERATOR)
+    assert [stop["stop_id"] for stop in view["active_stops"]] == [stopped["stop_id"]]
+    assert rig.intents.removed == []
+
+    rig.audit.failing = False
+    acknowledged = await rig.facade.acknowledge_emergency_stop(
+        stop_id=stopped["stop_id"],
+        principal=OPERATOR,
+        idempotency_key="ack-key-a2",
+        request_id="request-e3",
+    )
+    assert acknowledged == {
+        "stop_id": stopped["stop_id"],
+        "status": "acknowledged",
+        "degraded": [],
+    }
+    assert rig.intents.removed == [stopped["stop_id"]]
+
+
+@pytest.mark.parametrize("degradation", ["store_refused", "unknown_unit"])
+async def test_degraded_stop_errors_carry_the_reason_codes(api: Any, degradation: str) -> None:
+    """Impl-11/Impl-15: the stop error paths carry the uniform DegradedReport
+    (stop id + degraded codes) so the boundary can surface both verbatim."""
+    rig = make_rig(api)
+    if degradation == "store_refused":
+        rig.intents.add_failing = True
+        unit_ids = ["pod-a"]
+    else:
+        unit_ids = ["pod-a", "pod-ghost"]
+
+    with pytest.raises((OSError, ValueError)) as excinfo:
+        await _stop(
+            rig.facade,
+            unit_ids=unit_ids,
+            reason="degraded completion",
+            idempotency_key=f"stop-key-{degradation}",
+            request_id=f"request-{degradation}",
+        )
+
+    report = getattr(excinfo.value, "degraded_report", None)
+    assert report is not None, "the uniform degraded-report type rides the error"
+    assert report.stop_id == excinfo.value.stop_id  # type: ignore[attr-defined]
+    assert report.stop_id and canonical(report.stop_id)
+    expected_code = "intent_store_unavailable" if degradation == "store_refused" else "unknown_unit"
+    assert any(code.startswith(expected_code) for code in report.degraded), report.degraded
+
+
 # --- emergency_stop ---------------------------------------------------------
 
 
@@ -2846,6 +3107,7 @@ async def test_cancel_intent_by_id_and_by_current_removes_audits_and_publishes(
         "intent_id": "intent-3",
         "status": "cancelled",
         "unit_ids": ["pod-a"],
+        "degraded": [],
     }
     assert rig.intents.removed == ["intent-3"]
     (event,) = [event for event in rig.audit.appended if event.event_type == "intent_cancelled"]

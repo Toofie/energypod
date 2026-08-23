@@ -582,6 +582,28 @@ coordinator, the event bus, and per-unit actor handles.
   silent. Arming is refused for unknown units, unqualified units, or units inhibited with a
   latched cause that has not been acknowledged. Disarm is the same path inverted and always
   succeeds for known units.
+- Mutation atomicity (Impl-10, one doctrine for every facade mutation): a mutation whose
+  effect has an exact inverse and enables power is ATOMIC with its audit — `submit_intent`
+  and `submit_advisory_intent` roll the stored intent back (a dispatch the caller saw fail
+  leaves nothing to arbitrate), and `arm` COMPENSATES: a failed audit append stops the
+  request, disarms every unit it armed, lands one `unit_armed`/`rolled_back` audit row per
+  compensated unit (reason codes `audit_unavailable` + `disarmed`/`disarm_failed`), and
+  raises the original failure — no unit is ever left physically armed behind a failed
+  answer. A mutation with NO inverse appends its durable record BEFORE touching state:
+  `acknowledge_inhibit` and `acknowledge_emergency_stop` refuse on a failed append with the
+  latch fully intact and the call retryable (the row records the operator's command against
+  the latch as issued; a mutation failure after the append leaves the latch for the retry,
+  which lands its own row). A SAFETY-POSITIVE mutation never undoes or fails its completed
+  stop work: `disarm` and `cancel_intent` stand, and a failed audit/publication is named in
+  the response's `degraded` list (`audit_unavailable[:unit_id]`, `publish_unavailable`)
+  exactly like `emergency_stop`'s; the disarm, cancel, and both acknowledgement responses
+  carry `degraded: []` on the clean path.
+- Degraded stop errors (Impl-11/Impl-15): `emergency_stop`'s error paths (store refused,
+  unknown units) raise the original error with the uniform `DegradedReport`
+  (`energypod.application.service.DegradedReport`: `stop_id`, `degraded` reason codes)
+  attached; REST translates any error carrying it into `503 emergency_stop_degraded` with
+  `details.stop_id` and `details.degraded`, keeping the exact-id acknowledgement usable —
+  never a bare `internal_error` over safety work that landed.
 - `emergency_stop(principal, unit_ids, reason)` creates one latched stop intent through the
   intent repository, immediately advances the fleet generation (fencing all outstanding
   authority before returning), revokes outstanding fleet authorizations, requests the bounded

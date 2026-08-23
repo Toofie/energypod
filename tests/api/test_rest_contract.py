@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from energypod.application.excess_charge import ExcessChargingRefusal
+from energypod.application.service import DegradedReport
 
 from .conftest import (
     MID_TELEMETRY_SUMMARY,
@@ -843,6 +844,59 @@ class _SequentialStopService(RecordingEnergyService):
         self.calls.append(("emergency_stop", kwargs))
         stop_number = sum(1 for name, _ in self.calls if name == "emergency_stop")
         return {"stop_id": f"stop-{stop_number}", "status": "latched"}
+
+
+class _DegradedStopService(RecordingEnergyService):
+    """A stop whose safety work landed but whose completion is degraded.
+
+    Impl-11: the facade raises the original store error with the uniform
+    DegradedReport attached (stop id + degraded reason codes).
+    """
+
+    async def emergency_stop(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("emergency_stop", kwargs))
+        error = OSError("intent store unavailable")
+        error.stop_id = "stop-degraded-1"  # type: ignore[attr-defined]
+        error.degraded_report = DegradedReport(  # type: ignore[attr-defined]
+            stop_id="stop-degraded-1", degraded=("intent_store_unavailable",)
+        )
+        raise error
+
+
+def test_a_degraded_stop_surfaces_its_stop_id_and_reason_codes(
+    authenticator: FakeAuthenticator,
+) -> None:
+    """Impl-11: a stop that latched behind a degraded dependency answers 503
+    ``emergency_stop_degraded`` carrying the stop id and the degraded codes in
+    its details -- the stop stays acknowledgeable by that id, never a bare
+    internal_error over landed safety work."""
+    module = load_contract_module("energypod.api.rest")
+    service = _DegradedStopService()
+    app = module.create_api_app(
+        service=service,
+        authenticator=authenticator,
+        event_source=FakeEventSource(),
+        auth_required=True,
+    )
+    with TestClient(app) as client:
+        degraded = client.post(
+            f"{API}/emergency-stop",
+            json={"unit_ids": ["pod-a"], "reason": "degraded store"},
+            headers=_mutation_headers("operator-token", key="stop-degraded"),
+        )
+        details = _assert_error(degraded, 503, "emergency_stop_degraded")["details"]
+        assert details["stop_id"] == "stop-degraded-1"
+        assert details["degraded"] == ["intent_store_unavailable"]
+
+        acknowledged = client.post(
+            f"{API}/emergency-stop/stop-degraded-1/acknowledge",
+            json={"confirmation": "ACKNOWLEDGE"},
+            headers=_mutation_headers("operator-token", key="ack-degraded"),
+        )
+
+    assert acknowledged.status_code == 200
+    ack = next(values for name, values in service.calls if name == "acknowledge_emergency_stop")
+    assert ack["stop_id"] == "stop-degraded-1"
 
 
 def test_latched_stops_stay_acknowledgeable_beyond_idempotency_capacity(

@@ -346,7 +346,11 @@ async def test_acknowledge_emergency_stop_audit_and_publication_content(facade_a
         idempotency_key="ack-key-1",
         request_id="request-s2",
     )
-    assert result == {"stop_id": "stop-0-100.000000", "status": "acknowledged"}
+    assert result == {
+        "stop_id": "stop-0-100.000000",
+        "status": "acknowledged",
+        "degraded": [],
+    }
     assert_audit(
         rig,
         {
@@ -383,7 +387,12 @@ async def test_acknowledge_inhibit_audit_and_publication_content(facade_api: Any
         idempotency_key="inhibit-key-1",
         request_id="request-i1",
     )
-    assert result == {"unit_id": "pod-a", "status": "acknowledged", "latch_cleared": True}
+    assert result == {
+        "unit_id": "pod-a",
+        "status": "acknowledged",
+        "latch_cleared": True,
+        "degraded": [],
+    }
     assert_audit(
         rig,
         {
