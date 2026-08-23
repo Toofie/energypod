@@ -283,22 +283,23 @@ storage:
 # is NOT a config key: it is captured ONCE, durably, through the first
 # enable's `"economics": "NET_BILLED"` field and never re-prompted.
 #
-# OPERATOR DECISION STILL OPEN (flagged by the backend implementation,
-# 2026-08-23): with the commissioned `assumed_autonomous_charge_w: 520` and
-# `min_acceleration_w: 100`, the beat-autonomy ENTRY threshold is 620 W —
-# a 500 W cap can never clear it, so a 500 W trial as literally wired in
-# §4 would never command.  Commissioning the trial must ALSO revisit
-# `assumed_autonomous_charge_w` (e.g. 300 W puts the entry threshold at
-# 400 W, inside the 500 W cap) or raise the trial cap above 620 W.  This
-# example keeps the commissioned autonomy value and names the tension
-# rather than deciding it.
+# TRIAL COMMISSIONING (resolved 2026-08-24, present-but-off): the block below
+# is UNCOMMENTED so the machinery composes — the console tile and toggle are
+# visible, the PCS grid block is promoted — while `enabled: false` keeps
+# participation suspended; the trial STARTS at the operator's toggle (which
+# itself requires the one-time NET_BILLED acknowledgement). The trial-cap
+# tension flagged by the implementation is resolved by lowering the autonomy
+# assumption for the trial: assumed_autonomous_charge_w 300 puts the
+# beat-autonomy ENTRY threshold at 400 W, inside the 500 W cap — the
+# simulator-proven combination. Graduation to production restores 2500 W and
+# re-commissions the autonomy key from observed daytime self-charge.
 #
-# excess_charging:
-#   enabled: false            # suspended at boot; the trial STARTS at the toggle
-#   export_headroom_margin_w: 200
-#   max_charge_from_export_w: 500   # the trial cap (graduation restores 2500)
-#   export_telemetry_max_age_s: 3.0
-#   assumed_autonomous_charge_w: 520
-#   min_acceleration_w: 100
-#   exit_hysteresis_w: 50
-#   intent_ttl_s: 10.0
+excess_charging:
+  enabled: false            # suspended at boot; the trial STARTS at the toggle
+  export_headroom_margin_w: 200
+  max_charge_from_export_w: 500   # the trial cap (graduation restores 2500)
+  export_telemetry_max_age_s: 3.0
+  assumed_autonomous_charge_w: 300  # trial value: entry threshold 400 W < 500 W cap
+  min_acceleration_w: 100
+  exit_hysteresis_w: 50
+  intent_ttl_s: 10.0
