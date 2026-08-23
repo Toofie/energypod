@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-23 (Australia/Brisbane)
+Last updated: 2026-08-24 (Australia/Brisbane)
 
 ## Purpose
 
@@ -348,6 +348,43 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-24 (concurrent per-unit operation): THE OPERATOR'S CONCURRENCY
+  REQUIREMENT IMPLEMENTED — "I instructed MID to charge at 2,000 watts and RHS
+  to discharge at 1,000 watts. Only one operation functions at a time. I
+  require both to function concurrently whenever a battery request is made."
+  The arbiter now selects a PER-UNIT WINNER SET (`arbitrate()` →
+  CycleArbitration; `select()` stays as the single-winner equivalence anchor):
+  each unit is claimed by the highest-priority live intent naming it, an
+  intent's effective scope is its selection minus higher-priority claims, and
+  a fully-claimed intent is simply not represented that cycle. One kernel tick
+  composes every per-unit winner into ONE cycle: the allocator runs once per
+  represented intent over its SURVIVING scope (`allocate_fleet_power` gained a
+  `unit_ids` scope argument), the matcher binds every proposal to its unit's
+  winning intent (identity AND direction) with per-intent watt bounds, one
+  cycle_id/decision_id, one audit row (new optional `directions_by_unit`;
+  multi-intent rows are cycle-level — intent_id null, correlation
+  `cycle:<cycle_id>`, principals joined, dominant source), and one
+  AuthorizationBatch whose capabilities carry their own unit's intent,
+  revision, and direction. Safety: the fleet-wide `mixed_directions` rejection
+  is REPLACED by per-unit coherence; fleet limits apply PER DIRECTION
+  (charge subtotal under fleet_charge_limit_w, discharge under
+  fleet_discharge_limit_w); every per-unit denial zeroes ONLY its unit (a
+  denied unit is a zero-watt non-participant for its direction — the
+  6abd869/d2163a5 doctrine extended to concurrency) while the other units
+  still run; no-participant cycles still fail closed to whole-cycle rejection.
+  Single-intent cycles are byte-identical to before (rows, fingerprints,
+  behavior). Excess-charge adviser yield is now per unit (a claim on its own
+  target withdraws it; a claim on a different battery no longer does; any live
+  stop always does). Bus payloads extended: authorization.granted carries
+  watts_by_unit + directions_by_unit; audit.appended carries directions_by_unit.
+  REST schema unchanged (multiple POST /intents coexist and now run
+  concurrently on disjoint scopes). API_CONTRACTS.md: arbiter section
+  rewritten + new "Concurrent per-unit operation" subsection. Scoped families
+  green (arbiter, safety, control_kernel, control_audit, composition,
+  write_enabled_run incl. a two-gateway concurrent replay, service_facade,
+  excess_charge, allocation, domain, rest + event contracts); ruff, format,
+  and mypy strict clean. Commits 00ad829..edf5881.
 
 - 2026-08-23 (excess-solar design): EXCESS-SOLAR ACCELERATED CHARGING DESIGNED,
   ACCEPTED PENDING IMPLEMENTATION. Contracts + red-phase tests + implementation

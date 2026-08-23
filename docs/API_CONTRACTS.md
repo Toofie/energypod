@@ -81,23 +81,46 @@ allocated`; every scalar-path invariant above (unit-set equality, zero-watt non-
 permutation-invariant ties, export-cap composition, the concentration boundary — now per-target)
 is preserved unchanged. A scalar `watts` intent keeps the pure capacity-weighted behavior exactly.
 
+An optional `unit_ids` argument names the intent's SURVIVING scope under per-unit arbitration (a
+non-empty subset of its selection): the allocation covers exactly those units — a scalar intent
+distributes its whole demand across the survivors, a per-unit intent carries each surviving
+unit's own target with the demand re-summed over the survivors — while `requested_watts` stays
+the intent's own full request so the eroded share surfaces as unallocated.
+
 `SafetyKernel.evaluate(proposed_setpoints, current_observations, previous_observations, policy,
 now_mono) -> ControlDecision` is deterministic and side-effect free. Unknown, stale, invalid,
 incomplete, contradictory, or implausibly jumping safety data rejects non-zero power. Zero/stop is
-always permitted. It applies dynamic device limits, static unit/fleet limits, ramp limits,
-SOC/cell/temperature/imbalance constraints and returns stable machine-readable reason codes. Cell
+always permitted. It applies dynamic device limits, static unit limits, ramp limits,
+SOC/cell/temperature/imbalance constraints and returns stable machine-readable reason codes.
+Fleet limits apply PER DIRECTION across that direction's subtotal in the proposal set (see
+"Concurrent per-unit operation" below). Cell
 sequence monotonicity is non-decreasing: an unchanged cell sequence between consecutive
 observations is permitted because cell blocks poll less frequently than the control rate, with
 freshness enforced by the maximum cell age; a regressed cell sequence rejects.
 
-`IntentArbiter.select(intents, now_mono)` removes expired intents and applies priority:
-emergency stop > manual > agent > optimizer > schedule > idle. Equal-priority conflicts resolve by
-highest server-assigned acceptance revision then stable id ordering. Emergency stop remains latched
-until an operator with stop-acknowledge scope acknowledges the exact stop id; acknowledgement removes
-the latched stop from the intent repository so it cannot immediately relatch.
+`IntentArbiter.arbitrate(intents, now_mono) -> CycleArbitration` removes expired intents and
+selects a PER-UNIT WINNER SET: for each unit, the highest-priority live intent claiming it wins
+that unit (priority order unchanged: emergency stop > manual > agent > optimizer > schedule;
+equal-priority conflicts on a unit resolve by highest server-assigned acceptance revision then
+stable id ordering — the existing fleet-wide tie rules applied per unit). An intent's effective
+scope is its selection minus the units higher-priority intents claimed; an intent whose entire
+scope was claimed away is simply not represented that cycle and returns the moment a claimer
+lapses. A live or latched emergency stop is the whole cycle — it claims exactly its own units, no
+other intent is represented, and it latches exactly as before. `select()` remains the pinned
+single-winner view: for a cycle held by exactly one intent the two agree. Emergency stop remains
+latched until an operator with stop-acknowledge scope acknowledges the exact stop id;
+acknowledgement removes the latched stop from the intent repository so it cannot immediately
+relatch.
 
-`ControlKernel.tick()` obtains the selected intent and current observations, evaluates safety,
-creates and durably appends a canonical correlated `AuditEvent`, and publishes short-lived
+`ControlKernel.tick()` composes EVERY per-unit winner into ONE cycle: the allocator runs once per
+represented intent over that intent's SURVIVING scope (`allocate_fleet_power`'s `unit_ids` — a
+scalar intent distributes its whole demand across the survivors; a per-unit intent carries each
+surviving unit's own target with the demand re-summed), the matcher binds every proposal to its
+unit's winning intent (identity AND direction) and bounds each intent's proposals by its own
+watts, one `cycle_id`/`decision_id` and one audit row carry the per-unit breakdown, and one
+`AuthorizationBatch` carries per-unit capabilities whose intent, revision, and direction are their
+own unit's winner's. The kernel then evaluates safety, creates and durably appends a canonical
+correlated `AuditEvent`, and publishes short-lived
 authorizations. The canonical audit-event factory is required at construction; a kernel cannot be
 composed without one, so authority is never granted on a degraded audit trail. The audited
 observation basis is every observation the kernel held for the cycle; selected units without
@@ -109,6 +132,46 @@ after the revocation with zero authorized watts, so fencing never produces an au
 evaluation or audit persistence fails, it revokes all authorization. Repeated cycles in one
 healthy generation are permitted, but a consumed `(unit_id, generation, cycle_id)` capability can
 never be replayed.
+
+### Concurrent per-unit operation
+
+The operator's requirement (2026-08-24): "I instructed MID to charge at 2,000 watts and RHS to
+discharge at 1,000 watts. Only one operation functions at a time. I require both to function
+concurrently whenever a battery request is made." Two or more accepted intents now run in the SAME
+control cycle whenever their unit scopes are disjoint; the REST surface needs no schema change —
+multiple `POST /intents` coexist and now run concurrently. The rules:
+
+- Overlapping scopes resolve PER UNIT by priority (and by revision/id within a priority): a manual
+  intent claiming `lhs`+`mid` against an agent intent claiming `mid`+`rhs` leaves the agent its
+  `rhs` while the manual intent holds `lhs`+`mid` — the older intent's other units still run.
+- Different units MAY run different directions in one cycle: charging one battery while
+  discharging another is physically legitimate (independent phases). The fleet-wide
+  `mixed_directions` rejection is replaced by per-unit coherence — each proposal's direction must
+  equal its unit's winning intent's direction (enforced by the kernel's matcher; one unit proposed
+  twice is still rejected as `duplicate_unit_setpoint`).
+- Fleet limits apply PER DIRECTION across the cycle's subtotals: `fleet_charge_limit_w` bounds the
+  charge subtotal and `fleet_discharge_limit_w` the discharge subtotal — never one blended budget.
+- Every per-unit check — SOC bound, ramp, dynamic capability, cell/temperature, quality — applies
+  per unit against ITS direction exactly as before. A denial zeroes ONLY that unit: a denied unit
+  is a zero-watt non-participant for its direction (the non-participation doctrine extended to
+  concurrency) while the other units, including opposite-direction units, still run. When NO unit
+  can participate, the decision still fails closed to a whole-cycle rejection.
+- One audit row per cycle carries the per-unit breakdown: `requested_watts_by_unit` (each unit's
+  winner's own target, when any represented intent carried per-unit targets),
+  `authorized_watts_by_unit`, and `directions_by_unit` (null on single-intent rows and on rows
+  written before 2026-08-24). A row composed from several intents cannot honestly name one
+  intent: it carries `intent_id: null`, correlates to its cycle (`cycle:<cycle_id>`), joins the
+  represented principals, and keeps the dominant source. `requested_active_w` /
+  `authorized_active_w` remain signed sums (charge negative, discharge positive) — the NET across
+  the mixed cycle.
+- The console can now hold N active request cards at once; each card's batteries follow its own
+  intent, and `authorization.granted` bus events carry `watts_by_unit` and `directions_by_unit`
+  per cycle so a card can label each battery's own authorized power and direction.
+- `PowerIntent` itself does not change shape: direction stays per-intent — one request = one
+  direction, as operators think. Concurrency comes from composition, never from per-unit
+  directions inside one intent. IDLE and emergency semantics are unchanged (an idle intent holds
+  only its own units to zero), and expiry stays per intent (an expired intent simply stops
+  claiming units).
 
 ## Unit actor
 
@@ -448,12 +511,14 @@ advisory-only and config-gated OFF by default.
 ### Operator precedence (pinned)
 
 `IntentArbiter` priority (emergency stop > manual > agent > optimizer > schedule > idle; equal
-priority by acceptance revision then stable id) already displaces the adviser whenever a manual or
-agent intent is live — live-verified 2026-08-23, when a console manual intent superseded an
-in-flight agent intent mid-window. The adviser also yields on its own: while any active intent
-with priority above `OPTIMIZER` exists fleet-wide, it withdraws its intent (repository removal,
-never a stop triple) and does not re-post until that intent has expired AND the entry hysteresis
-re-qualifies.
+priority by acceptance revision then stable id) already displaces the adviser on the units a
+higher-priority intent claims — live-verified 2026-08-23, when a console manual intent superseded
+an in-flight agent intent mid-window. The adviser also yields on its own, PER UNIT (2026-08-24
+concurrent operations): when a higher-priority intent claims the adviser's own target (its scope
+is exactly one unit) — or any emergency stop is live, since a stop dominates every unit — it
+withdraws its intent (repository removal, never a stop triple) and does not re-post until that
+claim has expired AND the entry hysteresis re-qualifies. A manual or agent intent claiming a
+DIFFERENT battery no longer stands the advisory charge down: the arbiter runs both in one cycle.
 
 ### Deterministic export bound
 
