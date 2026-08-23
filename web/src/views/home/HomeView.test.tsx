@@ -79,6 +79,7 @@ import type { ApiClient } from "../../api/client";
 import { ADVISER_REASON_CODES } from "../../app/fleet";
 import {
   adviserState,
+  excessAdviserStateChanged,
   excessChargingToggleOk,
   telemetrySummary,
   type WireAdviserState,
@@ -1871,6 +1872,91 @@ describe("HomeView — the solar-surplus tile", () => {
     const status = within(region).getByText(/Export reading unavailable/);
     expect(status).toHaveTextContent(/Export figure: not available\./);
     expect(status.textContent ?? "").not.toMatch(/0 W/);
+  });
+
+  it("updates the tile live from state_changed frames: an active-flip announces, a heartbeat re-prices figures silently", async () => {
+    // The trial's shape: composed and enabled, cap 500, evaluating entry.
+    const world = solarWorld(
+      adviserState({
+        enabled: true,
+        acknowledged_economics: true,
+        active: false,
+        hysteresis_state: "entering",
+        commanded_charge_w: 0,
+        fleet_export_w: 800,
+        charge_cap_w: 500,
+        held_intent_id: null,
+        reason_codes: ["no_export_headroom"],
+      }),
+    );
+    const channel = liveChannel([snapshotFrame(world)]);
+    installClient({ snapshot: world, openEvents: channel.openEvents });
+    renderHome();
+    const region = await screen.findByRole("region", { name: SOLAR_REGION });
+    expect(region).toHaveTextContent(/Exporting 800 W — below the headroom margin/);
+
+    // The adviser starts charging: the frame alone moves the tile — no
+    // snapshot refetch, no reload — and the flip reaches the live region.
+    channel.push(
+      excessAdviserStateChanged(43, {
+        active: true,
+        hysteresis_state: "holding",
+        target_unit_id: "pod-mid",
+        commanded_charge_w: 400,
+        fleet_export_w: 1800,
+        held_intent_id: "opt-3f9c21",
+        reason_codes: ["export_headroom_available"],
+      }) as unknown as StreamFrame,
+    );
+    await waitFor(() => {
+      expect(region).toHaveTextContent(/Charging pod-mid at 400 W from 1,800 W export\./);
+    });
+    // The event payload carries no charge_cap_w (§2): the composed cap the
+    // snapshot carried survives the patch.
+    expect(region).toHaveTextContent(/cap 500 W/);
+    expect(await screen.findByText("Solar-surplus charging started.")).toBeInTheDocument();
+
+    // A heartbeat republish: same state tuple, fresher figures — the tile
+    // re-prices with NO new announcement.
+    channel.push(
+      excessAdviserStateChanged(44, {
+        heartbeat: true,
+        active: true,
+        hysteresis_state: "holding",
+        target_unit_id: "pod-mid",
+        commanded_charge_w: 500,
+        fleet_export_w: 1900,
+        held_intent_id: "opt-3f9c21",
+        reason_codes: ["export_headroom_available"],
+      }) as unknown as StreamFrame,
+    );
+    await waitFor(() => {
+      expect(region).toHaveTextContent(/Charging pod-mid at 500 W from 1,900 W export\./);
+    });
+    expect(screen.queryAllByText(/Solar-surplus charging/)).toHaveLength(1);
+  });
+
+  it("announces the stand-down when the adviser hands back over the stream", async () => {
+    const world = solarWorld(adviserState({ charge_cap_w: 500 }));
+    const channel = liveChannel([snapshotFrame(world)]);
+    installClient({ snapshot: world, openEvents: channel.openEvents });
+    renderHome();
+    await screen.findByRole("region", { name: SOLAR_REGION });
+
+    channel.push(
+      excessAdviserStateChanged(43, {
+        active: false,
+        hysteresis_state: "exiting",
+        commanded_charge_w: 0,
+        held_intent_id: null,
+        fleet_export_w: 700,
+        reason_codes: ["below_exit_hysteresis"],
+      }) as unknown as StreamFrame,
+    );
+    await waitFor(() => {
+      expect(screen.getByText(/Surplus is falling — handing back/)).toBeInTheDocument();
+    });
+    expect(await screen.findByText("Solar-surplus charging stood down.")).toBeInTheDocument();
   });
 });
 

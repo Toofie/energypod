@@ -536,6 +536,35 @@ describe("BatteriesView (UI_CONTRACTS.md - Batteries)", () => {
     expect(lhs).not.toHaveTextContent(/\d+\s*W/);
   });
 
+  it("carries the advisory grid/load readthrough per unit — the same import/export wording as the Home tile, with honest gaps", async () => {
+    // The excess-solar package's W-D: `grid_power_w` / `load_power_w` are live
+    // on today's wire (service.py `_telemetry_summary`), signed negative =
+    // import, positive = export, and null whenever the poll served no PCS
+    // live block — that gap is named, never zero-filled.
+    const world: WireSnapshot = snapshot([
+      unitSnapshot({
+        unit_id: "MID",
+        lifecycle: "disarmed",
+        telemetry: telemetrySummary({ grid_power_w: 620, load_power_w: 340 }),
+      }),
+      unitSnapshot({
+        unit_id: "RHS",
+        lifecycle: "disarmed",
+        telemetry: telemetrySummary({ grid_power_w: -800, load_power_w: 210 }),
+      }),
+      // No observation at all: the row still renders, both figures absent.
+      unitSnapshot({ unit_id: "LHS", lifecycle: "disarmed", telemetry: null }),
+    ]);
+    renderView(healthyClient(world, fleetEvents(world)));
+
+    const mid = await screen.findByRole("group", { name: "MID" });
+    expect(mid).toHaveTextContent(/grid and load:\s*grid \+620 W export · load 340 W/i);
+    const rhs = screen.getByRole("group", { name: "RHS" });
+    expect(rhs).toHaveTextContent(/grid and load:\s*grid -800 W import · load 210 W/i);
+    const lhs = screen.getByRole("group", { name: "LHS" });
+    expect(lhs).toHaveTextContent(/grid and load:\s*grid not available · load not available/i);
+  });
+
   it("warns per-unit when the cell spread crosses the 50 mV early-warning line, and stays silent under it or without a reading", async () => {
     // The 2026-08-23 policy relaxation: imbalance no longer blocks dispatch on
     // its own, so the console keeps the OLD 50 mV gate visible as a warning —

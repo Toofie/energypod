@@ -44,7 +44,7 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { ApiClientError, isUnauthorizedError } from "../api/client";
 import type { ApiClientError as ApiClientErrorType, Health, StreamEvent } from "../api/client";
 import { formatWatts } from "../lib/format";
-import { isRecord, normalizeSnapshot, type FleetSnapshot, type Lifecycle } from "./fleet";
+import { isRecord, normalizeSnapshot, patchAdviserState, type AdviserState, type FleetSnapshot, type Lifecycle } from "./fleet";
 import type { RealStream, SharedDataPlane } from "./SharedDataPlane";
 import { useUnitIntentFigures } from "./useUnitIntentFigures";
 import type { DirectionsByUnit, WattsByUnit } from "./fleet";
@@ -146,6 +146,7 @@ type Action =
   | { type: "restart-notice" }
   | { type: "clear-restart-notice" }
   | { type: "stop-released"; stopId: string }
+  | { type: "adviser-state"; state: AdviserState }
   | { type: "polite"; text: string }
   | { type: "assertive"; text: string }
   | { type: "clear-assertive" };
@@ -306,6 +307,15 @@ function reducer(state: State, action: Action): State {
     }
     case "polite":
       return { ...state, polite: [...state.polite, action.text].slice(-5) };
+    case "adviser-state": {
+      // The adviser's own frame (§5 W-C): patch the shell's adviser-state
+      // slice in place — the payload is the freshest projection the console
+      // can have, and the live-cadence snapshot confirms it moments later.
+      if (state.snapshot === null) {
+        return state;
+      }
+      return { ...state, snapshot: { ...state.snapshot, adviserState: action.state } };
+    }
     case "assertive":
       return { ...state, assertive: [action.text] };
     case "clear-assertive":
@@ -390,7 +400,11 @@ const LATCHED_INHIBIT_REASONS: readonly string[] = ["blocking_fault_active", "id
  * the whole session (the snapshot frame arrives exactly once per connection).
  * Idle refusals (no_setpoints and friends) do not trigger a read.
  */
-function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void): boolean {
+function applyEventFrame(
+  frame: StreamEvent,
+  dispatch: (action: Action) => void,
+  adviser: AdviserState | null = null,
+): boolean {
   switch (frame.type) {
     case "snapshot": {
       dispatch({ type: "snapshot", snapshot: normalizeSnapshot(frame.data) });
@@ -550,6 +564,23 @@ function applyEventFrame(frame: StreamEvent, dispatch: (action: Action) => void)
       // the grant event this re-reads immediately so the figures move at the
       // moment of the grant instead of the next refresh.
       return true;
+    case "excess_adviser.state_changed": {
+      // Feature-detected (§5 W-C): the adviser's own frame patches the
+      // shell's adviser-state slice from the payload. The debounced authority
+      // refetch runs ONLY when `active`/`enabled` changed — the watt figures
+      // ride every publication (heartbeats included) and are their own
+      // refresh; refetching on figure wander would put one read per tick on
+      // the REST path for numbers the payload already carries.
+      const payload = payloadOf(frame);
+      const next = patchAdviserState(adviser, payload);
+      if (next === null) {
+        return false;
+      }
+      dispatch({ type: "adviser-state", state: next });
+      return (
+        adviser === null || adviser.enabled !== next.enabled || adviser.active !== next.active
+      );
+    }
     default:
       // observation.published, audit.appended refusals, ... are not
       // shell-level facts; subscribers that care read them through the feed.
@@ -1007,7 +1038,7 @@ export function useConsoleData(
             } else {
               plane.publishEvent(frame);
             }
-            if (applyEventFrame(frame, dispatch)) {
+            if (applyEventFrame(frame, dispatch, stateRef.current.snapshot?.adviserState ?? null)) {
               scheduleAuthorityRefresh();
             }
           }

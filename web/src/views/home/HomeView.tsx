@@ -75,6 +75,7 @@ import { ApiClientError } from "../../api/client";
 import type { ApiClient, Health, StreamEvent } from "../../api/client";
 import {
   isRecord,
+  patchAdviserState,
   toAdviserState,
   toWattsByUnit,
   type AdviserState,
@@ -669,6 +670,14 @@ export function HomeView({ client }: HomeViewProps) {
   const [phase, setPhase] = useState<Phase>("loading");
   const [failure, setFailure] = useState<unknown>(null);
   const [snapshot, setSnapshot] = useState<SnapshotView | null>(null);
+  /**
+   * The adviser projection by reference, mirroring `snapshot.adviserState`
+   * wherever it changes (snapshot adoption, the toggle's optimistic adoption,
+   * a state_changed frame). Frame handlers need the CURRENT projection
+   * synchronously — an active-flip announcement cannot wait for React to run
+   * a deferred state updater — so they read this and keep it current.
+   */
+  const adviserRef = useRef<AdviserState | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [announcement, setAnnouncement] = useState("");
@@ -742,6 +751,7 @@ export function HomeView({ client }: HomeViewProps) {
       adoptedSequenceRef.current = incoming;
       capturedAtRef.current = monotonicNowMs();
       setSnapshot(parsed);
+      adviserRef.current = parsed.adviserState;
       lastSequenceRef.current = incoming;
       return true;
     };
@@ -958,6 +968,28 @@ export function HomeView({ client }: HomeViewProps) {
           );
         }
         refetchSnapshot();
+      }
+      if (frame.type === "excess_adviser.state_changed") {
+        // The adviser's own frame (feature-detected): the payload patches the
+        // tile's projection — watt figures refresh on EVERY frame, heartbeats
+        // included, with no announcement; only an active-flip is worth the
+        // operator's ear. No refetch: the payload is the projection, and the
+        // plane's live cadence confirms it. The projection is read and kept
+        // current through adviserRef: the flip comparison must happen NOW,
+        // not when React runs a deferred updater.
+        const payload: unknown = frame.payload;
+        const previous = adviserRef.current;
+        const next = patchAdviserState(previous, payload);
+        if (next !== null && next !== previous) {
+          adviserRef.current = next;
+          setSnapshot((prior) => (prior === null ? prior : { ...prior, adviserState: next }));
+          if (previous !== null && !previous.active && next.active) {
+            setAnnouncement("Solar-surplus charging started.");
+          } else if (previous !== null && previous.active && !next.active) {
+            setAnnouncement("Solar-surplus charging stood down.");
+          }
+        }
+        return;
       }
     };
 
@@ -1328,6 +1360,7 @@ export function HomeView({ client }: HomeViewProps) {
         onAdopt={(adopted) => {
           // A toggle 200's own post-toggle projection, adopted optimistically;
           // the next snapshot or excess_adviser.state_changed frame confirms.
+          adviserRef.current = adopted;
           setSnapshot((previous) =>
             previous === null ? previous : { ...previous, adviserState: adopted },
           );

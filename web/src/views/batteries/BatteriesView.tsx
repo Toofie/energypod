@@ -63,7 +63,7 @@ import type {
   StreamEvent,
 } from "../../api/client";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
-import type { WattsByUnit } from "../../app/fleet";
+import { gridLoadText, type WattsByUnit } from "../../app/fleet";
 import {
   formatMillivolts,
   formatPercent,
@@ -121,6 +121,14 @@ interface TelemetryView {
   readonly cellSpreadMv: number | null;
   readonly temperatureMinC: number | null;
   readonly temperatureMaxC: number | null;
+  /**
+   * The advisory per-pod CT readthrough (service.py `_telemetry_summary`,
+   * live on today's wire): `gridPowerW` signed (negative = import, positive =
+   * export), `loadPowerW` the pod's local load. Null when the poll served no
+   * PCS live block — named as missing, never zero-filled.
+   */
+  readonly gridPowerW: number | null;
+  readonly loadPowerW: number | null;
   readonly activeFaults: readonly string[] | null;
   readonly activeWarnings: readonly string[] | null;
 }
@@ -398,6 +406,17 @@ function cardTemperatureText(unit: ViewUnit): string {
   return `${formatTemp(min)} to ${formatTemp(max)}`;
 }
 
+/**
+ * The grid-tie row (the excess-solar package's W-D): the pod's own advisory
+ * CT readthrough, with the SAME import/export wording as the Home tile's
+ * per-phase rows ("grid -800 W import · load 210 W"). An absent datum reads
+ * "not available" — the fields are live on the wire but null whenever the
+ * poll served no PCS live block, and that gap is named, never zero-filled.
+ */
+function cardGridLoadText(unit: ViewUnit): string {
+  return gridLoadText(unit.telemetry?.gridPowerW ?? null, unit.telemetry?.loadPowerW ?? null);
+}
+
 /** Warnings row: the block's own words; an empty list is a real "None". */
 function cardWarningsText(unit: ViewUnit): string {
   const warnings = unit.telemetry?.activeWarnings;
@@ -504,6 +523,8 @@ function parseTelemetryFields(value: Record<string, unknown>): TelemetryView {
     cellSpreadMv: parseNumber(value.cell_spread_mv),
     temperatureMinC: parseNumber(value.temperature_min_c),
     temperatureMaxC: parseNumber(value.temperature_max_c),
+    gridPowerW: parseNumber(value.grid_power_w),
+    loadPowerW: parseNumber(value.load_power_w),
     activeFaults: parseStringArray(value.active_faults),
     activeWarnings: parseStringArray(value.active_warnings),
   };
@@ -733,6 +754,9 @@ function FleetCard({
       </p>
       <p>
         <b>Cell spread:</b> {cardCellSpreadText(unit)}
+      </p>
+      <p>
+        <b>Grid and load:</b> {cardGridLoadText(unit)}
       </p>
       {imbalanceWarning !== null && (
         <p role="note" className="cell-imbalance-warning">
