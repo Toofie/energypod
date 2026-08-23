@@ -1269,6 +1269,9 @@ def test_unknown_night_keys_are_refused() -> None:
     assert any(
         item["type"] == "extra_forbidden" and item["loc"][0] == "night_charging"
         for item in caught.value.errors()
+    )
+
+
 # --- plant history (DESIGN_PLANT_HISTORY section 2.5, H3) ------------------------
 
 
