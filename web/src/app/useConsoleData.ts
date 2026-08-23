@@ -44,7 +44,20 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { ApiClientError, isUnauthorizedError } from "../api/client";
 import type { ApiClientError as ApiClientErrorType, Health, StreamEvent } from "../api/client";
 import { formatWatts } from "../lib/format";
-import { isRecord, normalizeSnapshot, patchAdviserState, type AdviserState, type FleetSnapshot, type Lifecycle } from "./fleet";
+import {
+  isRecord,
+  normalizeSnapshot,
+  patchAdviserState,
+  patchUnitHealth,
+  toActuationIncoherentEvent,
+  toHealthChangedEvent,
+  type ActuationIncoherentEvent,
+  type AdviserState,
+  type FleetSnapshot,
+  type Lifecycle,
+  type UnitHealth,
+} from "./fleet";
+import { echoDiscriminatorText, incoherenceAnnouncement } from "./unitHealth";
 import type { RealStream, SharedDataPlane } from "./SharedDataPlane";
 import { useUnitIntentFigures } from "./useUnitIntentFigures";
 import type { DirectionsByUnit, WattsByUnit } from "./fleet";
@@ -127,6 +140,15 @@ interface State {
   restartNotice: string | null;
   polite: string[];
   assertive: string[];
+  /**
+   * Per-unit incoherence-episode bookkeeping (the self-healing awareness
+   * layer): which units' OPEN episodes have already had their one polite
+   * alarm (and their one echo-discriminator line) announced. A unit leaving
+   * `actuation_incoherent` re-arms both — the NEXT episode announces again,
+   * a replayed frame of the SAME episode never does.
+   */
+  incoherentAnnounced: Record<string, boolean>;
+  echoAnnounced: Record<string, boolean>;
 }
 
 type Action =
@@ -147,6 +169,14 @@ type Action =
   | { type: "clear-restart-notice" }
   | { type: "stop-released"; stopId: string }
   | { type: "adviser-state"; state: AdviserState }
+  | { type: "unit-health"; unitId: string; health: UnitHealth }
+  | {
+      type: "actuation-incoherent";
+      unitId: string;
+      reasons: string[];
+      announcement: string | null;
+      echoText: string | null;
+    }
   | { type: "polite"; text: string }
   | { type: "assertive"; text: string }
   | { type: "clear-assertive" };
@@ -163,6 +193,8 @@ const INITIAL: State = {
   restartNotice: null,
   polite: [],
   assertive: [],
+  incoherentAnnounced: {},
+  echoAnnounced: {},
 };
 
 /**
@@ -209,6 +241,17 @@ function patchUnits(
         : unit,
     ),
   };
+}
+
+/** A copy of the map without one key (the episode bookkeeping's re-arm). */
+function withoutKey(map: Record<string, boolean>, key: string): Record<string, boolean> {
+  const next: Record<string, boolean> = {};
+  for (const [unitId, value] of Object.entries(map)) {
+    if (unitId !== key) {
+      next[unitId] = value;
+    }
+  }
+  return next;
 }
 
 function reducer(state: State, action: Action): State {
@@ -315,6 +358,56 @@ function reducer(state: State, action: Action): State {
         return state;
       }
       return { ...state, snapshot: { ...state.snapshot, adviserState: action.state } };
+    }
+    case "unit-health": {
+      // A live recovery transition (unit.health_changed): the unit's health
+      // moves NOW, state-locally — no refetch. The periodic snapshot remains
+      // the reconciler (it is the only source of the remediation hint).
+      const snapshot = patchUnitHealth(state.snapshot, action.unitId, action.health);
+      let next = snapshot === state.snapshot ? state : { ...state, snapshot };
+      // Leaving actuation_incoherent ends the episode: the next one must be
+      // allowed to announce again.
+      if (action.health.state !== "actuation_incoherent") {
+        const announced = next.incoherentAnnounced[action.unitId] === true;
+        const echoed = next.echoAnnounced[action.unitId] === true;
+        if (announced || echoed) {
+          next = {
+            ...next,
+            incoherentAnnounced: withoutKey(next.incoherentAnnounced, action.unitId),
+            echoAnnounced: withoutKey(next.echoAnnounced, action.unitId),
+          };
+        }
+      }
+      return next;
+    }
+    case "actuation-incoherent": {
+      // One polite alarm per EPISODE, plus the echo discriminator once the
+      // read-back classifies. The badge state itself moves through the same
+      // patch path a health_changed frame uses; the snapshot delivers the
+      // remediation hint on its next read.
+      const snapshot = patchUnitHealth(state.snapshot, action.unitId, {
+        state: "actuation_incoherent",
+        reasons: action.reasons,
+        remediationHint: null,
+      });
+      let polite = state.polite;
+      let incoherentAnnounced = state.incoherentAnnounced;
+      let echoAnnounced = state.echoAnnounced;
+      if (action.announcement !== null && state.incoherentAnnounced[action.unitId] !== true) {
+        polite = [...polite, action.announcement].slice(-5);
+        incoherentAnnounced = { ...incoherentAnnounced, [action.unitId]: true };
+      }
+      if (action.echoText !== null && state.echoAnnounced[action.unitId] !== true) {
+        polite = [...polite, action.echoText].slice(-5);
+        echoAnnounced = { ...echoAnnounced, [action.unitId]: true };
+      }
+      return {
+        ...state,
+        snapshot: snapshot === state.snapshot ? state.snapshot : snapshot,
+        polite,
+        incoherentAnnounced,
+        echoAnnounced,
+      };
     }
     case "assertive":
       return { ...state, assertive: [action.text] };
@@ -581,6 +674,61 @@ function applyEventFrame(
         adviser === null || adviser.enabled !== next.enabled || adviser.active !== next.active
       );
     }
+    case "unit.health_changed": {
+      // The awareness layer's live transition (recovery publishes exactly one
+      // per state change): the unit's health moves state-locally — the badge
+      // updates without waiting for a poll, and NO refetch runs (the periodic
+      // snapshot remains the reconciler, so a chattery classifier can never
+      // start a read storm).
+      const transition = toHealthChangedEvent(payloadOf(frame));
+      if (transition === null) {
+        return false;
+      }
+      dispatch({
+        type: "unit-health",
+        unitId: transition.unitId,
+        health: {
+          state: transition.to,
+          reasons: transition.reasons,
+          remediationHint: null,
+        },
+      });
+      return false;
+    }
+    case "actuation.incoherent": {
+      // The watchdog's one-per-episode alarm (plus the echo-classified
+      // follow-up frame of the same type): exactly ONE polite announcement
+      // per episode (the reducer's bookkeeping enforces it, robust against a
+      // replayed frame), the discriminator named plainly when the echo has
+      // classified, and the badge state moving now — again without a refetch.
+      const detection: ActuationIncoherentEvent | null = toActuationIncoherentEvent(
+        payloadOf(frame),
+      );
+      if (detection === null) {
+        return false;
+      }
+      dispatch({
+        type: "actuation-incoherent",
+        unitId: detection.unitId,
+        reasons:
+          detection.echoClassification === null
+            ? ["authorized_not_actuating"]
+            : ["authorized_not_actuating", detection.echoClassification],
+        announcement: incoherenceAnnouncement(detection.unitId, detection.authorizedWatts),
+        echoText:
+          detection.echoClassification === null
+            ? null
+            : echoDiscriminatorText(detection.unitId, detection.echoClassification),
+      });
+      return false;
+    }
+    case "unit.unexpected_autonomy":
+      // QUIET-TIER EVIDENCE (mid's standing uncommanded oscillation): never a
+      // shell announcement, never a badge, never a refetch. The Activity
+      // timeline renders the recorded evidence from its own stream
+      // subscription; this case exists so the quietness is a pinned decision,
+      // not an oversight.
+      return false;
     default:
       // observation.published, audit.appended refusals, ... are not
       // shell-level facts; subscribers that care read them through the feed.
