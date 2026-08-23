@@ -1617,6 +1617,93 @@ async def test_submit_intent_is_atomic_with_its_audit_and_publication(
     assert not live, "power can never flow from a dispatch the caller saw fail"
 
 
+# --- submit_intent with per-unit watt targets --------------------------------
+
+
+async def test_submit_intent_with_watts_by_unit_derives_the_fleet_total(api: Any) -> None:
+    """The 2026-08-23 operator ruling: each setting is that battery's request.
+
+    One dispatch names a different watt target per battery; the facade derives
+    the fleet total as the sum, stores both on the intent, and carries the
+    per-unit breakdown into the audit fact set and the published event.
+    """
+    rig = make_rig(api)
+    view = await rig.facade.submit_intent(
+        **submit_kwargs(
+            unit_ids=["pod-a", "pod-b"],
+            watts=None,
+            watts_by_unit={"pod-a": 900, "pod-b": 600},
+        )
+    )
+    assert view["requested"] == {
+        "direction": "discharge",
+        "watts": 1_500,
+        "watts_by_unit": {"pod-a": 900, "pod-b": 600},
+    }
+    (stored,) = rig.intents.added
+    assert stored.watts == 1_500
+    assert dict(stored.watts_by_unit) == {"pod-a": 900, "pod-b": 600}
+    assert stored.selected_unit_ids == frozenset({"pod-a", "pod-b"})
+    assert_audited_and_published(rig, OPERATOR.subject)
+    (published,) = rig.bus.published
+    assert published["payload"]["watts_by_unit"] == {"pod-a": 900, "pod-b": 600}
+    assert published["payload"]["watts"] == 1_500
+
+
+async def test_submit_intent_per_unit_breakdown_reaches_the_audit_fact_set(api: Any) -> None:
+    """The intent_accepted audit fingerprint is computed over the breakdown.
+
+    Two dispatches over the same unit with the same total watts -- one scalar,
+    one per-unit -- must never share a request fingerprint.
+    """
+    per_unit = make_rig(api)
+    await per_unit.facade.submit_intent(
+        **submit_kwargs(unit_ids=["pod-a"], watts=None, watts_by_unit={"pod-a": 900})
+    )
+    scalar = make_rig(api)
+    await scalar.facade.submit_intent(**submit_kwargs(unit_ids=["pod-a"], watts=900))
+    (per_unit_event,) = per_unit.audit.appended
+    (scalar_event,) = scalar.audit.appended
+    assert per_unit_event.event_type == scalar_event.event_type == "intent_accepted"
+    assert per_unit_event.request_fingerprint != scalar_event.request_fingerprint
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"watts": 900, "watts_by_unit": {"pod-a": 900}},
+        {"watts": None, "watts_by_unit": None},
+        {"unit_ids": ["pod-a", "pod-b"], "watts": None, "watts_by_unit": {"pod-a": 900}},
+        {"watts": None, "watts_by_unit": {"pod-a": 0}},
+        {"watts": None, "watts_by_unit": {"pod-a": -5}},
+        {"watts": None, "watts_by_unit": {"pod-a": 1.5}},
+        {"watts": None, "watts_by_unit": {"pod-a": True}},
+        {"watts": None, "watts_by_unit": "pod-a:900"},
+        {"watts": None, "watts_by_unit": {}},
+    ],
+    ids=[
+        "both_forms",
+        "neither_form",
+        "key_set_mismatch",
+        "zero_target",
+        "negative_target",
+        "float_target",
+        "boolean_target",
+        "non_mapping",
+        "empty_mapping",
+    ],
+)
+async def test_submit_intent_rejects_malformed_per_unit_payloads_without_storing(
+    api: Any, overrides: dict
+) -> None:
+    rig = make_rig(api)
+    with pytest.raises((TypeError, ValueError)):
+        await rig.facade.submit_intent(**submit_kwargs(**overrides))
+    assert rig.intents.added == []
+    assert rig.audit.appended == []
+    assert rig.bus.published == []
+
+
 # --- arm --------------------------------------------------------------------
 
 

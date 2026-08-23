@@ -236,6 +236,48 @@ def _positive_watts(watts: Any) -> int:
     return int(watts)
 
 
+def _per_unit_watts(watts_by_unit: Any, units: Sequence[str]) -> dict[str, int] | None:
+    """Validate an optional per-unit watt-target map against the selection.
+
+    The 2026-08-23 operator ruling makes per-unit the primary mental model:
+    each value is THAT battery's own request.  The keys must match the
+    selected units exactly and every value is a positive integer.  ``None``
+    means the dispatch used the scalar fleet-total form.  A target above a
+    unit's static cap is not an error here: the policy's headroom bounds the
+    allocation exactly as it bounds a scalar request today (clamped, with the
+    shortfall reported unallocated), never reversed and never fabricated.
+    """
+    if watts_by_unit is None:
+        return None
+    if isinstance(watts_by_unit, str | bytes) or not isinstance(watts_by_unit, Mapping):
+        raise TypeError("watts_by_unit must be a mapping of unit identifiers to watts")
+    values = dict(watts_by_unit)
+    if not values:
+        raise ValueError("watts_by_unit must name every selected unit")
+    if set(values) != set(units):
+        raise ValueError("watts_by_unit keys must match the selected units exactly")
+    for unit_id, watts in values.items():
+        if not isinstance(unit_id, str):
+            raise TypeError("watts_by_unit keys must be unit identifiers")
+        if isinstance(watts, bool) or type(watts) is not int:
+            raise TypeError("per-unit watts must be integers")
+        if watts <= 0:
+            raise ValueError("per-unit watts must be positive")
+    return values
+
+
+def _dispatch_watts(
+    watts: Any, watts_by_unit: Any, units: Sequence[str]
+) -> tuple[int, dict[str, int] | None]:
+    """Resolve the exactly-one watt form (scalar fleet total or per-unit map)."""
+    resolved_per_unit = _per_unit_watts(watts_by_unit, units)
+    if resolved_per_unit is None:
+        return _positive_watts(watts), None
+    if watts is not None:
+        raise ValueError("send watts or watts_by_unit, never both")
+    return sum(resolved_per_unit.values()), resolved_per_unit
+
+
 def _positive_duration(ttl_s: Any) -> float:
     if isinstance(ttl_s, bool) or not isinstance(ttl_s, int | float):
         raise TypeError("ttl_s must be a number")
@@ -591,12 +633,19 @@ class EnergyServiceFacade:
         principal: Principal,
         idempotency_key: Any,
         request_id: Any,
+        watts_by_unit: Any = None,
     ) -> dict[str, Any]:
         """Accept one intent with a server-assigned revision; grant nothing.
 
         Acceptance is atomic with its audit and publication: if either fails,
         the stored intent is rolled back and the error surfaces, so power can
         never flow from a dispatch the caller saw fail.
+
+        The watt form is exactly one of: scalar ``watts`` (the fleet total) or
+        ``watts_by_unit`` (one target per selected unit, from which the fleet
+        total is derived as the sum).  The per-unit breakdown travels onto the
+        stored intent, the audit fact set, the published event, and the
+        acceptance view.
         """
         self._admit(principal, "dispatch")
         units = _validated_units(unit_ids)
@@ -605,7 +654,7 @@ class EnergyServiceFacade:
             raise ValueError(f"unknown units requested: {unknown}")
         await self._refuse_undispatchable_modes(units)
         resolved_direction = _dispatch_direction(direction)
-        resolved_watts = _positive_watts(watts)
+        resolved_watts, resolved_per_unit = _dispatch_watts(watts, watts_by_unit, units)
         duration_s = _positive_duration(ttl_s)
         _reason_text(reason, required=False)
         _correlation_key(idempotency_key, "idempotency_key")
@@ -620,6 +669,7 @@ class EnergyServiceFacade:
             selected_unit_ids=frozenset(units),
             direction=resolved_direction,
             watts=resolved_watts,
+            watts_by_unit=resolved_per_unit,
             duration_s=duration_s,
             accepted_at_mono=now_mono,
             acceptance_revision=revision,
@@ -643,6 +693,11 @@ class EnergyServiceFacade:
                         "direction": resolved_direction.value,
                         "unit_ids": sorted(units),
                         "watts": resolved_watts,
+                        **(
+                            {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                            if resolved_per_unit is not None
+                            else {}
+                        ),
                     },
                 )
             )
@@ -653,6 +708,11 @@ class EnergyServiceFacade:
                     "intent_id": intent_id,
                     "direction": resolved_direction.value,
                     "watts": resolved_watts,
+                    **(
+                        {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                        if resolved_per_unit is not None
+                        else {}
+                    ),
                     "unit_ids": sorted(units),
                 },
             )
@@ -673,6 +733,11 @@ class EnergyServiceFacade:
             "requested": {
                 "direction": resolved_direction.value,
                 "watts": resolved_watts,
+                **(
+                    {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                    if resolved_per_unit is not None
+                    else {}
+                ),
             },
             "authorized": None,
             "measured": None,

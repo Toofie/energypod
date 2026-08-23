@@ -142,6 +142,55 @@ async def test_submit_intent_audit_and_publication_content(facade_api: Any) -> N
     )
 
 
+async def test_submit_intent_per_unit_audit_and_publication_content(
+    facade_api: Any,
+) -> None:
+    """The per-unit dispatch carries its breakdown through audit and events."""
+    rig = make_rig(facade_api)
+    await rig.facade.submit_intent(
+        **submit_kwargs(
+            unit_ids=["pod-a", "pod-b"],
+            watts=None,
+            watts_by_unit={"pod-a": 900, "pod-b": 600},
+        )
+    )
+    assert_audit(
+        rig,
+        {
+            "event_type": "intent_accepted",
+            "correlation_id": "facade:intent_accepted:request-1",
+            "intent_id": "intent-0-100.000000",
+            "source": facade_api.IntentSource.MANUAL,
+            "reason_codes": ("accepted",),
+            "result": "accepted",
+            "lifecycle": facade_api.UnitLifecycle.DISARMED,
+            "facts": {
+                "event_type": "intent_accepted",
+                "principal": OPERATOR.subject,
+                "result": "accepted",
+                "direction": "discharge",
+                "unit_ids": ["pod-a", "pod-b"],
+                "watts": 1_500,
+                "watts_by_unit": {"pod-a": 900, "pod-b": 600},
+            },
+        },
+    )
+    assert_published(
+        rig,
+        {
+            "type": "intent.accepted",
+            "payload": {
+                "principal": OPERATOR.subject,
+                "intent_id": "intent-0-100.000000",
+                "direction": "discharge",
+                "watts": 1_500,
+                "watts_by_unit": {"pod-a": 900, "pod-b": 600},
+                "unit_ids": ["pod-a", "pod-b"],
+            },
+        },
+    )
+
+
 async def test_arm_audit_and_publication_content(facade_api: Any) -> None:
     rig = make_rig(facade_api)
     await rig.facade.arm(
