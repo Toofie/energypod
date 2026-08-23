@@ -348,6 +348,14 @@ class SQLiteScheduleRepository:
                         "effective_until": entry.effective_until.isoformat(),
                         "priority": entry.priority,
                         "enabled": entry.enabled,
+                        # DESIGN_SCHEDULES §1: the per-unit watt form rides the
+                        # durable payload; null keeps every scalar entry's
+                        # stored bytes exactly as before.
+                        "watts_by_unit": (
+                            None
+                            if entry.watts_by_unit is None
+                            else dict(sorted(entry.watts_by_unit.items()))
+                        ),
                     }
                     for entry in schedule.entries
                 ],
@@ -381,7 +389,11 @@ class SQLiteScheduleRepository:
         for item in value["entries"]:
             if type(item) is not dict:
                 raise ValueError("schedule entry must be a JSON object")
-            _require_exact_keys(item, entry_keys, "schedule entry")
+            # Optional key: ``watts_by_unit`` (null or the per-unit mapping).
+            # Rows written before the per-unit form carry no key and every
+            # scalar entry decodes unchanged.
+            if not entry_keys <= item.keys() <= entry_keys | {"watts_by_unit"}:
+                raise ValueError(f"invalid schedule entry keys: {sorted(item.keys())}")
             if type(item["days"]) is not list or any(type(day) is not int for day in item["days"]):
                 raise ValueError("schedule days must be an integer JSON array")
             if len(item["days"]) != len(set(item["days"])):
@@ -392,6 +404,11 @@ class SQLiteScheduleRepository:
                 raise ValueError("schedule unit_ids must be a string JSON array")
             if len(item["unit_ids"]) != len(set(item["unit_ids"])):
                 raise ValueError("schedule unit_ids must not contain duplicates")
+            if item.get("watts_by_unit") is not None and (
+                type(item["watts_by_unit"]) is not dict
+                or any(type(watts) is not int for watts in item["watts_by_unit"].values())
+            ):
+                raise ValueError("schedule watts_by_unit must be a unit-to-watts JSON object")
         entries = tuple(
             ScheduleEntry(
                 entry_id=item["entry_id"],
@@ -405,6 +422,7 @@ class SQLiteScheduleRepository:
                 effective_until=date.fromisoformat(item["effective_until"]),
                 priority=item["priority"],
                 enabled=item["enabled"],
+                watts_by_unit=item.get("watts_by_unit"),
             )
             for item in value["entries"]
         )

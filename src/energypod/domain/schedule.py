@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, time, timedelta
 from enum import IntEnum
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from energypod.domain.intents import Direction
+from energypod.domain.models import _FrozenStringMapping
 
 
 class ScheduleValidationError(ValueError):
@@ -36,6 +38,17 @@ def _strict_text(value: object, label: str) -> str:
 
 @dataclass(frozen=True, slots=True)
 class ScheduleEntry:
+    """One named weekly window; the entry id IS the operator's name for it.
+
+    The watt form is exactly ``PowerIntent``'s dual form: scalar ``watts``
+    (the fleet total, distributed capacity-weighted at allocation — the
+    original form, unchanged) OR ``watts_by_unit`` (one positive integer per
+    selected unit, key set exactly ``unit_ids``, the fleet total being the
+    sum — the 2026-08-23 operator ruling).  ``watts`` always carries the
+    fleet total so every existing consumer is unchanged; ``idle`` entries
+    carry scalar ``watts: 0`` and never a mapping.
+    """
+
     entry_id: str
     days: frozenset[Weekday]
     start_local: time
@@ -47,6 +60,7 @@ class ScheduleEntry:
     effective_until: date
     priority: int
     enabled: bool
+    watts_by_unit: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
         _strict_text(self.entry_id, "entry_id")
@@ -80,6 +94,29 @@ class ScheduleEntry:
             raise ScheduleValidationError("priority must be an integer")
         if type(self.enabled) is not bool:
             raise ScheduleValidationError("enabled must be boolean")
+        if self.watts_by_unit is not None:
+            # The per-unit form (DESIGN_SCHEDULES §1): one positive integer
+            # per selected unit, key set exactly unit_ids, summing to the
+            # entry's fleet total, never on an idle entry.  Normalized to the
+            # deterministic frozen mapping so equality and hashing follow the
+            # value, not dict identity.
+            if self.action is Direction.IDLE:
+                raise ScheduleValidationError("idle entries carry no per-unit watts")
+            if not isinstance(self.watts_by_unit, Mapping):
+                raise ScheduleValidationError("watts_by_unit must be a mapping of unit to watts")
+            for unit_id, watts in self.watts_by_unit.items():
+                _strict_text(unit_id, "watts_by_unit key")
+                if type(watts) is not int or watts <= 0:
+                    raise ScheduleValidationError("per-unit watts must be positive integers")
+            if set(self.watts_by_unit) != set(self.unit_ids):
+                raise ScheduleValidationError(
+                    "watts_by_unit must name every selected unit and no others"
+                )
+            if sum(self.watts_by_unit.values()) != self.watts:
+                raise ScheduleValidationError("per-unit watts must sum to the fleet total")
+            object.__setattr__(
+                self, "watts_by_unit", _FrozenStringMapping(dict(self.watts_by_unit))
+            )
 
     @property
     def crosses_midnight(self) -> bool:

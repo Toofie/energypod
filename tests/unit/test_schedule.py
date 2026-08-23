@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, date, datetime, time
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -404,3 +405,271 @@ def test_duplicate_entry_ids_are_rejected_even_when_windows_do_not_overlap() -> 
             _entry(entry_id="duplicate", start=time(9, 0), end=time(10, 0)),
             _entry(entry_id="duplicate", start=time(11, 0), end=time(12, 0)),
         )
+
+
+# --- DESIGN_SCHEDULES §1 B1: the per-battery watt form (the PowerIntent rules) ---
+
+
+def _per_unit_entry(**overrides: Any) -> Any:
+    _require_contract()
+    values: dict[str, Any] = {
+        "entry_id": "per-battery",
+        "days": frozenset({Weekday.MONDAY}),
+        "start_local": time(9, 0),
+        "end_local": time(10, 0),
+        "action": Direction.CHARGE,
+        "watts": 5_000,
+        "unit_ids": frozenset({"lhs", "mid", "rhs"}),
+        "effective_from": date(2026, 1, 1),
+        "effective_until": date(2026, 12, 31),
+        "priority": 10,
+        "enabled": True,
+        "watts_by_unit": {"lhs": 1_500, "mid": 2_000, "rhs": 1_500},
+    }
+    values.update(overrides)
+    return ScheduleEntry(**values)
+
+
+def test_per_unit_watts_form_is_the_native_v1_form() -> None:
+    """One positive integer per selected unit; the fleet total is the sum."""
+    entry = _per_unit_entry()
+    assert entry.watts_by_unit is not None
+    assert dict(entry.watts_by_unit) == {"lhs": 1_500, "mid": 2_000, "rhs": 1_500}
+    assert entry.watts == 5_000
+
+
+def test_per_unit_keys_must_be_exactly_the_selected_units() -> None:
+    assert ScheduleValidationError is not None
+    with pytest.raises(ScheduleValidationError):
+        _per_unit_entry(watts_by_unit={"lhs": 1_500, "mid": 2_000})
+    with pytest.raises(ScheduleValidationError):
+        _per_unit_entry(watts_by_unit={"lhs": 1_000, "mid": 2_000, "rhs": 1_500, "spare": 500})
+
+
+def test_per_unit_values_must_be_positive_integers() -> None:
+    assert ScheduleValidationError is not None
+    with pytest.raises(ScheduleValidationError):
+        _per_unit_entry(watts_by_unit={"lhs": 0, "mid": 2_000, "rhs": 1_500}, watts=3_500)
+    with pytest.raises(ScheduleValidationError):
+        _per_unit_entry(watts_by_unit={"lhs": -100, "mid": 2_000, "rhs": 1_500}, watts=3_400)
+    with pytest.raises(ScheduleValidationError):
+        _per_unit_entry(watts_by_unit={"lhs": True, "mid": 2_000, "rhs": 1_500}, watts=3_501)
+
+
+def test_per_unit_watts_must_sum_to_the_fleet_total() -> None:
+    """Exactly the PowerIntent rule: the scalar stays the fleet total."""
+    assert ScheduleValidationError is not None
+    with pytest.raises(ScheduleValidationError):
+        _per_unit_entry(watts=4_999)
+    with pytest.raises(ScheduleValidationError):
+        _per_unit_entry(watts=5_001)
+
+
+def test_idle_entries_carry_scalar_zero_and_never_a_mapping() -> None:
+    assert ScheduleValidationError is not None
+    idle = _per_unit_entry(action=Direction.IDLE, watts=0, watts_by_unit=None)
+    assert idle.watts == 0 and idle.watts_by_unit is None
+    with pytest.raises(ScheduleValidationError):
+        _per_unit_entry(action=Direction.IDLE, watts_by_unit={"lhs": 0, "mid": 0, "rhs": 0})
+
+
+def test_per_unit_form_survives_the_evaluator_verbatim() -> None:
+    """The entry's form carries onto the evaluated intent, per unit."""
+    zone = ZoneInfo("Australia/Brisbane")
+    evaluator = ScheduleEvaluator(intent_ttl_s=0.5)
+    intent = evaluator.evaluate(
+        schedule=_plan(_per_unit_entry(), version=4),
+        at=datetime(2026, 1, 5, 9, 30, tzinfo=zone),
+        now_monotonic=10.0,
+    )
+    assert intent is not None
+    assert intent.watts_by_unit is not None
+    assert dict(intent.watts_by_unit) == {"lhs": 1_500, "mid": 2_000, "rhs": 1_500}
+    assert intent.watts == 5_000
+    assert intent.entry_id == "per-battery"
+
+
+def test_scalar_entries_keep_their_exact_prior_behavior() -> None:
+    """The extension is additive: every scalar entry decodes unchanged."""
+    zone = ZoneInfo("Australia/Brisbane")
+    evaluator = ScheduleEvaluator(intent_ttl_s=0.5)
+    intent = evaluator.evaluate(
+        schedule=_plan(_entry(), version=2),
+        at=datetime(2026, 1, 5, 9, 30, tzinfo=zone),
+        now_monotonic=10.0,
+    )
+    assert intent is not None
+    assert intent.watts_by_unit is None
+    assert intent.watts == 1_800
+
+
+def test_per_unit_entries_round_trip_through_the_durable_payload() -> None:
+    """The SQLite contract: both forms encode and decode losslessly."""
+    from energypod.adapters.persistence.sqlite import SQLiteScheduleRepository
+
+    store = SQLiteScheduleRepository.__new__(SQLiteScheduleRepository)
+    plan = _plan(
+        _per_unit_entry(),
+        _entry(entry_id="scalar", start=time(11, 0), end=time(12, 0)),
+        version=3,
+    )
+    decoded = store._decode(store._encode(plan))
+    assert decoded == plan
+    per_unit, scalar = decoded.entries
+    assert dict(per_unit.watts_by_unit or {}) == {"lhs": 1_500, "mid": 2_000, "rhs": 1_500}
+    assert scalar.watts_by_unit is None
+
+
+def test_scalar_rows_written_before_the_extension_still_decode() -> None:
+    """A durable payload without the watts_by_unit key decodes unchanged."""
+    from energypod.adapters.persistence.sqlite import SQLiteScheduleRepository
+
+    legacy_payload = json.dumps(
+        {
+            "version": 2,
+            "timezone": "Australia/Brisbane",
+            "entries": [
+                {
+                    "entry_id": "old",
+                    "days": [0],
+                    "start_local": "09:00:00",
+                    "end_local": "10:00:00",
+                    "action": "charge",
+                    "watts": 1800,
+                    "unit_ids": ["mid"],
+                    "effective_from": "2026-01-01",
+                    "effective_until": "2026-12-31",
+                    "priority": 10,
+                    "enabled": True,
+                }
+            ],
+        }
+    )
+    store = SQLiteScheduleRepository.__new__(SQLiteScheduleRepository)
+    decoded = store._decode(legacy_payload)
+    assert decoded.entries[0].watts_by_unit is None
+    assert decoded.entries[0].watts == 1800
+
+
+# --- DESIGN_SCHEDULES §5.4 B1: the pure next-occurrence helpers -----------------
+
+
+def _helpers() -> Any:
+    _require_contract()
+    from energypod.application import scheduling
+
+    return scheduling
+
+
+def test_next_start_finds_the_earliest_future_occurrence() -> None:
+    helpers = _helpers()
+    zone = ZoneInfo("Australia/Brisbane")
+    plan = _plan(_entry(days=frozenset({Weekday.MONDAY, Weekday.THURSDAY})))
+
+    found = helpers.next_start(plan, datetime(2026, 1, 5, 8, 0, tzinfo=zone))
+
+    assert found is not None
+    entry, starts_at = found
+    assert entry.entry_id == "weekday-charge"
+    assert starts_at == datetime(2026, 1, 5, 9, 0, tzinfo=zone)
+
+
+def test_next_start_skips_a_window_already_open_and_finds_next_week() -> None:
+    helpers = _helpers()
+    zone = ZoneInfo("Australia/Brisbane")
+    plan = _plan(_entry(days=frozenset({Weekday.MONDAY})))
+
+    found = helpers.next_start(plan, datetime(2026, 1, 5, 9, 30, tzinfo=zone))
+
+    assert found is not None
+    assert found[1] == datetime(2026, 1, 12, 9, 0, tzinfo=zone)
+
+
+def test_next_start_honours_effective_bounds_on_the_start_date() -> None:
+    helpers = _helpers()
+    zone = ZoneInfo("Australia/Brisbane")
+    entry = _entry(
+        days=frozenset({Weekday.MONDAY}),
+        effective_from=date(2026, 1, 5),
+        effective_until=date(2026, 1, 5),
+    )
+    plan = _plan(entry)
+
+    # A start date still inside the effective bounds is a future occurrence
+    # even when `at` precedes the bounds entirely.
+    before = helpers.next_start(plan, datetime(2025, 12, 29, 8, 0, tzinfo=zone))
+    inside = helpers.next_start(plan, datetime(2026, 1, 5, 8, 0, tzinfo=zone))
+    after = helpers.next_start(plan, datetime(2026, 1, 5, 10, 0, tzinfo=zone))
+    past = helpers.next_start(plan, datetime(2026, 1, 12, 8, 0, tzinfo=zone))
+
+    assert before is not None and before[1] == datetime(2026, 1, 5, 9, 0, tzinfo=zone)
+    assert inside is not None and inside[1] == datetime(2026, 1, 5, 9, 0, tzinfo=zone)
+    assert after is None
+    assert past is None
+
+
+def test_next_start_ignores_disabled_entries_and_reports_none_when_nothing_comes() -> None:
+    helpers = _helpers()
+    zone = ZoneInfo("Australia/Brisbane")
+    assert (
+        helpers.next_start(_plan(_entry(enabled=False)), datetime(2026, 1, 5, 8, 0, tzinfo=zone))
+        is None
+    )
+
+
+def test_next_start_resolves_same_instant_ties_by_priority_then_id() -> None:
+    helpers = _helpers()
+    zone = ZoneInfo("Australia/Brisbane")
+    low = _entry(entry_id="a-low", priority=10)
+    high = _entry(entry_id="b-high", priority=20)
+    # Same window, different priorities: overlaps are legal across priorities.
+    plan = _plan(low, high)
+
+    found = helpers.next_start(plan, datetime(2026, 1, 5, 8, 0, tzinfo=zone))
+
+    assert found is not None
+    assert found[0].entry_id == "b-high"
+
+
+def test_next_start_is_dst_honest_through_the_plan_zone() -> None:
+    """A 02:30 window on the US spring-forward Sunday still reports its day."""
+    helpers = _helpers()
+    zone = ZoneInfo("America/New_York")
+    plan = _plan(
+        _entry(
+            days=frozenset({Weekday.SUNDAY}),
+            start=time(2, 30),
+            end=time(3, 30),
+            effective_from=date(2026, 3, 8),
+            effective_until=date(2026, 3, 8),
+        ),
+        timezone_name="America/New_York",
+    )
+
+    found = helpers.next_start(plan, datetime(2026, 3, 7, 12, 0, tzinfo=zone))
+
+    assert found is not None
+    assert found[1].date() == date(2026, 3, 8)
+    assert found[1].timetz().replace(tzinfo=None) == time(2, 30)
+
+
+def test_window_end_returns_the_local_end_of_the_matching_window() -> None:
+    helpers = _helpers()
+    zone = ZoneInfo("Australia/Brisbane")
+    entry = _entry()
+
+    ends_at = helpers.window_end(entry, datetime(2026, 1, 5, 9, 30, tzinfo=zone))
+
+    assert ends_at == datetime(2026, 1, 5, 10, 0, tzinfo=zone)
+
+
+def test_window_end_of_a_cross_midnight_tail_ends_today() -> None:
+    helpers = _helpers()
+    zone = ZoneInfo("Australia/Brisbane")
+    overnight = _entry(days=frozenset({Weekday.MONDAY}), start=time(23, 0), end=time(2, 0))
+
+    head = helpers.window_end(overnight, datetime(2026, 1, 5, 23, 30, tzinfo=zone))
+    tail = helpers.window_end(overnight, datetime(2026, 1, 6, 1, 0, tzinfo=zone))
+
+    assert head == datetime(2026, 1, 6, 2, 0, tzinfo=zone)
+    assert tail == datetime(2026, 1, 6, 2, 0, tzinfo=zone)
