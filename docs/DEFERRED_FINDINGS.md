@@ -97,6 +97,10 @@ From the 32-agent Milestone A implementation review (all P0/P1 were fixed in
    exactly the wire shape.
 5. EventBus: `resync_required` control type shares the publisher vocabulary; a
    publisher event of that type closes every client stream.
+   Status: FIXED 2026-08-23 — the WebSocket consumer only treats frames
+   typed `resync_required` WITHOUT a `sequence` as its own terminal
+   control frame; a published event of that type (always carrying the
+   bus-assigned sequence) is delivered and the stream stays open.
 6. Simulator: blanket GOOD quality lets a malformed-injected limit word report
    62,535 W headroom unflagged.
 7. Simulator: system-block battery current served/decoded signed against the

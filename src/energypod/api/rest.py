@@ -902,7 +902,12 @@ async def _stream_events(
             if item is None:
                 return
             await websocket.send_json(item)
-            if item.get("type") == "resync_required":
+            # Only the adapter's own terminate frames close the stream, and
+            # those never carry a sequence.  A published event may legitimately
+            # use the ``resync_required`` type string — the vocabulary belongs
+            # to publishers — and it always carries the bus-assigned sequence,
+            # so it must be delivered and the stream kept open.
+            if item.get("type") == "resync_required" and "sequence" not in item:
                 return
     except WebSocketDisconnect:
         return
