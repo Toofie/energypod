@@ -396,6 +396,7 @@ class PlantHistorySurface(Protocol):
         unit_ids: Sequence[str] | None = None,
         fields: Sequence[str] | None = None,
         points: int = 600,
+        now_utc: datetime | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -1328,6 +1329,7 @@ class EnergyServiceFacade:
             unit_ids=unit_ids,
             fields=fields,
             points=points,
+            now_utc=self._clock.wall_now().astimezone(UTC),
         )
 
     async def get_observed_objectives(

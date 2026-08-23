@@ -79,12 +79,14 @@ def _row(
     )
 
 
-def _control(repository: InMemoryTelemetryHistoryRepository | None = None) -> Any:
+def _control(
+    repository: InMemoryTelemetryHistoryRepository | None = None, *, retention_days: int = 14
+) -> Any:
     _require_contract()
     return PlantHistoryControl(
         unit_ids=(UNIT_A, UNIT_B),
         sample_interval_s=INTERVAL_S,
-        retention_full_resolution_days=14,
+        retention_full_resolution_days=retention_days,
         repository=repository if repository is not None else InMemoryTelemetryHistoryRepository(),
     )
 
@@ -229,29 +231,31 @@ def test_null_values_are_skipped_never_zeroed() -> None:
 
 
 def test_the_resolution_boundary_sits_at_the_data_horizon() -> None:
-    """DESIGN section 3.1: ``from`` at or after the oldest retained
-    full-resolution sample answers ``full``; anything earlier answers
-    ``hourly`` for the whole window -- one resolution per response."""
+    """DESIGN section 3.1: ``from`` at or after the retention horizon
+    answers ``full`` from whatever rows exist; a window opening earlier
+    answers ``hourly`` for its entirety -- one resolution per response.
+    The retention is ONE DAY on both sides (the engine's day-granularity
+    config and the repository's seconds-granularity pruning agree)."""
     _require_contract()
-    repository = InMemoryTelemetryHistoryRepository(retention_full_resolution_s=3_600.0)
-    # Six rows in the 04:00 hour (rolled + pruned by the pass below) and two
-    # retained rows at 06:00 -- the data horizon sits at 06:00:00.
+    repository = InMemoryTelemetryHistoryRepository(retention_full_resolution_s=86_400.0)
+    # Six rows two days back (rolled + pruned by the pass below) and two
+    # retained rows at BASE -- the horizon sits at BASE.
     for index in range(6):
         repository.append_samples(
             (
                 _row(
                     UNIT_A,
-                    BASE - timedelta(hours=2) + timedelta(seconds=INTERVAL_S * index),
+                    BASE - timedelta(days=2) + timedelta(seconds=INTERVAL_S * index),
                     battery_watts=-1000.0 - index,
                 ),
             )
         )
     for index in range(2):
         repository.append_samples((_row(UNIT_A, BASE + timedelta(seconds=INTERVAL_S * index)),))
-    repository.maintain(BASE + timedelta(hours=1, minutes=30))
+    repository.maintain(BASE + timedelta(days=1, minutes=30))
     assert repository.oldest_full_res_at() == BASE
 
-    control = _control(repository)
+    control = _control(repository, retention_days=1)
     full = control.query_payload(
         range_from=_iso(BASE),
         range_to=_iso(BASE + timedelta(minutes=10)),
@@ -261,7 +265,7 @@ def test_the_resolution_boundary_sits_at_the_data_horizon() -> None:
     assert full["units"][UNIT_A]["sample_count"] == 2
 
     hourly = control.query_payload(
-        range_from=_iso(BASE - timedelta(hours=3)),
+        range_from=_iso(BASE - timedelta(days=3)),
         range_to=_iso(BASE + timedelta(minutes=10)),
         fields=("battery_watts",),
     )
@@ -269,20 +273,59 @@ def test_the_resolution_boundary_sits_at_the_data_horizon() -> None:
         "a window opening before the horizon serves hourly for its entirety"
     )
     hours = hourly["units"][UNIT_A]["series"]["battery_watts"]["points"]
-    assert [point["t"] for point in hours] == [_iso(BASE - timedelta(hours=2))]
+    assert [point["t"] for point in hours] == [_iso(BASE - timedelta(days=2))]
     assert hours[0]["n"] == 6
     assert hours[0]["min"] == -1005.0
     assert hours[0]["max"] == -1000.0
     assert hours[0]["v"] == pytest.approx(-1002.5)
-    # An empty window before any data is a 200 with nulls, never an error.
-    empty = _control().query_payload(
-        range_from=_iso(BASE - timedelta(days=2)),
-        range_to=_iso(BASE - timedelta(days=1)),
+    # An empty window beyond the retention horizon is a 200 with nulls,
+    # never an error (served hourly: nothing full-resolution is retained
+    # that far back, by definition of the horizon -- and older than even
+    # the rolled hours, so the hourly answer is empty too).
+    empty = control.query_payload(
+        range_from=_iso(BASE - timedelta(days=5)),
+        range_to=_iso(BASE - timedelta(days=3)),
         fields=("battery_watts",),
     )
-    assert empty["resolution"] == "full"
+    assert empty["resolution"] == "hourly"
     assert empty["units"][UNIT_A]["first_sample_at"] is None
     assert empty["units"][UNIT_A]["series"]["battery_watts"]["points"] == []
+
+
+def test_a_window_opening_before_the_first_sample_still_serves_full() -> None:
+    """The commissioning-day regression: the boundary is RETENTION, never
+    the oldest retained row.  A store that began recording mid-window (the
+    day's own midnight opens before the first sample) serves the samples
+    it actually holds at full resolution -- an empty page while rows sit
+    unqueried is exactly the first-day console bug."""
+    _require_contract()
+    repository = InMemoryTelemetryHistoryRepository(retention_full_resolution_s=14 * 86_400.0)
+    # Recording began at 01:46; three rows through 02:46.
+    first = BASE + timedelta(hours=1, minutes=46)
+    for index in range(3):
+        repository.append_samples(
+            (_row(UNIT_A, first + timedelta(seconds=INTERVAL_S * index), battery_watts=-500.0),)
+        )
+
+    control = _control(repository)
+    # "Today": the window opens at midnight -- 1 h 46 m BEFORE the first
+    # sample -- with now well inside the 14-day retention.
+    body = control.query_payload(
+        range_from=_iso(BASE),
+        range_to=_iso(BASE + timedelta(hours=3)),
+        fields=("battery_watts",),
+        now_utc=BASE + timedelta(hours=3),
+    )
+    assert body["resolution"] == "full", (
+        "a window inside the retention horizon serves full resolution even "
+        "when recording began mid-window: leading absence is absence, not a "
+        "tier change"
+    )
+    points = body["units"][UNIT_A]["series"]["battery_watts"]["points"]
+    assert [point["t"] for point in points] == [
+        _iso(first + timedelta(seconds=INTERVAL_S * index)) for index in range(3)
+    ]
+    assert body["units"][UNIT_A]["sample_count"] == 3
 
 
 def test_gaps_are_server_computed_at_both_resolutions() -> None:
@@ -320,6 +363,7 @@ def test_gaps_are_server_computed_at_both_resolutions() -> None:
         range_from=_iso(BASE),
         range_to=_iso(BASE + timedelta(hours=7)),
         fields=("battery_watts",),
+        now_utc=BASE + timedelta(days=30),
     )
     assert rolled["resolution"] == "hourly"
     assert rolled["units"][UNIT_A]["gaps"] == [

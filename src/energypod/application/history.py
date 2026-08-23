@@ -468,12 +468,22 @@ class PlantHistoryControl:
         unit_ids: Sequence[str] | None = None,
         fields: Sequence[str] | None = None,
         points: int = 600,
+        now_utc: datetime | None = None,
     ) -> dict[str, Any]:
         """One windowed, server-downsampled history response (DESIGN section 3).
 
         Every parameter rule raises ``ValueError`` (the boundary's 422
         envelope); a window the data cannot answer is an EMPTY 200, never an
-        error.  One resolution per response, chosen by the data horizon.
+        error.  One resolution per response, chosen by the RETENTION
+        horizon: a window opening at or after ``now - retention`` answers
+        from full-resolution rows (whatever exists there -- recording that
+        began mid-window is leading absence, never a tier change); a window
+        opening earlier answers hourly for its entirety.  The boundary is
+        retention, NEVER the oldest retained row: on commissioning day the
+        oldest row is minutes old, and sentencing every window that opens
+        before it (the day's own midnight) to the hourly tier would serve a
+        first-day console an empty page while full-resolution rows sat
+        unqueried.
         """
         start, end, effective_units, requested, threshold = parse_plant_history_query(
             range_from=range_from,
@@ -484,17 +494,12 @@ class PlantHistoryControl:
             configured_units=self._unit_ids,
             max_window_days=31,
         )
-        oldest = self._repository.oldest_full_res_at()
-        if oldest is not None:
-            resolution = "full" if start >= oldest else "hourly"
-        else:
-            # No full-resolution row is retained anywhere: the window is
-            # hourly whenever rollups can answer it, and full (vacuously
-            # empty) only when the store holds nothing at all -- the
-            # boundary stays data-driven, never config-coupled.
-            resolution = (
-                "hourly" if self._repository.rollup_hours(effective_units, start, end) else "full"
-            )
+        if now_utc is None:
+            # A caller with no clock uses the window's own edge as "now";
+            # for every to-now window this matches the live facade exactly.
+            now_utc = end
+        horizon = now_utc.astimezone(UTC) - timedelta(days=self._retention_full_resolution_days)
+        resolution = "full" if start >= horizon else "hourly"
         if resolution == "full":
             units_payload, fleet_payload = self._full_resolution(
                 effective_units, requested, threshold, start, end
