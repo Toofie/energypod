@@ -36,7 +36,7 @@ import contextlib
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, TypeGuard
+from typing import Any, Final, Literal, Protocol, TypeGuard
 
 from energypod.domain import DataQuality, Direction, IntentSource, UnitLifecycle
 
@@ -64,6 +64,30 @@ _CONTROLLABLE_LIFECYCLES: frozenset[UnitLifecycle] = frozenset(
 # intent, or a zero-watt submission.
 Action = Literal["idle", "propose", "renew", "withdraw"]
 
+# DESIGN_EXCESS_ACTIVATION §1: the projection's vocabulary additions — the
+# participation states the tick alone cannot see.  The implemented decision
+# codes (below, verbatim in the tick) plus these three are the ONE pinned
+# reason vocabulary; two vocabularies for the same facts is the drift class
+# the EE-calibration incident taught.
+REASON_DISABLED_BY_CONFIG: Final[str] = "disabled_by_config"
+REASON_DISABLED_BY_RUNTIME: Final[str] = "disabled_by_runtime"
+REASON_ECONOMICS_ACKNOWLEDGEMENT_REQUIRED: Final[str] = "economics_acknowledgement_required"
+
+# The fleet grid rollup's fail-closed words — the kernel's own export-evidence
+# spellings — with the pinned "worst word wins" precedence (a unit that served
+# no word at all is strictly less knowable than one that served a flagged or
+# aged one).
+ExportEvidence = Literal["good", "missing", "bad", "stale"]
+_EXPORT_EVIDENCE_RANK: Final[dict[str, int]] = {
+    "good": 0,
+    "stale": 1,
+    "bad": 2,
+    "missing": 3,
+}
+
+HysteresisState = Literal["inactive", "entering", "holding", "exiting"]
+EnabledOrigin = Literal["config", "runtime"]
+
 
 @dataclass(frozen=True, slots=True)
 class ExcessChargeSettings:
@@ -77,13 +101,23 @@ class ExcessChargeSettings:
 
 @dataclass(frozen=True, slots=True)
 class ExcessChargeDecision:
-    """One advisory tick's outcome, for audit and supervision observability."""
+    """One advisory tick's outcome, for audit and supervision observability.
+
+    ``export_evidence`` and ``fleet_export_w`` (DESIGN_EXCESS_ACTIVATION §1)
+    carry the fleet grid rollup the tick already computed, so the projection
+    can never disagree with the bound the tick acted on and no second
+    observation read is needed: ``fleet_export_w`` is the floor of the summed
+    export while every fleet unit's grid word is GOOD, and null on any
+    missing/bad/stale word — never zero-filled.
+    """
 
     action: Action
     target_unit_id: str | None
     eligible_charge_w: int
     proposed_watts: int
     reason_codes: tuple[str, ...]
+    export_evidence: ExportEvidence = "missing"
+    fleet_export_w: int | None = None
 
 
 class _Clock(Protocol):
@@ -104,9 +138,45 @@ class _SubmitPort(Protocol):
     async def __call__(self, *, unit_ids: Any, direction: Any, watts: Any, ttl_s: Any) -> Any: ...
 
 
+class _ParticipationPort(Protocol):
+    """The tick-start participation read (DESIGN_EXCESS_ACTIVATION §3 P6).
+
+    Returns ``None`` while the adviser participates this tick, or the pinned
+    projection reason code (``disabled_by_config`` / ``disabled_by_runtime``
+    / ``economics_acknowledgement_required``) while it does not.  The toggle
+    flips only the flag behind this port; the next tick observes it.
+    """
+
+    def __call__(self) -> str | None: ...
+
+
 def _finite_number(value: Any) -> TypeGuard[float]:
     """A real, finite measurement — never a bool masquerading as one."""
     return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _grid_evidence_word(observation: Any, *, max_age_s: float, now_mono: float) -> ExportEvidence:
+    """One unit's grid word classified under the bound's own fail-closed rules.
+
+    The kernel spellings: ``missing`` when the observation or the word itself
+    is absent/non-finite, ``bad`` when a present quality key is not GOOD (a
+    quality map that does not carry the key — e.g. a raw fleet projection —
+    is judged on the value alone), ``stale`` when the capture is older than
+    the armed freshness bound, ``good`` otherwise.
+    """
+    grid_w = getattr(observation, "grid_power_w", None)
+    if observation is None or not _finite_number(grid_w):
+        return "missing"
+    quality = getattr(observation, "quality", None)
+    flag = quality.get("grid_power_w") if isinstance(quality, Mapping) else None
+    if flag is not None and flag is not DataQuality.GOOD:
+        return "bad"
+    captured_at_mono = getattr(observation, "captured_at_mono", None)
+    if not _finite_number(captured_at_mono):
+        return "missing"
+    if float(now_mono) - captured_at_mono > float(max_age_s):
+        return "stale"
+    return "good"
 
 
 def eligible_export_charge_w(observations: Mapping[str, Any], policy: Any, now_mono: float) -> int:
@@ -135,22 +205,41 @@ def eligible_export_charge_w(observations: Mapping[str, Any], policy: Any, now_m
     total_w = 0.0
     for unit_id in fleet:
         observation = observations.get(unit_id)
-        grid_w = getattr(observation, "grid_power_w", None)
-        if observation is None or not _finite_number(grid_w):
+        if _grid_evidence_word(observation, max_age_s=max_age_s, now_mono=now_mono) != "good":
             return 0
-        quality = getattr(observation, "quality", None)
-        flag = quality.get("grid_power_w") if isinstance(quality, Mapping) else None
-        if flag is not None and flag is not DataQuality.GOOD:
-            return 0
-        captured_at_mono = getattr(observation, "captured_at_mono", None)
-        if not _finite_number(captured_at_mono):
-            return 0
-        age_s = float(now_mono) - captured_at_mono
-        if age_s > float(max_age_s):
-            return 0
-        total_w += float(grid_w)
+        total_w += float(getattr(observation, "grid_power_w", 0.0))
     eligible = max(0, math.floor(total_w) - int(margin))
     return min(int(limit), eligible)
+
+
+def fleet_export_evidence(
+    observations: Mapping[str, Any], policy: Any, now_mono: float
+) -> tuple[ExportEvidence, int | None]:
+    """The §1 fleet grid rollup under the bound's own fail-closed rules.
+
+    Returns the worst per-unit grid word (precedence ``missing > bad >
+    stale > good``) and the floor of the summed export (positive = export)
+    while every word is GOOD — ``None`` on ANY missing/bad/stale word, never
+    zero-filled: one unreadable phase is never treated as zero export.  An
+    unarmed policy triple has no rollup to make and reads as ``missing``.
+    """
+    max_age_s = getattr(policy, "export_telemetry_max_age_s", None)
+    fleet = getattr(policy, "expected_cell_count_by_unit", None)
+    if max_age_s is None or not isinstance(fleet, Mapping) or not fleet:
+        return "missing", None
+    worst: ExportEvidence = "good"
+    total_w = 0.0
+    for unit_id in fleet:
+        observation = observations.get(unit_id)
+        word = _grid_evidence_word(observation, max_age_s=max_age_s, now_mono=now_mono)
+        if word != "good":
+            if _EXPORT_EVIDENCE_RANK[word] > _EXPORT_EVIDENCE_RANK[worst]:
+                worst = word
+            continue
+        total_w += float(getattr(observation, "grid_power_w", 0.0))
+    if worst != "good":
+        return worst, None
+    return "good", math.floor(total_w)
 
 
 class ExcessChargeAdviser:
@@ -173,6 +262,7 @@ class ExcessChargeAdviser:
         observations: _ObservationPort,
         intents: _IntentPort,
         submit: _SubmitPort,
+        participation: _ParticipationPort | None = None,
     ) -> None:
         self._settings = settings
         self._policy = policy
@@ -180,16 +270,45 @@ class ExcessChargeAdviser:
         self._observations = observations
         self._intents = intents
         self._submit = submit
+        self._participation = participation
         # Hysteresis state: which intent id the adviser currently holds and
         # whether it is intervening (inside the hysteresis band).
         self._held_intent_id: str | None = None
         self._intervening = False
 
+    @property
+    def held_intent_id(self) -> str | None:
+        """The live adviser intent id, or ``None`` while holding nothing.
+
+        The projection derives ``active`` from THIS fact — never a lifecycle
+        guess — so it can never claim inactive while an adviser intent is
+        still live (the withdraw-then-tick race).
+        """
+        return self._held_intent_id
+
+    @property
+    def intervening(self) -> bool:
+        """Whether the adviser is inside the hysteresis band."""
+        return self._intervening
+
     async def tick(self) -> ExcessChargeDecision:
-        """Evaluate the bound once and act; never raises past its ports."""
+        """Evaluate the bound once and act; never raises past its ports.
+
+        The participation port is consumed AT TICK START (P6): a disabled
+        tick still computes the bound and the evidence rollup (the suspended
+        console keeps its what-would-it-do figures live), withdraws-if-held
+        exactly once by removal, and then idles carrying the projection's own
+        participation reason code.
+        """
         now_mono = float(self._clock.monotonic())
         latest = await self._observations.all_latest()
         bound_w = eligible_export_charge_w(latest, self._policy, now_mono)
+        evidence, fleet_export_w = fleet_export_evidence(latest, self._policy, now_mono)
+        verdict = None if self._participation is None else self._participation()
+        if verdict is not None:
+            if self._held_intent_id is not None or self._intervening:
+                return await self._withdraw(bound_w, (verdict,), evidence, fleet_export_w)
+            return self._idle(bound_w, (verdict,), evidence, fleet_export_w)
         active = await self._intents.active(now_mono)
         target = self._select_target(latest)
         if self._target_claimed(target, active):
@@ -202,30 +321,38 @@ class ExcessChargeAdviser:
             # DIFFERENT unit no longer stands the adviser down: the arbiter
             # runs both in one cycle now.  A live emergency stop claims every
             # unit (it dominates the whole cycle), so it always yields.
-            return await self._withdraw(bound_w, ("yielding_to_higher_priority",))
+            return await self._withdraw(
+                bound_w, ("yielding_to_higher_priority",), evidence, fleet_export_w
+            )
         achievable_w = self._achievable_w(bound_w, target, latest)
         entry_w = self._settings.assumed_autonomous_charge_w + self._settings.min_acceleration_w
         exit_w = self._settings.assumed_autonomous_charge_w + self._settings.exit_hysteresis_w
 
         if self._intervening:
             if target is not None and achievable_w > exit_w:
-                return await self._renew(target, achievable_w, bound_w)
+                return await self._renew(target, achievable_w, bound_w, evidence, fleet_export_w)
             if bound_w <= 0:
-                return await self._withdraw(bound_w, ("no_export_headroom",))
+                return await self._withdraw(
+                    bound_w, ("no_export_headroom",), evidence, fleet_export_w
+                )
             if target is None:
-                return await self._withdraw(bound_w, ("no_eligible_target",))
-            return await self._withdraw(bound_w, ("below_exit_hysteresis",))
+                return await self._withdraw(
+                    bound_w, ("no_eligible_target",), evidence, fleet_export_w
+                )
+            return await self._withdraw(
+                bound_w, ("below_exit_hysteresis",), evidence, fleet_export_w
+            )
 
         if bound_w <= 0:
-            return self._idle(bound_w, ("no_export_headroom",))
+            return self._idle(bound_w, ("no_export_headroom",), evidence, fleet_export_w)
         if target is None:
-            return self._idle(bound_w, ("no_eligible_target",))
+            return self._idle(bound_w, ("no_eligible_target",), evidence, fleet_export_w)
         if achievable_w < entry_w:
             # Below autonomy + margin the pod's own self-consumption is
             # faster than anything the adviser could command: commanding
             # less would SLOW charging, so autonomy is left untouched.
-            return self._idle(bound_w, ("no_acceleration_over_autonomy",))
-        return await self._renew(target, achievable_w, bound_w)
+            return self._idle(bound_w, ("no_acceleration_over_autonomy",), evidence, fleet_export_w)
+        return await self._renew(target, achievable_w, bound_w, evidence, fleet_export_w)
 
     @staticmethod
     def _target_claimed(target: str | None, active: tuple[Any, ...]) -> bool:
@@ -294,7 +421,14 @@ class ExcessChargeAdviser:
             return 0
         return max(0, min(int(bound_w), dynamic_w, int(static)))
 
-    async def _renew(self, target: str, achievable_w: int, bound_w: int) -> ExcessChargeDecision:
+    async def _renew(
+        self,
+        target: str,
+        achievable_w: int,
+        bound_w: int,
+        evidence: ExportEvidence,
+        fleet_export_w: int | None,
+    ) -> ExcessChargeDecision:
         """Remove the previous adviser intent, then submit a fresh one."""
         action: Action = "renew" if self._intervening else "propose"
         await self._remove_held()
@@ -313,9 +447,17 @@ class ExcessChargeAdviser:
             eligible_charge_w=bound_w,
             proposed_watts=achievable_w,
             reason_codes=("export_headroom_available",),
+            export_evidence=evidence,
+            fleet_export_w=fleet_export_w,
         )
 
-    async def _withdraw(self, bound_w: int, reasons: tuple[str, ...]) -> ExcessChargeDecision:
+    async def _withdraw(
+        self,
+        bound_w: int,
+        reasons: tuple[str, ...],
+        evidence: ExportEvidence,
+        fleet_export_w: int | None,
+    ) -> ExcessChargeDecision:
         """Withdraw by non-renewal: remove the held intent, submit nothing.
 
         No stop triple, no idle intent, no zero-watt submission — the TTL
@@ -332,15 +474,25 @@ class ExcessChargeAdviser:
             eligible_charge_w=bound_w,
             proposed_watts=0,
             reason_codes=reasons,
+            export_evidence=evidence,
+            fleet_export_w=fleet_export_w,
         )
 
-    def _idle(self, bound_w: int, reasons: tuple[str, ...]) -> ExcessChargeDecision:
+    def _idle(
+        self,
+        bound_w: int,
+        reasons: tuple[str, ...],
+        evidence: ExportEvidence,
+        fleet_export_w: int | None,
+    ) -> ExcessChargeDecision:
         return ExcessChargeDecision(
             action="idle",
             target_unit_id=None,
             eligible_charge_w=bound_w,
             proposed_watts=0,
             reason_codes=reasons,
+            export_evidence=evidence,
+            fleet_export_w=fleet_export_w,
         )
 
     async def _remove_held(self) -> None:
@@ -355,10 +507,343 @@ class ExcessChargeAdviser:
             await self._intents.remove(held)
 
 
+# --- the operator-facing projection (DESIGN_EXCESS_ACTIVATION §1/§2) ------------
+
+
+class ExcessChargingRefusal(Exception):
+    """A guarded-toggle refusal carrying its wire code and details.
+
+    The facade raises exactly this for the three 409 shapes of §3; the
+    guarded boundary maps ``code`` onto the error envelope verbatim.
+    """
+
+    def __init__(self, code: str, message: str, details: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = dict(details or {})
+
+
+@dataclass(frozen=True, slots=True)
+class ExcessAdviserState:
+    """The frozen §1 projection: the feature's whole story in one object.
+
+    Single writer: the fleet loop's post-tick update through
+    ``ExcessAdviserController.observe_tick`` owns every tick-derived field;
+    the toggle flips only the participation flag; ``active`` and
+    ``held_intent_id`` are composed from the adviser's LIVE held fact so the
+    projection can never claim inactive while an adviser intent is live.
+    """
+
+    enabled: bool
+    enabled_origin: EnabledOrigin
+    acknowledged_economics: bool
+    active: bool
+    hysteresis_state: HysteresisState
+    target_unit_id: str | None
+    commanded_charge_w: int
+    eligible_export_charge_w: int
+    fleet_export_w: int | None
+    export_evidence: ExportEvidence
+    charge_cap_w: int
+    held_intent_id: str | None
+    last_action: Action
+    last_tick_at: str
+    reason_codes: tuple[str, ...]
+
+    def payload(self) -> dict[str, Any]:
+        """The §1 JSON shape (values JSON-native, codes as a list)."""
+        return {
+            "enabled": self.enabled,
+            "enabled_origin": self.enabled_origin,
+            "acknowledged_economics": self.acknowledged_economics,
+            "active": self.active,
+            "hysteresis_state": self.hysteresis_state,
+            "target_unit_id": self.target_unit_id,
+            "commanded_charge_w": self.commanded_charge_w,
+            "eligible_export_charge_w": self.eligible_export_charge_w,
+            "fleet_export_w": self.fleet_export_w,
+            "export_evidence": self.export_evidence,
+            "charge_cap_w": self.charge_cap_w,
+            "held_intent_id": self.held_intent_id,
+            "last_action": self.last_action,
+            "last_tick_at": self.last_tick_at,
+            "reason_codes": list(self.reason_codes),
+        }
+
+    def event_payload(self) -> dict[str, Any]:
+        """The §2 ``excess_adviser.state_changed`` payload (the §1 subset the
+        event contract carries: no ``charge_cap_w``, ``last_action``, or
+        ``last_tick_at`` — the snapshot owns those)."""
+        return {
+            "enabled": self.enabled,
+            "enabled_origin": self.enabled_origin,
+            "acknowledged_economics": self.acknowledged_economics,
+            "active": self.active,
+            "hysteresis_state": self.hysteresis_state,
+            "target_unit_id": self.target_unit_id,
+            "commanded_charge_w": self.commanded_charge_w,
+            "eligible_export_charge_w": self.eligible_export_charge_w,
+            "fleet_export_w": self.fleet_export_w,
+            "export_evidence": self.export_evidence,
+            "reason_codes": list(self.reason_codes),
+            "held_intent_id": self.held_intent_id,
+        }
+
+    def semantic_tuple(self) -> tuple[Any, ...]:
+        """The §2 throttle tuple: the semantic state that triggers an event.
+
+        The watt figures are deliberately absent — they ride every
+        publication but never trigger one.
+        """
+        return (
+            self.enabled,
+            self.enabled_origin,
+            self.acknowledged_economics,
+            self.active,
+            self.hysteresis_state,
+            self.target_unit_id,
+            self.export_evidence,
+            self.reason_codes,
+        )
+
+
+class _EventPublisherPort(Protocol):
+    async def publish(self, body: Mapping[str, Any]) -> int: ...
+
+
+class _WallClock(Protocol):
+    def monotonic(self) -> float: ...
+
+    def wall_now(self) -> Any: ...
+
+
+# §2: the heartbeat cadence is a constant, not a config key.
+STATE_EVENT_HEARTBEAT_S: Final[float] = 30.0
+STATE_EVENT_TYPE: Final[str] = "excess_adviser.state_changed"
+
+
+class ExcessAdviserController:
+    """Participation flag, acknowledgement latch, projection, and events.
+
+    Composition wiring order is pinned: the controller is built FIRST (it
+    owns the participation flag the guarded toggle flips), the adviser is
+    then constructed with ``participation_verdict`` as its tick-start port,
+    and the controller binds the adviser for the live held-intent read.
+
+    Writers are split by ownership, never by race: the fleet loop's
+    ``observe_tick`` is the single writer of every tick-derived field; the
+    facade's toggle is the only writer of the participation flag and the
+    acknowledgement latch; readers (facade snapshot, toggle response, event
+    publication) compose a frozen view from both plus the adviser's live
+    ``held_intent_id``.
+    """
+
+    def __init__(
+        self,
+        *,
+        charge_cap_w: int,
+        clock: _WallClock,
+        acknowledged_economics: bool,
+        config_enabled: bool,
+        bus: _EventPublisherPort | None = None,
+        heartbeat_period_s: float = STATE_EVENT_HEARTBEAT_S,
+    ) -> None:
+        if isinstance(charge_cap_w, bool) or not isinstance(charge_cap_w, int) or charge_cap_w <= 0:
+            raise ValueError("charge_cap_w must be a positive integer")
+        if isinstance(heartbeat_period_s, bool) or not heartbeat_period_s > 0:
+            raise ValueError("heartbeat_period_s must be positive")
+        self._charge_cap_w = charge_cap_w
+        self._clock = clock
+        self._bus = bus
+        self._heartbeat_period_s = float(heartbeat_period_s)
+        # Participation state (toggle-owned; P1: never persisted — boot
+        # recomposes from config, which is why the boot value is captured
+        # here and the origin reads "config" until a toggle changes it).
+        self._enabled = bool(config_enabled)
+        self._enabled_origin: EnabledOrigin = "config"
+        # The once-ever durable net-billing fact (§3 P3), boot-loaded from
+        # the audit store and flipped only by the audited first enable.
+        self._acknowledged = bool(acknowledged_economics)
+        self._adviser: ExcessChargeAdviser | None = None
+        # Tick-derived fields (fleet-loop-owned single writer).  Before the
+        # first tick the honest frame is a zero bound over MISSING evidence:
+        # nothing has been read yet, and the first tick replaces it within
+        # one cycle.
+        self._last_action: Action = "idle"
+        self._last_target: str | None = None
+        self._last_proposed_w: int = 0
+        self._last_bound_w: int = 0
+        self._last_evidence: ExportEvidence = "missing"
+        self._last_fleet_export_w: int | None = None
+        self._last_reason_codes: tuple[str, ...] = ("export_evidence_missing",)
+        self._last_tick_at = clock.wall_now().isoformat()
+        # §2 publication state.
+        self._published_tuple: tuple[Any, ...] | None = None
+        self._last_publish_mono: float | None = None
+
+    def bind_adviser(self, adviser: ExcessChargeAdviser) -> None:
+        """Bind the adviser for the live held-intent read (exactly once)."""
+        if self._adviser is not None:
+            raise RuntimeError("the excess adviser controller is already bound")
+        self._adviser = adviser
+
+    # --- participation (the toggle's half) --------------------------------
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def enabled_origin(self) -> EnabledOrigin:
+        return self._enabled_origin
+
+    @property
+    def acknowledged_economics(self) -> bool:
+        return self._acknowledged
+
+    def set_participation(self, *, enabled: bool) -> None:
+        """Flip the participation flag; the next tick observes it.
+
+        The origin becomes ``runtime`` — the honest "until restart" marker.
+        P5: this flips participation ONLY; every commissioned envelope (cap,
+        export triple, read plan, hysteresis, TTL, mode) is a composition
+        fact the toggle can never touch.
+        """
+        self._enabled = bool(enabled)
+        self._enabled_origin = "runtime"
+
+    def mark_acknowledged(self) -> None:
+        """Latch the captured net-billing fact (after its durable append)."""
+        self._acknowledged = True
+
+    def participation_verdict(self) -> str | None:
+        """``None`` while the adviser participates; else its reason code.
+
+        Effective participation is the flag AND the acknowledgement: an
+        unacknowledged site composes SUSPENDED even with the config block
+        enabled (P3's fail-closed gate), and a runtime disable outranks the
+        pending acknowledgement in the vocabulary.
+        """
+        if not self._enabled:
+            if self._enabled_origin == "runtime":
+                return REASON_DISABLED_BY_RUNTIME
+            return REASON_DISABLED_BY_CONFIG
+        if not self._acknowledged:
+            return REASON_ECONOMICS_ACKNOWLEDGEMENT_REQUIRED
+        return None
+
+    # --- the projection (the fleet loop's half) ----------------------------
+
+    def state(self) -> ExcessAdviserState:
+        """Compose the frozen §1 view from the live participation and held
+        facts plus the last tick's decision."""
+        verdict = self.participation_verdict()
+        held = self._adviser.held_intent_id if self._adviser is not None else None
+        active = held is not None
+        if active:
+            # The held fact outranks everything: the projection must never
+            # claim inactive (nor "inactive" hysteresis) while an adviser
+            # intent is still live — the withdraw-then-tick race.
+            hysteresis: HysteresisState = "holding"
+        elif verdict is not None:
+            hysteresis = "inactive"
+        elif self._last_action == "withdraw":
+            hysteresis = "exiting"
+        else:
+            hysteresis = "entering"
+        if verdict is None or active:
+            # Participating (or still holding through the pre-withdraw
+            # transient): the tick's own codes and target, VERBATIM.
+            reason_codes = self._last_reason_codes
+            target_unit_id = self._last_target
+            commanded = self._last_proposed_w if self._last_action in ("propose", "renew") else 0
+        else:
+            reason_codes = (verdict,)
+            target_unit_id = None
+            commanded = 0
+        return ExcessAdviserState(
+            enabled=self._enabled,
+            enabled_origin=self._enabled_origin,
+            acknowledged_economics=self._acknowledged,
+            active=active,
+            hysteresis_state=hysteresis,
+            target_unit_id=target_unit_id,
+            commanded_charge_w=commanded,
+            eligible_export_charge_w=self._last_bound_w,
+            fleet_export_w=self._last_fleet_export_w,
+            export_evidence=self._last_evidence,
+            charge_cap_w=self._charge_cap_w,
+            held_intent_id=held,
+            last_action=self._last_action,
+            last_tick_at=self._last_tick_at,
+            reason_codes=reason_codes,
+        )
+
+    def state_payload(self) -> dict[str, Any]:
+        """The §1 JSON shape (the facade/toggle read surface)."""
+        return self.state().payload()
+
+    async def observe_tick(self, decision: ExcessChargeDecision) -> None:
+        """The single-writer post-tick update, then the §2 publication.
+
+        Publishes ``excess_adviser.state_changed`` only when the semantic
+        tuple changes — watt figures ride but never trigger — and, while
+        ``enabled`` is true, republishes the full payload as a heartbeat
+        every ``heartbeat_period_s``.  While disabled, no heartbeat: the
+        state_changed to disabled is the last event.  A publication failure
+        propagates to the fleet loop's suppression (the projection write
+        above has already landed); it never gates control.
+        """
+        self._last_action = decision.action
+        self._last_target = decision.target_unit_id
+        self._last_proposed_w = int(decision.proposed_watts)
+        self._last_bound_w = int(decision.eligible_charge_w)
+        self._last_evidence = decision.export_evidence
+        self._last_fleet_export_w = decision.fleet_export_w
+        self._last_reason_codes = tuple(decision.reason_codes)
+        self._last_tick_at = self._clock.wall_now().isoformat()
+        if self._bus is None:
+            return
+        state = self.state()
+        semantic = state.semantic_tuple()
+        now_mono = float(self._clock.monotonic())
+        heartbeat = False
+        if semantic != self._published_tuple:
+            heartbeat = False
+        elif state.enabled and (
+            self._last_publish_mono is None
+            or now_mono - self._last_publish_mono >= self._heartbeat_period_s
+        ):
+            heartbeat = True
+        else:
+            return
+        await self._bus.publish(
+            {
+                "type": STATE_EVENT_TYPE,
+                "payload": {**state.event_payload(), "heartbeat": heartbeat},
+            }
+        )
+        self._published_tuple = semantic
+        self._last_publish_mono = now_mono
+
+
 __all__ = [
+    "REASON_DISABLED_BY_CONFIG",
+    "REASON_DISABLED_BY_RUNTIME",
+    "REASON_ECONOMICS_ACKNOWLEDGEMENT_REQUIRED",
+    "STATE_EVENT_HEARTBEAT_S",
+    "STATE_EVENT_TYPE",
     "Action",
+    "EnabledOrigin",
+    "ExcessAdviserController",
+    "ExcessAdviserState",
     "ExcessChargeAdviser",
     "ExcessChargeDecision",
     "ExcessChargeSettings",
+    "ExcessChargingRefusal",
+    "ExportEvidence",
+    "HysteresisState",
     "eligible_export_charge_w",
+    "fleet_export_evidence",
 ]

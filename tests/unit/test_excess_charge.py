@@ -737,3 +737,354 @@ async def test_adviser_stands_down_while_any_emergency_stop_is_live(excess: Any,
     assert decision.action in {"withdraw", "idle"}
     assert "yielding_to_higher_priority" in decision.reason_codes
     assert submit.submissions == []
+
+
+# --- adviser state projection (DESIGN_EXCESS_ACTIVATION §1) ---------------------
+#
+# The tick decision is computed every cycle and must no longer be discarded
+# beyond its intent: the frozen ExcessAdviserState projection (one writer --
+# the post-tick update through ExcessAdviserController.observe_tick; readers
+# -- facade snapshot, toggle response, event publication) carries the whole
+# operator story: participation, the held/hysteresis facts, the deterministic
+# bound, and the fleet grid rollup under the bound's own fail-closed rules.
+# The reason vocabulary is ONE vocabulary: the implemented tick codes ride
+# VERBATIM; the projection adds only the participation states the tick alone
+# cannot see.
+
+
+@dataclass
+class FakeBus:
+    published: list[dict[str, Any]] = field(default_factory=list)
+
+    async def publish(self, body: Mapping[str, Any]) -> int:
+        self.published.append(dict(body))
+        return len(self.published)
+
+
+@dataclass
+class ProjectionRig:
+    """Adviser + controller wired exactly as the composition wires them.
+
+    The controller is built first (it owns the participation flag the toggle
+    flips), the adviser is then constructed with the controller's verdict as
+    its tick-start participation port, and the controller binds the adviser
+    for the live held-intent read.
+    """
+
+    controller: Any
+    adviser: Any
+    observations: FakeObservations
+    intents: FakeIntents
+    submit: FakeSubmit
+    clock: FakeClock
+
+
+def make_projection_rig(
+    excess: Any,
+    api: Any,
+    grids: Mapping[str, float | None],
+    *,
+    acknowledged: bool = True,
+    config_enabled: bool = True,
+    charge_cap_w: int = 2_000,
+    bus: FakeBus | None = None,
+) -> ProjectionRig:
+    clock = FakeClock()
+    controller = excess.ExcessAdviserController(
+        charge_cap_w=charge_cap_w,
+        clock=clock,
+        acknowledged_economics=acknowledged,
+        config_enabled=config_enabled,
+        bus=bus,
+    )
+    observations = FakeObservations(latest=make_fleet(api, grids))
+    intents = FakeIntents()
+    submit = FakeSubmit()
+    adviser = excess.ExcessChargeAdviser(
+        settings=make_settings(excess),
+        policy=make_policy(api),
+        clock=clock,
+        observations=observations,
+        intents=intents,
+        submit=submit,
+        participation=controller.participation_verdict,
+    )
+    controller.bind_adviser(adviser)
+    return ProjectionRig(
+        controller=controller,
+        adviser=adviser,
+        observations=observations,
+        intents=intents,
+        submit=submit,
+        clock=clock,
+    )
+
+
+async def tick(rig: ProjectionRig) -> Any:
+    """One fleet-cycle step: the tick, then the single-writer post-tick update."""
+    decision = await rig.adviser.tick()
+    await rig.controller.observe_tick(decision)
+    return decision
+
+
+@pytest.mark.parametrize(
+    ("grids", "overrides", "expected_word", "expected_export_w"),
+    [
+        # Every phase GOOD: the floor of the summed export, positive = export.
+        ({"lhs": -300.0, "mid": 800.0, "rhs": 900.5}, {}, "good", 1_400),
+        # One unit with no observation at all: missing, never zero-filled.
+        ({"lhs": -300.0, "rhs": 900.0}, {}, "missing", None),
+        # One unsourced (None) grid word: missing, fleet export null.
+        ({"lhs": -300.0, "mid": None, "rhs": 900.0}, {}, "missing", None),
+        # A non-GOOD quality word: bad.
+        ({"lhs": -300.0, "mid": 800.0, "rhs": 900.0}, {"grid_quality": "BAD"}, "bad", None),
+        # A stale capture: stale (age 4.5 > 3.0).
+        (
+            {"lhs": -300.0, "mid": 800.0, "rhs": 900.0},
+            {"export_telemetry_max_age_s": 3.0, "captured": {"rhs": 95.5}},
+            "stale",
+            None,
+        ),
+        # Worst word wins under the pinned precedence missing > bad > stale:
+        # a missing word outranks a bad one even when both apply.
+        (
+            {"lhs": None, "mid": 800.0, "rhs": 900.0},
+            {"grid_quality": "BAD"},
+            "missing",
+            None,
+        ),
+    ],
+)
+def test_fleet_export_evidence_rolls_up_fail_closed(
+    excess: Any,
+    api: Any,
+    grids: dict[str, float | None],
+    overrides: dict[str, Any],
+    expected_word: str,
+    expected_export_w: int | None,
+) -> None:
+    """The §1 fleet rollup reuses the bound's own rules: GOOD phases sum to a
+    floor int; ANY missing/bad/stale word collapses the whole figure to null --
+    one unreadable phase is never treated as zero export."""
+    policy = make_policy(
+        api,
+        **{k: v for k, v in overrides.items() if k == "export_telemetry_max_age_s"},
+    )
+    captured = overrides.get("captured", {})
+    grid_quality = (
+        getattr(api.DataQuality, overrides["grid_quality"]) if "grid_quality" in overrides else None
+    )
+    observations = {
+        unit: make_observation(
+            api,
+            unit_id=unit,
+            grid_power_w=grid,
+            captured_at_mono=captured.get(unit, NOW),
+            grid_quality=grid_quality,
+        )
+        for unit, grid in grids.items()
+    }
+
+    word, fleet_export_w = excess.fleet_export_evidence(observations, policy, NOW)
+
+    assert word == expected_word
+    assert fleet_export_w == expected_export_w
+
+
+def test_fleet_export_evidence_is_missing_when_the_triple_is_not_armed(
+    excess: Any, api: Any
+) -> None:
+    policy = make_policy(
+        api,
+        export_charge_limit_w=None,
+        export_headroom_margin_w=None,
+        export_telemetry_max_age_s=None,
+    )
+    observations = {
+        unit: make_observation(api, unit_id=unit, grid_power_w=900.0) for unit in UNIT_IDS
+    }
+
+    assert excess.fleet_export_evidence(observations, policy, NOW) == ("missing", None)
+
+
+async def test_participating_tick_carries_the_evidence_on_its_decision(
+    excess: Any, api: Any
+) -> None:
+    """The decision -- the thing the fleet loop already holds post-tick -- is
+    the projection's evidence carrier: the rollup rides it, so no second
+    observation read is needed and the projection can never disagree with the
+    bound the tick acted on."""
+    rig = make_projection_rig(excess, api, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0})
+    decision = await rig.adviser.tick()
+
+    assert decision.action == "propose"
+    assert decision.export_evidence == "good"
+    assert decision.fleet_export_w == 1_200  # -300 + 0 + 1500
+    assert decision.eligible_charge_w == 1_100  # 1200 - 100 margin
+    assert rig.adviser.held_intent_id == "excess-1"
+    assert rig.adviser.intervening is True
+
+
+async def test_projection_composes_the_contract_shape(excess: Any, api: Any) -> None:
+    """§1's exact field set on the commanding path: participating, holding,
+    the commanded/bound/export trio, the cap, the held id, tick-granular wall
+    time, and the tick's own reason code -- verbatim."""
+    rig = make_projection_rig(excess, api, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0})
+
+    await tick(rig)
+    state = rig.controller.state()
+
+    assert state.enabled is True
+    assert state.enabled_origin == "config"
+    assert state.acknowledged_economics is True
+    assert state.active is True
+    assert state.hysteresis_state == "holding"
+    assert state.target_unit_id == "mid"
+    assert state.commanded_charge_w == 1_100
+    assert state.eligible_export_charge_w == 1_100
+    assert state.fleet_export_w == 1_200
+    assert state.export_evidence == "good"
+    assert state.charge_cap_w == 2_000
+    assert state.held_intent_id == "excess-1"
+    assert state.last_action == "propose"
+    assert state.last_tick_at == rig.clock.wall_now().isoformat()
+    assert state.reason_codes == ("export_headroom_available",)
+    payload = state.payload()
+    assert set(payload) == {
+        "enabled",
+        "enabled_origin",
+        "acknowledged_economics",
+        "active",
+        "hysteresis_state",
+        "target_unit_id",
+        "commanded_charge_w",
+        "eligible_export_charge_w",
+        "fleet_export_w",
+        "export_evidence",
+        "charge_cap_w",
+        "held_intent_id",
+        "last_action",
+        "last_tick_at",
+        "reason_codes",
+    }
+    assert payload["reason_codes"] == ["export_headroom_available"]
+
+
+async def test_projection_idle_reason_codes_are_the_tick_codes_verbatim(
+    excess: Any, api: Any
+) -> None:
+    """ONE vocabulary: an idle participating adviser shows exactly the codes
+    the domain decision carries -- never a projected paraphrase."""
+    rig = make_projection_rig(excess, api, {"lhs": 0.0, "mid": 0.0, "rhs": 700.0})  # 600 < 620
+
+    await tick(rig)
+    state = rig.controller.state()
+
+    assert state.hysteresis_state == "entering"
+    assert state.active is False
+    assert state.commanded_charge_w == 0
+    assert state.target_unit_id is None
+    assert state.reason_codes == ("no_acceleration_over_autonomy",)
+
+
+async def test_projection_names_the_participation_states(excess: Any, api: Any) -> None:
+    """The three projection-only codes, each on the state that owns it."""
+    grids = {"lhs": 0.0, "mid": 0.0, "rhs": 1_000.0}
+
+    # Composed disabled by config, untouched this process.
+    rig = make_projection_rig(excess, api, grids, acknowledged=True, config_enabled=False)
+    await tick(rig)
+    state = rig.controller.state()
+    assert state.reason_codes == ("disabled_by_config",)
+    assert state.hysteresis_state == "inactive"
+    assert state.enabled is False
+    assert state.enabled_origin == "config"
+
+    # Config-enabled, disabled at runtime: operational only until restart.
+    rig2 = make_projection_rig(excess, api, grids, acknowledged=True)
+    rig2.controller.set_participation(enabled=False)
+    await tick(rig2)
+    state2 = rig2.controller.state()
+    assert state2.reason_codes == ("disabled_by_runtime",)
+    assert state2.hysteresis_state == "inactive"
+    assert state2.enabled is False
+    assert state2.enabled_origin == "runtime"
+
+    # Composed enabled but suspended on the pending acknowledgement.
+    rig3 = make_projection_rig(excess, api, grids, acknowledged=False)
+    await tick(rig3)
+    state3 = rig3.controller.state()
+    assert state3.reason_codes == ("economics_acknowledgement_required",)
+    assert state3.hysteresis_state == "inactive"
+    assert state3.enabled is True
+    assert state3.acknowledged_economics is False
+
+
+async def test_projection_active_never_lies_during_the_withdraw_race(excess: Any, api: Any) -> None:
+    """The withdraw-then-tick race pin: between the disable and the next tick
+    the adviser still holds a live intent, so the projection must still say
+    active/holding (derived from held_intent_id, never a lifecycle guess); the
+    withdraw tick then lands inactive with the projection's own code."""
+    rig = make_projection_rig(excess, api, {"lhs": 0.0, "mid": 0.0, "rhs": 1_000.0})
+    await tick(rig)
+    assert rig.controller.state().active is True
+
+    rig.controller.set_participation(enabled=False)
+    pre_tick = rig.controller.state()
+    assert pre_tick.active is True, "held_intent_id is the truth, not the flag"
+    assert pre_tick.hysteresis_state == "holding"
+
+    decision = await tick(rig)
+    state = rig.controller.state()
+
+    assert decision.action == "withdraw", "a disabled tick withdraws-if-held exactly once"
+    assert decision.reason_codes == ("disabled_by_runtime",)
+    assert state.active is False
+    assert state.held_intent_id is None
+    assert state.hysteresis_state == "inactive"
+    assert rig.intents.removed == ["excess-1"], "the withdraw is a removal, never a stop"
+    assert all(entry["watts"] > 0 for entry in rig.submit.submissions)
+
+
+async def test_a_disabled_adviser_keeps_computing_the_fresh_evidence(excess: Any, api: Any) -> None:
+    """Suspended is not blind: while disabled the tick still computes the
+    bound and the rollup every cycle (the console's what-would-it-do figures
+    stay live) and commands nothing."""
+    rig = make_projection_rig(
+        excess, api, {"lhs": 0.0, "mid": 0.0, "rhs": 1_000.0}, config_enabled=False
+    )
+    await tick(rig)
+
+    rig.observations.latest = make_fleet(api, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0})
+    rig.clock.now = NOW + 1.5
+    await tick(rig)
+    state = rig.controller.state()
+
+    assert rig.submit.submissions == []
+    assert state.commanded_charge_w == 0
+    assert state.target_unit_id is None
+    assert state.eligible_export_charge_w == 1_100
+    assert state.fleet_export_w == 1_200
+    assert state.export_evidence == "good"
+
+
+async def test_projection_hysteresis_walks_the_pinned_lifecycle(excess: Any, api: Any) -> None:
+    """entering -> holding -> exiting -> entering, tick-granular."""
+    rig = make_projection_rig(excess, api, {"lhs": 0.0, "mid": 0.0, "rhs": 1_000.0})
+
+    await tick(rig)
+    assert rig.controller.state().hysteresis_state == "holding"
+
+    rig.observations.latest = make_fleet(api, {"lhs": 0.0, "mid": 0.0, "rhs": 650.0})  # below exit
+    rig.clock.now = NOW + 1.5
+    await tick(rig)
+    exiting = rig.controller.state()
+    assert exiting.hysteresis_state == "exiting"
+    assert exiting.active is False
+    assert exiting.reason_codes == ("below_exit_hysteresis",)
+
+    rig.clock.now = NOW + 3.0
+    await tick(rig)
+    assert rig.controller.state().hysteresis_state == "entering", (
+        "exiting persists exactly until the next tick re-evaluates"
+    )
