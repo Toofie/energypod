@@ -1006,14 +1006,20 @@ def test_noninteger_cell_sequence_is_rejected_defensively(api: SimpleNamespace) 
     assert "cell_sequence_invalid" in reasons(decision)
 
 
-def test_mixed_directions_are_rejected_before_evaluation(api: SimpleNamespace) -> None:
+def test_one_unit_proposed_twice_in_opposite_directions_is_rejected(api: SimpleNamespace) -> None:
+    """Per-unit coherence replaces the fleet-wide ``mixed_directions``
+    rejection (2026-08-24 concurrent operations): DIFFERENT units may run
+    different directions in one cycle, but ONE unit can never be proposed
+    twice -- the duplicate-unit defense still rejects the confused cycle."""
     mixed = (
         make_proposed_setpoints(api, direction=api.Direction.CHARGE, watts=500)[0],
         make_proposed_setpoints(api, direction=api.Direction.DISCHARGE, watts=500)[0],
     )
+    assert mixed[0].unit_id == mixed[1].unit_id == "mid"
     decision = evaluate(api, proposed_setpoints=mixed)
     assert_rejected(decision, api)
-    assert "mixed_directions" in reasons(decision)
+    assert "duplicate_unit_setpoint" in reasons(decision)
+    assert "mixed_directions" not in reasons(decision)
 
 
 def test_noninteger_power_is_rejected_defensively(api: SimpleNamespace) -> None:
@@ -1702,3 +1708,350 @@ def test_ordinary_charge_is_untouched_by_export_evidence_rules(
     assert_rejected(decision, api)
     assert "observation_missing" in reasons(decision)
     assert not [reason for reason in reasons(decision) if reason.startswith("export_")]
+
+
+# --- concurrent per-unit operation (2026-08-24 operator requirement) -----------
+#
+# "I instructed MID to charge at 2,000 watts and RHS to discharge at 1,000
+# watts. Only one operation functions at a time. I require both to function
+# concurrently whenever a battery request is made."  One cycle may now carry
+# DIFFERENT directions on different units -- charging one pod while
+# discharging another is physically legitimate (independent phases).  The
+# old fleet-wide ``mixed_directions`` rejection is replaced by per-unit
+# coherence: each proposal's direction is judged against its own unit (the
+# control kernel's matcher binds every proposal to its unit's winning
+# intent), fleet limits apply PER DIRECTION over that direction's subtotal,
+# and every per-unit deny reason zeroes ONLY its own unit -- a denied unit is
+# a zero-watt non-participant for its direction (the 6abd869/d2163a5
+# non-participation doctrine extended to concurrency) while the other units
+# still run.
+
+
+def make_mixed_proposals(
+    api: SimpleNamespace,
+    *,
+    charge: dict[str, int] | None = None,
+    discharge: dict[str, int] | None = None,
+    idle: tuple[str, ...] = (),
+    intent_expires_at_mono: float = 109.0,
+) -> tuple[ProposedSetpointRecord, ...]:
+    """Compose per-unit proposals carrying each unit's own direction."""
+    proposals: list[ProposedSetpointRecord] = []
+    for unit_id, watts in sorted((charge or {}).items()):
+        proposals.append(
+            ProposedSetpointRecord(
+                unit_id=unit_id,
+                direction=api.Direction.CHARGE,
+                watts=watts,
+                intent_id=f"intent-charge-{unit_id}",
+                intent_expires_at_mono=intent_expires_at_mono,
+            )
+        )
+    for unit_id, watts in sorted((discharge or {}).items()):
+        proposals.append(
+            ProposedSetpointRecord(
+                unit_id=unit_id,
+                direction=api.Direction.DISCHARGE,
+                watts=watts,
+                intent_id=f"intent-discharge-{unit_id}",
+                intent_expires_at_mono=intent_expires_at_mono,
+            )
+        )
+    for unit_id in sorted(idle):
+        proposals.append(
+            ProposedSetpointRecord(
+                unit_id=unit_id,
+                direction=api.Direction.IDLE,
+                watts=0,
+                intent_id=f"intent-idle-{unit_id}",
+                intent_expires_at_mono=intent_expires_at_mono,
+            )
+        )
+    return tuple(proposals)
+
+
+def _unit_routed_overrides(unit_id: str, overrides: dict[str, Any]) -> dict[str, Any]:
+    """Per-unit observation overrides keyed as unit-colon-id-colon-field."""
+    prefix = f"unit:{unit_id}:"
+    return {key[len(prefix) :]: value for key, value in overrides.items() if key.startswith(prefix)}
+
+
+def make_fleet_observations(api: SimpleNamespace, **overrides: Any) -> dict[str, Any]:
+    """Observations for every fleet unit, with per-unit overrides routed by key."""
+    return {
+        unit_id: make_observation(
+            api, unit_id=unit_id, **_unit_routed_overrides(unit_id, overrides)
+        )
+        for unit_id in UNIT_IDS
+    }
+
+
+def test_mixed_direction_cycle_is_authorized_when_each_unit_is_coherent(
+    api: SimpleNamespace,
+) -> None:
+    """The operator's exact scenario: MID charges 2,000 W while RHS discharges
+    1,000 W in ONE authorized decision -- each proposal keeps its own unit's
+    direction and watts, nothing is reversed or blended."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_mixed_proposals(
+            api, charge={"mid": 2_000}, discharge={"rhs": 1_000}
+        ),
+        current_observations=make_fleet_observations(api),
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert reasons(decision) == ("safety_checks_passed",)
+    setpoints = setpoints_by_unit(decision)
+    assert setpoints["mid"].direction is api.Direction.CHARGE
+    assert setpoints["mid"].watts == 2_000
+    assert setpoints["rhs"].direction is api.Direction.DISCHARGE
+    assert setpoints["rhs"].watts == 1_000
+
+
+def test_per_unit_soc_bound_applies_against_each_units_own_direction(
+    api: SimpleNamespace,
+) -> None:
+    """RHS at the SOC floor cannot discharge (its own direction's bound) but
+    that same floor never touches MID's charge in the same cycle."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_mixed_proposals(
+            api, charge={"mid": 2_000}, discharge={"rhs": 1_000}
+        ),
+        current_observations=make_fleet_observations(
+            api,
+            **{
+                "unit:rhs:system_soc_pct": 9.5,
+                "unit:rhs:bms_soc_pct": 9.5,
+            },
+        ),
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert "soc_below_discharge_floor" in reasons(decision)
+    setpoints = setpoints_by_unit(decision)
+    assert setpoints["mid"].direction is api.Direction.CHARGE
+    assert setpoints["mid"].watts == 2_000
+    # The denied unit is a zero-watt non-participant for ITS direction; the
+    # other unit still runs.
+    assert setpoints["rhs"].watts == 0
+
+
+def test_one_units_denial_zeroes_only_that_unit_in_a_mixed_cycle(
+    api: SimpleNamespace,
+) -> None:
+    """A blocking fault on the charging unit stops that unit's charge only;
+    the discharging unit keeps its full authority in the same decision."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_mixed_proposals(
+            api, charge={"mid": 2_000}, discharge={"rhs": 1_000}
+        ),
+        current_observations=make_fleet_observations(
+            api, **{"unit:mid:active_faults": frozenset({"BMS_CRITICAL"})}
+        ),
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert "blocking_fault" in reasons(decision)
+    setpoints = setpoints_by_unit(decision)
+    assert setpoints["mid"].watts == 0
+    assert setpoints["rhs"].direction is api.Direction.DISCHARGE
+    assert setpoints["rhs"].watts == 1_000
+
+
+def test_every_unit_denied_in_a_mixed_cycle_fails_closed_to_rejection(
+    api: SimpleNamespace,
+) -> None:
+    """When NO unit can participate the decision is rejected whole (fail
+    closed), never an authorized empty grant."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_mixed_proposals(
+            api, charge={"mid": 2_000}, discharge={"rhs": 1_000}
+        ),
+        current_observations=make_fleet_observations(
+            api,
+            **{
+                "unit:mid:active_faults": frozenset({"BMS_CRITICAL"}),
+                "unit:rhs:system_soc_pct": 9.5,
+                "unit:rhs:bms_soc_pct": 9.5,
+            },
+        ),
+    )
+
+    assert_rejected(decision, api)
+    assert "blocking_fault" in reasons(decision)
+    assert "soc_below_discharge_floor" in reasons(decision)
+
+
+def test_zero_dynamic_capability_zeroes_only_that_unit_in_a_mixed_cycle(
+    api: SimpleNamespace,
+) -> None:
+    """A unit whose BMS reports no charge headroom becomes a non-participant;
+    the discharging unit in the same cycle is untouched."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_mixed_proposals(
+            api, charge={"mid": 2_000}, discharge={"rhs": 1_000}
+        ),
+        current_observations=make_fleet_observations(api, **{"unit:mid:dynamic_charge_limit_w": 0}),
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert "zero_dynamic_capability" in reasons(decision)
+    setpoints = setpoints_by_unit(decision)
+    assert setpoints["mid"].watts == 0
+    assert setpoints["rhs"].watts == 1_000
+
+
+def test_fleet_limits_apply_per_direction_across_each_directions_subtotal(
+    api: SimpleNamespace,
+) -> None:
+    """fleet_charge_limit_w bounds the charge subtotal and
+    fleet_discharge_limit_w the discharge subtotal -- never one blended budget.
+    lhs+mid charge 2,500 W each against a 3,000 W charge limit while rhs
+    discharges 1,000 W inside a 7,500 W discharge limit: the charges clamp to
+    3,000 W together and the discharge is untouched."""
+    policy = make_policy(api, fleet_charge_limit_w=3_000)
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_mixed_proposals(
+            api, charge={"lhs": 2_500, "mid": 2_500}, discharge={"rhs": 1_000}
+        ),
+        current_observations=make_fleet_observations(api),
+        policy=policy,
+    )
+
+    assert decision.status is api.DecisionStatus.CLAMPED
+    assert reasons(decision) == ("power_clamped",)
+    setpoints = setpoints_by_unit(decision)
+    assert setpoints["lhs"].watts + setpoints["mid"].watts == 3_000
+    assert setpoints["lhs"].direction is api.Direction.CHARGE
+    assert setpoints["mid"].direction is api.Direction.CHARGE
+    assert setpoints["rhs"].direction is api.Direction.DISCHARGE
+    assert setpoints["rhs"].watts == 1_000
+
+
+def test_a_starved_charge_limit_does_not_veto_the_discharge_side(
+    api: SimpleNamespace,
+) -> None:
+    """A charge budget starved to its last watt clamps the charge side to 1 W
+    without touching the discharge side's own budget -- the per-direction
+    doctrine across directions."""
+    policy = make_policy(api, fleet_charge_limit_w=1)
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_mixed_proposals(
+            api, charge={"mid": 2_000}, discharge={"rhs": 1_000}
+        ),
+        current_observations=make_fleet_observations(api),
+        policy=policy,
+    )
+
+    assert decision.status is api.DecisionStatus.CLAMPED
+    assert reasons(decision) == ("power_clamped",)
+    setpoints = setpoints_by_unit(decision)
+    assert setpoints["mid"].watts == 1
+    assert setpoints["mid"].direction is api.Direction.CHARGE
+    assert setpoints["rhs"].watts == 1_000
+    assert setpoints["rhs"].direction is api.Direction.DISCHARGE
+
+
+def test_each_direction_clamps_under_its_own_limit_in_one_cycle(
+    api: SimpleNamespace,
+) -> None:
+    """Both directions clamp in the same decision, each against its own
+    budget, and the exact-integer remainder distribution holds per side."""
+    policy = make_policy(api, fleet_charge_limit_w=1_500, fleet_discharge_limit_w=700)
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_mixed_proposals(
+            api, charge={"lhs": 2_000, "mid": 2_000}, discharge={"rhs": 1_000}
+        ),
+        current_observations=make_fleet_observations(api),
+        policy=policy,
+    )
+
+    assert decision.status is api.DecisionStatus.CLAMPED
+    setpoints = setpoints_by_unit(decision)
+    assert setpoints["lhs"].watts + setpoints["mid"].watts == 1_500
+    assert setpoints["lhs"].direction is setpoints["mid"].direction is api.Direction.CHARGE
+    assert setpoints["rhs"].watts == 700
+
+
+def test_zero_watt_idle_proposal_rides_along_an_active_mixed_cycle(
+    api: SimpleNamespace,
+) -> None:
+    """A unit held idle by its own winning intent is a zero-watt rider: it
+    neither vetoes nor joins the two active directions."""
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_mixed_proposals(
+            api, charge={"mid": 2_000}, discharge={"rhs": 1_000}, idle=("lhs",)
+        ),
+        current_observations=make_fleet_observations(api),
+    )
+
+    assert decision.status is api.DecisionStatus.AUTHORIZED
+    assert reasons(decision) == ("safety_checks_passed",)
+    setpoints = setpoints_by_unit(decision)
+    assert setpoints["lhs"].watts == 0
+    assert setpoints["mid"].watts == 2_000
+    assert setpoints["rhs"].watts == 1_000
+
+
+def test_mixed_cycle_rejects_when_a_structural_flaw_remains(
+    api: SimpleNamespace,
+) -> None:
+    """Structural proposal flaws (unknown direction, an expired intent) still
+    reject the WHOLE composed cycle before any per-unit evaluation --
+    concurrency never weakens the structural gate."""
+    flawed = make_mixed_proposals(api, charge={"mid": 2_000}, discharge={"rhs": 1_000})
+    expired = (
+        flawed[0],
+        ProposedSetpointRecord(
+            unit_id="rhs",
+            direction=api.Direction.DISCHARGE,
+            watts=1_000,
+            intent_id="intent-discharge-rhs",
+            intent_expires_at_mono=NOW,
+        ),
+    )
+    decision = evaluate(api, proposed_setpoints=expired)
+    assert_rejected(decision, api)
+    assert "intent_expired" in reasons(decision)
+
+    invalid_direction = (
+        flawed[0],
+        ProposedSetpointRecord(
+            unit_id="rhs",
+            direction="reverse",
+            watts=1_000,
+            intent_id="intent-discharge-rhs",
+            intent_expires_at_mono=109.0,
+        ),
+    )
+    decision = evaluate(api, proposed_setpoints=invalid_direction)
+    assert_rejected(decision, api)
+    assert "invalid_direction" in reasons(decision)
+
+
+def test_single_direction_fleet_behavior_is_unchanged_by_the_per_unit_doctrine(
+    api: SimpleNamespace,
+) -> None:
+    """The regression anchor: a homogeneous three-unit discharge clamps to the
+    fleet discharge limit exactly as before concurrency."""
+    policy = make_policy(api, fleet_discharge_limit_w=4_500)
+    decision = evaluate(
+        api,
+        proposed_setpoints=make_proposed_setpoints(
+            api, watts_by_unit={"lhs": 2_000, "mid": 2_000, "rhs": 2_000}
+        ),
+        current_observations=make_fleet_observations(api),
+        policy=policy,
+    )
+    setpoints = setpoints_by_unit(decision)
+    assert decision.status is api.DecisionStatus.CLAMPED
+    assert sum(point.watts for point in setpoints.values()) == 4_500

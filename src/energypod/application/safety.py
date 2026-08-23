@@ -69,7 +69,14 @@ class SafetyKernel:
                 ("zero_dynamic_capability",),
             )
 
-        reasons: set[str] = set()
+        # Concurrent per-unit operation (2026-08-24): every deny reason is
+        # PER UNIT.  A denied unit becomes a zero-watt non-participant for its
+        # own direction -- the 6abd869/d2163a5 non-participation doctrine
+        # extended from zero-watt PROPOSALS to denied units -- while the other
+        # units (including units running the OPPOSITE direction) still run.
+        # Different units may carry different directions in one cycle; each
+        # proposal is judged against its own unit's evidence exactly as today.
+        denied: dict[str, set[str]] = {}
         limits: dict[str, int] = {}
         expiries: dict[str, float] = {}
         for proposal in proposals:
@@ -88,61 +95,84 @@ class SafetyKernel:
                 expiries[proposal.unit_id] = now_mono
                 continue
             unit_reasons = self._deny_reasons(proposal, observation, previous, policy, now_mono)
-            reasons.update(unit_reasons)
-            if getattr(proposal, "export_bounded", False):
+            if not unit_reasons and getattr(proposal, "export_bounded", False):
                 # API_CONTRACTS "Excess-solar accelerated charging
                 # (advisory)": defense in depth behind the allocator's export
                 # bound.  A NON-ZERO export-bounded proposal re-derives the
                 # fleet grid evidence here, over the observations the kernel
                 # already holds, so a proposal that outran its evidence is
-                # refused even if some other path minted it.  Zero-watt
-                # proposals never reach this line (they are explicit
-                # non-participation above), keeping the all-zero/partial
-                # -eligibility doctrine of 6abd869/d2163a5 intact.
-                reasons.update(
-                    self._export_evidence_reasons(current_observations, policy, now_mono)
-                )
-            if observation is not None and not unit_reasons:
-                limits[proposal.unit_id] = self._unit_limit(proposal, observation, policy)
-                expiries[proposal.unit_id] = min(
-                    now_mono + policy.authorization_lifetime_s,
-                    proposal.intent_expires_at_mono,
-                    observation.captured_at_mono + policy.max_telemetry_age_s,
-                    observation.cell_captured_at_mono + policy.max_cell_age_s,
-                )
-        if reasons:
+                # refused even if some other path minted it.  The bound's own
+                # evidence gap zeroes the advisory units alone: an operator's
+                # units in the same cycle never depended on it.
+                unit_reasons = self._export_evidence_reasons(current_observations, policy, now_mono)
+            if unit_reasons or observation is None:
+                # ``_deny_reasons`` already denies a missing observation, so
+                # the None arm is the type-visible spelling of that fact.
+                denied[proposal.unit_id] = unit_reasons or {"observation_missing"}
+                limits[proposal.unit_id] = 0
+                expiries[proposal.unit_id] = now_mono
+                continue
+            limits[proposal.unit_id] = self._unit_limit(proposal, observation, policy)
+            expiries[proposal.unit_id] = min(
+                now_mono + policy.authorization_lifetime_s,
+                proposal.intent_expires_at_mono,
+                observation.captured_at_mono + policy.max_telemetry_age_s,
+                observation.cell_captured_at_mono + policy.max_cell_age_s,
+            )
+            if limits[proposal.unit_id] <= 0:
+                # Only units ASKED to deliver power can fail the
+                # dynamic-capability check; a zero-watt proposal was already
+                # skipped above as a non-participant by definition.
+                denied[proposal.unit_id] = {"zero_dynamic_capability"}
+
+        participating = [p for p in proposals if p.watts > 0 and p.unit_id not in denied]
+        if not participating:
+            # Nothing is deliverable anywhere: fail closed exactly like the
+            # all-zero allocation -- a REJECTED decision the kernel audits
+            # every tick, never an authorized empty grant.
+            combined: set[str] = set()
+            for unit_reasons in denied.values():
+                combined.update(unit_reasons)
             return ControlDecision(
                 DecisionStatus.REJECTED,
                 tuple(self._zero_setpoint(p, now_mono) for p in proposals),
-                tuple(sorted(reasons)),
+                tuple(sorted(combined)) or ("zero_dynamic_capability",),
             )
 
-        bounded = {p.unit_id: min(p.watts, limits[p.unit_id]) for p in proposals}
-        # Only units ASKED to deliver power can fail the dynamic-capability
-        # check. A zero-watt proposal (no usable headroom — a partially
-        # eligible fleet) is satisfied by definition and must not veto the
-        # units that can deliver.
-        if any(proposal.watts > 0 and bounded[proposal.unit_id] <= 0 for proposal in proposals):
-            return ControlDecision(
-                DecisionStatus.REJECTED,
-                tuple(self._zero_setpoint(p, now_mono) for p in proposals),
-                ("zero_dynamic_capability",),
+        bounded = {p.unit_id: min(p.watts, limits[p.unit_id]) for p in participating}
+        # Fleet limits apply PER DIRECTION across that direction's subtotal in
+        # this cycle (2026-08-24): fleet_charge_limit_w bounds the charge
+        # subtotal, fleet_discharge_limit_w the discharge subtotal -- never one
+        # blended budget.  A direction starved to zero by its own limit leaves
+        # its units as zero-watt non-participants while the other direction
+        # keeps its full budget.
+        clamped = False
+        by_direction: dict[Direction, list[str]] = {}
+        for proposal in participating:
+            by_direction.setdefault(proposal.direction, []).append(proposal.unit_id)
+        for direction, unit_ids in sorted(by_direction.items(), key=lambda item: item[0].value):
+            fleet_limit = (
+                policy.fleet_charge_limit_w
+                if direction is Direction.CHARGE
+                else policy.fleet_discharge_limit_w
             )
-        direction = proposals[0].direction
-        fleet_limit = (
-            policy.fleet_charge_limit_w
-            if direction is Direction.CHARGE
-            else policy.fleet_discharge_limit_w
-        )
-        bounded = self._apply_fleet_limit(bounded, fleet_limit)
-        clamped = any(bounded[p.unit_id] != p.watts for p in proposals)
+            group = self._apply_fleet_limit({u: bounded[u] for u in unit_ids}, fleet_limit)
+            clamped = clamped or any(
+                group[u] != next(p.watts for p in participating if p.unit_id == u) for u in unit_ids
+            )
+            bounded.update(group)
+        outcome_reasons: set[str] = set()
+        for unit_reasons in denied.values():
+            outcome_reasons.update(unit_reasons)
+        if clamped:
+            outcome_reasons.add("power_clamped")
         status = DecisionStatus.CLAMPED if clamped else DecisionStatus.AUTHORIZED
-        reason_codes = ("power_clamped",) if clamped else ("safety_checks_passed",)
+        reason_codes = tuple(sorted(outcome_reasons)) or ("safety_checks_passed",)
         setpoints = tuple(
             UnitSetpoint(
                 unit_id=p.unit_id,
                 direction=p.direction,
-                watts=bounded[p.unit_id],
+                watts=bounded.get(p.unit_id, 0),
                 generation=getattr(p, "generation", 0),
                 intent_id=p.intent_id,
                 authorization_expires_at_mono=expiries[p.unit_id],
@@ -159,9 +189,12 @@ class SafetyKernel:
         unit_ids = [getattr(proposal, "unit_id", None) for proposal in proposals]
         if len(set(unit_ids)) != len(unit_ids):
             reasons.add("duplicate_unit_setpoint")
-        directions = {getattr(proposal, "direction", None) for proposal in proposals}
-        if len(directions) != 1:
-            reasons.add("mixed_directions")
+        # Concurrent per-unit operation (2026-08-24): different units MAY carry
+        # different directions in one proposal set -- the fleet-wide
+        # ``mixed_directions`` rejection is gone.  Per-unit coherence is the
+        # control kernel's matcher (every proposal must bind to its unit's
+        # winning intent, direction included); the duplicate-unit defense here
+        # still refuses one unit proposed twice in any direction.
         for proposal in proposals:
             direction = getattr(proposal, "direction", None)
             watts = getattr(proposal, "watts", None)
