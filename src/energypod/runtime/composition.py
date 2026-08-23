@@ -2041,7 +2041,11 @@ def _control_policy(config: ControllerConfig) -> ControlPolicy:
         reactive_limit_var=configured.reactive_power_limit_var,
         stable_samples_needed_to_rearm=configured.stable_samples_to_rearm,
         blocking_fault_codes=frozenset(configured.blocking_fault_codes),
-        blocking_warning_codes=frozenset(),
+        # S1 (SYNC_RESILIENCE_AUDIT): the configured warning-tier blocking
+        # set reaches the policy instead of a hard-wired empty set -- the
+        # kernel's ``blocking_warning`` deny can now actually fire when a
+        # commissioning chooses warning bits to block on.
+        blocking_warning_codes=frozenset(configured.blocking_warning_codes),
         export_charge_limit_w=export_limit_w,
         export_headroom_margin_w=export_margin_w,
         export_telemetry_max_age_s=export_age_s,

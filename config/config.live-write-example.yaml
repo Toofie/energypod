@@ -140,9 +140,42 @@ policy:
   ramp_limit_w_per_s: 1000
   stable_samples_to_rearm: 3
   reactive_power_limit_var: 0
-  blocking_fault_codes:
-    - PCS_EE_CALIBRATION_OUT_OF_RANGE
-    - DCDC_EE_CALIBRATION_OUT_OF_RANGE
+  # ---------------------------------------------------------------------------
+  # BLOCKING FAULT/WARNING CODES — READ BEFORE EDITING (S1, 2026-08-24).
+  #
+  # The decoder generates codes in the format {prefix}_{bit} over the fault
+  # catalog's word prefixes (adapters/modbus/faults.py; PROTOCOL_EVIDENCE 9):
+  #   warning words: PCS_Warning0..3, DCDC_Warning0..3, Stack_Warning0,
+  #                  Becu0_Warning0..1
+  #   fault words:   PCS_Fault0..5, DCDC_Fault0..5, Stack_Fault0..1,
+  #                  Becu0_Fault0..3
+  # e.g. PCS_Fault0_1, Stack_Warning0_12, and the two EE-calibration signals
+  # below.  ANY other spelling (human names such as
+  # PCS_EE_CALIBRATION_OUT_OF_RANGE) can NEVER match a decoded code — the
+  # earlier revision of this file carried exactly such names and the intended
+  # block was silently inert (fail-open).
+  #
+  # The EE-calibration signals the operator intended to block are WARNING
+  # bits, not fault words:
+  #   PCS_Warning0_1  = "EE Calibration Parameter Out of Range"
+  #   DCDC_Warning0_1 = "EEPROM Calibration Parameter Out of Range"
+  # (PROTOCOL_EVIDENCE 9, confirmed by vendor code; both appear throughout
+  # the vendor's own logs.)
+  #
+  # THEY ARE DELIBERATELY NOT ENABLED HERE: both bits are STANDING-ACTIVE on
+  # all three pods of this fleet (live-capture-2026-08-22: PCS_Warning0 = 2
+  # and DCDC_Warning0 = 2 on mid, rhs and lhs alike), and the vendor evidence
+  # explicitly does not establish root cause, severity, or a safe reset for
+  # them.  Wiring them into blocking_warning_codes would therefore deny EVERY
+  # dispatch on this fleet — the mirror-image failure of the inert block.
+  # Enabling them is a commissioning decision: uncomment the two lines below
+  # only after the operator has ruled these warnings blocking-worthy.
+  # ---------------------------------------------------------------------------
+  blocking_fault_codes: []
+  # blocking_warning_codes:
+  #   - PCS_Warning0_1
+  #   - DCDC_Warning0_1
+  blocking_warning_codes: []
   debug_modes_enabled: false
 
 authentication:

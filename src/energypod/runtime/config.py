@@ -212,6 +212,15 @@ class PolicyConfig(_FrozenModel):
     stable_samples_to_rearm: PositiveStrictInt
     reactive_power_limit_var: NonNegativeStrictInt
     blocking_fault_codes: tuple[NonEmpty, ...]
+    # SYNC_RESILIENCE_AUDIT S1 (2026-08-24): the decoder generates fault and
+    # warning codes as "{prefix}_{bit}" over the fault catalog's word
+    # prefixes -- the EE-calibration signals are WARNING bits decoded as
+    # PCS_Warning0_1 and DCDC_Warning0_1 (PROTOCOL_EVIDENCE 9) -- so warning-
+    # tier blocks need their own configurable set.  Empty by default: the
+    # commissioning decision of WHICH warning bits block belongs to the
+    # operator (both calibration bits are standing-active on this fleet, so
+    # enabling them as blocking denies every dispatch).
+    blocking_warning_codes: tuple[NonEmpty, ...] = ()
     debug_modes_enabled: StrictBool
 
     @field_validator("threshold_provenance")
@@ -232,6 +241,14 @@ class PolicyConfig(_FrozenModel):
         cleaned = tuple(_plain(value, label="blocking fault code") for value in values)
         if len(set(cleaned)) != len(cleaned):
             raise ValueError("blocking fault codes must be unique")
+        return cleaned
+
+    @field_validator("blocking_warning_codes")
+    @classmethod
+    def validate_warning_codes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned = tuple(_plain(value, label="blocking warning code") for value in values)
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("blocking warning codes must be unique")
         return cleaned
 
     @model_validator(mode="after")

@@ -1437,6 +1437,25 @@ def test_the_fleet_loop_promotes_cells_for_every_cell_derived_deny() -> None:
     assert promote(None) is False
 
 
+def test_configured_blocking_warning_codes_reach_the_composed_policy() -> None:
+    """SYNC_RESILIENCE_AUDIT S1: the wiring defect, fixed.
+
+    The composition hard-wired ``blocking_warning_codes`` to the empty set,
+    so the policy's ``blocking_warning`` deny could never fire no matter what
+    the configuration said -- the operator's intended EE-calibration block
+    was silently inert.  The configured set now reaches the composed policy
+    verbatim (the kernel's existing intersection check does the rest)."""
+    payload = _live_config_payload(with_control_configuration=True)
+    payload["policy"]["blocking_warning_codes"] = ["PCS_Warning0_1", "DCDC_Warning0_1"]
+    runtime = _build(_validate(payload))
+    assert runtime.policy.blocking_warning_codes == frozenset(
+        {"PCS_Warning0_1", "DCDC_Warning0_1"}
+    ), "the configured warning codes must reach the composed policy"
+
+    default = _build(_validate(_live_config_payload(with_control_configuration=True)))
+    assert default.policy.blocking_warning_codes == frozenset()
+
+
 async def test_the_system_overview_block_rides_the_cold_ring_not_a_once_per_process_read() -> None:
     """SYNC_RESILIENCE_AUDIT B5 + the SOC-incident read-plan follow-up.
 

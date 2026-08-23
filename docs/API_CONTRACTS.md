@@ -99,6 +99,18 @@ sequence monotonicity is non-decreasing: an unchanged cell sequence between cons
 observations is permitted because cell blocks poll less frequently than the control rate, with
 freshness enforced by the maximum cell age; a regressed cell sequence rejects.
 
+Blocking code vocabulary (SYNC_RESILIENCE_AUDIT S1, 2026-08-24): both `blocking_fault_codes` and
+`blocking_warning_codes` are configurable policy sets, and the codes they must carry are the
+decoder's GENERATED strings — format `{prefix}_{bit}` over the fault catalog's word prefixes
+(`PCS_Warning0_1`, `DCDC_Warning0_1`, `PCS_Fault0_0`, `Stack_Warning0_12`, ...; see
+`adapters/modbus/faults.py` and PROTOCOL_EVIDENCE 9). The two EE-calibration signals the live
+config once named in human terms are WARNING bits — `PCS_Warning0_1` ("EE Calibration Parameter
+Out of Range") and `DCDC_Warning0_1` ("EEPROM Calibration Parameter Out of Range") — and the old
+human-name entries could never match a decoded code (silently inert, fail-open). Both bits are
+standing-active on this fleet's three pods and their severity is not established by the vendor
+evidence, so the shipped example documents them without enabling them; the composition now wires
+the configured warning set through to the policy instead of a hard-wired empty set.
+
 #### BMS-authoritative SOC (2026-08-24)
 
 The operator's ruling (2026-08-24): "I don't think it should get blocked like this. If there's a

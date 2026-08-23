@@ -392,6 +392,40 @@ def test_valid_config_is_frozen_and_retains_explicit_profiles() -> None:
         parsed.revision = 8
 
 
+# --- SYNC_RESILIENCE_AUDIT S1: blocking warning codes are configurable ----------
+#
+# The decoder generates fault/warning codes as "{prefix}_{bit}" over the fault
+# catalog's word prefixes (PCS_Warning0_1, DCDC_Warning0_1, PCS_Fault0_0,
+# Stack_Warning0_12, ...), so the old human-name config entries could never
+# match anything.  The EE-calibration signals the operator meant to block are
+# WARNING bits (PROTOCOL_EVIDENCE 9), and the composition hard-wired
+# blocking_warning_codes to the empty set -- the block was silently inert.
+
+
+def test_blocking_warning_codes_are_configurable_and_default_empty() -> None:
+    parsed = _validate(_valid_config())
+    assert parsed.policy is not None
+    assert parsed.policy.blocking_warning_codes == ()
+
+    payload = _valid_config()
+    payload["policy"]["blocking_warning_codes"] = ["PCS_Warning0_1", "DCDC_Warning0_1"]
+    parsed = _validate(payload)
+    assert parsed.policy is not None
+    assert parsed.policy.blocking_warning_codes == ("PCS_Warning0_1", "DCDC_Warning0_1")
+
+
+def test_blocking_warning_codes_must_be_unique_and_normalized() -> None:
+    payload = _valid_config()
+    payload["policy"]["blocking_warning_codes"] = ["PCS_Warning0_1", "PCS_Warning0_1"]
+    with pytest.raises(ValidationError, match="unique"):
+        _validate(payload)
+
+    payload = _valid_config()
+    payload["policy"]["blocking_warning_codes"] = [" PCS_Warning0_1"]
+    with pytest.raises(ValidationError):
+        _validate(payload)
+
+
 # --- excess-solar accelerated charging gates (API_CONTRACTS "Excess-solar
 # --- accelerated charging (advisory)") ----------------------------------------
 #
