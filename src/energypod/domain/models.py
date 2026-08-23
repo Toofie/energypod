@@ -239,6 +239,16 @@ class ControlPolicy(BaseModel):
             raise ValueError("percentage policy values must be between zero and 100")
         return value
 
+    @field_validator("max_soc_jump_pct", "max_soc_disagreement_pct")
+    @classmethod
+    def _positive_percentage(cls, value: float) -> float:
+        # A zero SOC-jump or zero SOC-disagreement tolerance is a degenerate
+        # policy: every live observation would violate it, so the fleet could
+        # never re-arm.  These two tolerances must be strictly positive.
+        if value <= 0:
+            raise ValueError("SOC jump and disagreement tolerances must be positive")
+        return value
+
     @field_validator(
         "min_cell_voltage_v",
         "max_cell_voltage_v",

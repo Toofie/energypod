@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import weakref
 from collections import deque
 from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
@@ -24,6 +25,7 @@ from typing import Any, Protocol
 _RESYNC_TYPE = "resync"
 _RESYNC_STALE_CURSOR = "retention_window_exceeded"
 _RESYNC_SLOW_CONSUMER = "slow_subscriber"
+_RESYNC_FUTURE_CURSOR = "future_cursor"
 # The bus overwrites these envelope fields on every publication; a caller
 # supplying them is untrusted input, exactly like a forged audit sequence.
 _SERVER_ASSIGNED_KEYS = frozenset({"sequence", "occurred_at"})
@@ -44,14 +46,29 @@ def _build_envelope(body: Mapping[str, Any], *, sequence: int, occurred_at: str)
     event_type = body.get("type")
     if not isinstance(event_type, str) or not event_type:
         raise ValueError("a published event body requires a non-empty string type")
+    if any(not isinstance(key, str) for key in body):
+        # json.dumps would silently stringify non-string keys, leaving the
+        # in-memory envelope and the wire shape naming different fields.
+        raise TypeError("published event body keys must be strings")
+    if "payload" in body and not isinstance(body["payload"], Mapping):
+        # The consumption contract publishes payload objects; a scalar or
+        # array payload is a shape mistake, not a vocabulary choice.
+        raise TypeError("a published event payload must be a mapping")
     envelope = {key: value for key, value in body.items() if key not in _SERVER_ASSIGNED_KEYS}
-    envelope.setdefault("payload", {})
+    # Canonicalize the payload out of any Mapping (a MappingProxyType or the
+    # domain's frozen mappings are contract-legal payloads but not JSON
+    # natively); nested exotic mappings still fail closed below.
+    envelope["payload"] = dict(envelope.get("payload", {}))
     envelope["sequence"] = sequence
     envelope["occurred_at"] = occurred_at
-    # Fail closed at the publisher: an event that cannot be serialized must
-    # surface here rather than silently break every downstream subscriber.
-    json.dumps(envelope, allow_nan=False)
-    return envelope
+    # Fail closed at the publisher AND detach from caller-owned objects: the
+    # envelope is re-materialized from its own JSON encoding, so an event that
+    # cannot be serialized surfaces here (never silently breaking a downstream
+    # subscriber), and a caller mutating or aliasing its payload after publish
+    # can never reach the retention window or another subscriber's queue.  The
+    # retained copy is exactly the wire shape.
+    detached: dict[str, Any] = json.loads(json.dumps(envelope, ensure_ascii=False, allow_nan=False))
+    return detached
 
 
 def _resync_marker(reason: str, snapshot_sequence: int) -> dict[str, Any]:
@@ -85,6 +102,13 @@ class _Subscription:
         # delivered after the marker.
         self._pending_resync = resync
         self._closed = False
+        # The bus keeps only this weak reference, so a subscription abandoned
+        # without ``aclose`` (a disconnected client whose adapter never ran
+        # its finally block) is garbage-collected instead of being drained on
+        # every publish forever.  The reference lives on the subscription so
+        # ``_detach`` removes exactly its own entry: distinct ``weakref.ref``
+        # objects to the same subscription never compare equal.
+        self._self_reference = weakref.ref(self)
         for event in replay:
             self._queue.put_nowait(event)
 
@@ -178,7 +202,7 @@ class EventBus:
         self._clock = clock
         self._queue_capacity = queue_capacity
         self._window: deque[dict[str, Any]] = deque(maxlen=retention)
-        self._subscribers: list[_Subscription] = []
+        self._subscribers: list[weakref.ReferenceType[_Subscription]] = []
         self._sequence = 0
 
     async def publish(self, body: Mapping[str, Any]) -> int:
@@ -193,7 +217,14 @@ class EventBus:
         # order and a failed publication consumes no sequence at all.
         self._sequence = sequence
         self._window.append(envelope)
-        for subscriber in tuple(self._subscribers):
+        for reference in tuple(self._subscribers):
+            subscriber = reference()
+            if subscriber is None:
+                # The subscription was abandoned without aclose: reclaim its
+                # entry instead of draining a dead queue on every publish.
+                with suppress(ValueError):
+                    self._subscribers.remove(reference)
+                continue
             subscriber.offer(envelope)
         return sequence
 
@@ -218,7 +249,7 @@ class EventBus:
             replay=replay,
             resync=resync,
         )
-        self._subscribers.append(subscription)
+        self._subscribers.append(subscription._self_reference)
         return subscription
 
     def _subscription_start(
@@ -227,6 +258,18 @@ class EventBus:
         if after_sequence is None:
             # A cursor-less subscription is live-only; it never replays.
             return self._sequence, (), None
+        if isinstance(after_sequence, bool) or not isinstance(after_sequence, int):
+            raise TypeError("after_sequence must be an integer or None")
+        if after_sequence < 0:
+            raise ValueError("after_sequence must be a non-negative integer")
+        if after_sequence > self._sequence:
+            # A cursor ahead of the live edge names history that does not
+            # exist: the client's view is desynchronized (for example carried
+            # over from another process instance).  Saying nothing would
+            # silently suppress every event up to the fabricated sequence, so
+            # the subscriber is told to resynchronize from the live snapshot
+            # instead and then continues from the live edge.
+            return self._sequence, (), (_RESYNC_FUTURE_CURSOR, self._sequence)
         if self._window:
             oldest = self._window[0]["sequence"]
             if after_sequence < oldest - 1:
@@ -253,8 +296,9 @@ class EventBus:
         return now.isoformat()
 
     def _detach(self, subscription: _Subscription) -> None:
+        reference = subscription._self_reference
         with suppress(ValueError):
-            self._subscribers.remove(subscription)
+            self._subscribers.remove(reference)
 
 
 __all__ = ["Clock", "EventBus"]

@@ -224,6 +224,36 @@ def test_non_monotonic_source_event_closes_stream_instead_of_forwarding_it() -> 
     assert terminal["reason"] == "non_monotonic_event"
 
 
+def test_publisher_event_typed_resync_required_is_delivered_not_terminal() -> None:
+    # Deferred P2 (implementation review 2026-08-22): the consumer treated ANY
+    # frame typed ``resync_required`` as its own terminate marker, so one
+    # publisher event using that vocabulary string closed every client stream.
+    # The adapter's own control frames never carry a sequence; a published
+    # event always carries the bus-assigned one, so the stream must deliver it
+    # and keep flowing.
+    source = FakeEventSource(
+        [
+            {"sequence": 21, "type": "resync_required", "payload": {"note": "publisher event"}},
+            {"sequence": 22, "type": "observation.updated", "payload": {"index": 1}},
+        ]
+    )
+    with (
+        TestClient(_app(RecordingEnergyService(), source)) as client,
+        client.websocket_connect(
+            "/api/v1/events", headers={"Authorization": "Bearer viewer-token"}
+        ) as websocket,
+    ):
+        assert websocket.receive_json()["type"] == "snapshot"
+        first = websocket.receive_json()
+        second = websocket.receive_json()
+
+    assert first["type"] == "resync_required"
+    assert first["sequence"] == 21
+    assert second["type"] == "observation.updated"
+    assert second["sequence"] == 22
+    assert source.subscriptions == [20]
+
+
 @pytest.mark.parametrize(
     "events, reason",
     [

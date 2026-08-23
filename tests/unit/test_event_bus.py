@@ -12,9 +12,11 @@ is reported as an ordinary test failure.
 from __future__ import annotations
 
 import asyncio
+import gc
 import importlib
 import json
 import re
+import weakref
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
@@ -640,4 +642,159 @@ async def test_subscription_matches_the_adapter_eventsource_shape(bus_module: An
     event = await next_event(iterator)
     assert isinstance(event, dict)
     assert isinstance(event.get("sequence"), int) and not isinstance(event.get("sequence"), bool)
+    await close_subscription(iterator)
+
+
+async def test_publishing_detaches_the_envelope_from_caller_owned_objects(
+    bus_module: Any,
+) -> None:
+    # Deferred P2 (implementation review 2026-08-22): JSON enforcement was
+    # bypassable by mutating a payload after publish — retention and other
+    # subscribers would then hold non-serializable envelopes.  The retained
+    # copy must be the wire shape, immune to later caller mutation.
+    bus = make_bus(bus_module, retention=8, queue_capacity=8)
+    live = bus.subscribe(after_sequence=0)
+    payload: dict[str, Any] = {"watts": 900}
+    await bus.publish({"type": "observation.updated", "payload": payload})
+    payload["watts"] = object()  # non-serializable, post-publish mutation
+    event = await next_event(live)
+    assert event is not _EXHAUSTED and event["payload"] == {"watts": 900}
+    replay = bus.subscribe(after_sequence=0)
+    replayed = await next_event(replay)
+    assert replayed is not _EXHAUSTED and replayed["payload"] == {"watts": 900}
+    await close_subscription(live)
+    await close_subscription(replay)
+
+
+async def test_nested_non_serializable_payload_fails_the_publish(bus_module: Any) -> None:
+    # Fail-closed must reach nested values, not only the top-level body.
+    bus = make_bus(bus_module)
+    with pytest.raises((TypeError, ValueError)):
+        await bus.publish({"type": "observation.updated", "payload": {"cause": object()}})
+    assert bus.snapshot_sequence() == 0, "a failed publication consumes no sequence"
+
+
+async def test_future_cursor_gets_an_explicit_resync_marker_not_a_dead_stream(
+    bus_module: Any,
+) -> None:
+    # Deferred P2 (implementation review 2026-08-22): a cursor ahead of the
+    # live edge used to produce a silently dead iterator.  It is a
+    # desynchronized client (its sequence can only come from another process
+    # instance): the first delivery is an explicit marker naming the live
+    # snapshot, and the stream continues from the live edge.
+    bus = make_bus(bus_module, retention=8, queue_capacity=8)
+    await publish_events(bus, start=0, count=2)
+    iterator = bus.subscribe(after_sequence=99)
+    marker = await next_event(iterator)
+    assert is_resync_marker(marker), f"expected a discontinuity marker, got {marker!r}"
+    assert marker["reason"] == "future_cursor"
+    assert marker["snapshot_sequence"] == 2
+    await publish_event(bus, "observation.updated", {"index": 2})
+    event = await next_event(iterator)
+    assert event is not _EXHAUSTED and event["sequence"] == 3
+    await close_subscription(iterator)
+
+
+async def test_an_empty_bus_still_flags_a_future_cursor(bus_module: Any) -> None:
+    # Sequence 0 live edge: any positive cursor is fabricate history.
+    bus = make_bus(bus_module)
+    iterator = bus.subscribe(after_sequence=1)
+    marker = await next_event(iterator)
+    assert is_resync_marker(marker), f"expected a discontinuity marker, got {marker!r}"
+    assert marker["snapshot_sequence"] == 0
+    await close_subscription(iterator)
+
+
+@pytest.mark.parametrize("cursor", [-1, -100])
+def test_negative_cursors_are_rejected_input(bus_module: Any, cursor: int) -> None:
+    bus = make_bus(bus_module)
+    with pytest.raises(ValueError):
+        bus.subscribe(after_sequence=cursor)
+
+
+def test_boolean_cursors_are_rejected_input(bus_module: Any) -> None:
+    bus = make_bus(bus_module)
+    with pytest.raises(TypeError):
+        bus.subscribe(after_sequence=True)  # type: ignore[arg-type]
+
+
+def test_abandoned_subscriptions_do_not_stay_referenced_by_the_bus(
+    bus_module: Any,
+) -> None:
+    # Deferred P2 (implementation review 2026-08-22): a subscription abandoned
+    # without aclose stayed in the bus's subscriber list forever, costing an
+    # O(capacity) drain on every publish.  The bus may hold only weak
+    # references: once the caller drops the iterator, the subscription is
+    # garbage-collected (and the next publish reclaims its entry).
+    bus = make_bus(bus_module, retention=8, queue_capacity=8)
+    iterator = bus.subscribe(after_sequence=0)
+    reference = weakref.ref(iterator)
+    del iterator
+    gc.collect()
+    assert reference() is None, "the bus must not keep an abandoned subscription alive"
+
+
+async def test_publish_after_abandonment_still_fans_out_to_live_subscribers(
+    bus_module: Any,
+) -> None:
+    bus = make_bus(bus_module, retention=8, queue_capacity=8)
+    abandoned = bus.subscribe(after_sequence=0)
+    del abandoned
+    gc.collect()
+    live = bus.subscribe(after_sequence=0)
+    await publish_event(bus, "observation.updated", {"index": 0})
+    event = await next_event(live)
+    assert event is not _EXHAUSTED and event["sequence"] == 1
+    await close_subscription(live)
+
+
+async def test_aclose_detaches_so_later_publishes_reach_no_closed_queue(
+    bus_module: Any,
+) -> None:
+    bus = make_bus(bus_module, retention=8, queue_capacity=8)
+    closed = bus.subscribe(after_sequence=0)
+    await close_subscription(closed)
+    retained = weakref.ref(closed)
+    del closed
+    gc.collect()
+    live = bus.subscribe(after_sequence=0)
+    await publish_events(bus, start=0, count=3)
+    events = await drain(live, 3)
+    assert [event["sequence"] for event in events] == [1, 2, 3]
+    await close_subscription(live)
+    assert retained() is None
+
+
+@pytest.mark.parametrize(
+    "body, error",
+    [
+        ({"type": "observation.updated", 1: "x"}, TypeError),
+        ({"type": "observation.updated", "payload": [1, 2]}, TypeError),
+        ({"type": "observation.updated", "payload": "text"}, TypeError),
+    ],
+)
+async def test_non_json_object_shapes_are_rejected_at_publish(
+    bus_module: Any, body: dict[str, Any], error: type[Exception]
+) -> None:
+    # Deferred P2 (implementation review 2026-08-22): non-string keys were
+    # silently stringified by json.dumps (in-memory and wire shapes diverging)
+    # and non-mapping payloads were accepted against the documented payload
+    # object contract.
+    bus = make_bus(bus_module)
+    with pytest.raises(error):
+        await bus.publish(body)
+    assert bus.snapshot_sequence() == 0
+
+
+async def test_mapping_proxy_payload_is_served_as_a_plain_wire_dict(
+    bus_module: Any,
+) -> None:
+    from types import MappingProxyType
+
+    bus = make_bus(bus_module, retention=8, queue_capacity=8)
+    iterator = bus.subscribe(after_sequence=0)
+    await bus.publish({"type": "observation.updated", "payload": MappingProxyType({"watts": 900})})
+    event = await next_event(iterator)
+    assert event is not _EXHAUSTED
+    assert type(event["payload"]) is dict and event["payload"] == {"watts": 900}
     await close_subscription(iterator)
