@@ -15,12 +15,14 @@ import { ActivityView } from "./views/activity/ActivityView";
 import { BatteriesView } from "./views/batteries/BatteriesView";
 import { HomeView } from "./views/home/HomeView";
 import { NowView } from "./views/now/NowView";
+import { ScheduleView } from "./views/schedule/ScheduleView";
 import "./styles.css";
 
 const views: ViewRegistry = {
   home: HomeView,
   batteries: BatteriesView,
   now: NowView,
+  schedule: ScheduleView,
   activity: ActivityView,
 } satisfies Partial<Record<ViewId, ShellView>>;
 

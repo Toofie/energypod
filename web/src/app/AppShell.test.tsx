@@ -1481,12 +1481,15 @@ describe("AppShell — navigation", () => {
     // Home is the default view.
     expect(within(nav).getByRole("link", { name: "Home", current: "page" })).toBeVisible();
 
-    for (const name of ["Batteries", "Now", "Activity"]) {
+    for (const name of ["Batteries", "Now", "Schedule", "Activity"]) {
       expect(within(nav).getByRole("link", { name })).toBeVisible();
     }
 
-    // Every not-yet-built view says so and is never a dead link.
-    for (const name of ["Energy Flow", "Insights", "Schedule", "Plan history"]) {
+    // Every not-yet-built view says so and is never a dead link. Schedule is
+    // deliberately NOT here anymore: its nav link is always offered and the
+    // view itself answers a not-commissioned deployment honestly (the pinned
+    // decision in views.ts).
+    for (const name of ["Energy Flow", "Insights", "Plan history"]) {
       expect(within(nav).queryByRole("link", { name: new RegExp(name, "i") })).toBeNull();
       const entry = within(nav).getByRole("listitem", { name: new RegExp(name, "i") });
       expectVisibleText(entry, /not available|coming soon|not yet/i);
@@ -1524,6 +1527,11 @@ describe("AppShell — navigation", () => {
     const nowLink = within(nav).getByRole("link", { name: "Now" });
     expect(nowLink).toHaveFocus();
     expect(nowLink).toBeVisible();
+
+    await user.tab();
+    const scheduleLink = within(nav).getByRole("link", { name: "Schedule" });
+    expect(scheduleLink).toHaveFocus();
+    expect(scheduleLink).toBeVisible();
 
     await user.tab();
     const activity = within(nav).getByRole("link", { name: "Activity" });

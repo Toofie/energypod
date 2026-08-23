@@ -1,0 +1,481 @@
+/*
+ * Schedule view styling — the same calm household product language as the
+ * other views: cards, quiet labels, no color-only meaning, motion honored
+ * behind prefers-reduced-motion (nothing here animates at all — the list is a
+ * form, the states are words).
+ */
+
+.schedule-view {
+  display: grid;
+  gap: 1rem;
+  max-width: 52rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+.schedule-card {
+  padding: 1rem 1.25rem;
+  border: 1px solid #e2e0da;
+  border-radius: 0.9rem;
+  background: #fffdf9;
+  box-shadow: 0 1px 2px rgb(60 50 30 / 6%);
+}
+
+.schedule-card h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.05rem;
+  line-height: 1.3;
+  color: #3f3a30;
+}
+
+.schedule-card--absent,
+.schedule-card--error {
+  border-color: #d9c8a8;
+}
+
+.schedule-loading {
+  margin: 0;
+  color: #3f3a30;
+}
+
+.schedule-policy-line {
+  margin: 0 0 0.5rem;
+  color: #3f3a30;
+}
+
+.schedule-plan-line {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+  color: #57534e;
+}
+
+.schedule-timezone-line {
+  margin: 0;
+  font-size: 0.9rem;
+  color: #57534e;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.schedule-timezone-edit input {
+  margin-left: 0.25rem;
+}
+
+.schedule-timezone-line code {
+  background: #f5f2ea;
+  border-radius: 0.35rem;
+  padding: 0.05rem 0.35rem;
+}
+
+.schedule-notice {
+  margin: 0;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid #c9e2ce;
+  border-radius: 0.7rem;
+  background: #f2f9f3;
+  color: #22543d;
+}
+
+.schedule-conflict {
+  padding: 0.75rem 1rem;
+  border: 1px solid #e2c9a8;
+  border-radius: 0.7rem;
+  background: #fdf6ec;
+}
+
+.schedule-conflict p {
+  margin: 0 0 0.5rem;
+  color: #5f4a24;
+}
+
+.schedule-refusal {
+  padding: 0.75rem 1rem;
+  border: 1px solid #e5b8b8;
+  border-radius: 0.7rem;
+  background: #fdf2f2;
+}
+
+.schedule-refusal p {
+  margin: 0 0 0.5rem;
+  color: #6b2f2f;
+}
+
+.schedule-refusal-verbatim {
+  font-size: 0.9rem;
+}
+
+.schedule-refusal-verbatim code {
+  background: #f7ecec;
+  border-radius: 0.35rem;
+  padding: 0.05rem 0.35rem;
+}
+
+.schedule-refusal-offending {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.schedule-entries {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.9rem;
+}
+
+.schedule-entry {
+  padding: 0.9rem 1.1rem;
+  border: 1px solid #e2e0da;
+  border-radius: 0.9rem;
+  background: #fffdf9;
+}
+
+.schedule-entry[data-enabled="false"] {
+  background: #faf8f3;
+  border-style: dashed;
+}
+
+.schedule-entry-head {
+  display: flex;
+  align-items: end;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.schedule-entry-name {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: #57534e;
+  flex: 1 1 14rem;
+}
+
+.schedule-entry-name input {
+  font-size: 1rem;
+}
+
+.schedule-entry-summary {
+  margin: 0.5rem 0 0.75rem;
+  font-size: 0.92rem;
+  color: #3f3a30;
+}
+
+.schedule-entry fieldset {
+  border: 1px solid #e7e4dc;
+  border-radius: 0.6rem;
+  margin: 0 0 0.6rem;
+  padding: 0.5rem 0.75rem 0.6rem;
+}
+
+.schedule-entry legend {
+  font-size: 0.8rem;
+  color: #57534e;
+  padding: 0 0.35rem;
+}
+
+.schedule-day,
+.schedule-unit,
+.schedule-direction {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-right: 0.75rem;
+  font-size: 0.92rem;
+  color: #3f3a30;
+}
+
+.schedule-entry-times {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 0.4rem;
+}
+
+.schedule-entry-times label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: #57534e;
+}
+
+.schedule-time-hint {
+  margin: 0 0 0.6rem;
+  font-size: 0.85rem;
+  color: #78716c;
+}
+
+.schedule-idle-note,
+.schedule-no-units {
+  margin: 0.35rem 0 0;
+  font-size: 0.85rem;
+  color: #78716c;
+}
+
+.schedule-entry-watts {
+  margin-bottom: 0.6rem;
+}
+
+.schedule-watts-head {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  font-size: 0.85rem;
+  color: #57534e;
+  margin-bottom: 0.4rem;
+}
+
+.schedule-same-for-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+
+.schedule-watts-units {
+  list-style: none;
+  margin: 0 0 0.4rem;
+  padding: 0;
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.schedule-watts-units label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: #57534e;
+}
+
+.schedule-watts-total {
+  margin: 0;
+  font-size: 0.88rem;
+  color: #57534e;
+}
+
+.schedule-watts-scalar {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: #57534e;
+  max-width: 14rem;
+}
+
+.schedule-guard {
+  margin: 0.4rem 0 0.6rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.6rem;
+  border: 1px solid #e2c9a8;
+  background: #fdf6ec;
+  color: #5f4a24;
+  font-size: 0.9rem;
+}
+
+.schedule-guard--blocking {
+  border-color: #e5b8b8;
+  background: #fdf2f2;
+  color: #6b2f2f;
+}
+
+.schedule-field-error {
+  margin: 0.25rem 0 0.5rem;
+  color: #a13434;
+  font-size: 0.88rem;
+}
+
+.schedule-switch {
+  border: 1px solid #c9c4ba;
+  border-radius: 999px;
+  background: #f5f2ea;
+  color: #57534e;
+  padding: 0.25rem 0.9rem;
+  font-weight: 600;
+}
+
+.schedule-switch.is-on {
+  border-color: #9ae6b4;
+  background: #f0fff4;
+  color: #276749;
+}
+
+.schedule-remove {
+  border: none;
+  background: none;
+  color: #8a6d3b;
+  text-decoration: underline;
+  padding: 0.25rem 0;
+}
+
+.schedule-advanced {
+  margin-top: 0.4rem;
+}
+
+.schedule-advanced-toggle {
+  border: 1px solid #d6d3d1;
+  border-radius: 0.5rem;
+  background: #fafaf9;
+  color: #57534e;
+  padding: 0.2rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.schedule-advanced-body {
+  margin-top: 0.5rem;
+  padding: 0.6rem 0.8rem;
+  border: 1px dashed #d6d3d1;
+  border-radius: 0.6rem;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.schedule-advanced-field {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  color: #57534e;
+  max-width: 16rem;
+}
+
+.schedule-entry-dates {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.schedule-actions {
+  display: grid;
+  gap: 0.5rem;
+  justify-items: start;
+}
+
+.schedule-add {
+  border: 1px solid #b8c4d4;
+  border-radius: 0.6rem;
+  background: #f2f6fb;
+  color: #2c5282;
+  padding: 0.4rem 0.9rem;
+  font-weight: 600;
+}
+
+.schedule-publish:not(:disabled) {
+  border: 1px solid #9ae6b4;
+  border-radius: 0.6rem;
+  background: #f0fff4;
+  color: #276749;
+  padding: 0.45rem 1rem;
+  font-weight: 700;
+}
+
+.schedule-publish:disabled {
+  border: 1px solid #d6d3d1;
+  border-radius: 0.6rem;
+  background: #f5f5f4;
+  color: #a8a29e;
+  padding: 0.45rem 1rem;
+  font-weight: 700;
+}
+
+.schedule-publish-state {
+  margin: 0;
+  font-size: 0.88rem;
+  color: #57534e;
+}
+
+.schedule-error-note {
+  color: #57534e;
+}
+
+.schedule-retry {
+  border: 1px solid #b8c4d4;
+  border-radius: 0.6rem;
+  background: #f2f6fb;
+  color: #2c5282;
+  padding: 0.35rem 0.9rem;
+}
+
+/* The night-posture dialog: same layering approach as the excess tile's. */
+.schedule-night-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  padding: 1.5rem;
+  background: rgb(30 25 15 / 45%);
+}
+
+.schedule-night-dialog > * {
+  width: min(34rem, 100%);
+}
+
+.schedule-night-dialog h2 {
+  color: #fffdf9;
+}
+
+.schedule-night-dialog p,
+.schedule-night-dialog blockquote {
+  color: #fffdf9;
+}
+
+.schedule-night-assertion {
+  font-style: italic;
+  border-left: 3px solid #9ae6b4;
+  padding-left: 0.75rem;
+  margin: 0.5rem 0;
+}
+
+.schedule-night-typed {
+  display: grid;
+  gap: 0.3rem;
+}
+
+.schedule-night-typed input {
+  padding: 0.4rem;
+  font-size: 1rem;
+}
+
+.schedule-refusal--dialog {
+  background: rgb(253 242 242 / 92%);
+}
+
+.schedule-refusal--dialog p {
+  color: #6b2f2f;
+}
+
+.schedule-dialog-actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: flex-end;
+}
+
+.schedule-night-confirm:not(:disabled) {
+  border: 1px solid #9ae6b4;
+  background: #f0fff4;
+  color: #276749;
+  border-radius: 0.6rem;
+  padding: 0.4rem 0.9rem;
+  font-weight: 700;
+}
+
+.schedule-night-confirm:disabled {
+  border: 1px solid #d6d3d1;
+  background: #f5f5f4;
+  color: #a8a29e;
+  border-radius: 0.6rem;
+  padding: 0.4rem 0.9rem;
+}
+
+.schedule-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

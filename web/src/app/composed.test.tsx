@@ -14,7 +14,7 @@
  *
  * Composition under test (the exact wiring of web/src/main.tsx):
  * - AppShell with the real view registry — HomeView, BatteriesView, NowView,
- *   ActivityView — assigned directly against `ViewRegistry` so a prop drift
+ *   ScheduleView, ActivityView — assigned directly against `ViewRegistry` so a prop drift
  *   at this seam is a compile error here too (main.tsx mounts on import, so
  *   its registry const cannot be imported; this replica is kept verbatim and
  *   type-checked with the same `satisfies` constraint, never adapted/cast).
@@ -45,6 +45,7 @@ import { ActivityView } from "../views/activity/ActivityView";
 import { BatteriesView } from "../views/batteries/BatteriesView";
 import { HomeView } from "../views/home/HomeView";
 import { NowView } from "../views/now/NowView";
+import { ScheduleView } from "../views/schedule/ScheduleView";
 import type { Health } from "../api/client";
 import {
   activeStop,
@@ -75,6 +76,7 @@ const views: ViewRegistry = {
   home: HomeView,
   batteries: BatteriesView,
   now: NowView,
+  schedule: ScheduleView,
   activity: ActivityView,
 } satisfies Partial<Record<ViewId, ShellView>>;
 

@@ -23,7 +23,7 @@ export type ShellView = ComponentType<ShellViewProps>;
 /** The injection map the shell is handed (main.tsx assigns real views into it). */
 export type ViewRegistry = Partial<Record<ViewId, ShellView>>;
 
-export type ViewId = "home" | "batteries" | "now" | "activity";
+export type ViewId = "home" | "batteries" | "now" | "schedule" | "activity";
 
 export interface ViewDescriptor {
   id: ViewId;
@@ -35,11 +35,18 @@ export const VIEWS: readonly ViewDescriptor[] = [
   { id: "home", label: "Home" },
   { id: "batteries", label: "Batteries" },
   { id: "now", label: "Now" },
+  { id: "schedule", label: "Schedule" },
   { id: "activity", label: "Activity" },
 ];
 
 /**
  * Views contracted but not built in this milestone: honest not-yet entries,
  * never dead links (UI_CONTRACTS.md "Scope").
+ *
+ * "Schedule" was promoted out of this list when its view landed. The pinned
+ * decision (DESIGN_SCHEDULES.md §6 deviates deliberately): the nav link is
+ * ALWAYS offered and the view itself answers a not-commissioned deployment
+ * honestly — the excess tile's own pattern ("not commissioned in this
+ * deployment's config") — instead of hiding behind a not-yet placeholder.
  */
-export const PLANNED_VIEWS: readonly string[] = ["Energy flow", "Insights", "Schedule", "Plan history"];
+export const PLANNED_VIEWS: readonly string[] = ["Energy flow", "Insights", "Plan history"];
