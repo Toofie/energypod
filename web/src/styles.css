@@ -457,6 +457,50 @@ main.dimmed {
   color: var(--ink-soft);
 }
 
+/* --- the per-unit recovery health badge (self-healing awareness layer) ----
+ * Shared by the Batteries cards and Home's per-unit power entries. The tag
+ * renders ONLY for the states that owe the operator a word: quiet-positive
+ * while a battery manages itself, a warning while a commanded battery is not
+ * moving, the prominent honest terminal when remote recovery is exhausted,
+ * and the gateway-class name. Healthy units render nothing at all. */
+.unit-health {
+  margin: 0.2rem 0 0.4rem;
+  padding: 0.15rem 0.6rem;
+  border: 1px solid;
+  border-radius: 8px;
+  font-size: 0.9em;
+  line-height: 1.45;
+}
+
+/* Quiet positive: the battery is managing itself and needs nothing. */
+.unit-health--healing {
+  color: var(--yes);
+  border-color: #9ae6b4;
+  background: #f0fff4;
+}
+
+/* Warning: we commanded power and the battery is not moving. */
+.unit-health--warning {
+  color: var(--warn);
+  border-color: #e9c46a;
+  background: var(--warn-surface);
+}
+
+/* The honest terminal: remote recovery is exhausted, or the gateway path is
+ * down. The remediation hint renders verbatim beneath the tag line. */
+.unit-health--critical {
+  color: var(--no);
+  border-color: #f0b4ae;
+  background: #fdf3f2;
+}
+
+.unit-health-hint {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--ink-soft);
+  font-size: 0.95em;
+}
+
 /* --- reduced motion ------------------------------------------------------ */
 
 @media (prefers-reduced-motion: reduce) {
