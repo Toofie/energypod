@@ -680,6 +680,7 @@ class ExcessAdviserController:
         self._last_tick_at = clock.wall_now().isoformat()
         # §2 publication state.
         self._published_tuple: tuple[Any, ...] | None = None
+        self._published_enabled: bool | None = None
         self._last_publish_mono: float | None = None
 
     def bind_adviser(self, adviser: ExcessChargeAdviser) -> None:
@@ -754,8 +755,19 @@ class ExcessAdviserController:
             hysteresis = "entering"
         if verdict is None or active:
             # Participating (or still holding through the pre-withdraw
-            # transient): the tick's own codes and target, VERBATIM.
+            # transient): the tick's own codes and target, VERBATIM — plus
+            # the rollup's own word when the evidence collapsed.  The tick
+            # cannot distinguish a collapsed bound from a small export; the
+            # vocabulary's definition of ``no_export_headroom`` ("evidence
+            # good but export at or below the margin") can, so the collapsed
+            # frame carries the evidence code instead — one vocabulary, never
+            # two codes for the same fact.
             reason_codes = self._last_reason_codes
+            if self._last_evidence != "good":
+                reason_codes = (
+                    f"export_evidence_{self._last_evidence}",
+                    *(code for code in reason_codes if code != "no_export_headroom"),
+                )
             target_unit_id = self._last_target
             commanded = self._last_proposed_w if self._last_action in ("propose", "renew") else 0
         else:
@@ -790,10 +802,13 @@ class ExcessAdviserController:
         Publishes ``excess_adviser.state_changed`` only when the semantic
         tuple changes — watt figures ride but never trigger — and, while
         ``enabled`` is true, republishes the full payload as a heartbeat
-        every ``heartbeat_period_s``.  While disabled, no heartbeat: the
-        state_changed to disabled is the last event.  A publication failure
-        propagates to the fleet loop's suppression (the projection write
-        above has already landed); it never gates control.
+        every ``heartbeat_period_s``.  While disabled, nothing publishes at
+        all, before or after: the state_changed that CARRIES the disable is
+        the last event (a boot-composed disabled site therefore never
+        publishes — the stream's authoritative first snapshot frame carries
+        the projection instead).  A publication failure propagates to the
+        fleet loop's suppression (the projection write above has already
+        landed); it never gates control.
         """
         self._last_action = decision.action
         self._last_target = decision.target_unit_id
@@ -810,6 +825,10 @@ class ExcessAdviserController:
         now_mono = float(self._clock.monotonic())
         heartbeat = False
         if semantic != self._published_tuple:
+            if not state.enabled and self._published_enabled is not True:
+                # Disabled (or boot-composed disabled) with no enabled state
+                # published before it: there is no transition to announce.
+                return
             heartbeat = False
         elif state.enabled and (
             self._last_publish_mono is None
@@ -825,6 +844,7 @@ class ExcessAdviserController:
             }
         )
         self._published_tuple = semantic
+        self._published_enabled = state.enabled
         self._last_publish_mono = now_mono
 
 

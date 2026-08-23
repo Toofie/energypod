@@ -91,6 +91,7 @@ from energypod.application.audit import AuditEventFactory
 from energypod.application.control_kernel import ControlKernel
 from energypod.application.events import EventBus
 from energypod.application.excess_charge import (
+    ExcessAdviserController,
     ExcessChargeAdviser,
     ExcessChargeSettings,
     eligible_export_charge_w,
@@ -1597,6 +1598,7 @@ class _Supervision:
         process_instance_id: str,
         process_origin_mono: float,
         adviser: ExcessChargeAdviser | None = None,
+        excess_controller: ExcessAdviserController | None = None,
         intents: _AsyncIntentRepository | None = None,
         observations: _AsyncObservationRepository | None = None,
         recovery: RecoveryMonitor | None = None,
@@ -1613,6 +1615,9 @@ class _Supervision:
         self._process_instance_id = process_instance_id
         self._process_origin_mono = process_origin_mono
         self._adviser = adviser
+        # DESIGN_EXCESS_ACTIVATION §2: the projection controller driven
+        # post-tick by this loop (its single writer).
+        self._excess_controller = excess_controller
         # Self-healing awareness layer (R4): the passive detection monitor
         # driven once per fleet cycle, plus the two ports it reads through.
         self._intents_port = intents
@@ -1786,8 +1791,11 @@ class _Supervision:
                 # cycle — the intent TTL lapse plus the firmware watchdog
                 # are the designed hand-back — and never halts the fleet.
                 # CancelledError is a BaseException and is never swallowed.
+                # DESIGN_EXCESS_ACTIVATION §2: the same suppressed step is
+                # the projection's single-writer update + event publication
+                # (observe_tick), so observability can never gate control.
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(self._adviser.tick(), timeout=self._interval_s)
+                    await asyncio.wait_for(self._adviser_step(), timeout=self._interval_s)
             # A kernel tick that overruns the interval is a component failure,
             # not a survivable per-unit fault. Cancelling it is safe — the
             # kernel's BaseException path revokes authority first (shielded)
@@ -1808,6 +1816,13 @@ class _Supervision:
                 # 1.5 s control period / 1.60 s renewal budget).
                 for actor in self._actors:
                     actor.request_cell_refresh()
+
+    async def _adviser_step(self) -> None:
+        """One advisory tick plus the projection's single-writer update."""
+        assert self._adviser is not None
+        decision = await self._adviser.tick()
+        if self._excess_controller is not None:
+            await self._excess_controller.observe_tick(decision)
 
     async def _bounded_poll(self, actor: EnergyPodActor) -> str:
         """One bounded, survived poll; returns the cycle's bus-read outcome.
@@ -2262,6 +2277,10 @@ class ComposedRuntime:
     # API_CONTRACTS "Excess-solar accelerated charging (advisory)": composed
     # only when the configuration enables the feature; None otherwise.
     excess_adviser: ExcessChargeAdviser | None = None
+    # DESIGN_EXCESS_ACTIVATION §1/§2: the projection controller (the
+    # participation flag, the acknowledgement latch, the frozen state view,
+    # and the state_changed publication the fleet loop drives).
+    excess_controller: ExcessAdviserController | None = None
 
 
 def _simulator_pod(
@@ -2620,12 +2639,27 @@ def _build_runtime(
 
     # --- excess-solar advisory composition ---------------------------------
     excess_adviser: ExcessChargeAdviser | None = None
+    excess_controller: ExcessAdviserController | None = None
     if excess_enabled and excess_config is not None:
         # The adviser is composed exactly when the feature is enabled, under
         # the composed automation principal, driving the facade's internal
         # advisory submission (never REST/MCP).  Everything downstream is the
         # existing arbiter -> allocator -> SafetyKernel -> per-unit authority
         # path; the adviser holds no special authority anywhere.
+        #
+        # DESIGN_EXCESS_ACTIVATION §1/§2: the projection controller is built
+        # FIRST (it owns the participation flag the guarded toggle flips),
+        # the adviser consumes its verdict at tick start, and the controller
+        # binds the adviser for the live held-intent read.  The
+        # acknowledgement latch is step B3 (the durable boot-load); until
+        # then the composed gate starts acknowledged.
+        excess_controller = ExcessAdviserController(
+            charge_cap_w=int(excess_config.max_charge_from_export_w),
+            clock=resolved_clock,
+            acknowledged_economics=True,
+            config_enabled=True,
+            bus=bus,
+        )
         adviser_principal = _AdvisoryPrincipal(
             subject=_EXCESS_ADVISER_PRINCIPAL_SUBJECT,
             scopes=_EXCESS_ADVISER_PRINCIPAL_SCOPES,
@@ -2656,7 +2690,9 @@ def _build_runtime(
             observations=observation_port,
             intents=intent_port,
             submit=_submit_advisory_intent,
+            participation=excess_controller.participation_verdict,
         )
+        excess_controller.bind_adviser(excess_adviser)
 
     def mcp_server_factory(*, principal: Any) -> FastMCP:
         # MCP is read-only by default: dispatch needs explicit configuration
@@ -2715,6 +2751,7 @@ def _build_runtime(
         process_instance_id=process_instance_id,
         process_origin_mono=process_origin_mono,
         adviser=excess_adviser,
+        excess_controller=excess_controller,
         intents=intent_port,
         observations=observation_port,
         recovery=recovery_monitor,
@@ -2743,6 +2780,7 @@ def _build_runtime(
         simulators=simulators,
         recovery=recovery_monitor,
         excess_adviser=excess_adviser,
+        excess_controller=excess_controller,
     )
 
 

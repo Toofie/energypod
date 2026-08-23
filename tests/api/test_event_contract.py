@@ -4,12 +4,25 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketDenialResponse
 from starlette.websockets import WebSocketDisconnect
+
+from tests.unit.test_event_bus import close_subscription, drain
+from tests.unit.test_excess_charge import (
+    NOW,
+    FakeClock,
+    FakeIntents,
+    FakeObservations,
+    FakeSubmit,
+    make_fleet,
+    make_policy,
+    make_settings,
+)
 
 from .conftest import (
     FakeAuthenticator,
@@ -592,3 +605,238 @@ def test_ticket_channel_still_prohibits_query_string_credentials() -> None:
         ) as websocket:
             assert websocket.receive_json()["type"] == "snapshot"
     assert source.subscriptions == [20]
+
+
+# --- excess_adviser.state_changed (DESIGN_EXCESS_ACTIVATION §2) -----------------
+#
+# One new bus event, same vocabulary as the §1 projection: published ONLY
+# when the semantic state tuple changes (watt figures ride but never
+# trigger), with a 30 s heartbeat republish while enabled and none while
+# disabled.  The REAL EventBus and the REAL adviser/controller drive these
+# contracts -- the adapter-family fakes above cannot express them.
+
+
+def _excess_modules() -> Any:
+    try:
+        import energypod.application.events as events
+        import energypod.application.excess_charge as excess
+    except ImportError as error:  # pragma: no cover - contract modules exist
+        raise AssertionError(f"excess event contract dependency missing: {error}") from error
+    return SimpleNamespace(events=events, excess=excess)
+
+
+@pytest.fixture
+def api_domain() -> Any:
+    import energypod.domain as domain
+
+    return domain
+
+
+def _fresh_fleet(api_domain: Any, grids: Any, rig: Any) -> None:
+    """Re-script the fleet with capture times fresh at the CURRENT clock."""
+    rig.observations.latest = make_fleet(
+        api_domain,
+        grids,
+        **{f"{unit}__captured_at_mono": rig.clock.now for unit in grids},
+    )
+
+
+def _adviser_rig(api_domain: Any, grids: Any) -> Any:
+    """A real adviser + controller over the real bus (deterministic clock)."""
+    modules = _excess_modules()
+    clock = FakeClock()
+    bus = modules.events.EventBus(retention=64, queue_capacity=64, clock=clock)
+    controller = modules.excess.ExcessAdviserController(
+        charge_cap_w=2_000,
+        clock=clock,
+        acknowledged_economics=True,
+        config_enabled=True,
+        bus=bus,
+    )
+    observations = FakeObservations(latest=make_fleet(api_domain, grids))
+    adviser = modules.excess.ExcessChargeAdviser(
+        settings=make_settings(modules.excess),
+        policy=make_policy(api_domain),
+        clock=clock,
+        observations=observations,
+        intents=FakeIntents(),
+        submit=FakeSubmit(),
+        participation=controller.participation_verdict,
+    )
+    controller.bind_adviser(adviser)
+    return SimpleNamespace(
+        controller=controller,
+        adviser=adviser,
+        observations=observations,
+        clock=clock,
+        bus=bus,
+    )
+
+
+async def test_first_tick_publishes_the_contract_payload(api_domain: Any) -> None:
+    rig = _adviser_rig(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    events = await drain(subscription, 4)
+
+    assert [event["type"] for event in events] == ["excess_adviser.state_changed"]
+    payload = events[0]["payload"]
+    assert set(payload) == {
+        "enabled",
+        "enabled_origin",
+        "acknowledged_economics",
+        "active",
+        "hysteresis_state",
+        "target_unit_id",
+        "commanded_charge_w",
+        "eligible_export_charge_w",
+        "fleet_export_w",
+        "export_evidence",
+        "reason_codes",
+        "held_intent_id",
+        "heartbeat",
+    }
+    assert payload["enabled"] is True
+    assert payload["enabled_origin"] == "config"
+    assert payload["acknowledged_economics"] is True
+    assert payload["active"] is True
+    assert payload["hysteresis_state"] == "holding"
+    assert payload["target_unit_id"] == "mid"
+    assert payload["commanded_charge_w"] == 1_100
+    assert payload["eligible_export_charge_w"] == 1_100
+    assert payload["fleet_export_w"] == 1_200
+    assert payload["export_evidence"] == "good"
+    assert payload["reason_codes"] == ["export_headroom_available"]
+    assert payload["held_intent_id"] == "excess-1"
+    assert payload["heartbeat"] is False
+    await close_subscription(subscription)
+
+
+async def test_watt_wander_rides_but_never_triggers_a_publication(api_domain: Any) -> None:
+    """The pinned throttle: while holding, the commanded watts re-price with
+    export every tick (~1.5 s), and publishing that would put one event per
+    cycle on the bus for figure wander the console already gets elsewhere."""
+    rig = _adviser_rig(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    first = await drain(subscription, 2)
+    assert len(first) == 1
+
+    for cycle, export in enumerate((1_600.0, 1_700.0, 1_800.0), start=1):
+        rig.clock.now = NOW + 1.5 * cycle
+        _fresh_fleet(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": export}, rig)
+        await rig.controller.observe_tick(await rig.adviser.tick())
+
+    assert rig.controller.state().commanded_charge_w == 1_400
+    quiet = await drain(subscription, 2)
+    assert quiet == [], "watt wander must never publish"
+    await close_subscription(subscription)
+
+
+async def test_a_semantic_change_publishes_and_carries_the_new_figures(api_domain: Any) -> None:
+    """Export collapse to below the exit threshold is a semantic change
+    (holding -> exiting, the reason vocabulary changes): exactly one new
+    event, carrying the collapsed figures."""
+    rig = _adviser_rig(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert len(await drain(subscription, 2)) == 1
+
+    rig.observations.latest = make_fleet(api_domain, {"lhs": 0.0, "mid": 0.0, "rhs": 650.0})
+    rig.clock.now = NOW + 1.5
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    events = await drain(subscription, 2)
+
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["active"] is False
+    assert payload["hysteresis_state"] == "exiting"
+    assert payload["reason_codes"] == ["below_exit_hysteresis"]
+    assert payload["commanded_charge_w"] == 0
+    assert payload["held_intent_id"] is None
+    await close_subscription(subscription)
+
+
+async def test_the_heartbeat_republishes_every_30_seconds_while_enabled(api_domain: Any) -> None:
+    """Bounded (<= 2/min) liveness proof: a repeat publication that does NOT
+    change the semantic tuple, every 30 s while enabled -- and never sooner."""
+    rig = _adviser_rig(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert len(await drain(subscription, 2)) == 1
+
+    rig.clock.now = NOW + 29.0
+    _fresh_fleet(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0}, rig)
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert (await drain(subscription, 2)) == [], "29 s is not the heartbeat cadence"
+
+    rig.clock.now = NOW + 30.0
+    _fresh_fleet(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0}, rig)
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    events = await drain(subscription, 2)
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["heartbeat"] is True
+    assert payload["active"] is True, "the heartbeat carries the full live payload"
+
+    rig.clock.now = NOW + 45.0
+    _fresh_fleet(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0}, rig)
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert (await drain(subscription, 2)) == [], "one heartbeat per 30 s window, no more"
+    await close_subscription(subscription)
+
+
+async def test_disabled_publishes_its_state_change_and_then_nothing(api_domain: Any) -> None:
+    """The state_changed to disabled is the LAST event: while disabled there
+    is no heartbeat, however long the loop runs."""
+    rig = _adviser_rig(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert len(await drain(subscription, 2)) == 1
+
+    rig.controller.set_participation(enabled=False)
+    rig.clock.now = NOW + 1.5
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    events = await drain(subscription, 2)
+    assert [event["payload"]["enabled"] for event in events] == [False]
+    assert events[0]["payload"]["reason_codes"] == ["disabled_by_runtime"]
+    assert events[0]["payload"]["heartbeat"] is False
+
+    for cycle in range(1, 5):
+        rig.clock.now = NOW + 30.0 * cycle
+        _fresh_fleet(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0}, rig)
+        await rig.controller.observe_tick(await rig.adviser.tick())
+    assert (await drain(subscription, 4)) == [], "no heartbeat while disabled"
+    await close_subscription(subscription)
+
+
+async def test_missing_evidence_replaces_the_headroom_code_in_the_vocabulary(
+    api_domain: Any,
+) -> None:
+    """The evidence words are projection codes: a collapsed rollup prepends
+    its own code and drops ``no_export_headroom``, whose definition ('evidence
+    good but export at or below the margin') the collapsed state cannot
+    satisfy -- one vocabulary, never two codes for the same fact."""
+    rig = _adviser_rig(api_domain, {"lhs": -300.0, "mid": 0.0, "rhs": 1_500.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    assert len(await drain(subscription, 2)) == 1
+
+    rig.clock.now = NOW + 1.5
+    _fresh_fleet(api_domain, {"lhs": None, "mid": 0.0, "rhs": 1_500.0}, rig)  # one phase unserved
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    events = await drain(subscription, 2)
+
+    assert len(events) == 1
+    payload = events[0]["payload"]
+    assert payload["export_evidence"] == "missing"
+    assert payload["fleet_export_w"] is None
+    assert payload["reason_codes"] == ["export_evidence_missing"]
+    assert payload["hysteresis_state"] == "exiting"
+    await close_subscription(subscription)

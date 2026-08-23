@@ -1909,6 +1909,68 @@ async def test_enabled_excess_charging_composes_the_adviser_and_armed_policy(
     await _shutdown_actors(runtime)
 
 
+async def test_supervision_drives_the_adviser_projection_and_publishes_state_events(
+    tmp_path: Path,
+) -> None:
+    """DESIGN_EXCESS_ACTIVATION §2 (publication wiring): the composed fleet
+    loop itself drives the post-tick projection update and publishes
+    ``excess_adviser.state_changed`` on the shared bus — no external caller,
+    no separate publisher task (publication rides with the tick exactly like
+    every other composed event path)."""
+    payload = _write_enabled_payload(tmp_path / "adviser-events.sqlite3")
+    payload["policy"]["maximum_cell_imbalance_v"] = 0.50
+    payload["excess_charging"] = {"enabled": True}
+    runtime = _compose_with(_validate(payload), simulate=True, clock=ScriptedClock())
+
+    controller = getattr(runtime, "excess_controller", None)
+    assert controller is not None, "a composed adviser must expose its controller"
+
+    seen: list[dict[str, Any]] = []
+
+    async def consume(iterator: Any) -> None:
+        async for event in iterator:
+            if event.get("type") == "excess_adviser.state_changed":
+                seen.append(event)
+                return
+
+    subscription = runtime.event_bus.subscribe(after_sequence=None)
+    consumer = asyncio.create_task(consume(subscription))
+    session = _LifespanSession(runtime.app)
+    try:
+        session.send("lifespan.startup")
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete")
+            or session.seen("lifespan.startup.failed"),
+            message="the application lifespan never reported supervision startup",
+        )
+        assert session.seen("lifespan.startup.complete"), f"startup failed: {session.events!r}"
+        await session.pump_until(
+            lambda: bool(seen), message="supervision never published an adviser state event"
+        )
+    finally:
+        session.send("lifespan.shutdown")
+        await session.pump_until(
+            lambda: session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed"),
+            message="the application lifespan never reported supervision shutdown",
+        )
+        consumer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await consumer
+        await close_subscription(subscription)
+
+    state = seen[0]["payload"]
+    assert state["enabled"] is True
+    assert state["enabled_origin"] == "config"
+    assert state["active"] is False
+    assert state["heartbeat"] is False
+    assert state["export_evidence"] in {"good", "missing", "stale"}
+    assert state["reason_codes"], "the projection never carries an empty vocabulary"
+    # The single-writer discipline is structural: the controller the loop
+    # drives is the same object the composed runtime exposes.
+    assert controller.state_payload()["enabled"] is True
+
+
 async def test_cancel_intent_endpoint_cancels_the_active_intent(tmp_path: Path) -> None:
     """API_CONTRACTS "Cancel intent" (2026-08-23): POST /api/v1/intents/cancel
     is dispatch-scoped with no interactive requirement, demands an
