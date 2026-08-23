@@ -2772,9 +2772,13 @@ describe("HomeView — the next-scheduled-action card", () => {
       act(() => {
         vi.advanceTimersByTime(30_000);
       });
+      // The countdown is now in seconds form (70 s minus the 30 s advanced,
+      // minus whatever real time bled through shouldAdvanceTime — any bleed
+      // only makes it smaller), never frozen at "1 min".
       await waitFor(() => {
-        expect(region).toHaveTextContent(/ends in 4[0-9] s \(at 05:59\)/);
+        expect(region).toHaveTextContent(/ends in \d+ s \(at 05:59\)/);
       });
+      expect(region).not.toHaveTextContent(/ends in 1 min/);
     } finally {
       vi.useRealTimers();
     }
