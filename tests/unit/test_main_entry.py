@@ -743,25 +743,33 @@ def test_serving_failure_exits_cleanly_with_a_nonzero_code(
 # ---------------------------------------------------------------------------
 
 
-def _with_exploding_first_tick(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Compose for real, then make the kernel die on its very first tick.
+def _with_failing_supervision_startup(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compose for real, then make supervision fail inside the startup window.
 
-    The first-tick failure lands inside the supervision startup window, the
-    one supervisor-failure path that is deterministic under the real clock.
+    The start-report startup rework (2026-08-22 live commissioning) completes
+    the lifespan once every actor reports ``actor.start()`` succeeded — BEFORE
+    the fleet loop's first kernel tick — so an exploding first tick now lands
+    after ``lifespan.startup.complete``, where a runner parked on ``receive()``
+    waits forever and the default runner's bridge sees nothing.  The one
+    deterministic in-window supervision failure is the start-report path the
+    rework added for exactly this: one actor's ``start()`` raises, the fleet
+    task records the failure on its start report and dies, and
+    ``_await_startup`` fails the lifespan startup loudly — the same
+    supervisor-failure handling every component failure gets.
     """
     composition = importlib.import_module("energypod.runtime.composition")
     real_build = composition.build_runtime
 
-    def exploding_build(*args: Any, **kwargs: Any) -> Any:
+    def failing_build(*args: Any, **kwargs: Any) -> Any:
         runtime = real_build(*args, **kwargs)
 
-        async def exploding_tick() -> None:
-            raise RuntimeError("supervisor component failed: audit store unavailable")
+        async def failing_start() -> None:
+            raise RuntimeError("supervisor component failed: actor start failed")
 
-        monkeypatch.setattr(runtime.kernel, "tick", exploding_tick)
+        monkeypatch.setattr(next(iter(runtime.actors.values())), "start", failing_start)
         return runtime
 
-    monkeypatch.setattr(composition, "build_runtime", exploding_build)
+    monkeypatch.setattr(composition, "build_runtime", failing_build)
 
 
 class _FakeListener:
@@ -848,7 +856,7 @@ def test_supervision_failure_through_the_lifespan_exits_nonzero(
     a healthy serve when supervision failed during startup.
     """
     _forbid_real_serving(monkeypatch)
-    _with_exploding_first_tick(monkeypatch)
+    _with_failing_supervision_startup(monkeypatch)
     path = tmp_path / "controller.yaml"
     _write_valid_config(path, tmp_path / "controller.sqlite3")
     events: list[dict[str, Any]] = []
@@ -892,11 +900,12 @@ def test_default_runner_exits_nonzero_when_supervision_fails_during_startup(
     """The default uvicorn path: supervision failure stops serving, exit 1.
 
     Drives ``main`` with ``server_runner=None`` — the real uvicorn runner —
-    against a genuinely composed runtime whose kernel dies on its first tick.
-    uvicorn itself exits on a failed lifespan startup; this pins that the
-    process outcome is a structured nonzero return, not a healthy serve.
+    against a genuinely composed runtime whose supervision fails during
+    startup.  uvicorn itself exits on a failed lifespan startup; this pins
+    that the process outcome is a structured nonzero return, not a healthy
+    serve.
     """
-    _with_exploding_first_tick(monkeypatch)
+    _with_failing_supervision_startup(monkeypatch)
     _prevent_listener_sockets(monkeypatch)
     path = tmp_path / "controller.yaml"
     _write_valid_config(path, tmp_path / "controller.sqlite3")
