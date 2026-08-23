@@ -1129,6 +1129,14 @@ export interface WireSnapshot {
    */
   readonly schedule_state?: WireScheduleState;
   /**
+   * The night-charge projection (PENDING, feature-detected, §5): present
+   * whenever the `night_charging` config block is composed — including while
+   * suspended — and ABSENT (the default, today's wire) when nothing is
+   * composed: no Night tile, no toggle, nothing else changes. Attach with
+   * `withNightChargeState`.
+   */
+  readonly night_charge_state?: WireNightChargeState;
+  /**
    * The energy scorecard's live-day block (PENDING, feature-detected): the
    * in-progress day's `EnergyDayRecord` plus `as_of`, present only when the
    * `energy_scorecard` config block is composed. ABSENT (the default, today's
@@ -1670,6 +1678,296 @@ export function excessChargingToggleOk(state: WireAdviserState): Record<string, 
     persisted: false,
     acknowledged_economics: state.acknowledged_economics,
     adviser_state: state,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Night charge (DESIGN_NIGHT_CHARGE.md §5, API_CONTRACTS.md "Off-peak night
+// charge") — the whole family is PENDING-BACKEND: the `night_charge_state`
+// projection, the `night_charge.state_changed` event, and the guarded toggle
+// route are not live yet, so none of these shapes is served by today's wire
+// (the default snapshot omits `night_charge_state` entirely; an absent field
+// is today's wire truth). Defaults are the design's own §5 illustrative night,
+// verbatim. Attach with `withNightChargeState`.
+// ---------------------------------------------------------------------------
+
+/**
+ * The night adviser's state announcement (§5): published only when the
+ * semantic tuple `(enabled, enabled_origin, acknowledged_partition, active,
+ * phase, active_unit_ids, demand_evidence, reason_codes)` changes, plus a 30 s
+ * `"heartbeat": true` republish while enabled and NOTHING while disabled.
+ * PENDING-BACKEND — not in PUBLISHED_EVENT_TYPES; suites attach it with
+ * `nightChargeStateChanged`.
+ */
+export const NIGHT_CHARGE_STATE_CHANGED = "night_charge.state_changed" as const;
+
+/** The fleet-level phase vocabulary (§5's ONE list, verbatim). */
+export const NIGHT_PHASE_VALUES: readonly string[] = [
+  "idle",
+  "pacing",
+  "holding_on_demand",
+  "complete",
+  "skipped_full",
+];
+
+/** The per-unit phase vocabulary: the fleet list plus `sitting_out`. */
+export const NIGHT_UNIT_PHASE_VALUES: readonly string[] = [
+  "pacing",
+  "holding_on_demand",
+  "skipped_full",
+  "complete",
+  "sitting_out",
+];
+
+/** The demand rollup's worst-word-wins evidence vocabulary. */
+export const NIGHT_DEMAND_EVIDENCE_VALUES: readonly string[] = [
+  "good",
+  "missing",
+  "bad",
+  "stale",
+];
+
+/** The projection's ONE pinned reason vocabulary (§5), verbatim. */
+export const NIGHT_REASON_CODE_VALUES: readonly string[] = [
+  "outside_window",
+  "window_open",
+  "on_plan",
+  "deadline_at_risk",
+  "demand_above_threshold",
+  "demand_below_exit",
+  "demand_evidence_missing",
+  "demand_evidence_bad",
+  "demand_evidence_stale",
+  "at_ceiling",
+  "no_charge_headroom",
+  "target_reached",
+  "no_eligible_units",
+  "units_disarmed",
+  "yielding_to_higher_priority",
+  "disabled_by_config",
+  "disabled_by_runtime",
+  "night_acknowledgement_required",
+];
+
+/** One unit's per-tick plan row, exactly as the projection spells it. */
+export interface WireNightUnitState {
+  readonly unit_id: string;
+  readonly soc_pct: number | null;
+  readonly phase: string;
+  readonly target_w: number;
+  readonly reason: string;
+}
+
+/**
+ * A per-unit night row fixture. Defaults are the §5 example's own three rows
+ * (lhs pacing at the cap, mid pacing, rhs skipped-full at the ceiling); an
+ * explicit null soc_pct is preserved — never zero-filled.
+ */
+export function nightUnitState(spec: Partial<WireNightUnitState> = {}): WireNightUnitState {
+  return {
+    unit_id: spec.unit_id ?? "lhs",
+    soc_pct: spec.soc_pct === undefined ? 71.4 : spec.soc_pct,
+    phase: spec.phase ?? "pacing",
+    target_w: spec.target_w ?? 2500,
+    reason: spec.reason ?? "on_plan",
+  };
+}
+
+/**
+ * The snapshot's top-level `night_charge_state` projection (§5), verbatim from
+ * the design's own illustrative pacing example: 00:00–06:00 Brisbane, cap-first
+ * pacing at 2,500 W with the 1,000 W demand rule good at 412 W, lhs/mid pacing
+ * and rhs sitting out full. Present whenever the `night_charging` block is
+ * composed (including suspended); ABSENT (the default, today's wire) otherwise.
+ */
+export interface WireNightChargeState {
+  readonly enabled: boolean;
+  readonly enabled_origin: "config" | "runtime";
+  readonly acknowledged_partition: boolean;
+  readonly posture: "yield" | "partition";
+  readonly active: boolean;
+  readonly phase: string;
+  readonly window: { readonly start_local: string; readonly end_local: string; readonly timezone: string };
+  readonly window_ends_at: string | null;
+  readonly window_ends_in_s: number | null;
+  readonly next_window_at: string | null;
+  readonly pacing: "cap_first" | "even";
+  readonly rate_cap_w: number;
+  readonly hold_rate_w: number;
+  readonly demand_scope: "fleet" | "per_phase";
+  readonly demand_threshold_w: number;
+  readonly demand_w: number | null;
+  readonly demand_evidence: "good" | "missing" | "bad" | "stale";
+  readonly held_intent_id: string | null;
+  readonly units: readonly WireNightUnitState[];
+  readonly last_action: string;
+  readonly last_tick_at: string;
+  readonly reason_codes: readonly string[];
+}
+
+/** A night-projection fixture; explicit nulls are preserved (never zero-filled). */
+export function nightChargeState(spec: Partial<WireNightChargeState> = {}): WireNightChargeState {
+  return {
+    enabled: spec.enabled ?? true,
+    enabled_origin: spec.enabled_origin ?? "runtime",
+    acknowledged_partition: spec.acknowledged_partition ?? true,
+    posture: spec.posture ?? "partition",
+    active: spec.active ?? true,
+    phase: spec.phase ?? "pacing",
+    window: spec.window ?? {
+      start_local: "00:00",
+      end_local: "06:00",
+      timezone: "Australia/Brisbane",
+    },
+    window_ends_at:
+      spec.window_ends_at === undefined ? "2026-08-27T06:00:00+10:00" : spec.window_ends_at,
+    window_ends_in_s: spec.window_ends_in_s === undefined ? 5341 : spec.window_ends_in_s,
+    next_window_at: spec.next_window_at === undefined ? null : spec.next_window_at,
+    pacing: spec.pacing ?? "cap_first",
+    rate_cap_w: spec.rate_cap_w ?? 2500,
+    hold_rate_w: spec.hold_rate_w ?? 100,
+    demand_scope: spec.demand_scope ?? "fleet",
+    demand_threshold_w: spec.demand_threshold_w ?? 1000,
+    demand_w: spec.demand_w === undefined ? 412 : spec.demand_w,
+    demand_evidence: spec.demand_evidence ?? "good",
+    held_intent_id:
+      spec.held_intent_id === undefined ? "night-881-77123.445101" : spec.held_intent_id,
+    units:
+      spec.units ??
+      [
+        nightUnitState(),
+        nightUnitState({ unit_id: "mid", soc_pct: 88.0 }),
+        nightUnitState({ unit_id: "rhs", soc_pct: 98.0, phase: "skipped_full", target_w: 0, reason: "at_ceiling" }),
+      ],
+    last_action: spec.last_action ?? "renew",
+    last_tick_at: spec.last_tick_at ?? "2026-08-27T01:31:05+10:00",
+    reason_codes: [...(spec.reason_codes ?? ["window_open", "on_plan"])],
+  };
+}
+
+/** Attach the pending night projection to a snapshot world. */
+export function withNightChargeState(
+  world: WireSnapshot,
+  state: WireNightChargeState,
+): WireSnapshot {
+  return { ...world, night_charge_state: state };
+}
+
+/**
+ * One `night_charge.state_changed` payload, exactly as §5 spells it: the
+ * projection subset MINUS `last_action`/`last_tick_at`, plus `heartbeat`.
+ * Defaults are the §5 pacing example carried whole; overrides win per field.
+ * PENDING-BACKEND.
+ */
+export interface NightChargeStateChangedPayload
+  extends Omit<WireNightChargeState, "last_action" | "last_tick_at"> {
+  readonly heartbeat: boolean;
+}
+
+export function nightChargeStateChanged(
+  sequence: number,
+  payload: Partial<NightChargeStateChangedPayload> = {},
+  occurredAt: string = "2026-08-27T01:31:05+10:00",
+): EventFrame<NightChargeStateChangedPayload> {
+  const base = nightChargeState(payload);
+  return frame(
+    NIGHT_CHARGE_STATE_CHANGED,
+    sequence,
+    {
+      enabled: base.enabled,
+      enabled_origin: base.enabled_origin,
+      acknowledged_partition: base.acknowledged_partition,
+      posture: base.posture,
+      active: base.active,
+      phase: base.phase,
+      window: base.window,
+      window_ends_at: base.window_ends_at,
+      window_ends_in_s: base.window_ends_in_s,
+      next_window_at: base.next_window_at,
+      pacing: base.pacing,
+      rate_cap_w: base.rate_cap_w,
+      hold_rate_w: base.hold_rate_w,
+      demand_scope: base.demand_scope,
+      demand_threshold_w: base.demand_threshold_w,
+      demand_w: base.demand_w,
+      demand_evidence: base.demand_evidence,
+      held_intent_id: base.held_intent_id,
+      units: base.units,
+      reason_codes: base.reason_codes,
+      heartbeat: payload.heartbeat ?? false,
+    },
+    occurredAt,
+  );
+}
+
+/**
+ * The guarded night toggle's 200 body (§7 B4), either action: the feature id,
+ * the post-toggle participation facts, `persisted: false` spelled anyway (the
+ * contract states the non-persistence policy on every response), the captured
+ * acknowledgement flag, and the full projection for optimistic adoption.
+ * PENDING-BACKEND.
+ */
+export function nightChargingToggleOk(state: WireNightChargeState): Record<string, unknown> {
+  return {
+    feature: "night_charging",
+    enabled: state.enabled,
+    enabled_origin: state.enabled_origin,
+    persisted: false,
+    acknowledged_partition: state.acknowledged_partition,
+    night_charge_state: state,
+  };
+}
+
+/**
+ * A refusal envelope for the night toggle, shaped exactly as the thrown
+ * `ApiClientError` carries it (tests wrap: `new ApiClientError({...}))`). The
+ * named shapes carry their contract-pinned details verbatim (§7 B4):
+ * `night_acknowledgement_required` carries `{"acknowledgement":
+ * "PARTITION_ACKNOWLEDGED"}` (the night toggle's OWN code — the schedules
+ * surface's `night_posture_acknowledgement_required` is the other surface's),
+ * and `night_enable_refused` names the units/stops holding it. PENDING-BACKEND.
+ */
+export function nightChargingRefusalEnvelope(
+  code:
+    | "validation_error"
+    | "night_charging_not_commissioned"
+    | "night_acknowledgement_required"
+    | "night_enable_refused",
+  options: {
+    message?: string;
+    details?: Record<string, unknown>;
+    status?: number;
+  } = {},
+): { status: number; code: string; message: string; details: Record<string, unknown> | null; request_id: string } {
+  const defaults: Record<string, { status: number; message: string; details: Record<string, unknown> | null }> = {
+    validation_error: {
+      status: 422,
+      message: "Request validation failed",
+      details: null,
+    },
+    night_charging_not_commissioned: {
+      status: 409,
+      message: "Night charging is not commissioned in this deployment's config.",
+      details: null,
+    },
+    night_acknowledgement_required: {
+      status: 409,
+      message: "The night-partition acknowledgement must be captured before the first enable.",
+      details: { acknowledgement: "PARTITION_ACKNOWLEDGED" },
+    },
+    night_enable_refused: {
+      status: 409,
+      message: "The fleet is not in a state where night charging can start.",
+      details: { reasons: ["unit_active_under_intent"], unit_ids: ["lhs"], stop_ids: [] },
+    },
+  };
+  const pinned = defaults[code]!;
+  return {
+    status: options.status ?? pinned.status,
+    code,
+    message: options.message ?? pinned.message,
+    details: options.details ?? pinned.details,
+    request_id: `req-${code}`,
   };
 }
 

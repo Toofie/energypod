@@ -256,6 +256,22 @@ export interface ApiClient {
     options?: { economics?: "NET_BILLED"; idempotencyKey?: string },
   ): Promise<Record<string, unknown>>;
   /**
+   * The night-charge guarded toggle (POST /api/v1/night-charging,
+   * DESIGN_NIGHT_CHARGE.md §3.4 + §7 B4): `{action, confirmation: "NIGHT"}` —
+   * the typed confirmation is required for BOTH actions — plus
+   * `"night_posture": "PARTITION_ACKNOWLEDGED"` on the first enable ever (the
+   * one-time night-partition acknowledgement, captured once; either surface's
+   * capture counts). The 200 carries the post-toggle `night_charge_state` for
+   * optimistic adoption; refusals reject with the envelope (422
+   * validation_error; 409 night_charging_not_commissioned /
+   * night_acknowledgement_required / night_enable_refused — the enable refusal
+   * names the units/stops holding it, and disable is never refused).
+   */
+  postNightCharging(
+    action: "enable" | "disable",
+    options?: { nightPosture?: "PARTITION_ACKNOWLEDGED"; idempotencyKey?: string },
+  ): Promise<Record<string, unknown>>;
+  /**
    * The schedules read (GET /api/v1/schedule, observe scope): the whole
    * published plan (null before the first publish), the derived policy, the
    * durable night-acknowledgement fact, and the pure next occurrence. A
@@ -605,6 +621,20 @@ export function createApiClient(token: string): ApiClient {
         body.economics = options.economics;
       }
       return request<Record<string, unknown>>("/api/v1/excess-charging", {
+        method: "POST",
+        body,
+        idempotencyKey: withKey(options.idempotencyKey),
+      });
+    },
+    postNightCharging: (action, options = {}) => {
+      const body: Record<string, unknown> = { action, confirmation: "NIGHT" };
+      if (options.nightPosture !== undefined) {
+        // Consulted only on the first enable ever (the site's durable
+        // night-partition fact is shared with the schedules surface); the
+        // client sends it exactly when the operator confirmed the assertion.
+        body.night_posture = options.nightPosture;
+      }
+      return request<Record<string, unknown>>("/api/v1/night-charging", {
         method: "POST",
         body,
         idempotencyKey: withKey(options.idempotencyKey),

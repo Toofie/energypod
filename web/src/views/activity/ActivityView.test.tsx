@@ -199,6 +199,7 @@ const makeClient = (): ApiClient => ({
   postStopAcknowledgement: vi.fn(),
   postInhibitAcknowledgement: vi.fn(),
   postExcessCharging: vi.fn(),
+  postNightCharging: vi.fn(),
   getSchedule: vi.fn(),
   putSchedule: vi.fn(),
   openEvents: vi.fn(async function* () {}),

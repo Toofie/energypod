@@ -15,6 +15,7 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import type { ApiClient, Snapshot, StreamEvent } from "../api/client";
+import { nightChargeStateChanged } from "../test/wire";
 import { SharedDataPlane, isPlaneSnapshot, sharedClient } from "./SharedDataPlane";
 
 function wireSnapshot(sequence: number, capturedAt: string): Snapshot {
@@ -189,6 +190,26 @@ describe("SharedDataPlane — fan-out subscriptions can tell cached from current
     expect((await second.next()).done).toBe(true);
   });
 
+  it("hands the night adviser's frames to every subscriber verbatim (the feature's own detection, never the plane's filter)", async () => {
+    // `night_charge.state_changed` is a PENDING-BACKEND frame the plane has no
+    // opinion about: the fan-out carries it exactly as sent so the shell (the
+    // slice patch) and any view render from the payload. A plane that filtered
+    // unknown types would silently ship a console whose night tile never moves.
+    const plane = new SharedDataPlane(mockClient());
+    const view = sharedClient(plane, mockClient());
+    const first = view.openEvents()[Symbol.asyncIterator]();
+    const second = view.openEvents()[Symbol.asyncIterator]();
+
+    const event = nightChargeStateChanged(42, {
+      phase: "holding_on_demand",
+      demand_w: 2340,
+      reason_codes: ["demand_above_threshold"],
+    }) as unknown as StreamEvent;
+    plane.publishEvent(event);
+    expect(await readAll(first)).toEqual([event]);
+    expect(await readAll(second)).toEqual([event]);
+  });
+
   it("delivers nothing before the first picture: no invented snapshot exists", async () => {
     const plane = new SharedDataPlane(mockClient());
     const frames = await readAll(plane.subscribe());
@@ -250,6 +271,30 @@ describe("SharedDataPlane — fan-out subscriptions can tell cached from current
     });
     expect(real.getSchedule).toHaveBeenCalledTimes(1);
     expect(real.putSchedule).toHaveBeenCalledWith({ expected_version: null }, "console-key");
+  });
+
+  it("routes the guarded night toggle straight through to the real client, exactly as called", async () => {
+    // A mutation with an Idempotency-Key: the shared client adds no caching,
+    // no retry, and no rewriting — the toggle's own envelope is the answer.
+    const real = mockClient({
+      postNightCharging: vi.fn((action, options) =>
+        Promise.resolve({ feature: "night_charging", enabled: action === "enable", options }),
+      ),
+    });
+    const plane = new SharedDataPlane(real);
+    const view = sharedClient(plane, real);
+
+    await expect(view.postNightCharging("enable", { nightPosture: "PARTITION_ACKNOWLEDGED" })).resolves.toEqual({
+      feature: "night_charging",
+      enabled: true,
+      options: { nightPosture: "PARTITION_ACKNOWLEDGED" },
+    });
+    await expect(view.postNightCharging("disable")).resolves.toMatchObject({ enabled: false });
+    expect(real.postNightCharging).toHaveBeenCalledTimes(2);
+    expect(real.postNightCharging).toHaveBeenNthCalledWith(1, "enable", {
+      nightPosture: "PARTITION_ACKNOWLEDGED",
+    });
+    expect(real.postNightCharging).toHaveBeenNthCalledWith(2, "disable", undefined);
   });
 });
 

@@ -15,7 +15,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { ApiClientError } from "../api/client";
 import type { ApiClient, Snapshot, StreamEvent } from "../api/client";
-import { adviserState, excessAdviserStateChanged } from "../test/wire";
+import { adviserState, excessAdviserStateChanged, nightChargeState, nightChargeStateChanged } from "../test/wire";
 import { SharedDataPlane } from "./SharedDataPlane";
 import { nextStreamRetryDelayMs, STREAM_RETRY_DELAYS_MS, useConsoleData } from "./useConsoleData";
 import type { ConsoleData } from "./useConsoleData";
@@ -113,6 +113,7 @@ function Probe({
     ...(livePollMs === undefined ? {} : { livePollMs }),
   });
   const adviser = data.snapshot?.adviserState ?? null;
+  const night = data.snapshot?.nightChargeState ?? null;
   return (
     <div>
       <output data-testid="status">{data.streamStatus}</output>
@@ -130,6 +131,18 @@ function Probe({
           : `${adviser.enabled ? "on" : "off"}|${adviser.active ? "active" : "idle"}|${
               adviser.commandedChargeW
             }W|cap ${adviser.chargeCapW}W`}
+      </output>
+      {/* The shell's night-state slice, same rule: "absent" is the feature
+          detection; otherwise participation, phase, and the demand figures
+          the events refresh. */}
+      <output data-testid="night">
+        {night === null
+          ? "absent"
+          : `${night.enabled ? "on" : "off"}|${night.active ? "active" : "idle"}|${
+              night.phase
+            }|demand ${night.demandW === null ? "none" : `${night.demandW}W`}|${
+              night.demandEvidence
+            }`}
       </output>
       <button type="button" onClick={data.retryStream}>
         retry stream
@@ -429,6 +442,220 @@ describe("useConsoleData — the excess-adviser event", () => {
     // The figures move from the payload alone…
     await waitFor(() => {
       expect(screen.getByTestId("adviser").textContent).toBe("on|active|500W|cap 500W");
+    });
+    // …and the state tuple did not change, so no authority refetch ran.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+    expect(getSnapshot.mock.calls.length).toBe(reads);
+  });
+});
+
+// --- the night-charge event (feature-detected, §5) -----------------------------
+//
+// `night_charge.state_changed` patches the shell's night-state slice from the
+// payload (the excess_adviser mechanics verbatim), and the debounced authority
+// refetch runs ONLY when `active`/`enabled` changed — the per-unit targets, SOC
+// figures, and demand reading ride every publication (heartbeats included) and
+// are their own refresh, so figure wander must never put a REST read per tick
+// on the wire. NOTHING is published while disabled, so the disable-carrying
+// frame is the last one.
+
+describe("useConsoleData — the night-charge event", () => {
+  /** A controllable stream: yields the initial frames, then pushed frames. */
+  function eventChannel(initial: StreamEvent[]): {
+    open(): AsyncGenerator<StreamEvent, void, unknown>;
+    push(frame: StreamEvent): void;
+  } {
+    const queue: StreamEvent[] = [...initial];
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    return {
+      open: () =>
+        (async function* channel(): AsyncGenerator<StreamEvent, void, unknown> {
+          while (true) {
+            while (queue.length > 0) {
+              const next = queue.shift();
+              if (next !== undefined) {
+                yield next;
+              }
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        })(),
+      push: (frame) => {
+        queue.push(frame);
+        notify();
+      },
+    };
+  }
+
+  it("keeps the night slice absent while the snapshot carries no night_charge_state (feature detection)", async () => {
+    const client = mockClient({ openEvents: vi.fn(() => liveThenQuiet()) });
+    render(<Probe client={client} onUnauthorized={vi.fn()} retryDelaysMs={[5]} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("status").textContent).toBe("live");
+    });
+    expect(screen.getByTestId("night").textContent).toBe("absent");
+  });
+
+  it("patches the night slice from the payload and refetches authority when activity flips", async () => {
+    const world = {
+      ...SNAPSHOT,
+      night_charge_state: nightChargeState({
+        enabled: true,
+        active: false,
+        phase: "idle",
+        held_intent_id: null,
+        window_ends_at: null,
+        window_ends_in_s: null,
+        next_window_at: "2026-08-28T00:00:00+10:00",
+        demand_w: 412,
+        reason_codes: ["outside_window"],
+      }),
+    } as unknown as Snapshot;
+    const channel = eventChannel([
+      { type: "snapshot", sequence: world.snapshot_sequence, data: world },
+    ]);
+    const getSnapshot = vi.fn(() => Promise.resolve(world));
+    const client = mockClient({
+      getSnapshot: getSnapshot as unknown as ApiClient["getSnapshot"],
+      openEvents: vi.fn(() => channel.open()),
+    });
+    render(
+      <Probe client={client} onUnauthorized={vi.fn()} retryDelaysMs={[5]} livePollMs={100_000} />,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("night").textContent).toBe("on|idle|idle|demand 412W|good");
+    });
+    const reads = getSnapshot.mock.calls.length;
+
+    // The window opens: the adviser submits — an active flip (idle →
+    // holding a night intent), so the world is re-read through the plane.
+    act(() => {
+      channel.push(
+        nightChargeStateChanged(42, {
+          active: true,
+          phase: "pacing",
+          held_intent_id: "night-881-77123.445101",
+          window_ends_at: "2026-08-28T06:00:00+10:00",
+          window_ends_in_s: 5341,
+          next_window_at: null,
+          reason_codes: ["window_open", "on_plan"],
+        }) as unknown as StreamEvent,
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("night").textContent).toBe("on|active|pacing|demand 412W|good");
+    });
+    await waitFor(() => {
+      expect(getSnapshot.mock.calls.length).toBeGreaterThan(reads);
+    });
+  });
+
+  it("re-prices a demand hold in place: a phase change that keeps the intent needs no refetch", async () => {
+    // The hold is a small POSITIVE charge — the intent stays held (only its
+    // watts change), so pacing → holding_on_demand is figure movement, not an
+    // authority change: the payload alone answers it.
+    const world = {
+      ...SNAPSHOT,
+      night_charge_state: nightChargeState({
+        enabled: true,
+        active: true,
+        phase: "pacing",
+        demand_w: 412,
+        reason_codes: ["window_open", "on_plan"],
+      }),
+    } as unknown as Snapshot;
+    const channel = eventChannel([
+      { type: "snapshot", sequence: world.snapshot_sequence, data: world },
+    ]);
+    const getSnapshot = vi.fn(() => Promise.resolve(world));
+    const client = mockClient({
+      getSnapshot: getSnapshot as unknown as ApiClient["getSnapshot"],
+      openEvents: vi.fn(() => channel.open()),
+    });
+    render(
+      <Probe client={client} onUnauthorized={vi.fn()} retryDelaysMs={[5]} livePollMs={100_000} />,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("night").textContent).toBe("on|active|pacing|demand 412W|good");
+    });
+    const reads = getSnapshot.mock.calls.length;
+
+    act(() => {
+      channel.push(
+        nightChargeStateChanged(42, {
+          active: true,
+          phase: "holding_on_demand",
+          demand_w: 2340,
+          reason_codes: ["demand_above_threshold"],
+        }) as unknown as StreamEvent,
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("night").textContent).toBe(
+        "on|active|holding_on_demand|demand 2340W|good",
+      );
+    });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+    expect(getSnapshot.mock.calls.length).toBe(reads);
+  });
+
+  it("refreshes figures from a heartbeat without a refetch (figure wander never re-reads)", async () => {
+    const world = {
+      ...SNAPSHOT,
+      night_charge_state: nightChargeState({
+        enabled: true,
+        active: true,
+        phase: "pacing",
+        demand_w: 412,
+        reason_codes: ["window_open", "on_plan"],
+      }),
+    } as unknown as Snapshot;
+    const channel = eventChannel([
+      { type: "snapshot", sequence: world.snapshot_sequence, data: world },
+    ]);
+    const getSnapshot = vi.fn(() => Promise.resolve(world));
+    const client = mockClient({
+      getSnapshot: getSnapshot as unknown as ApiClient["getSnapshot"],
+      openEvents: vi.fn(() => channel.open()),
+    });
+    render(
+      <Probe client={client} onUnauthorized={vi.fn()} retryDelaysMs={[5]} livePollMs={100_000} />,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("night").textContent).toBe("on|active|pacing|demand 412W|good");
+    });
+    const reads = getSnapshot.mock.calls.length;
+
+    act(() => {
+      channel.push(
+        nightChargeStateChanged(42, {
+          heartbeat: true,
+          enabled: true,
+          active: true,
+          phase: "pacing",
+          demand_w: 505,
+          reason_codes: ["window_open", "on_plan"],
+        }) as unknown as StreamEvent,
+      );
+    });
+
+    // The figures move from the payload alone (a re-priced demand reading on
+    // the same state tuple)…
+    await waitFor(() => {
+      expect(screen.getByTestId("night").textContent).toBe("on|active|pacing|demand 505W|good");
     });
     // …and the state tuple did not change, so no authority refetch ran.
     await new Promise((resolve) => {

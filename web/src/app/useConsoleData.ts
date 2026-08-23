@@ -63,6 +63,7 @@ import {
   toForeignObjectiveEvent,
 } from "./objectives";
 import { toEnergyDayRolledEvent } from "./energy";
+import { patchNightChargeState, type NightChargeState } from "./nightCharge";
 import type { UnitObjective } from "./objectives";
 import {
   applyWindowClosing,
@@ -185,6 +186,7 @@ type Action =
   | { type: "clear-restart-notice" }
   | { type: "stop-released"; stopId: string }
   | { type: "adviser-state"; state: AdviserState }
+  | { type: "night-state"; state: NightChargeState }
   | { type: "schedule-state"; state: ScheduleState }
   | { type: "unit-health"; unitId: string; health: UnitHealth }
   | { type: "unit-objective"; unitId: string; objective: UnitObjective }
@@ -377,6 +379,16 @@ function reducer(state: State, action: Action): State {
       }
       return { ...state, snapshot: { ...state.snapshot, adviserState: action.state } };
     }
+    case "night-state": {
+      // The night adviser's own frame (§5, the adviser-state mirror): patch
+      // the shell's night-state slice in place — the payload is the freshest
+      // projection the console can have, and the live-cadence snapshot
+      // confirms it moments later.
+      if (state.snapshot === null) {
+        return state;
+      }
+      return { ...state, snapshot: { ...state.snapshot, nightChargeState: action.state } };
+    }
     case "schedule-state": {
       // A schedule window transition (§5 W-D): the projection moves NOW,
       // state-locally — the card swaps without waiting for a poll, and the
@@ -550,6 +562,7 @@ function applyEventFrame(
   dispatch: (action: Action) => void,
   adviser: AdviserState | null = null,
   schedule: ScheduleState | null = null,
+  night: NightChargeState | null = null,
 ): boolean {
   switch (frame.type) {
     case "snapshot": {
@@ -725,6 +738,25 @@ function applyEventFrame(
       dispatch({ type: "adviser-state", state: next });
       return (
         adviser === null || adviser.enabled !== next.enabled || adviser.active !== next.active
+      );
+    }
+    case "night_charge.state_changed": {
+      // Feature-detected (§5, the excess_adviser mechanics verbatim): the
+      // night adviser's own frame patches the shell's night-state slice from
+      // the payload. The debounced authority refetch runs ONLY when
+      // `active`/`enabled` changed — the per-unit watt and SOC figures ride
+      // every publication (heartbeats included) and are their own refresh;
+      // refetching on figure wander would put one read per tick on the REST
+      // path for numbers the payload already carries. NOTHING is published
+      // while disabled, so the disable-carrying frame is the last one.
+      const payload = payloadOf(frame);
+      const next = patchNightChargeState(night, payload);
+      if (next === null) {
+        return false;
+      }
+      dispatch({ type: "night-state", state: next });
+      return (
+        night === null || night.enabled !== next.enabled || night.active !== next.active
       );
     }
     case "unit.health_changed": {
@@ -1335,6 +1367,7 @@ export function useConsoleData(
                 dispatch,
                 stateRef.current.snapshot?.adviserState ?? null,
                 stateRef.current.snapshot?.scheduleState ?? null,
+                stateRef.current.snapshot?.nightChargeState ?? null,
               )
             ) {
               scheduleAuthorityRefresh();
