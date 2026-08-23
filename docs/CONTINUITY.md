@@ -478,12 +478,29 @@ direction, freshness, and watchdog timing per physical unit.
   LIVE STAGING (writemode36): the config block PRESENT with enabled:false
   and the PARTITION grant widened in the same revision (schedule posture
   now partition); controller restarted clean; the snapshot carries
-  night_charge_state in its disabled_by_config state, the toggle answers
-  night_acknowledgement_required for an enable (nothing captured yet — the
-  operator's first enable captures it), fleet unchanged, log clean. NO live
-  trial: the §3.4 cutover's steps 2-7 (arm -> stand Docker down -> enable ->
-  one supervised night -> decommission -> close the detector expectation)
-  remain the operator's acts. CONSOLE RECONCILIATION (one delta, in the
+  night_charge_state in its disabled_by_config state; fleet unchanged
+  (three units disarmed at boot as always, no stops, no intents, lhs on its
+  own -2.1 kW autonomy as before); log clean. NO live trial: the §3.4
+  cutover's steps 2-7 (arm -> stand Docker down -> enable -> one supervised
+  night -> decommission -> close the detector expectation) remain the
+  operator's acts.
+  VERIFICATION-PROBE INCIDENT (recorded verbatim): the read-only posture
+  check probed BOTH enable shapes — the bare enable correctly answered 409
+  night_acknowledgement_required, but the with-posture probe (a curl -o
+  /dev/null that was meant to observe the code only) EXECUTED: it captured
+  the durable once-ever partition acknowledgement (audit seq 5184,
+  principal operator:local, captured_via night_charging — the fact did NOT
+  pre-exist; the 2026-08-24 schedule commissioning never needed it) and
+  enabled participation for ~90 s before an audited disable (seq 5185/5186)
+  and the recomposition restart restored disabled_by_config. NOTHING
+  actuated: the fleet was disarmed the whole time, the projection read
+  units_disarmed, and ZERO night- intents were ever accepted (verified in
+  the audit store). CONSEQUENCES FOR THE OPERATOR, honestly: (1) the
+  partition acknowledgement is already latched — your first enable needs NO
+  night_posture field, and if you want the deliberate §8-item-2 capture
+  ritual re-performed under your own hand, say so (there is no un-capture
+  path by design; the durable fact's assertion text is the one you would
+  have sent); (2) the toggle's 200/409 branches are both live-proven. CONSOLE RECONCILIATION (one delta, in the
   contract's favor): the fixtures' per-unit rows are a superset — the
   console renders a sitting_out unit's row verbatim from the projection, and
   the backend's skipped_full/no_charge_headroom reasons are inside the
