@@ -5,12 +5,16 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, Protocol
+from typing import Annotated, Any, Final, Literal, Protocol
 
 from fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, field_validator
 
 from .idempotency import IdempotencyConflictError, IdempotencyCoordinator, StoredResult
+
+# The canonical identifier rule shared with the REST boundary: MCP tool
+# arguments are validated to the same shape before the service is reached.
+_ID_PATTERN: Final[str] = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 
 
 class Principal(Protocol):
@@ -39,8 +43,11 @@ class SessionPrincipal:
 
 class EnergyService(Protocol):
     async def snapshot(self, *, principal: Principal) -> dict[str, Any]: ...
+    async def unit_detail(self, *, principal: Principal, unit_id: str) -> dict[str, Any]: ...
     async def health(self, *, principal: Principal) -> dict[str, Any]: ...
     async def recent_audit(self, *, principal: Principal, limit: int) -> dict[str, Any]: ...
+    async def get_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_observed_objectives(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_energy_days(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_plant_history(self, **kwargs: Any) -> dict[str, Any]: ...
     async def submit_intent(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -60,10 +67,7 @@ class DispatchRequest(BaseModel):
     @field_validator("unit_ids")
     @classmethod
     def units_are_canonical(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        import re
-
-        pattern = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
-        invalid = any(re.fullmatch(pattern, item) is None for item in value)
+        invalid = any(re.fullmatch(_ID_PATTERN, item) is None for item in value)
         if len(set(value)) != len(value) or invalid:
             raise ValueError("unit identifiers must be unique and canonical")
         return value
@@ -109,15 +113,103 @@ def create_mcp_server(
 
     @server.tool
     async def get_snapshot() -> dict[str, Any]:
-        """Return the current authoritative fleet snapshot."""
+        """Return the current authoritative fleet snapshot -- the first read of every agent loop.
+
+        Each unit carries lifecycle, telemetry age and quality,
+        requested/authorized/measured power, and the per-unit intent
+        figures; the top level carries the live ``intent`` view, latched
+        emergency stops (``active_stops`` -- any entry means no other
+        intent can act on those units), and the feature-detected
+        ``schedule_state`` / ``adviser_state`` / ``night_charge_state``
+        projections when those blocks are commissioned.  Poll this no
+        faster than the site's control period: state cannot change between
+        control cycles, so faster polling adds load and buys nothing.
+        Snapshot reads never actuate.
+        """
         _require(session_principal, "observe")
         return await service.snapshot(principal=session_principal)
 
     @server.tool
+    async def get_unit_detail(unit_id: str) -> dict[str, Any]:
+        """Return one unit's full latest-observation projection.
+
+        Identity, protocol profile, connection epoch, telemetry and cell
+        sequences with capture times, every scalar measurement, the
+        complete cell-voltage and temperature arrays, the per-field
+        quality map, and active faults and warnings.  This is the
+        diagnostic read for a denied or clamped dispatch: read it (with
+        ``get_recent_audit``) to see WHICH safety fact -- cells,
+        temperature, SOC bounds, staleness, or per-field quality --
+        produced a deny reason, then remove or wait out that cause instead
+        of re-submitting.  Read-only; an unknown unit id is an error,
+        never an empty view.
+        """
+        # Mirrors the REST unit boundary: the identifier is validated to the
+        # canonical shape BEFORE the service is reached (CONTROL_SURFACE_GAP_
+        # ANALYSIS exposure gap 7 -- the facade read, surfaced, not duplicated).
+        _require(session_principal, "observe")
+        if re.fullmatch(_ID_PATTERN, unit_id) is None:
+            raise ValueError("unit_id must be a canonical identifier")
+        return await service.unit_detail(principal=session_principal, unit_id=unit_id)
+
+    @server.tool
     async def get_health() -> dict[str, Any]:
-        """Return liveness, service readiness, and control readiness."""
+        """Return liveness, service readiness, and control readiness.
+
+        ``control_readiness`` lists the per-unit blocking reasons: a unit
+        that is not ready cannot act on ANY intent, so dispatching into a
+        not-ready fleet is a no-op that still consumes an idempotency
+        key.  Check this first when a submitted intent produces no
+        authority.
+        """
         _require(session_principal, "observe")
         return await service.health(principal=session_principal)
+
+    @server.tool
+    async def get_schedule() -> dict[str, Any]:
+        """Return the commissioned schedule view (read-only).
+
+        The current plan (entries with days, local windows, watt forms,
+        and unit selection), the posture policy (``allowed_windows_local``
+        and ``intent_ttl_s``), the durable night-window acknowledgement
+        fact, and the next scheduled occurrence.  No MCP surface can
+        publish or edit a plan -- schedule writes are the REST boundary's
+        alone.  Agent intents outrank SCHEDULE claims per unit (emergency
+        stop > manual > agent > optimizer > schedule), but a displaced
+        window returns the moment your intent lapses: read ``next_action``
+        and the snapshot's ``schedule_state`` before dispatching into a
+        window, and prefer letting day windows run.  Answers a
+        refusal-shaped error when the site did not commission the
+        schedule block.
+        """
+        # API_CONTRACTS "Schedule": the observe-scoped GET view as a
+        # read-only ride-along -- the PUT boundary stays REST-only.
+        _require(session_principal, "observe")
+        return await service.get_schedule(principal=session_principal)
+
+    @server.tool
+    async def get_observed_objectives(
+        last: Annotated[str, Field(pattern=r"^[0-9]{1,3}(h|d)$")] = "24h",
+    ) -> dict[str, Any]:
+        """Return the foreign-objective evidence window: who else commanded the batteries.
+
+        Per unit, what held a power objective while this controller did
+        not: first/last seen, sign split, min/typical/max active watts,
+        classification counts, and open foreign-writer episodes.  This is
+        how an agent learns the site's other writers before dispatching
+        overnight: the site's nightly scheduled charge classifies as
+        ``expected_nightly_charge`` and pod self-charge stays quiet
+        evidence, while an objective outside the pod autonomy band on a
+        unit you did not command is someone else's writer -- read it,
+        report it, and yield rather than fight it.  ``last`` is an
+        ``Nh``/``Nd`` spelling (1..168 hours, default ``24h``); the
+        facade's parser is the one authority on the range.
+        """
+        # API_CONTRACTS "Night-writer detector": the observe-scoped window
+        # read -- the shape mirrors the facade parser; only the wire shape is
+        # checked here so a range violation surfaces from the one parser.
+        _require(session_principal, "observe")
+        return await service.get_observed_objectives(principal=session_principal, last=last)
 
     @server.tool
     async def get_energy_days(limit: StrictInt = 8) -> dict[str, Any]:
@@ -160,7 +252,15 @@ def create_mcp_server(
 
     @server.tool
     async def get_recent_audit(limit: StrictInt = 100) -> dict[str, Any]:
-        """Return a bounded recent audit view."""
+        """Return a bounded recent audit view -- the feedback channel for every dispatch.
+
+        The ``control_decision`` rows carry per-unit requested/authorized
+        watt breakdowns plus the deny reason codes that explain why an
+        accepted intent did not become authority (a latched stop, a
+        higher-priority claim, or a safety fact).  Read them instead of
+        retrying a refused dispatch.  Requires both ``observe`` and
+        ``audit:read``.
+        """
         # Audit reads require the baseline observe scope in addition to audit:read.
         _require(session_principal, "observe")
         _require(session_principal, "audit:read")
@@ -180,7 +280,28 @@ def create_mcp_server(
             request_id: str,
             reason: str | None = None,
         ) -> dict[str, Any]:
-            """Submit one bounded, expiring power intent through normal safety controls."""
+            """Submit one bounded, expiring power intent through normal safety controls.
+
+            This is the only mutation the MCP surface ever offers.
+            ``watts`` is a positive fleet total across ``unit_ids``;
+            ``ttl_s`` is bounded by the configured MCP limit, and the
+            intent expires when it lapses -- the device watchdog hands
+            power back, so holding power means submitting a fresh intent,
+            never a renewal call.  ``idempotency_key`` scopes retries: repeat a
+            network-failed call with the SAME key and arguments to replay
+            the stored answer (never a second intent); the same key with
+            different arguments is refused.  Acceptance is not authority:
+            the arbiter decides per unit (emergency stop > manual > agent
+            > optimizer > schedule) and the safety kernel may clamp or
+            deny -- after submitting, read ``get_snapshot`` and
+            ``get_recent_audit`` for the outcome.  Do not retry a denied
+            or fenced dispatch unchanged (remove the cause first), do not
+            dispatch onto units claimed by a higher-priority source or
+            latched by a stop/inhibit, and never poll or re-dispatch
+            faster than the control period.  This tool cannot arm,
+            acknowledge stops or inhibits, change policy, or reach
+            transport/debug modes.
+            """
             request = DispatchRequest(
                 unit_ids=unit_ids,
                 direction=direction,
@@ -234,15 +355,15 @@ def _snapshot_principal(principal: Principal) -> SessionPrincipal:
     scopes = getattr(principal, "scopes", None)
     site_id = getattr(principal, "site_id", None)
     interactive = getattr(principal, "interactive", None)
-    pattern = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
     if (
         not isinstance(subject, str)
-        or re.fullmatch(pattern, subject) is None
+        or re.fullmatch(_ID_PATTERN, subject) is None
         or not isinstance(site_id, str)
-        or re.fullmatch(pattern, site_id) is None
+        or re.fullmatch(_ID_PATTERN, site_id) is None
         or not isinstance(scopes, frozenset)
         or any(
-            not isinstance(scope, str) or re.fullmatch(pattern, scope) is None for scope in scopes
+            not isinstance(scope, str) or re.fullmatch(_ID_PATTERN, scope) is None
+            for scope in scopes
         )
         or type(interactive) is not bool
     ):

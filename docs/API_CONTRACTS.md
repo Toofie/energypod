@@ -394,6 +394,24 @@ this section is the wire contract.
   hold that scope). It submits ordinary bounded, expiring intents and cannot arm, acknowledge stops
   or inhibits, change policy, or use debug/maintenance modes. Its audit view requires both
   `observe` and `audit:read`, matching the REST boundary.
+- The MCP read surface (2026-08-24) is `get_snapshot`, `get_unit_detail(unit_id)` (the REST
+  `GET /api/v1/units/{unit_id}` projection verbatim, `observe`; a malformed or unknown unit id is
+  a tool error, never an empty view), `get_health`, `get_schedule()` (the Schedule §5 GET view as
+  a read-only ride-along — no MCP surface can publish a plan, and an absent schedule block answers
+  the refusal-shaped error), `get_observed_objectives(last)` (the night-writer window read,
+  `Nh`/`Nd`, default `24h`), `get_energy_days(limit)`, `get_plant_history(from, to, unit_ids?,
+  fields?, points?)`, and `get_recent_audit(limit)`. Every read requires `observe`, forwards to
+  the one facade, and never re-implements a projection.
+- The tool descriptions ARE the agent-loop contract (2026-08-24): poll `get_snapshot` no faster
+  than the site control period (state cannot change between cycles); read
+  `get_observed_objectives` and `get_schedule` before dispatching overnight or into a window, and
+  `get_unit_detail`/`get_recent_audit` to diagnose a denial; submit only through `dispatch_intent`
+  with an idempotency key (same key + same arguments replays the stored answer; same key +
+  different arguments is refused); holding power means a fresh submission before TTL, never a
+  renewal call; acceptance is not authority — the arbiter decides per unit (emergency stop >
+  manual > agent > optimizer > schedule) and the safety kernel may clamp or deny — and a denied
+  or fenced dispatch is never retried unchanged, nor is anything dispatched onto units claimed by
+  a higher-priority source or latched by a stop/inhibit.
 - `POST /api/v1/intents` carries exactly one watt form (the 2026-08-23 operator ruling: each
   setting is that battery's own request): either scalar `watts` (integer > 0, the fleet total —
   fully supported, unchanged) or `watts_by_unit` (a JSON object of one integer > 0 per unit id,

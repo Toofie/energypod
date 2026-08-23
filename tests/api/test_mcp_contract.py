@@ -296,6 +296,114 @@ async def test_mcp_idempotency_replay_uses_shared_service_path_once(
 
 
 @pytest.mark.asyncio
+async def test_mcp_unit_detail_mirrors_the_rest_unit_endpoint(
+    service: RecordingEnergyService,
+) -> None:
+    """CONTROL_SURFACE_GAP_ANALYSIS exposure gap 7 / PRODUCT_NEXT S8: the
+    facade read behind GET /api/v1/units/{unit_id} as an observe-scoped tool
+    -- the same projection, never a second implementation."""
+    server = await _server(service, principal_name="viewer-token")
+    async with Client(server) as client:
+        detail = await client.call_tool("get_unit_detail", {"unit_id": "MID"})
+        empty = await client.call_tool("get_unit_detail", {"unit_id": "pod-empty"})
+        unknown = await client.call_tool(
+            "get_unit_detail", {"unit_id": "pod-ghost"}, raise_on_error=False
+        )
+        malformed = await client.call_tool(
+            "get_unit_detail", {"unit_id": "../raw-register-read"}, raise_on_error=False
+        )
+
+    assert detail.data["device_identity"] == "BEP0005KXX11B10500055"
+    assert len(detail.data["cell_voltages_v"]) == 60
+    assert detail.data["quality"]["battery_watts"] == "good"
+    assert empty.data["battery_watts"] is None, "an unpublished unit is nulls, never zeros"
+    assert unknown.is_error, "an unknown unit id is an error, never an empty view"
+    assert malformed.is_error
+    forwarded = [values for name, values in service.calls if name == "unit_detail"]
+    assert forwarded[0]["unit_id"] == "MID"
+    assert forwarded[0]["principal"].subject == "person:viewer"
+    assert [values["unit_id"] for values in forwarded] == [
+        "MID",
+        "pod-empty",
+        "pod-ghost",
+    ], "a malformed identifier never reaches the service"
+
+
+@pytest.mark.asyncio
+async def test_mcp_schedule_state_is_a_read_only_ride_along(
+    service: RecordingEnergyService,
+) -> None:
+    """API_CONTRACTS "Schedule": the observe-scoped GET view as an MCP tool.
+    No MCP surface can publish a plan -- the PUT boundary is REST-only."""
+    from energypod.application.scheduling import ScheduleRefusal
+
+    server = await _server(service, principal_name="viewer-token")
+    async with Client(server) as client:
+        view = await client.call_tool("get_schedule", {})
+        service.schedule_refusal = ScheduleRefusal(
+            "schedule_not_commissioned",
+            "the schedule feature is not composed on this site",
+        )
+        refused = await client.call_tool("get_schedule", {}, raise_on_error=False)
+
+    assert view.data["policy"]["posture"] == "yield"
+    assert view.data["plan"] is None
+    assert refused.is_error, "an absent schedule block is a refusal, never a silent empty plan"
+    assert [name for name, _ in service.calls] == ["get_schedule", "get_schedule"]
+    assert service.calls[0][1]["principal"].subject == "person:viewer"
+
+
+@pytest.mark.asyncio
+async def test_mcp_observed_objectives_is_a_read_only_ride_along(
+    service: RecordingEnergyService,
+) -> None:
+    """API_CONTRACTS "Night-writer detector": the observe-scoped window read
+    -- the agent's only view of the site's other (night) writers."""
+    server = await _server(service, principal_name="viewer-token")
+    async with Client(server) as client:
+        day = await client.call_tool("get_observed_objectives", {})
+        week = await client.call_tool("get_observed_objectives", {"last": "7d"})
+        refused = await client.call_tool(
+            "get_observed_objectives", {"last": "nope"}, raise_on_error=False
+        )
+
+    assert day.data["window_s"] == 86400
+    assert day.data["units"][0]["foreign_reason"] == "sustained_charge_without_pv_evidence"
+    assert week.data["last"] == "7d"
+    assert week.data["window_s"] == 168 * 3600
+    assert refused.is_error
+    forwarded = [values for name, values in service.calls if name == "get_observed_objectives"]
+    assert forwarded[0]["last"] == "24h"
+    assert forwarded[1]["last"] == "7d"
+    assert len(forwarded) == 2, "a malformed window never reaches the service"
+
+
+@pytest.mark.asyncio
+async def test_tool_descriptions_teach_the_safe_agent_loop(
+    service: RecordingEnergyService,
+) -> None:
+    """The tool surface is an autonomous agent's only manual: the descriptions
+    must encode the loop contract (poll snapshot -> read objectives/schedule
+    -> dispatch with idempotency), the arbiter's precedence, and the refusals
+    (never poll faster than the control period; never retry a fenced denial)."""
+    server = await _server(service, principal_name="operator-token", mutations_enabled=True)
+    async with Client(server) as client:
+        descriptions = {tool.name: tool.description or "" for tool in await client.list_tools()}
+
+    snapshot = descriptions["get_snapshot"]
+    assert "control period" in snapshot
+    assert "active_stops" in snapshot
+
+    for name in ("get_unit_detail", "get_observed_objectives", "get_schedule"):
+        assert name in descriptions, f"{name} must be part of the read surface"
+
+    dispatch = descriptions["dispatch_intent"]
+    for needle in ("idempotency_key", "expire", "arbiter", "deny"):
+        assert needle in dispatch, f"the dispatch contract must name {needle}"
+    assert "cannot arm" in dispatch or "never arm" in dispatch
+
+
+@pytest.mark.asyncio
 async def test_mcp_plant_history_is_a_read_only_ride_along(
     service: RecordingEnergyService,
 ) -> None:
