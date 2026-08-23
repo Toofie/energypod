@@ -1460,9 +1460,12 @@ export function scheduleRefusalEnvelope(
     },
     validation_error: {
       status: 422,
-      message: "The schedule entries did not validate.",
+      message: "Request validation failed",
       details: {
-        entries: [
+        // The shape rest.py's replace_schedule handler pins (B4, landed):
+        // the per-entry domain errors nested under `errors`, each naming the
+        // offending entry_id.
+        errors: [
           { entry_id: "Night Charge", field: "end_local", message: "window must outlast its start" },
         ],
       },

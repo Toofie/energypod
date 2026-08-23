@@ -440,17 +440,28 @@ function asRefusal(error: unknown): ScheduleRefusal {
   };
 }
 
-/** The per-entry server errors a 422 carries, mapped by entry id. */
+/**
+ * The per-entry server errors a 422 carries, mapped by entry id. The service
+ * nests them under `details.errors` (rest.py's replace_schedule handler,
+ * landed with B4); `entries` is read alongside it defensively — the doc pins
+ * the shape, the row mapping must survive either spelling.
+ */
 function serverEntryErrors(refusal: ScheduleRefusal): Record<string, string[]> {
   const mapped: Record<string, string[]> = {};
   const details = refusal.details;
-  const rows = Array.isArray(details?.entries) ? (details?.entries as unknown[]) : [];
+  const rows = Array.isArray(details?.errors)
+    ? (details?.errors as unknown[])
+    : Array.isArray(details?.entries)
+      ? (details?.entries as unknown[])
+      : [];
   for (const row of rows) {
     if (row === null || typeof row !== "object") {
       continue;
     }
     const record = row as Record<string, unknown>;
     if (typeof record.entry_id !== "string") {
+      // A plan-level error (entry_id null) has no row to sit on; the envelope
+      // itself renders it verbatim.
       continue;
     }
     const message =
