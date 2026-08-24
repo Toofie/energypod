@@ -1702,22 +1702,27 @@ export function excessChargingToggleOk(state: WireAdviserState): Record<string, 
 }
 
 // ---------------------------------------------------------------------------
-// Night charge (DESIGN_NIGHT_CHARGE.md §5, API_CONTRACTS.md "Off-peak night
-// charge") — the whole family is PENDING-BACKEND: the `night_charge_state`
-// projection, the `night_charge.state_changed` event, and the guarded toggle
-// route are not live yet, so none of these shapes is served by today's wire
-// (the default snapshot omits `night_charge_state` entirely; an absent field
-// is today's wire truth). Defaults are the design's own §5 illustrative night,
-// verbatim. Attach with `withNightChargeState`.
+// Night charge (DESIGN_NIGHT_CHARGE.md §5, DESIGN_NIGHT_CHARGE_V2.md §7,
+// API_CONTRACTS.md "Off-peak night charge") — the backend family is LIVE
+// (v1 since the night program; the V2 forecast keys since 2026-08-24,
+// commits 5ba401d..b6a6308): the `night_charge_state` projection, the
+// `night_charge.state_changed` event, and the guarded toggle route are served
+// wherever the `night_charging` block is composed. The default snapshot still
+// omits `night_charge_state` entirely — that absent key models the
+// uncommissioned site and is the console's feature detection. Defaults are
+// the design's own §5 illustrative night, verbatim (a v1/full-posture frame;
+// the V2 keys are additive and ABSENT under `full`, so v1 consumers see
+// byte-identical frames). Attach with `withNightChargeState`.
 // ---------------------------------------------------------------------------
 
 /**
- * The night adviser's state announcement (§5): published only when the
+ * The night adviser's state announcement (§5 + V2 §7): published only when the
  * semantic tuple `(enabled, enabled_origin, acknowledged_partition, active,
- * phase, active_unit_ids, demand_evidence, reason_codes)` changes, plus a 30 s
- * `"heartbeat": true` republish while enabled and NOTHING while disabled.
- * PENDING-BACKEND — not in PUBLISHED_EVENT_TYPES; suites attach it with
- * `nightChargeStateChanged`.
+ * phase, active_unit_ids, demand_evidence, reason_codes, target_policy,
+ * trust.state)` changes — the V2 pair are the exactly-two new members — plus
+ * a 30 s `"heartbeat": true` republish while enabled and NOTHING while
+ * disabled. Not in PUBLISHED_EVENT_TYPES (the checklist predates the family);
+ * suites attach it with `nightChargeStateChanged`.
  */
 export const NIGHT_CHARGE_STATE_CHANGED = "night_charge.state_changed" as const;
 
@@ -1747,7 +1752,7 @@ export const NIGHT_DEMAND_EVIDENCE_VALUES: readonly string[] = [
   "stale",
 ];
 
-/** The projection's ONE pinned reason vocabulary (§5), verbatim. */
+/** The projection's ONE pinned reason vocabulary (§5 + V2 §7's five additions). */
 export const NIGHT_REASON_CODE_VALUES: readonly string[] = [
   "outside_window",
   "window_open",
@@ -1767,7 +1772,165 @@ export const NIGHT_REASON_CODE_VALUES: readonly string[] = [
   "disabled_by_config",
   "disabled_by_runtime",
   "night_acknowledgement_required",
+  // V2 §3.3's ladder words (each rides every frame of a fallback window) and
+  // §5.4's honest close — additive, in the backend's own declaration order.
+  "forecast_missing",
+  "forecast_stale",
+  "forecast_no_load_baseline",
+  "forecast_below_trust",
+  "window_closed_below_target",
 ];
+
+/** V2 §3.1's three-state `target_policy` key (absent = `full` = v1 identity). */
+export const NIGHT_TARGET_POLICY_VALUES: readonly string[] = [
+  "full",
+  "forecast_suggest",
+  "forecast_act",
+];
+
+/** V2 §3.2's trust scoreboard states (the gate's own words). */
+export const NIGHT_TRUST_STATE_VALUES: readonly string[] = [
+  "provisioning",
+  "earned",
+  "suspended",
+];
+
+/** V2 §7's forecast-frame statuses: `ok`, or §3.3's four fallback rungs. */
+export const NIGHT_FORECAST_STATUS_VALUES: readonly string[] = [
+  "ok",
+  "forecast_missing",
+  "forecast_stale",
+  "forecast_no_load_baseline",
+  "forecast_below_trust",
+];
+
+/** V2 §7's ceiling-bound decomposition words (A10): which guard fired. */
+export const NIGHT_CEILING_BOUND_BY_VALUES: readonly string[] = ["sky", "netting"];
+
+/**
+ * V2 §3.2's trust scoreboard block, exactly as the ledger's `snapshot()`
+ * serves it: the state word, the day counts (`days_scored` is the store's
+ * TOTAL — the §7 example carries 19 against a required 14), the rolling mean
+ * and signed bias (positive = over-forecast, null before any scored window),
+ * and the A4 regime-mix counts over the scored days.
+ */
+export interface WireNightTrust {
+  readonly state: string;
+  readonly days_scored: number;
+  readonly required_days: number;
+  readonly mean_abs_err_pct: number | null;
+  readonly bias_pct: number | null;
+  readonly low_surplus_days: number;
+  readonly high_surplus_days: number;
+}
+
+/**
+ * A trust fixture. Defaults are the design's own §7 example numbers verbatim
+ * (19 days, mean 21.4, bias −4.2, 5 low / 4 high — earned); explicit nulls are
+ * preserved (a young scoreboard carries no mean yet).
+ */
+export function nightTrust(spec: Partial<WireNightTrust> = {}): WireNightTrust {
+  return {
+    state: spec.state ?? "earned",
+    days_scored: spec.days_scored ?? 19,
+    required_days: spec.required_days ?? 14,
+    mean_abs_err_pct: spec.mean_abs_err_pct === undefined ? 21.4 : spec.mean_abs_err_pct,
+    bias_pct: spec.bias_pct === undefined ? -4.2 : spec.bias_pct,
+    low_surplus_days: spec.low_surplus_days ?? 5,
+    high_surplus_days: spec.high_surplus_days ?? 4,
+  };
+}
+
+/**
+ * V2 §7's `forecast` frame — the morning-credit arithmetic actually used, or
+ * the §3.3 ladder's honest word. A union because the backend builds exactly
+ * two shapes: the `ok` frame (full arithmetic + provenance + A10's
+ * `ceiling_bound_by`) and the fallback frames (status word, the commissioned
+ * quantile and midday, NOTHING else — a fallback night leaves no figures to
+ * misread).
+ */
+export type WireNightForecast = WireNightForecastOk | WireNightForecastFallback;
+
+/** The live-computation frame (V2 §7's JSON, verbatim keys). */
+export interface WireNightForecastOk {
+  readonly status: "ok";
+  readonly source: string | null;
+  readonly quantile: number | null;
+  readonly issued_at: string | null;
+  readonly fetched_at: string | null;
+  readonly e_surplus_kwh: number | null;
+  readonly e_deficit_kwh: number | null;
+  readonly e_credit_kwh: number | null;
+  readonly midday_local: string;
+  readonly ceiling_bound_by: string | null;
+}
+
+/** One of §3.3's four fallback rungs — the word, no figures. */
+export interface WireNightForecastFallback {
+  readonly status:
+    | "forecast_missing"
+    | "forecast_stale"
+    | "forecast_no_load_baseline"
+    | "forecast_below_trust";
+  readonly quantile: number;
+  readonly midday_local: string;
+}
+
+/**
+ * A live-forecast fixture. Defaults are the design's own §7 illustrative
+ * arithmetic (6.0 surplus / 0.5 deficit / 4.9 credit, Solcast p10 issued
+ * 18:03, midday 12:00, unbound); explicit nulls are preserved.
+ */
+export function nightForecastOk(spec: Partial<WireNightForecastOk> = {}): WireNightForecastOk {
+  return {
+    status: "ok",
+    source: spec.source ?? "solcast",
+    quantile: spec.quantile === undefined ? 0.1 : spec.quantile,
+    issued_at: spec.issued_at === undefined ? "2026-08-24T18:03:00+10:00" : spec.issued_at,
+    fetched_at: spec.fetched_at === undefined ? "2026-08-24T20:00:12+10:00" : spec.fetched_at,
+    e_surplus_kwh: spec.e_surplus_kwh === undefined ? 6.0 : spec.e_surplus_kwh,
+    e_deficit_kwh: spec.e_deficit_kwh === undefined ? 0.5 : spec.e_deficit_kwh,
+    e_credit_kwh: spec.e_credit_kwh === undefined ? 4.9 : spec.e_credit_kwh,
+    midday_local: spec.midday_local ?? "12:00",
+    ceiling_bound_by: spec.ceiling_bound_by === undefined ? null : spec.ceiling_bound_by,
+  };
+}
+
+/** One fallback frame (§3.3's ladder word + the commissioned quantile/midday). */
+export function nightForecastFallback(
+  status: WireNightForecastFallback["status"],
+  spec: { quantile?: number; midday_local?: string } = {},
+): WireNightForecastFallback {
+  return {
+    status,
+    quantile: spec.quantile ?? 0.1,
+    midday_local: spec.midday_local ?? "12:00",
+  };
+}
+
+/**
+ * V2 §5.4/A5's morning notice: a forecast window that closed below target
+ * latches this on the projection until `midday_local` (the backend clears it;
+ * `until_local` restates the line so the console can say it).
+ */
+export interface WireNightMorningNotice {
+  readonly date: string;
+  readonly target_soc_pct: number | null;
+  readonly units_below_target: readonly string[];
+  readonly until_local: string;
+}
+
+/** A morning-notice fixture; explicit nulls are preserved. */
+export function nightMorningNotice(
+  spec: Partial<WireNightMorningNotice> = {},
+): WireNightMorningNotice {
+  return {
+    date: spec.date ?? "2026-08-28",
+    target_soc_pct: spec.target_soc_pct === undefined ? 65.5 : spec.target_soc_pct,
+    units_below_target: [...(spec.units_below_target ?? ["rhs"])],
+    until_local: spec.until_local ?? "12:00",
+  };
+}
 
 /** One unit's per-tick plan row, exactly as the projection spells it. */
 export interface WireNightUnitState {
@@ -1776,21 +1939,36 @@ export interface WireNightUnitState {
   readonly phase: string;
   readonly target_w: number;
   readonly reason: string;
+  /**
+   * V2 §7's per-unit target key, ADDITIVE and named by the posture: exactly
+   * ONE of the two is ever present, only under a forecast posture with a live
+   * computation, and never under `full` or a fallback window.
+   */
+  readonly target_soc_pct?: number;
+  readonly suggested_target_soc_pct?: number;
 }
 
 /**
  * A per-unit night row fixture. Defaults are the §5 example's own three rows
  * (lhs pacing at the cap, mid pacing, rhs skipped-full at the ceiling); an
- * explicit null soc_pct is preserved — never zero-filled.
+ * explicit null soc_pct is preserved — never zero-filled. The V2 target keys
+ * are ABSENT by default (a v1 frame) — pass one explicitly, never both.
  */
 export function nightUnitState(spec: Partial<WireNightUnitState> = {}): WireNightUnitState {
-  return {
+  const base: Omit<WireNightUnitState, "target_soc_pct" | "suggested_target_soc_pct"> = {
     unit_id: spec.unit_id ?? "lhs",
     soc_pct: spec.soc_pct === undefined ? 71.4 : spec.soc_pct,
     phase: spec.phase ?? "pacing",
     target_w: spec.target_w ?? 2500,
     reason: spec.reason ?? "on_plan",
   };
+  if (spec.target_soc_pct !== undefined) {
+    return { ...base, target_soc_pct: spec.target_soc_pct };
+  }
+  if (spec.suggested_target_soc_pct !== undefined) {
+    return { ...base, suggested_target_soc_pct: spec.suggested_target_soc_pct };
+  }
+  return base;
 }
 
 /**
@@ -1823,11 +2001,22 @@ export interface WireNightChargeState {
   readonly last_action: string;
   readonly last_tick_at: string;
   readonly reason_codes: readonly string[];
+  // --- V2 (§7, additive; the five keys below are emitted ONLY when
+  // `target_policy` is present-and-not-full — under `full` they are ABSENT so
+  // v1 consumers see byte-identical frames) -------------------------------
+  readonly target_policy?: "forecast_suggest" | "forecast_act";
+  readonly trust?: WireNightTrust | null;
+  readonly forecast?: WireNightForecast | null;
+  readonly explanation?: string | null;
+  readonly morning_notice?: WireNightMorningNotice | null;
 }
 
 /** A night-projection fixture; explicit nulls are preserved (never zero-filled). */
 export function nightChargeState(spec: Partial<WireNightChargeState> = {}): WireNightChargeState {
-  return {
+  const base: Omit<
+    WireNightChargeState,
+    "target_policy" | "trust" | "forecast" | "explanation" | "morning_notice"
+  > = {
     enabled: spec.enabled ?? true,
     enabled_origin: spec.enabled_origin ?? "runtime",
     acknowledged_partition: spec.acknowledged_partition ?? true,
@@ -1862,6 +2051,19 @@ export function nightChargeState(spec: Partial<WireNightChargeState> = {}): Wire
     last_action: spec.last_action ?? "renew",
     last_tick_at: spec.last_tick_at ?? "2026-08-27T01:31:05+10:00",
     reason_codes: [...(spec.reason_codes ?? ["window_open", "on_plan"])],
+  };
+  // The V2 keys ride only when the fixture names a forecast posture — the
+  // backend's own shape (absent under `full`, present-but-nullable after).
+  if (spec.target_policy === undefined) {
+    return base;
+  }
+  return {
+    ...base,
+    target_policy: spec.target_policy,
+    trust: spec.trust === undefined ? null : spec.trust,
+    forecast: spec.forecast === undefined ? null : spec.forecast,
+    explanation: spec.explanation === undefined ? null : spec.explanation,
+    morning_notice: spec.morning_notice === undefined ? null : spec.morning_notice,
   };
 }
 
@@ -1914,6 +2116,17 @@ export function nightChargeStateChanged(
       held_intent_id: base.held_intent_id,
       units: base.units,
       reason_codes: base.reason_codes,
+      // The V2 keys ride exactly when the posture names them (the projection's
+      // own rule — absent under `full`, present-but-nullable after).
+      ...(base.target_policy === undefined
+        ? {}
+        : {
+            target_policy: base.target_policy,
+            trust: base.trust ?? null,
+            forecast: base.forecast ?? null,
+            explanation: base.explanation ?? null,
+            morning_notice: base.morning_notice ?? null,
+          }),
       heartbeat: payload.heartbeat ?? false,
     },
     occurredAt,
@@ -2207,19 +2420,56 @@ export function energyDayRecord(
   };
 }
 
+/**
+ * The optional tariff block (DESIGN_ENERGY_SCORECARD §7), LIVE on the wire
+ * since the operator's keys were commissioned 2026-08-24 (the Night Saver EV
+ * plan: 30.77 c general import / 2 c feed-in, with the 00:00–06:00 night
+ * window at 7.2727 c): the composition rides the operator's DEFAULT rates on
+ * `energy_today` and the days route — null when the keys are absent
+ * (kWh-only). The per-window rates (the night window's own off-peak figure)
+ * are NOT carried on this wire.
+ */
+export interface WireEnergyTariff {
+  readonly currency: string;
+  readonly import_cents_per_kwh: number;
+  readonly export_cents_per_kwh: number;
+}
+
+/** A tariff fixture; defaults are the commissioned site's own default rates. */
+export function energyTariff(spec: Partial<WireEnergyTariff> = {}): WireEnergyTariff {
+  return {
+    currency: spec.currency ?? "AUD",
+    import_cents_per_kwh:
+      spec.import_cents_per_kwh === undefined ? 30.77 : spec.import_cents_per_kwh,
+    export_cents_per_kwh:
+      spec.export_cents_per_kwh === undefined ? 2.0 : spec.export_cents_per_kwh,
+  };
+}
+
 /** The snapshot's `energy_today` block: the live record plus `as_of`. */
 export interface WireEnergyToday extends WireEnergyDayRecord {
   readonly as_of: string;
+  /** The optional tariff block; ABSENT = the keys are not commissioned. */
+  readonly tariff?: WireEnergyTariff | null;
 }
 
 export function energyToday(
-  spec: Parameters<typeof energyDayRecord>[0] & { as_of?: string } = {},
+  spec: Parameters<typeof energyDayRecord>[0] & {
+    as_of?: string;
+    tariff?: WireEnergyTariff | null;
+  } = {},
 ): WireEnergyToday {
-  const { as_of: asOf, ...record } = spec;
-  return {
+  const { as_of: asOf, tariff, ...record } = spec;
+  const base = {
     ...energyDayRecord(record),
     as_of: asOf ?? "2026-08-26T14:03:00+10:00",
   };
+  // An absent key stays absent (the kWh-only site); an explicit null is the
+  // composed-but-unkeyed answer — two different wires, never collapsed.
+  if (tariff === undefined) {
+    return base;
+  }
+  return { ...base, tariff };
 }
 
 /** Attach the pending energy block to a snapshot world. */
@@ -2243,11 +2493,13 @@ export function energyDayRolled(
 export function getEnergyDaysOk(view: {
   days?: readonly WireEnergyDayRecord[];
   grid_counter_roles?: "unpinned" | "vendor_labels" | "swapped";
+  tariff?: WireEnergyTariff | null;
 }): Record<string, unknown> {
   return {
     days: [...(view.days ?? [])],
     grid_counter_roles: view.grid_counter_roles ?? "unpinned",
     solar_production_measured: false,
+    tariff: view.tariff === undefined ? null : view.tariff,
   };
 }
 

@@ -71,7 +71,7 @@
  * with no partial data; a unit status change arriving over the socket is
  * announced through a live region.
  */
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError, createApiClient } from "../../api/client";
@@ -85,6 +85,7 @@ import {
   adviserState,
   energyDayRecord,
   energyDayRolled,
+  energyTariff,
   energyToday,
   excessAdviserStateChanged,
   excessChargingToggleOk,
@@ -92,6 +93,10 @@ import {
   nightChargeState,
   nightChargeStateChanged,
   nightChargingToggleOk,
+  nightForecastFallback,
+  nightForecastOk,
+  nightMorningNotice,
+  nightTrust,
   nightUnitState,
   scheduleEntry,
   schedulePlan,
@@ -2696,6 +2701,28 @@ describe("HomeView — the night-charge tile", () => {
         /Waiting on the one-time night-partition acknowledgement before night charging can start\./,
       fixture: { acknowledged_partition: false },
     },
+    // V2 §3.3's ladder + §5.4's honest close: each fallback rung names the v1
+    // charge it lands on — never a mysterious v1-shaped night.
+    {
+      code: "forecast_missing",
+      sentence: /No forecast covers this morning — charging full tonight \(the v1 charge\)\./,
+    },
+    {
+      code: "forecast_stale",
+      sentence: /The forecast is too old to steer with — charging full tonight \(the v1 charge\)\./,
+    },
+    {
+      code: "forecast_no_load_baseline",
+      sentence: /No load baseline for the morning — charging full tonight \(the v1 charge\)\./,
+    },
+    {
+      code: "forecast_below_trust",
+      sentence: /Forecast trust has not been earned — charging full tonight \(the v1 charge\)\./,
+    },
+    {
+      code: "window_closed_below_target",
+      sentence: /The window closed below target — solar is finishing what it can\./,
+    },
   ];
 
   it("maps every code in the pinned vocabulary to a plain sentence (the table is complete)", () => {
@@ -2887,6 +2914,270 @@ describe("HomeView — the night-charge tile", () => {
     expect(
       await screen.findByText(/Night charging stood down — the batteries are back on their own\./),
     ).toBeInTheDocument();
+  });
+});
+
+// --- the night-charge V2 lines (DESIGN_NIGHT_CHARGE_V2 §8, feature-detected
+// on the projection's additive keys — under `full` the tile renders exactly
+// as before) -------------------------------------------------------------------
+
+describe("HomeView — the night tile's V2 forecast lines", () => {
+  /** A SUGGEST posture with a live computation (§7's own example numbers). */
+  function suggestNight(
+    over: Partial<WireNightChargeState> = {},
+  ): WireNightChargeState {
+    return nightChargeState({
+      target_policy: "forecast_suggest",
+      trust: nightTrust({ state: "provisioning", days_scored: 6, low_surplus_days: 2, high_surplus_days: 1 }),
+      forecast: nightForecastOk(),
+      explanation:
+        "lhs to 66% by 06:00 — 4.9 kWh forecast surplus by 12:00 finishes it (solcast p10, issued 2026-08-24T18:03:00+10:00)",
+      units: [
+        nightUnitState({ unit_id: "lhs", soc_pct: 61.8, suggested_target_soc_pct: 65.5 }),
+        nightUnitState({ unit_id: "mid", soc_pct: 64, suggested_target_soc_pct: 65.5 }),
+        nightUnitState({ unit_id: "rhs", soc_pct: 68.9, phase: "complete", suggested_target_soc_pct: 65.5, target_w: 0, reason: "target_reached" }),
+      ],
+      ...over,
+    });
+  }
+
+  it("renders nothing of the V2 story on a v1/full-posture frame (the additive law)", async () => {
+    installClient({ snapshot: nightWorld(nightChargeState()) });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region.textContent ?? "").not.toMatch(/target/i);
+    expect(region.textContent ?? "").not.toMatch(/forecast trust/i);
+    expect(region.textContent ?? "").not.toMatch(/forecast/i);
+  });
+
+  it("renders the suggest line with the arithmetic, the 95-vs-100 clause, and the banner beside it", async () => {
+    installClient({ snapshot: nightWorld(suggestNight()) });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    // The suggest/act line: the fleet's one target, the arithmetic that
+    // produced it, and the 95-vs-100 clause standing beside every target.
+    expect(region).toHaveTextContent(
+      /Suggested target: 65\.5% — 4\.9 kWh forecast surplus by 12:00 finishes it\./,
+    );
+    expect(region).toHaveTextContent(
+      /Targets stop at the ceiling — the pods top the last few percent themselves\./,
+    );
+    // The MUST-SAY-SO clause: a displayed number that does not govern says so
+    // beside itself — SUGGEST is the standing posture, not a transient.
+    expect(region).toHaveTextContent(
+      /Showing forecast targets — charging to 95% \(v1\) until trust is earned; promotion is a config revision\./,
+    );
+    // The projection's own reasoning sentence, verbatim, with the age beside it.
+    expect(region).toHaveTextContent(
+      /lhs to 66% by 06:00 — 4\.9 kWh forecast surplus by 12:00 finishes it \(solcast p10, issued 2026-08-24T18:03:00\+10:00\)/,
+    );
+    expect(region).toHaveTextContent(/forecast fetched /);
+    // The per-battery rows carry target vs SOC (§8), and the trust line as
+    // evidence — never a verdict below the required days.
+    expect(region).toHaveTextContent(/lhs — 61\.8% charged · target 65\.5% · lhs 2,500 W \(on plan\)/);
+    expect(region).toHaveTextContent(/Forecast trust: provisioning — 6\/14 days scored/);
+    expect(region).toHaveTextContent(/2 low \/ 1 high mornings \(not a verdict until 14 days\)/);
+  });
+
+  it("renders the suggest posture idle (outside the window): the banner stands, no invented numbers", async () => {
+    installClient({
+      snapshot: nightWorld(
+        suggestNight({
+          active: false,
+          phase: "idle",
+          held_intent_id: null,
+          window_ends_at: null,
+          window_ends_in_s: null,
+          next_window_at: "2026-08-28T00:00:00+10:00",
+          reason_codes: ["outside_window"],
+          forecast: null,
+          explanation: null,
+          // The real outside-window frame carries no unit rows.
+          units: [],
+        }),
+      ),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent(
+      /Showing forecast targets — charging to 95% \(v1\) until trust is earned; promotion is a config revision\./,
+    );
+    // No live computation, no target line, no reasoning sentence — the idle
+    // posture is honest about carrying no numbers.
+    expect(region.textContent ?? "").not.toMatch(/Suggested target/);
+    expect(region.textContent ?? "").not.toMatch(/forecast surplus/);
+    expect(region).toHaveTextContent(/Outside the charging window/);
+  });
+
+  it("renders the act posture: the governing target line, no suggest banner", async () => {
+    installClient({
+      snapshot: nightWorld(
+        suggestNight({
+          target_policy: "forecast_act",
+          trust: nightTrust(),
+          units: [
+            nightUnitState({ unit_id: "lhs", soc_pct: 61.8, target_soc_pct: 65.5 }),
+            nightUnitState({ unit_id: "mid", soc_pct: 64, target_soc_pct: 65.5 }),
+            nightUnitState({ unit_id: "rhs", soc_pct: 68.9, phase: "complete", target_soc_pct: 65.5, target_w: 0, reason: "target_reached" }),
+          ],
+        }),
+      ),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent(/Target: 65\.5% — 4\.9 kWh forecast surplus by 12:00 finishes it\./);
+    expect(region.textContent ?? "").not.toMatch(/Showing forecast targets/);
+    // The pacing story names the governing number under ACT (never "full").
+    expect(region).toHaveTextContent(/Charging toward 65\.5% \(the rest by solar\) by 06:00/);
+    expect(region).toHaveTextContent(/Forecast trust: earned — 19\/14 days scored/);
+  });
+
+  it.each([
+    {
+      status: "forecast_missing" as const,
+      sentence: /No forecast covers this morning — charging full tonight \(the v1 charge\)\./,
+    },
+    {
+      status: "forecast_stale" as const,
+      sentence: /The forecast is too old to steer with — charging full tonight \(the v1 charge\)\./,
+    },
+    {
+      status: "forecast_no_load_baseline" as const,
+      sentence: /No load baseline for the morning — charging full tonight \(the v1 charge\)\./,
+    },
+    {
+      status: "forecast_below_trust" as const,
+      sentence: /Forecast trust has not been earned — charging full tonight \(the v1 charge\)\./,
+    },
+  ])("renders the $status fallback frame beside the still-pacing night", async ({ status, sentence }) => {
+    installClient({
+      snapshot: nightWorld(
+        suggestNight({
+          forecast: nightForecastFallback(status),
+          explanation: null,
+          reason_codes: ["window_open", "on_plan", status],
+          units: [nightUnitState(), nightUnitState({ unit_id: "mid", soc_pct: 88 })],
+        }),
+      ),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent(sentence);
+    // The night keeps charging (the v1 charge) and the fallback state is its
+    // own visible line, never silence — and never a fabricated target.
+    expect(region).toHaveTextContent(/Charging toward full by 06:00/);
+    expect(region.textContent ?? "").not.toMatch(/Suggested target/);
+  });
+
+  it("words the ceiling-bound decomposition (A10): sky and netting in honest words", async () => {
+    installClient({
+      snapshot: nightWorld(
+        suggestNight({
+          forecast: nightForecastOk({ ceiling_bound_by: "netting", e_surplus_kwh: 6.5, e_deficit_kwh: 7.4, e_credit_kwh: -1.55 }),
+        }),
+      ),
+    });
+    renderHome();
+    const netting = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(netting).toHaveTextContent(/Charging to full — the morning deficit bound it, not the sky\./);
+
+    cleanup();
+    installClient({
+      snapshot: nightWorld(
+        suggestNight({
+          forecast: nightForecastOk({ ceiling_bound_by: "sky", e_surplus_kwh: 0, e_deficit_kwh: 0, e_credit_kwh: 0 }),
+        }),
+      ),
+    });
+    renderHome();
+    const sky = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(sky).toHaveTextContent(/Charging to full — the sky gave no surplus worth leaving room for\./);
+  });
+
+  it("renders the trust line for every state, evidence-styled and never a verdict below n", async () => {
+    const of = async (trust: ReturnType<typeof nightTrust>): Promise<HTMLElement> => {
+      cleanup();
+      installClient({ snapshot: nightWorld(suggestNight({ trust })) });
+      renderHome();
+      return within(await screen.findByRole("region", { name: NIGHT_REGION })).getByText(
+        /Forecast trust:/,
+      );
+    };
+    const earned = await of(nightTrust());
+    expect(earned).toHaveTextContent(/earned — 19\/14 days scored · mean err 21\.4% · bias -4\.2%/);
+    expect(earned.getAttribute("data-state")).toBe("earned");
+    const provisioning = await of(
+      nightTrust({ state: "provisioning", days_scored: 3, mean_abs_err_pct: null, bias_pct: null }),
+    );
+    expect(provisioning).toHaveTextContent(/provisioning — 3\/14 days scored/);
+    expect(provisioning.getAttribute("data-state")).toBe("provisioning");
+    const suspended = await of(nightTrust({ state: "suspended", mean_abs_err_pct: 38.2, bias_pct: 15.7 }));
+    expect(suspended).toHaveTextContent(
+      /SUSPENDED — 19\/14 days scored · mean err 38\.2% · bias \+15\.7%/,
+    );
+    expect(suspended).toHaveTextContent(/charging full until the rolling window re-earns it/);
+    expect(suspended.getAttribute("data-state")).toBe("suspended");
+  });
+
+  it("renders the A5 morning notice until midday when a window closed below target", async () => {
+    installClient({
+      snapshot: nightWorld(
+        suggestNight({
+          active: false,
+          phase: "idle",
+          held_intent_id: null,
+          window_ends_at: null,
+          window_ends_in_s: null,
+          next_window_at: "2026-08-29T00:00:00+10:00",
+          reason_codes: ["outside_window", "window_closed_below_target"],
+          forecast: null,
+          explanation: null,
+          // The real outside-window frame carries no unit rows (the tick's
+          // plans are empty outside the window) — the notice stands alone.
+          units: [],
+          morning_notice: nightMorningNotice({ units_below_target: ["rhs", "lhs"], target_soc_pct: 65.5 }),
+        }),
+      ),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent(
+      /Ended the night below target \(rhs, lhs under 65\.5%\) — solar is finishing what it can; landing visible after midday \(until 12:00\)\./,
+    );
+    // The window's own status sentence stays the outside-window one (the FIRST
+    // reason code renders it); the notice is the below-target story. The code's
+    // own plain sentence is pinned by the inactive-cases table above.
+    expect(region).toHaveTextContent(/Outside the charging window/);
+    // The trivial Insights cross-link (the landing line takes over at midday).
+    expect(within(region).getByRole("link", { name: /Insights landings take over after midday/i })).toHaveAttribute(
+      "href",
+      "#view-insights",
+    );
+  });
+
+  it("composes the commissioned tariff into the energy line; the unkeyed site keeps its named gap", async () => {
+    installClient({
+      snapshot: nightWorld(suggestNight(), {
+        energy_today: energyToday({ tariff: energyTariff() }),
+      }),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    // The rates render as RATES — the wire carries the general (default)
+    // figures only, so no night-charge cost is computed from them.
+    expect(region).toHaveTextContent(
+      /Tariff keys are commissioned — AUD 30\.77 c\/kWh import · 2 c\/kWh feed-in/,
+    );
+    expect(region).toHaveTextContent(/the night window's own off-peak rate is not carried on this wire/);
+    expect(region.textContent ?? "").not.toMatch(/The cost appears once the tariff keys are commissioned/);
+
+    cleanup();
+    installClient({
+      snapshot: nightWorld(suggestNight(), { energy_today: energyToday() }),
+    });
+    renderHome();
+    const unkeyed = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(unkeyed).toHaveTextContent(/The cost appears once the tariff keys are commissioned\./);
   });
 });
 

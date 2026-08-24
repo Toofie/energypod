@@ -31,11 +31,25 @@
  * - The window countdown ticks from the projection's own instants, falling
  *   back to the snapshot-derived seconds; outside the window the NEXT window's
  *   countdown is the answer.
+ * - V2 (DESIGN_NIGHT_CHARGE_V2 §8, feature-detected on the projection's new
+ *   keys — absent under `full` the tile renders exactly as before): the
+ *   suggest/act target line with the §2.1 arithmetic and the 95-vs-100 clause
+ *   ("the pods top the last few percent themselves") standing beside every
+ *   target; the SUGGEST banner (a displayed number that does not govern SAYS
+ *   SO beside itself); A10's ceiling-bound decomposition ("sky"/"netting" in
+ *   honest words); §3.3's fallback words each naming the v1 charge they land
+ *   on ("charging full tonight" — a v1-behaving night is never mysterious);
+ *   the trust line as EVIDENCE (days n/required + the regime mix, never a
+ *   verdict below the required days); and the A5 morning notice latched until
+ *   midday when a window closed below target ("solar is finishing what it
+ *   can; landing visible after midday" — the Insights cross-link).
  * - The energy line composes with the scorecard's `energy_today` where the
  *   design pins it (§6): the nightly charge is real grid import, the scorecard
- *   measures it from day one, and the money line appears only when the
- *   operator supplies the tariff keys — which no wire shape carries today, so
- *   its absence is stated, never improvised (the Today card's own gap).
+ *   measures it from day one, and the money line renders the operator's own
+ *   rates when the commissioned tariff block rides the wire — the wire carries
+ *   the general (default) rates only, so the rates render as rates and no
+ *   night-charge cost is ever computed from them (the night window's own
+ *   off-peak rate is not on the wire; its absence is stated, never improvised).
  * - The toggle is the contract's guarded confirmation (§3.4/B4): BOTH actions
  *   type NIGHT; the FIRST enable ever additionally captures the one-time
  *   night-partition acknowledgement (the §8 item 2 assertion verbatim, a
@@ -53,11 +67,18 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { JSX, KeyboardEvent as ReactKeyboardEvent } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient } from "../../api/client";
-import { kwhText, type EnergyToday } from "../../app/energy";
+import { kwhText, tariffText, type EnergyToday } from "../../app/energy";
 import {
+  NIGHT_SUGGEST_BANNER_TEXT,
+  nightDecompositionText,
   nightDemandText,
+  nightExplanationText,
+  nightForecastFallbackText,
+  nightMorningNoticeText,
   nightStatusText,
+  nightTargetLineText,
   nightToggleStateText,
+  nightTrustText,
   nightUnitRowText,
   nightWindowLineText,
   toNightChargeState,
@@ -103,15 +124,18 @@ export const PARTITION_ASSERTION =
 /**
  * The energy line, composed where the design pins it (§6): the nightly charge
  * is real grid import at the off-peak rate; the scorecard measures the kWh
- * from day one; the MONEY line appears only when the operator supplies the
- * tariff keys — absent on every pinned wire shape, so the gap is named, never
- * filled with an invented rate. Null when the scorecard is not composed (the
- * night story stands on its own figures).
+ * from day one; the MONEY line renders the operator's own rates once the
+ * commissioned tariff block rides the wire — the general rates render as
+ * rates, and the night window's own off-peak rate is named as NOT carried (no
+ * cost is computed from a rate the wire does not have). Without the block the
+ * gap is named, never filled with an invented rate.
  */
 export function nightEnergyLine(today: EnergyToday): string {
-  return `Charging at night is real grid import — the energy scorecard measures it (bought from the grid today so far: ${kwhText(
+  const base = `Charging at night is real grid import — the energy scorecard measures it (bought from the grid today so far: ${kwhText(
     today.fleet.gridImportKwh,
-  )}). The cost appears once the tariff keys are commissioned.`;
+  )}).`;
+  const rates = today.tariff === null ? null : tariffText(today.tariff);
+  return rates === null ? `${base} The cost appears once the tariff keys are commissioned.` : `${base} ${rates}`;
 }
 
 // --- the guarded toggle's refusal envelopes (B4), rendered inline -------------
@@ -420,6 +444,14 @@ export function NightChargeTile({
   }
   const windowWalls = `${night.window.startLocal}–${night.window.endLocal}`;
   const windowLine = nightWindowLineText(night, nowMs);
+  // The V2 lines (each null on a v1/full-posture frame — the tile renders
+  // exactly as before). The suggest banner keys on the POSTURE (standing, not
+  // transient), everything else on the frame's own facts.
+  const targetLine = nightTargetLineText(night);
+  const decomposition =
+    night.forecast === null ? null : nightDecompositionText(night.forecast);
+  const fallback = night.forecast === null ? null : nightForecastFallbackText(night.forecast);
+  const reasoning = nightExplanationText(night, nowMs);
   return (
     <section className="home-card home-card--night" aria-labelledby={headingId}>
       <h2 id={headingId}>Night charging</h2>
@@ -434,6 +466,35 @@ export function NightChargeTile({
       <p className="home-night-demand" data-evidence={night.demandEvidence}>
         {nightDemandText(night)}
       </p>
+      {targetLine !== null && (
+        <p className="home-night-target" data-policy={night.targetPolicy}>
+          {targetLine}
+        </p>
+      )}
+      {night.targetPolicy === "forecast_suggest" && (
+        <p role="note" className="home-night-suggest">
+          {NIGHT_SUGGEST_BANNER_TEXT}.
+        </p>
+      )}
+      {decomposition !== null && (
+        <p
+          className="home-night-decomposition"
+          data-bound-by={night.forecast?.ceilingBoundBy ?? undefined}
+        >
+          {decomposition}
+        </p>
+      )}
+      {reasoning !== null && <p className="home-night-reasoning">{reasoning}</p>}
+      {fallback !== null && (
+        <p className="home-night-fallback" data-status={night.forecast?.status}>
+          {fallback}
+        </p>
+      )}
+      {night.trust !== null && (
+        <p className="home-night-trust" data-state={night.trust.state}>
+          {nightTrustText(night.trust)}
+        </p>
+      )}
       {night.units.length > 0 && (
         <ul className="home-night-units" aria-label="Per-battery night charge plan">
           {night.units.map((unit) => (
@@ -442,6 +503,12 @@ export function NightChargeTile({
             </li>
           ))}
         </ul>
+      )}
+      {night.morningNotice !== null && (
+        <p role="note" className="home-night-notice">
+          {nightMorningNoticeText(night.morningNotice)}{" "}
+          <a href="#view-insights">The Insights landings take over after midday.</a>
+        </p>
       )}
       {today !== null && (
         <p className="home-night-energy">{nightEnergyLine(today)}</p>

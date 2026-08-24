@@ -15,13 +15,21 @@ import {
   NIGHT_CHARGE_STATE_CHANGED_EVENT,
   NIGHT_PHASES,
   NIGHT_REASON_CODES,
+  NIGHT_SUGGEST_BANNER_TEXT,
   NIGHT_UNIT_PHASES,
+  fleetTargetSocPct,
+  nightDecompositionText,
   nightDemandText,
+  nightExplanationText,
+  nightForecastFallbackText,
+  nightMorningNoticeText,
   nightPhaseAnnouncement,
   nightPhaseText,
   nightReasonText,
   nightStatusText,
+  nightTargetLineText,
   nightToggleStateText,
+  nightTrustText,
   nightUnitRowText,
   nightWindowLineText,
   nextWindowInText,
@@ -32,7 +40,15 @@ import {
   type NightChargeState,
 } from "./nightCharge";
 import { NIGHT_CHARGE_STATE_CHANGED } from "../test/wire";
-import { nightChargeState, nightUnitState } from "../test/wire";
+import {
+  nightChargeState,
+  nightChargeStateChanged,
+  nightForecastFallback,
+  nightForecastOk,
+  nightMorningNotice,
+  nightTrust,
+  nightUnitState,
+} from "../test/wire";
 
 // A fixed clock the countdown assertions derive from: the §5 example's own
 // tick (2026-08-27T01:31:05+10:00) — the window ends 5341 s later by the
@@ -66,13 +82,21 @@ describe("nightCharge — the projection parse", () => {
     expect(state!.demandEvidence).toBe("good");
     expect(state!.heldIntentId).toBe("night-881-77123.445101");
     expect(state!.units).toEqual([
-      { unitId: "lhs", socPct: 71.4, phase: "pacing", targetW: 2500, reason: "on_plan" },
-      { unitId: "mid", socPct: 88, phase: "pacing", targetW: 2500, reason: "on_plan" },
-      { unitId: "rhs", socPct: 98, phase: "skipped_full", targetW: 0, reason: "at_ceiling" },
+      { unitId: "lhs", socPct: 71.4, phase: "pacing", targetW: 2500, reason: "on_plan", targetSocPct: null },
+      { unitId: "mid", socPct: 88, phase: "pacing", targetW: 2500, reason: "on_plan", targetSocPct: null },
+      { unitId: "rhs", socPct: 98, phase: "skipped_full", targetW: 0, reason: "at_ceiling", targetSocPct: null },
     ]);
     expect(state!.lastAction).toBe("renew");
     expect(state!.lastTickAt).toBe("2026-08-27T01:31:05+10:00");
     expect(state!.reasonCodes).toEqual(["window_open", "on_plan"]);
+    // The V2 keys are ABSENT on the v1 wire (the additive law): the honest
+    // defaults keep the parse exactly v1 — the posture is `full`, nothing else
+    // of the forecast story exists.
+    expect(state!.targetPolicy).toBe("full");
+    expect(state!.trust).toBeNull();
+    expect(state!.forecast).toBeNull();
+    expect(state!.explanation).toBeNull();
+    expect(state!.morningNotice).toBeNull();
   });
 
   it("narrows to null for a non-object — a garbage frame is never half-adopted", () => {
@@ -105,7 +129,7 @@ describe("nightCharge — the projection parse", () => {
       units: [nightUnitState(), { no_id: true }, { unit_id: "", phase: "pacing" }],
     });
     expect(state!.units).toEqual([
-      { unitId: "lhs", socPct: 71.4, phase: "pacing", targetW: 2500, reason: "on_plan" },
+      { unitId: "lhs", socPct: 71.4, phase: "pacing", targetW: 2500, reason: "on_plan", targetSocPct: null },
     ]);
   });
 });
@@ -462,7 +486,361 @@ describe("nightCharge — the plain-word maps", () => {
       "complete",
       "sitting_out",
     ]);
-    // The reason vocabulary is the ONE list; the wire fixtures agree.
-    expect(NIGHT_REASON_CODES).toHaveLength(18);
+    // The reason vocabulary is the ONE list (§5's eighteen + V2 §7's five
+    // additions); the wire fixtures agree.
+    expect(NIGHT_REASON_CODES).toHaveLength(23);
+  });
+});
+
+// --- V2 (the forecast-aware target, DESIGN_NIGHT_CHARGE_V2 §7/§8) ---------------
+
+describe("nightCharge — the V2 projection parse", () => {
+  it("parses the §7 forecast-posture projection field for field", () => {
+    const state = toNightChargeState(
+      nightChargeState({
+        target_policy: "forecast_act",
+        trust: nightTrust(),
+        forecast: nightForecastOk(),
+        explanation:
+          "lhs to 66% by 06:00 — 4.9 kWh forecast surplus by 12:00 finishes it (solcast p10, issued 2026-08-24T18:03:00+10:00)",
+        morning_notice: nightMorningNotice(),
+        units: [
+          nightUnitState({ unit_id: "lhs", soc_pct: 61.8, target_soc_pct: 65.5, target_w: 2500 }),
+          nightUnitState({ unit_id: "rhs", soc_pct: 68.9, phase: "complete", target_soc_pct: 65.5, target_w: 0, reason: "target_reached" }),
+        ],
+      }),
+    )!;
+    expect(state.targetPolicy).toBe("forecast_act");
+    expect(state.trust).toEqual({
+      state: "earned",
+      daysScored: 19,
+      requiredDays: 14,
+      meanAbsErrPct: 21.4,
+      biasPct: -4.2,
+      lowSurplusDays: 5,
+      highSurplusDays: 4,
+    });
+    expect(state.forecast).toEqual({
+      status: "ok",
+      source: "solcast",
+      quantile: 0.1,
+      issuedAt: "2026-08-24T18:03:00+10:00",
+      fetchedAt: "2026-08-24T20:00:12+10:00",
+      eSurplusKwh: 6,
+      eDeficitKwh: 0.5,
+      eCreditKwh: 4.9,
+      middayLocal: "12:00",
+      ceilingBoundBy: null,
+    });
+    expect(state.explanation).toBe(
+      "lhs to 66% by 06:00 — 4.9 kWh forecast surplus by 12:00 finishes it (solcast p10, issued 2026-08-24T18:03:00+10:00)",
+    );
+    expect(state.morningNotice).toEqual({
+      date: "2026-08-28",
+      targetSocPct: 65.5,
+      unitsBelowTarget: ["rhs"],
+      untilLocal: "12:00",
+    });
+    // The per-unit target key, whichever posture named it.
+    expect(state.units[0]!.targetSocPct).toBe(65.5);
+    expect(state.units[1]!.targetSocPct).toBe(65.5);
+    expect(fleetTargetSocPct(state)).toBe(65.5);
+  });
+
+  it("reads the suggested key under SUGGEST — the posture names the number's authority", () => {
+    const state = toNightChargeState(
+      nightChargeState({
+        target_policy: "forecast_suggest",
+        units: [nightUnitState({ suggested_target_soc_pct: 62 })],
+      }),
+    )!;
+    expect(state.targetPolicy).toBe("forecast_suggest");
+    expect(state.units[0]!.targetSocPct).toBe(62);
+  });
+
+  it("parses a fallback frame: the ladder's word, the quantile, the midday — and NOTHING else", () => {
+    for (const status of [
+      "forecast_missing",
+      "forecast_stale",
+      "forecast_no_load_baseline",
+      "forecast_below_trust",
+    ] as const) {
+      const state = toNightChargeState(
+        nightChargeState({ target_policy: "forecast_suggest", forecast: nightForecastFallback(status) }),
+      )!;
+      expect(state.forecast!.status).toBe(status);
+      // No figures ride a fallback frame — there is nothing to misread.
+      expect(state.forecast!.source).toBeNull();
+      expect(state.forecast!.eCreditKwh).toBeNull();
+      expect(state.forecast!.middayLocal).toBe("12:00");
+    }
+  });
+
+  it("falls back honestly on present-but-unusable V2 data, never to a fabricated figure", () => {
+    const state = toNightChargeState({
+      target_policy: "forecast_act",
+      trust: { state: "garbage", days_scored: "many" },
+      forecast: { status: "nonsense" },
+      explanation: 42,
+      morning_notice: "still dark out",
+      units: [{ unit_id: "lhs", soc_pct: 71.4, phase: "pacing", target_w: 2500, reason: "on_plan", target_soc_pct: "high" }],
+    })!;
+    expect(state.trust!.state).toBe("provisioning");
+    expect(state.trust!.daysScored).toBe(0);
+    // An unreadable status word is never half-adopted as a live computation.
+    expect(state.forecast).toBeNull();
+    expect(state.explanation).toBeNull();
+    expect(state.morningNotice).toBeNull();
+    expect(state.units[0]!.targetSocPct).toBeNull();
+  });
+
+  it("patches V2 facts by KEY PRESENCE: an absent key inherits, an explicit null wins", () => {
+    const base = toNightChargeState(
+      nightChargeState({
+        target_policy: "forecast_suggest",
+        trust: nightTrust({ state: "provisioning", days_scored: 6 }),
+        forecast: nightForecastOk(),
+        explanation: "lhs to 66% by 06:00",
+        morning_notice: nightMorningNotice(),
+      }),
+    )!;
+    // A v1-shaped payload (no V2 keys — the full-posture event) never erases
+    // the snapshot's V2 facts.
+    const v1Payload = patchNightChargeState(base, { phase: "holding_on_demand" })!;
+    expect(v1Payload.targetPolicy).toBe("forecast_suggest");
+    expect(v1Payload.forecast!.status).toBe("ok");
+    expect(v1Payload.morningNotice!.date).toBe("2026-08-28");
+    // The frame's own explicit nulls ARE the answer: the notice cleared at
+    // midday, the forecast gone quiet outside the window.
+    const cleared = toNightChargeStateChangedEvent(
+      base,
+      nightChargeStateChanged(44, {
+        target_policy: "forecast_suggest",
+        forecast: null,
+        explanation: null,
+        morning_notice: null,
+        trust: nightTrust({ state: "earned" }),
+        heartbeat: true,
+      }).payload,
+    )!.state;
+    expect(cleared.forecast).toBeNull();
+    expect(cleared.explanation).toBeNull();
+    expect(cleared.morningNotice).toBeNull();
+    expect(cleared.trust!.state).toBe("earned");
+  });
+});
+
+describe("nightCharge — the V2 plain-word maps", () => {
+  /** A SUGGEST frame with a live computation — the §7 example's own numbers. */
+  function suggestFrame(over: Parameters<typeof nightChargeState>[0] = {}): NightChargeState {
+    return toNightChargeState(
+      nightChargeState({
+        target_policy: "forecast_suggest",
+        trust: nightTrust(),
+        forecast: nightForecastOk(),
+        explanation: "lhs to 66% by 06:00 — 4.9 kWh forecast surplus by 12:00 finishes it (solcast p10, issued 2026-08-24T18:03:00+10:00)",
+        units: [
+          nightUnitState({ unit_id: "lhs", soc_pct: 61.8, suggested_target_soc_pct: 65.5 }),
+          nightUnitState({ unit_id: "mid", soc_pct: 64.0, suggested_target_soc_pct: 65.5 }),
+        ],
+        ...over,
+      }),
+    )!;
+  }
+
+  it("words the suggest line: the number, the arithmetic, and the 95-vs-100 clause", () => {
+    expect(nightTargetLineText(suggestFrame())).toBe(
+      "Suggested target: 65.5% — 4.9 kWh forecast surplus by 12:00 finishes it. Targets stop at the ceiling — the pods top the last few percent themselves.",
+    );
+    // Under ACT the same arithmetic names the governing number.
+    expect(
+      nightTargetLineText(suggestFrame({ target_policy: "forecast_act" })),
+    ).toMatch(/^Target: 65\.5% — 4\.9 kWh forecast surplus by 12:00 finishes it\./);
+  });
+
+  it("renders no target line without a live computation — full, fallback, or figure-less", () => {
+    expect(nightTargetLineText(toNightChargeState(nightChargeState())!)).toBeNull();
+    expect(
+      nightTargetLineText(
+        suggestFrame({ forecast: nightForecastFallback("forecast_stale") }),
+      ),
+    ).toBeNull();
+    expect(
+      nightTargetLineText(suggestFrame({ units: [nightUnitState()] })),
+    ).toBeNull();
+  });
+
+  it("pins the suggest banner verbatim (a number that does not govern says so beside itself)", () => {
+    expect(NIGHT_SUGGEST_BANNER_TEXT).toBe(
+      "Showing forecast targets — charging to 95% (v1) until trust is earned; promotion is a config revision",
+    );
+  });
+
+  it("words every fallback rung with the v1 charge it lands on — never mysterious", () => {
+    const of = (
+      status: "forecast_missing" | "forecast_stale" | "forecast_no_load_baseline" | "forecast_below_trust",
+    ) =>
+      nightForecastFallbackText(
+        toNightChargeState(
+          nightChargeState({ target_policy: "forecast_suggest", forecast: nightForecastFallback(status) }),
+        )!.forecast!,
+      )!;
+    expect(of("forecast_missing")).toBe(
+      "No forecast covers this morning — charging full tonight (the v1 charge).",
+    );
+    expect(of("forecast_stale")).toBe(
+      "The forecast is too old to steer with — charging full tonight (the v1 charge).",
+    );
+    expect(of("forecast_no_load_baseline")).toBe(
+      "No load baseline for the morning — charging full tonight (the v1 charge).",
+    );
+    expect(of("forecast_below_trust")).toBe(
+      "Forecast trust has not been earned — charging full tonight (the v1 charge).",
+    );
+    // Every rung names the v1 charge (§3.3's umbrella, made testable).
+    for (const sentence of [
+      of("forecast_missing"),
+      of("forecast_stale"),
+      of("forecast_no_load_baseline"),
+      of("forecast_below_trust"),
+    ]) {
+      expect(sentence).toMatch(/charging full tonight/);
+    }
+    expect(
+      nightForecastFallbackText(
+        toNightChargeState(
+          nightChargeState({ target_policy: "forecast_act", forecast: nightForecastOk() }),
+        )!.forecast!,
+      ),
+    ).toBeNull();
+  });
+
+  it("words A10's ceiling-bound decomposition: sky and netting in honest words", () => {
+    const frame = (boundBy: "sky" | "netting" | null) =>
+      toNightChargeState(
+        nightChargeState({
+          target_policy: "forecast_act",
+          forecast: nightForecastOk({ ceiling_bound_by: boundBy }),
+        }),
+      )!.forecast!;
+    expect(nightDecompositionText(frame("sky"))).toBe(
+      "Charging to full — the sky gave no surplus worth leaving room for.",
+    );
+    expect(nightDecompositionText(frame("netting"))).toBe(
+      "Charging to full — the morning deficit bound it, not the sky.",
+    );
+    expect(nightDecompositionText(frame(null))).toBeNull();
+    expect(
+      nightDecompositionText(
+        toNightChargeState(
+          nightChargeState({
+            target_policy: "forecast_act",
+            forecast: nightForecastFallback("forecast_missing"),
+          }),
+        )!.forecast!,
+      ),
+    ).toBeNull();
+  });
+
+  it("words the trust line as evidence, never a verdict below the required days", () => {
+    const trust = (spec: Parameters<typeof nightTrust>[0]) =>
+      toNightChargeState(
+        nightChargeState({ target_policy: "forecast_suggest", trust: nightTrust(spec) }),
+      )!.trust!;
+    expect(nightTrustText(trust({}))).toBe(
+      "Forecast trust: earned — 19/14 days scored · mean err 21.4% · bias -4.2% · 5 low / 4 high mornings.",
+    );
+    expect(
+      nightTrustText(trust({ state: "provisioning", days_scored: 6, low_surplus_days: 2, high_surplus_days: 1 })),
+    ).toBe(
+      "Forecast trust: provisioning — 6/14 days scored · mean err 21.4% · bias -4.2% · 2 low / 1 high mornings (not a verdict until 14 days).",
+    );
+    expect(nightTrustText(trust({ state: "suspended", mean_abs_err_pct: 34.1, bias_pct: 12.4 }))).toBe(
+      "Forecast trust: SUSPENDED — 19/14 days scored · mean err 34.1% · bias +12.4% · 5 low / 4 high mornings; charging full until the rolling window re-earns it.",
+    );
+    // A young scoreboard carries no mean or bias — the counts stand alone,
+    // and the over-forecast direction keeps its plus sign.
+    expect(
+      nightTrustText(
+        trust({ state: "provisioning", days_scored: 0, mean_abs_err_pct: null, bias_pct: null, low_surplus_days: 0, high_surplus_days: 0 }),
+      ),
+    ).toBe(
+      "Forecast trust: provisioning — 0/14 days scored · 0 low / 0 high mornings (not a verdict until 14 days).",
+    );
+  });
+
+  it("words the A5 morning notice: the honest close, carried until midday", () => {
+    const notice = (spec: Parameters<typeof nightMorningNotice>[0]) =>
+      toNightChargeState(
+        nightChargeState({
+          target_policy: "forecast_suggest",
+          morning_notice: nightMorningNotice(spec),
+        }),
+      )!.morningNotice!;
+    expect(nightMorningNoticeText(notice({}))).toBe(
+      "Ended the night below target (rhs under 65.5%) — solar is finishing what it can; landing visible after midday (until 12:00).",
+    );
+    // A notice without units or a target still says the one sentence that matters.
+    expect(
+      nightMorningNoticeText(notice({ units_below_target: [], target_soc_pct: null, until_local: "" })),
+    ).toBe("Ended the night below target — solar is finishing what it can; landing visible after midday.");
+  });
+
+  it("renders the projection's explanation verbatim with the forecast's age beside it", () => {
+    const state = suggestFrame();
+    const fetchedAt = Date.parse("2026-08-24T20:00:12+10:00");
+    expect(nightExplanationText(state, fetchedAt + 26 * 60 * 1000)).toBe(
+      "lhs to 66% by 06:00 — 4.9 kWh forecast surplus by 12:00 finishes it (solcast p10, issued 2026-08-24T18:03:00+10:00) (forecast fetched 26 min ago)",
+    );
+    // An unparseable or absent instant keeps the sentence alone, never an
+    // invented age; a frame with no sentence renders nothing.
+    expect(
+      nightExplanationText(suggestFrame({ forecast: nightForecastOk({ fetched_at: null }) }), 0),
+    ).toBe(state.explanation);
+    expect(nightExplanationText(toNightChargeState(nightChargeState())!, 0)).toBeNull();
+  });
+
+  it("carries the target beside the SOC in the per-battery row (§8's target-vs-SOC)", () => {
+    expect(
+      nightUnitRowText(
+        toNightChargeState(
+          nightChargeState({
+            target_policy: "forecast_act",
+            units: [nightUnitState({ soc_pct: 61.8, target_soc_pct: 65.5 })],
+          }),
+        )!.units[0]!,
+      ),
+    ).toBe("lhs — 61.8% charged · target 65.5% · lhs 2,500 W (on plan)");
+  });
+
+  it("names the governing target in the ACT pacing story — and never in the SUGGEST one", () => {
+    expect(nightPhaseText(suggestFrame({ target_policy: "forecast_act", phase: "pacing" }))).toBe(
+      "Charging toward 65.5% (the rest by solar) by 06:00: lhs 2,500 W · mid 2,500 W.",
+    );
+    // Under SUGGEST the submission math is v1's (the ceiling): the story keeps
+    // saying "full" and the suggested number says so beside itself instead.
+    expect(nightPhaseText(suggestFrame({ phase: "pacing" }))).toBe(
+      "Charging toward full by 06:00: lhs 2,500 W · mid 2,500 W.",
+    );
+  });
+
+  it("words the five new reason codes in plain language (each fallback names the v1 charge)", () => {
+    const of = (code: string, fixture: Parameters<typeof nightChargeState>[0] = {}) =>
+      nightReasonText(toNightChargeState(nightChargeState({ phase: "idle", reason_codes: [code], ...fixture }))!);
+    expect(of("forecast_missing")).toBe(
+      "No forecast covers this morning — charging full tonight (the v1 charge).",
+    );
+    expect(of("forecast_stale")).toBe(
+      "The forecast is too old to steer with — charging full tonight (the v1 charge).",
+    );
+    expect(of("forecast_no_load_baseline")).toBe(
+      "No load baseline for the morning — charging full tonight (the v1 charge).",
+    );
+    expect(of("forecast_below_trust")).toBe(
+      "Forecast trust has not been earned — charging full tonight (the v1 charge).",
+    );
+    expect(of("window_closed_below_target")).toBe(
+      "The window closed below target — solar is finishing what it can.",
+    );
   });
 });

@@ -433,6 +433,99 @@
   color: #9b2c2c;
 }
 
+/* --- Night-charge V2 (the forecast-aware target's own lines; each renders
+       only when the projection carries its keys) ---------------------------- */
+
+/* The suggest/act target line: the fleet's one target with its arithmetic.
+   Muted-evidence styling — the number is advisory under SUGGEST and the
+   banner directly below says so in words. */
+.home-night-target {
+  margin: 0 0 0.4rem;
+  color: #3f3a30;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The SUGGEST banner (the invisible-state rule): a displayed number that does
+   not govern says so beside itself — the standing posture, amber like the
+   acknowledgement class it belongs to (a fact to notice, not an alarm). */
+.home-night-suggest {
+  margin: 0 0 0.4rem;
+  padding: 0.4rem 0.6rem;
+  border-left: 3px solid #d69e2e;
+  background: #fdf6e9;
+  border-radius: 0 0.4rem 0.4rem 0;
+  font-size: 0.9rem;
+  color: #57534e;
+}
+
+/* A10's ceiling-bound decomposition: which guard fired — a v1-shaped night
+   with a live forecast is legible as such. */
+.home-night-decomposition {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  font-style: italic;
+  color: #78716c;
+}
+
+/* §8's reasoning sentence, verbatim from the projection with the forecast's
+   age beside it. */
+.home-night-reasoning {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  color: #57534e;
+}
+
+/* §3.3's fallback words: every rung lands on the v1 full charge, LOUDLY —
+   visible from across the room, amber (a fact to notice, never a silent
+   v1-shaped night). */
+.home-night-fallback {
+  margin: 0 0 0.4rem;
+  padding: 0.4rem 0.6rem;
+  border-left: 3px solid #d69e2e;
+  background: #fdf6e9;
+  border-radius: 0 0.4rem 0.4rem 0;
+  font-size: 0.9rem;
+  color: #57534e;
+}
+
+/* The trust line: EVIDENCE styling — quiet figures, never a verdict below the
+   required days. `suspended` is the one loud state (ACT demoted itself to
+   full targets); `earned` carries the pass without celebration. */
+.home-night-trust {
+  margin: 0 0 0.6rem;
+  font-size: 0.9rem;
+  color: #78716c;
+  font-variant-numeric: tabular-nums;
+}
+
+.home-night-trust[data-state="earned"] {
+  color: #57534e;
+}
+
+.home-night-trust[data-state="suspended"] {
+  padding: 0.4rem 0.6rem;
+  border-left: 3px solid #9b2c2c;
+  background: #fdf0ef;
+  border-radius: 0 0.4rem 0.4rem 0;
+  color: #9b2c2c;
+}
+
+/* The A5 morning notice: a window that closed below target, latched until
+   midday — the honest close, carried beside the plan rows it belongs to. */
+.home-night-notice {
+  margin: 0 0 0.6rem;
+  padding: 0.4rem 0.6rem;
+  border-left: 3px solid #b3c7e8;
+  background: #f0f6ff;
+  border-radius: 0 0.4rem 0.4rem 0;
+  font-size: 0.9rem;
+  color: #2c5282;
+}
+
+.home-night-notice a {
+  color: #2c5282;
+}
+
 .home-night-units {
   list-style: none;
   margin: 0 0 0.6rem;

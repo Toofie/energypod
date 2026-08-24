@@ -19,6 +19,7 @@ import {
   gridProvenanceNote,
   kwhText,
   sourceProvenanceText,
+  tariffText,
   toEnergyDayRecord,
   toEnergyDayRolledEvent,
   toEnergyDaysView,
@@ -27,6 +28,7 @@ import {
 import {
   energyDayRecord,
   energyDayRolled,
+  energyTariff,
   energyToday,
   energyUnitDay,
   getEnergyDaysOk,
@@ -219,6 +221,35 @@ describe("energy — the snapshot block, the route body, and the rollover event"
     expect(toEnergyToday(null)).toBeNull();
     // An absent as_of stays null, never a fabricated stamp.
     expect(toEnergyToday(energyDayRecord())!.asOf).toBeNull();
+  });
+
+  it("narrowes the optional tariff block: absent/null = kWh-only, present = the operator's own rates", () => {
+    // Absent key and explicit null are both the honest kWh-only answer.
+    expect(toEnergyToday(energyToday())!.tariff).toBeNull();
+    expect(toEnergyToday(energyToday({ tariff: null }))!.tariff).toBeNull();
+    expect(toEnergyToday(energyDayRecord())!.tariff).toBeNull();
+    // The commissioned site's own block, field for field.
+    const tariff = toEnergyToday(energyToday({ tariff: energyTariff() }))!.tariff!;
+    expect(tariff.currency).toBe("AUD");
+    expect(tariff.importCentsPerKwh).toBe(30.77);
+    expect(tariff.exportCentsPerKwh).toBe(2);
+    // A present-but-unusable datum falls back to null, never to 0.
+    const broken = toEnergyToday({
+      ...energyToday(),
+      tariff: { currency: "aud", import_cents_per_kwh: "thirty", export_cents_per_kwh: null },
+    })!.tariff!;
+    expect(broken.currency).toBe("aud");
+    expect(broken.importCentsPerKwh).toBeNull();
+    expect(broken.exportCentsPerKwh).toBeNull();
+  });
+
+  it("words the tariff as rates only — no cost is computed from the general rate", () => {
+    expect(tariffText(toEnergyToday(energyToday({ tariff: energyTariff() }))!.tariff!)).toBe(
+      "Tariff keys are commissioned — AUD 30.77 c/kWh import · 2 c/kWh feed-in (the general rates; the night window's own off-peak rate is not carried on this wire, so no cost is computed here).",
+    );
+    // A block with no usable rate renders nothing — the caller keeps its own
+    // "once commissioned" wording rather than an empty sentence.
+    expect(tariffText({ currency: "AUD", importCentsPerKwh: null, exportCentsPerKwh: null })).toBeNull();
   });
 
   it("narrowes the days route body: days newest-last, the roles vocabulary, the solar fact", () => {

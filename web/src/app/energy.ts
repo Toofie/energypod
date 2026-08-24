@@ -34,7 +34,7 @@
  *   the A-1 gate made structural), so that source label legitimately carries
  *   "the pods' own meters, roles confirmed".
  */
-import { formatKilowattHours, formatPercent } from "../lib/format";
+import { formatDecimal, formatKilowattHours, formatPercent } from "../lib/format";
 import { isRecord } from "./fleet";
 
 /** The rollover TRANSITION event (the completed record; never a heartbeat). */
@@ -152,9 +152,46 @@ export interface EnergyDayRecord {
   solarProductionMeasured: boolean | null;
 }
 
+/**
+ * The optional tariff block (§7, additive on the wire): the operator's own
+ * DEFAULT rates as the composition serves them — null when the keys are
+ * absent (kWh-only). The per-window rates (this site's 00:00–06:00 night
+ * window) are NOT carried on this wire, so no surface may compute a night-
+ * charge cost from the default import rate; the rates render as rates.
+ */
+export interface EnergyTariff {
+  /** ISO-4217-style three-letter code ("AUD"), uppercased by the backend. */
+  currency: string;
+  /** The all-times default import rate; null when the block carried none. */
+  importCentsPerKwh: number | null;
+  /** The feed-in rate; null when the block carried none. */
+  exportCentsPerKwh: number | null;
+}
+
+function toEnergyTariff(value: unknown): EnergyTariff | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  return {
+    currency: typeof value.currency === "string" ? value.currency : "",
+    importCentsPerKwh:
+      typeof value.import_cents_per_kwh === "number" &&
+      Number.isFinite(value.import_cents_per_kwh)
+        ? value.import_cents_per_kwh
+        : null,
+    exportCentsPerKwh:
+      typeof value.export_cents_per_kwh === "number" &&
+      Number.isFinite(value.export_cents_per_kwh)
+        ? value.export_cents_per_kwh
+        : null,
+  };
+}
+
 /** The snapshot's `energy_today` block: the live in-progress day plus `as_of`. */
 export interface EnergyToday extends EnergyDayRecord {
   asOf: string | null;
+  /** The optional tariff block; null when the wire carries none (kWh-only). */
+  tariff: EnergyTariff | null;
 }
 
 /** The days route's 200 body. */
@@ -269,7 +306,8 @@ export function toEnergyDayRecord(value: unknown): EnergyDayRecord | null {
 /**
  * Narrow the snapshot's `energy_today`. The whole BLOCK is the feature
  * detection (absent key = the scorecard is not composed — nothing renders);
- * inside a present block every field is absent-tolerant per field.
+ * inside a present block every field is absent-tolerant per field, the
+ * optional `tariff` included (absent or null = kWh-only, no money figures).
  */
 export function toEnergyToday(value: unknown): EnergyToday | null {
   const record = toEnergyDayRecord(value);
@@ -277,7 +315,7 @@ export function toEnergyToday(value: unknown): EnergyToday | null {
     return null;
   }
   const asOf = isRecord(value) && typeof value.as_of === "string" ? value.as_of : null;
-  return { ...record, asOf };
+  return { ...record, asOf, tariff: toEnergyTariff(isRecord(value) ? value.tariff : null) };
 }
 
 /** Narrow the days route's 200 body; null when the value is not an object. */
@@ -313,6 +351,29 @@ export function toEnergyDayRolledEvent(payload: unknown): EnergyDayRecord | null
 /** A kWh figure or the named gap — never 0 standing in for an absent source. */
 export function kwhText(value: number | null): string {
   return value === null ? "not available" : formatKilowattHours(value);
+}
+
+/**
+ * The commissioned tariff in the operator's words, rendered as RATES and
+ * nothing more: the wire carries the operator's default (all-times) rates
+ * only — the per-window rates (this site's off-peak night window) are not on
+ * the wire — so the sentence says exactly that and no surface ever computes a
+ * night-charge cost from the general rate. Null when the keys are absent
+ * (kWh-only; the caller keeps its own "once commissioned" wording).
+ */
+export function tariffText(tariff: EnergyTariff): string | null {
+  const rates: string[] = [];
+  if (tariff.importCentsPerKwh !== null) {
+    rates.push(`${formatDecimal(tariff.importCentsPerKwh)} c/kWh import`);
+  }
+  if (tariff.exportCentsPerKwh !== null) {
+    rates.push(`${formatDecimal(tariff.exportCentsPerKwh)} c/kWh feed-in`);
+  }
+  if (rates.length === 0) {
+    return null;
+  }
+  const currency = tariff.currency === "" ? "" : `${tariff.currency} `;
+  return `Tariff keys are commissioned — ${currency}${rates.join(" · ")} (the general rates; the night window's own off-peak rate is not carried on this wire, so no cost is computed here).`;
 }
 
 /** A coverage percentage, or "" when the day carries none. */

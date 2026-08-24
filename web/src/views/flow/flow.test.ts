@@ -112,6 +112,12 @@ const night = (over: Partial<NightChargeState> = {}): NightChargeState => ({
   lastAction: "idle",
   lastTickAt: "",
   reasonCodes: [],
+  // V2's additive keys, at their v1-identity defaults (a full-posture frame).
+  targetPolicy: "full",
+  trust: null,
+  forecast: null,
+  explanation: null,
+  morningNotice: null,
   ...over,
 });
 
