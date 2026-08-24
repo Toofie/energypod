@@ -9,7 +9,10 @@ lives in tests/api/test_parking_rest.py):
 - T-PARK-CONCURRENCY: the single-flight critical section (park-vs-park).
 - T-PARK-EXPIRY: alarm-only -- a row, an alert-tier event, NO write, ever.
 - T-PARK-CRASH/RESTART: boot reconstruction (expired-in-downtime alarm,
-  never a write); pending-row adoption.
+  never a write); the crashed-then-verified park adopted at boot AND at the
+  first pass (operator origin, resume needs no takeover); the evicted audit
+  window degrading to ``unrecorded``; the TTL-elapsed row adopting straight
+  into the expired alarm; a row older than the cap never adopted.
 - T-PARK-REPLAY: the table truth (renewed rows participate; the closing set
   includes observed_foreign).
 - T-PARK-FOREIGN: word=1 no lease (unrecorded/foreign + takeover), word 2-6
@@ -33,6 +36,7 @@ import pytest
 from energypod.adapters.persistence.memory import InMemoryParkLeaseRepository
 from energypod.application.actor import DebugModeChangeError
 from energypod.application.parking import (
+    ADOPTED_PENDING_REASON,
     EXPIRY_HINT,
     PARK_ALREADY_PARKED,
     PARK_CONFLICT_REFUSED,
@@ -227,6 +231,7 @@ class AsyncLeaseStore:
         self.audit = audit
         self.store = InMemoryParkLeaseRepository(audit_sink=self._sync_sink())
         self.commit_calls: list[ParkLease] = []
+        self.fail_commits = 0  # commits left to drop (the crash-window simulation)
 
     def _sync_sink(self) -> Any:
         audit = self.audit
@@ -239,6 +244,11 @@ class AsyncLeaseStore:
         return _Sink()
 
     async def commit(self, event: AuditEvent, lease: ParkLease) -> None:
+        if self.fail_commits:
+            # The durable-first crash window: the pending row and the verified
+            # write landed; the completing transaction never did.
+            self.fail_commits -= 1
+            raise OSError("the process died between the verified write and the transaction")
         self.store.commit(event, lease)
         self.commit_calls.append(lease)
 
@@ -682,6 +692,162 @@ async def test_boot_reconstruction_never_parks_or_unparks_a_live_lease(rig: Rig)
     assert rig.audit.of_type("unit_park_expired") == []
     lease = await rig.store.lease("mid")
     assert lease is not None and lease.state == LEASE_OPEN
+
+
+# --- T-PARK-CRASH/RESTART: the crashed-then-verified park adopted -------------------
+
+
+async def _crash_after_verified_write(rig: Rig) -> None:
+    """Land the durable-first crash window on ``mid``: the pending row and the
+    verified write landed (the word moved to 1); the completing transaction --
+    the lease row -- never did."""
+    rig.store.fail_commits = 1
+    with pytest.raises(OSError):
+        await rig.park()
+    assert rig.actors["mid"].word == 1
+    assert [row.result for row in rig.audit.of_type("unit_parked")] == ["pending"]
+    assert await rig.store.lease("mid") is None
+
+
+def _revived(
+    rig: Rig,
+    *,
+    audit: FakeAudit | None = None,
+    bus: FakeBus | None = None,
+    observations: FakeObservations | None = None,
+) -> ParkController:
+    """The next process over the SAME durable truth (the store and the audit
+    trail survive the crash; a fresh bus collects this process's events)."""
+    return ParkController(
+        unit_ids=frozenset(UNITS),
+        commissioning=ParkCommissioning(
+            max_lease_s=14400, default_lease_s=14400, mode_write_enabled=True
+        ),
+        clock=rig.clock,
+        store=rig.store,
+        audit=audit if audit is not None else rig.audit,
+        bus=bus if bus is not None else rig.bus,
+        actors=rig.actors,
+        observations=observations if observations is not None else rig.observations,
+        intents=rig.intents,
+        process_instance_id="process-2",
+        process_origin_mono=rig.clock.now,
+    )
+
+
+async def test_boot_adopts_a_crashed_then_verified_park_as_ours(rig: Rig) -> None:
+    """DESIGN section 4: pending row + word=1 is the durable-first park
+    COMPLETED.  Boot adopts the lease the crash lost -- operator origin, the
+    row's authorizer and instant, the cap as the TTL -- with an honest
+    ``adopted_pending`` completing row; the operator's RESUME then needs no
+    takeover, because the park is ours."""
+    rig.observations.serve("mid", debug_mode_w=1)  # the survived readback word
+    await _crash_after_verified_write(rig)
+    fresh_bus = FakeBus()
+    revived = _revived(rig, bus=fresh_bus)
+    await revived.reconstruct_at_boot()
+
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.state == LEASE_OPEN
+    assert lease.epoch == 1 and lease.authorizer == "person:operator"
+    assert lease.parked_at == WALL
+    assert lease.expires_at == WALL + timedelta(seconds=14400)
+    assert lease.soc_pct_at_park is None, "the crash lost the SOC snapshot -- never invented"
+    rows = rig.audit.of_type("unit_parked")
+    assert [row.result for row in rows] == ["pending", "parked"]
+    assert rows[1].reason_codes == ("adopted_pending",)
+    assert rows[1].correlation_id == rows[0].correlation_id, "the adoption completes THE request"
+    assert rig.actors["mid"].mode_calls == [1], "adoption is a store write only"
+    state = (await revived.park_states())["mid"]
+    assert state["parked"] is True and state["origin"] == "operator"
+    assert state["reason"] == ADOPTED_PENDING_REASON
+
+    # The resume is the operator's own act: no takeover acknowledgement.
+    result = await revived.resume("mid", principal_subject="person:operator", request_id="req-9")
+    assert result["origin"] == "operator" and result["verified"] is True
+    closed = await rig.store.lease("mid")
+    assert closed is not None and closed.state == LEASE_CLOSED_OPERATOR
+
+
+async def test_the_first_pass_adopts_when_the_word_first_serves(rig: Rig) -> None:
+    """A fresh boot holds no served word yet, so boot reconstruction has
+    nothing to judge on; the adoption joins on the FIRST supervision pass --
+    exactly where the ``unrecorded`` classification used to be the only
+    answer."""
+    await _crash_after_verified_write(rig)
+    fresh_observations = FakeObservations()
+    revived = _revived(rig, observations=fresh_observations, bus=FakeBus())
+    await revived.reconstruct_at_boot()
+    assert await rig.store.lease("mid") is None, "no served word -- nothing to adopt on yet"
+
+    fresh_observations.serve("mid", debug_mode_w=1)
+    await revived.supervise()
+
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.state == LEASE_OPEN
+    state = (await revived.park_states())["mid"]
+    assert state["origin"] == "operator", "adopted, never 'unrecorded'"
+    assert rig.actors["mid"].mode_calls == [1], "the pass never writes either"
+
+
+async def test_an_evicted_pending_row_degrades_to_the_honest_unknown(rig: Rig) -> None:
+    """The audit store's bounded window no longer reaches the pending row:
+    adoption is honestly impossible and today's ``unrecorded`` path stands --
+    never a lease minted from evidence we can no longer see."""
+    await _crash_after_verified_write(rig)
+    rig.audit.events.append(
+        _fault_row("heartbeat_failed", ("suppressed_exception",), WALL + timedelta(minutes=30))
+    )
+    rig.audit.retention_limit = 1  # the pending row is gone from the window
+    rig.observations.serve("mid", debug_mode_w=1)
+    revived = _revived(rig, bus=FakeBus())
+    await revived.reconstruct_at_boot()
+    await revived.supervise()
+
+    assert await rig.store.lease("mid") is None
+    state = (await revived.park_states())["mid"]
+    assert state["parked"] is True and state["origin"] == "unrecorded"
+
+
+async def test_a_ttl_elapsed_pending_row_adopts_straight_into_the_expired_alarm(
+    rig: Rig,
+) -> None:
+    """The crashed park's own cap passed while the process was down: the
+    adoption lands the lease ALREADY in the expiry alarm -- the row, the
+    alert-tier event, and never a write under any path."""
+    rig.observations.serve("mid", debug_mode_w=1)
+    await _crash_after_verified_write(rig)
+    rig.clock.advance(14400.0)  # exactly the cap: recent evidence, fully elapsed
+    fresh_bus = FakeBus()
+    revived = _revived(rig, bus=fresh_bus)
+    await revived.reconstruct_at_boot()
+
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.state == LEASE_EXPIRED
+    (expired_row,) = rig.audit.of_type("unit_park_expired")
+    assert expired_row.result == "expired"
+    assert "expired_in_downtime" in expired_row.reason_codes
+    (event,) = fresh_bus.of_type("unit.park_expired")
+    assert event["payload"]["tier"] == "alert"
+    assert rig.actors["mid"].mode_calls == [1], "boot never writes, under any path"
+    state = (await revived.park_states())["mid"]
+    assert state["parked"] is True and state["expired"] is True
+    assert state["hint"] == EXPIRY_HINT
+
+
+async def test_a_pending_row_older_than_the_cap_is_never_adopted(rig: Rig) -> None:
+    """Stale evidence is the honest unknown: past the anti-rollover cap no
+    lease can still be ours, so the row is not adopted on either path."""
+    rig.observations.serve("mid", debug_mode_w=1)
+    await _crash_after_verified_write(rig)
+    rig.clock.advance(14401.0)
+    revived = _revived(rig, bus=FakeBus())
+    await revived.reconstruct_at_boot()
+    await revived.supervise()
+
+    assert await rig.store.lease("mid") is None
+    state = (await revived.park_states())["mid"]
+    assert state["origin"] == "unrecorded"
 
 
 # --- T-PARK-FOREIGN: divergence is alarmed, never fought ------------------------------------

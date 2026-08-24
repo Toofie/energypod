@@ -108,6 +108,16 @@ _FAULT_EVENT_TYPES: Final[frozenset[str]] = frozenset(
 )
 _FAULT_AUDIT_SCAN_LIMIT: Final[int] = 200
 
+# DESIGN section 4 (boot adoption): the pending-row scan reads the same
+# bounded recent window as the fault scan.  An evicted pending row is honestly
+# NOT FOUND -- the adoption degrades to today's ``unrecorded`` path, never a
+# fabricated lease.
+_ADOPTION_AUDIT_SCAN_LIMIT: Final[int] = 200
+# The honest reason an adopted lease carries: the operator's own reason text
+# lived in the pending row's payload, which the audit row keeps only as a
+# fingerprint -- unknowable after the crash, never invented.
+ADOPTED_PENDING_REASON: Final[str] = "adopted pending park (crash-recovered)"
+
 # The words that render ``foreign_mode`` (DESIGN section 0/3): the vendor
 # values 2-6 are permanently unexposed -- read-side vocabulary only.
 _FOREIGN_MODE_WORDS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6})
@@ -836,10 +846,14 @@ class ParkController:
         """Boot reconstruction from the lease table: alarm, never a write.
 
         Expired-during-downtime raises the expiry alarm here (table truth
-        alone); the word-vs-ledger reconciliation (foreign resume, the
-        unrecorded standby) joins on the first supervision pass, when the
-        first poll has served the device word.  Boot never parks and never
-        un-parks.
+        alone).  A crashed-then-verified park is ADOPTED here when a survived
+        observation already serves word=1 (section 4: pending row + word=1 is
+        the durable-first park completed); a fresh boot without a served word
+        adopts on the first supervision pass, when the first poll has served
+        it.  The rest of the word-vs-ledger reconciliation (foreign resume,
+        the unrecorded standby) joins on that same first pass.  Boot never
+        parks and never un-parks: adoption mints the lost lease row and never
+        touches the device register.
         """
         try:
             leases = dict(await self._store.all_leases())
@@ -851,7 +865,149 @@ class ParkController:
                 continue
             if lease.state == LEASE_OPEN and now >= lease.expires_at:
                 await self._expire_lease(lease, now, reason_codes=("expired_in_downtime",))
+        for unit_id in self._locks:
+            standing = leases.get(unit_id)
+            if standing is not None and standing.parked:
+                continue
+            observation = await self._latest_observation(unit_id)
+            word = (
+                _optional_word(getattr(observation, "debug_mode_w", None))
+                if observation is not None
+                else None
+            )
+            if word != 1:
+                continue
+            adopted = await self._adopt_pending_park(unit_id, now)
+            if adopted is not None:
+                leases[unit_id] = adopted
         self._mirror_from(leases)
+
+    async def _adopt_pending_park(self, unit_id: str, now: datetime) -> ParkLease | None:
+        """Section 4: adopt a crashed-then-verified park as ours.
+
+        The durable-first sequence is pending row -> write -> verifying
+        commit; a crash between the verified write and that transaction
+        leaves exactly ``word=1, no lease row, a pending row``.  This scans
+        the audit store's bounded recent window for the unit's most recent
+        ``unit_parked`` pending row with no later completing row and, when
+        the row is recent (within ``max_lease_s`` of its timestamp), mints
+        the lease the crash lost: origin operator, the row's authorizer (its
+        principal) and instant, the commissioning cap as the TTL -- the
+        operator's requested ``lease_s`` lived only in the payload the audit
+        row keeps as a fingerprint, so the cap is the honest bound, never a
+        fabricated figure -- and the standard expiry alarm when that TTL
+        already passed.
+
+        Adoption is a STORE write only; the device register is never touched
+        (boot never writes).  No row found, the window evicted, a completing
+        row present, or the store failing all degrade to ``None`` -- the
+        caller keeps today's honest path.
+        """
+        pending = await self._latest_uncompleted_pending(unit_id)
+        if pending is None:
+            return None
+        occurred = getattr(pending, "occurred_at", None)
+        if not isinstance(occurred, datetime) or occurred.tzinfo is None:
+            return None
+        cap = self._commissioning.max_lease_s
+        if (now - occurred).total_seconds() > cap:
+            # Stale evidence: whatever lease the operator took can no longer
+            # be ours under the anti-rollover cap -- the honest unknown.
+            return None
+        authorizer = getattr(pending, "principal", None)
+        if not isinstance(authorizer, str) or not authorizer.strip():
+            return None
+        async with self._locks[unit_id]:
+            existing = await self._store.lease(unit_id)
+            if existing is not None and existing.parked:
+                return None
+            lease = ParkLease(
+                unit_id=unit_id,
+                epoch=1 if existing is None else existing.epoch + 1,
+                parked_at=occurred,
+                expires_at=occurred + timedelta(seconds=cap),
+                max_total_s=cap,
+                reason=ADOPTED_PENDING_REASON,
+                authorizer=authorizer,
+                soc_pct_at_park=None,
+            )
+            correlation = getattr(pending, "correlation_id", None)
+            request_id = (
+                correlation.removeprefix("parking:unit_parked:")
+                if isinstance(correlation, str)
+                and correlation.startswith("parking:unit_parked:")
+                and len(correlation) > len("parking:unit_parked:")
+                else f"adoption:{unit_id}"
+            )
+            # The completing row the crash lost (the adopted_foreign_park
+            # origin-transition vocabulary): OUR controller mints it, no
+            # write was performed, the ledger never claims more than that.
+            try:
+                await self._store.commit(
+                    self._row(
+                        event_type="unit_parked",
+                        unit_id=unit_id,
+                        principal="energypod:parking",
+                        request_id=request_id,
+                        result="parked",
+                        reason_codes=("adopted_pending",),
+                        lifecycle=self._actor_lifecycle(unit_id),
+                        payload={
+                            "prior_word": 1,
+                            "written_value": None,
+                            "readback_word": 1,
+                            "verified": None,
+                            "origin": "operator",
+                            "authorizer": authorizer,
+                            "reason": ADOPTED_PENDING_REASON,
+                            "adopted": True,
+                            **lease.to_payload(),
+                        },
+                    ),
+                    lease,
+                )
+            except Exception:
+                return None
+            adopted = lease
+            if now >= lease.expires_at:
+                await self._expire_lease(lease, now, reason_codes=("expired_in_downtime",))
+                adopted = dataclass_replace(lease, state=LEASE_EXPIRED)
+            self._mirror_parked(unit_id, parked=True, lease=adopted)
+            return adopted
+
+    async def _latest_uncompleted_pending(self, unit_id: str) -> Any | None:
+        """The unit's most recent pending ``unit_parked`` row no later row
+        completes (``parked`` / ``refused``) -- the crash-after-write shape.
+
+        Row order never matters: a completing row AT-OR-AFTER the pending's
+        instant closes the sequence (the commit lands within the write's own
+        second), so both store orderings answer identically.
+        """
+        try:
+            events = await self._audit.recent(limit=_ADOPTION_AUDIT_SCAN_LIMIT)
+        except Exception:
+            return None
+        pending_rows: dict[datetime, Any] = {}
+        completed_at: list[datetime] = []
+        for event in events:
+            if getattr(event, "unit_id", None) != unit_id:
+                continue
+            if getattr(event, "event_type", None) != "unit_parked":
+                continue
+            occurred = getattr(event, "occurred_at", None)
+            if not isinstance(occurred, datetime) or occurred.tzinfo is None:
+                continue
+            result = getattr(event, "result", None)
+            if result == "pending":
+                pending_rows.setdefault(occurred, event)
+            elif result in ("parked", "refused"):
+                completed_at.append(occurred)
+        if not pending_rows:
+            return None
+        latest = max(pending_rows)
+        if any(at >= latest for at in completed_at):
+            return None
+        return pending_rows[latest]
 
     async def _expire_lease(
         self, lease: ParkLease, now: datetime, *, reason_codes: tuple[str, ...] = ()
@@ -958,11 +1114,16 @@ class ParkController:
                         if memory.foreign_standby_since is None:
                             memory.foreign_standby_since = self._wall_now()
                     elif memory.foreign_standby_origin is None:
-                        # Already 1 at this process's first look:
-                        # crash-after-write residue, the honest unknown.
-                        memory.foreign_standby_origin = "unrecorded"
-                        if memory.foreign_standby_since is None:
-                            memory.foreign_standby_since = self._wall_now()
+                        # Already 1 at this process's first look.  Section 4:
+                        # before calling it the honest unknown, try adopting
+                        # OUR crashed-then-verified park (pending row + word=1,
+                        # no lease) -- a store write only, never a device
+                        # write.  No row / an evicted window / a store failure
+                        # degrades to the unrecorded classification.
+                        if await self._adopt_pending_park(unit_id, self._wall_now()) is None:
+                            memory.foreign_standby_origin = "unrecorded"
+                            if memory.foreign_standby_since is None:
+                                memory.foreign_standby_since = self._wall_now()
             memory.last_word = word
         except Exception:
             return
@@ -1479,6 +1640,7 @@ class ParkController:
 
 
 __all__ = [
+    "ADOPTED_PENDING_REASON",
     "EXPIRY_HINT",
     "MIN_LEASE_S",
     "PARK_ALREADY_PARKED",
