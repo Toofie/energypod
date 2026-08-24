@@ -33,6 +33,7 @@ from energypod.domain.history import (
 )
 from energypod.domain.intents import Direction, IntentSource
 from energypod.domain.observations import UnitLifecycle
+from energypod.domain.parking import ParkLease, ParkLeaseEpochConflict
 from energypod.domain.schedule import (
     ScheduleEntry,
     SchedulePlan,
@@ -188,30 +189,11 @@ class SQLiteAuditRepository:
             raise
 
     def append(self, event: AuditEvent) -> None:
-        if hasattr(event, "model_dump"):
-            # Avoid Pydantic attempting to serialize immutable MappingProxyType
-            # values; the explicit encoder below owns all persistence encoding.
-            record = {name: getattr(event, name) for name in type(event).model_fields}
-        elif is_dataclass(event):
-            record = {field.name: getattr(event, field.name) for field in fields(event)}
-        else:  # pragma: no cover - defensive port boundary
-            raise TypeError("audit event must be an immutable record")
-        payload = json.dumps(
-            {name: _json_value(value) for name, value in record.items()},
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
         try:
             with self._database.lock:
                 self._database.connection.execute("BEGIN IMMEDIATE")
                 try:
-                    self._database.connection.execute(
-                        """INSERT INTO audit_events(
-                               event_id, unit_id, monotonic_offset_s, payload
-                           ) VALUES (?, ?, ?, ?)""",
-                        (event.event_id, event.unit_id, event.monotonic_offset_s, payload),
-                    )
+                    _insert_audit_event(self._database.connection, event)
                     self._database.connection.execute("COMMIT")
                 except BaseException:
                     self._database.connection.execute("ROLLBACK")
@@ -278,6 +260,262 @@ class SQLiteAuditRepository:
             raise ValueError("audit reason_codes must be a JSON array")
         values["reason_codes"] = tuple(values["reason_codes"])
         return AuditEvent(**values)
+
+
+def _insert_audit_event(connection: sqlite3.Connection, event: AuditEvent) -> None:
+    """Encode and insert one audit row inside the CALLER's open transaction.
+
+    The parking lease store appends its audit row and its ``park_leases`` row
+    in ONE transaction boundary (DESIGN_POD_PARKING section 4), so the insert
+    itself is shared here: the row's encoding is the audit store's own, and
+    the transaction -- BEGIN/COMMIT/ROLLBACK -- stays each caller's to own.
+    """
+    if hasattr(event, "model_dump"):
+        # Avoid Pydantic attempting to serialize immutable MappingProxyType
+        # values; the explicit encoder below owns all persistence encoding.
+        record = {name: getattr(event, name) for name in type(event).model_fields}
+    elif is_dataclass(event):
+        record = {field.name: getattr(event, field.name) for field in fields(event)}
+    else:  # pragma: no cover - defensive port boundary
+        raise TypeError("audit event must be an immutable record")
+    payload = json.dumps(
+        {name: _json_value(value) for name, value in record.items()},
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    connection.execute(
+        """INSERT INTO audit_events(
+               event_id, unit_id, monotonic_offset_s, payload
+           ) VALUES (?, ?, ?, ?)""",
+        (event.event_id, event.unit_id, event.monotonic_offset_s, payload),
+    )
+
+
+class SQLiteParkLeaseRepository:
+    """The durable parking-lease store (DESIGN_POD_PARKING section 4).
+
+    One row per unit (``unit_id`` PRIMARY KEY): the machine truth beside the
+    audit trail's narrative.  ``commit`` appends the parking audit row AND
+    upserts the lease row in ONE ``BEGIN IMMEDIATE`` transaction -- a lease
+    never exists without its narrative row and a narrative row for a lease
+    mutation never exists without the lease.  Terminal rows are kept (the
+    epoch column is the per-unit monotonic single-flight counter), and
+    ``replace`` performs the compare-and-set on ``epoch`` so a mutation on a
+    closed epoch refuses instead of acting on a stale view.
+    """
+
+    _LEASE_COLUMNS: tuple[str, ...] = (
+        "unit_id",
+        "opened_at",
+        "expires_at",
+        "max_total_s",
+        "reason",
+        "authorizer",
+        "epoch",
+        "state",
+        "soc_pct_at_park",
+        "closed_at",
+        "write_unverified",
+        "foreign_rewrite",
+    )
+
+    def __init__(self, database: SQLiteDatabase) -> None:
+        self._database = database
+        try:
+            with database.lock:
+                # The audit table is created here too (idempotently, in the
+                # audit store's own shape) because ``commit`` writes BOTH rows
+                # in one transaction: this repository must not depend on the
+                # audit repository having been constructed first.
+                database.connection.execute(
+                    """CREATE TABLE IF NOT EXISTS audit_events (
+                        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_id TEXT NOT NULL UNIQUE,
+                        unit_id TEXT,
+                        monotonic_offset_s REAL NOT NULL,
+                        payload TEXT NOT NULL
+                    )"""
+                )
+                database.connection.execute(
+                    """CREATE TABLE IF NOT EXISTS park_leases (
+                        unit_id TEXT PRIMARY KEY,
+                        opened_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        max_total_s INTEGER NOT NULL,
+                        reason TEXT NOT NULL,
+                        authorizer TEXT NOT NULL,
+                        epoch INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        soc_pct_at_park REAL,
+                        closed_at TEXT,
+                        write_unverified INTEGER NOT NULL DEFAULT 0,
+                        foreign_rewrite INTEGER NOT NULL DEFAULT 0
+                    )"""
+                )
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError(
+                    "park lease database is busy during initialization"
+                ) from exc
+            raise
+
+    def commit(self, event: AuditEvent, lease: ParkLease) -> None:
+        """One transaction: the audit row and the lease row land together."""
+        if type(lease) is not ParkLease:
+            raise TypeError("lease must be a ParkLease")
+        try:
+            with self._database.lock:
+                connection = self._database.connection
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    _insert_audit_event(connection, event)
+                    self._upsert_lease(connection, lease)
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+        except sqlite3.IntegrityError as exc:
+            if exc.sqlite_errorcode in {
+                sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
+                sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+            }:
+                raise DuplicateAuditEventError(event.event_id) from exc
+            raise
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("park lease database is busy") from exc
+            raise
+
+    def replace(
+        self, event: AuditEvent, lease: ParkLease, *, expected_epoch: int
+    ) -> ParkLease:
+        """CAS upsert: the audit row and the epoch-guarded lease row together.
+
+        ``expected_epoch`` is the epoch the caller read under its critical
+        section; a row that moved underneath (another process, a restart)
+        refuses with :class:`ParkLeaseEpochConflict` and NOTHING lands -- the
+        audit row rolls back with the lease, so a refused mutation leaves no
+        narrative behind either.
+        """
+        if type(lease) is not ParkLease:
+            raise TypeError("lease must be a ParkLease")
+        if type(expected_epoch) is not int or expected_epoch < 1:
+            raise ValueError("expected_epoch must be a positive integer")
+        try:
+            with self._database.lock:
+                connection = self._database.connection
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    row = connection.execute(
+                        "SELECT epoch FROM park_leases WHERE unit_id = ?", (lease.unit_id,)
+                    ).fetchone()
+                    actual = 0 if row is None else int(row[0])
+                    if actual != expected_epoch:
+                        raise ParkLeaseEpochConflict(lease.unit_id, expected_epoch, actual)
+                    _insert_audit_event(connection, event)
+                    self._upsert_lease(connection, lease)
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+        except sqlite3.IntegrityError as exc:
+            if exc.sqlite_errorcode in {
+                sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
+                sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+            }:
+                raise DuplicateAuditEventError(event.event_id) from exc
+            raise
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("park lease database is busy") from exc
+            raise
+        return lease
+
+    def lease(self, unit_id: str) -> ParkLease | None:
+        try:
+            with self._database.lock:
+                row = self._database.connection.execute(
+                    f"SELECT {', '.join(self._LEASE_COLUMNS)} FROM park_leases"  # noqa: S608
+                    " WHERE unit_id = ?",
+                    (unit_id,),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("park lease database is busy") from exc
+            raise
+        return None if row is None else self._decode(row)
+
+    def all_leases(self) -> dict[str, ParkLease]:
+        try:
+            with self._database.lock:
+                rows = self._database.connection.execute(
+                    f"SELECT {', '.join(self._LEASE_COLUMNS)} FROM park_leases"  # noqa: S608
+                    " ORDER BY unit_id"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("park lease database is busy") from exc
+            raise
+        return {str(row[0]): self._decode(row) for row in rows}
+
+    @staticmethod
+    def _upsert_lease(connection: sqlite3.Connection, lease: ParkLease) -> None:
+        connection.execute(
+            """INSERT INTO park_leases(
+                   unit_id, opened_at, expires_at, max_total_s, reason, authorizer,
+                   epoch, state, soc_pct_at_park, closed_at, write_unverified,
+                   foreign_rewrite
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(unit_id) DO UPDATE SET
+                 opened_at = excluded.opened_at,
+                 expires_at = excluded.expires_at,
+                 max_total_s = excluded.max_total_s,
+                 reason = excluded.reason,
+                 authorizer = excluded.authorizer,
+                 epoch = excluded.epoch,
+                 state = excluded.state,
+                 soc_pct_at_park = excluded.soc_pct_at_park,
+                 closed_at = excluded.closed_at,
+                 write_unverified = excluded.write_unverified,
+                 foreign_rewrite = excluded.foreign_rewrite""",
+            (
+                lease.unit_id,
+                lease.parked_at.astimezone(UTC).isoformat(),
+                lease.expires_at.astimezone(UTC).isoformat(),
+                int(lease.max_total_s),
+                lease.reason,
+                lease.authorizer,
+                int(lease.epoch),
+                lease.state,
+                None if lease.soc_pct_at_park is None else float(lease.soc_pct_at_park),
+                None if lease.closed_at is None else lease.closed_at.astimezone(UTC).isoformat(),
+                1 if lease.write_unverified else 0,
+                1 if lease.foreign_rewrite else 0,
+            ),
+        )
+
+    @classmethod
+    def _decode(cls, row: Sequence[Any]) -> ParkLease:
+        values = dict(zip(cls._LEASE_COLUMNS, row, strict=True))
+        soc = values["soc_pct_at_park"]
+        return ParkLease(
+            unit_id=str(values["unit_id"]),
+            epoch=int(values["epoch"]),
+            parked_at=datetime.fromisoformat(str(values["opened_at"])),
+            expires_at=datetime.fromisoformat(str(values["expires_at"])),
+            max_total_s=int(values["max_total_s"]),
+            reason=str(values["reason"]),
+            authorizer=str(values["authorizer"]),
+            soc_pct_at_park=None if soc is None else float(soc),
+            state=str(values["state"]),
+            closed_at=(
+                None if values["closed_at"] is None
+                else datetime.fromisoformat(str(values["closed_at"]))
+            ),
+            write_unverified=bool(values["write_unverified"]),
+            foreign_rewrite=bool(values["foreign_rewrite"]),
+        )
 
 
 class SQLiteScheduleRepository:

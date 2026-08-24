@@ -22,6 +22,7 @@ from energypod.domain.history import (
     parse_history_timestamp,
 )
 from energypod.domain.history import worst_quality as worst_of
+from energypod.domain.parking import ParkLease, ParkLeaseEpochConflict
 
 
 class InMemoryEnergyLedgerRepository:
@@ -74,6 +75,51 @@ class InMemoryEnergyLedgerRepository:
 
         if type(day) is not _date:
             raise TypeError("day must be a civil date")
+
+
+class InMemoryParkLeaseRepository:
+    """Process-local parking leases: one unbounded map per unit (DESIGN §4).
+
+    The simulator/memory twin of ``SQLiteParkLeaseRepository`` -- the SAME
+    interface, deliberately unbounded (the in-memory audit store is itself a
+    bounded deque that would evict leases, which is exactly why the durable
+    lease row is a dedicated store and not audit replay).  The "transaction"
+    of ``commit``/``replace`` is trivially atomic here: the audit sink's
+    append and the map update share one lock and either both land or the
+    raised error leaves both untouched.
+    """
+
+    def __init__(self, *, audit_sink: Any = None) -> None:
+        self._leases: dict[str, ParkLease] = {}
+        self._audit_sink = audit_sink
+        self._lock = RLock()
+
+    def commit(self, event: Any, lease: ParkLease) -> None:
+        with self._lock:
+            if self._audit_sink is not None:
+                self._audit_sink.append(event)
+            self._leases[lease.unit_id] = lease
+
+    def replace(
+        self, event: Any, lease: ParkLease, *, expected_epoch: int
+    ) -> ParkLease:
+        with self._lock:
+            current = self._leases.get(lease.unit_id)
+            actual = 0 if current is None else current.epoch
+            if actual != expected_epoch:
+                raise ParkLeaseEpochConflict(lease.unit_id, expected_epoch, actual)
+            if self._audit_sink is not None:
+                self._audit_sink.append(event)
+            self._leases[lease.unit_id] = lease
+        return lease
+
+    def lease(self, unit_id: str) -> ParkLease | None:
+        with self._lock:
+            return self._leases.get(unit_id)
+
+    def all_leases(self) -> dict[str, ParkLease]:
+        with self._lock:
+            return dict(self._leases)
 
 
 class InMemoryObservationRepository:

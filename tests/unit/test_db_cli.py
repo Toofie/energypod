@@ -319,9 +319,9 @@ def _no_temporary_files(directory: Path) -> list[str]:
 
 def test_schema_version_is_stamped_from_day_one(tmp_path: Path) -> None:
     """Opening a fresh database stamps the latest known version before
-    anything else runs (version 3 added the telemetry-history tables)."""
+    anything else runs (version 4 added the pod-parking lease table)."""
     _require_contract()
-    assert SCHEMA_VERSION == 3
+    assert SCHEMA_VERSION == 4
     database = SQLiteDatabase(tmp_path / "controller.sqlite3")
     database.open()
     try:
@@ -333,6 +333,7 @@ def test_schema_version_is_stamped_from_day_one(tmp_path: Path) -> None:
             "energy_baseline",
             "telemetry_sample",
             "telemetry_rollup_hourly",
+            "park_leases",
         ):
             present = connection.execute(
                 "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
@@ -460,11 +461,15 @@ def test_db_migration_failure_rolls_back_transactionally(
     seeded.close()
     _write_config(config, database)
 
+    last_real = MIGRATIONS[-1].version
     broken = (
         *MIGRATIONS,
-        Migration(version=3, statements=("CREATE TABLE rollback_probe (id INTEGER)",)),
         Migration(
-            version=4,
+            version=last_real + 1,
+            statements=("CREATE TABLE rollback_probe (id INTEGER)",),
+        ),
+        Migration(
+            version=last_real + 2,
             statements=(
                 "CREATE TABLE partial_probe (id INTEGER)",
                 "DROP TABLE must_not_exist_anywhere",
@@ -477,7 +482,9 @@ def test_db_migration_failure_rolls_back_transactionally(
 
     assert result.exit_code == 1, result.report()
     assert "database error" in result.stderr, result.report()
-    assert _stored_version(database) == 3, "migration 3 committed before 4 failed"
+    assert _stored_version(database) == last_real + 1, (
+        f"migration {last_real + 1} committed before {last_real + 2} failed"
+    )
     assert not _has_table(database, "partial_probe"), "the failed migration rolled back"
     assert _no_temporary_files(tmp_path) == []
 

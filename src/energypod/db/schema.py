@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-SCHEMA_VERSION: Final[int] = 3
+SCHEMA_VERSION: Final[int] = 4
 BASELINE_VERSION: Final[int] = 0
 
 _CREATE_VERSION_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS schema_version (
@@ -100,6 +100,32 @@ _CREATE_TELEMETRY_ROLLUP_TABLE: Final[str] = (
     PRIMARY KEY (unit_id, hour_start)
 ) WITHOUT ROWID"""
 )
+# DESIGN_POD_PARKING section 4: the dedicated durable parking-lease table --
+# one row per unit, the machine truth beside the audit trail's narrative (the
+# in-memory audit store is a bounded deque and would evict leases in simulator
+# mode, so audit replay is deliberately NOT the lease store).  ``opened_at``
+# is the wire's ``parked_at`` (the same instant; both spellings live in the
+# contracts).  Wall-clock ISO-8601 timestamps because downtime spans restarts
+# and boot reconstruction must judge "expired while we were down" from the row
+# alone.  The close-context columns (``closed_at``, ``write_unverified``,
+# ``foreign_rewrite``) carry the terminal sub-states of DESIGN section 3; a
+# terminal row is KEPT -- the ``epoch`` column is the per-unit monotonic
+# single-flight counter, so a new park over a closed lease mints epoch+1 and a
+# mutation on a closed epoch refuses instead of acting on a stale view.
+_CREATE_PARK_LEASE_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS park_leases (
+    unit_id TEXT PRIMARY KEY,
+    opened_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    max_total_s INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    authorizer TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    soc_pct_at_park REAL,
+    closed_at TEXT,
+    write_unverified INTEGER NOT NULL DEFAULT 0,
+    foreign_rewrite INTEGER NOT NULL DEFAULT 0
+)"""
 
 
 @dataclass(frozen=True)
@@ -125,7 +151,10 @@ class MigrationResult:
 # date, energy_baseline keyed by unit.  Version 3 adds the telemetry
 # historian's tables (DESIGN_PLANT_HISTORY section 2.2): telemetry_sample
 # and telemetry_rollup_hourly -- an in-place upgrade that touches no
-# existing table.
+# existing table.  Version 4 adds the pod-parking lease table
+# (DESIGN_POD_PARKING section 4): park_leases keyed by unit, written in the
+# same transaction boundary as the parking audit append -- again an
+# in-place upgrade that touches no existing table.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, statements=(_CREATE_VERSION_TABLE,)),
     Migration(
@@ -136,6 +165,7 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=3,
         statements=(_CREATE_TELEMETRY_SAMPLE_TABLE, _CREATE_TELEMETRY_ROLLUP_TABLE),
     ),
+    Migration(version=4, statements=(_CREATE_PARK_LEASE_TABLE,)),
 )
 
 
