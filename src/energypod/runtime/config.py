@@ -150,6 +150,18 @@ class TimingConfig(_FrozenModel):
     # (the prior integration's proven 0.1 s; see waveshare.py). Default keeps
     # the commissioned value so a config omitting it still behaves safely.
     inter_request_delay_s: NonNegativeFiniteFloat = 0.1
+    # The pod-parking mode write's OWN budget (DESIGN_POD_PARKING section 5;
+    # commissioned 2026-08-24 after the live smoke: this gateway's FC16-to-
+    # 0x8000 turnaround outran the cadence-commissioned write timeout, while a
+    # direct script at 1.0 s succeeded -- docs/evidence/standby-cycle-
+    # 2026-08-24.md).  The mode write is a ONE-SHOT operator act, never
+    # cadence-bound: it neither rides nor extends the complete operation
+    # budget below (which must keep fitting inside the device command
+    # expiry); the named operation's total is its prior read + this write +
+    # its readback, each leg inside its own budget.  It only has to out-live
+    # the inter-frame gap the write still pays and the ordinary write budget
+    # it replaces for its one FC16, and stay inside the sane 5 s ceiling.
+    mode_write_timeout_s: Annotated[StrictFloat, Field(gt=0, le=5.0)] = 2.0
 
     @field_validator("device_command_expiry_evidence")
     @classmethod
@@ -185,6 +197,23 @@ class TimingConfig(_FrozenModel):
             raise ValueError(
                 "write timeout must fit strictly inside the control period: it is wired as "
                 "the heartbeat safety margin inside the heartbeat interval"
+            )
+        # The mode write's budget stands alone (above): it must EXCEED the
+        # ordinary write budget it replaces for its one FC16 and the
+        # inter-frame gap that write still pays, and never a narrowing of
+        # either -- a budget that cannot cover the gateway's measured
+        # debug-mode turnaround is the live-smoke failure this key exists to
+        # commission away.
+        if self.mode_write_timeout_s <= self.write_timeout_s:
+            raise ValueError(
+                "mode write timeout must exceed write_timeout_s: it is the one-shot "
+                "debug-mode FC16 budget that REPLACES the cadence-bound write budget "
+                "for that single write, never a narrowing of it"
+            )
+        if self.mode_write_timeout_s <= self.inter_request_delay_s:
+            raise ValueError(
+                "mode write timeout must exceed inter_request_delay_s: the named mode "
+                "write still pays the commissioned inter-frame gap inside its own budget"
             )
         return self
 

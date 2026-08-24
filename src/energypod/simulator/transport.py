@@ -56,7 +56,7 @@ class SimulatorTransport:
         self._ensure_connected()
         self._pod.apply_pq_frame(frame)
 
-    async def write_debug_mode(self, value: int) -> None:
+    async def write_debug_mode(self, value: int, timeout_s: float | None = None) -> None:
         """Write the sanctioned vendor debug-mode word (0x8000 <- value).
 
         The named method the production transport grew for pod parking
@@ -64,7 +64,10 @@ class SimulatorTransport:
         the ``{0, 1}`` whitelist BEFORE any connection or device state is
         consulted -- the ``_validated_pq_frame`` ordering -- and the generic
         ``write_registers`` gate stays byte-identical, so only this method can
-        ever reach the debug register.
+        ever reach the debug register.  ``timeout_s`` mirrors the production
+        signature and is ACCEPTED AND IGNORED: there is no wire here, so the
+        one-shot mode write's commissioned budget (timing.
+        ``mode_write_timeout_s``) has nothing to bound in the simulator.
         """
         mode = _validated_debug_mode(value)
         self._ensure_connected()

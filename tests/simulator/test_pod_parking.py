@@ -160,6 +160,22 @@ async def test_the_transport_write_debug_mode_routes_to_the_pod() -> None:
     await transport.close()
 
 
+async def test_write_debug_mode_accepts_and_ignores_the_timeout_override() -> None:
+    """The production signature's per-op budget parameter (2026-08-24 live
+    smoke: timing.mode_write_timeout_s): the simulator mirror ACCEPTS it and
+    IGNORES it -- there is no wire here, so the one-shot write's commissioned
+    budget has nothing to bound."""
+    pod, transport, _clock = build_parked_unit()
+    await transport.connect()
+
+    await transport.write_debug_mode(1, timeout_s=2.0)
+    assert await debug_readback(transport) == 1
+
+    await transport.write_debug_mode(0, timeout_s=2.0)
+    assert await debug_readback(transport) == 0
+    await transport.close()
+
+
 async def test_write_debug_mode_validates_before_the_connection_is_consulted() -> None:
     """The PQ gate's ordering, mirrored: a malformed write is refused before
     any connection state is consulted, exactly like ``_validated_pq_frame``."""

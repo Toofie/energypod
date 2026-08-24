@@ -745,6 +745,31 @@ async def test_live_run_config_composes_lazy_production_transports_and_decode_st
     await asyncio.sleep(0)
 
 
+async def test_the_lazy_production_transport_forwards_the_named_mode_write() -> None:
+    """The 2026-08-24 live smoke's ``park_write_failed`` root cause, pinned:
+    the lazy proxy must expose the NAMED ``write_debug_mode`` -- the actor's
+    duck-typed lookup found nothing when the proxy forwarded only the generic
+    surface, so a live composition's mode write could never reach the bus at
+    all.  The commissioned one-shot budget rides through untouched (only the
+    real transport knows how to apply it)."""
+    module = _composition()
+    forwarded: list[tuple[int, float | None]] = []
+
+    class _StubTransport:
+        async def write_debug_mode(self, value: int, timeout_s: float | None = None) -> None:
+            forwarded.append((value, timeout_s))
+
+    stub = _StubTransport()
+    lazy = module._LazyWaveshareTransport(lambda: stub)
+
+    await lazy.write_debug_mode(1, timeout_s=2.0)
+    await lazy.write_debug_mode(0)
+
+    assert forwarded == [(1, 2.0), (0, None)], (
+        "the named write and its per-op budget must forward to the resolved transport verbatim"
+    )
+
+
 async def test_replayed_live_capture_serves_the_full_run_mode_read_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

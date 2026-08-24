@@ -19,6 +19,9 @@ import pytest
 UNIT_ID = "mid"
 IDENTITY = "BEP0005KXX11B10500055"
 PROFILE = "iot-v1"
+# The vendor's debug-mode readback word (DESIGN_POD_PARKING sections 4/5: the
+# write sits at 0x8000, the readback at 0x8100 -- the asymmetry is pinned).
+DEBUG_MODE_READBACK_ADDRESS = 0x8100
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,12 @@ class SpyTransport:
         self.read_gate: Gate | None = None
         self.write_gates: deque[Gate] = deque()
         self.write_failures: deque[BaseException] = deque()
+        # The named parking write (DESIGN_POD_PARKING section 5): every
+        # attempt records (value, timeout_s) so the commissioned one-shot
+        # budget's journey to the transport is observable.
+        self.debug_mode_attempts: list[tuple[int, float | None]] = []
+        self.debug_mode_writes: list[tuple[int, float | None]] = []
+        self.debug_word = 0  # the 0x8100 readback word the spy serves
 
     async def connect(self) -> None:
         await self._operation("connect", None)
@@ -134,6 +143,8 @@ class SpyTransport:
         async def body() -> tuple[int, ...]:
             if self.read_gate is not None:
                 await self.read_gate.wait()
+            if address == DEBUG_MODE_READBACK_ADDRESS and count == 1:
+                return (self.debug_word,)
             return tuple(0 for _ in range(count))
 
         return await self._operation("read", (address, count), body)
@@ -150,6 +161,19 @@ class SpyTransport:
             self.writes.append(request)
 
         await self._operation("write", request, body)
+
+    async def write_debug_mode(self, value: int, timeout_s: float | None = None) -> None:
+        self.debug_mode_attempts.append((value, timeout_s))
+
+        async def body() -> None:
+            if self.write_gates:
+                await self.write_gates.popleft().wait()
+            if self.write_failures:
+                raise self.write_failures.popleft()
+            self.debug_word = value
+            self.debug_mode_writes.append((value, timeout_s))
+
+        await self._operation("debug_write", (value, timeout_s), body)
 
     async def close(self) -> None:
         if self.closed:
@@ -255,6 +279,7 @@ def contract() -> Any:
             {
                 "EnergyPodActor": actor_module.EnergyPodActor,
                 "ArmRefused": actor_module.ArmRefused,
+                "DebugModeChangeError": actor_module.DebugModeChangeError,
                 "InhibitCause": actor_module.InhibitCause,
                 "UnitLifecycle": domain_module.UnitLifecycle,
             },
@@ -272,6 +297,8 @@ def make_actor(
     authorizations: FakeAuthorizationRepository | None = None,
     blocking_fault_codes: frozenset[str] | None = None,
     mode_refresh_window: tuple[int, int] | None = None,
+    debug_mode_readback_address: int | None = None,
+    mode_write_timeout_s: float | None = None,
     telemetry: Any | None = None,
 ) -> tuple[Any, FakeClock, SpyTransport, FakeObservationRepository, FakeAuthorizationRepository]:
     test_clock = clock or FakeClock()
@@ -296,6 +323,8 @@ def make_actor(
         heartbeat_safety_margin_s=0.2,
         blocking_fault_codes=blocking_fault_codes,
         mode_refresh_window=mode_refresh_window,
+        debug_mode_readback_address=debug_mode_readback_address,
+        mode_write_timeout_s=mode_write_timeout_s,
         telemetry=telemetry,
     )
     return actor, test_clock, test_transport, observation_repo, authorization_repo
@@ -401,6 +430,88 @@ async def test_mode_word_refresh_without_a_wired_window_fails_closed(contract: A
 
     with pytest.raises(RuntimeError, match="mode refresh window"):
         await actor.refresh_mode_words()
+    await actor.shutdown()
+
+
+# --- DESIGN_POD_PARKING sections 4/5: the named mode write's OWN budget ----------
+#
+# The 2026-08-24 live smoke: the gateway's FC16-to-0x8000 turnaround outran
+# the cadence-commissioned write timeout (0.50 s), so the parking WRITE leg
+# runs under its own commissioned budget (timing.mode_write_timeout_s) and
+# hands that budget to the named transport write as the one FC16's per-op
+# client timeout.  The prior read and the readback keep the margin.
+
+
+async def test_the_named_mode_write_carries_its_own_commissioned_budget(
+    contract: Any,
+) -> None:
+    actor, _, transport, _, _ = make_actor(
+        contract,
+        debug_mode_readback_address=DEBUG_MODE_READBACK_ADDRESS,
+        mode_write_timeout_s=2.0,
+    )
+    await actor.start()
+
+    outcome = await actor.request_debug_mode_change(1)
+
+    assert outcome == {
+        "prior_word": 0,
+        "written_value": 1,
+        "readback_word": 1,
+        "verified": True,
+        "retries": 0,
+    }
+    assert transport.debug_mode_writes == [(1, 2.0)], (
+        "the commissioned budget must ride the named transport write"
+    )
+    reads = [detail for name, detail in transport.history if name == "read:start"]
+    assert (DEBUG_MODE_READBACK_ADDRESS, 1) in reads, (
+        "the prior read and the readback still run through the ordinary read path"
+    )
+    await actor.shutdown()
+
+
+async def test_an_unwired_mode_write_budget_keeps_the_call_exact(contract: Any) -> None:
+    """``None`` (the default) changes nothing: the write leg keeps the
+    heartbeat-margin bound and the transport call carries no override."""
+    actor, _, transport, _, _ = make_actor(
+        contract, debug_mode_readback_address=DEBUG_MODE_READBACK_ADDRESS
+    )
+    await actor.start()
+
+    outcome = await actor.request_debug_mode_change(0)
+
+    assert outcome["verified"] is True
+    assert transport.debug_mode_writes == [(0, None)]
+    await actor.shutdown()
+
+
+async def test_a_mode_write_outrunning_its_budget_refuses_as_write_failed(
+    contract: Any,
+) -> None:
+    """The budget bounds the write leg itself: a write that never completes
+    inside it is cancelled BY it (the live-smoke refusal class), retried once,
+    and refused with the typed write_failed facts."""
+    actor, _, transport, _, _ = make_actor(
+        contract,
+        debug_mode_readback_address=DEBUG_MODE_READBACK_ADDRESS,
+        mode_write_timeout_s=0.05,
+    )
+    await actor.start()
+    stalled_first = Gate()
+    stalled_retry = Gate()
+    transport.write_gates.extend((stalled_first, stalled_retry))
+
+    with pytest.raises(contract.DebugModeChangeError) as caught:
+        await actor.request_debug_mode_change(1)
+
+    assert caught.value.reason == "write_failed"
+    assert caught.value.details["error_class"] == "TimeoutError"
+    assert stalled_first.cancelled.is_set() and stalled_retry.cancelled.is_set()
+    assert transport.debug_mode_attempts == [(1, 0.05), (1, 0.05)], (
+        "both bounded attempts carry the commissioned budget"
+    )
+    assert transport.debug_mode_writes == []
     await actor.shutdown()
 
 

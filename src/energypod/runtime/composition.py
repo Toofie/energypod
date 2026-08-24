@@ -747,6 +747,7 @@ class _AsyncParkLeaseRepository:
 
 class _AsyncAuditRepository:
     """Awaitable audit port; every durable append is also a bus event."""
+
     def __init__(self, store: _AuditStore, *, bus: EventBus) -> None:
         self._store = store
         self._bus = bus
@@ -1079,6 +1080,18 @@ class _LazyWaveshareTransport:
 
     async def write_registers(self, address: int, values: Sequence[int]) -> None:
         await self._resolve().write_registers(address, values)
+
+    async def write_debug_mode(self, value: int, timeout_s: float | None = None) -> None:
+        """Forward the named parking write (DESIGN_POD_PARKING section 5).
+
+        The 2026-08-24 live smoke's ``park_write_failed`` root cause: the lazy
+        proxy exposed only the generic surface, so the actor's duck-typed
+        lookup of the named method found nothing and the mode write could
+        never reach the bus on a live composition at all.  The override rides
+        through untouched — it is the commissioned one-shot budget, and only
+        the real transport knows how to apply it.
+        """
+        await self._resolve().write_debug_mode(value, timeout_s=timeout_s)
 
     async def close(self) -> None:
         # A transport that was never constructed never opened anything, and
@@ -3350,6 +3363,12 @@ def _build_runtime(
             # only through the named operation a commissioned parking block's
             # controller drives.
             debug_mode_readback_address=_DEBUG_MODE_BLOCK_BASE,
+            # The one-shot mode write's OWN budget (2026-08-24 live smoke):
+            # the WRITE leg of the parking operation runs under it and hands
+            # it to the transport as that one FC16's per-op client timeout.
+            # Wired on EVERY actor so the config key is the single authority
+            # (the simulator transport accepts and ignores it).
+            mode_write_timeout_s=config.timing.mode_write_timeout_s,
             telemetry=telemetry,
         )
 

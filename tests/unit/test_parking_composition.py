@@ -129,6 +129,26 @@ async def test_a_present_block_composes_the_controller_and_the_rest_routes(
     assert "/api/v1/units/{unit_id}/resume" in paths
 
 
+async def test_the_composed_actors_carry_the_commissioned_mode_write_budget(
+    tmp_path: Path,
+) -> None:
+    """The one-shot mode write's OWN budget (2026-08-24 live smoke): the
+    commissioned timing key reaches every composed actor -- the WRITE leg of
+    the named parking operation runs under it and hands it to the transport
+    as that one FC16's per-op client timeout (the simulator transport accepts
+    and ignores it; the production transport applies it)."""
+    payload = _parking_payload(max_lease_s=7200, default_lease_s=3600)
+    payload["timing"]["mode_write_timeout_s"] = 1.25
+    runtime = build_runtime(
+        ControllerConfig.model_validate(payload), clock=ManualClock(), simulate=True
+    )
+
+    for actor in runtime.actors.values():
+        assert actor._mode_write_timeout == 1.25, (
+            "the commissioned mode-write budget must be wired into every actor"
+        )
+
+
 async def test_an_operator_park_drives_the_real_actor_mailbox_operation(
     tmp_path: Path,
 ) -> None:
@@ -198,9 +218,7 @@ async def test_an_operator_park_drives_the_real_actor_mailbox_operation(
 
         # The durable audit trail: pending then parked.
         rows = [
-            event
-            for event in runtime.audit.recent(limit=32)
-            if event.event_type == "unit_parked"
+            event for event in runtime.audit.recent(limit=32) if event.event_type == "unit_parked"
         ]
         assert [row.result for row in rows] == ["parked", "pending"]
         assert rows[0].unit_id == "mid"

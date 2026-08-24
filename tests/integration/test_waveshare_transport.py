@@ -8,6 +8,7 @@ not captured golden vectors and not evidence that the deployed Waveshare uses th
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import inspect
 from dataclasses import dataclass, field
@@ -26,6 +27,11 @@ PQ_WRITE_RESPONSE = bytes.fromhex("04 10 02 00 00 03 81 e5")
 MODBUS_EXCEPTION_RESPONSE = bytes.fromhex("04 83 02 d0 f0")
 WRONG_DEVICE_RESPONSE = bytes.fromhex("05 03 0e 01 01 00 03 00 00 00 00 00 01 00 06 00 00 7d 11")
 SHORT_READ_RESPONSE = bytes.fromhex("04 03 0c 01 01 00 03 00 00 00 00 00 01 00 06 6a 7e")
+
+# RV-WAVE-003, E1: independently calculated FC16 [1] at 0x8000 (the sanctioned
+# standby word of the 2026-08-24 rhs cycle) and its echo ACK.
+DEBUG_MODE_WRITE_REQUEST = bytes.fromhex("04 10 80 00 00 01 02 00 01 d9 08")
+DEBUG_MODE_WRITE_RESPONSE = bytes.fromhex("04 10 80 00 00 01 28 5c")
 
 
 class _MissingContract:
@@ -72,15 +78,39 @@ class StubResponse:
         return self.error
 
 
+class _CommParams:
+    """The pymodbus 3.15 ``CommParams`` shape the per-op timeout override mutates."""
+
+    def __init__(self, timeout_connect: float) -> None:
+        self.timeout_connect = timeout_connect
+
+
+class _TransactionManager:
+    """The pymodbus 3.15 ``client.ctx`` shim: the manager holds its OWN copy
+    of CommParams (``ModbusProtocol.__init__`` copies the client's), and that
+    copy -- not the client's field -- is the per-request response deadline
+    ``TransactionManager.execute`` reads."""
+
+    def __init__(self, comm_params: _CommParams) -> None:
+        self.comm_params = comm_params
+
+
 class RecordingClient:
     def __init__(self, host: str, **kwargs: Any) -> None:
         self.host = host
         self.constructor_kwargs = kwargs
+        # pymodbus 3.15 maps the constructor's ``timeout=`` onto
+        # ``comm_params.timeout_connect``, twice: once on the client and once
+        # (copied) on the transaction manager the override must reach.
+        constructed = _CommParams(float(kwargs.get("timeout", 3)))
+        self.comm_params = constructed
+        self.ctx = _TransactionManager(_CommParams(constructed.timeout_connect))
         self.connect_result = True
         self.connected = False
         self.closed = False
         self.read_calls: list[tuple[int, int, int]] = []
         self.write_calls: list[tuple[int, tuple[int, ...], int]] = []
+        self.write_timeouts: list[float] = []
         self.read_responses: list[Any] = []
         self.write_responses: list[Any] = []
         self.read_entered = asyncio.Event()
@@ -110,6 +140,7 @@ class RecordingClient:
         self, address: int, values: list[int], *, device_id: int
     ) -> StubResponse:
         self.write_calls.append((address, tuple(values), device_id))
+        self.write_timeouts.append(self.ctx.comm_params.timeout_connect)
         self.write_entered.set()
         if self.write_release is not None:
             await self.write_release.wait()
@@ -143,9 +174,10 @@ class RecordingFactory:
 class ReferenceRtuPeer:
     """Capture one exact request and send one fixed, independently authored response."""
 
-    def __init__(self, *, expected_request: bytes, response: bytes) -> None:
+    def __init__(self, *, expected_request: bytes, response: bytes, delay_s: float = 0.0) -> None:
         self.expected_request = expected_request
         self.response = response
+        self.delay_s = delay_s
         self.received: bytes | None = None
         self.server: asyncio.AbstractServer | None = None
         self.exchange: asyncio.Future[bytes] | None = None
@@ -173,6 +205,10 @@ class ReferenceRtuPeer:
                 raise AssertionError(
                     f"expected {self.expected_request.hex(' ')}, got {request.hex(' ')}"
                 )
+            if self.delay_s:
+                # A gateway slower than the caller's budget: the response
+                # lands only after the deadline a tight client timeout fires.
+                await asyncio.sleep(self.delay_s)
             writer.write(self.response)
             await writer.drain()
             if not self.exchange.done():
@@ -182,7 +218,8 @@ class ReferenceRtuPeer:
                 self.exchange.set_exception(error)
         finally:
             writer.close()
-            await writer.wait_closed()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
 
     async def wait(self) -> bytes:
         assert self.exchange is not None
@@ -209,12 +246,12 @@ def _make_transport(contract: Any) -> tuple[Any, RecordingClient]:
     return transport, factory.instances[0]
 
 
-def _make_real_transport(contract: Any, *, port: int) -> Any:
+def _make_real_transport(contract: Any, *, port: int, timeout_s: float = 1.0) -> Any:
     config = contract.WaveshareTransportConfig(
         host="127.0.0.1",
         port=port,
         device_id=4,
-        timeout_s=1.0,
+        timeout_s=timeout_s,
         retries=0,
         reconnect_delay_s=0,
     )
@@ -655,3 +692,137 @@ async def test_the_pq_write_gate_predicate_is_byte_identical(contract: Any) -> N
 
     await transport.write_registers(0x0200, (1, 0xFA24, 0))
     assert client.write_calls == [(0x0200, (1, 0xFA24, 0), 4)]
+
+
+# --- pod parking: the one-shot mode write's OWN commissioned timeout -------------
+#
+# The 2026-08-24 live smoke: this gateway's FC16-to-0x8000 turnaround outran
+# the cadence-commissioned client timeout (timing.write_timeout_s = 0.50),
+# while a direct script at 1.0 s succeeded (docs/evidence/standby-cycle-
+# 2026-08-24.md).  The named write therefore accepts a per-op timeout
+# override (timing.mode_write_timeout_s, default 2.0).  pymodbus 3.15 offers
+# no per-request timeout parameter, so the transport applies the override to
+# ``client.comm_params.timeout_connect`` -- the field
+# TransactionManager.execute reads as its response deadline -- and restores
+# it under the request lock.
+
+
+async def test_write_debug_mode_applies_the_per_op_timeout_and_restores_it(
+    contract: Any,
+) -> None:
+    """T-PARK-TRANSPORT-008 / 2026-08-24 live smoke / S0: the commissioned
+    budget reaches the client call itself, and the constructed timeout is
+    restored afterwards (no other operation can observe the override -- the
+    transport's lock serializes every bus request)."""
+    transport, client = _make_transport(contract)
+    client.write_responses.append(
+        StubResponse(function_code=16, address=_DEBUG_MODE_ADDRESS, count=1, dev_id=4)
+    )
+    await transport.connect()
+
+    await transport.write_debug_mode(1, timeout_s=2.0)
+
+    assert client.write_calls == [(_DEBUG_MODE_ADDRESS, (1,), 4)]
+    assert client.write_timeouts == [2.0], "the override must reach the client call"
+    assert client.ctx.comm_params.timeout_connect == 0.75, (
+        "the constructed response deadline is restored"
+    )
+
+
+async def test_write_debug_mode_without_an_override_keeps_the_client_timeout(
+    contract: Any,
+) -> None:
+    """T-PARK-TRANSPORT-009 / S0: ``None`` (the default) is byte-identical to
+    the pre-override behavior -- the client's constructed timeout serves the
+    write untouched."""
+    transport, client = _make_transport(contract)
+    await transport.connect()
+
+    await transport.write_debug_mode(0)
+
+    assert client.write_timeouts == [0.75]
+    assert client.ctx.comm_params.timeout_connect == 0.75
+
+
+async def test_write_debug_mode_restores_the_timeout_across_the_failure_resync(
+    contract: Any,
+) -> None:
+    """T-PARK-TRANSPORT-010 / S0: a failing write still restores the captured
+    client's budget (the resync discards that client and rebuilds from the
+    factory, whose timeout is the constructed one either way)."""
+    transport, client = _make_transport(contract)
+    await transport.connect()
+
+    client.write_responses.append(ConnectionResetError("synthetic reset"))
+    with pytest.raises(contract.TransportConnectionError):
+        await transport.write_debug_mode(1, timeout_s=2.0)
+
+    assert client.write_timeouts == [2.0]
+    assert client.ctx.comm_params.timeout_connect == 0.75
+    assert client.closed is True
+
+
+@pytest.mark.parametrize(
+    "timeout_s",
+    [0, -0.5, True, "2.0", float("inf"), float("nan")],
+)
+async def test_write_debug_mode_refuses_malformed_timeout_overrides(
+    contract: Any,
+    timeout_s: Any,
+) -> None:
+    """T-PARK-TRANSPORT-011 / S0: a malformed budget is refused BEFORE any
+    bus operation -- the same defensive style as the config value itself."""
+    transport, client = _make_transport(contract)
+    await transport.connect()
+
+    with pytest.raises(ValueError, match="positive finite"):
+        await transport.write_debug_mode(1, timeout_s=timeout_s)
+
+    assert client.write_calls == [], "a refused budget must never reach the bus"
+
+
+async def test_real_pymodbus_honors_the_per_op_timeout_on_the_mode_write(
+    contract: Any,
+) -> None:
+    """T-PARK-TRANSPORT-012 / PYMODBUS-3.15 / S0: against a peer whose ACK
+    lands after the constructed client timeout (0.25 s here, the live-smoke
+    shape at 0.50 s), the plain write is refused -- and the SAME delay serves
+    the mode write under the commissioned per-op budget, proving the override
+    reaches pymodbus's own response deadline and not merely the call site."""
+    slow_mode_peer = ReferenceRtuPeer(
+        expected_request=DEBUG_MODE_WRITE_REQUEST,
+        response=DEBUG_MODE_WRITE_RESPONSE,
+        delay_s=0.8,
+    )
+    slow_pq_peer = ReferenceRtuPeer(
+        expected_request=SIGNED_PQ_WRITE_REQUEST,
+        response=PQ_WRITE_RESPONSE,
+        delay_s=0.8,
+    )
+    await slow_mode_peer.start()
+    await slow_pq_peer.start()
+    mode_transport = _make_real_transport(contract, port=slow_mode_peer.port, timeout_s=0.25)
+    pq_transport = _make_real_transport(contract, port=slow_pq_peer.port, timeout_s=0.25)
+
+    try:
+        # Negative control: the cadence-commissioned timeout refuses the same
+        # delay through the generic write path.
+        await mode_transport.connect()
+        await pq_transport.connect()
+        with pytest.raises(contract.ModbusResponseError):
+            await pq_transport.write_registers(0x0200, (1, 0xFA24, 0))
+        assert slow_pq_peer.received == SIGNED_PQ_WRITE_REQUEST
+        # Retrieve the peer's late-response failure (the stream is gone by the
+        # time its delayed ACK lands) so it never surfaces as an unretrieved
+        # future exception.
+        with contextlib.suppress(Exception):
+            await slow_pq_peer.wait()
+
+        # The one-shot budget carries the mode write across that same delay.
+        await mode_transport.write_debug_mode(1, timeout_s=5.0)
+        assert await slow_mode_peer.wait() == DEBUG_MODE_WRITE_REQUEST
+    finally:
+        await mode_transport.close()
+        await pq_transport.close()
+        await slow_mode_peer.close()
+        await slow_pq_peer.close()

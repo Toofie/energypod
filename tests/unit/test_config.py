@@ -293,6 +293,7 @@ def test_observe_only_mode_does_not_require_control_credentials() -> None:
         "acknowledgement_timeout_s",
         "maximum_jitter_s",
         "renewal_margin_s",
+        "mode_write_timeout_s",
     ],
 )
 @pytest.mark.parametrize("value", [0, -0.001])
@@ -302,6 +303,41 @@ def test_timing_values_must_be_positive(field: str, value: float) -> None:
     payload["timing"][field] = value
 
     _assert_invalid(payload, location_contains=field)
+
+
+def test_mode_write_timeout_defaults_to_two_seconds_with_a_sane_ceiling() -> None:
+    """T-UNIT-CONFIG-017 / 2026-08-24 live smoke / S0: the one-shot parking
+    mode write carries its OWN budget -- defaulted at 2.0 s (a direct script
+    at 1.0 s served the gateway the 0.50 s cadence timeout could not), never
+    above the sane 5.0 s ceiling."""
+    parsed = _validate(_valid_config())
+    assert parsed.timing.mode_write_timeout_s == 2.0
+
+    at_ceiling = _valid_config()
+    at_ceiling["timing"]["mode_write_timeout_s"] = 5.0
+    assert _validate(at_ceiling).timing.mode_write_timeout_s == 5.0
+
+    beyond = _valid_config()
+    beyond["timing"]["mode_write_timeout_s"] = 5.01
+    _assert_invalid(beyond, location_contains="mode_write_timeout_s")
+
+
+def test_mode_write_timeout_must_exceed_the_write_budget_and_the_inter_frame_gap() -> None:
+    """T-UNIT-CONFIG-018 / S0: the mode write's budget REPLACES the
+    cadence-bound write budget for its one FC16 (never a narrowing of it) and
+    must still cover the inter-frame gap the write pays -- the two live-smoke
+    bounds that make the one-shot act commissionable."""
+    at_write_budget = _valid_config()
+    at_write_budget["timing"]["mode_write_timeout_s"] = at_write_budget["timing"]["write_timeout_s"]
+    error = _assert_invalid(at_write_budget, location_contains="timing")
+    assert "write_timeout_s" in str(error)
+
+    at_gap = _valid_config()
+    at_gap["timing"]["write_timeout_s"] = 0.05
+    at_gap["timing"]["inter_request_delay_s"] = 0.10
+    at_gap["timing"]["mode_write_timeout_s"] = 0.10
+    error = _assert_invalid(at_gap, location_contains="timing")
+    assert "inter_request_delay_s" in str(error)
 
 
 def test_complete_worst_case_cycle_must_fit_device_expiry_window() -> None:

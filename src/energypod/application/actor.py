@@ -130,6 +130,7 @@ class EnergyPodActor:
         mode_refresh_window: tuple[int, int] | None = None,
         autonomous_charge_signature_max_w: int | None = None,
         debug_mode_readback_address: int | None = None,
+        mode_write_timeout_s: float | None = None,
         telemetry: Any | None = None,
     ) -> None:
         if stable_observations_required < 1:
@@ -209,6 +210,21 @@ class EnergyPodActor:
         ):
             raise ValueError("debug_mode_readback_address must be an unsigned 16-bit integer")
         self._debug_readback_address = debug_mode_readback_address
+        # The one-shot mode write's OWN budget (timing.mode_write_timeout_s,
+        # commissioned 2026-08-24): the gateway's FC16-to-0x8000 turnaround
+        # outruns the cadence-commissioned write timeout the heartbeat margin
+        # wires, so the WRITE leg of the parking operation alone runs under
+        # this longer bound and hands it to the transport as that one FC16's
+        # per-op client timeout.  The prior read and the readback keep their
+        # existing heartbeat-margin budgets.  ``None`` keeps today's exact
+        # behavior (every leg under the margin, no override passed).
+        if mode_write_timeout_s is not None and (
+            type(mode_write_timeout_s) not in (int, float) or mode_write_timeout_s <= 0
+        ):
+            raise ValueError("mode_write_timeout_s must be a positive number")
+        self._mode_write_timeout = (
+            float(mode_write_timeout_s) if mode_write_timeout_s is not None else None
+        )
         # The classification the LAST arm preflight reached (read by the
         # facade for the audit trail): "sole_writer", "pod_autonomy",
         # "takeover_acknowledged", "external_writer", or None before any arm.
@@ -736,9 +752,7 @@ class EnergyPodActor:
         except DebugModeChangeError:
             raise
         except Exception as error:
-            raise RuntimeError(
-                f"{self.unit_id}: the debug-mode readback read failed"
-            ) from error
+            raise RuntimeError(f"{self.unit_id}: the debug-mode readback read failed") from error
 
     async def _debug_mode_owned(self, value: int) -> dict[str, Any]:
         """The parking transport sequence: read prior, write, read back, verify.
@@ -773,7 +787,13 @@ class EnergyPodActor:
         retries = 0
         for attempt in (1, 2):
             try:
-                async with asyncio.timeout(self._heartbeat_margin or 0.1):
+                # The WRITE leg alone runs under the commissioned mode-write
+                # budget when one is wired (the gateway's FC16-to-0x8000
+                # turnaround outruns the cadence-commissioned margin); the
+                # prior read and the readback above/below keep the margin.
+                async with asyncio.timeout(
+                    self._mode_write_timeout or self._heartbeat_margin or 0.1
+                ):
                     await self._write_debug_mode(value)
             except asyncio.CancelledError:
                 raise
@@ -834,7 +854,10 @@ class EnergyPodActor:
         writer = getattr(self._transport, "write_debug_mode", None)
         if writer is None:
             raise RuntimeError(f"{self.unit_id}: the transport exposes no write_debug_mode")
-        await writer(value)
+        if self._mode_write_timeout is not None:
+            await writer(value, timeout_s=self._mode_write_timeout)
+        else:
+            await writer(value)
 
     async def _read_objective_echo_owned(self) -> tuple[str, tuple[int, int]]:
         """The P1 iii bounded fresh read + classification of the served objective."""

@@ -207,7 +207,7 @@ class WaveshareTransport:
             self._ensure_connected()
             self._validate_write_response(response, address, len(registers))
 
-    async def write_debug_mode(self, value: int) -> None:
+    async def write_debug_mode(self, value: int, timeout_s: float | None = None) -> None:
         """Write the sanctioned vendor debug-mode word: FC16 ``[value]`` at 0x8000.
 
         The separately named method pod parking composes (DESIGN_POD_PARKING
@@ -223,17 +223,42 @@ class WaveshareTransport:
         PERMANENTLY UNEXPOSED, and so is every other shape.  The write runs
         under the same lock, inter-frame gap, ACK-echo validation, and
         resync-after-failure discipline as the PQ objective.
+
+        ``timeout_s`` is the one-shot mode write's OWN budget (timing.
+        ``mode_write_timeout_s``, commissioned 2026-08-24): the gateway's
+        FC16-to-0x8000 turnaround outruns the cadence-commissioned client
+        timeout, so this single operation may carry a longer per-op one.
+        pymodbus 3.15 exposes no per-request timeout parameter (the client
+        methods take only ``address``/``values``/``device_id``/
+        ``no_response_expected``) and the client carries no settable timeout
+        attribute; ``TransactionManager.execute`` reads its response deadline
+        from ``client.ctx.comm_params.timeout_connect`` -- the manager's OWN
+        copy of CommParams (``ModbusProtocol.__init__`` copies the client's,
+        so the client's own field is NOT the deadline).  The override sets
+        that copy for exactly this call and restores it after, under the
+        request lock the transport already holds (no other operation can
+        observe the temporary value).  ``None`` keeps the constructed
+        timeout, byte-identical to before.
         """
         if type(value) is not int or value not in (0, 1):
             raise ValueError(
                 "write_debug_mode accepts only 0 (Normal) or 1 (Standby): the vendor "
                 "values 2-6 are permanently unexposed"
             )
+        if timeout_s is not None and (
+            type(timeout_s) not in (int, float) or not math.isfinite(timeout_s) or timeout_s <= 0
+        ):
+            raise ValueError("timeout_s must be a positive finite number")
         async with self._lock:
             self._ensure_connected()
             await self._respect_inter_request_gap()
+            client = self._client
+            original_timeout: float | None = None
+            if timeout_s is not None:
+                original_timeout = client.ctx.comm_params.timeout_connect
+                client.ctx.comm_params.timeout_connect = timeout_s
             try:
-                response = await self._client.write_registers(
+                response = await client.write_registers(
                     0x8000,
                     [value],
                     device_id=self._config.device_id,
@@ -246,6 +271,14 @@ class WaveshareTransport:
             except OSError as error:
                 await self._resync_after_failure()
                 raise TransportConnectionError("connection lost during Modbus write") from error
+            finally:
+                # Restore on the captured client: a failure above has already
+                # rebuilt ``self._client`` from the factory (timeout = the
+                # constructed one), and the mutated client is discarded with
+                # its stream -- restoring it anyway keeps even that object
+                # honest if anything ever reuses it.
+                if original_timeout is not None:
+                    client.ctx.comm_params.timeout_connect = original_timeout
             self._ensure_connected()
             self._validate_write_response(response, 0x8000, 1)
 
