@@ -2487,6 +2487,34 @@ export function withParkState(unit: WireUnitSnapshot, park: WireParkState): Wire
 }
 
 /**
+ * The `lease` object the park/renew 200s and the `park_already_parked`
+ * refusal carry (§2 — ParkLease.to_payload on the service, verbatim keys):
+ * the LEASE payload, a different shape from the `park_state` projection —
+ * `expires_at` (not `lease_expires_at`), no `parked`/`origin`/`expired`
+ * flags, plus the single-flight `epoch`.
+ */
+export interface WireParkLease {
+  readonly parked_at: string;
+  readonly expires_at: string;
+  readonly max_total_s: number;
+  readonly reason: string;
+  readonly authorizer: string;
+  readonly epoch: number;
+}
+
+/** A lease-payload fixture (the 200's `lease`, never the projection shape). */
+export function parkLease(spec: Partial<WireParkLease> = {}): WireParkLease {
+  return {
+    parked_at: spec.parked_at ?? "2026-08-24T02:00:00+10:00",
+    expires_at: spec.expires_at ?? "2026-08-24T06:00:00+10:00",
+    max_total_s: spec.max_total_s ?? 14400,
+    reason: spec.reason ?? "evening standby",
+    authorizer: spec.authorizer ?? "operator:home",
+    epoch: spec.epoch ?? 1,
+  };
+}
+
+/**
  * The resume 200's `checklist` object (§2, verbatim keys): the honest
  * after-park facts the operator reads before trusting the pod again.
  */
@@ -2525,7 +2553,7 @@ export function parkOk(
     unit_id?: string;
     prior_word?: number;
     as_of?: string;
-    lease?: WireParkState;
+    lease?: WireParkLease;
   } = {},
 ): Record<string, unknown> {
   return {
@@ -2536,12 +2564,14 @@ export function parkOk(
     readback_word: 1,
     verified: true,
     as_of: spec.as_of ?? "2026-08-24T02:00:01+10:00",
-    lease: spec.lease ?? parkState(),
+    lease: spec.lease ?? parkLease(),
     prior_state: { lifecycle: "disarmed", measured_watts: 0 },
   };
 }
 
-/** The resume route's 200 body (§2): the verified write plus the checklist. */
+/** The resume route's 200 body (§2): the verified write, checklist, and the
+ * bookkeeping-honesty array (empty when every durable write landed;
+ * `audit_unavailable` rides it when the record could not). */
 export function resumeOk(
   spec: {
     unit_id?: string;
@@ -2549,6 +2579,7 @@ export function resumeOk(
     origin?: "operator" | "foreign" | "none";
     checklist?: WireResumeChecklist;
     as_of?: string;
+    degraded?: readonly string[];
   } = {},
 ): Record<string, unknown> {
   return {
@@ -2561,6 +2592,7 @@ export function resumeOk(
     as_of: spec.as_of ?? "2026-08-24T05:31:00+10:00",
     origin: spec.origin ?? "operator",
     checklist: spec.checklist ?? resumeChecklist(),
+    degraded: spec.degraded ?? [],
   };
 }
 
@@ -2608,7 +2640,7 @@ export function parkRefusalEnvelope(
     park_already_parked: {
       status: 409,
       message: "The unit is already parked — renew the lease instead.",
-      details: { lease: parkState() },
+      details: { lease: parkLease() },
     },
     park_mode_out_of_scope: {
       status: 409,
