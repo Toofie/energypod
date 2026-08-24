@@ -762,9 +762,9 @@ export interface StripWordSegment {
    * chooser (`fittingBandLabel`) walks these against the band's measured
    * pixels: the fullest word that fits, a shorter honest word when only that
    * fits, and NO word when even the shortest cannot (an ellipsis mid-word
-   * reads as an error; the tooltip and the listing below carry every segment
-   * regardless, so nothing is lost — the listing is the strip's accessible
-   * half and never narrows with the bands).
+   * reads as an error). A bare band is the one trigger for the listing's
+   * visible ink: its clause prints beneath the bar, so the fact the bar
+   * refused to draw still lives on the page.
    */
   readonly bandLabels: readonly string[];
   /**
@@ -828,11 +828,13 @@ export const BAND_LABEL_CHROME_PX = 16;
 /**
  * The fitted band label: the first tier whose measured width fits the band's
  * measured pixels, "" when even the last tier cannot (the band stays, bare —
- * its tooltip and its listing item still carry the segment). Widths the
- * measurer never produced are skipped, never guessed; and when the pixels
- * are UNKNOWN (a DOM that reports no widths — the test environment, or a
- * measurer that has not answered yet) the FULLEST word renders: a word is
- * suppressed only by a measured refusal, never by ignorance.
+ * its tooltip still carries the segment, and its clause is the one listing
+ * item that inks the line beneath the bar). Widths the measurer never
+ * produced are skipped, never guessed; and when the pixels are UNKNOWN (a
+ * DOM that reports no widths — the test environment, or a measurer that has
+ * not answered yet) the FULLEST word renders: a word is suppressed only by a
+ * measured refusal, never by ignorance — and the same refusal rule governs
+ * the listing's ink, so an unmeasured row prints nothing beneath its bar.
  */
 export function fittingBandLabel(
   candidates: readonly string[],
@@ -857,10 +859,14 @@ export function fittingBandLabel(
  * rhythm: the FIRST segment says its word "until" the next change, a middle
  * one carries both instants, the last says its word "since" its start (the
  * state was still true when the window closed — `wordSegments`' own
- * doctrine). This listing IS the strip's accessible half: every segment's
- * word and time survive here even when its proportional band is an
- * invisible sliver. Only the row's first item reads as the start of the
- * line; the rest keep their clause's own case.
+ * doctrine). The listing is the strip's ACCESSIBLE surface — every segment's
+ * word and time are announced here even when its proportional band is an
+ * invisible sliver — while its VISIBLE ink is sparse by doctrine: the view
+ * prints an item on paper only where its band could not fit even its
+ * shortest word, so the bar is never duplicated beneath itself (a worded
+ * segment's item stays in the list, off the page). Only the row's first
+ * item reads as the start of the line; the rest keep their clause's own
+ * case.
  */
 export function segmentListingItems(
   segments: readonly Pick<StripWordSegment, "from" | "to" | "clause">[],

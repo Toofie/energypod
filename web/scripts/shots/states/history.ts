@@ -13,11 +13,12 @@
  *
  * The states pin the view's landing surfaces: the recorded night (full
  * resolution, a charge, a gap, a degraded stretch), the same night read as
- * one battery's archaeology strip (worded bands + change-point listings),
- * the hourly rollup tier a 30-day window honestly serves — both as the
- * whole-site charts and as the strip's worded absence — the fresh database's
- * empty window (the first thing an operator sees the morning after
- * commissioning), and the honest not-commissioned 409.
+ * one battery's archaeology strip (fitted-word bands whose too-narrow
+ * segments ink their clause beneath the bar), the hourly rollup tier a
+ * 30-day window honestly serves — both as the whole-site charts and as the
+ * strip's worded absence — the fresh database's empty window (the first
+ * thing an operator sees the morning after commissioning), and the honest
+ * not-commissioned 409.
  *
  * Figures are physically coherent (grid ≈ battery + house per phase, the
  * fleet the true sum) and deterministic — a fixed UTC day, piecewise-linear
@@ -297,7 +298,7 @@ export const HISTORY_STATES: readonly ShotStateDefinition[] = [
   {
     id: "battery-night-archaeology-strip",
     caption:
-      "One battery's night as the archaeology strip READS it: lifecycle, health and commanded rows of proportional bands whose labels are fitted to measured pixels (the fullest word that fits, a shorter honest word next, none when even that cannot — the commanded bar carries the source's short words, never the full clause), the no-intent stretches one step quieter than the commands, and each row's change-point listing underneath carrying every segment's word and time even where its band is an invisible sliver; the health row's tooltip carries the tag's own sentence.",
+      "One battery's night as the archaeology strip READS it: lifecycle, health and commanded rows of proportional bands whose labels are fitted to measured pixels (the fullest word that fits, a shorter honest word next, none when even that cannot — the commanded bar carries the source's short words, never the full clause), the no-intent stretches one step quieter than the commands, and the paper free of duplication: a segment too narrow for any word surfaces as its worded clause with times in the line beneath the bar (at desktop widths, the health row's 12-minute self-heal), a fully-worded row prints nothing beneath itself, and every segment's full sentence and times still ride its band's tooltip — the health row's tooltip carries the tag's own sentence.",
     world: historyWorld(iso(TO)),
     history: recordedNight,
     interact: [{ click: { role: "button", name: "mid" } }],

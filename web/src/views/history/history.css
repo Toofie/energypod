@@ -331,9 +331,13 @@
   color: var(--ink-soft);
 }
 
-/* The change-point listing — the strip's ACCESSIBLE half, one line in the
- * gap-notes rhythm. The " · " separators are pure rhythm, so they live in
- * CSS and never enter the accessibility tree. */
+/* The change-point listing — the strip's ACCESSIBLE surface, one item per
+ * segment in the gap-notes rhythm, every segment's word and time announced.
+ * Its ink is sparse by doctrine: an item prints on paper only where its band
+ * could not fit even its shortest word (the bare slivers — the bar already
+ * says the rest, and the duplicated raw text is exactly what this removes).
+ * The " · " separators are pure rhythm, so they live in CSS and never enter
+ * the accessibility tree. */
 .history-strip-listing {
   margin: 0.3rem 0 0;
   padding: 0;
@@ -349,6 +353,31 @@
   content: "·";
   margin: 0 0.45em;
   color: var(--line);
+}
+
+/* The offpage pattern (the console's sr-only house style, as the view's own
+ * h2) serves BOTH scopes: on the whole list when every band carries its word
+ * (the row is just its bar — the screen reader still walks every segment),
+ * and on one item when its band is worded but a bare sibling inks the line.
+ * Nothing here leaves the accessibility tree; it only leaves the paper. */
+.history-strip-listing--offpage {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* The rhythm dot only between two ADJACENT inked items: a dot against an
+ * offpage neighbor (or on one) would hang a separator off a clause that
+ * stands alone. */
+.history-strip-listing li.history-strip-listing--offpage + li::before,
+.history-strip-listing li + li.history-strip-listing--offpage::before {
+  content: none;
 }
 
 .history-bands {
@@ -382,7 +411,8 @@
  * below is the last-resort guard for a user-set root font size shifting the
  * chrome constant, never the common case. An unworded band is a SUPPRESSED
  * tier (too narrow for even its shortest word), not a styling bug: the
- * tooltip and the listing below still carry the segment. */
+ * tooltip still carries the segment, and its clause is the one item that
+ * inks the listing beneath the bar. */
 .history-band-label {
   overflow: hidden;
   text-overflow: ellipsis;
