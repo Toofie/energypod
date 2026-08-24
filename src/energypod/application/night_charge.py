@@ -38,6 +38,23 @@ stale evidence HOLDS at ``hold_rate_w`` — the evidence-failure fallback
 rate and never a demand behavior — because standby answers measured
 demand, never missing data, and must never silently free-run a fleet
 into autonomy drain during an EV night.
+
+V2 (DESIGN_NIGHT_CHARGE_V2) changes WHAT the overnight charge aims at,
+never WHEN, never HOW FAST, never UNDER WHOSE AUTHORITY: a per-battery
+top-up target computed at window open from the INJECTED
+``morning_credit_kwh`` port (section 2.7 — the application layer never
+imports a provider adapter), bounded by the reserve floor below and the
+unchanged charge ceiling above, one fleet percentage by the
+capacity-proportional share collapse (section 2.2), revised mid-window
+only on a materially changed forecast under the 2-per-window and
+60-minute caps derived from DURABLE revision rows (A6 — a restart mid-
+window must not reset the re-target budget), completion ONE-DIRECTIONAL
+(falls hold, rises above the measured SOC re-open — A2), and — below
+trust or on any forecast failure — fallen back to the v1 ceiling loudly
+with its own reason code (section 3.3: every failure of foresight buys
+MORE off-peak energy, never less).  ``forecast_suggest`` keeps the
+submission math byte-identical to v1 while the projection carries the
+suggested target; ``full`` (the default) is v1 identity throughout.
 """
 
 from __future__ import annotations
@@ -46,11 +63,13 @@ import contextlib
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Final, Literal, Protocol, TypeGuard
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from energypod.domain import DataQuality, Direction, IntentSource, UnitLifecycle
+from energypod.domain.audit import AuditEvent
 
 _CONTROLLABLE_LIFECYCLES: frozenset[UnitLifecycle] = frozenset(
     {UnitLifecycle.ARMED_IDLE, UnitLifecycle.ACTIVE}
@@ -122,6 +141,104 @@ _DEMAND_EVIDENCE_RANK: Final[dict[str, int]] = {
 STATE_EVENT_TYPE: Final[str] = "night_charge.state_changed"
 # §5: the heartbeat cadence is a constant, not a config key.
 STATE_EVENT_HEARTBEAT_S: Final[float] = 30.0
+
+# --- V2: the forecast-aware target (DESIGN_NIGHT_CHARGE_V2) -------------------------
+#
+# The three-state posture (§3.1): ``full`` is v1 identity (the absent-key
+# default); ``forecast_suggest`` computes and displays but charges v1
+# (byte-identical submission math — a named test); ``forecast_act`` lets the
+# computed target govern, entered ONLY by config revision + restart.
+TargetPolicy = Literal["full", "forecast_suggest", "forecast_act"]
+
+# §3.3's fail-safe ladder, every rung landing on v1-full targets, loudly:
+# the reason codes are additive vocabulary and render as their own tile
+# states, never as silence.
+REASON_FORECAST_MISSING: Final[str] = "forecast_missing"
+REASON_FORECAST_STALE: Final[str] = "forecast_stale"
+REASON_FORECAST_NO_LOAD_BASELINE: Final[str] = "forecast_no_load_baseline"
+REASON_FORECAST_BELOW_TRUST: Final[str] = "forecast_below_trust"
+# §5.4's honest close: the window ended with a unit below its target -- lost
+# window time is unrecoverable, the morning solar takes what it takes, and
+# the scoreboard prices the miss.
+REASON_WINDOW_CLOSED_BELOW_TARGET: Final[str] = "window_closed_below_target"
+
+# §5.2's re-target materiality: |dE_credit| >= max(threshold% of the standing
+# credit, the absolute floor) — the floor keeps tiny-forecast noise from
+# re-targeting (ruling 4).
+_RETARGET_ABSOLUTE_FLOOR_KWH: Final[float] = 0.5
+# §5.2's pinned caps: at most TWO re-targets per window, minimum 60 minutes
+# apart — derived from DURABLE rows, never runtime counters (A6).
+_RETARGET_MAX_PER_WINDOW: Final[int] = 2
+
+_FALLBACK_CODES: Final[frozenset[str]] = frozenset(
+    {
+        REASON_FORECAST_MISSING,
+        REASON_FORECAST_STALE,
+        REASON_FORECAST_NO_LOAD_BASELINE,
+        REASON_FORECAST_BELOW_TRUST,
+    }
+)
+
+_NIGHT_PRINCIPAL = "energypod:night-adviser"
+_NIGHT_POLICY_VERSION = "night-1"
+
+
+@dataclass(frozen=True, slots=True)
+class CreditSlot:
+    """One morning slot's netting inputs (the archive row's reconstruction)."""
+
+    start: datetime
+    end: datetime
+    pv_w: float
+    load_w: float
+
+
+@dataclass(frozen=True, slots=True)
+class MorningCredit:
+    """The morning AFTER the window, in kWh (§2.7's port result).
+
+    ``e_surplus_kwh``/``e_deficit_kwh`` are the SLOT-NETTED figures over
+    [window_end, midday) -- sum(max(0, pv - load) x slot_h) and its mirror --
+    with the load half from the same-slot-last-week baseline and NO
+    degrade-to-PV-only path (§3.3).  ``failure`` carries the §3.3 ladder's
+    word when the credit could not be computed honestly; the adviser falls
+    back to v1 targets and never fabricates a zero.
+    """
+
+    e_surplus_kwh: float | None
+    e_deficit_kwh: float | None
+    slots: tuple[CreditSlot, ...]
+    source: str | None
+    quantile: float | None
+    fetched_at: datetime | None
+    issued_at: datetime | None
+    failure: str | None = None
+
+
+class _MorningCreditPort(Protocol):
+    """§2.7's injected forecast port: ``morning_credit_kwh`` by name and by
+    unit, composed from the provider registry by the composition root — the
+    application layer never imports a provider adapter (the fitness pin)."""
+
+    async def __call__(
+        self, window_end: datetime, midday_local: time, quantile: float
+    ) -> MorningCredit: ...
+
+
+class _TrustStatePort(Protocol):
+    """The trust ledger's live word: provisioning | earned | suspended."""
+
+    def __call__(self) -> str: ...
+
+
+class _AuditAppendPort(Protocol):
+    async def append(self, event: Any) -> None: ...
+
+
+# The durable re-target row sink and read-back (A6: the caps derive from
+# DURABLE rows across restarts, never runtime counters).
+_RevisionSinkPort = Callable[[date, datetime], None]
+_RetargetHistoryPort = Callable[[date], tuple[datetime, ...]]
 
 
 # --- the pure civil-time helpers (§2.3) -----------------------------------------
@@ -331,13 +448,20 @@ _CEIL_EPSILON = 1e-9
 
 @dataclass(frozen=True, slots=True)
 class NightUnitPlan:
-    """One unit's per-tick row: its own SOC, phase, target, and reason."""
+    """One unit's per-tick row: its own SOC, phase, target, and reason.
+
+    ``target_soc_pct`` is the V2 fleet target the row stands against — the
+    GOVERNING number under ``forecast_act``, the SUGGESTED display number
+    under ``forecast_suggest`` (the submission math stays v1's), and ``None``
+    under ``full`` (v1 frames carry no new keys).
+    """
 
     unit_id: str
     soc_pct: float | None
     phase: NightUnitPhase
     target_w: int
     reason: str
+    target_soc_pct: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -352,6 +476,12 @@ class NightChargeDecision:
     demand_w: int | None
     demand_evidence: DemandEvidence
     reason_codes: tuple[str, ...]
+    # --- V2 (absent under ``full``: v1 consumers see identical frames) -----
+    target_soc_pct: float | None = None
+    fallback_reason: str | None = None
+    forecast: Mapping[str, Any] | None = None
+    explanation: str | None = None
+    morning_notice: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +500,16 @@ class NightChargeSettings:
     windows: tuple[tuple[time, time], ...]
     timezone: str
     unit_ids: tuple[str, ...]
+    # --- V2 (DESIGN_NIGHT_CHARGE_V2 §6; the defaults keep ``full`` at exact
+    # v1 identity — the new keys are never consulted under ``full``) --------
+    target_policy: TargetPolicy = "full"
+    forecast_quantile: float = 0.1
+    midday_local: time = time(12, 0)
+    floor_pct: float = 50.0
+    charge_efficiency: float = 0.9
+    retarget_threshold_pct: float = 20.0
+    retarget_min_gap_min: int = 60
+    stale_after_s: float = 3600.0
 
 
 class _Clock(Protocol):
@@ -435,6 +575,12 @@ class NightChargeAdviser:
         submit: _SubmitPort,
         participation: _ParticipationPort | None = None,
         parked_units: Callable[[], frozenset[str]] | None = None,
+        morning_credit: _MorningCreditPort | None = None,
+        trust_state: _TrustStatePort | None = None,
+        audit: _AuditAppendPort | None = None,
+        revision_sink: _RevisionSinkPort | None = None,
+        retarget_history: _RetargetHistoryPort | None = None,
+        morning_archive_sink: Callable[[Any], None] | None = None,
     ) -> None:
         self._settings = settings
         self._policy = policy
@@ -449,6 +595,16 @@ class NightChargeAdviser:
         # standing refusal would violate the never-retry-a-denied-dispatch
         # doctrine.  ``None`` (isolated compositions) excludes nothing.
         self._parked_units = parked_units
+        # --- V2: the injected forecast port (§2.7), the trust word, and the
+        # durable revision rows (A6).  All optional so isolated v1
+        # compositions stay byte-identical; a forecast posture without its
+        # port fails safe to full targets with forecast_missing.
+        self._morning_credit = morning_credit
+        self._trust_state = trust_state
+        self._audit = audit
+        self._revision_sink = revision_sink
+        self._retarget_history = retarget_history
+        self._morning_archive_sink = morning_archive_sink
         self._zone = ZoneInfo(settings.timezone)
         self._held_intent_id: str | None = None
         # Window-scoped state, reset at every window boundary (§2.4: the hold
@@ -459,6 +615,21 @@ class NightChargeAdviser:
         self._participated: frozenset[str] = frozenset()
         self._submitted_this_window = False
         self._resumed_this_tick = False
+        # --- V2 window-scoped target state (§2/§5.2/§5.1) ------------------
+        # The fleet percentage the window aims at (None = v1 ceiling), the
+        # basis it stands on, the §3.3 ladder's word once the computation is
+        # abandoned for the window, and the one-directional completion latch
+        # (per-unit target at completion — a RISE above the measured SOC is
+        # the only re-entry, A2).
+        self._window_target: float | None = None
+        self._window_credit: MorningCredit | None = None
+        self._window_evaluated_fetch: datetime | None = None
+        self._window_archived: bool = False
+        self._window_abandoned: str | None = None
+        self._completed_targets: dict[str, float] = {}
+        self._window_final_soc: dict[str, float] = {}
+        self._window_morning_date: date | None = None
+        self._pending_notice: dict[str, Any] | None = None
 
     @property
     def held_intent_id(self) -> str | None:
@@ -486,8 +657,30 @@ class NightChargeAdviser:
             return await self._standby("idle", window_now, _NO_READING, (verdict,), ())
         if not window_now:
             # Window end is NON-RENEWAL: remove, then the TTL lapse and the
-            # ~3.5-4.0 s watchdog return each pod to its own autonomy.
-            return await self._standby("idle", False, _NO_READING, ("outside_window",), ())
+            # ~3.5-4.0 s watchdog return each pod to its own autonomy.  A
+            # forecast window that closed below target leaves the §5.4/A5
+            # morning notice on this close frame (the projection latches it
+            # until midday_local).
+            notice = self._pending_notice
+            self._pending_notice = None
+            codes: tuple[str, ...] = ("outside_window",)
+            if notice is not None:
+                codes = ("outside_window", REASON_WINDOW_CLOSED_BELOW_TARGET)
+            return await self._standby(
+                "idle",
+                False,
+                _NO_READING,
+                codes,
+                (),
+                morning_notice=notice,
+            )
+
+        # --- V2: the window's forecast evaluation (§2 at window open, §5.2
+        # on a qualifying revision).  BEFORE the observation walk: the §7
+        # ``night_target_set`` row is written at the FIRST in-window tick
+        # whatever the fleet's eligibility, and the ladder's failures ride
+        # every downstream reason code.
+        await self._evaluate_forecast(wall)
 
         latest = await self._observations.all_latest()
         reading = demand_reading(
@@ -528,6 +721,11 @@ class NightChargeAdviser:
                 held_units.append(unit_id)
                 if plan.phase == "standing_by_on_demand":
                     standing_units.append(unit_id)
+        for plan in plans:
+            # The §5.4 close evaluation reads each participant's last
+            # measured SOC this window.
+            if plan.soc_pct is not None and _finite_number(plan.soc_pct):
+                self._window_final_soc[plan.unit_id] = float(plan.soc_pct)
 
         if not participating:
             if standing_units:
@@ -564,6 +762,10 @@ class NightChargeAdviser:
             reason_codes = ("window_open", "deadline_at_risk")
         else:
             reason_codes = ("window_open", "on_plan")
+        if self._window_abandoned is not None:
+            # §3.3's loud fallback: the ladder's word rides every frame the
+            # window publishes after the computation was abandoned.
+            reason_codes = (*reason_codes, self._window_abandoned)
 
         action: Action = "renew" if self._submitted_this_window else "propose"
         targets_by_unit = {
@@ -598,6 +800,10 @@ class NightChargeAdviser:
             demand_w=reading.demand_w,
             demand_evidence=reading.evidence,
             reason_codes=reason_codes,
+            target_soc_pct=self._decision_target_pct(),
+            fallback_reason=self._window_abandoned,
+            forecast=self._forecast_projection(),
+            explanation=self._explanation(),
         )
 
     # --- internals -------------------------------------------------------
@@ -606,11 +812,438 @@ class NightChargeAdviser:
         """Reset the window-scoped latches at every boundary crossing."""
         if window_now == self._window_open:
             return
+        if self._window_open and not window_now and self._window_target is not None:
+            # §5.4/A5: a forecast window closing below target leaves the
+            # honest notice -- lost window time is unrecoverable, the morning
+            # solar takes what it takes, and the scoreboard prices the miss.
+            # Only PARTICIPANTS can have fallen short; a completed unit
+            # reached what it reached.
+            below = sorted(
+                unit_id
+                for unit_id in self._participated
+                if self._window_final_soc.get(unit_id, 0.0) < (self._window_target or 0.0)
+            )
+            if below and self._window_morning_date is not None:
+                self._pending_notice = {
+                    "date": self._window_morning_date.isoformat(),
+                    "target_soc_pct": self._window_target,
+                    "units_below_target": below,
+                    "until_local": self._settings.midday_local.strftime("%H:%M"),
+                }
         self._window_open = window_now
         self._holding_fleet = False
         self._holding_units = frozenset()
         self._participated = frozenset()
         self._submitted_this_window = False
+        self._window_target = None
+        self._window_credit = None
+        self._window_evaluated_fetch = None
+        self._window_archived = False
+        self._window_abandoned = None
+        self._completed_targets = {}
+        self._window_final_soc = {}
+        self._window_morning_date = None
+
+    # --- V2: the forecast evaluation (§2 at open, §5.2 on revision) ------
+
+    async def _evaluate_forecast(self, wall: datetime) -> None:
+        """Set or revise the window's fleet target from the morning credit.
+
+        At the first in-window tick this is the §2 computation (with the §7
+        ``night_target_set`` archive row); on a NEW ``fetched_at`` it is the
+        §5.2 revision under the materiality rule and the durable caps.  Any
+        §3.3 rung abandons the computation FOR THE WINDOW: targets revert to
+        the v1 ceiling for every unit, loudly, and no archive row is written
+        (A12 — a fallback night leaves nothing to score).
+        """
+        if self._settings.target_policy == "full":
+            return  # v1 identity: no forecast is consumed at all
+        window_end = open_window_end(wall, self._settings.windows, self._zone)
+        if window_end is None:  # pragma: no cover - tick only runs in-window
+            return
+        morning_date = window_end.astimezone(self._zone).date()
+        credit: MorningCredit
+        if self._morning_credit is None:
+            credit = _no_credit(REASON_FORECAST_MISSING)
+        else:
+            try:
+                credit = await self._morning_credit(
+                    window_end, self._settings.midday_local, self._settings.forecast_quantile
+                )
+            except Exception:
+                # T-NC2-ARCHITECTURE: a provider failure is no-credit is
+                # fallback — never a crash, never a fabricated zero.
+                credit = _no_credit(REASON_FORECAST_MISSING)
+        if self._window_morning_date is None:
+            self._window_morning_date = morning_date
+        if credit.failure is not None:
+            self._abandon(credit.failure)
+            return
+        if (
+            credit.fetched_at is None
+            or credit.e_surplus_kwh is None
+            or credit.e_deficit_kwh is None
+        ):
+            self._abandon(REASON_FORECAST_MISSING)
+            return
+        now = self._clock.wall_now()
+        if (now - credit.fetched_at).total_seconds() > float(self._settings.stale_after_s):
+            # §3.3: a cached 12 h-old forecast is legitimate; a 26 h-old one
+            # is not (the provider layer's own stale_after_s).
+            self._abandon(REASON_FORECAST_STALE)
+            return
+        # §3.3's last rung, scoped to the governing path (the §3.1 display
+        # runs from day one under SUGGEST; an unearned ACT site runs the
+        # fallback per §6 until the scoreboard earns).
+        trust = self._trust_state() if self._trust_state is not None else "provisioning"
+        if trust == "suspended" or (
+            self._settings.target_policy == "forecast_act" and trust != "earned"
+        ):
+            self._abandon(REASON_FORECAST_BELOW_TRUST)
+            return
+        if self._window_credit is None:
+            await self._set_window_target(credit, morning_date, window_end)
+            return
+        if (
+            self._window_evaluated_fetch is not None
+            and credit.fetched_at != self._window_evaluated_fetch
+        ):
+            await self._maybe_revise(credit, morning_date, now)
+
+    def _abandon(self, reason: str) -> None:
+        """§3.3: abandon the forecast computation for the window, loudly."""
+        self._window_abandoned = reason
+        self._window_target = None
+        self._window_credit = None
+
+    async def _set_window_target(
+        self, credit: MorningCredit, morning: date, window_end: datetime
+    ) -> None:
+        """The §2 computation at window open, plus the §7 archive row."""
+        target, bound_by = self._compute_target(credit)
+        self._window_target = target
+        self._window_credit = credit
+        self._window_evaluated_fetch = credit.fetched_at
+        trust = self._trust_state() if self._trust_state is not None else None
+        await self._window_archive_row(
+            credit, morning, window_end, target, bound_by, trust, event_type="night_target_set"
+        )
+        self._window_archived = True
+        if self._morning_archive_sink is not None:
+            # The durable machine-truth twin (the park-lease doctrine): the
+            # trust evaluator scores THIS morning from it post-midday.
+            from energypod.domain.night_trust import ArchivedMorning
+
+            with contextlib.suppress(Exception):
+                self._morning_archive_sink(
+                    ArchivedMorning(
+                        date=morning,
+                        provider=credit.source or "forecast",
+                        target_policy=self._settings.target_policy,
+                        quantile=credit.quantile,
+                        window_end=window_end.astimezone(UTC),
+                        midday=self._midday_instant(window_end).astimezone(UTC),
+                        e_surplus_forecast_kwh=credit.e_surplus_kwh or 0.0,
+                        e_deficit_kwh=credit.e_deficit_kwh or 0.0,
+                    )
+                )
+
+    async def _maybe_revise(
+        self, credit: MorningCredit, morning: date, now: datetime
+    ) -> None:
+        """§5.2: a materially changed forecast re-targets the still-charging
+        units, both directions, under the DURABLE caps (A6)."""
+        assert self._window_credit is not None  # guarded by the caller
+        standing = self._credit_kwh(self._window_credit)
+        arriving = self._credit_kwh(credit)
+        delta = abs(arriving - standing)
+        floor = max(
+            float(self._settings.retarget_threshold_pct) / 100.0 * abs(standing),
+            _RETARGET_ABSOLUTE_FLOOR_KWH,
+        )
+        if delta < floor:
+            # Tiny-forecast noise (ruling 4's absolute floor): the fetch is
+            # seen, the target stands.
+            self._window_evaluated_fetch = credit.fetched_at
+            return
+        history = (
+            ()
+            if self._retarget_history is None
+            else tuple(self._retarget_history(morning))
+        )
+        if len(history) >= _RETARGET_MAX_PER_WINDOW:
+            return  # the window's durable budget is spent
+        if history:
+            gap_s = (now - history[-1]).total_seconds()
+            if gap_s < float(self._settings.retarget_min_gap_min) * 60.0:
+                return  # inside the pinned minimum gap
+        previous_target = self._window_target
+        previous = self._window_credit
+        target, _bound = self._compute_target(credit)
+        self._window_target = target
+        self._window_credit = credit
+        self._window_evaluated_fetch = credit.fetched_at
+        if self._revision_sink is not None:
+            with contextlib.suppress(Exception):
+                self._revision_sink(morning, now)
+        trust = self._trust_state() if self._trust_state is not None else None
+        await self._revision_row(
+            credit,
+            morning,
+            now,
+            previous_target=previous_target,
+            new_target=target,
+            delta_kwh=arriving - standing,
+            trust=trust,
+            previous_fetched_at=None if previous is None else previous.fetched_at,
+        )
+
+    def _credit_kwh(self, credit: MorningCredit) -> float:
+        """§2.1's credit: the η-derated surplus minus the full-value deficit."""
+        surplus = credit.e_surplus_kwh or 0.0
+        deficit = credit.e_deficit_kwh or 0.0
+        return float(self._settings.charge_efficiency) * surplus - deficit
+
+    def _compute_target(self, credit: MorningCredit) -> tuple[float, str | None]:
+        """The §2.1 formula and §7's ``ceiling_bound_by`` decomposition.
+
+        The capacity-proportional share collapses algebraically to ONE fleet
+        percentage (section 2.2): 100 - 100 x E_credit x 1000 / fleet Wh, clamped to
+        [floor_pct, min(100, policy.max_soc_pct)].
+        """
+        capacities = self._settings.assumed_capacity_wh or {}
+        total_wh = sum(int(value) for value in capacities.values() if isinstance(value, int))
+        if total_wh <= 0:  # pragma: no cover - config validation requires the map
+            return float(self._policy.max_soc_pct), "sky"
+        raw = 100.0 - 100.0 * self._credit_kwh(credit) * 1000.0 / float(total_wh)
+        ceiling = min(100.0, float(self._policy.max_soc_pct))
+        floor = float(self._settings.floor_pct)
+        target = min(max(raw, floor), ceiling)
+        bound_by: str | None = None
+        if raw > ceiling:
+            # A10's decomposition: the SKY gave no surplus at all, or a real
+            # surplus was eaten by the deficit/η netting.
+            bound_by = "sky" if (credit.e_surplus_kwh or 0.0) <= 0.0 else "netting"
+        return target, bound_by
+
+    def _decision_target_pct(self) -> float | None:
+        """The frame's target number: the governing target under ACT, the
+        suggested number under SUGGEST (v1 ceiling behavior either way)."""
+        if self._settings.target_policy == "full" or self._window_abandoned is not None:
+            return None
+        return self._window_target
+
+    def _unit_target_pct(self) -> float | None:
+        """The per-unit display target; None under full or fallback."""
+        return self._decision_target_pct()
+
+    def _governing_target_pct(self) -> float | None:
+        """The target that GOVERNS behavior: ACT with a live forecast only —
+        under SUGGEST the submission math is v1's (the named byte-identity),
+        and a fallback window is v1 by §3.3."""
+        if (
+            self._settings.target_policy == "forecast_act"
+            and self._window_abandoned is None
+            and self._window_target is not None
+        ):
+            return self._window_target
+        return None
+
+    def _forecast_projection(self) -> dict[str, Any] | None:
+        """The §7 ``forecast`` block (absent under full)."""
+        if self._settings.target_policy == "full":
+            return None
+        credit = self._window_credit
+        if credit is None or self._window_abandoned is not None:
+            if self._window_abandoned is None:
+                return None
+            return {
+                "status": self._window_abandoned,
+                "quantile": self._settings.forecast_quantile,
+                "midday_local": self._settings.midday_local.strftime("%H:%M"),
+            }
+        return {
+            "status": "ok",
+            "source": credit.source,
+            "quantile": credit.quantile,
+            "issued_at": None if credit.issued_at is None else credit.issued_at.isoformat(),
+            "fetched_at": None
+            if credit.fetched_at is None
+            else credit.fetched_at.isoformat(),
+            "e_surplus_kwh": credit.e_surplus_kwh,
+            "e_deficit_kwh": credit.e_deficit_kwh,
+            "e_credit_kwh": self._credit_kwh(credit),
+            "midday_local": self._settings.midday_local.strftime("%H:%M"),
+            "ceiling_bound_by": self._compute_target(credit)[1],
+        }
+
+    def _explanation(self) -> str | None:
+        """The one-sentence §8 reasoning line, verbatim on the projection."""
+        if self._settings.target_policy == "full" or self._window_abandoned is not None:
+            return None
+        credit = self._window_credit
+        target = self._window_target
+        if credit is None or target is None:
+            return None
+        first_unit = self._settings.unit_ids[0] if self._settings.unit_ids else "fleet"
+        window_end = open_window_end(
+            self._clock.wall_now(), self._settings.windows, self._zone
+        )
+        end_wall = "--:--" if window_end is None else window_end.astimezone(self._zone).strftime(
+            "%H:%M"
+        )
+        source = credit.source or "forecast"
+        quantile_word = (
+            "p50"
+            if credit.quantile is None or credit.quantile == 0.5
+            else f"p{round((credit.quantile or 0.0) * 100)}"
+        )
+        issued = "" if credit.issued_at is None else f", issued {credit.issued_at.isoformat()}"
+        return (
+            f"{first_unit} to {target:.0f}% by {end_wall} — "
+            f"{self._credit_kwh(credit):.1f} kWh forecast surplus by "
+            f"{self._settings.midday_local.strftime('%H:%M')} finishes it "
+            f"({source} {quantile_word}{issued})"
+        )
+
+    # --- V2: the audit rows (§7, the accountant pattern) ------------------
+
+    def _night_row(
+        self,
+        *,
+        event_type: str,
+        payload: dict[str, Any],
+        reason_codes: tuple[str, ...],
+        result: str,
+    ) -> AuditEvent:
+        now_mono = float(self._clock.monotonic())
+        wall = self._clock.wall_now().astimezone(UTC)
+        return AuditEvent(
+            event_id=f"night-{event_type}-{uuid4().hex}",
+            occurred_at=wall,
+            monotonic_offset_s=now_mono,
+            process_instance_id=_NIGHT_PRINCIPAL,
+            event_type=event_type,
+            principal=_NIGHT_PRINCIPAL,
+            correlation_id=f"night:{event_type}",
+            policy_version=_NIGHT_POLICY_VERSION,
+            configuration_version=0,
+            observation_sequences={},
+            reason_codes=reason_codes,
+            requested_active_w=0,
+            authorized_active_w=0,
+            request_fingerprint=_night_fingerprint({"event_type": event_type, **payload}),
+            response_fingerprint=_night_fingerprint({"result": result}),
+            result=result,
+            lifecycle=UnitLifecycle.DISARMED,
+            payload=payload,
+        )
+
+    async def _window_archive_row(
+        self,
+        credit: MorningCredit,
+        morning: date,
+        window_end: datetime,
+        target: float,
+        bound_by: str | None,
+        trust: str | None,
+        *,
+        event_type: str,
+    ) -> None:
+        """The §7 ``night_target_set`` reconstruction row: the full
+        arithmetic, the forecast series verbatim, and the trust snapshot."""
+        payload = {
+            "window_date": morning.isoformat(),
+            "window_end": window_end.astimezone(UTC).isoformat(),
+            "midday": self._midday_instant(window_end).isoformat(),
+            "window_end_local": window_end.astimezone(self._zone).strftime("%H:%M"),
+            "midday_local": self._settings.midday_local.strftime("%H:%M"),
+            "target_policy": self._settings.target_policy,
+            "quantile": self._settings.forecast_quantile,
+            "e_surplus_forecast_kwh": credit.e_surplus_kwh,
+            "e_deficit_kwh": credit.e_deficit_kwh,
+            "e_credit_kwh": self._credit_kwh(credit),
+            "target_soc_pct": target,
+            "ceiling_bound_by": bound_by,
+            "share_model": "capacity_proportional",
+            "assumed_capacity_wh": dict(sorted((self._settings.assumed_capacity_wh or {}).items())),
+            "charge_efficiency": self._settings.charge_efficiency,
+            "floor_pct": self._settings.floor_pct,
+            "trust_state": trust,
+            "forecast": {
+                "source": credit.source,
+                "quantile": credit.quantile,
+                "fetched_at": None
+                if credit.fetched_at is None
+                else credit.fetched_at.isoformat(),
+                "issued_at": None
+                if credit.issued_at is None
+                else credit.issued_at.isoformat(),
+            },
+            "slots": [
+                {
+                    "start": slot.start.isoformat(),
+                    "end": slot.end.isoformat(),
+                    "pv_w": slot.pv_w,
+                    "load_w": slot.load_w,
+                }
+                for slot in credit.slots
+            ],
+        }
+        await self._append_night_row(event_type, payload, ("window_open",), "target_set")
+
+    async def _revision_row(
+        self,
+        credit: MorningCredit,
+        morning: date,
+        revised_at: datetime,
+        *,
+        previous_target: float | None,
+        new_target: float,
+        delta_kwh: float,
+        trust: str | None,
+        previous_fetched_at: datetime | None,
+    ) -> None:
+        direction = "raise" if new_target > (previous_target or 0.0) else "lower"
+        payload = {
+            "window_date": morning.isoformat(),
+            "revised_at": revised_at.astimezone(UTC).isoformat(),
+            "direction": direction,
+            "previous_target_soc_pct": previous_target,
+            "target_soc_pct": new_target,
+            "delta_credit_kwh": delta_kwh,
+            "trust_state": trust,
+            "forecast": {
+                "source": credit.source,
+                "quantile": credit.quantile,
+                "fetched_at": None
+                if credit.fetched_at is None
+                else credit.fetched_at.isoformat(),
+                "previous_fetched_at": None
+                if previous_fetched_at is None
+                else previous_fetched_at.isoformat(),
+                "issued_at": None
+                if credit.issued_at is None
+                else credit.issued_at.isoformat(),
+            },
+        }
+        await self._append_night_row("night_target_revised", payload, (direction,), "revised")
+
+    async def _append_night_row(
+        self, event_type: str, payload: dict[str, Any], reasons: tuple[str, ...], result: str
+    ) -> None:
+        if self._audit is None:
+            return
+        event = self._night_row(
+            event_type=event_type, payload=payload, reason_codes=reasons, result=result
+        )
+        with contextlib.suppress(Exception):
+            await self._audit.append(event)
+
+    def _midday_instant(self, window_end: datetime) -> datetime:
+        """The civil midday of the MORNING the window belongs to."""
+        local_end = window_end.astimezone(self._zone)
+        return datetime.combine(local_end.date(), self._settings.midday_local, tzinfo=self._zone)
 
     def _remaining_s(self, wall: datetime) -> float:
         ends = open_window_end(wall, self._settings.windows, self._zone)
@@ -712,16 +1345,50 @@ class NightChargeAdviser:
         soc_pct = getattr(observation, "authoritative_soc_pct", None)
         if not _finite_number(soc_pct):
             return self._sitting_out(unit_id, "no_charge_headroom", observation), False, False
+        display_target = self._unit_target_pct()
+        governing = self._governing_target_pct()
+        # V2's widened completion word (§5.1): the CEILING case keeps its own
+        # words (at_ceiling + skipped_full); a unit at or above a governing
+        # forecast target is complete/target_reached -- SOC above target is
+        # complete, NEVER pacing (A8).  Completion is ONE-DIRECTIONAL (A2):
+        # sticky against target FALLS, re-opened only by a target RISE above
+        # the unit's MEASURED SOC.
+        completed_target = self._completed_targets.get(unit_id)
+        if (
+            completed_target is not None
+            and governing is not None
+            and governing > float(soc_pct)
+            and governing > completed_target
+        ):
+            del self._completed_targets[unit_id]  # the only re-entry (§5.1)
+            completed_target = None
+        if governing is not None and float(soc_pct) >= governing and completed_target is None:
+            self._completed_targets[unit_id] = governing
+            completed_target = governing
         if soc_pct >= self._policy.max_soc_pct:
-            if unit_id in self._participated:
+            if unit_id in self._participated or completed_target is not None:
                 # It charged this window and reached the target: the honest
                 # completion row, not a from-the-start skip.
                 return (
-                    NightUnitPlan(unit_id, soc_pct, "complete", 0, "target_reached"),
+                    NightUnitPlan(
+                        unit_id, soc_pct, "complete", 0, "target_reached", display_target
+                    ),
                     False,
                     False,
                 )
-            return (NightUnitPlan(unit_id, soc_pct, "skipped_full", 0, "at_ceiling"), False, False)
+            return (
+                NightUnitPlan(unit_id, soc_pct, "skipped_full", 0, "at_ceiling", display_target),
+                False,
+                False,
+            )
+        if completed_target is not None:
+            # Sticky against the fall: the unit stays complete even if its SOC
+            # dipped under a LOWERED target (un-charging is not a thing).
+            return (
+                NightUnitPlan(unit_id, soc_pct, "complete", 0, "target_reached", display_target),
+                False,
+                False,
+            )
         dynamic = getattr(observation, "dynamic_charge_limit_w", None)
         static = self._policy.static_charge_limit_w_by_unit.get(unit_id)
         achievable = (
@@ -763,6 +1430,7 @@ class NightChargeAdviser:
                         "standing_by_on_demand",
                         0,
                         "demand_above_threshold",
+                        display_target,
                     ),
                     False,
                     True,
@@ -778,6 +1446,7 @@ class NightChargeAdviser:
                     "holding_on_demand",
                     int(self._settings.hold_rate_w),
                     "demand_above_threshold",
+                    display_target,
                 ),
                 False,
                 True,
@@ -791,9 +1460,14 @@ class NightChargeAdviser:
                     False,
                     False,
                 )
+            # §4-5: under `even` the forecast target is just a smaller
+            # target_soc_pct in the same self-correcting deadline rule; under
+            # suggest/fallback the ceiling stays the deadline's aim.
             rate, at_risk = even_rate_w(
                 soc_pct=float(soc_pct),
-                target_soc_pct=float(self._policy.max_soc_pct),
+                target_soc_pct=float(
+                    governing if governing is not None else self._policy.max_soc_pct
+                ),
                 capacity_wh=capacity,
                 remaining_s=remaining_s,
                 cap_w=achievable,
@@ -805,11 +1479,16 @@ class NightChargeAdviser:
                     "pacing",
                     rate,
                     "deadline_at_risk" if at_risk else "on_plan",
+                    display_target,
                 ),
                 at_risk,
                 False,
             )
-        return (NightUnitPlan(unit_id, soc_pct, "pacing", achievable, "on_plan"), False, False)
+        return (
+            NightUnitPlan(unit_id, soc_pct, "pacing", achievable, "on_plan", display_target),
+            False,
+            False,
+        )
 
     def _latch_held(self, unit_id: str, held: bool) -> None:
         """Persist this tick's hold decision into the adviser-state latch.
@@ -841,7 +1520,12 @@ class NightChargeAdviser:
     def _sitting_out(self, unit_id: str, reason: str, observation: Any) -> NightUnitPlan:
         soc = getattr(observation, "authoritative_soc_pct", None)
         return NightUnitPlan(
-            unit_id, soc if _finite_number(soc) else None, "sitting_out", 0, reason
+            unit_id,
+            soc if _finite_number(soc) else None,
+            "sitting_out",
+            0,
+            reason,
+            self._unit_target_pct(),
         )
 
     async def _standby(
@@ -851,6 +1535,8 @@ class NightChargeAdviser:
         reading: DemandReading,
         reason_codes: tuple[str, ...],
         plans: tuple[NightUnitPlan, ...],
+        *,
+        morning_notice: Mapping[str, Any] | None = None,
     ) -> NightChargeDecision:
         """Remove-if-held and submit nothing (non-renewal, the only exit).
 
@@ -871,6 +1557,11 @@ class NightChargeAdviser:
             demand_w=reading.demand_w,
             demand_evidence=reading.evidence,
             reason_codes=reason_codes,
+            target_soc_pct=None if not in_window else self._decision_target_pct(),
+            fallback_reason=None if not in_window else self._window_abandoned,
+            forecast=self._forecast_projection() if in_window else None,
+            explanation=None if not in_window else self._explanation(),
+            morning_notice=morning_notice,
         )
 
     async def _remove_held(self) -> None:
@@ -883,6 +1574,28 @@ class NightChargeAdviser:
         # lapse is the designed hand-back.
         with contextlib.suppress(Exception):
             await self._intents.remove(held)
+
+
+def _no_credit(failure: str) -> MorningCredit:
+    """The honest absence: no figures, no provenance, the ladder's word."""
+    return MorningCredit(
+        e_surplus_kwh=None,
+        e_deficit_kwh=None,
+        slots=(),
+        source=None,
+        quantile=None,
+        fetched_at=None,
+        issued_at=None,
+        failure=failure,
+    )
+
+
+def _night_fingerprint(facts: Mapping[str, Any]) -> str:
+    import hashlib
+    import json
+
+    encoded = json.dumps(facts, sort_keys=True, default=str, allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _no_participant_reasons(plans: tuple[NightUnitPlan, ...]) -> tuple[str, ...]:
@@ -962,10 +1675,18 @@ class NightChargeState:
     last_tick_at: str
     reason_codes: tuple[str, ...]
     active_unit_ids: tuple[str, ...] = ()
+    # --- V2 (§7, additive; ABSENT under ``full`` so v1 consumers see
+    # byte-identical frames) -----------------------------------------------
+    target_policy: TargetPolicy = "full"
+    trust: Mapping[str, Any] | None = None
+    forecast: Mapping[str, Any] | None = None
+    explanation: str | None = None
+    morning_notice: Mapping[str, Any] | None = None
+    suggest_posture: bool = False
 
     def payload(self) -> dict[str, Any]:
         """The §5 JSON shape (values JSON-native, codes as a list)."""
-        return {
+        payload = {
             "enabled": self.enabled,
             "enabled_origin": self.enabled_origin,
             "acknowledged_partition": self.acknowledged_partition,
@@ -989,6 +1710,15 @@ class NightChargeState:
             "last_tick_at": self.last_tick_at,
             "reason_codes": list(self.reason_codes),
         }
+        if self.target_policy != "full":
+            payload["target_policy"] = self.target_policy
+            payload["trust"] = None if self.trust is None else dict(self.trust)
+            payload["forecast"] = None if self.forecast is None else dict(self.forecast)
+            payload["explanation"] = self.explanation
+            payload["morning_notice"] = (
+                None if self.morning_notice is None else dict(self.morning_notice)
+            )
+        return payload
 
     def event_payload(self) -> dict[str, Any]:
         """The §5 ``night_charge.state_changed`` payload: the projection
@@ -1012,6 +1742,10 @@ class NightChargeState:
             self.active_unit_ids,
             self.demand_evidence,
             self.reason_codes,
+            # §7's exactly-two V2 members: the posture and the trust word.
+            # Targets and figures ride every publication but never trigger.
+            self.target_policy,
+            None if self.trust is None else self.trust.get("state"),
         )
 
 
@@ -1054,6 +1788,9 @@ class NightChargeController:
         config_enabled: bool,
         bus: _EventPublisherPort | None = None,
         heartbeat_period_s: float = STATE_EVENT_HEARTBEAT_S,
+        target_policy: TargetPolicy = "full",
+        midday_local: time = time(12, 0),
+        trust_view: Callable[[], Mapping[str, Any] | None] | None = None,
     ) -> None:
         if isinstance(rate_cap_w, bool) or not isinstance(rate_cap_w, int) or rate_cap_w <= 0:
             raise ValueError("rate_cap_w must be a positive integer")
@@ -1079,6 +1816,15 @@ class NightChargeController:
         # The once-ever durable night-partition fact (§3.2), boot-loaded from
         # the audit store and latched by either surface's audited capture.
         self._acknowledged = bool(acknowledged_partition)
+        # --- V2: the posture the projection names, the morning notice's
+        # clear line (midday), and the live trust view.  The defaults keep
+        # v1 frames byte-identical (the additive keys never appear).
+        self._target_policy: TargetPolicy = target_policy
+        self._midday_local = midday_local
+        self._trust_view = trust_view
+        self._morning_notice: dict[str, Any] | None = None
+        self._last_forecast: Mapping[str, Any] | None = None
+        self._last_explanation: str | None = None
         self._adviser: NightChargeAdviser | None = None
         # Tick-derived fields (fleet-loop-owned single writer).  Before the
         # first tick the honest frame is an idle projection over MISSING
@@ -1190,21 +1936,70 @@ class NightChargeController:
             demand_w=self._last_demand_w,
             demand_evidence=self._last_evidence,
             held_intent_id=held,
-            units=tuple(
-                {
-                    "unit_id": plan.unit_id,
-                    "soc_pct": plan.soc_pct,
-                    "phase": plan.phase,
-                    "target_w": plan.target_w,
-                    "reason": plan.reason,
-                }
-                for plan in units
-            ),
+            units=tuple(self._unit_rows(plan) for plan in units),
             last_action=self._last_action,
             last_tick_at=self._last_tick_at,
             reason_codes=reason_codes,
             active_unit_ids=active_units,
+            target_policy=self._target_policy,
+            trust=self._trust_payload(),
+            forecast=self._last_forecast,
+            explanation=self._last_explanation,
+            morning_notice=self._live_morning_notice(wall),
         )
+
+    def _unit_rows(self, plan: NightUnitPlan) -> dict[str, Any]:
+        """One unit's §7 row; the V2 target key is ADDITIVE and named by the
+        posture (``suggested_`` under SUGGEST — a number that does not govern
+        MUST say so beside itself)."""
+        row: dict[str, Any] = {
+            "unit_id": plan.unit_id,
+            "soc_pct": plan.soc_pct,
+            "phase": plan.phase,
+            "target_w": plan.target_w,
+            "reason": plan.reason,
+        }
+        if self._target_policy != "full" and plan.target_soc_pct is not None:
+            key = (
+                "suggested_target_soc_pct"
+                if self._target_policy == "forecast_suggest"
+                else "target_soc_pct"
+            )
+            row[key] = plan.target_soc_pct
+        return row
+
+    def _trust_payload(self) -> Mapping[str, Any] | None:
+        """The live trust view (the ledger's §7 block), read per frame."""
+        if self._target_policy == "full" or self._trust_view is None:
+            return None
+        try:
+            payload = self._trust_view()
+        except Exception:
+            return None
+        return payload
+
+    def _live_morning_notice(self, wall: Any) -> Mapping[str, Any] | None:
+        """The latched §8/A5 morning notice, cleared at ``midday_local``.
+
+        The notice persists on the Night tile until midday -- the window's
+        honest below-target close stays visible while solar finishes what it
+        can, then the Insights landing line takes over.
+        """
+        if self._morning_notice is None:
+            return None
+        local = wall.astimezone(self._zone)
+        notice_date = self._morning_notice.get("date")
+        if isinstance(notice_date, str):
+            try:
+                morning = date.fromisoformat(notice_date)
+            except ValueError:
+                morning = None  # pragma: no cover - the adviser writes ISO dates
+            if morning is not None:
+                midday = datetime.combine(morning, self._midday_local, tzinfo=self._zone)
+                if local >= midday:
+                    self._morning_notice = None
+                    return None
+        return self._morning_notice
 
     def _projection_window(self, wall: Any) -> dict[str, str]:
         """The window the projection names: the open one, else the next."""
@@ -1256,6 +2051,14 @@ class NightChargeController:
         self._last_evidence = decision.demand_evidence
         self._last_reason_codes = tuple(decision.reason_codes)
         self._last_tick_at = self._clock.wall_now().isoformat()
+        # --- V2: the forecast mirror and the once-per-window morning notice
+        # latch (§8/A5 -- the projection holds it until midday_local).
+        self._last_forecast = (
+            None if decision.forecast is None else dict(decision.forecast)
+        )
+        self._last_explanation = decision.explanation
+        if decision.morning_notice is not None:
+            self._morning_notice = dict(decision.morning_notice)
         if self._bus is None:
             return
         state = self.state()

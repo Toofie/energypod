@@ -321,7 +321,7 @@ def test_schema_version_is_stamped_from_day_one(tmp_path: Path) -> None:
     """Opening a fresh database stamps the latest known version before
     anything else runs (version 5 added the night-trust day table)."""
     _require_contract()
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION == 6
     database = SQLiteDatabase(tmp_path / "controller.sqlite3")
     database.open()
     try:

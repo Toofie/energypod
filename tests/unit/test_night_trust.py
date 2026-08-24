@@ -803,13 +803,17 @@ class TestTheCompoundGate:
 
 
 class TestPersistence:
-    def test_schema_v5_migrates_a_version_four_database_in_place(
+    def test_the_schema_migrates_a_version_four_database_in_place(
         self, tmp_path: Path
     ) -> None:
+        """v5 added the day records; v6 added the morning archive and the
+        re-target instants (the machine-truth twins of the night audit rows):
+        a stamped-v4 database with live rows upgrades in place to the latest
+        stamped version, existing tables untouched."""
         from energypod.adapters.persistence.sqlite import SQLiteDatabase
         from energypod.db.schema import SCHEMA_VERSION
 
-        assert SCHEMA_VERSION == 5
+        assert SCHEMA_VERSION == 6
         path = tmp_path / "trust-migrate.sqlite3"
         raw = sqlite3.connect(path)
         try:
@@ -831,14 +835,15 @@ class TestPersistence:
             stamped = database.connection.execute(
                 "SELECT version FROM schema_version WHERE singleton = 1"
             ).fetchone()
-            assert stamped == (5,)
+            assert stamped == (6,)
             assert database.connection.execute(
                 "SELECT COUNT(*) FROM park_leases"
             ).fetchone() == (1,), "an in-place upgrade touches no existing table's rows"
-            present = database.connection.execute(
-                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'night_trust_day'"
-            ).fetchone()
-            assert present is not None
+            for table in ("night_trust_day", "night_morning_archive", "night_target_revisions"):
+                present = database.connection.execute(
+                    "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
+                ).fetchone()
+                assert present is not None, table
         finally:
             database.close()
 

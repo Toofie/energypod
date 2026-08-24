@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-SCHEMA_VERSION: Final[int] = 5
+SCHEMA_VERSION: Final[int] = 6
 BASELINE_VERSION: Final[int] = 0
 
 _CREATE_VERSION_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS schema_version (
@@ -135,6 +135,25 @@ _CREATE_NIGHT_TRUST_DAY_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS night_
     day TEXT PRIMARY KEY,
     payload TEXT NOT NULL
 )"""
+# DESIGN_NIGHT_CHARGE_V2 sections 3.2+5.2: the night-V2 machinery's durable
+# machine truth beside the audit narrative (the park-lease doctrine verbatim:
+# the audit trail is the narrative, but a dense site's control-decision rows
+# push the rare night rows out of any bounded scan -- so the morning archive
+# the trust evaluator scores from, and the re-target instants the A6 caps
+# derive from, live in queryable dedicated tables).
+_CREATE_NIGHT_MORNING_ARCHIVE_TABLE: Final[str] = (
+    """CREATE TABLE IF NOT EXISTS night_morning_archive (
+    window_date TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+)"""
+)
+_CREATE_NIGHT_TARGET_REVISIONS_TABLE: Final[str] = (
+    """CREATE TABLE IF NOT EXISTS night_target_revisions (
+    window_date TEXT NOT NULL,
+    revised_at TEXT NOT NULL,
+    PRIMARY KEY (window_date, revised_at)
+) WITHOUT ROWID"""
+)
 
 
 @dataclass(frozen=True)
@@ -166,6 +185,9 @@ class MigrationResult:
 # in-place upgrade that touches no existing table.  Version 5 adds the
 # night-charge trust day table (DESIGN_NIGHT_CHARGE_V2 section 3.2):
 # night_trust_day keyed by civil date, one payload per scored morning.
+# Version 6 adds the night-V2 morning archive and re-target instants
+# (DESIGN_NIGHT_CHARGE_V2 sections 3.2+5.2): the queryable twins of the
+# night_target_set/night_target_revised audit rows.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, statements=(_CREATE_VERSION_TABLE,)),
     Migration(
@@ -178,6 +200,13 @@ MIGRATIONS: tuple[Migration, ...] = (
     ),
     Migration(version=4, statements=(_CREATE_PARK_LEASE_TABLE,)),
     Migration(version=5, statements=(_CREATE_NIGHT_TRUST_DAY_TABLE,)),
+    Migration(
+        version=6,
+        statements=(
+            _CREATE_NIGHT_MORNING_ARCHIVE_TABLE,
+            _CREATE_NIGHT_TARGET_REVISIONS_TABLE,
+        ),
+    ),
 )
 
 

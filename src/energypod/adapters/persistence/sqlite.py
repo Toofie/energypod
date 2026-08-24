@@ -32,7 +32,7 @@ from energypod.domain.history import (
     parse_history_timestamp,
 )
 from energypod.domain.intents import Direction, IntentSource
-from energypod.domain.night_trust import NightTrustDayRecord
+from energypod.domain.night_trust import ArchivedMorning, NightTrustDayRecord
 from energypod.domain.observations import UnitLifecycle
 from energypod.domain.parking import ParkLease, ParkLeaseEpochConflict
 from energypod.domain.schedule import (
@@ -1062,6 +1062,82 @@ class SQLiteNightTrustRepository:
                 raise PersistenceBusyError("night trust day database is busy") from exc
             raise
         return int(row[0])
+
+    # --- the night-V2 machine-truth twins (schema v6) -----------------------
+
+    def record_morning(self, morning: ArchivedMorning) -> None:
+        """One archive row per window, first-write-wins: the window-open
+        forecast is the one the scoreboard scores (a later revision changes
+        the target, never the archived series)."""
+        if type(morning) is not ArchivedMorning:
+            raise TypeError("morning must be an ArchivedMorning")
+        payload = json.dumps(
+            morning.payload(), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        try:
+            with self._database.lock:
+                connection = self._database.connection
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(
+                        "INSERT INTO night_morning_archive(window_date, payload)"
+                        " VALUES (?, ?) ON CONFLICT(window_date) DO NOTHING",
+                        (morning.date.isoformat(), payload),
+                    )
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("night morning archive is busy") from exc
+            raise
+
+    def morning(self, day: date) -> ArchivedMorning | None:
+        if type(day) is not date:
+            raise TypeError("day must be a civil date")
+        try:
+            with self._database.lock:
+                row = self._database.connection.execute(
+                    "SELECT payload FROM night_morning_archive WHERE window_date = ?",
+                    (day.isoformat(),),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("night morning archive is busy") from exc
+            raise
+        return None if row is None else ArchivedMorning.from_payload(_load_json_object(row[0]))
+
+    def record_revision(self, window_date: date, revised_at: datetime) -> None:
+        if type(window_date) is not date or not isinstance(revised_at, datetime):
+            raise TypeError("record_revision needs a civil date and a datetime")
+        try:
+            with self._database.lock:
+                self._database.connection.execute(
+                    "INSERT INTO night_target_revisions(window_date, revised_at)"
+                    " VALUES (?, ?) ON CONFLICT DO NOTHING",
+                    (window_date.isoformat(), revised_at.isoformat()),
+                )
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("night revisions are busy") from exc
+            raise
+
+    def revisions(self, window_date: date) -> tuple[datetime, ...]:
+        if type(window_date) is not date:
+            raise TypeError("window_date must be a civil date")
+        try:
+            with self._database.lock:
+                rows = self._database.connection.execute(
+                    "SELECT revised_at FROM night_target_revisions"
+                    " WHERE window_date = ? ORDER BY revised_at",
+                    (window_date.isoformat(),),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("night revisions are busy") from exc
+            raise
+        return tuple(datetime.fromisoformat(str(row[0])) for row in rows)
 
 
 class SQLiteTelemetryHistoryRepository:

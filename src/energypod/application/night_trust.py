@@ -49,7 +49,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from energypod.domain.audit import AuditEvent
-from energypod.domain.night_trust import NightTrustDayRecord
+from energypod.domain.night_trust import ArchivedMorning, NightTrustDayRecord
 from energypod.domain.observations import UnitLifecycle
 
 __all__ = [
@@ -267,21 +267,8 @@ class _HistoryRowsPort(Protocol):
     ) -> Sequence[Any]: ...
 
 
-@dataclass(frozen=True, slots=True)
-class ArchivedMorning:
-    """The morning's archived forecast arithmetic (the ``night_target_set``
-    row's reconstruction payload, read back post-midday)."""
-
-    date: date
-    provider: str
-    target_policy: str
-    quantile: float | None
-    window_end: datetime
-    midday: datetime
-    e_surplus_forecast_kwh: float
-    e_deficit_kwh: float
-
-
+# The archived-morning shape lives in the domain (the durable twin's payload
+# model); re-exported here as the evaluator's port vocabulary.
 MorningArchivePort = Callable[[date], ArchivedMorning | None]
 
 

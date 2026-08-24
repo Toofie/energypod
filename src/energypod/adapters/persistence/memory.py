@@ -22,7 +22,7 @@ from energypod.domain.history import (
     parse_history_timestamp,
 )
 from energypod.domain.history import worst_quality as worst_of
-from energypod.domain.night_trust import NightTrustDayRecord
+from energypod.domain.night_trust import ArchivedMorning, NightTrustDayRecord
 from energypod.domain.parking import ParkLease, ParkLeaseEpochConflict
 
 
@@ -87,6 +87,8 @@ class InMemoryNightTrustRepository:
 
     def __init__(self) -> None:
         self._records: dict[Any, NightTrustDayRecord] = {}
+        self._mornings: dict[Any, ArchivedMorning] = {}
+        self._revisions: dict[Any, list[Any]] = {}
         self._lock = RLock()
 
     def record_day(self, record: NightTrustDayRecord) -> None:
@@ -109,6 +111,27 @@ class InMemoryNightTrustRepository:
     def record_count(self) -> int:
         with self._lock:
             return len(self._records)
+
+    def record_morning(self, morning: ArchivedMorning) -> None:
+        if type(morning) is not ArchivedMorning:
+            raise TypeError("morning must be an ArchivedMorning")
+        with self._lock:
+            self._mornings.setdefault(morning.date, morning)
+
+    def morning(self, day: Any) -> ArchivedMorning | None:
+        with self._lock:
+            return self._mornings.get(day)
+
+    def record_revision(self, window_date: Any, revised_at: Any) -> None:
+        with self._lock:
+            instants = self._revisions.setdefault(window_date, [])
+            if revised_at not in instants:
+                instants.append(revised_at)
+                instants.sort()
+
+    def revisions(self, window_date: Any) -> tuple[Any, ...]:
+        with self._lock:
+            return tuple(self._revisions.get(window_date, ()))
 
 
 class InMemoryParkLeaseRepository:

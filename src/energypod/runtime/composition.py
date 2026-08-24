@@ -77,6 +77,7 @@ from energypod.adapters.persistence.memory import (
     InMemoryAuthorizationRepository,
     InMemoryEnergyLedgerRepository,
     InMemoryIntentRepository,
+    InMemoryNightTrustRepository,
     InMemoryObservationRepository,
     InMemoryParkLeaseRepository,
     InMemoryTelemetryHistoryRepository,
@@ -86,6 +87,7 @@ from energypod.adapters.persistence.sqlite import (
     SQLiteAuditRepository,
     SQLiteDatabase,
     SQLiteEnergyLedgerRepository,
+    SQLiteNightTrustRepository,
     SQLiteParkLeaseRepository,
     SQLiteScheduleRepository,
     SQLiteTelemetryHistoryRepository,
@@ -131,6 +133,11 @@ from energypod.application.night_charge import (
     NightChargeAdviser,
     NightChargeController,
     NightChargeSettings,
+)
+from energypod.application.night_trust import (
+    NIGHT_TRUST_EARNED_EVENT_ID,
+    NightTrustLedger,
+    TrustGateSettings,
 )
 from energypod.application.parking import ParkCommissioning, ParkController
 from energypod.application.recovery import (
@@ -1863,6 +1870,188 @@ class _NightAdviserPrincipal:
     site_id: str
 
 
+class _RegistryMorningCredit:
+    """DESIGN_NIGHT_CHARGE_V2 section 2.7's composed ``morning_credit_kwh``
+    port: the registry's PV slice and load baseline netted per section 2.1.
+
+    The application layer's adviser never imports a provider adapter — this
+    bridge, composed HERE, is the one place the two meet.  The section 2.1
+    netting, honestly: every PV slot of [window_end, midday) must exist
+    (else ``forecast_missing`` — no coverage, no credit) and the load
+    baseline must cover EVERY slot's span fully — a single same-slot-last-
+    week gap is a hole in the netting, not a spot to interpolate around (A9:
+    the whole morning fails to ``forecast_no_load_baseline``, with
+    deliberately no degrade-to-PV-only path).  The result is cached per PV
+    ``fetched_at``: the provider's own refresh gate owns the wire budget
+    (the night adviser is the first forecast-CONSUMING adviser and its
+    evaluation drives the same 2/day fetches — no scheduler task was added),
+    the baseline reread happens only on a cache miss, and staleness is
+    re-judged on EVERY call (a cached 12 h-old fetch is legitimate; a 26 h
+    one is not, whatever the cache says).
+    """
+
+    def __init__(
+        self,
+        *,
+        pv: Any,
+        load: Any,
+        clock: Any,
+        stale_after_s: float,
+    ) -> None:
+        self._pv = pv
+        self._load = load
+        self._clock = clock
+        self._stale_after_s = float(stale_after_s)
+        self._cache_key: tuple[Any, ...] | None = None
+        self._cache_value: Any = None
+
+    async def __call__(
+        self, window_end: Any, midday_local: Any, quantile: float
+    ) -> Any:
+        from energypod.application.night_charge import (
+            REASON_FORECAST_MISSING,
+            REASON_FORECAST_STALE,
+        )
+
+        local_end = window_end.astimezone(window_end.tzinfo)
+        midday = datetime.combine(local_end.date(), midday_local, tzinfo=window_end.tzinfo)
+        try:
+            pv_series = await self._pv.pv_forecast()
+        except Exception:
+            return _night_no_credit(REASON_FORECAST_MISSING)
+        now = self._clock.wall_now()
+        key = (window_end, midday, float(quantile), pv_series.fetched_at)
+        credit = self._cache_value if self._cache_key == key else None
+        if credit is None:
+            credit = await self._net(pv_series, window_end, midday, quantile)
+            if credit.failure is None:
+                self._cache_key = key
+                self._cache_value = credit
+        if (
+            credit.failure is None
+            and credit.fetched_at is not None
+            and (now - credit.fetched_at).total_seconds() > self._stale_after_s
+        ):
+            return _night_no_credit(REASON_FORECAST_STALE)
+        return credit
+
+    async def _net(self, pv_series: Any, window_end: Any, midday: Any, quantile: float) -> Any:
+        from energypod.application.night_charge import (
+            REASON_FORECAST_MISSING,
+            REASON_FORECAST_NO_LOAD_BASELINE,
+            CreditSlot,
+            MorningCredit,
+        )
+
+        slots = _pv_slots(pv_series, window_end, midday, quantile)
+        if not slots:
+            return _night_no_credit(REASON_FORECAST_MISSING)
+        if self._load is None:
+            return _night_no_credit(REASON_FORECAST_NO_LOAD_BASELINE)
+        try:
+            load_series = await self._load.load_forecast()
+        except Exception:
+            return _night_no_credit(REASON_FORECAST_NO_LOAD_BASELINE)
+        intervals = sorted(
+            (value.interval_start, value.interval_end, value.value)
+            for value in load_series.values
+        )
+        surplus_wh = 0.0
+        deficit_wh = 0.0
+        netted: list[Any] = []
+        for start, end, pv_w in slots:
+            load_w = _load_over(intervals, start, end)
+            if load_w is None:
+                # A9's pin: a single unavailable baseline slot fails the WHOLE
+                # morning span — no interpolation, no PV-only degrade.
+                return _night_no_credit(REASON_FORECAST_NO_LOAD_BASELINE)
+            slot_h = (end - start).total_seconds() / 3600.0
+            surplus_wh += max(0.0, pv_w - load_w) * slot_h
+            deficit_wh += max(0.0, load_w - pv_w) * slot_h
+            netted.append(CreditSlot(start=start, end=end, pv_w=pv_w, load_w=load_w))
+        quantiled = any(value.quantile == quantile for value in pv_series.values)
+        return MorningCredit(
+            e_surplus_kwh=surplus_wh / 1000.0,
+            e_deficit_kwh=deficit_wh / 1000.0,
+            slots=tuple(netted),
+            source=pv_series.source,
+            quantile=(quantile if quantiled else None),
+            fetched_at=pv_series.fetched_at,
+            issued_at=pv_series.issued_at,
+        )
+
+
+def _night_no_credit(failure: str) -> Any:
+    from energypod.application.night_charge import MorningCredit
+
+    return MorningCredit(
+        e_surplus_kwh=None,
+        e_deficit_kwh=None,
+        slots=(),
+        source=None,
+        quantile=None,
+        fetched_at=None,
+        issued_at=None,
+        failure=failure,
+    )
+
+
+def _pv_slots(
+    pv_series: Any, window_end: Any, midday: Any, quantile: float
+) -> list[tuple[Any, Any, float]]:
+    """The PV slice's slots covering [window_end, midday), or [] when the
+    span is not fully covered (a missing slot is no coverage, never a
+    zero)."""
+    values = [
+        value
+        for value in pv_series.values
+        if value.quantile == quantile or value.quantile is None
+    ]
+    if not any(value.quantile == quantile for value in values):
+        values = [value for value in values if value.quantile is None]
+    intervals = sorted(
+        (value.interval_start, value.interval_end, value.value) for value in values
+    )
+    covered_from = window_end
+    slots: list[tuple[Any, Any, float]] = []
+    for start, end, watts in intervals:
+        if end <= covered_from:
+            continue
+        if start > covered_from:
+            return []  # a gap inside the span: not covered
+        if start >= midday:
+            break
+        slot_end = min(end, midday)
+        slots.append((covered_from, slot_end, watts))
+        covered_from = slot_end
+        if covered_from >= midday:
+            return slots
+    return [] if covered_from < midday else slots
+
+
+def _load_over(
+    intervals: list[tuple[Any, Any, float]], start: Any, end: Any
+) -> float | None:
+    """The baseline's time-weighted mean load over [start, end), or None when
+    the baseline does not cover the span fully (A9's single-gap rule)."""
+    span_s = (end - start).total_seconds()
+    if span_s <= 0:
+        return 0.0
+    covered_s = 0.0
+    weighted = 0.0
+    for interval_start, interval_end, watts in intervals:
+        overlap_start = max(interval_start, start)
+        overlap_end = min(interval_end, end)
+        if overlap_end <= overlap_start:
+            continue
+        seconds = (overlap_end - overlap_start).total_seconds()
+        covered_s += seconds
+        weighted += watts * seconds
+    if covered_s < span_s - 1e-9:
+        return None
+    return float(weighted / span_s)
+
+
 def _announce_dev_credential_to_stdout(token: str) -> None:
     """The default startup sink: print the token once (API_CONTRACTS)."""
     print(f"energypod simulate: development principal bearer token: {token}")
@@ -1980,6 +2169,7 @@ class _Supervision:
         excess_controller: ExcessAdviserController | None = None,
         night_adviser: NightChargeAdviser | None = None,
         night_controller: NightChargeController | None = None,
+        night_trust: NightTrustLedger | None = None,
         intents: _AsyncIntentRepository | None = None,
         observations: _AsyncObservationRepository | None = None,
         recovery: RecoveryMonitor | None = None,
@@ -2011,6 +2201,7 @@ class _Supervision:
         # driven by the same suppressed step.
         self._night_adviser = night_adviser
         self._night_controller = night_controller
+        self._night_trust = night_trust
         # DESIGN_SCHEDULES §2: the schedule runner, ticked once per fleet
         # cycle AFTER the polls and BEFORE the adviser step (pinned below).
         self._schedule_runner = schedule_runner
@@ -2291,6 +2482,17 @@ class _Supervision:
                 # plus the firmware watchdog are the designed hand-back.
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(self._night_step(), timeout=self._interval_s)
+            if self._night_trust is not None:
+                # DESIGN_NIGHT_CHARGE_V2 section 3.2: one bounded, fully
+                # suppressed trust-evaluation step per fleet cycle (the
+                # historian's own pattern) — it acts only post-midday on
+                # mornings not yet scored, so the daily cost is one archive
+                # lookup most cycles, and a failure merely retries next
+                # cycle (the durable day record is score-once).
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        self._night_trust.evaluate_pending(), timeout=self._interval_s
+                    )
             if self._energy_accountant is not None:
                 # DESIGN_ENERGY_SCORECARD section 7: one bounded accounting
                 # tick per fleet cycle, beside the adviser-projection update
@@ -3469,6 +3671,49 @@ def _build_runtime(
             store=schedule_store,
             acknowledged_night_windows=audit_store.contains_event(SCHEDULE_NIGHT_ACK_EVENT_ID),
         )
+    # --- night trust ledger (DESIGN_NIGHT_CHARGE_V2 section 3.2) -----------
+    # Composed exactly when the night block runs a FORECAST posture with the
+    # historian available (the config validation guarantees the advisory
+    # stack; the environment may still omit a provider — the ledger itself
+    # never fetches, it scores archived mornings against the historian, so a
+    # missing provider only degrades the adviser's own target).  The durable
+    # store rides the existing database (schema v5/v6); the once-ever earned
+    # receipt boot-loads by keyed existence, exactly like the partition
+    # acknowledgement.
+    night_trust_ledger: NightTrustLedger | None = None
+    night_trust_store: SQLiteNightTrustRepository | InMemoryNightTrustRepository | None = None
+    night_forecast_posture = night_config is not None and night_config.target_policy != "full"
+    if night_forecast_posture and history_store is not None:
+        assert night_config is not None
+        night_trust_store = (
+            SQLiteNightTrustRepository(database)
+            if database is not None
+            else InMemoryNightTrustRepository()
+        )
+
+        def _morning_archive(day: Any) -> Any:
+            return night_trust_store.morning(day) if night_trust_store is not None else None
+
+        night_trust_ledger = NightTrustLedger(
+            unit_ids=tuple(unit.unit_id for unit in config.units),
+            timezone_name=night_config.timezone,
+            settings=TrustGateSettings(
+                required_days=int(night_config.trust.required_days),
+                tolerance_pct=float(night_config.trust.tolerance_pct),
+                max_overforecast_bias_pct=float(night_config.trust.max_overforecast_bias_pct),
+                max_underforecast_bias_pct=float(night_config.trust.max_underforecast_bias_pct),
+                min_regime_days=int(night_config.trust.min_regime_days),
+            ),
+            clock=resolved_clock,
+            store=night_trust_store,
+            history=history_store,
+            archive=_morning_archive,
+            audit=audit_port,
+            previously_earned=audit_store.contains_event(NIGHT_TRUST_EARNED_EVENT_ID),
+            process_instance_id=process_instance_id,
+            process_origin_mono=process_origin_mono,
+        )
+
     # --- night charge composition (DESIGN_NIGHT_CHARGE §3: block PRESENT) ---
     # Built BEFORE the facade (the facade projects and toggles through it)
     # and BEFORE the adviser (the adviser consumes its participation verdict
@@ -3477,6 +3722,10 @@ def _build_runtime(
     # from the durable store — one keyed existence check under the schedule
     # surface's own historical event id (either surface's capture counts);
     # an unacknowledged site composes SUSPENDED even with `enabled: true`.
+    def _night_trust_payload() -> dict[str, Any]:
+        assert night_trust_ledger is not None  # the guard is the call site's
+        return night_trust_ledger.snapshot().payload()
+
     night_controller: NightChargeController | None = None
     if night_config is not None:
         night_controller = NightChargeController(
@@ -3498,7 +3747,11 @@ def _build_runtime(
             acknowledged_partition=audit_store.contains_event(SCHEDULE_NIGHT_ACK_EVENT_ID),
             config_enabled=night_config.enabled,
             bus=bus,
+            target_policy=night_config.target_policy,
+            midday_local=parse_hhmm(night_config.midday_local),
+            trust_view=None if night_trust_ledger is None else _night_trust_payload,
         )
+
     # --- energy scorecard composition (DESIGN_ENERGY_SCORECARD sections 5-7) ---
     # Built BEFORE the facade (the facade projects through the control) and
     # composed exactly when the block is PRESENT.  The accountant consumes
@@ -3707,6 +3960,25 @@ def _build_runtime(
             tariff=registry_tariff,
             notes=tuple(registry_notes),
         )
+    # --- the night adviser's morning-credit port (V2 section 2.7) -----------
+    # The first forecast-CONSUMING adviser: its evaluation drives the PV
+    # fetch through the provider's own cache gate (the 2/day refresh budget
+    # stands; no scheduler task was added), and the netted result is cached
+    # per fetched_at so a 1.5 s tick cadence burns no historian reads.
+    night_morning_credit = None
+    if (
+        night_forecast_posture
+        and forecast_registry is not None
+        and forecast_registry.pv is not None
+        and forecast_registry.load is not None
+    ):
+        night_morning_credit = _RegistryMorningCredit(
+            pv=forecast_registry.pv,
+            load=forecast_registry.load,
+            clock=resolved_clock,
+            stale_after_s=float(providers_config.stale_after_s) if providers_config else 3600.0,
+        )
+
     # --- the forecast read surface (the registry's first consumer) ---------
     # The advisory doctrine keeps its shape: this is a READ surface only (the
     # console's GET /api/v1/forecast), never a fleet-loop slot -- the wire-leg
@@ -3903,8 +4175,34 @@ def _build_runtime(
                 principal=night_principal,
             )
 
+        def _night_trust_word() -> str:
+            assert night_trust_ledger is not None  # the guard is the call site's
+            return night_trust_ledger.snapshot().state
+
+        def _record_revision(window_date: Any, revised_at: Any) -> None:
+            if night_trust_store is not None:
+                with contextlib.suppress(Exception):
+                    night_trust_store.record_revision(window_date, revised_at)
+
+        def _archive_morning(morning: Any) -> None:
+            if night_trust_store is not None:
+                with contextlib.suppress(Exception):
+                    night_trust_store.record_morning(morning)
+
+        def _retarget_history(day: Any) -> tuple[datetime, ...]:
+            if night_trust_store is None:
+                return ()
+            revisions = night_trust_store.revisions(day)
+            return tuple(moment for moment in revisions if isinstance(moment, datetime))
+
         night_adviser = NightChargeAdviser(
             parked_units=_parked_units,
+            morning_credit=night_morning_credit,
+            trust_state=None if night_trust_ledger is None else _night_trust_word,
+            audit=audit_port,
+            revision_sink=_record_revision,
+            retarget_history=_retarget_history,
+            morning_archive_sink=_archive_morning,
             settings=NightChargeSettings(
                 rate_cap_w=int(night_config.rate_cap_w),
                 hold_rate_w=int(night_config.hold_rate_w),
@@ -3920,6 +4218,18 @@ def _build_runtime(
                 ),
                 timezone=night_config.timezone,
                 unit_ids=tuple(unit.unit_id for unit in config.units),
+                target_policy=night_config.target_policy,
+                forecast_quantile=float(night_config.forecast_quantile),
+                midday_local=parse_hhmm(night_config.midday_local),
+                floor_pct=float(night_config.floor_pct),
+                charge_efficiency=float(night_config.charge_efficiency),
+                retarget_threshold_pct=float(night_config.retarget_threshold_pct),
+                retarget_min_gap_min=int(night_config.retarget_min_gap_min),
+                stale_after_s=(
+                    float(providers_config.stale_after_s)
+                    if providers_config is not None
+                    else 3600.0
+                ),
             ),
             policy=policy,
             clock=resolved_clock,
@@ -3990,6 +4300,7 @@ def _build_runtime(
         excess_controller=excess_controller,
         night_adviser=night_adviser,
         night_controller=night_controller,
+        night_trust=night_trust_ledger,
         intents=intent_port,
         observations=observation_port,
         schedule_runner=schedule_runner,

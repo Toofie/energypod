@@ -20,7 +20,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Literal, cast
 
 RegimeBucket = Literal["low", "middle", "high"]
@@ -164,4 +164,94 @@ class NightTrustDayRecord:
         )
 
 
-__all__ = ["REGIME_BUCKETS", "NightTrustDayRecord", "RegimeBucket"]
+@dataclass(frozen=True, slots=True)
+class ArchivedMorning:
+    """The morning's archived forecast arithmetic (the machine-truth twin of
+    the ``night_target_set`` audit row's reconstruction payload).
+
+    Written once at window open by the night adviser; read back post-midday
+    by the trust ledger's evaluator.  ``window_end``/``midday`` are
+    timezone-aware instants (UTC-normalized on construction)."""
+
+    date: date
+    provider: str
+    target_policy: str
+    quantile: float | None
+    window_end: datetime
+    midday: datetime
+    e_surplus_forecast_kwh: float
+    e_deficit_kwh: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.date, date):
+            raise ValueError("date must be a civil date")
+        for name in ("provider", "target_policy"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(f"{name} must be a non-empty normalized string")
+        if self.quantile is not None:
+            quantile = _finite(self.quantile, "quantile")
+            if not 0.0 <= quantile <= 1.0:
+                raise ValueError("quantile must lie in [0.0, 1.0]")
+            object.__setattr__(self, "quantile", quantile)
+        for name in ("window_end", "midday"):
+            moment = getattr(self, name)
+            if not isinstance(moment, datetime) or moment.tzinfo is None:
+                raise ValueError(f"{name} must be a timezone-aware datetime")
+        if self.midday <= self.window_end:
+            raise ValueError("midday must sit strictly after window_end")
+        for name in ("e_surplus_forecast_kwh", "e_deficit_kwh"):
+            object.__setattr__(self, name, _finite(getattr(self, name), name))
+
+    def payload(self) -> dict[str, Any]:
+        """The JSON-native row."""
+        return {
+            "date": self.date.isoformat(),
+            "provider": self.provider,
+            "target_policy": self.target_policy,
+            "quantile": self.quantile,
+            "window_end": self.window_end.isoformat(),
+            "midday": self.midday.isoformat(),
+            "e_surplus_forecast_kwh": self.e_surplus_forecast_kwh,
+            "e_deficit_kwh": self.e_deficit_kwh,
+        }
+
+    @classmethod
+    def from_payload(cls, value: Mapping[str, Any]) -> ArchivedMorning:
+        keys = frozenset(
+            {
+                "date",
+                "provider",
+                "target_policy",
+                "quantile",
+                "window_end",
+                "midday",
+                "e_surplus_forecast_kwh",
+                "e_deficit_kwh",
+            }
+        )
+        actual = frozenset(value)
+        if actual != keys:
+            missing = sorted(keys - actual)
+            extra = sorted(actual - keys)
+            raise ValueError(
+                f"invalid archived morning keys; missing={missing}, extra={extra}"
+            )
+        return cls(
+            date=date.fromisoformat(str(value["date"])),
+            provider=str(value["provider"]),
+            target_policy=str(value["target_policy"]),
+            quantile=None if value["quantile"] is None else float(value["quantile"]),
+            window_end=datetime.fromisoformat(str(value["window_end"])),
+            midday=datetime.fromisoformat(str(value["midday"])),
+            e_surplus_forecast_kwh=float(value["e_surplus_forecast_kwh"]),
+            e_deficit_kwh=float(value["e_deficit_kwh"]),
+        )
+
+
+__all__ = [
+    "REGIME_BUCKETS",
+    "ArchivedMorning",
+    "NightTrustDayRecord",
+    "RegimeBucket",
+]

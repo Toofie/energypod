@@ -1127,7 +1127,12 @@ def test_the_event_payload_is_the_projection_minus_tick_bookkeeping() -> None:
     assert "last_tick_at" not in event
     # The §5 semantic tuple: participation facts, active, phase, the active
     # unit ids, the evidence word, the codes — never the watt/SOC figures.
+    # V2 (DESIGN_NIGHT_CHARGE_V2 §7) appends exactly two members: the target
+    # policy and the trust word (both constant/None under `full`, so a v1
+    # site publishes nothing new).
     semantic = state.semantic_tuple()
-    assert len(semantic) == 8
+    assert len(semantic) == 10
     assert semantic[0] is False  # enabled
     assert semantic[6] == "missing"  # demand_evidence
+    assert semantic[8] == "full"
+    assert semantic[9] is None

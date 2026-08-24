@@ -893,7 +893,7 @@ def test_history_schema_migrates_a_version_two_database_in_place(tmp_path: Path)
     """
     from energypod.db.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 5
+    assert SCHEMA_VERSION == 6
     path = tmp_path / "history-migrate.sqlite3"
     raw = sqlite3.connect(path)
     try:
@@ -914,7 +914,7 @@ def test_history_schema_migrates_a_version_two_database_in_place(tmp_path: Path)
         stamped = database.connection.execute(
             "SELECT version FROM schema_version WHERE singleton = 1"
         ).fetchone()
-        assert stamped == (5,)
+        assert stamped == (6,)
         assert database.connection.execute("SELECT COUNT(*) FROM energy_day").fetchone() == (1,)
         tables = {
             name
