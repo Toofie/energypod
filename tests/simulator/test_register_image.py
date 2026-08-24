@@ -184,6 +184,7 @@ class _ScriptedDevice:
         self.cell_base_mv = seeded["cell_base_mv"]
         self.temp_base_words = seeded["temp_base_words"]
         self.energy = seeded
+        self.debug_mode = 0  # the device boots in Normal (never parked here)
         self.charge_watt_seconds = 0.0
         self.discharge_watt_seconds = 0.0
         self.applied_active_w = 0
@@ -358,12 +359,17 @@ class _ScriptedDevice:
         return words
 
     def expected_identity_words(self) -> tuple[list[int], list[int], list[int]]:
-        """Debug, network, RTU-ID pair, and the device-parameters mirror."""
+        """Debug, network, RTU-ID pair, and the device-parameters mirror.
+
+        The debug block serves the device's debug-mode word (DESIGN_POD_PARKING
+        section 6; the hard-pinned [0] became the field in the same round).
+        This scenario never parks, so the word is the boot default 0.
+        """
         rtu_id = zlib.crc32(IDENTITY.encode("utf-8"))
         id_low, id_high = _low_first(rtu_id)
         parameters = [0] * DEVICE_PARAMETERS_COUNT
         parameters[4], parameters[5] = id_low, id_high  # mirror at 0x8102+4/+5
-        return [0], [id_low, id_high], parameters
+        return [self.debug_mode], [id_low, id_high], parameters
 
 
 async def _read_full_plan(transport: Any) -> dict[int, tuple[int, ...]]:

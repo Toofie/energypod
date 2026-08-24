@@ -7,6 +7,11 @@ monotonic clock:
 
 - applied ``0x0200`` ``[1, P, Q]`` objectives latch until the watchdog lease
   expires to idle, and every accepted write renews the lease;
+- the vendor debug-mode word (``0x8100`` readback, ``0x8000`` write) is a
+  device field: ``apply_debug_mode`` accepts only ``{0, 1}`` (DESIGN_POD_PARKING
+  section 6), and while parked the pod ACKs objective writes but delivers no
+  power, leaves the served objective words unchanged by an ignored write, and
+  touches no watchdog lease -- "ignored means ignored";
 - telemetry and cell sequences advance once per explicit :meth:`poll` step,
   with cell data refreshing on its own slower cadence;
 - every derived register value is a deterministic function of the injected
@@ -182,6 +187,16 @@ class SimulatedEnergyPod:
         self._applied_active_w = 0
         self._applied_reactive_var = 0
         self._lease_deadline_mono: float | None = None
+        # The vendor debug-mode word (DESIGN_POD_PARKING section 6): 0 Normal,
+        # 1 Standby, nothing else ever.  ``_scripted_debug_mode`` is the
+        # scenario hook's pending (value, at_s) transition, landed by the next
+        # poll that reaches ``at_s``; ``_parked_readback_words`` is the
+        # flip-hook echo of the last ignored write (absent by default -- the
+        # pinned-conservative readback leaves the served words unchanged).
+        self._debug_mode = 0
+        self._scripted_debug_mode: tuple[int, float] | None = None
+        self._parked_readback_shows_write = False
+        self._parked_readback_words: tuple[int, int] | None = None
         # Night-writer scenario hook (API_CONTRACTS "Night-writer detector"):
         # a FOREIGN served objective -- another writer's words on the detail
         # block, never latched through our own apply path.
@@ -245,6 +260,7 @@ class SimulatedEnergyPod:
         now = float(self._clock.monotonic())
         if now < self._last_poll_mono:
             raise ValueError("injected monotonic time moved backwards")
+        self._land_scripted_debug_mode(now)
         self._advance_device_state(now)
         self._telemetry_sequence += 1
         self._telemetry_captured_at_mono = now
@@ -261,16 +277,93 @@ class SimulatedEnergyPod:
         decoded into locals before any instance state changes, so a frame that
         fails on its last word leaves the latched objective, the watchdog
         lease, and every served register bit-for-bit unchanged.
+
+        While parked (DESIGN_POD_PARKING section 6, live-proven ACK-then-
+        ignore) a well-formed frame is still ACKed -- it returns normally --
+        but nothing latches: delivered power stays 0 through the rebuild, the
+        served objective words are UNCHANGED by the ignored write (unless the
+        ``script_parked_readback_shows_write`` flip hook is staging the other
+        fork side), and the watchdog lease is untouched.  Ignored means
+        ignored: mode changes what the PCS serves, never the wire protocol.
         """
         if len(frame) != 3 or type(frame[0]) is not int or frame[0] != _PQ_HEADER_WORD:
             raise ValueError("only the evidenced three-register PQ objective is applicable")
         active_w = protocol_codec.decode_signed16(frame[1])
         reactive_var = protocol_codec.decode_signed16(frame[2])
+        if self._debug_mode != 0:
+            # The ACK: the write is accepted on the wire and changes nothing.
+            if self._parked_readback_shows_write:
+                self._parked_readback_words = (
+                    protocol_codec.encode_signed16(active_w),
+                    protocol_codec.encode_signed16(reactive_var),
+                )
+                self._rebuild()
+            return
         lease_deadline_mono = float(self._clock.monotonic()) + self._watchdog_timeout_s
         self._applied_active_w = active_w
         self._applied_reactive_var = reactive_var
         self._lease_deadline_mono = lease_deadline_mono
         self._rebuild()
+
+    def apply_debug_mode(self, value: int) -> None:
+        """Apply one vendor debug-mode write: 0 (Normal) or 1 (Standby).
+
+        The transport-layer analog's refusal, at the device boundary: the
+        whitelist is ``{0, 1}`` and nothing else, ever (DESIGN_POD_PARKING
+        section 0 -- vendor values 2-6 are permanently unexposed).  A direct
+        application supersedes any pending scheduled transition and retires
+        the parked-echo words: the device word is what was just written.
+        """
+        self._debug_mode = _validated_debug_mode(value)
+        self._scripted_debug_mode = None
+        self._parked_readback_words = None
+        self._rebuild()
+
+    def script_debug_mode(self, value: int, at_s: float) -> None:
+        """Scenario hook: schedule the debug-mode word to change at ``at_s``.
+
+        The ``script_objective`` style, scheduled: the (validated) transition
+        is pending until the injected clock reaches ``at_s`` and lands at the
+        next :meth:`poll` -- the device model advances only through explicit
+        steps -- so a scenario parks (or resumes) mid-flight without
+        interleaving a direct call between the drive's steps.  A later call
+        replaces the pending transition.
+        """
+        mode = _validated_debug_mode(value)
+        if (
+            isinstance(at_s, bool)
+            or not isinstance(at_s, int | float)
+            or not math.isfinite(float(at_s))
+            or float(at_s) < 0.0
+        ):
+            raise ValueError("at_s must be a non-negative finite scripted time")
+        self._scripted_debug_mode = (mode, float(at_s))
+
+    def script_parked_readback_shows_write(self, enabled: bool = True) -> None:
+        """Scenario hook: stage the OTHER fork side of the parked readback.
+
+        The pinned-conservative default (DESIGN_POD_PARKING section 6) leaves
+        the served objective words UNCHANGED by an ignored write, because no
+        live evidence has shown what a parked pod serves at 0x1060+17/+18
+        after ACKing.  This hook flips exactly that readback half -- the
+        ignored write's pair is served -- while the delivery half (power stays
+        0) and the lease half (nothing latches, nothing renews) hold on both
+        sides.  Re-stage with ``enabled=False`` to return to the conservative
+        readback; the words fall back to the pod's own served pair.
+        """
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        self._parked_readback_shows_write = enabled
+        if not enabled:
+            self._parked_readback_words = None
+        self._rebuild()
+
+    def _land_scripted_debug_mode(self, now: float) -> None:
+        scheduled = self._scripted_debug_mode
+        if scheduled is not None and now >= scheduled[1]:
+            self._debug_mode = scheduled[0]
+            self._scripted_debug_mode = None
+            self._parked_readback_words = None
 
     def read(self, address: int, count: int) -> tuple[int, ...]:
         """Serve one register window; reads never advance device state."""
@@ -403,21 +496,28 @@ class SimulatedEnergyPod:
     def _advance_device_state(self, now: float) -> None:
         previous = self._last_poll_mono
         deadline = self._lease_deadline_mono
+        delivered_w = self._delivered_active_w()
         if deadline is not None and now >= deadline:
             # The load applied only until the lease expired; split the interval
             # so energy and SOC follow the actual applied-power history.
             live_seconds = max(0.0, min(now, deadline) - previous)
-            self._accumulate(self._applied_active_w, live_seconds)
+            self._accumulate(delivered_w, live_seconds)
             self._applied_active_w = 0
             self._applied_reactive_var = 0
             self._lease_deadline_mono = None
             self._accumulate(0, now - previous - live_seconds)
         else:
-            self._accumulate(self._applied_active_w, now - previous)
+            self._accumulate(delivered_w, now - previous)
         # The CT accumulators follow the SCRIPTED site conditions over the
         # whole interval, independent of any latched objective.
         self._accumulate_ct(now - previous)
         self._last_poll_mono = now
+
+    def _delivered_active_w(self) -> int:
+        """The power the PCS actually delivers: the applied objective, or 0
+        while parked -- a parked PCS control path moves no power regardless of
+        what any writer keeps writing (the live 2026-08-24 standby cycle)."""
+        return 0 if self._debug_mode != 0 else self._applied_active_w
 
     def _accumulate_ct(self, seconds: float) -> None:
         """Accumulate the scripted per-pod CT words into the grid/load pairs.
@@ -471,17 +571,20 @@ class SimulatedEnergyPod:
         pack_voltage_counts = self._pack_voltage_counts()
         applied_active_word = protocol_codec.encode_signed16(self._applied_active_w)
         applied_reactive_word = protocol_codec.encode_signed16(self._applied_reactive_var)
+        # Measured/delivered words carry the DELIVERED power (0 while parked),
+        # never the latched objective a parked PCS is ignoring.
+        measured_word = protocol_codec.encode_signed16(self._delivered_active_w())
         pack_current_word = protocol_codec.encode_signed16(
-            self._pack_current_counts(pack_voltage_counts)
+            self._pack_current_counts(pack_voltage_counts, self._delivered_active_w())
         )
-        self._rebuild_system_block(pack_voltage_counts, pack_current_word, applied_active_word)
-        self._rebuild_pcs_live_block(pack_voltage_counts, applied_active_word)
+        self._rebuild_system_block(pack_voltage_counts, pack_current_word, measured_word)
+        self._rebuild_pcs_live_block(pack_voltage_counts, measured_word)
         self._rebuild_fault_blocks()
         self._rebuild_pcs_detail_block(applied_active_word, applied_reactive_word)
-        self._rebuild_dcdc_live_block(pack_voltage_counts, applied_active_word)
+        self._rebuild_dcdc_live_block(pack_voltage_counts, measured_word)
         self._rebuild_dcdc_detail_block()
         self._rebuild_totals_block()
-        self._rebuild_bms_block(pack_voltage_counts, pack_current_word, applied_active_word)
+        self._rebuild_bms_block(pack_voltage_counts, pack_current_word, measured_word)
         self._rebuild_cell_blocks()
         self._rebuild_identity_blocks()
 
@@ -534,11 +637,17 @@ class SimulatedEnergyPod:
         words[0] = 0  # debug status readback: normal mode
         # The served objective words: the night-writer scenario's FOREIGN pair
         # overrides the applied pair while scripted (the external writer's
-        # words are what the wire serves); otherwise the pod's own.
+        # words are what the wire serves); then, while parked, the flip hook's
+        # echo of the last ignored write (DESIGN_POD_PARKING section 6 -- the
+        # conservative default leaves these words unchanged); otherwise the
+        # pod's own.
         scripted = self._scripted_objective
+        parked_echo = self._parked_readback_words if self._debug_mode != 0 else None
         active_word, reactive_word = (
             (scripted[0], scripted[1])
             if scripted is not None
+            else parked_echo
+            if parked_echo is not None
             else (applied_active_word, applied_reactive_word)
         )
         words[17] = active_word & 0xFFFF  # active power objective, int16 W
@@ -648,7 +757,9 @@ class SimulatedEnergyPod:
 
     def _rebuild_identity_blocks(self) -> None:
         id_low, id_high = self._low_first_words(self._rtu_id)
-        self._blocks[_DEBUG_MODE_BASE] = [0]  # debug mode readback: normal mode
+        # The debug-mode readback serves the device's own mode word (written
+        # at the vendor's asymmetric 0x8000 address; DESIGN_POD_PARKING 6).
+        self._blocks[_DEBUG_MODE_BASE] = [self._debug_mode]
         self._blocks[_NETWORK_STATUS_BASE] = [0]
         self._blocks[_RTU_ID_BASE] = [id_low, id_high]
         parameters = [0] * 56
@@ -682,11 +793,11 @@ class SimulatedEnergyPod:
         # Pack voltage is x0.1 V counts derived from the series cell sum.
         return max(1, round(sum(self._cell_millivolts) / 100))
 
-    def _pack_current_counts(self, pack_voltage_counts: int) -> int:
+    def _pack_current_counts(self, pack_voltage_counts: int, delivered_w: int) -> int:
         volts = pack_voltage_counts / 10.0
         if volts <= 0.0:
             return 0
-        return round(self._applied_active_w / volts * 10.0)
+        return round(delivered_w / volts * 10.0)
 
     def _charge_energy_counts(self) -> int:
         counts = self._charge_base_counts + int(self._charge_watt_seconds / _WATT_SECONDS_PER_COUNT)
@@ -714,6 +825,20 @@ def _positive_finite(value: object) -> bool:
         return False
     number = float(value)
     return math.isfinite(number) and number > 0.0
+
+
+def _validated_debug_mode(value: object) -> int:
+    """The debug-mode whitelist, shared by the device model and its transport.
+
+    ``{0, 1}`` and nothing else, ever (DESIGN_POD_PARKING section 0): 0 is
+    Normal and 1 is Standby -- the live-proven pair of the 2026-08-24 rhs
+    standby cycle -- while the vendor values 2-6 (Charge, Discharge,
+    Circulation, Fixing SOC, Verify Capacity) are permanently unexposed and
+    every other shape is refused before any device state is consulted.
+    """
+    if type(value) is not int or value not in (0, 1):
+        raise ValueError("debug mode accepts only 0 (Normal) or 1 (Standby)")
+    return value
 
 
 def _index_of_max(values: list[int]) -> int:

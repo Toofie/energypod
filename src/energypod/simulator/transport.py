@@ -5,7 +5,11 @@
 `SimulatedEnergyPod` and enforces the production write gate: only the
 evidenced three-register ``[1, P, Q]`` objective at ``0x0200`` is writable and
 every other write is refused before the device is touched (ADR-0003 decision
-D4).  It never opens a socket: exact Waveshare on-wire framing is an
+D4).  The sanctioned vendor debug-mode word is the one named addition
+(DESIGN_POD_PARKING section 5): ``write_debug_mode(value)`` mirrors the
+production transport's separately named method -- the generic
+``write_registers`` gate stays byte-identical and can never reach ``0x8000``.
+It never opens a socket: exact Waveshare on-wire framing is an
 unverified-evidence commissioning capture item and must not be simulated as
 if known.
 """
@@ -14,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from .pod import SimulatedEnergyPod
+from .pod import SimulatedEnergyPod, _validated_debug_mode
 
 _PQ_WRITE_ADDRESS = 0x0200
 _PQ_FRAME_LENGTH = 3
@@ -51,6 +55,20 @@ class SimulatorTransport:
         frame = _validated_pq_frame(address, values)
         self._ensure_connected()
         self._pod.apply_pq_frame(frame)
+
+    async def write_debug_mode(self, value: int) -> None:
+        """Write the sanctioned vendor debug-mode word (0x8000 <- value).
+
+        The named method the production transport grew for pod parking
+        (DESIGN_POD_PARKING section 5, item 1): the value is validated against
+        the ``{0, 1}`` whitelist BEFORE any connection or device state is
+        consulted -- the ``_validated_pq_frame`` ordering -- and the generic
+        ``write_registers`` gate stays byte-identical, so only this method can
+        ever reach the debug register.
+        """
+        mode = _validated_debug_mode(value)
+        self._ensure_connected()
+        self._pod.apply_debug_mode(mode)
 
     async def close(self) -> None:
         self._closed = True
