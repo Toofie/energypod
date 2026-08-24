@@ -32,6 +32,7 @@ from energypod.domain.history import (
     parse_history_timestamp,
 )
 from energypod.domain.intents import Direction, IntentSource
+from energypod.domain.night_trust import NightTrustDayRecord
 from energypod.domain.observations import UnitLifecycle
 from energypod.domain.parking import ParkLease, ParkLeaseEpochConflict
 from energypod.domain.schedule import (
@@ -964,9 +965,107 @@ class SQLiteEnergyLedgerRepository:
         )
 
 
+class SQLiteNightTrustRepository:
+    """The durable night-trust day store (DESIGN_NIGHT_CHARGE_V2 section 3.2).
+
+    One row per SCORED morning, keyed by the civil date of the morning (the
+    energy-day precedent: the first record for a date stands, because the
+    evaluator scores a morning exactly once).  ``latest_records`` returns
+    newest-first within the caller's bound and ``record_count`` serves the
+    gate's all-time ``days_scored`` display.
+    """
+
+    def __init__(self, database: SQLiteDatabase) -> None:
+        self._database = database
+        try:
+            with database.lock:
+                database.connection.execute(
+                    """CREATE TABLE IF NOT EXISTS night_trust_day (
+                        day TEXT PRIMARY KEY,
+                        payload TEXT NOT NULL
+                    )"""
+                )
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError(
+                    "night trust database is busy during initialization"
+                ) from exc
+            raise
+
+    def record_day(self, record: NightTrustDayRecord) -> None:
+        if type(record) is not NightTrustDayRecord:
+            raise TypeError("record must be a NightTrustDayRecord")
+        payload = json.dumps(
+            record.payload(), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        day = record.date.isoformat()
+        try:
+            with self._database.lock:
+                connection = self._database.connection
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    # The first record for a morning stands (score-once).
+                    connection.execute(
+                        "INSERT INTO night_trust_day(day, payload) VALUES (?, ?)"
+                        " ON CONFLICT(day) DO NOTHING",
+                        (day, payload),
+                    )
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("night trust day database is busy") from exc
+            raise
+
+    def get_day(self, day: date) -> NightTrustDayRecord | None:
+        if type(day) is not date:
+            raise TypeError("day must be a civil date")
+        try:
+            with self._database.lock:
+                row = self._database.connection.execute(
+                    "SELECT payload FROM night_trust_day WHERE day = ?", (day.isoformat(),)
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("night trust day database is busy") from exc
+            raise
+        return None if row is None else NightTrustDayRecord.from_payload(
+            _load_json_object(row[0])
+        )
+
+    def latest_records(self, limit: int) -> tuple[NightTrustDayRecord, ...]:
+        if type(limit) is not int or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        if limit == 0:
+            return ()
+        try:
+            with self._database.lock:
+                rows = self._database.connection.execute(
+                    "SELECT payload FROM night_trust_day ORDER BY day DESC LIMIT ?", (limit,)
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("night trust day database is busy") from exc
+            raise
+        return tuple(NightTrustDayRecord.from_payload(_load_json_object(row[0])) for row in rows)
+
+    def record_count(self) -> int:
+        try:
+            with self._database.lock:
+                row = self._database.connection.execute(
+                    "SELECT COUNT(*) FROM night_trust_day"
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("night trust day database is busy") from exc
+            raise
+        return int(row[0])
+
+
 class SQLiteTelemetryHistoryRepository:
     """The durable plant-history store (DESIGN_PLANT_HISTORY sections 2.2-2.4).
-
     ``telemetry_sample`` holds the append-only sample rows keyed
     ``(unit_id, sampled_at)``; ``telemetry_rollup_hourly`` holds the hourly
     projections keyed ``(unit_id, hour_start)``.  Both tables are created by

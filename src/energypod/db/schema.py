@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-SCHEMA_VERSION: Final[int] = 4
+SCHEMA_VERSION: Final[int] = 5
 BASELINE_VERSION: Final[int] = 0
 
 _CREATE_VERSION_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS schema_version (
@@ -126,6 +126,15 @@ _CREATE_PARK_LEASE_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS park_leases
     write_unverified INTEGER NOT NULL DEFAULT 0,
     foreign_rewrite INTEGER NOT NULL DEFAULT 0
 )"""
+# DESIGN_NIGHT_CHARGE_V2 section 3.2: the per-day durable trust records --
+# one row per SCORED morning (the energy_day precedent: the civil date is the
+# key, the payload is the record's whole JSON).  Excluded days (full-posture
+# mornings, fallback nights, incomplete historian records) deliberately
+# leave NO row: they fail to inform, never to pass.
+_CREATE_NIGHT_TRUST_DAY_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS night_trust_day (
+    day TEXT PRIMARY KEY,
+    payload TEXT NOT NULL
+)"""
 
 
 @dataclass(frozen=True)
@@ -154,7 +163,9 @@ class MigrationResult:
 # existing table.  Version 4 adds the pod-parking lease table
 # (DESIGN_POD_PARKING section 4): park_leases keyed by unit, written in the
 # same transaction boundary as the parking audit append -- again an
-# in-place upgrade that touches no existing table.
+# in-place upgrade that touches no existing table.  Version 5 adds the
+# night-charge trust day table (DESIGN_NIGHT_CHARGE_V2 section 3.2):
+# night_trust_day keyed by civil date, one payload per scored morning.
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, statements=(_CREATE_VERSION_TABLE,)),
     Migration(
@@ -166,6 +177,7 @@ MIGRATIONS: tuple[Migration, ...] = (
         statements=(_CREATE_TELEMETRY_SAMPLE_TABLE, _CREATE_TELEMETRY_ROLLUP_TABLE),
     ),
     Migration(version=4, statements=(_CREATE_PARK_LEASE_TABLE,)),
+    Migration(version=5, statements=(_CREATE_NIGHT_TRUST_DAY_TABLE,)),
 )
 
 

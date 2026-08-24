@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from datetime import datetime, timedelta
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
@@ -59,6 +60,14 @@ class AuditEvent(BaseModel):
     response_fingerprint: str
     result: str
     lifecycle: UnitLifecycle
+    # Advisory rows with reconstruction value (the night-v2 wave, 2026-08-24:
+    # the night adviser's ``night_target_set`` archive and the trust ledger's
+    # daily evaluations): a free-form but JSON-native payload whose DATA is
+    # the row's point -- a later decision replays from it.  Null on every
+    # control-decision row ever written: the field is additive, and durable
+    # rows from before it decode with the null default (the known-optional
+    # omission rule).
+    payload: Mapping[str, Any] | None = None
 
     @field_validator("observation_sequences")
     @classmethod
@@ -162,3 +171,12 @@ class AuditEvent(BaseModel):
         if any(not code or code != code.strip() for code in value):
             raise ValueError("reason codes must be normalized")
         return value
+
+    @field_validator("payload")
+    @classmethod
+    def _freeze_payload(cls, value: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+        if value is None:
+            return None
+        if any(type(key) is not str or not key for key in value):
+            raise ValueError("payload keys must be non-empty strings")
+        return _FrozenStringMapping(dict(value))

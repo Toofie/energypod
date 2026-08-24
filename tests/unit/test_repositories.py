@@ -887,13 +887,13 @@ def test_history_schema_migrates_a_version_two_database_in_place(tmp_path: Path)
     """DESIGN_PLANT_HISTORY section 2.2 / schema_version 3 migration in place.
 
     A database stamped at version 2 (the energy-ledger schema, with live rows)
-    upgrades in place: the stamped version becomes the latest (v4 -- the
-    parking lease table rode v4), the energy ledger rows are untouched, and
+    upgrades in place: the stamped version becomes the latest (v5 -- the
+    night-trust day table rode v5), the energy ledger rows are untouched, and
     both history tables exist.
     """
     from energypod.db.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     path = tmp_path / "history-migrate.sqlite3"
     raw = sqlite3.connect(path)
     try:
@@ -914,7 +914,7 @@ def test_history_schema_migrates_a_version_two_database_in_place(tmp_path: Path)
         stamped = database.connection.execute(
             "SELECT version FROM schema_version WHERE singleton = 1"
         ).fetchone()
-        assert stamped == (4,)
+        assert stamped == (5,)
         assert database.connection.execute("SELECT COUNT(*) FROM energy_day").fetchone() == (1,)
         tables = {
             name

@@ -102,6 +102,9 @@ def assert_audit(rig: Any, expected: Mapping[str, Any]) -> None:
         response_fingerprint=fingerprint({"result": expected["result"]}),
         result=expected["result"],
         lifecycle=expected["lifecycle"],
+        # Facade rows carry no free-form payload (the night-v2 advisory-row
+        # field stays null on every control-path event).
+        payload=None,
     )
 
 

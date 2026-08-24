@@ -22,6 +22,7 @@ from energypod.domain.history import (
     parse_history_timestamp,
 )
 from energypod.domain.history import worst_quality as worst_of
+from energypod.domain.night_trust import NightTrustDayRecord
 from energypod.domain.parking import ParkLease, ParkLeaseEpochConflict
 
 
@@ -75,6 +76,39 @@ class InMemoryEnergyLedgerRepository:
 
         if type(day) is not _date:
             raise TypeError("day must be a civil date")
+
+
+class InMemoryNightTrustRepository:
+    """Process-local night-trust days (DESIGN_NIGHT_CHARGE_V2 section 3.2).
+
+    The simulator/memory twin of ``SQLiteNightTrustRepository``: one record
+    per scored morning, first-write-wins by civil date, newest-first reads.
+    """
+
+    def __init__(self) -> None:
+        self._records: dict[Any, NightTrustDayRecord] = {}
+        self._lock = RLock()
+
+    def record_day(self, record: NightTrustDayRecord) -> None:
+        if type(record) is not NightTrustDayRecord:
+            raise TypeError("record must be a NightTrustDayRecord")
+        with self._lock:
+            self._records.setdefault(record.date, record)
+
+    def get_day(self, day: Any) -> NightTrustDayRecord | None:
+        with self._lock:
+            return self._records.get(day)
+
+    def latest_records(self, limit: int) -> tuple[NightTrustDayRecord, ...]:
+        if type(limit) is not int or limit < 0:
+            raise ValueError("limit must be a non-negative integer")
+        with self._lock:
+            days = sorted(self._records, reverse=True)[:limit]
+            return tuple(self._records[day] for day in days)
+
+    def record_count(self) -> int:
+        with self._lock:
+            return len(self._records)
 
 
 class InMemoryParkLeaseRepository:

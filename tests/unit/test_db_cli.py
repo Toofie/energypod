@@ -319,9 +319,9 @@ def _no_temporary_files(directory: Path) -> list[str]:
 
 def test_schema_version_is_stamped_from_day_one(tmp_path: Path) -> None:
     """Opening a fresh database stamps the latest known version before
-    anything else runs (version 4 added the pod-parking lease table)."""
+    anything else runs (version 5 added the night-trust day table)."""
     _require_contract()
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     database = SQLiteDatabase(tmp_path / "controller.sqlite3")
     database.open()
     try:
@@ -334,6 +334,7 @@ def test_schema_version_is_stamped_from_day_one(tmp_path: Path) -> None:
             "telemetry_sample",
             "telemetry_rollup_hourly",
             "park_leases",
+            "night_trust_day",
         ):
             present = connection.execute(
                 "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?", (table,)
