@@ -308,6 +308,16 @@ Known environment state:
 - Node 24.19.0 exists; npm is broken due a missing user-level npm CLI. Corepack
   works and should invoke pinned pnpm.
 - Docker is not installed in this environment.
+- LONG-LIVED SERVICES LAUNCH FROM THE MAIN SESSION ONLY. Subagent task
+  shells reap their children at lifecycle end. Observed 2026-08-24: a
+  subagent-backgrounded controller (build 366abe1, running clean) was
+  killed silently by backgrounded-child cleanup minutes after launch —
+  backgrounded-child cleanup killed a subagent-launched controller; pods
+  self-managed; no controller defect (clean log, all requests 200, no
+  traceback) — leaving :8080 dark ~3.5 h (10:52–14:13) until the
+  main-session restart. A main-session-launched controller survives its
+  launcher shell exiting (the historical pattern); :8080 ownership stays
+  with the main session.
 - The repository is owned by a different Windows account (Codex sandbox). Git
   requires `git config --global --add safe.directory
   C:/Users/vagrant/Downloads/EnergyPod/pod-manager` before any git command.
