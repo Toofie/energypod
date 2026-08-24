@@ -21,10 +21,11 @@
  *   doctrine): the fullest word that fits the band's measured pixels, a
  *   shorter honest word when only that fits, and no word when even the
  *   shortest cannot — the commanded bar carries the SOURCE's short words
- *   (never the full clause). The change-point listing stays the row's
- *   ACCESSIBLE surface while its ink narrows to exactly the bare slivers:
- *   a worded segment's item rides off the page, a bare band's clause prints
- *   beneath the bar, and an unmeasured DOM prints nothing (no flash).
+ *   (never the full clause). The change-point listing is the row's ACCESSIBLE
+ *   surface and NEVER inks: three operator rounds settled that text after
+ *   the bars reads as raw duplicated data, so the whole list rides off the
+ *   page in every regime — bare bands included — and the detail view is the
+ *   band's own tooltip.
  * - RANGE SWITCHING re-queries with the new preset's window.
  * - A FAILED REFRESH KEEPS THE LAST WINDOW (never a blank flash), with the
  *   refusal surfaced above it.
@@ -411,13 +412,13 @@ describe("History view — the archaeology strip", () => {
     expect(strip.textContent ?? "").toContain("nothing commanded");
   });
 
-  it("keeps every segment's clause in the accessible listing — ink only where a band cannot word", async () => {
+  it("keeps every segment's clause in the accessible listing — off the page in every regime", async () => {
     await landStrip();
     const t1 = localTime(Date.parse("2026-08-24T00:00:30+00:00"));
     const t2 = localTime(Date.parse("2026-08-24T00:02:00+00:00"));
     const t3 = localTime(Date.parse("2026-08-24T04:00:00+00:00"));
     // The listing is the accessibility surface: one list per row, named,
-    // every segment worded with its time — off the page or not.
+    // every segment worded with its time — announced, never inked.
     const lifecycleList = screen.getByLabelText("Lifecycle");
     expect(within(lifecycleList).getAllByRole("listitem")).toHaveLength(1);
     expect(lifecycleList.textContent).toBe(`Disarmed since ${t1}`);
@@ -430,16 +431,16 @@ describe("History view — the archaeology strip", () => {
       `the night-charge adviser — charging 2,500 W ${t2}–${t3}`,
       `nothing commanded since ${t3}`,
     ]);
-    // The unmeasured test DOM words every band with its FULLEST tier (the
-    // fitting doctrine's ignorance fallback), so nothing counts as bare and
-    // every row's whole listing rides off the page: the row is just its bar,
-    // and the duplicated raw text never prints — with every item worded, the
-    // per-item offpage class agrees all the way down.
+    // The ink verdict held across three operator rounds: text after the bars
+    // reads as raw duplicated data (a flapping health night printed sixty
+    // clauses). The list wears the offpage class unconditionally — no regime,
+    // measured or not, ever prints it — and no item carries a class of its
+    // own: the bar is the visual instrument, the tooltip the detail view.
     for (const name of ["Lifecycle", "Health", "Commanded"]) {
       expect(screen.getByLabelText(name).className).toContain("history-strip-listing--offpage");
     }
     for (const item of within(commandedList).getAllByRole("listitem")) {
-      expect(item.className).toBe("history-strip-listing--offpage");
+      expect(item.className).toBe("");
     }
   });
 
@@ -572,28 +573,20 @@ describe("History view — the archaeology strip", () => {
       // accessible surface — still carries every segment, fitted bands or not.
       expect(bandLabels(".history-bands--lifecycle")).toEqual(["Disarmed"]);
       expect(bandLabels(".history-bands--health")).toEqual(["Healthy"]);
-      // The ink decision rides the SAME fit: the bare 90-second opening
-      // sliver is the one clause printed beneath the bar (worded with its
-      // time), while its worded siblings stay in the list, off the page —
-      // the bar already says them.
+      // The listing stays off the page in EVERY regime — the bare sliver
+      // included: the bar is the whole visual story, and the bare band's
+      // clause lives on its tooltip and in the accessibility tree, never in
+      // a printed line after the bar.
       const commandedList = screen.getByLabelText("Commanded");
-      expect(commandedList.className).toBe("history-strip-listing");
+      expect(commandedList.className).toContain("history-strip-listing--offpage");
       const items = within(commandedList).getAllByRole("listitem");
       expect(items).toHaveLength(3);
-      expect(items[0]?.className).toBe("");
       expect(items[0]?.textContent).toMatch(/^Nothing commanded until /);
-      expect(items[1]?.className).toBe("history-strip-listing--offpage");
-      expect(items[2]?.className).toBe("history-strip-listing--offpage");
-      // A fully-worded row prints nothing beneath itself at all.
-      expect(screen.getByLabelText("Lifecycle").className).toContain(
-        "history-strip-listing--offpage",
-      );
-      expect(screen.getByLabelText("Health").className).toContain(
-        "history-strip-listing--offpage",
-      );
-      // And the ALL-BARE regime (a 20 px row): every clause inks, no item
-      // goes offpage — the listing is the row's whole voice when no band
-      // can carry a word.
+      for (const item of items) {
+        expect(item.className).toBe("");
+      }
+      // And the ALL-BARE regime (a 20 px row): every band goes wordless, and
+      // STILL nothing prints beneath the bar — the row is its bar alone.
       observers.forEach((fire) => {
         fire(20);
       });
@@ -602,9 +595,11 @@ describe("History view — the archaeology strip", () => {
       });
       const narrowItems = within(screen.getByLabelText("Commanded")).getAllByRole("listitem");
       expect(narrowItems.map((item) => item.className)).toEqual(["", "", ""]);
-      expect(screen.getByLabelText("Lifecycle").className).not.toContain(
-        "history-strip-listing--offpage",
-      );
+      for (const name of ["Lifecycle", "Health", "Commanded"]) {
+        expect(screen.getByLabelText(name).className).toContain(
+          "history-strip-listing--offpage",
+        );
+      }
     } finally {
       offsetWidth.mockRestore();
       vi.unstubAllGlobals();
@@ -616,17 +611,13 @@ describe("History view — the archaeology strip", () => {
     const explainer = screen.getByText(/Lifecycle is the state the controller held/);
     expect(explainer.textContent ?? "").toContain("recovery monitor's judgment");
     expect(explainer.textContent ?? "").toContain("what this console asked");
-    // The where-the-facts-live sentence: word on the band, clause + times in
-    // the line beneath exactly where a band cannot word, full sentence +
-    // times on the tooltip — said once, so the sparse ink needs no legend.
+    // The where-the-facts-live sentence: word on the band, full sentence +
+    // times on the tooltip — said once, because nothing else prints.
     expect(explainer.textContent ?? "").toContain(
       "Each band carries the fullest word its width holds",
     );
     expect(explainer.textContent ?? "").toContain(
-      "a segment too narrow for any word is named, with its times, in the line beneath the bar",
-    );
-    expect(explainer.textContent ?? "").toContain(
-      "every segment's full sentence and times ride its band's tooltip",
+      "hover any band for its full sentence and times",
     );
     // DESIGN_PLANT_HISTORY §6, said where the operator reads it.
     expect(explainer.textContent ?? "").toContain("30-second sampled view");

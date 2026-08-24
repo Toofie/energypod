@@ -562,8 +562,8 @@ function UnitSection({
 
       {/* THE ARCHAEOLOGY STRIP — the step series under the charts: what the
           unit was, how it was judged, and what WE commanded, as held bands
-          whose every word also survives for the screen reader — and in ink
-          beneath the bar exactly where a band cannot carry a word. */}
+          whose every word also survives for the screen reader (the offpage
+          listing) and for the hovering operator (every band's tooltip). */}
       <StepStrip unit={unit} window={window} multiDay={multiDay} />
 
       {/* The secondary group: cells and temperature — the homeowner scans
@@ -608,16 +608,16 @@ function UnitSection({
 }
 
 // ---------------------------------------------------------------------------
-// the archaeology strip (fitted bands; ink beneath only where they cannot word)
+// the archaeology strip (fitted bands; the listing is assistive-tech-only)
 // ---------------------------------------------------------------------------
 
 /** The strip's one muted explainer: what each row asserts, where each fact
- * lives now that the bar speaks for itself (word on the band where it fits,
- * clause + times in the line beneath where it cannot, the full sentence +
- * times on every band's tooltip), plus the design's §6 caveat (the sampled
- * view versus the audit trail) said where it counts. */
+ * lives now that the bar is the whole visual story (word on the band where
+ * it fits, the full sentence + times on every band's tooltip), plus the
+ * design's §6 caveat (the sampled view versus the audit trail) said where it
+ * counts. */
 const STRIP_EXPLAINER_TEXT =
-  "Lifecycle is the state the controller held; health is the recovery monitor's judgment; commanded is what this console asked of the battery. Each band carries the fullest word its width holds; a segment too narrow for any word is named, with its times, in the line beneath the bar; every segment's full sentence and times ride its band's tooltip. The strip is a 30-second sampled view — where it disagrees with the audit trail, the audit row is the record.";
+  "Lifecycle is the state the controller held; health is the recovery monitor's judgment; commanded is what this console asked of the battery. Each band carries the fullest word its width holds; hover any band for its full sentence and times. The strip is a 30-second sampled view — where it disagrees with the audit trail, the audit row is the record.";
 
 function StepStrip({
   unit,
@@ -739,17 +739,15 @@ function StripRow({ label, children }: { label: string; children: JSX.Element })
 
 /**
  * One strip row's two halves: the proportional bands (visual, labels fitted
- * to measured pixels, fuller sentence + instants on the tooltip) and, under
- * them, the change-point listing — the row's ACCESSIBLE surface, one item
- * per segment in the gap-notes rhythm, every segment's word and time in the
- * accessibility tree. The listing's INK is sparse by doctrine: an item whose
- * band carries its word rides off the page (the bar already says it — the
- * duplicated raw text this layout removes), and an item whose band could not
- * fit even its shortest word prints with its times — the one fact the bar
- * refused to draw. Until the bands report a fit (and wherever widths cannot
- * be measured at all) every band renders its FULLEST tier, so nothing counts
- * as bare and the whole listing rides off the page: ink appears only by a
- * measured refusal, never by ignorance, never as a flash that then hides.
+ * to measured pixels, fuller sentence + instants on the tooltip) and the
+ * change-point listing — the row's ACCESSIBLE surface, one item per segment
+ * in the gap-notes rhythm, every segment's word and time announced to
+ * assistive tech and NEVER inked on paper. The listing spent three rounds as
+ * a visible line under the bar; the operator's verdict was the same each
+ * time — text after the bars reads as raw duplicated data, and a night of
+ * health flapping (60+ alternations) printed it as a wall. The bar is the
+ * visual instrument now; the tooltip is the detail view; the listing is the
+ * accessibility tree's copy, off the page for good.
  */
 function StripSegments({
   segments,
@@ -770,45 +768,13 @@ function StripSegments({
 }): JSX.Element {
   const time = multiDay ? localDayTime : localTime;
   const name = tone === "lifecycle" ? "Lifecycle" : tone === "health" ? "Health" : "Commanded";
-  // The bands' fitted labels, reported up before paint (StripBands). Null =
-  // no fit has answered for THIS segment set: nothing counts as bare and the
-  // listing stays off the page (the unmeasured fallback words every band).
-  const [fittedLabels, setFittedLabels] = useState<readonly string[] | null>(null);
-  const onFitted = useCallback((labels: readonly string[]): void => {
-    setFittedLabels(labels);
-  }, []);
   const listings = segmentListingItems(segments, multiDay);
-  const measured = fittedLabels !== null && fittedLabels.length === listings.length;
-  const anyInk = measured && fittedLabels.some((label) => label === "");
   return (
     <>
-      <StripBands
-        segments={segments}
-        span={span}
-        windowFrom={windowFrom}
-        tone={tone}
-        time={time}
-        onFitted={onFitted}
-      />
-      <ul
-        className={
-          anyInk
-            ? "history-strip-listing"
-            : "history-strip-listing history-strip-listing--offpage"
-        }
-        aria-label={name}
-      >
+      <StripBands segments={segments} span={span} windowFrom={windowFrom} tone={tone} time={time} />
+      <ul className="history-strip-listing history-strip-listing--offpage" aria-label={name}>
         {listings.map((item, index) => (
-          <li
-            key={index}
-            className={
-              measured && fittedLabels !== null && fittedLabels[index] !== ""
-                ? "history-strip-listing--offpage"
-                : undefined
-            }
-          >
-            {item}
-          </li>
+          <li key={index}>{item}</li>
         ))}
       </ul>
     </>
@@ -823,11 +789,10 @@ function StripSegments({
  * shows the fullest tier that fits — a shorter honest word when only that
  * fits, and NO word when even the shortest cannot (a 12-minute spell in a
  * 16-hour window is a sliver; an ellipsis mid-word there reads as an error,
- * and the segment still lives in the tooltip and the accessible listing —
- * with its clause in ink beneath the bar exactly then). Where widths cannot
- * be measured at all (a canvas-less test DOM whose boxes report 0), the
- * fullest tier renders — a word is suppressed only by a measured refusal,
- * never by ignorance (see `fittingBandLabel`).
+ * and the segment still lives in its tooltip and the offpage listing). Where
+ * widths cannot be measured at all (a canvas-less test DOM whose boxes
+ * report 0), the fullest tier renders — a word is suppressed only by a
+ * measured refusal, never by ignorance (see `fittingBandLabel`).
  */
 function StripBands({
   segments,
@@ -835,18 +800,12 @@ function StripBands({
   windowFrom,
   tone,
   time,
-  onFitted,
 }: {
   segments: readonly StripWordSegment[];
   span: number;
   windowFrom: number;
   tone: "lifecycle" | "health" | "command";
   time: (epochMs: number) => string;
-  /** Reports the row's fitted labels upward (StripSegments' ink decision):
-   * which clauses may print beneath the bar is the SAME fact as which words
-   * the bands carry, so it is computed once here and handed up, never
-   * re-derived apart. */
-  onFitted: (labels: readonly string[]) => void;
 }): JSX.Element {
   const bandsRef = useRef<HTMLUListElement | null>(null);
   const measureRef = useRef<HTMLDivElement | null>(null);
@@ -918,11 +877,9 @@ function StripBands({
     setLabelWidths(widths);
   }, [candidates]);
 
-  // Every band's geometry and fitted label in ONE memo — the fit is the row's
-  // single truth: the bands render it here, and the listing's ink decision
-  // (which clause may print beneath the bar) reads the same reported array,
-  // so the bar and the line beneath it can never disagree about which
-  // segments were worded.
+  // Every band's geometry and fitted label in ONE memo — the row's single
+  // truth, rendered straight onto the bands (the listing no longer reads it;
+  // it is off the page for good, carrying the same clauses to assistive tech).
   const fitted = useMemo(
     () =>
       segments.map((segment) => {
@@ -943,13 +900,6 @@ function StripBands({
       }),
     [segments, span, windowFrom, rowWidthPx, labelWidths],
   );
-
-  // Report the fits BEFORE PAINT (a layout effect): the ink clause and the
-  // bands' words land in the same painted frame — a flash of clause-then-
-  // quiet would be the duplication this layout removed, replayed in time.
-  useLayoutEffect(() => {
-    onFitted(fitted.map((entry) => entry.label));
-  }, [fitted, onFitted]);
 
   return (
     <>
