@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-24 (Australia/Brisbane; the history strip comprehension layer — the words survive the bands)
+Last updated: 2026-08-25 (Australia/Brisbane; the history strip geometry fix — the bands render inside the box)
 
 ## Purpose
 
@@ -373,6 +373,31 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (history strip geometry — THE BANDS RENDER INSIDE THE BOX;
+  68d0f04, web-only): the operator reported EMPTY band boxes with the
+  words appearing outside them on the History unit-detail strip. ROOT
+  CAUSE: StripSegments (web/src/views/history/HistoryView.tsx) computed
+  `left: (segment.from / span) * 100%` — segment.from is an ABSOLUTE
+  epoch-ms instant while span is the window DURATION, so every band
+  landed at ~8e8 % left and overflow:hidden clipped them all: the boxes
+  rendered hollow since W1–W3 shipped, the words surviving only in the
+  change-point listing below. FIX: StripSegments takes windowFrom and
+  computes window-relative, clamped percentages — rawLeft =
+  ((from − windowFrom)/span)·100; left = max(0, rawLeft); width =
+  max(0, ((to − from)/span)·100 − (left − rawLeft)); three call sites
+  pass windowFrom={window.from}. A geometry regression test pins every
+  band inside [0,100] % and the fixture's lifecycle band at left
+  0.139 % / width 99.861 %. GATES: 948 web tests green, tsc -b && vite
+  build green, 99 design shots regenerated. VISION VERIFICATION at
+  native resolution (the earlier 900 px downscale was too small for
+  0.78 rem band text — a false-negative "empty" read, now corrected in
+  method): LIFECYCLE band contains "Disarmed", HEALTH contains
+  "Healthy", COMMANDED contains "nothing commanded", each inheriting
+  its row's tint; bands fill the box proportionally. Web-only — the
+  Vite dev server serves it on refresh; the controller (managed task
+  becsdbr2j) untouched. NIGHT-V1 ENABLE STILL GATED on the operator's
+  Docker stand-down confirmation; arm satisfied.
 
 - 2026-08-24 (history strip comprehension — THE WORDS SURVIVE THE BANDS;
   deff29e, web-only, 13 files +640/−122): the History unit-detail
