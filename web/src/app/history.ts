@@ -751,6 +751,67 @@ export function wordSegments(
   return segments;
 }
 
+// --- the archaeology strip's text half (the change-point listings) ---------------
+
+/** One strip segment ready for wording: the band's label, the tooltip's fuller sentence, the listing's clause. */
+export interface StripWordSegment {
+  readonly from: number;
+  readonly to: number;
+  /** The band's short label — the word map's word, never the raw code. */
+  readonly label: string;
+  /** The tooltip's fuller sentence (the UnitHealthTag sentence, the full clause). */
+  readonly title: string;
+  /** The change-point listing's clause ("Disarmed", "nothing commanded"). */
+  readonly clause: string;
+}
+
+/**
+ * The strip's change-point listing, one item per segment, in the gap-notes
+ * rhythm: the FIRST segment says its word "until" the next change, a middle
+ * one carries both instants, the last says its word "since" its start (the
+ * state was still true when the window closed — `wordSegments`' own
+ * doctrine). This listing IS the strip's accessible half: every segment's
+ * word and time survive here even when its proportional band is an
+ * invisible sliver. Only the row's first item reads as the start of the
+ * line; the rest keep their clause's own case.
+ */
+export function segmentListingItems(
+  segments: readonly Pick<StripWordSegment, "from" | "to" | "clause">[],
+  multiDay: boolean,
+): string[] {
+  const time = multiDay ? localDayTime : localTime;
+  return segments.map((segment, index) => {
+    const first = index === 0;
+    const last = index === segments.length - 1;
+    const clause =
+      index === 0
+        ? segment.clause.charAt(0).toUpperCase() + segment.clause.slice(1)
+        : segment.clause;
+    if (first && !last) {
+      return `${clause} until ${time(segment.to)}`;
+    }
+    if (!first && !last) {
+      return `${clause} ${time(segment.from)}–${time(segment.to)}`;
+    }
+    return `${clause} since ${time(segment.from)}`;
+  });
+}
+
+/**
+ * The hourly tier's strip absence: the rollups keep the numeric series but
+ * drop the step-encoded words, so the section SAYS so instead of silently
+ * vanishing (the 7 d/30 d presets serve hourly on a young database).
+ */
+export const STRIP_HOURLY_ABSENCE_TEXT =
+  "State words are kept only inside the full-resolution window — pick a shorter range to see them";
+
+/**
+ * The health row's honest word when a unit recorded samples but no health
+ * words: the recovery monitor is not part of this deployment — an absence
+ * named, never a row that silently disappears.
+ */
+export const HEALTH_NOT_RECORDED_TEXT = "health was not recorded on this deployment";
+
 // --- the recording note (the view's data-age line) -----------------------------------
 
 /**

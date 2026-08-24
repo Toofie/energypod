@@ -37,7 +37,9 @@ import {
   snapshot,
   unitSnapshot,
   withHistoryState,
+  type WireHistoryUnit,
 } from "../../test/wire";
+import { localTime } from "../../app/history";
 import { HistoryView } from "./HistoryView";
 
 const api = vi.hoisted(() => {
@@ -87,8 +89,9 @@ function snapshotWith(units: string[]): ReturnType<typeof snapshot> {
   );
 }
 
-/** A full-resolution world with a charge, a gap, and a degraded stretch. */
-function fullWindow() {
+/** A full-resolution world with a charge, a gap, and a degraded stretch.
+ * `midPatch` lets a test vary the mid unit (the strip family's worlds). */
+function fullWindow(midPatch: Partial<WireHistoryUnit> = {}) {
   return historyBody({
     resolution: "full",
     from: "2026-08-24T00:00:00+00:00",
@@ -129,6 +132,7 @@ function fullWindow() {
           { t: "2026-08-24T00:02:00+00:00", source: "night_adviser", direction: "charge", watts: 2500 },
           { t: "2026-08-24T04:00:00+00:00", source: null, direction: null, watts: null },
         ],
+        ...midPatch,
       }),
     },
     fleet: {
@@ -372,6 +376,85 @@ describe("History view — the ready window", () => {
     // absence on the hourly world instead — a full world's absent field.
     const block = screen.getByLabelText(/mid charge level over the window/i);
     expect(block.textContent ?? "").toContain("2,871 samples");
+  });
+});
+
+// --- the archaeology strip (the step series' words) --------------------------------------
+
+describe("History view — the archaeology strip", () => {
+  /** Land the world, switch to the mid battery, wait for the strip's heading. */
+  async function landStrip(windowBody: unknown = fullWindow()): Promise<void> {
+    await landReads(snapshotWith(["mid", "rhs", "lhs"]), windowBody);
+    render(<HistoryView client={injectedClient()} />);
+    await screen.findByText("Whole site — power");
+    await userEvent.setup().click(screen.getByRole("button", { name: "mid" }));
+    await screen.findByText("What the battery was doing");
+  }
+
+  it("renders the operator's words, never the wire's raw enum codes", async () => {
+    await landStrip();
+    const strip = screen.getByLabelText(/Lifecycle, health and command history/i);
+    // The wire's codes never reach the operator through the strip…
+    expect(strip.textContent ?? "").not.toMatch(/armed_idle|self_healing|night_adviser|observe_only/);
+    // …the word maps do — band labels and listings both carry them.
+    expect(strip.textContent ?? "").toContain("Disarmed");
+    expect(strip.textContent ?? "").toContain("Healthy");
+    expect(strip.textContent ?? "").toContain("night-charge adviser");
+    expect(strip.textContent ?? "").toContain("nothing commanded");
+  });
+
+  it("carries the change-point listing under each row — every word with its time", async () => {
+    await landStrip();
+    const t1 = localTime(Date.parse("2026-08-24T00:00:30+00:00"));
+    const t2 = localTime(Date.parse("2026-08-24T00:02:00+00:00"));
+    const t3 = localTime(Date.parse("2026-08-24T04:00:00+00:00"));
+    // The listings are the accessibility surface: one list per row, named.
+    const lifecycleList = screen.getByLabelText("Lifecycle");
+    expect(within(lifecycleList).getAllByRole("listitem")).toHaveLength(1);
+    expect(lifecycleList.textContent).toBe(`Disarmed since ${t1}`);
+    expect(screen.getByLabelText("Health").textContent).toBe(`Healthy since ${t1}`);
+    const commandedList = screen.getByLabelText("Commanded");
+    expect(
+      within(commandedList).getAllByRole("listitem").map((item) => item.textContent),
+    ).toEqual([
+      `Nothing commanded until ${t2}`,
+      `the night-charge adviser — charging 2,500 W ${t2}–${t3}`,
+      `nothing commanded since ${t3}`,
+    ]);
+  });
+
+  it("explains what each row asserts and carries the §6 caveat beside them", async () => {
+    await landStrip();
+    const explainer = screen.getByText(/Lifecycle is the state the controller held/);
+    expect(explainer.textContent ?? "").toContain("recovery monitor's judgment");
+    expect(explainer.textContent ?? "").toContain("what this console asked");
+    // DESIGN_PLANT_HISTORY §6, said where the operator reads it.
+    expect(explainer.textContent ?? "").toContain("30-second sampled view");
+    expect(explainer.textContent ?? "").toContain(
+      "where it disagrees with the audit trail, the audit row is the record",
+    );
+  });
+
+  it("words the hourly tier's absence instead of silently vanishing", async () => {
+    await landStrip(hourlyWindow());
+    const strip = screen.getByLabelText(/Lifecycle, health and command history/i);
+    expect(strip.textContent ?? "").toContain(
+      "State words are kept only inside the full-resolution window",
+    );
+    expect(strip.textContent ?? "").toContain("pick a shorter range");
+    // No band rows render on the hourly tier — the words ARE the absence.
+    expect(within(strip).queryByLabelText("Lifecycle")).toBeNull();
+    expect(within(strip).queryByLabelText("Commanded")).toBeNull();
+  });
+
+  it("words a health row that was never recorded on this deployment", async () => {
+    await landStrip(fullWindow({ health_state_changes: [] }));
+    const strip = screen.getByLabelText(/Lifecycle, health and command history/i);
+    // The row renders with the honest absence word — never silence.
+    expect(strip.textContent ?? "").toContain("health was not recorded on this deployment");
+    // The rows that WERE recorded keep their words beside it.
+    expect(screen.getByLabelText("Lifecycle").textContent).toMatch(/^Disarmed since /);
+    expect(screen.getByLabelText("Commanded").textContent).toContain("night-charge adviser");
   });
 });
 

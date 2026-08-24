@@ -39,8 +39,10 @@ import {
   extremeText,
   gapText,
   GAP_REASON_TEXT,
+  HEALTH_NOT_RECORDED_TEXT,
   HISTORY_RANGE_PRESETS,
   historyQuery,
+  localDayTime,
   localTime,
   qualityIsClean,
   qualityWordText,
@@ -48,16 +50,26 @@ import {
   recordingNote,
   resolutionCaveatText,
   resolutionText,
+  segmentListingItems,
+  STRIP_HOURLY_ABSENCE_TEXT,
   toHistoryRecordingState,
   toPlantHistoryWindow,
   wordSegments,
   type HistoryGap,
+  type StripWordSegment,
   type HistoryRecordingState,
   type HistorySeries,
   type HistoryUnitBlock,
   type PlantHistoryWindow,
 } from "../../app/history";
 import type { HistoryRangeId } from "../../app/history";
+import {
+  HEALTH_STATES,
+  healthWord,
+  lifecycleWord,
+  type HealthState,
+} from "../../app/fleet";
+import { unitHealthSentence } from "../../app/unitHealth";
 import {
   formatMillivolts,
   formatPercent,
@@ -545,8 +557,9 @@ function UnitSection({
       </section>
 
       {/* THE ARCHAEOLOGY STRIP — the step series under the charts: what the
-          unit was, how it was judged, and what WE commanded, as held bands. */}
-      <StepStrip unit={unit} window={window} />
+          unit was, how it was judged, and what WE commanded, as held bands
+          whose every word also survives as the change-point listing. */}
+      <StepStrip unit={unit} window={window} multiDay={multiDay} />
 
       {/* The secondary group: cells and temperature — the homeowner scans
           power and charge first; these are the diagnosis figures. */}
@@ -590,98 +603,150 @@ function UnitSection({
 }
 
 // ---------------------------------------------------------------------------
-// the archaeology strip (the step series, as labeled bands)
+// the archaeology strip (the step series, as labeled bands + worded listings)
 // ---------------------------------------------------------------------------
+
+/** The strip's one muted explainer: what each row asserts, plus the design's
+ * §6 caveat (the sampled view versus the audit trail) said where it counts. */
+const STRIP_EXPLAINER_TEXT =
+  "Lifecycle is the state the controller held; health is the recovery monitor's judgment; commanded is what this console asked of the battery. The strip is a 30-second sampled view — where it disagrees with the audit trail, the audit row is the record.";
 
 function StepStrip({
   unit,
   window,
+  multiDay,
 }: {
   unit: HistoryUnitBlock;
   window: PlantHistoryWindow;
+  multiDay: boolean;
 }): JSX.Element | null {
+  // The hourly tier (7 d/30 d presets) keeps the numeric series but drops
+  // the step-encoded words: the section renders its absence — never silence.
+  if (window.resolution === "hourly") {
+    return (
+      <section className="history-strip" aria-label="Lifecycle, health and command history">
+        <h3>What the battery was doing</h3>
+        <p className="history-strip-absence" role="note">
+          {STRIP_HOURLY_ABSENCE_TEXT}.
+        </p>
+      </section>
+    );
+  }
   const commanded = commandedSegments(unit.commandedChanges, window.to);
   const lifecycle = wordSegments(unit.lifecycleChanges, window.to);
   const health = wordSegments(unit.healthStateChanges, window.to);
-  if (commanded.length === 0 && lifecycle.length === 0 && health.length === 0) {
+  // A unit that recorded samples but no health words: the recovery monitor
+  // is not part of this deployment — the row says so, never silence.
+  const healthAbsent = health.length === 0 && unit.sampleCount > 0;
+  if (commanded.length === 0 && lifecycle.length === 0 && !healthAbsent) {
     return null;
   }
+  const lifecycleRows = lifecycle.map((segment) => {
+    const word = lifecycleWord(segment.v);
+    return { from: segment.from, to: segment.to, label: word, title: word, clause: word };
+  });
+  const healthRows = health.map((segment) => {
+    const word = healthWord(segment.v);
+    // The tooltip carries the tag's own sentence where the tag speaks
+    // (a reasons-less health gets the generic line, never a fabricated
+    // reason); the tag's silent states keep their short word.
+    const sentence = (HEALTH_STATES as readonly string[]).includes(segment.v)
+      ? unitHealthSentence({
+          state: segment.v as HealthState,
+          reasons: [],
+          remediationHint: null,
+        })
+      : null;
+    return { from: segment.from, to: segment.to, label: word, title: sentence ?? word, clause: word };
+  });
+  const commandedRows = commanded.map((segment) => {
+    const clause = commandedSegmentText(segment);
+    return { from: segment.from, to: segment.to, label: clause, title: clause, clause };
+  });
   const span = Math.max(1, window.to - window.from);
   return (
     <section className="history-strip" aria-label="Lifecycle, health and command history">
       <h3>What the battery was doing</h3>
+      <p className="history-strip-explainer">{STRIP_EXPLAINER_TEXT}</p>
       <dl className="history-strip-rows">
-        {lifecycle.length > 0 ? (
-          <div className="history-strip-row">
-            <dt>Lifecycle</dt>
-            <dd>
-              <BandSegments
-                segments={lifecycle.map((segment) => ({ ...segment, label: segment.v }))}
-                span={span}
-                tone="lifecycle"
-              />
-            </dd>
-          </div>
+        {lifecycleRows.length > 0 ? (
+          <StripRow label="Lifecycle">
+            <StripSegments segments={lifecycleRows} span={span} tone="lifecycle" multiDay={multiDay} />
+          </StripRow>
         ) : null}
-        {health.length > 0 ? (
-          <div className="history-strip-row">
-            <dt>Health</dt>
-            <dd>
-              <BandSegments
-                segments={health.map((segment) => ({ ...segment, label: segment.v }))}
-                span={span}
-                tone="health"
-              />
-            </dd>
-          </div>
+        {healthRows.length > 0 || healthAbsent ? (
+          <StripRow label="Health">
+            {healthAbsent ? (
+              <p className="history-strip-absence">{HEALTH_NOT_RECORDED_TEXT}.</p>
+            ) : (
+              <StripSegments segments={healthRows} span={span} tone="health" multiDay={multiDay} />
+            )}
+          </StripRow>
         ) : null}
-        {commanded.length > 0 ? (
-          <div className="history-strip-row">
-            <dt>Commanded</dt>
-            <dd>
-              <BandSegments
-                segments={commanded.map((segment) => ({
-                  from: segment.from,
-                  to: segment.to,
-                  label: commandedSegmentText(segment),
-                }))}
-                span={span}
-                tone="command"
-              />
-            </dd>
-          </div>
+        {commandedRows.length > 0 ? (
+          <StripRow label="Commanded">
+            <StripSegments segments={commandedRows} span={span} tone="command" multiDay={multiDay} />
+          </StripRow>
         ) : null}
       </dl>
     </section>
   );
 }
 
-/** One strip row: held bands positioned by their share of the window. */
-function BandSegments({
+/** One strip row's labeled pair (the dl's dt/dd with the row's name). */
+function StripRow({ label, children }: { label: string; children: JSX.Element }): JSX.Element {
+  return (
+    <div className="history-strip-row">
+      <dt>{label}</dt>
+      <dd>{children}</dd>
+    </div>
+  );
+}
+
+/**
+ * One strip row's two halves: the proportional bands (visual, worded labels,
+ * fuller sentence + instants on the tooltip) and, under them, the
+ * change-point listing — the row's ACCESSIBLE surface, one item per segment
+ * in the gap-notes rhythm, where every segment's word and time survive even
+ * when its band is an invisible sliver.
+ */
+function StripSegments({
   segments,
   span,
   tone,
+  multiDay,
 }: {
-  segments: readonly { from: number; to: number; label: string }[];
+  segments: readonly StripWordSegment[];
   span: number;
   tone: "lifecycle" | "health" | "command";
+  multiDay: boolean;
 }): JSX.Element {
+  const time = multiDay ? localDayTime : localTime;
+  const listings = segmentListingItems(segments, multiDay);
+  const name = tone === "lifecycle" ? "Lifecycle" : tone === "health" ? "Health" : "Commanded";
   return (
-    <ul className={`history-bands history-bands--${tone}`} aria-label="Held states across the window">
-      {segments.map((segment, index) => (
-        <li
-          key={`${segment.from}-${index}`}
-          className="history-band"
-          style={{
-            left: `${(segment.from / span) * 100}%`,
-            width: `${((segment.to - segment.from) / span) * 100}%`,
-          }}
-          title={segment.label}
-        >
-          <span className="history-band-label">{segment.label}</span>
-        </li>
-      ))}
-    </ul>
+    <>
+      <ul className={`history-bands history-bands--${tone}`} aria-hidden="true">
+        {segments.map((segment, index) => (
+          <li
+            key={`${segment.from}-${index}`}
+            className="history-band"
+            style={{
+              left: `${(segment.from / span) * 100}%`,
+              width: `${((segment.to - segment.from) / span) * 100}%`,
+            }}
+            title={`${segment.title} · ${time(segment.from)}–${time(segment.to)}`}
+          >
+            <span className="history-band-label">{segment.label}</span>
+          </li>
+        ))}
+      </ul>
+      <ul className="history-strip-listing" aria-label={name}>
+        {listings.map((item, index) => (
+          <li key={index}>{item}</li>
+        ))}
+      </ul>
+    </>
   );
 }
 

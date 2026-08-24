@@ -67,6 +67,7 @@ import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import {
   applyHealthPatch,
   gridLoadText,
+  lifecycleWord,
   toActuationIncoherentEvent,
   toHealthChangedEvent,
   toUnitHealth,
@@ -369,17 +370,9 @@ const CELL_IMBALANCE_WARNING_MV = 50;
 // Plain-language mappings (words first, raw codes only on demand)
 // ---------------------------------------------------------------------------
 
-const LIFECYCLE_WORDS: Record<string, string> = {
-  boot: "Starting up",
-  disarmed: "Disarmed",
-  armed: "Armed",
-  armed_idle: "Armed and idle",
-  observe_only: "Observe only",
-  active: "Active",
-  inhibited: "Inhibited",
-  stopping: "Stopping",
-  disconnected: "No contact",
-};
+// The lifecycle words live in app/fleet.ts (LIFECYCLE_WORDS/lifecycleWord):
+// ONE map shared with the shell banner and the History strip, so "Armed and
+// idle" can never drift back into two truths.
 
 /** Audit `event_type` values the service writes (see wire.ts AUDIT_EVENT_TYPES). */
 const AUDIT_TYPE_WORDS: Record<string, string> = {
@@ -407,8 +400,9 @@ const RESULT_WORDS: Record<string, string> = {
   acknowledged: "Acknowledged",
 };
 
+/** The lifecycle in the operator's words — the shared fleet map, never local. */
 function availabilityWord(lifecycle: string): string {
-  return LIFECYCLE_WORDS[lifecycle] ?? lifecycle.replace(/_/g, " ");
+  return lifecycleWord(lifecycle);
 }
 
 function humanizeCode(code: string): string {

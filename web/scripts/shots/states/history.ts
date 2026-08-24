@@ -11,11 +11,13 @@
  * - gaps are absent rows: the controller-down interval 02:10–03:40 has NO
  *   points anywhere, and the charts must break there — never bridge.
  *
- * The four states pin the view's landing surfaces: the recorded night (full
- * resolution, a charge, a gap, a degraded stretch), the hourly rollup tier a
- * 30-day window honestly serves, the fresh database's empty window (the
- * first thing an operator sees the morning after commissioning), and the
- * honest not-commissioned 409.
+ * The states pin the view's landing surfaces: the recorded night (full
+ * resolution, a charge, a gap, a degraded stretch), the same night read as
+ * one battery's archaeology strip (worded bands + change-point listings),
+ * the hourly rollup tier a 30-day window honestly serves — both as the
+ * whole-site charts and as the strip's worded absence — the fresh database's
+ * empty window (the first thing an operator sees the morning after
+ * commissioning), and the honest not-commissioned 409.
  *
  * Figures are physically coherent (grid ≈ battery + house per phase, the
  * fleet the true sum) and deterministic — a fixed UTC day, piecewise-linear
@@ -293,11 +295,27 @@ export const HISTORY_STATES: readonly ShotStateDefinition[] = [
     history: recordedNight,
   },
   {
+    id: "battery-night-archaeology-strip",
+    caption:
+      "One battery's night as the archaeology strip READS it: lifecycle, health and commanded rows of worded bands, each with its change-point listing underneath — every segment's word and time survives even where its band is an invisible sliver, and the health row's tooltip carries the tag's own sentence.",
+    world: historyWorld(iso(TO)),
+    history: recordedNight,
+    interact: [{ click: { role: "button", name: "mid" } }],
+  },
+  {
     id: "hourly-rollup-month",
     caption:
       "The 30-day window the data horizon honestly serves as hourly rollups — the badge says so, and every summary row carries the hours' own min–max bands.",
     world: historyWorld(iso(TO)),
     history: hourlyMonth,
+  },
+  {
+    id: "hourly-strip-absence",
+    caption:
+      "The hourly tier keeps the numeric rollups but no state words: the strip section says so and offers the shorter range — an absence worded, never a silent gap.",
+    world: historyWorld(iso(TO)),
+    history: hourlyMonth,
+    interact: [{ click: { role: "button", name: "mid" } }],
   },
   {
     id: "fresh-database-empty-window",

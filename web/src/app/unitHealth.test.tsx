@@ -47,6 +47,7 @@ import {
   echoDiscriminatorText,
   incoherenceAnnouncement,
   incoherenceStory,
+  unitHealthSentence,
   UnitHealthTag,
 } from "./unitHealth";
 
@@ -200,6 +201,37 @@ describe("applyHealthPatch — event patches never erase the wire's terminal hin
     expect(applyHealthPatch(null, health("self_healing", ["cell_balancing"]))).toEqual(
       health("self_healing", ["cell_balancing"], null),
     );
+  });
+});
+
+describe("unitHealthSentence — the ONE wording every full-sentence surface shares", () => {
+  it("returns null exactly where the tag is silent (the design's quietness)", () => {
+    expect(unitHealthSentence(health("healthy"))).toBeNull();
+    expect(unitHealthSentence(health("foreign_writer", ["external_writer_latched"]))).toBeNull();
+    expect(unitHealthSentence(health("inhibited", ["inhibited"]))).toBeNull();
+    // A parked state without healing reasons has nothing to add to the park.
+    expect(unitHealthSentence(health("parked"))).toBeNull();
+  });
+
+  it("words each speaking state with the tag's own sentence", () => {
+    expect(unitHealthSentence(health("not_responding"))).toBe(
+      "Not responding — remote recovery exhausted",
+    );
+    expect(unitHealthSentence(health("unreachable"))).toBe("Gateway unreachable");
+    expect(unitHealthSentence(health("actuation_incoherent"), 1000)).toBe(
+      "Commanded 1,000 W but the battery isn't moving — investigating",
+    );
+    expect(unitHealthSentence(health("actuation_incoherent"))).toBe(
+      "The battery isn't moving as commanded — investigating",
+    );
+    expect(unitHealthSentence(health("self_healing", ["cell_balancing"]))).toBe("Cell balancing");
+    expect(unitHealthSentence(health("parked", ["cell_balancing"]))).toBe("Cell balancing");
+  });
+
+  it("keeps the generic line for a reasons-less self-healing (the History strip's shape)", () => {
+    // The strip holds only the state word, never the reasons: it gets the
+    // honest generic sentence, never a fabricated reason.
+    expect(unitHealthSentence(health("self_healing"))).toBe("Managing itself");
   });
 });
 

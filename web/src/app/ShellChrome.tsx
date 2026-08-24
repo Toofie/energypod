@@ -7,7 +7,7 @@
 import type { ReactElement } from "react";
 import { formatSeconds } from "../lib/format";
 import type { UnitModel, WattsByUnit } from "./fleet";
-import { fleetBanner, UNIT_LABELS } from "./fleet";
+import { fleetBanner, lifecycleWord } from "./fleet";
 import type { ConnectionHealth, ConsoleData, RefusalEnvelope } from "./useConsoleData";
 
 const BADGE_ICONS: Record<string, string> = {
@@ -63,7 +63,7 @@ export function FleetBanner({
         <ul className="banner-units">
           {units.map((unit) => (
             <li key={unit.unitId}>
-              {unit.unitId} — {UNIT_LABELS[unit.lifecycle]}
+              {unit.unitId} — {lifecycleWord(unit.lifecycle)}
               {ageText(unit)}
             </li>
           ))}

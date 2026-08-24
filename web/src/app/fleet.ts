@@ -33,17 +33,40 @@ const LIFECYCLES: readonly Lifecycle[] = [
   "disconnected",
 ];
 
-/** Human label for a unit lifecycle; capitalized for display, never wire. */
-export const UNIT_LABELS: Record<Lifecycle, string> = {
+/**
+ * The lifecycle vocabulary in the operator's words — ONE map for every
+ * surface (the shell's banner list, the Batteries rows, the History strip's
+ * bands and listings), unified on the Batteries per-unit truth: an
+ * `armed_idle` battery is "Armed and idle", never the banner-style "Armed" —
+ * the idle half is the fact the state asserts. The defensive non-wire
+ * "armed" (a value some older snapshots carried) keeps its word so a
+ * stranger code still reads as one.
+ */
+export const LIFECYCLE_WORDS: Record<string, string> = {
   boot: "Starting up",
   observe_only: "Observe only",
   disarmed: "Disarmed",
-  armed_idle: "Armed",
+  armed: "Armed",
+  armed_idle: "Armed and idle",
   active: "Active",
   inhibited: "Inhibited",
   stopping: "Stopping",
   disconnected: "No contact",
 };
+
+/** A stranger code humanized ("some_new_state" → "Some new state"), never raw. */
+function humanizeCode(code: string): string {
+  const words = code.toLowerCase().replace(/_+/g, " ").trim();
+  if (words === "") {
+    return code;
+  }
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+/** The lifecycle in the operator's words; an unknown code is humanized, never shown raw. */
+export function lifecycleWord(lifecycle: string): string {
+  return LIFECYCLE_WORDS[lifecycle] ?? humanizeCode(lifecycle);
+}
 
 export interface PowerFigure {
   direction: string;
@@ -390,6 +413,29 @@ export const HEALTH_STATES: readonly HealthState[] = [
   // the park itself; the badge renders only the healing reasons it carries.
   "parked",
 ];
+
+/**
+ * The recovery vocabulary's SHORT words — one readable word per state, the
+ * History strip's band labels and change-point listings (the Batteries badge
+ * keeps its own quietness rules; this map names every state, because a strip
+ * segment must say what it held, including the states the badge renders
+ * silently). An unknown code falls to the humanized code, never raw.
+ */
+export const HEALTH_WORDS: Record<string, string> = {
+  healthy: "Healthy",
+  self_healing: "Self-healing",
+  actuation_incoherent: "Actuation incoherent",
+  not_responding: "Not responding",
+  unreachable: "Unreachable",
+  foreign_writer: "Foreign writer",
+  inhibited: "Inhibited",
+  parked: "Parked",
+};
+
+/** The health state's short word; an unknown code is humanized, never shown raw. */
+export function healthWord(state: string): string {
+  return HEALTH_WORDS[state] ?? humanizeCode(state);
+}
 
 /**
  * One unit's derived recovery view (API_CONTRACTS.md "Self-healing awareness

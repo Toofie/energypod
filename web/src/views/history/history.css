@@ -314,6 +314,43 @@
   margin: 0;
 }
 
+/* The one muted line under the h3: what each row asserts, plus the sampled-
+ * view caveat (DESIGN_PLANT_HISTORY §6) said where the operator reads it. */
+.history-strip-explainer {
+  margin: 0 0 0.6rem;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+/* The strip's worded absences (the hourly tier, the health monitor's
+ * absence): quiet, italic like the chart note, never silent. */
+.history-strip-absence {
+  margin: 0;
+  font-size: 0.88rem;
+  font-style: italic;
+  color: var(--ink-soft);
+}
+
+/* The change-point listing — the strip's ACCESSIBLE half, one line in the
+ * gap-notes rhythm. The " · " separators are pure rhythm, so they live in
+ * CSS and never enter the accessibility tree. */
+.history-strip-listing {
+  margin: 0.3rem 0 0;
+  padding: 0;
+  font-size: 0.85rem;
+  color: var(--ink-soft);
+}
+
+.history-strip-listing li {
+  display: inline;
+}
+
+.history-strip-listing li + li::before {
+  content: "·";
+  margin: 0 0.45em;
+  color: var(--line);
+}
+
 .history-bands {
   list-style: none;
   margin: 0;
@@ -360,8 +397,14 @@
   color: var(--armed);
 }
 
-.history-bands--command .history-band:empty {
-  background: var(--surface);
+/* Narrow widths: the row's label stacks above its bands and listing — the
+ * bands keep enough width to stay proportional, the listing simply wraps. */
+@media (max-width: 30rem) {
+  .history-strip-row {
+    grid-template-columns: 1fr;
+    gap: 0.2rem;
+    align-items: start;
+  }
 }
 
 /* --- the secondary group ------------------------------------------------------------ */

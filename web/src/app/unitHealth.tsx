@@ -121,6 +121,38 @@ export function echoDiscriminatorText(unitId: string, classification: string): s
 /** The tag's visual weight: quiet, warning, or the prominent terminal. */
 type HealthTagKind = "healing" | "warning" | "critical";
 
+/**
+ * The sentence the badge renders for one health — the ONE wording shared by
+ * every surface that speaks a recovery state in full (the Batteries/Home tag
+ * and the History strip's tooltips), so they can never drift apart. Null is
+ * the design's own silence (healthy, feature-absent, and the states whose
+ * stories the inhibit and parked surfaces already tell); callers with only a
+ * state word — the History strip's change points — pass a reasons-less
+ * health and get the generic sentence, never a fabricated reason.
+ */
+export function unitHealthSentence(
+  health: UnitHealth,
+  authorizedWatts: number | null = null,
+  measuredWatts: number | null = null,
+): string | null {
+  switch (health.state) {
+    case "healthy":
+    case "foreign_writer":
+    case "inhibited":
+      return null;
+    case "parked":
+      return health.reasons.length === 0 ? null : selfHealingText(health, measuredWatts);
+    case "self_healing":
+      return selfHealingText(health, measuredWatts);
+    case "actuation_incoherent":
+      return incoherenceStory(authorizedWatts);
+    case "not_responding":
+      return "Not responding — remote recovery exhausted";
+    case "unreachable":
+      return "Gateway unreachable";
+  }
+}
+
 interface UnitHealthTagProps {
   health: UnitHealth | null;
   /**
@@ -150,43 +182,21 @@ export function UnitHealthTag({
   if (health === null) {
     return null;
   }
-  let kind: HealthTagKind;
-  let text: string;
-  switch (health.state) {
-    case "healthy":
-      return null;
-    case "foreign_writer":
-    case "inhibited":
-      // Already spoken for by the inhibit latch surfaces; duplicating them
-      // here would be noise, never clarity.
-      return null;
-    case "parked":
-      // The parked surfaces (chip, banner, Home's fleet banner) tell the
-      // park; this badge renders only the composable healing reasons the
-      // classifier carried alongside it. No healing reasons: silence.
-      if (health.reasons.length === 0) {
-        return null;
-      }
-      kind = "healing";
-      text = selfHealingText(health, measuredWatts);
-      break;
-    case "self_healing":
-      kind = "healing";
-      text = selfHealingText(health, measuredWatts);
-      break;
-    case "actuation_incoherent":
-      kind = "warning";
-      text = incoherenceStory(authorizedWatts);
-      break;
-    case "not_responding":
-      kind = "critical";
-      text = "Not responding — remote recovery exhausted";
-      break;
-    case "unreachable":
-      kind = "critical";
-      text = "Gateway unreachable";
-      break;
+  // The wording is the shared sentence picker's (`unitHealthSentence` — the
+  // History strip renders the same words); this component adds only the
+  // visual weight and the verbatim terminal hint.
+  const text = unitHealthSentence(health, authorizedWatts, measuredWatts);
+  if (text === null) {
+    return null;
   }
+  const kind: HealthTagKind =
+    health.state === "self_healing" ||
+    // A parked badge speaks ONLY through its composable healing reasons.
+    (health.state === "parked" && health.reasons.length > 0)
+      ? "healing"
+      : health.state === "actuation_incoherent"
+        ? "warning"
+        : "critical";
   return (
     <p role="note" className={`unit-health unit-health--${kind}`}>
       {text}

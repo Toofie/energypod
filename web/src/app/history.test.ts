@@ -33,8 +33,10 @@ import {
   emptyWindowNote,
   extremeText,
   gapText,
+  HEALTH_NOT_RECORDED_TEXT,
   HISTORY_FIELDS,
   historyQuery,
+  localDayTime,
   localTime,
   qualityIsClean,
   qualityWordText,
@@ -42,6 +44,8 @@ import {
   recordingNote,
   resolutionCaveatText,
   resolutionText,
+  segmentListingItems,
+  STRIP_HOURLY_ABSENCE_TEXT,
   toHistoryRecordingState,
   toPlantHistoryWindow,
   type CommandedChange,
@@ -473,6 +477,83 @@ describe("history model — the commanded triple", () => {
     expect(commandedSourceText(null)).toBe("no command");
     expect(commandedSourceText("schedule")).toBe("the schedule");
     expect(commandedSourceText("excess_adviser")).toBe("the solar-surplus adviser");
+  });
+});
+
+// --- the strip's change-point listings (the archaeology strip's text half) --------
+
+describe("history model — the strip's change-point listings", () => {
+  const T1 = Date.parse("2026-08-24T00:00:30+00:00");
+  const T2 = Date.parse("2026-08-24T00:02:00+00:00");
+  const T3 = Date.parse("2026-08-24T04:00:00+00:00");
+  const END = Date.parse("2026-08-24T06:00:00+00:00");
+
+  it("words a multi-segment row in the gap-notes rhythm: until, both instants, since", () => {
+    const items = segmentListingItems(
+      [
+        { from: T1, to: T2, clause: "Disarmed" },
+        { from: T2, to: T3, clause: "Armed and idle" },
+        { from: T3, to: END, clause: "Active" },
+      ],
+      false,
+    );
+    expect(items).toEqual([
+      `Disarmed until ${localTime(T2)}`,
+      `Armed and idle ${localTime(T2)}–${localTime(T3)}`,
+      `Active since ${localTime(T3)}`,
+    ]);
+  });
+
+  it("words a single held segment as 'since' its start — still true when the window closed", () => {
+    expect(segmentListingItems([{ from: T1, to: END, clause: "Disarmed" }], false)).toEqual([
+      `Disarmed since ${localTime(T1)}`,
+    ]);
+  });
+
+  it("capitalizes only the row's first item — the listing reads as one line", () => {
+    const items = segmentListingItems(
+      [
+        { from: T1, to: T2, clause: "nothing commanded" },
+        { from: T2, to: END, clause: "night-charge adviser — charging 2,500 W" },
+      ],
+      false,
+    );
+    expect(items[0]).toBe(`Nothing commanded until ${localTime(T2)}`);
+    // The second item is also the last: it keeps its clause's own case and
+    // says "since" — only the row's first item was capitalized.
+    expect(items[1]).toBe(
+      `night-charge adviser — charging 2,500 W since ${localTime(T2)}`,
+    );
+  });
+
+  it("carries the day beside the clock on multi-day windows (the gap-notes convention)", () => {
+    const items = segmentListingItems([{ from: T1, to: END, clause: "Active" }], true);
+    expect(items).toEqual([`Active since ${localDayTime(T1)}`]);
+  });
+
+  it("keeps every segment's word and time even where its band would be an invisible sliver", () => {
+    const sliverEnd = T2 + 30_000; // 30 s of a 6 h window
+    const items = segmentListingItems(
+      [
+        { from: T1, to: T2, clause: "Healthy" },
+        { from: T2, to: sliverEnd, clause: "Self-healing" },
+        { from: sliverEnd, to: END, clause: "Healthy" },
+      ],
+      false,
+    );
+    expect(items).toHaveLength(3);
+    expect(items[1]).toBe(`Self-healing ${localTime(T2)}–${localTime(sliverEnd)}`);
+  });
+});
+
+describe("history model — the strip's worded absences", () => {
+  it("words the hourly tier's absence: the words are a full-resolution truth", () => {
+    expect(STRIP_HOURLY_ABSENCE_TEXT).toContain("full-resolution window");
+    expect(STRIP_HOURLY_ABSENCE_TEXT).toContain("shorter range");
+  });
+
+  it("words the unrecorded health row exactly (an absence named, never silence)", () => {
+    expect(HEALTH_NOT_RECORDED_TEXT).toBe("health was not recorded on this deployment");
   });
 });
 
