@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the strip listing retired by operator direction — the bar is the whole visual story)
+Last updated: 2026-08-25 (Australia/Brisbane; the PVOutput integration complete — the retiring Docker writer's replacement composed, off by config, the toggle is the operator's)
 
 ## Purpose
 
@@ -354,13 +354,15 @@ background task, per the rule above — never a subagent, never a bare
 
 ```
 source var/solcast.env && export SOLCAST_API_KEY && \
+  source var/pvoutput.env && \
   ./.venv/Scripts/python.exe -m energypod.main run \
   config/config.live-write-example.yaml
 ```
 
-The Solcast key lives OUTSIDE the repo in `var/solcast.env` (the
-no-secrets rule); without it the provider composes out with a visible
-registry note — the controller still boots.
+The Solcast key lives OUTSIDE the repo in `var/solcast.env` and the
+PVOutput credentials in `var/pvoutput.env` (the no-secrets rule);
+without them the provider/client composes out with a visible note —
+the controller still boots.
 
 ## Completion gates
 
@@ -373,6 +375,43 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (PVOutput integration COMPLETE — THE RETIRING DOCKER
+  WRITER'S REPLACEMENT IS COMPOSED; 482f96e, 38 files +4541): the
+  resumed agent landed with all gates green — 2768 backend tests (97
+  new), ruff + mypy clean, 990 web tests, tsc + build green, 105 shots
+  (+2 home states pvoutput-failing / pvoutput-not-commissioned × 3
+  viewports). REVIEW spot-checks: the REST route follows the night
+  pattern exactly (arm scope, interactive-to-enable, typed PVOUTPUT
+  confirmation, Idempotency-Key, 409 mapping); the composition step
+  rides the historian's exact suppress+wait_for envelope, after the
+  polls, before the kernel tick; the client's sign handling verified.
+  SIGN VERDICTS (live spec + PROTOCOL_EVIDENCE): (1) the old container
+  posted DCDC 0x2009 (decimal 8201), NOT 4103 — the operator's memory
+  was of the sensor table's PCS grid row; 0x2009 and our system 0x0114
+  share the negative=charge orientation, so v8/v10/v12 post UNNEGATED
+  and the existing PVOutput graphs stay continuous; (2) b1 is the
+  spec's OPPOSITE convention ("-200 (Discharge), 200 (Charge)") — the
+  adapter flips the fleet aggregate in exactly ONE place, pinned by
+  tests. DURABILITY: schema v7 pvoutput_state singleton (6→7, schema
+  pins updated in four existing test files), store-write-first toggle,
+  the stored row overrides config across restarts (proven by test).
+  SECRETS: var/pvoutput.env (gitignored, audited — no tracked file
+  carries the values; masked 09…a9 / 55…19). Config live block
+  enabled: false, revision 7. RUNTIME: the old controller task was
+  stopped and relaunched as a harness-managed background task with
+  BOTH env files sourced (solcast + pvoutput — the runbook's standing
+  launch command updated below); boot clean, schema v7 migrated,
+  status served immediately. LIVE-VERIFIED read-only post-restart:
+  enabled false / origin config / unit_slots lhs v7+v8, mid v11+v12,
+  rhs v9+v10 / native fields true / zero errors / no posts yet.
+  OPERATOR HANDOFF (the settled cutover order, new-uploader-first):
+  they flip the Home card toggle when ready (first POST at the next
+  5-min slot boundary; the card flips to Posting with last-post age
+  and hourly budget), verify the PVOutput dashboard, then stand the
+  Docker container down — which ALSO unblocks the night-V1 enable.
+  The toggle is deliberately the operator's; nobody enables it for
+  them.
 
 - 2026-08-25 (strip listing retired — THE BAR IS THE WHOLE VISUAL STORY;
   88c0db9, web-only, INLINE fix): the operator's FOURTH strip round.
@@ -464,16 +503,16 @@ direction, freshness, and watchdog timing per physical unit.
   carrying them.
 
 - 2026-08-25 (PVOutput reporting integration — RESEARCH COMPLETE; ALL
-  OPERATOR DECISIONS SETTLED 2026-08-25; IMPLEMENTATION IN FLIGHT): the
-  design round's three open decisions are settled — cutover ordering =
+  OPERATOR DECISIONS SETTLED 2026-08-25; IMPLEMENTED SAME DAY — see the
+  482f96e entry above; this standing note is CLOSED): the design
+  round's three open decisions are settled — cutover ordering =
   NEW-UPLOADER-FIRST then Docker stands down; v1–v6 are owned by the
   INVERTER and we never write them; SoC comes from the real BMS; the
   b1/b2 native battery fields are ON; the operator requested a UI
-  toggle (being built); donation tier confirmed. The implementation
-  agent is in flight (its uncommitted src/energypod/* pvoutput files
-  are work-in-progress — never swept by other agents). The Docker
-  container remains BOTH the night writer AND the current PVOutput
-  v7–v12 writer until the dual cutover executes.
+  toggle (built); donation tier confirmed. The Docker container remains
+  BOTH the night writer AND the current PVOutput v7–v12 writer until
+  the operator's dual cutover executes (their toggle first, then the
+  stand-down).
 
 - 2026-08-25 (history strip geometry — THE BANDS RENDER INSIDE THE BOX;
   68d0f04, web-only): the operator reported EMPTY band boxes with the
