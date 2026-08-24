@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the history strip's fitted band labels — measured pixels, tiered honest words, never an ellipsis)
+Last updated: 2026-08-25 (Australia/Brisbane; the strip listing's sparse-ink doctrine — ink only where the bar cannot word)
 
 ## Purpose
 
@@ -374,6 +374,32 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-25 (strip listing sparse ink — THE DUPLICATED RAW TEXT GOES;
+  f50a592, web-only): the operator's third strip report — raw text
+  duplicating the bars beneath them. DESIGN, sparse ink by doctrine: an
+  item whose band carries its fitted word rides off the page (the
+  sr-only house pattern); an item whose band could not fit even its
+  shortest tier prints with its times; a fully-worded row prints
+  nothing. ONE list (not two) so each segment appears exactly once in
+  the a11y tree; the fit is computed once in StripBands' memo and
+  reported up via useLayoutEffect so clause ink and band words land in
+  the same painted frame (no flash of text-then-quiet); unmeasured DOM
+  renders fullest tiers so nothing counts as bare and nothing prints —
+  ink only by measured refusal. The listing remains the full accessible
+  surface; separator dots only between adjacent inked items; the
+  explainer sentence now says where each fact lives. REJECTED
+  ALTERNATIVE recorded: a fully-sr-only listing would make slivers
+  hover-only, breaking "no information silently vanishes from the
+  visible page" on touch/no-hover. GATES: 961/961 web tests, tsc clean,
+  build green; Playwright DOM + native-pixel probes at 1440 and 390
+  (20/20 — desktop Health shows exactly one inked clause "Self-healing
+  13:40–13:52" beneath the bar, Lifecycle/Commanded print nothing);
+  ariaSnapshot confirms the full clause set for screen readers. Shots
+  deliberately NOT regenerated yet (the concurrent PVOutput
+  implementation agent may run shots — collision avoided; PNGs are
+  gitignored so the commit is complete); one regeneration pass follows
+  when the PVOutput agent lands.
+
 - 2026-08-25 (history strip fitted band labels — NEVER A MID-WORD
   ELLIPSIS; 1b9d6a7, web-only): the operator's second strip report —
   in-bar text ALWAYS truncated. DIAGNOSIS: StripSegments placed one
@@ -406,14 +432,17 @@ direction, freshness, and watchdog timing per physical unit.
   viewport; narrow-390 honestly renders bare slivers with the listing
   carrying them.
 
-- 2026-08-25 (PVOutput reporting integration — RESEARCH COMPLETE, NO
-  CODE, AWAITING OPERATOR DECISIONS): a second workstream delivered the
-  PVOutput reporting-integration design; the full report was relayed to
-  the operator. BLOCKED ON OPERATOR INPUT: cutover ordering (the Docker
-  container is BOTH the site's night writer AND the current PVOutput
-  v7–v12 writer — its stand-down now has TWO consumers), v1–v6 history
-  ownership, and donation-tier confirmation. No implementation until
-  those decisions land.
+- 2026-08-25 (PVOutput reporting integration — RESEARCH COMPLETE; ALL
+  OPERATOR DECISIONS SETTLED 2026-08-25; IMPLEMENTATION IN FLIGHT): the
+  design round's three open decisions are settled — cutover ordering =
+  NEW-UPLOADER-FIRST then Docker stands down; v1–v6 are owned by the
+  INVERTER and we never write them; SoC comes from the real BMS; the
+  b1/b2 native battery fields are ON; the operator requested a UI
+  toggle (being built); donation tier confirmed. The implementation
+  agent is in flight (its uncommitted src/energypod/* pvoutput files
+  are work-in-progress — never swept by other agents). The Docker
+  container remains BOTH the night writer AND the current PVOutput
+  v7–v12 writer until the dual cutover executes.
 
 - 2026-08-25 (history strip geometry — THE BANDS RENDER INSIDE THE BOX;
   68d0f04, web-only): the operator reported EMPTY band boxes with the
