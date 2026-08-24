@@ -31,6 +31,7 @@ import {
   auditPage,
   deliveryBias,
   emptyUnitDetail,
+  notParkedParkState,
   parkOk,
   parkRefusalEnvelope,
   parkState,
@@ -111,13 +112,15 @@ function openStream(
   };
 }
 
-/** The commissioned world: every unit carries a park_state (parked or not). */
+/** The commissioned world: every unit carries a park_state (parked or not).
+ * The unparked lhs unit rides the realistic corrected-wire frame: the site's
+ * cap standing, every lease-relative field null. */
 function fleetWorld(rhsPark: WireParkState): WireSnapshot {
   return snapshot(
     [
       withParkState(
         unitSnapshot({ unit_id: "lhs", lifecycle: "disarmed", telemetry_age_s: 3 }),
-        parkState({ parked: false }),
+        notParkedParkState(),
       ),
       withParkState(
         unitSnapshot({
@@ -428,7 +431,10 @@ describe("BatteriesView — the guarded park dialog", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 
-  it("names the lease too when the site offers no budget at all", async () => {
+  it("names the lease too when the frame offers no budget at all (degenerate-frame honesty)", async () => {
+    // A degenerate frame the corrected wire never serves a commissioned site
+    // (the cap is always >= 60): the view still degrades honestly, naming
+    // the missing lease beside the other missing inputs.
     await openParkDialog(
       makeClient(),
       fleetWorld(parkState({ parked: false, max_total_s: 0, remaining_cap_s: 0 })),
@@ -441,6 +447,38 @@ describe("BatteriesView — the guarded park dialog", () => {
     expect(
       within(dialog).getByText("No lease budget is available for this battery right now."),
     ).not.toBeNull();
+  });
+
+  it("renders the duration select against the realistic not-parked commissioned frame — the exact user-blocked path", async () => {
+    // The corrected wire for a not-parked unit on a commissioned site:
+    // max_total_s is the site's cap, remaining_cap_s (and every other
+    // lease-relative field) null. Before the backend fix this frame served
+    // max_total_s: null as well, leaseChoices came back empty, the "No lease
+    // budget" line stood in for the select, and the confirm could NEVER
+    // enable — no park could be started from the console at all.
+    const client = makeClient();
+    const user = await openParkDialog(client, fleetWorld(notParkedParkState()));
+    const dialog = screen.getByRole("dialog");
+
+    // The duration select RENDERS, with the ladder built from the cap alone.
+    const select = within(dialog).getByLabelText("Lease duration") as HTMLSelectElement;
+    const options = Array.from(select.options).map((option) => option.value);
+    expect(options.length).toBeGreaterThan(0);
+    expect(options).toContain("60");
+    expect(options).toContain("14400"); // the site's 4 h cap, offered and chosen by default
+    expect(select.value).toBe("14400");
+    expect(
+      within(dialog).queryByText("No lease budget is available for this battery right now."),
+    ).toBeNull();
+
+    // Confirm enables once the reason and the typed unit id are in — the
+    // exact previously-blocked path.
+    const confirm = within(dialog).getByRole("button", { name: "Park rhs" });
+    expect(confirm).toBeDisabled();
+    await user.type(within(dialog).getByLabelText("Reason (required)"), "evening standby");
+    expect(confirm).toBeDisabled();
+    await user.type(within(dialog).getByLabelText("Type rhs to enable park"), "rhs");
+    expect(confirm).toBeEnabled();
   });
 
   it("bounds the lease select to the site's budget and sends the typed confirmation with the chosen lease", async () => {

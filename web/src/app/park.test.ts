@@ -20,6 +20,7 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  notParkedParkState,
   parkRefusalEnvelope,
   parkState,
   resumeChecklist,
@@ -243,6 +244,24 @@ describe("the lease-duration choices", () => {
       expect(choice.seconds).toBeLessThanOrEqual(1800);
     }
     expect(choices.some((choice) => choice.seconds === 1800)).toBe(true);
+  });
+
+  it("builds the ladder from the site cap alone when no lease is open (the corrected wire)", () => {
+    // The realistic not-parked frame on a commissioned site: max_total_s is
+    // the SITE's cap, remaining_cap_s is null (lease-relative, no lease).
+    // The ladder must build from the cap alone — this is the exact frame the
+    // park dialog opens against, and the empty-ladder bug that blocked every
+    // console park.
+    const state = toParkState(notParkedParkState({ max_total_s: 7200 }))!;
+    expect(state.parked).toBe(false);
+    const choices = leaseChoices(state);
+    expect(choices.length).toBeGreaterThan(0);
+    for (const choice of choices) {
+      expect(choice.seconds).toBeGreaterThanOrEqual(60);
+      expect(choice.seconds).toBeLessThanOrEqual(7200);
+    }
+    expect(choices.some((choice) => choice.seconds === 7200)).toBe(true);
+    expect(choices.some((choice) => choice.seconds === 14400)).toBe(false);
   });
 
   it("offers nothing below the wire's 60-second floor and nothing without a budget", () => {

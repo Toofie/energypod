@@ -2439,17 +2439,23 @@ export const UNIT_PARK_EXPIRED_EVENT = "unit.park_expired" as const;
  * snapshot unit and unit detail once the `parking:` config block is
  * commissioned; ABSENT (never null-standing-in) when it is not — that absent
  * key is the console's not-commissioned feature detection.
+ *
+ * Field semantics split per §3: `max_total_s` is the SITE's commissioned
+ * lease cap and rides every composed projection (parked or not — the park
+ * dialog's duration ladder reads it with no lease open); `remaining_cap_s` is
+ * lease-relative (the anti-rollover figure an open lease still has) and null
+ * without one, as are the lease's own fields.
  */
 export interface WireParkState {
   readonly parked: boolean;
   readonly origin: string;
-  readonly parked_at: string;
-  readonly lease_expires_at: string;
-  readonly max_total_s: number;
-  readonly remaining_cap_s: number;
+  readonly parked_at: string | null;
+  readonly lease_expires_at: string | null;
+  readonly max_total_s: number | null;
+  readonly remaining_cap_s: number | null;
   readonly expired: boolean;
-  readonly reason: string;
-  readonly authorizer: string;
+  readonly reason: string | null;
+  readonly authorizer: string | null;
   /** True when a foreign park landed over our unchanged lease (named, no write). */
   readonly foreign_rewrite?: boolean;
   /** The terminal sub-state: a failed write never reclassifies a lease. */
@@ -2462,23 +2468,44 @@ export interface WireParkState {
  * A park-projection fixture. Defaults are the §0/§8 story's own figures: rhs
  * parked by the operator at 02:00 local under a 4 h lease — 166 V observed
  * while parked is the pack-voltage evidence the chip tooltip names. Explicit
- * nulls and the optional booleans are preserved exactly as given.
+ * nulls and the optional booleans are preserved exactly as given (use the
+ * `notParked` helper for the realistic commissioned-but-no-lease frame).
  */
 export function parkState(spec: Partial<WireParkState> = {}): WireParkState {
   return {
     parked: spec.parked ?? true,
     origin: spec.origin ?? "operator",
-    parked_at: spec.parked_at ?? "2026-08-24T02:00:00+10:00",
-    lease_expires_at: spec.lease_expires_at ?? "2026-08-24T06:00:00+10:00",
-    max_total_s: spec.max_total_s ?? 14400,
-    remaining_cap_s: spec.remaining_cap_s ?? 14400,
+    parked_at: spec.parked_at === undefined ? "2026-08-24T02:00:00+10:00" : spec.parked_at,
+    lease_expires_at:
+      spec.lease_expires_at === undefined ? "2026-08-24T06:00:00+10:00" : spec.lease_expires_at,
+    max_total_s: spec.max_total_s === undefined ? 14400 : spec.max_total_s,
+    remaining_cap_s: spec.remaining_cap_s === undefined ? 14400 : spec.remaining_cap_s,
     expired: spec.expired ?? false,
-    reason: spec.reason ?? "evening standby",
-    authorizer: spec.authorizer ?? "operator:home",
+    reason: spec.reason === undefined ? "evening standby" : spec.reason,
+    authorizer: spec.authorizer === undefined ? "operator:home" : spec.authorizer,
     ...(spec.foreign_rewrite === undefined ? {} : { foreign_rewrite: spec.foreign_rewrite }),
     ...(spec.write_unverified === undefined ? {} : { write_unverified: spec.write_unverified }),
     ...(spec.foreign_mode === undefined ? {} : { foreign_mode: spec.foreign_mode }),
   };
+}
+
+/**
+ * The realistic not-parked frame on a commissioned site (the corrected wire):
+ * the site's cap stands, every lease-relative field honestly null. This is
+ * the exact shape the park dialog opens against — the duration ladder builds
+ * from `max_total_s` alone.
+ */
+export function notParkedParkState(spec: Partial<WireParkState> = {}): WireParkState {
+  return parkState({
+    parked: false,
+    origin: "none",
+    parked_at: null,
+    lease_expires_at: null,
+    remaining_cap_s: null,
+    reason: null,
+    authorizer: null,
+    ...spec,
+  });
 }
 
 /** Attach the pending park projection to a snapshot unit. */

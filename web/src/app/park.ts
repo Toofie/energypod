@@ -19,6 +19,11 @@
  * - `park_state`: `{parked, origin, parked_at, lease_expires_at, max_total_s,
  *   remaining_cap_s, expired, reason, authorizer, foreign_rewrite?,
  *   write_unverified?, foreign_mode?}` — absent key when uncommissioned.
+ *   Field semantics split per §3: `max_total_s` is the SITE's commissioned
+ *   lease cap and rides every composed projection, parked or not (the park
+ *   dialog's duration ladder reads it with no lease open); `remaining_cap_s`
+ *   is lease-relative and null without an open lease, as are `parked_at` /
+ *   `lease_expires_at` / `reason` / `authorizer`.
  * - The lease countdown is POLICY, never safety: no countdown may imply
  *   time-bounded safety, and expiry is the alarm-only act (the controller
  *   performs no write; Resume is an operator act).

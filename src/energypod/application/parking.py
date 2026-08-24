@@ -1201,6 +1201,15 @@ class ParkController:
         memory: _DivergenceMemory,
         now: datetime,
     ) -> dict[str, Any]:
+        """One unit's projection, semantics split per field.
+
+        ``max_total_s`` is the SITE's commissioned lease cap and rides every
+        composed projection, parked or not (DESIGN section 3: the console's
+        lease ladder reads it the moment an operator opens the park dialog --
+        with NO lease open there is nothing else to bound a new park against).
+        ``remaining_cap_s`` is lease-relative -- the anti-rollover figure an
+        open lease still has -- and is ``None`` without one.
+        """
         foreign_mode: dict[str, Any] | None = None
         if memory.foreign_mode_word is not None:
             foreign_mode = {
@@ -1241,7 +1250,9 @@ class ParkController:
         if memory.last_word == 1 or (
             memory.foreign_standby_origin is not None and memory.last_word is None
         ):
-            # word=1 with no controller lease: the honest origin split.
+            # word=1 with no controller lease: the honest origin split.  The
+            # commissioned cap still rides (a NEW park over this word is the
+            # sanctioned exit); no lease, no anti-rollover figure.
             return {
                 "parked": True,
                 "origin": memory.foreign_standby_origin or "unrecorded",
@@ -1251,7 +1262,7 @@ class ParkController:
                     else memory.foreign_standby_since.astimezone(UTC).isoformat()
                 ),
                 "lease_expires_at": None,
-                "max_total_s": None,
+                "max_total_s": self._commissioning.max_lease_s,
                 "remaining_cap_s": None,
                 "expired": False,
                 "reason": None,
@@ -1263,7 +1274,7 @@ class ParkController:
             "origin": "none",
             "parked_at": None,
             "lease_expires_at": None,
-            "max_total_s": None,
+            "max_total_s": self._commissioning.max_lease_s,
             "remaining_cap_s": None,
             "expired": False,
             "reason": None,

@@ -882,12 +882,27 @@ async def test_an_observed_foreign_resume_closes_the_lease_with_no_write(rig: Ri
 async def test_a_word_one_with_no_lease_projects_the_honest_unknown_first(rig: Rig) -> None:
     """``unrecorded`` -- the word was already 1 at this process's first look
     (crash-after-write residue); the honest unknown, never a fabricated
-    transition."""
+    transition.  The commissioned cap still rides (a NEW park over this word
+    is the sanctioned exit); the lease-relative figure stays null."""
     rig.observations.serve("mid", debug_mode_w=1)
     await rig.controller.supervise()
     state = (await rig.controller.park_states())["mid"]
     assert state["parked"] is True and state["origin"] == "unrecorded"
     assert state["lease_expires_at"] is None
+    assert state["max_total_s"] == 14400
+    assert state["remaining_cap_s"] is None
+
+
+async def test_the_not_parked_projection_serves_the_commissioned_cap(rig: Rig) -> None:
+    """The field-semantics split (DESIGN section 3): ``max_total_s`` is the
+    SITE's commissioned lease cap on every composed projection, independent of
+    any lease; ``remaining_cap_s`` is lease-relative and ``None`` without an
+    open one.  The console's park dialog builds its duration ladder from the
+    cap alone the moment it opens -- the not-parked shape is load-bearing."""
+    state = (await rig.controller.park_states())["mid"]
+    assert state["parked"] is False and state["origin"] == "none"
+    assert state["max_total_s"] == 14400
+    assert state["remaining_cap_s"] is None
 
 
 async def test_an_observed_transition_to_standby_is_the_foreign_class(rig: Rig) -> None:

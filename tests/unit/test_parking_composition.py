@@ -129,6 +129,28 @@ async def test_a_present_block_composes_the_controller_and_the_rest_routes(
     assert "/api/v1/units/{unit_id}/resume" in paths
 
 
+async def test_the_projection_serves_the_commissioned_cap_with_no_lease_open(
+    tmp_path: Path,
+) -> None:
+    """The field-semantics split (DESIGN section 3): ``max_total_s`` is the
+    SITE's commissioned lease cap and rides every composed projection --
+    parked or not, a fresh park is bounded by the cap alone -- while
+    ``remaining_cap_s`` is lease-relative and ``None`` without an open lease.
+    The console's park dialog reads exactly this shape the moment it opens:
+    the not-parked cap IS the duration ladder's bound (the live bug: a null
+    cap served an empty ladder and no park could start)."""
+    runtime = _compose({"max_lease_s": 7200, "default_lease_s": 3600}, ManualClock())
+    snapshot = await runtime.facade.snapshot(principal=OPERATOR)
+    (unit,) = snapshot["units"]
+    assert unit["park_state"]["parked"] is False
+    assert unit["park_state"]["origin"] == "none"
+    assert unit["park_state"]["max_total_s"] == 7200, "the commissioned cap, no lease needed"
+    assert unit["park_state"]["remaining_cap_s"] is None, "lease-relative: no lease, no figure"
+    detail = await runtime.facade.unit_detail(principal=OPERATOR, unit_id="mid")
+    assert detail["park_state"]["max_total_s"] == 7200
+    assert detail["park_state"]["remaining_cap_s"] is None
+
+
 async def test_the_composed_actors_carry_the_commissioned_mode_write_budget(
     tmp_path: Path,
 ) -> None:
@@ -185,6 +207,7 @@ async def test_an_operator_park_drives_the_real_actor_mailbox_operation(
         assert unit["park_state"]["parked"] is True
         assert unit["park_state"]["origin"] == "operator"
         assert unit["park_state"]["reason"] == "inverter work"
+        assert unit["park_state"]["max_total_s"] == 7200
         assert unit["park_state"]["remaining_cap_s"] >= 3599
         detail = await runtime.facade.unit_detail(principal=OPERATOR, unit_id="mid")
         assert detail["park_state"]["parked"] is True
@@ -237,6 +260,10 @@ async def test_an_operator_park_drives_the_real_actor_mailbox_operation(
         snapshot = await runtime.facade.snapshot(principal=OPERATOR)
         (unit,) = snapshot["units"]
         assert unit["park_state"]["parked"] is False
+        # The closed lease leaves the site's cap standing, the lease-relative
+        # figure honestly null -- the next park's ladder reads the cap.
+        assert unit["park_state"]["max_total_s"] == 7200
+        assert unit["park_state"]["remaining_cap_s"] is None
     finally:
         for handle in runtime.actors.values():
             with contextlib.suppress(Exception):
