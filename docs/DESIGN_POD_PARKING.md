@@ -163,7 +163,8 @@ Refusals: the commissioning/write/readback twins above;
 vendor mode is its own acknowledged act, never a resume alias;
 `resume_stop_latched` when a latched emergency stop names the unit (resume
 would re-enable autonomy under a standing stop instruction — acknowledge
-the stop first).
+the stop first): `{"stop_ids": [...],
+"acknowledgement_endpoint": "/api/v1/emergency-stop/{stop_id}/acknowledge"}`.
 
 ## 3. State, projections, and vocabulary
 
@@ -208,6 +209,12 @@ the stop first).
     the per-cycle failure is survivable per its standing doctrine, and
     `schedule_state` carries `unit_parked` as a projection-level code (the
     `units_disarmed` mechanism verbatim).
+  - **Night-charge and excess DO exclude parked units at selection** —
+    selection is those advisers' designed job (they already exclude
+    non-eligible/full units; `unit_parked` is the stated exclusion cause in
+    the projection), and an adviser repeatedly submitting into a standing
+    refusal would violate the never-retry-a-denied-dispatch-unchanged
+    doctrine. Coordinator ruling 2026-08-24, resolving the B1 ambiguity.
   - Foreign PQ objectives observed on a parked unit (the night-writer
     case): the night-writer detector annotates those samples `unit_parked`
     — never silent, never an alert by itself. Consequence chain stated
