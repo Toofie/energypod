@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the strip listing's sparse-ink doctrine — ink only where the bar cannot word)
+Last updated: 2026-08-25 (Australia/Brisbane; the strip listing retired by operator direction — the bar is the whole visual story)
 
 ## Purpose
 
@@ -373,6 +373,35 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (strip listing retired — THE BAR IS THE WHOLE VISUAL STORY;
+  88c0db9, web-only, INLINE fix): the operator's FOURTH strip round.
+  They pasted the live DOM — their real Health row carried 60+
+  alternating Healthy/Self-healing entries overnight (the recovery
+  monitor flapping every 1–13 min, 00:32–08:11); under the sparse-ink
+  doctrine nearly every spell was a bare sliver, so the entire wall
+  printed again. THE OPERATOR'S INSTRUCTION WAS EXPLICIT: remove the
+  history-strip-listing element from the UI. THE FIX (surgical, not a
+  subagent): the listing wears the offpage class UNCONDITIONALLY — off
+  the paper in every regime, bare bands included, never out of the
+  accessibility tree; the fit-reporting machinery (onFitted callback,
+  fittedLabels state, per-item offpage classes, mixed-ink separator CSS
+  rules) is deleted; the explainer now reads "hover any band for its
+  full sentence and times". This supersedes the sparse-ink doctrine of
+  f50a592 by explicit operator direction — its touch/no-hover concern
+  stands recorded there but is overridden: the full sentence set
+  remains in the a11y tree and on hover; nothing prints on paper.
+  GATES: 961/961 web tests (one unrelated timing flake in the first
+  full run — a live/reconnect UI test — clean on two consecutive
+  reruns), tsc + build green; shots regenerating in the background.
+  OPEN OBSERVATION offered to the operator, no answer yet: the
+  health-flapping itself is REAL DATA (60+ spells, 1–13 min cadence,
+  00:32–08:11) and a possible investigation. PVOutput NOTE: the
+  implementation agent was interrupted mid-build BY THE OPERATOR to
+  prioritize this fix and is being resumed; its partial work
+  (adapters/pvoutput/, application/pvoutput_upload.py, edits to
+  rest.py/service.py/config.py/schema.py/persistence) sat uncommitted
+  and untouched throughout — never-sweep still applies.
 
 - 2026-08-25 (strip listing sparse ink — THE DUPLICATED RAW TEXT GOES;
   f50a592, web-only): the operator's third strip report — raw text
