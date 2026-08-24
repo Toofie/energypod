@@ -1303,12 +1303,257 @@ def test_even_pacing_requires_the_capacity_map_with_exactly_the_fleet_units() ->
 
 
 def test_cap_first_pacing_refuses_a_stray_capacity_map() -> None:
-    """`assumed_capacity_wh` present IFF `pacing: even` — a stray map under
-    cap_first is a configuration that lies about which pacing rule runs."""
+    """`assumed_capacity_wh` present IFF `pacing: even` OR a forecast target
+    policy — a stray map under cap_first-full is a configuration that lies
+    about which pacing rule runs (V2 section 2.1 widened the IFF)."""
     _assert_night_rule(
         _night_config(assumed_capacity_wh={"mid": 5000, "rhs": 5000, "lhs": 5000}),
         message_contains="assumed_capacity_wh",
     )
+
+
+# --- night charge V2 (DESIGN_NIGHT_CHARGE_V2 section 6, T-NC2-CONFIG) -------------
+
+
+def _night_v2_config(
+    policy: str = "forecast_suggest",
+    *,
+    tariff: dict[str, Any] | None = None,
+    without: tuple[str, ...] = (),
+    **night_overrides: Any,
+) -> dict[str, Any]:
+    """A forecast-posture night block against the full advisory stack: the
+    partition grant, the historian the load baseline reads, the enabled
+    provider block with solcast as the PV truth, and the capacity map the
+    forecast target needs even under cap_first."""
+    payload = _valid_config()
+    payload["schedule"] = {"allowed_windows_local": [["00:00", "20:00"]]}
+    payload["plant_history"] = {}
+    providers: dict[str, Any] = {
+        "enabled": True,
+        "solcast": {
+            "api_key_env": "SOLCAST_API_KEY",
+            "resource_id": "b6bf-9d1d-0680-4078",
+        },
+        "load_baseline": {},
+    }
+    if tariff is not None:
+        providers["tariff"] = tariff
+    for key in without:
+        providers.pop(key, None)
+    payload["forecast_providers"] = providers
+    night_block = {
+        "target_policy": policy,
+        "assumed_capacity_wh": {"mid": 5000, "rhs": 4200, "lhs": 5000},
+        **night_overrides,
+    }
+    payload["night_charging"] = _night_payload(**night_block)
+    return payload
+
+
+def test_target_policy_is_three_states_with_full_the_default() -> None:
+    parsed = _validate(_night_config())
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.target_policy == "full", "an absent key means full (v1)"
+
+    error = _assert_night_rule(
+        _night_config(target_policy="forecast"), message_contains="forecast_suggest"
+    )
+    assert "forecast_act" in str(error), "the refusal names all three words"
+
+
+def test_the_v2_keys_carry_their_pinned_defaults() -> None:
+    parsed = _validate(_night_v2_config())
+    block = parsed.night_charging
+    assert block is not None
+    assert block.forecast_quantile == 0.1
+    assert block.midday_local == "12:00"
+    assert block.floor_pct == 50.0
+    assert block.charge_efficiency == 0.9
+    assert block.retarget_threshold_pct == 20.0
+    assert block.retarget_min_gap_min == 60
+    assert block.trust is not None
+    assert block.trust.required_days == 14
+    assert block.trust.tolerance_pct == 30.0
+    assert block.trust.max_overforecast_bias_pct == 10.0
+    assert block.trust.max_underforecast_bias_pct == 20.0
+    assert block.trust.min_regime_days == 3
+
+
+def test_full_posture_is_v1_config_identity_needing_no_forecast_stack() -> None:
+    """T-NC2-CONFIG's identity pin: `full` validates with NO forecast
+    providers, NO historian, NO capacity map under cap_first — the v1 block,
+    byte for byte."""
+    parsed = _validate(_night_config(target_policy="full"))
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.target_policy == "full"
+    assert parsed.forecast_providers is None
+
+
+def test_a_forecast_posture_requires_the_capacity_map_exactly_the_fleet() -> None:
+    """Section 2.1's widened IFF: the map must be present with exactly the
+    fleet units IFF pacing `even` OR `target_policy != full` — one capacity
+    truth for pacing and the target alike."""
+    _assert_night_rule(
+        _night_v2_config(assumed_capacity_wh=None), message_contains="assumed_capacity_wh"
+    )
+    wrong = _night_v2_config(assumed_capacity_wh={"mid": 5000, "rhs": 4200})
+    _assert_night_rule(wrong, message_contains="fleet")
+    parsed = _validate(_night_v2_config(pacing="even"))
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.assumed_capacity_wh is not None
+
+
+@pytest.mark.parametrize("capacity", [0, -4200])
+def test_a_non_positive_capacity_value_is_refused_at_validation(capacity: int) -> None:
+    """A12: a zero-or-negative Wh is a nonsense capacity that would throw
+    targets across the range — refused at validation, never clamped."""
+    _assert_night_rule(
+        _night_v2_config(assumed_capacity_wh={"mid": 5000, "rhs": capacity, "lhs": 5000}),
+        message_contains="greater than 0",
+    )
+
+
+def test_a_forecast_posture_requires_the_declared_advisory_stack() -> None:
+    """Section 6: the PV source, the enabled provider block, and the load
+    baseline are prerequisites of any forecast posture — each refusal names
+    the missing block by path."""
+    _assert_night_rule(
+        _night_v2_config(without=("solcast",)), message_contains="PV forecast"
+    )
+    _assert_night_rule(
+        _night_v2_config(without=("load_baseline",)), message_contains="load_baseline"
+    )
+    disabled = _night_v2_config()
+    disabled["forecast_providers"] = {**disabled["forecast_providers"], "enabled": False}
+    _assert_night_rule(disabled, message_contains="forecast_providers.enabled")
+
+
+def test_midday_must_sit_strictly_after_every_window_end() -> None:
+    _assert_night_rule(_night_v2_config(midday_local="06:00"), message_contains="midday_local")
+    # A cross-midnight window ending 04:00 still finishes before noon (the
+    # partition grant widened beside it, as the union rule demands).
+    cross = _night_v2_config(window_local=[["22:00", "04:00"]])
+    cross["schedule"] = {"allowed_windows_local": [["20:00", "06:00"]]}
+    parsed = _validate(cross)
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.midday_local == "12:00"
+
+
+def test_the_v2_numeric_bounds_are_each_refused_with_their_rule_named() -> None:
+    _assert_night_rule(_night_v2_config(forecast_quantile=1.5), message_contains="quantile")
+    _assert_night_rule(
+        _night_v2_config(charge_efficiency=0.0), message_contains="charge_efficiency"
+    )
+    _assert_night_rule(
+        _night_v2_config(charge_efficiency=1.01), message_contains="charge_efficiency"
+    )
+    _assert_night_rule(_night_v2_config(floor_pct=0.0), message_contains="floor_pct")
+    _assert_night_rule(_night_v2_config(floor_pct=95.0), message_contains="floor_pct")
+    _assert_night_rule(
+        _night_v2_config(retarget_threshold_pct=0.0), message_contains="retarget_threshold_pct"
+    )
+    _assert_night_rule(
+        _night_v2_config(retarget_min_gap_min=10), message_contains="retarget_min_gap_min"
+    )
+
+
+def test_the_trust_block_bounds_refuse_symmetric_or_non_positive_bias() -> None:
+    """A4: over-forecast is the dangerous, TIGHTER direction — the bounds are
+    positive and asymmetric, and every other gate key is positive."""
+    symmetric = {
+        "required_days": 14,
+        "tolerance_pct": 30.0,
+        "max_overforecast_bias_pct": 15.0,
+        "max_underforecast_bias_pct": 15.0,
+        "min_regime_days": 3,
+    }
+    _assert_night_rule(
+        _night_v2_config(trust=symmetric), message_contains="overforecast"
+    )
+    inverted = {**symmetric, "max_overforecast_bias_pct": 25.0}
+    _assert_night_rule(_night_v2_config(trust=inverted), message_contains="overforecast")
+    zero_tolerance = {**symmetric, "tolerance_pct": 0.0, "max_overforecast_bias_pct": 10.0}
+    _assert_night_rule(_night_v2_config(trust=zero_tolerance), message_contains="tolerance_pct")
+    no_regime = {**symmetric, "min_regime_days": 0, "max_overforecast_bias_pct": 10.0}
+    _assert_night_rule(_night_v2_config(trust=no_regime), message_contains="min_regime_days")
+
+
+def test_forecast_act_is_gated_on_tariff_keys_and_the_export_spread() -> None:
+    """A3, the file-level economics gate: ACT requires the tariff keys with
+    the export FIT STRICTLY below the off-peak import — the legacy 44-52 c
+    QLD FiT against ~12 c off-peak loses ~35 c per stored kWh and the file
+    refuses to automate a loss."""
+    no_tariff = _assert_night_rule(
+        _night_v2_config("forecast_act"), message_contains="tariff"
+    )
+    assert "forecast_providers.tariff" in str(no_tariff), "the refusal names the block by path"
+
+    legacy_fit = _night_v2_config(
+        "forecast_act",
+        tariff={
+            "currency": "AUD",
+            "default_import_cents_per_kwh": 12.0,
+            "default_export_cents_per_kwh": 44.0,
+        },
+    )
+    error = _assert_night_rule(legacy_fit, message_contains="export")
+    assert "below" in str(error).lower(), "the refusal states the required direction"
+
+    paying = _night_v2_config(
+        "forecast_act",
+        tariff={
+            "currency": "AUD",
+            "default_import_cents_per_kwh": 12.0,
+            "default_export_cents_per_kwh": 9.0,
+        },
+    )
+    parsed = _validate(paying)
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.target_policy == "forecast_act"
+
+
+def test_the_act_tariff_gate_uses_the_rates_in_force_over_each_span() -> None:
+    """The night buy pays the import rate in force over the NIGHT window; the
+    forgone export earns the FIT over the MORNING span.  A cheap declared
+    night window cannot rescue a dear default: every minute must pay."""
+    split = _night_v2_config(
+        "forecast_act",
+        tariff={
+            "currency": "AUD",
+            "default_import_cents_per_kwh": 40.0,
+            "default_export_cents_per_kwh": 5.0,
+            "windows": [
+                {
+                    "window_local": ["00:00", "06:00"],
+                    "import_cents_per_kwh": 12.0,
+                    "export_cents_per_kwh": 9.0,
+                }
+            ],
+        },
+    )
+    parsed = _validate(split)
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.target_policy == "forecast_act"
+
+    # The same night window with a 50 c FiT slice inside the morning span:
+    # the surplus would forgo 50 c to save 12 c -- refused on physics.
+    poisoned = _night_v2_config(
+        "forecast_act",
+        tariff={
+            "currency": "AUD",
+            "default_import_cents_per_kwh": 12.0,
+            "default_export_cents_per_kwh": 9.0,
+            "windows": [
+                {
+                    "window_local": ["08:00", "09:00"],
+                    "import_cents_per_kwh": 28.0,
+                    "export_cents_per_kwh": 50.0,
+                }
+            ],
+        },
+    )
+    _assert_night_rule(poisoned, message_contains="export")
 
 
 def test_the_partition_grant_is_required_and_names_the_widening_path() -> None:
@@ -1354,7 +1599,8 @@ def test_unknown_night_keys_are_refused() -> None:
 
 def test_the_live_write_examples_night_block_validates_as_documented() -> None:
     """B6: the example's `night_charging:` block — present but `enabled:
-    false`, the grant widened beside it in the same revision — parses
+    false`, the grant widened beside it in the same revision, and (since
+    night-V2) the SUGGEST posture with its whole advisory stack — parses
     cleanly, so what the operator reads on the example is what the
     controller composes (the projection visible, participation off)."""
     from pathlib import Path
@@ -1366,17 +1612,23 @@ def test_the_live_write_examples_night_block_validates_as_documented() -> None:
     assert isinstance(document, dict), "the example must stay one YAML document"
     assert "night_charging" in document, "the night block is present-but-suspended"
     assert document["night_charging"]["enabled"] is False
+    assert document["night_charging"]["target_policy"] == "forecast_suggest", (
+        "the V2 shipping posture: computed, displayed, and byte-identical v1 charging"
+    )
     assert document["schedule"]["allowed_windows_local"] == [["00:00", "20:00"]], (
         "the PARTITION grant ships in the same revision as the night block"
     )
 
     payload = _valid_config()
     payload["schedule"] = document["schedule"]
+    payload["plant_history"] = document["plant_history"]
+    payload["forecast_providers"] = document["forecast_providers"]
     payload["night_charging"] = document["night_charging"]
     parsed = ControllerConfig.model_validate(payload)
     assert parsed.night_charging is not None
     assert parsed.night_charging.enabled is False
     assert parsed.night_charging.pacing == "cap_first"
+    assert parsed.night_charging.assumed_capacity_wh == {"lhs": 5000, "mid": 5000, "rhs": 4200}
     assert parsed.schedule is not None
     assert parsed.schedule.allowed_windows_local == (("00:00", "20:00"),)
 

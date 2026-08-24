@@ -7,6 +7,7 @@ unknown keys are rejected at every nesting level.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from enum import StrEnum
 from ipaddress import IPv4Network, IPv6Network
 from pathlib import Path
@@ -563,8 +564,69 @@ class EnergyScorecardConfig(_FrozenModel):
         return self
 
 
+def _covers_minute(start: int, end: int, minute: int) -> bool:
+    """Wrap-aware civil-minute containment, the tariff window's own rule."""
+    if start < end:
+        return start <= minute < end
+    return minute >= start or minute < end
+
+
+def _span_rates(
+    default_rate: float,
+    windows: Sequence[tuple[int, int, float]],
+    spans: Sequence[tuple[int, int]],
+) -> list[tuple[int, float]]:
+    """Resolve the rate in force at every civil minute of the spans.
+
+    The static-tariff provider's own precedence (``_rates_at``): the FIRST
+    declared window covering a minute wins, else the flat default.  Pure
+    minute-of-day arithmetic, so config validation stays offline-pure while
+    judging exactly the rates the composed provider would serve.
+    """
+    resolved: list[tuple[int, float]] = []
+    for span_start, span_end in spans:
+        minute = span_start
+        while True:
+            rate = float(default_rate)
+            for window_start, window_end, window_rate in windows:
+                if _covers_minute(window_start, window_end, minute):
+                    rate = float(window_rate)
+                    break
+            resolved.append((minute, rate))
+            minute = (minute + 1) % 1440
+            if minute == span_end:
+                break
+    return resolved
+
+
+class NightTrustBlockConfig(_FrozenModel):
+    """DESIGN_NIGHT_CHARGE_V2 section 6: the trust gate's keys.
+
+    The bounds are the panel-sharpened compound gate (A4): the bias is
+    ASYMMETRIC with over-forecast the dangerous, tighter direction, so the
+    over bound must sit strictly below the under bound — a symmetric pair is
+    a different gate than the one this contract ships.
+    """
+
+    required_days: PositiveStrictInt = 14
+    tolerance_pct: PositiveFiniteFloat = 30.0
+    max_overforecast_bias_pct: PositiveFiniteFloat = 10.0
+    max_underforecast_bias_pct: PositiveFiniteFloat = 20.0
+    min_regime_days: PositiveStrictInt = 3
+
+    @model_validator(mode="after")
+    def validate_bias_asymmetry(self) -> Self:
+        if self.max_overforecast_bias_pct >= self.max_underforecast_bias_pct:
+            raise ValueError(
+                "night_charging.trust.max_overforecast_bias_pct must be strictly below "
+                "max_underforecast_bias_pct: over-forecast is the dangerous direction "
+                "that under-charges, so its tolerance is the tighter half (A4)"
+            )
+        return self
+
+
 class NightChargingConfig(_FrozenModel):
-    """DESIGN_NIGHT_CHARGE §3.1 + API_CONTRACTS "Off-peak night charge".
+    """DESIGN_NIGHT_CHARGE §3.1 + DESIGN_NIGHT_CHARGE_V2 §6.
 
     Block-presence doctrine, symmetric with ``excess_charging``/``schedule``:
     a PRESENT block composes the adviser, the ``night_charge_state``
@@ -576,9 +638,14 @@ class NightChargingConfig(_FrozenModel):
     cross-fleet relations (the cap inside the static unit charge limit, the
     hold strictly between zero and the cap, the hysteresis band strictly
     inside the threshold, a freshness bound the polling loop can satisfy, a
-    bounded renewable TTL, the capacity map exactly when the pacing rule
-    needs it, and the PARTITION grant against the schedule policy) are
+    bounded renewable TTL, the capacity map exactly when the pacing rule or
+    the forecast target needs it, the forecast prerequisites of a forecast
+    posture, and the PARTITION grant against the schedule policy) are
     validated on ``ControllerConfig``, where the blocks they relate to live.
+
+    V2's keys all carry their §6 defaults so ``target_policy: full`` (the
+    absent-key default) is exact v1 identity: no forecast stack is required,
+    no capacity map under ``cap_first``, byte-identical behavior.
     """
 
     # REQUIRED: the off-peak window is a civil-time fact the operator
@@ -596,12 +663,26 @@ class NightChargingConfig(_FrozenModel):
     hold_rate_w: PositiveStrictInt = 100
     demand_scope: Literal["fleet", "per_phase"] = "fleet"
     pacing: Literal["cap_first", "even"] = "cap_first"
-    # REQUIRED iff ``pacing: even`` (key set exactly the fleet units,
-    # validated on ControllerConfig); a stray map under cap_first is refused
-    # — the estimate only shapes pacing, never safety.
+    # REQUIRED iff ``pacing: even`` OR ``target_policy != full`` (key set
+    # exactly the fleet units, validated on ControllerConfig); a stray map
+    # under cap_first-full is refused — the estimate only shapes pacing and
+    # the target, never safety.
     assumed_capacity_wh: dict[NonEmpty, PositiveStrictInt] | None = None
     demand_telemetry_max_age_s: PositiveFiniteFloat = 3.0
     intent_ttl_s: PositiveFiniteFloat = 10.0
+    # --- V2 (DESIGN_NIGHT_CHARGE_V2 section 6) ----------------------------------
+    # The three-state posture: full = v1 identity (the default an absent key
+    # means); forecast_suggest computes and displays but charges v1;
+    # forecast_act lets the computed target govern, entered only by config
+    # revision + restart after the operator accepts the section 3.2 evidence.
+    target_policy: Literal["full", "forecast_suggest", "forecast_act"] = "full"
+    forecast_quantile: Annotated[StrictFloat, Field(ge=0, le=1, allow_inf_nan=False)] = 0.1
+    midday_local: NonEmpty = "12:00"
+    floor_pct: Annotated[StrictFloat, Field(gt=0, allow_inf_nan=False)] = 50.0
+    charge_efficiency: Annotated[StrictFloat, Field(gt=0, le=1, allow_inf_nan=False)] = 0.9
+    retarget_threshold_pct: Annotated[StrictFloat, Field(gt=0, le=100, allow_inf_nan=False)] = 20.0
+    retarget_min_gap_min: Annotated[StrictInt, Field(ge=15)] = 60
+    trust: NightTrustBlockConfig = NightTrustBlockConfig()
 
     @field_validator("timezone")
     @classmethod
@@ -629,6 +710,29 @@ class NightChargingConfig(_FrozenModel):
         if not cleaned:
             raise ValueError("window_local must name at least one window")
         return tuple(cleaned)
+
+    @field_validator("midday_local")
+    @classmethod
+    def validate_midday(cls, value: str) -> str:
+        return _valid_policy_wall(value)
+
+    @model_validator(mode="after")
+    def validate_midday_after_window_ends(self) -> Self:
+        # The operator's declared finish line is a CIVIL fact: strictly after
+        # every configured window's end wall on the same civil morning (a
+        # window ending at or past midday leaves the morning no span).
+        midday = _valid_policy_wall(self.midday_local)
+        midday_minute = int(midday[:2]) * 60 + int(midday[3:5])
+        for _start, end in self.window_local:
+            end_minute = int(end[:2]) * 60 + int(end[3:5])
+            if midday_minute <= end_minute:
+                raise ValueError(
+                    "night_charging.midday_local must sit strictly after every "
+                    f"window_local end wall ({midday} is not after {end}): the "
+                    "morning surplus span [window_end, midday) would be empty or "
+                    "reversed"
+                )
+        return self
 
 
 class PlantHistoryConfig(_FrozenModel):
@@ -909,10 +1013,6 @@ class ControllerConfig(_FrozenModel):
     # declared last beside its siblings so its commissioning validator sees
     # the already-validated timing.
     energy_scorecard: EnergyScorecardConfig | None = None
-    # DESIGN_NIGHT_CHARGE §3.1 (B1): declared LAST of all so its commissioning
-    # validator sees the already-validated policy, timing, units, and the
-    # schedule block the PARTITION grant is judged against.
-    night_charging: NightChargingConfig | None = None
     # DESIGN_PLANT_HISTORY §2.5: the telemetry historian block, declared last
     # beside its siblings so its commissioning validator sees the
     # already-validated timing and storage blocks.
@@ -921,6 +1021,12 @@ class ControllerConfig(_FrozenModel):
     # declared last beside its siblings so its cross-block validator sees
     # the already-validated plant_history block the load baseline reads.
     forecast_providers: ForecastProvidersConfig | None = None
+    # DESIGN_NIGHT_CHARGE §3.1 (B1) + DESIGN_NIGHT_CHARGE_V2 §6: declared
+    # AFTER forecast_providers (V2) so its commissioning validator sees the
+    # advisory stack a forecast posture requires, beside the already-
+    # validated policy, timing, units, and the schedule block the PARTITION
+    # grant is judged against.
+    night_charging: NightChargingConfig | None = None
     # DESIGN_POD_PARKING section 5.1: the parking commissioning block,
     # declared last beside its siblings so its commissioning validator sees
     # the already-validated mode and policy the sanctioned write depends on.
@@ -1203,12 +1309,19 @@ class ControllerConfig(_FrozenModel):
                 "REST dispatch cap; the adviser may not out-live ordinary intents"
             )
         fleet_units = {unit.unit_id for unit in values.get("units", ()) or ()}
-        if night.pacing == "even":
+        # V2 section 2.1's widened IFF: ONE capacity truth — the map is
+        # required with exactly the fleet units IFF pacing 'even' OR a
+        # forecast target posture (the same Wh paces the deadline and sizes
+        # the target's headroom; two keys for one physical fact would drift).
+        capacity_needed = night.pacing == "even" or night.target_policy != "full"
+        if capacity_needed:
             if night.assumed_capacity_wh is None:
                 raise ValueError(
                     "night_charging.assumed_capacity_wh is required when pacing is "
-                    "'even': the deadline rule paces from the per-unit capacity "
-                    "estimate (the estimate only shapes pacing, never safety)"
+                    "'even' or target_policy is not 'full': the deadline rule and "
+                    "the forecast target both pace from the per-unit capacity "
+                    "estimate (the estimate only shapes pacing and targeting, "
+                    "never safety)"
                 )
             if set(night.assumed_capacity_wh) != fleet_units:
                 raise ValueError(
@@ -1219,9 +1332,121 @@ class ControllerConfig(_FrozenModel):
         elif night.assumed_capacity_wh is not None:
             raise ValueError(
                 "night_charging.assumed_capacity_wh must be present only when "
-                "pacing is 'even': cap_first paces from the cap alone and a stray "
-                "map misstates which pacing rule runs"
+                "pacing is 'even' or target_policy is not 'full': cap_first-full "
+                "paces from the cap alone and a stray map misstates which pacing "
+                "rule runs"
             )
+        # --- V2 section 6: the forecast posture's prerequisites (each
+        # refusal names the missing block by path).  ``full`` requires none
+        # of this — the v1 identity.
+        if night.target_policy != "full":
+            providers = values.get("forecast_providers")
+            if providers is None:
+                raise ValueError(
+                    "night_charging.target_policy != full requires the "
+                    "forecast_providers block: the target is computed from the PV "
+                    "forecast and the load baseline the block declares"
+                )
+            if not providers.enabled:
+                raise ValueError(
+                    "night_charging.target_policy != full requires "
+                    "forecast_providers.enabled: an advisory stack that composes "
+                    "nothing would fall the adviser back to full targets every "
+                    "night, silently"
+                )
+            if providers.solcast is None and (
+                providers.open_meteo is None or providers.open_meteo.pv is None
+            ):
+                raise ValueError(
+                    "night_charging.target_policy != full requires a PV forecast "
+                    "source in forecast_providers (solcast, or open_meteo.pv): "
+                    "without a PV truth there is no morning credit to net"
+                )
+            if providers.load_baseline is None:
+                raise ValueError(
+                    "night_charging.target_policy != full requires "
+                    "forecast_providers.load_baseline: E_credit is NET surplus "
+                    "(PV minus the load baseline), and there is deliberately NO "
+                    "degrade-to-PV-only path (gross PV over-credits the morning "
+                    "and under-charges, the refused direction)"
+                )
+            policy_block = values.get("policy")
+            if policy_block is not None and night.floor_pct >= policy_block.maximum_soc_pct:
+                raise ValueError(
+                    "night_charging.floor_pct must sit strictly below the policy "
+                    "maximum_soc_pct: the reserve floor is a lower clamp inside "
+                    "the charge ceiling, never a second ceiling"
+                )
+        if night.target_policy == "forecast_act":
+            # A3's file-level economics gate: the feature moves stored kWh off
+            # the overnight buy onto morning surplus, paying (import - FIT)/eta
+            # per stored kWh -- it pays only while FIT < off-peak import, and a
+            # legacy 44-52 c QLD FiT against ~12 c off-peak LOSES ~35 c per
+            # stored kWh.  The controller does not automate a per-stored-kWh
+            # loss; staying kWh-only keeps SUGGEST running and ACT refused.
+            providers = values.get("forecast_providers")
+            tariff = None if providers is None else providers.tariff
+            if tariff is None:
+                raise ValueError(
+                    "night_charging.target_policy forecast_act requires "
+                    "forecast_providers.tariff (the tariff keys: off-peak import "
+                    "and export FIT): every stored kWh moved off the overnight "
+                    "buy onto morning surplus pays (import - FIT)/eta, and the "
+                    "economics must be a file fact before ACT is granted"
+                )
+            from energypod.application.scheduling import parse_hhmm
+
+            def _minute(wall: str) -> int:
+                moment = parse_hhmm(wall)
+                return moment.hour * 60 + moment.minute
+
+            night_imports = _span_rates(
+                tariff.default_import_cents_per_kwh,
+                [
+                    (
+                        _minute(window.window_local[0]),
+                        _minute(window.window_local[1]),
+                        float(window.import_cents_per_kwh),
+                    )
+                    for window in tariff.windows
+                ],
+                [(_minute(start), _minute(end)) for start, end in night.window_local],
+            )
+            morning_exports = _span_rates(
+                tariff.default_export_cents_per_kwh,
+                [
+                    (
+                        _minute(window.window_local[0]),
+                        _minute(window.window_local[1]),
+                        float(window.export_cents_per_kwh),
+                    )
+                    for window in tariff.windows
+                ],
+                [
+                    (_minute(end), _minute(night.midday_local))
+                    for _start, end in night.window_local
+                ],
+            )
+            if not night_imports or not morning_exports:
+                raise ValueError(  # pragma: no cover - minute spans are non-empty
+                    "night_charging.target_policy forecast_act could not resolve the "
+                    "tariff rates over the night window and the morning span"
+                )
+            dearest_fit = max(rates[1] for rates in morning_exports)
+            cheapest_import = min(rates[1] for rates in night_imports)
+            if dearest_fit >= cheapest_import:
+                raise ValueError(
+                    "night_charging.target_policy forecast_act is refused on "
+                    f"physics: the export FIT in force over the morning span "
+                    f"({dearest_fit} c/kWh) is not strictly below the off-peak "
+                    f"import rate in force over the night window "
+                    f"({cheapest_import} c/kWh).  Every stored kWh moved off the "
+                    "overnight buy onto morning surplus pays "
+                    "(import - FIT)/efficiency, so the feature only pays while "
+                    "FIT < import -- on a legacy 44-52 c QLD FiT against ~12 c "
+                    "off-peak it LOSES ~35 c per stored kWh.  Stay kWh-only: "
+                    "keep target_policy forecast_suggest and ACT stays refused"
+                )
         schedule = values.get("schedule")
         if schedule is None:
             raise ValueError(

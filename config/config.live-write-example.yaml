@@ -542,6 +542,42 @@ night_charging:
   pacing: "cap_first"       # Docker parity; `even` is deadline-paced (needs the map)
   demand_telemetry_max_age_s: 3.0
   intent_ttl_s: 10.0
+  # --- NIGHT-V2 (DESIGN_NIGHT_CHARGE_V2): the forecast-aware top-up target --
+  # THE SHIPPING POSTURE is forecast_suggest (section 9 step 2, config
+  # revision two): the adviser COMPUTES and DISPLAYS tonight's per-battery
+  # target, its forecast provenance, and the trust scoreboard, but charges
+  # to the v1 ceiling — the submission math is byte-identical to full (a
+  # named test), so this posture runs from day one at zero actuation risk
+  # while the scoreboard accumulates one scored morning per day.
+  # forecast_act is the operator's LATER revision (a human act, exactly like
+  # every other authority grant): it needs the tariff keys with export FIT
+  # strictly below the off-peak import (A3) plus the earned trust line, and
+  # the console can never flip this key — there is deliberately no route.
+  # `full` (the absent-key default) is exact v1 identity.
+  target_policy: "forecast_suggest"
+  forecast_quantile: 0.1    # the DRIVER slice (p10); p50 explains. The
+                            # slot-wise netting compounds to ~95-99% full-by-
+                            # midday service, not the nominal 90% (A7)
+  midday_local: "12:00"     # the operator's wall-clock finish line (strictly
+                            # after the window's end wall)
+  floor_pct: 50.0           # the reserve floor (0, policy.max_soc_pct); it
+                            # BINDS on most sunny days on this array — 40 is
+                            # a defensible operator choice after a season
+  charge_efficiency: 0.9    # the round-trip derate on credited surplus
+  retarget_threshold_pct: 20.0   # with the 0.5 kWh absolute floor, per section 5.2
+  retarget_min_gap_min: 60       # and the 2-per-window cap (from durable audit rows)
+  # The capacity map (ASSUMPTION section 2.6 — the operator confirms; rhs's
+  # 4200 is derived from cell-count proportionality, unmeasured): required
+  # for any forecast posture AND for `even` pacing — one capacity truth for
+  # pacing and the target alike.  Understatement UNDER-CHARGES (the wrong
+  # way), so confirming rhs's true Wh matters most.
+  assumed_capacity_wh: {lhs: 5000, mid: 5000, rhs: 4200}
+  trust:
+    required_days: 14       # one synoptic cycle; extend to 28 is documented
+    tolerance_pct: 30.0     # mean |err| over the rolling scored window
+    max_overforecast_bias_pct: 10.0   # the DANGEROUS direction, tighter (A4)
+    max_underforecast_bias_pct: 20.0
+    min_regime_days: 3      # low- AND high-surplus mornings (A4's terciles)
 
 # ---------------------------------------------------------------------------
 # POD PARKING (DESIGN_POD_PARKING) — the sanctioned standby mode.
@@ -757,10 +793,23 @@ forecast_providers:
     hours: 48
     period: PT30M
     refresh_interval_s: 43200.0
-  # load_baseline:
-  #   slot_s: 1800.0
-  #   horizon_s: 43200.0
-  #   weeks_back: 1
+  # The historian-statistics load baseline, COMMISSIONED 2026-08-24 with
+  # night-V2 (DESIGN_NIGHT_CHARGE_V2 section 9 step 1): the morning netting's
+  # load half.  The 30 min slot grid matches Solcast's period; the 12 h
+  # horizon covers [window_end, midday) from any window-open fetch;
+  # weeks_back 1 is the same-slot-last-week read.  E_credit is deliberately
+  # NET surplus with NO degrade-to-PV-only path (gross PV over-credits the
+  # morning and under-charges -- the refused direction).
+  load_baseline:
+    slot_s: 1800.0
+    horizon_s: 43200.0
+    weeks_back: 1
+  # tariff stays UNSET until the operator answers section 13 item 6:
+  # forecast_act is refused without the keys AND without the export FIT
+  # strictly below the off-peak import (A3's economics -- a legacy 44-52 c
+  # QLD FiT against ~12 c off-peak LOSES ~35 c per stored kWh, and the
+  # config validation refuses to automate a per-stored-kWh loss; SUGGEST
+  # keeps running kWh-only either way).  The shape when the keys come:
   # tariff:
   #   currency: AUD
   #   default_import_cents_per_kwh: 28.0

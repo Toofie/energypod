@@ -303,6 +303,7 @@ class TestExampleConfig:
         )
 
         payload = _valid_config()
+        payload["plant_history"] = {}
         payload["forecast_providers"] = document["forecast_providers"]
         parsed = _validate(payload)
         block = parsed.forecast_providers
@@ -322,3 +323,10 @@ class TestExampleConfig:
         assert block.open_meteo.latitude == -27.59906
         assert block.open_meteo.longitude == 153.068355
         assert block.refresh_interval_s == 900.0
+        # The night-V2 commissioning (DESIGN_NIGHT_CHARGE_V2 section 9 step 1)
+        # declared the load baseline beside the stack: the morning netting's
+        # load half, same-slot-last-week from the historian.
+        assert block.load_baseline is not None
+        assert block.load_baseline.slot_s == 1800.0
+        assert block.load_baseline.horizon_s == 43200.0
+        assert block.load_baseline.weeks_back == 1
