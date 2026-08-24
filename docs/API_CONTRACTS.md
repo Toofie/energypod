@@ -1677,7 +1677,7 @@ standing stop instruction — acknowledge the stop first).
     `no_eligible_target` when every otherwise-eligible unit's exclusion cause
     is park.
   - Foreign PQ objectives observed on a parked unit (the night-writer case):
-    the detector annotates those samples `unit_parked` — never silent, never an
+    the detector annotates those samples `parked: true` — never silent, never an
     alert by itself; per the pinned conservative simulator model an ignored
     write leaves the served-objective words unchanged, so a foreign write
     during our park shows at readback and the next arm classifies it by the
