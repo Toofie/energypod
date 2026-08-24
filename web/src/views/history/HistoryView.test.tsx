@@ -423,6 +423,38 @@ describe("History view — the archaeology strip", () => {
     ]);
   });
 
+  it("places every band INSIDE the box — geometry is window-relative, never epoch-absolute", async () => {
+    await landStrip();
+    // The regression this pins: bands were once positioned at
+    // (epoch-milliseconds / window-duration)·100% — every band at an absurd
+    // left%, clipped out of the container, the boxes rendering empty. Band
+    // geometry must be relative to the window's start.
+    const rows = [
+      ".history-bands--lifecycle",
+      ".history-bands--health",
+      ".history-bands--command",
+    ] as const;
+    for (const row of rows) {
+      const bands = Array.from(document.querySelectorAll<HTMLElement>(`${row} .history-band`));
+      expect(bands.length).toBeGreaterThan(0);
+      for (const band of bands) {
+        const left = Number.parseFloat(band.style.left);
+        const width = Number.parseFloat(band.style.width);
+        expect(left).toBeGreaterThanOrEqual(0);
+        expect(left).toBeLessThan(100);
+        expect(width).toBeGreaterThan(0);
+        expect(left + width).toBeLessThanOrEqual(100.01);
+      }
+    }
+    // The fixture's one lifecycle change is 30 s after a 6 h window opens:
+    // one band, at ~0.14% from the left, ~99.86% wide — words inside boxes.
+    const lifecycleBand = document.querySelector<HTMLElement>(
+      ".history-bands--lifecycle .history-band",
+    );
+    expect(Number.parseFloat(lifecycleBand?.style.left ?? "nan")).toBeCloseTo(0.139, 2);
+    expect(Number.parseFloat(lifecycleBand?.style.width ?? "nan")).toBeCloseTo(99.861, 2);
+  });
+
   it("explains what each row asserts and carries the §6 caveat beside them", async () => {
     await landStrip();
     const explainer = screen.getByText(/Lifecycle is the state the controller held/);

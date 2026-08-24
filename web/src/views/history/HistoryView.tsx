@@ -671,7 +671,7 @@ function StepStrip({
       <dl className="history-strip-rows">
         {lifecycleRows.length > 0 ? (
           <StripRow label="Lifecycle">
-            <StripSegments segments={lifecycleRows} span={span} tone="lifecycle" multiDay={multiDay} />
+            <StripSegments segments={lifecycleRows} span={span} windowFrom={window.from} tone="lifecycle" multiDay={multiDay} />
           </StripRow>
         ) : null}
         {healthRows.length > 0 || healthAbsent ? (
@@ -679,13 +679,13 @@ function StepStrip({
             {healthAbsent ? (
               <p className="history-strip-absence">{HEALTH_NOT_RECORDED_TEXT}.</p>
             ) : (
-              <StripSegments segments={healthRows} span={span} tone="health" multiDay={multiDay} />
+              <StripSegments segments={healthRows} span={span} windowFrom={window.from} tone="health" multiDay={multiDay} />
             )}
           </StripRow>
         ) : null}
         {commandedRows.length > 0 ? (
           <StripRow label="Commanded">
-            <StripSegments segments={commandedRows} span={span} tone="command" multiDay={multiDay} />
+            <StripSegments segments={commandedRows} span={span} windowFrom={window.from} tone="command" multiDay={multiDay} />
           </StripRow>
         ) : null}
       </dl>
@@ -713,11 +713,17 @@ function StripRow({ label, children }: { label: string; children: JSX.Element })
 function StripSegments({
   segments,
   span,
+  windowFrom,
   tone,
   multiDay,
 }: {
   segments: readonly StripWordSegment[];
   span: number;
+  /** The window's start instant — band geometry is RELATIVE to it (the
+   * epoch-millisecond segments divided by the window's DURATION would land
+   * every band at an absurd left%; the bands rendered nowhere, exactly the
+   * empty-boxes defect the operator reported twice). */
+  windowFrom: number;
   tone: "lifecycle" | "health" | "command";
   multiDay: boolean;
 }): JSX.Element {
@@ -727,19 +733,26 @@ function StripSegments({
   return (
     <>
       <ul className={`history-bands history-bands--${tone}`} aria-hidden="true">
-        {segments.map((segment, index) => (
-          <li
-            key={`${segment.from}-${index}`}
-            className="history-band"
-            style={{
-              left: `${(segment.from / span) * 100}%`,
-              width: `${((segment.to - segment.from) / span) * 100}%`,
-            }}
-            title={`${segment.title} · ${time(segment.from)}–${time(segment.to)}`}
-          >
-            <span className="history-band-label">{segment.label}</span>
-          </li>
-        ))}
+        {segments.map((segment, index) => {
+          // Window-relative percentages, clamped into the box: a change that
+          // predates the window renders from 0, never a negative left.
+          const rawLeft = ((segment.from - windowFrom) / span) * 100;
+          const left = Math.max(0, rawLeft);
+          const width = Math.max(
+            0,
+            ((segment.to - segment.from) / span) * 100 - (left - rawLeft),
+          );
+          return (
+            <li
+              key={`${segment.from}-${index}`}
+              className="history-band"
+              style={{ left: `${left}%`, width: `${width}%` }}
+              title={`${segment.title} · ${time(segment.from)}–${time(segment.to)}`}
+            >
+              <span className="history-band-label">{segment.label}</span>
+            </li>
+          );
+        })}
       </ul>
       <ul className="history-strip-listing" aria-label={name}>
         {listings.map((item, index) => (
