@@ -255,6 +255,26 @@ referenced from CONTINUITY.md.)
   boot already guarantees this; document in operator guide).
   Status: SKIPPED (time) — documentation-only follow-up.
 
+## Queue: live-hardware observations (2026-08-24, rhs commissioning)
+
+1. Systematic discharge-power overshoot, +15–16% of command. Source: the
+   live single-unit rhs test 2026-08-24 10:38–10:50 local (standby/normal
+   register cycle evidence in `var/r3_standby_cycle_20260824.log`; the
+   discharge power figures are the live telemetry/audit stream over the two
+   legs). Both 1000 W discharge legs settled at a mean of ~1160 W against
+   the 1000 W command; both legs cleanly cancelled. Pre-existing and
+   independent of the register cycle (identical on both legs, cycle stages
+   read back clean). Severity-if-fixed-later: P1 — accuracy of the
+   delivered-power contract; charge direction is UNMEASURED, so the bound
+   does not yet transfer to the night adviser's 2500 W cap. Concrete
+   improvement: controlled single-unit legs at several setpoints
+   (500/1000/2000 W, both directions), commanded vs settled mean; if the
+   multiplicative bias is confirmed, calibrate the PQ write path (scaling,
+   sign-magnitude encoding, or PCS response bias) or surface a
+   delivered-vs-commanded correction in the console and audit until then.
+   Status: OPEN (filed 2026-08-24; promoted if a charge leg shows the same
+   bias at the policy cap).
+
 ## Queue: CONTINUITY.md deferred P2 inventory (cross-checked 2026-08-23)
 
 Deduplicated against the queues above; statuses tracked here so the
