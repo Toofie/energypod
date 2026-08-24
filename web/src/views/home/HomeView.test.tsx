@@ -2512,6 +2512,32 @@ describe("HomeView — the night-charge tile", () => {
     );
   });
 
+  it("measures the window countdown against WALL-clock now, never the monotonic tick", async () => {
+    // The clock-class pin (the parked-banner pattern): the projection's
+    // window instants are epoch times, so the countdown must be measured
+    // against Date.now() — a monotonic reading (performance.now(), a small
+    // number since page load) subtracted from an epoch instant renders an
+    // absurd figure while still matching a /\d+ h/ shape assertion. The
+    // instant is built relative to real wall-clock now so the H:MM figure is
+    // exact, with render slack that keeps the floored minutes stable.
+    const slackS = 30;
+    installClient({
+      snapshot: nightWorld(
+        nightChargeState({
+          window_ends_at: new Date(Date.now() + (5400 + slackS) * 1000).toISOString(),
+          window_ends_in_s: null,
+        }),
+      ),
+    });
+    renderHome();
+
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    // The clock word rides the ISO string's own hour (timezone-agnostic
+    // shape); the COUNTDOWN is the pin — exactly 1 h 30 min, never the
+    // five-or-six-digit hour figure the monotonic mix would render.
+    expect(region).toHaveTextContent(/Window 00:00–06:00 ends \d{2}:\d{2} \(in 1 h 30 min\)\./);
+  });
+
   // The ACTIVE phase sentences, parametrized — the design's own §7 W2 wording.
   it.each([
     {

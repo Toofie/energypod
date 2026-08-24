@@ -1712,7 +1712,11 @@ export function HomeView({ client }: HomeViewProps) {
         night={snapshot.nightState}
         today={snapshot.energyToday}
         client={client}
-        nowMs={nowMs}
+        // The window countdowns compare WALL-clock instants (the projection's
+        // window times are epoch times), so the value is wall-clock now: the
+        // monotonic tick above only decides WHEN this recomputes, never what
+        // the countdown is measured against (the parked-banner pattern).
+        nowMs={Date.now()}
         onAdopt={(adopted) => {
           // A toggle 200's own post-toggle projection, adopted optimistically;
           // the next snapshot or night_charge.state_changed frame confirms.
