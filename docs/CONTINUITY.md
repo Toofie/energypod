@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-24 (Australia/Brisbane; the forecast/night-V2 round — the registry's first consumer live, the operator's tariff commissioned, night-V2 composed in suggest mode)
+Last updated: 2026-08-24 (Australia/Brisbane; the history strip comprehension layer — the words survive the bands)
 
 ## Purpose
 
@@ -373,6 +373,25 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-24 (history strip comprehension — THE WORDS SURVIVE THE BANDS;
+  deff29e, web-only, 13 files +640/−122): the History unit-detail
+  archaeology strip never shipped with a comprehension layer in W1–W3 —
+  its bands rendered raw wire codes, clipped to invisibility on short
+  segments; nothing was broken and nothing was removed, the layer simply
+  never existed. NOW: the unified lifecycle map is hoisted to fleet.ts
+  (armed_idle = "Armed and idle" everywhere — the banner's bare "Armed"
+  no longer lands on the wrong surface), a health short-word map plus
+  health sentences shared with UnitHealthTag via an extracted
+  unitHealthSentence, EVERY ROW gains a change-point text listing so
+  narrow segments survive as prose ("Healthy until 13:40 · Self-healing
+  13:40–13:52 · Healthy since 13:52"), the explainer line and the
+  DESIGN_PLANT_HISTORY §6 sampled-view/audit-is-the-record caveat
+  render, and the two silent vanishings are worded (the
+  health-not-recorded deployment note; the hourly-tier absence note on
+  7d/30d ranges). Tests 925 → 947, build green, the history shot matrix
+  regenerated and vision-verified — the strip READS. No backend changes;
+  no restart needed (Vite serves it).
 
 - 2026-08-24 (forecast/night-V2 round — THE REGISTRY'S FIRST CONSUMER
   LIVE, THE OPERATOR'S REAL TARIFF COMMISSIONED, NIGHT-V2 COMPOSED IN
