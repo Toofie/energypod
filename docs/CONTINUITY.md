@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-24 (Australia/Brisbane; the park-dialog fold fix — pinned actions + the disabled-reason hint)
+Last updated: 2026-08-24 (Australia/Brisbane; the pod-parking round — park/resume live-verified on rhs, the write path mutation-proven)
 
 ## Purpose
 
@@ -308,16 +308,17 @@ Known environment state:
 - Node 24.19.0 exists; npm is broken due a missing user-level npm CLI. Corepack
   works and should invoke pinned pnpm.
 - Docker is not installed in this environment.
-- LONG-LIVED SERVICES LAUNCH FROM THE MAIN SESSION ONLY. Subagent task
-  shells reap their children at lifecycle end. Observed 2026-08-24: a
-  subagent-backgrounded controller (build 366abe1, running clean) was
-  killed silently by backgrounded-child cleanup minutes after launch —
-  backgrounded-child cleanup killed a subagent-launched controller; pods
-  self-managed; no controller defect (clean log, all requests 200, no
-  traceback) — leaving :8080 dark ~3.5 h (10:52–14:13) until the
-  main-session restart. A main-session-launched controller survives its
-  launcher shell exiting (the historical pattern); :8080 ownership stays
-  with the main session.
+- LONG-LIVED SERVICES RUN AS HARNESS-MANAGED BACKGROUND TASKS ONLY — not
+  subagent task shells, and not inline `&` launches (both reaped their
+  children at lifecycle end; both observed 2026-08-24). A
+  harness-managed background task survives its launcher shell and
+  notifies on exit. Observed: a subagent-backgrounded controller (build
+  366abe1, running clean) was killed silently by backgrounded-child
+  cleanup minutes after launch — backgrounded-child cleanup killed a
+  subagent-launched controller; pods self-managed; no controller defect
+  (clean log, all requests 200, no traceback) — leaving :8080 dark ~3.5 h
+  (10:52–14:13). :8080 ownership stays with the main session's
+  harness-managed task.
 - The repository is owned by a different Windows account (Codex sandbox). Git
   requires `git config --global --add safe.directory
   C:/Users/vagrant/Downloads/EnergyPod/pod-manager` before any git command.
@@ -358,6 +359,48 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-24 (pod-parking round — PARK/RESUME LIVE-VERIFIED ON rhs, THE
+  WRITE PATH MUTATION-PROVEN; base 9cd25c4 → HEAD 6765fe6, 20 commits):
+  the arc held the contract-first line throughout — design contract v2
+  with two red-team panels and the alarm-only expiry reversal (the lease
+  is the alarm, never the actor; 3a8f2f1 + the same-round amendment sweep
+  48b1a7b, coordinator rulings 62dd952, wave-C wire shapes 0a9c345) →
+  simulator/transport core (the device-mode word with ACK-then-ignore
+  pinned conservative 462e13e; the sanctioned 0x8000 write as a named
+  method + catalog entry + `parking:` block 3fa84fa) → the durable
+  park_leases store (schema v4, shared transaction, epoch CAS a4e2426) →
+  the ParkController + facade + three operator-only routes (f064ea7) →
+  PARKED health, adviser vocabulary, MCP companions (a084920) → the
+  console surfaces (22a5526, real-server-shape fixtures 409063d, the
+  NightChargeTile wall-clock countdown fix cf2872d) → adversarial review
+  (ALL hard conformance checks PASS) → repair wave (boot adopts the
+  crashed-then-verified park 1116ded; the dispatch refusal's provenance
+  rides the intents 409 7d5c957) → commissioning on the live-write
+  deployment (0a46e48) → live smoke → mutation round (6765fe6). FINAL
+  GATES: backend 2552 passed, web 861, ruff + strict mypy clean, build
+  green, tree clean. LIVE FINDINGS, all fixed + tested: (1)
+  `_LazyWaveshareTransport` never forwarded `write_debug_mode` — NO live
+  mode write could ever reach the bus; caught ONLY by live smoke
+  (230265f); (2) the mode write needs its own timeout line —
+  `mode_write_timeout_s: 2.0` — the 0.50 s PQ cadence budget was too
+  tight for the gateway's FC16 turnaround (230265f); (3) the park
+  dialog's actions fell below the fold with no disabled-reason
+  discoverability — caught by the OPERATOR on the real console,
+  vision-verified at all three viewports (4bc47e7, entry below); (4)
+  process reaping hit BOTH subagent- and inline-`&`-launched children —
+  the durable rule is refined below to harness-managed background tasks
+  only (2466347). MUTATION: every semantic mutant in the write path died
+  to the existing suite (the {0,1} bound, the FC16 shape, the echo
+  checks hold); the real find was `renew_park_lease` executed by NO test
+  anywhere — now covered end-to-end; 39 killing tests added, survivor
+  queue in DEFERRED_FINDINGS (6765fe6). LIVE SMOKE: park/resume verified
+  end-to-end on rhs through the sanctioned surface — the word triple
+  verified in both directions, the clean checklist, composed parked
+  health. STANDING: the night-cutover arm + night-enable remain gated on
+  the operator's Docker stand-down confirmation (night stays off by
+  config until then); the running controller IS this build, as a
+  harness-managed task that survives and notifies on exit.
 
 - 2026-08-24 (console park-dialog fix): THE DIALOG FOLD AND THE SILENT GRAYED
   CONFIRM FIXED — the operator hit it live: the park dialog's actions
