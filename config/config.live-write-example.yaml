@@ -804,18 +804,19 @@ forecast_providers:
     slot_s: 1800.0
     horizon_s: 43200.0
     weeks_back: 1
-  # tariff stays UNSET until the operator answers section 13 item 6:
-  # forecast_act is refused without the keys AND without the export FIT
-  # strictly below the off-peak import (A3's economics -- a legacy 44-52 c
-  # QLD FiT against ~12 c off-peak LOSES ~35 c per stored kWh, and the
-  # config validation refuses to automate a per-stored-kWh loss; SUGGEST
-  # keeps running kWh-only either way).  The shape when the keys come:
-  # tariff:
-  #   currency: AUD
-  #   default_import_cents_per_kwh: 28.0
-  #   default_export_cents_per_kwh: 9.0
-  #   horizon_s: 172800.0
-  #   windows:
-  #     - window_local: ["00:00", "06:00"]
-  #       import_cents_per_kwh: 12.0
-  #       export_cents_per_kwh: 5.0
+  # TARIFF COMMISSIONED 2026-08-24 from the operator's bill (Night Saver EV
+  # plan): general usage 30.77 c all times except 00:00-06:00; Night Saver
+  # 7.27 c (exactly the commissioned night window); standard feed-in 2.0 c
+  # at all times.  The A3 gate passes decisively: FIT 2.0 c is far below
+  # the ~6.5 c break-even against 7.27 c off-peak storage (7.27/0.9 eta);
+  # storing morning surplus forgoes ~2.2 c against ~8.1 c to buy -- the
+  # legacy 44-52 c QLD FiT inversion does not apply to this site.
+  tariff:
+    currency: AUD
+    default_import_cents_per_kwh: 30.77
+    default_export_cents_per_kwh: 2.0
+    horizon_s: 172800.0
+    windows:
+      - window_local: ["00:00", "06:00"]
+        import_cents_per_kwh: 7.2727
+        export_cents_per_kwh: 2.0
