@@ -161,9 +161,7 @@ class TestSolcastKeyResolution:
             "enabled": True,
             "solcast": {
                 "api_key_env": "ENERGYPOD_TEST_SOLCAST_KEY_UNSET",
-                "latitude": -27.4698,
-                "longitude": 153.0251,
-                "capacity_kw": 5.0,
+                "resource_id": "b6bf-9d1d-0680-4078",
             },
         }
         runtime = _build(payload)
@@ -177,11 +175,12 @@ class TestSolcastKeyResolution:
         payload = _config_payload()
         payload["forecast_providers"] = {
             "enabled": True,
+            # The hobbyist budget override beside the family's own key.
+            "stale_after_s": 43200.0,
             "solcast": {
                 "api_key_env": "ENERGYPOD_TEST_SOLCAST_KEY",
-                "latitude": -27.4698,
-                "longitude": 153.0251,
-                "capacity_kw": 5.0,
+                "resource_id": "b6bf-9d1d-0680-4078",
+                "refresh_interval_s": 43200.0,
             },
         }
         runtime = _build(payload)

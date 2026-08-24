@@ -673,30 +673,47 @@ plant_history:
 # The architecture-fitness test pins it: no domain or application module
 # may import adapters.providers.
 #
-# BLOCK PRESENCE + THE STAGED POSTURE: a PRESENT block declares the stack;
-# `enabled: false` (below, the shipped posture) composes NOTHING — the wire
-# families stay off until the operator flips the key as one deliberate act
-# (network egress + third-party accounts start with that flip).  An ABSENT
-# block is byte-identical.  Boot always recomposes from this file; nothing
-# runtime-persists.
+# BLOCK PRESENCE + THE ENABLED POSTURE: a PRESENT block declares the stack
+# and `enabled` gates composition; an ABSENT block is byte-identical to
+# off.  COMMISSIONED 2026-08-24, the same day the LIVE contract was
+# discovered with the operator's key: the Solcast HOBBYIST tier refuses
+# the world_pv_power data endpoints outright (HTTP 403 "Hobbyist accounts
+# are not allowed to access this endpoint") and serves the rooftop-sites
+# flow instead — GET /rooftop_sites/{resource_id}/forecasts, Bearer auth,
+# Accept: application/json, rows of pv_estimate/pv_estimate10/pv_estimate90
+# in kW.  The registered site record ("Home": capacity 5 kW AC / 6.5 kW DC,
+# azimuth 0 = equator-facing = NORTH for this southern-hemisphere array,
+# tilt 30, loss factor 0.9, lat -27.59906 lon 153.068355) holds the
+# geography and plane, so THIS file addresses the site by resource_id
+# alone — no lat/long/capacity keys exist to drift from what Solcast
+# models.  Nothing fetches at composition; the first consumer read takes
+# the first leg.
 #
-# THE WIRE BUDGET (shared by every HTTP family): request_timeout_s bounds
-#   one leg; refresh_interval_s is the MINIMUM spacing between legs (the
-#   rate-limit budget — Solcast hobbyist keys allow 10 requests per UTC day,
-#   and the free Open-Meteo tier 10k/day); stale_after_s is when the
-#   staleness report calls the data stale (>= refresh_interval_s).  A failed
-#   refresh serves the cache with its ORIGINAL fetched_at — rereading never
-#   freshens (the architecture's caching honesty rule).
+# THE WIRE BUDGET: request_timeout_s bounds one leg; refresh_interval_s is
+#   the MINIMUM spacing between legs (the rate-limit budget), and each wire
+#   family may override it for ITS legs alone — the canonical split below:
+#   the keyless Open-Meteo tier (10k/day) refreshes at the shared 900 s,
+#   while Solcast's hobbyist key allows 10 requests per UTC day.
+#   stale_after_s is when the staleness report raises the stale flag; it
+#   must sit at or above every declared family's effective refresh (the
+#   validator enforces it), so it rides the SLOWEST family — Solcast's
+#   43200 s gate — while each member's age_s and last_error stay honest
+#   per report regardless of the flag.  A failed refresh serves the cache
+#   with its ORIGINAL fetched_at — rereading never freshens (the
+#   architecture's caching honesty rule).
 #
 # THE FAMILIES (declare the ones this site wants; PV sources are mutually
 #   exclusive — exactly one PV truth per site):
 #   open_meteo: keyless weather (irradiance W/m2, cloud %, temperature C)
 #     and, with `pv:`, a derived PV forecast.  Open-Meteo publishes NO
-#     power variable; watts are derived here from tilted-plane irradiance
-#     as capacity_kw x GTI x derate.  azimuth uses the DOCS convention
+#     power variable; watts are derived from tilted-plane irradiance as
+#     capacity_kw x GTI x derate.  azimuth uses the DOCS convention
 #     (0 = south, -90 = east, +90 = west) — the OpenAPI YAML's "North=0"
 #     wording is wrong.  Attribution (CC BY 4.0): "Weather data by
 #     Open-Meteo.com" must accompany any surface that shows the data.
+#     IF derived PV is ever wanted for this NORTH-facing array: the plane's
+#     azimuth under Open-Meteo's convention is 180 (0 = south there) — the
+#     exact mirror of the site's Solcast azimuth 0 (equator-facing = north).
 #   solcast: the quantiled rooftop forecast (central/10%/90% slices).
 #     THE KEY IS A REFERENCE, NEVER MATERIAL: api_key_env names the
 #     environment variable resolved at boot (export SOLCAST_API_KEY=...);
@@ -712,26 +729,34 @@ plant_history:
 #     is labeled market=static-config/quality=static so no consumer can
 #     mistake it for a market signal.
 forecast_providers:
-  enabled: false   # the staged posture: nothing composes until this flips
+  enabled: true    # commissioned 2026-08-24: the layer composes (advisory-only)
   request_timeout_s: 10.0
-  refresh_interval_s: 900.0   # 15 min between wire legs
-  stale_after_s: 3600.0       # an hour-old forecast reports stale
-  # open_meteo:
-  #   latitude: -27.4698
-  #   longitude: 153.0251
-  #   forecast_days: 2
-  #   pv:
-  #     tilt_deg: 25.0
-  #     azimuth_deg: 10.0
-  #     capacity_kw: 5.0
-  #     derate: 0.9
-  # solcast:
-  #   api_key_env: SOLCAST_API_KEY   # the reference, never the key itself
-  #   latitude: -27.4698
-  #   longitude: 153.0251
-  #   capacity_kw: 5.0
-  #   hours: 48
-  #   period: PT30M
+  # Open-Meteo weather context + the forecast-vs-recorded-surplus
+  # cross-check scorer: keyless, 10k/day, so the shared 900 s cadence
+  # (15 min between legs) is the budget — no override needed.
+  refresh_interval_s: 900.0
+  # The stale flag rides the SLOWEST declared refresh (Solcast's 43200 s
+  # gate below): a cached forecast may legitimately be up to 12 h old, and
+  # flagging the gate's own cadence stale would cry wolf.  age_s and
+  # last_error stay honest per member at every age.
+  stale_after_s: 43200.0
+  # WEATHER ONLY — deliberately NO `pv:` sub-block: solcast is this site's
+  # one PV truth (the two are mutually exclusive at validation).
+  open_meteo:
+    latitude: -27.59906
+    longitude: 153.068355
+    forecast_days: 2
+  # THE HOBBYIST BUDGET MATH: the key allows 10 requests per UTC day.
+  # refresh_interval_s 43200 (12 h) = 2 scheduled fetches/day, and each
+  # process start also fetches once (the first consumer read primes an
+  # empty cache) — 2 + ~1/restart leaves 7+ of the 10 for restarts and
+  # re-commissioning inside every single-day window.
+  solcast:
+    api_key_env: SOLCAST_API_KEY   # the reference, never the key itself
+    resource_id: b6bf-9d1d-0680-4078   # the registered "Home" rooftop site
+    hours: 48
+    period: PT30M
+    refresh_interval_s: 43200.0
   # load_baseline:
   #   slot_s: 1800.0
   #   horizon_s: 43200.0

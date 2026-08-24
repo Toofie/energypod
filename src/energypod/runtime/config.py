@@ -669,29 +669,44 @@ class OpenMeteoPvConfig(_FrozenModel):
 
 
 class OpenMeteoProviderConfig(_FrozenModel):
-    """The keyless Open-Meteo site location (weather always, PV iff ``pv``)."""
+    """The keyless Open-Meteo site location (weather always, PV iff ``pv``).
+
+    ``refresh_interval_s`` optionally overrides the stack's shared wire
+    budget for this family alone (the keyless tier has no scarcity to
+    ration; absent keeps the shared ``forecast_providers.refresh_interval_s``).
+    """
 
     latitude: Annotated[StrictFloat, Field(ge=-90, le=90)]
     longitude: Annotated[StrictFloat, Field(ge=-180, le=180)]
     forecast_days: Annotated[StrictInt, Field(ge=1, le=16)] = 2
     pv: OpenMeteoPvConfig | None = None
+    refresh_interval_s: PositiveFiniteFloat | None = None
 
 
 class SolcastProviderConfig(_FrozenModel):
-    """The keyed Solcast site declaration.
+    """The keyed Solcast rooftop-site declaration (the live-verified tier).
 
     The API key is a REFERENCE, never material: ``api_key_env`` names the
     environment variable the composition root resolves at boot (the
-    architecture's "provider credentials by secret reference").  ``period``
-    is Solcast's documented averaging enum.
+    architecture's "provider credentials by secret reference").  The site
+    record registered at Solcast holds the geography and the plane
+    (latitude, longitude, capacity, azimuth, tilt, loss factor) -- the
+    hobbyist tier's rooftop-sites flow is addressed by ``resource_id``
+    ALONE, so those keys are deliberately absent here: a client-side copy
+    could only drift from what Solcast actually models.  ``period`` is
+    Solcast's documented averaging enum.
+
+    ``refresh_interval_s`` optionally overrides the stack's shared wire
+    budget for this family alone: hobbyist keys allow 10 requests per UTC
+    day (each process start also fetches once), so this family routinely
+    needs a far slower gate than the shared default.
     """
 
     api_key_env: NonEmpty
-    latitude: Annotated[StrictFloat, Field(ge=-90, le=90)]
-    longitude: Annotated[StrictFloat, Field(ge=-180, le=180)]
-    capacity_kw: PositiveFiniteFloat
+    resource_id: NonEmpty
     hours: Annotated[StrictInt, Field(ge=1, le=336)] = 48
     period: Literal["PT5M", "PT10M", "PT15M", "PT20M", "PT30M", "PT60M"] = "PT30M"
+    refresh_interval_s: PositiveFiniteFloat | None = None
 
     @field_validator("api_key_env")
     @classmethod
@@ -700,6 +715,21 @@ class SolcastProviderConfig(_FrozenModel):
             value,
             label="api_key_env",
         )
+
+    @field_validator("resource_id")
+    @classmethod
+    def validate_resource_id(cls, value: str) -> str:
+        value = _plain(value, label="resource_id")
+        # The identifier rides the request PATH (rooftop_sites/{id}/forecasts),
+        # so anything that would escape a path segment is refused, never
+        # silently encoded into a request somewhere else.
+        offenders = sorted(set(value) & frozenset("/?#&=%"))
+        if offenders:
+            raise ValueError(
+                f"resource_id must be a single URL path segment (carries {offenders}; "
+                "it names the registered rooftop site, e.g. b6bf-9d1d-0680-4078)"
+            )
+        return value
 
 
 class LoadBaselineConfig(_FrozenModel):
@@ -760,9 +790,13 @@ class ForecastProvidersConfig(_FrozenModel):
     tariff rates); runtime state never persists, boot recomposes from this
     file.  The shared wire budget: ``request_timeout_s`` bounds one leg,
     ``refresh_interval_s`` is the minimum spacing between legs (the
-    rate-limit budget -- Solcast hobbyist keys allow 10 requests per UTC
-    day), and ``stale_after_s`` is when the staleness report calls the data
-    stale; staleness may not hit before the first allowed reread.
+    rate-limit budget), and ``stale_after_s`` is when the staleness report
+    calls the data stale.  A wire family (``open_meteo``, ``solcast``) may
+    carry its own ``refresh_interval_s`` to slow or quicken ITS legs alone
+    -- the 10-requests-per-UTC-day hobbyist Solcast budget against the
+    keyless Open-Meteo tier is the canonical split -- and the staleness
+    floor then binds to every DECLARED family's effective refresh: data
+    may not turn stale before that family's first allowed reread.
 
     Providers are ADVISORY-ONLY: nothing in the control path reads them, and
     no provider failure may affect anything but its own data's availability.
@@ -779,11 +813,24 @@ class ForecastProvidersConfig(_FrozenModel):
 
     @model_validator(mode="after")
     def validate_provider_relations(self) -> Self:
-        if self.stale_after_s < self.refresh_interval_s:
-            raise ValueError(
-                "forecast_providers.stale_after_s must be at least refresh_interval_s "
-                "(data turns stale no earlier than the first allowed reread)"
+        # The staleness floor binds to every declared wire family's EFFECTIVE
+        # refresh: a family whose data turns stale before its first allowed
+        # reread would report stale forever, so the slowest declared gate
+        # (the shared default, or a family override above it) sets the floor.
+        budgets: list[tuple[str, float]] = [("refresh_interval_s", self.refresh_interval_s)]
+        if self.open_meteo is not None and self.open_meteo.refresh_interval_s is not None:
+            budgets.append(
+                ("open_meteo.refresh_interval_s", self.open_meteo.refresh_interval_s)
             )
+        if self.solcast is not None and self.solcast.refresh_interval_s is not None:
+            budgets.append(("solcast.refresh_interval_s", self.solcast.refresh_interval_s))
+        for budget_name, refresh_s in budgets:
+            if self.stale_after_s < refresh_s:
+                raise ValueError(
+                    f"forecast_providers.stale_after_s must be at least {budget_name} "
+                    f"({refresh_s} s: data turns stale no earlier than that family's "
+                    "first allowed reread)"
+                )
         if (
             self.open_meteo is not None
             and self.open_meteo.pv is not None

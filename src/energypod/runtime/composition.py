@@ -3613,13 +3613,15 @@ def _build_runtime(
         registry_notes: list[str] = []
         open_meteo = providers_config.open_meteo
         if open_meteo is not None:
+            # The family's optional refresh override, else the shared budget.
+            open_meteo_refresh_s = float(open_meteo.refresh_interval_s or refresh_s)
             registry_weather = OpenMeteoWeather(
                 transport=wire,
                 clock=resolved_clock,
                 latitude=float(open_meteo.latitude),
                 longitude=float(open_meteo.longitude),
                 forecast_days=int(open_meteo.forecast_days),
-                refresh_interval_s=refresh_s,
+                refresh_interval_s=open_meteo_refresh_s,
                 stale_after_s=stale_s,
             )
             if open_meteo.pv is not None:
@@ -3634,7 +3636,7 @@ def _build_runtime(
                     capacity_kw=float(plane.capacity_kw),
                     derate=float(plane.derate),
                     forecast_days=int(open_meteo.forecast_days),
-                    refresh_interval_s=refresh_s,
+                    refresh_interval_s=open_meteo_refresh_s,
                     stale_after_s=stale_s,
                 )
         solcast = providers_config.solcast
@@ -3647,12 +3649,12 @@ def _build_runtime(
                     transport=wire,
                     clock=resolved_clock,
                     api_key=api_key,
-                    latitude=float(solcast.latitude),
-                    longitude=float(solcast.longitude),
-                    capacity_kw=float(solcast.capacity_kw),
+                    resource_id=str(solcast.resource_id),
                     hours=int(solcast.hours),
                     period=str(solcast.period),
-                    refresh_interval_s=refresh_s,
+                    # The hobbyist quota gate: this family's override, else
+                    # the shared budget.
+                    refresh_interval_s=float(solcast.refresh_interval_s or refresh_s),
                     stale_after_s=stale_s,
                 )
             else:

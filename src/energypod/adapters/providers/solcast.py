@@ -1,25 +1,33 @@
-"""The Solcast PV adapter (Bearer-keyed, quantiled).
+"""The Solcast PV adapter (Bearer-keyed, quantiled, site-addressed).
 
-The wire facts encoded here come from Solcast's current docs and their
-OpenAPI spec (https://docs.solcast.com.au, parsed from
-https://api.solcast.com.au/openapi/v1/openapi.json, verified 2026-08-24):
+LIVE-DISCOVERED CONTRACT (2026-08-24, verified with the operator's key):
+the hobbyist tier REFUSES the ``world_pv_power`` data endpoints -- HTTP 403
+with the body ``"Hobbyist accounts are not allowed to access this
+endpoint"`` -- and serves the rooftop-sites flow instead:
 
-- ``GET https://api.solcast.com.au/data/forecast/rooftop_pv_power`` with
-  required ``latitude``/``longitude`` and ``capacity`` (kW, the greater of
-  inverter AC or module DC); ``hours`` bounds the horizon; ``period`` is an
-  ISO-8601 duration from the enum PT5M/PT10M/PT15M/PT20M/PT30M/PT60M.
-- ``output_parameters`` selects ``pv_power_rooftop`` (the central estimate),
-  ``pv_power_rooftop10`` (cloudy-biased) and ``pv_power_rooftop90``
-  (clear-sky-biased) -- ALL in kW of inverter AC output.
-- Rows arrive as ``forecasts[]`` with a UTC ``period_end`` (ISO 8601,
+- ``GET https://api.solcast.com.au/rooftop_sites/{resource_id}/forecasts``
+  with ``Authorization: Bearer`` auth and ``Accept: application/json``;
+  ``hours`` bounds the horizon and ``period`` the averaging enum
+  (PT5M/PT10M/PT15M/PT20M/PT30M/PT60M).
+- The registered SITE record holds the geography and the plane (this
+  site: "Home", capacity 5 kW AC / 6.5 kW DC, azimuth 0 -- Solcast's
+  equator-facing convention, which is NORTH for this southern-hemisphere
+  site -- tilt 30, loss factor 0.9).  That is why latitude, longitude,
+  and capacity are NOT inputs here or in the configuration: the
+  ``resource_id`` addresses them all, and duplicating them client-side
+  could only drift from what Solcast actually models.
+- Rows arrive as ``forecasts[]`` carrying ``pv_estimate`` (the central
+  estimate), ``pv_estimate10`` (cloudy-biased) and ``pv_estimate90``
+  (clear-sky-biased) -- all in kW -- plus a UTC ``period_end`` (ISO 8601,
   7 fractional digits, ``Z``) and the averaging ``period``; a row covers
-  ``[period_end - period, period_end)``.
+  ``[period_end - period, period_end)``.  Observed live: all-zero
+  estimates after sundown at ``period_end`` 2026-08-24T09:00:00.0000000Z.
 - Auth prefers the ``Authorization: Bearer`` header; the ``api_key`` query
-  parameter exists but leaks into server logs and is never used here.  429
-  is the rate-limit/quota signal (free hobbyist keys allow 10 requests per
-  UTC day) and 402 the plan-limit signal; both surface through the transport
-  as typed provider errors, and the refresh gate in the shared base is the
-  quota budget.
+  parameter exists but leaks into server logs and is never used here.
+  429 is the rate-limit/quota signal (free hobbyist keys allow 10 requests
+  per UTC day), 402 the plan-limit signal, and 403 the tier-refusal class
+  discovered live; all surface through the transport as typed provider
+  errors, and the refresh gate in the shared base is the quota budget.
 - Attribution (free tier): link "solar irradiance data" back to Solcast.
 """
 
@@ -36,9 +44,11 @@ from energypod.adapters.providers.http import (
 )
 from energypod.adapters.providers.model import ForecastSeries, ForecastValue
 
-__all__ = ["SOLCAST_API_URL", "SOLCAST_ATTRIBUTION", "SolcastPvForecast"]
+__all__ = ["SOLCAST_ATTRIBUTION", "SOLCAST_ROOFTOP_SITES_URL", "SolcastPvForecast"]
 
-SOLCAST_API_URL: Final[str] = "https://api.solcast.com.au/data/forecast/rooftop_pv_power"
+#: The rooftop-sites flow root; the registered site's resource_id and the
+#: ``forecasts`` segment complete the path.
+SOLCAST_ROOFTOP_SITES_URL: Final[str] = "https://api.solcast.com.au/rooftop_sites"
 #: The free-tier attribution obligation: link this text to
 #: https://solcast.com.au wherever the forecast is shown.
 SOLCAST_ATTRIBUTION: Final[str] = "solar irradiance data by Solcast"
@@ -48,14 +58,18 @@ _SOURCE: Final[str] = "solcast"
 SOLCAST_PERIODS: Final[frozenset[str]] = frozenset(
     {"PT5M", "PT10M", "PT15M", "PT20M", "PT30M", "PT60M"}
 )
-# The output parameters and the quantile each one claims: ``pv_power_rooftop``
-# is Solcast's central estimate, ``...10`` the cloudy-biased decile, ``...90``
+# The estimate fields and the quantile each one claims: ``pv_estimate`` is
+# Solcast's central estimate, ``...10`` the cloudy-biased decile, ``...90``
 # the clear-sky-biased one -- never a fabricated confidence.
 _QUANTILE_FIELDS: Final[tuple[tuple[str, float], ...]] = (
-    ("pv_power_rooftop", 0.5),
-    ("pv_power_rooftop10", 0.1),
-    ("pv_power_rooftop90", 0.9),
+    ("pv_estimate", 0.5),
+    ("pv_estimate10", 0.1),
+    ("pv_estimate90", 0.9),
 )
+#: A resource_id is interpolated into the request PATH, so the characters
+#: that would escape a path segment refuse construction instead of building
+#: a request to somewhere else.
+_RESOURCE_ID_FORBIDDEN: Final[frozenset[str]] = frozenset("/?#&=%")
 _DURATION_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^P(?:(?P<days>[0-9]+)D)?(?:T(?:(?P<hours>[0-9]+)H)?(?:(?P<minutes>[0-9]+)M)?"
     r"(?:(?P<seconds>[0-9]+(?:\.[0-9]+)?)S)?)?$"
@@ -80,22 +94,27 @@ def _iso_duration(raw: Any) -> timedelta:
     )
 
 
-def _geo(value: float, label: str, bound: float) -> float:
-    if (
-        not isinstance(value, int | float)
-        or isinstance(value, bool)
-        or not -bound <= float(value) <= bound
-    ):
-        raise ValueError(f"{label} must lie in [{-bound}, {bound}] degrees")
-    return float(value)
+def _checked_resource_id(raw: str) -> str:
+    """Validate the registered site identifier that rides the request path."""
+    if not isinstance(raw, str) or not raw or raw != raw.strip():
+        raise ValueError("resource_id must be non-empty with no surrounding whitespace")
+    offenders = sorted(set(raw) & _RESOURCE_ID_FORBIDDEN)
+    if offenders:
+        raise ValueError(
+            f"resource_id must be a single URL path segment (carries {offenders}; the "
+            "identifier names the registered rooftop site, e.g. b6bf-9d1d-0680-4078)"
+        )
+    return raw
 
 
 class SolcastPvForecast(HttpForecastProvider[ForecastSeries]):
-    """The commercial rooftop PV forecast, normalized to watt quantiles.
+    """The quantiled rooftop PV forecast, normalized to watt quantiles.
 
     The API key arrives as constructor material -- resolved from a secret
     reference by the composition root, never stored in configuration -- and
-    rides the ``Authorization: Bearer`` header on every leg.
+    rides the ``Authorization: Bearer`` header on every leg.  The
+    ``resource_id`` is the registered Solcast site: the site record is the
+    one holder of the geography and plane, so this adapter sends neither.
     """
 
     source = _SOURCE
@@ -106,9 +125,7 @@ class SolcastPvForecast(HttpForecastProvider[ForecastSeries]):
         transport: ForecastHttpTransport,
         clock: ProviderClock,
         api_key: str,
-        latitude: float,
-        longitude: float,
-        capacity_kw: float,
+        resource_id: str,
         hours: int = 48,
         period: str = "PT30M",
         refresh_interval_s: float = 900.0,
@@ -122,12 +139,6 @@ class SolcastPvForecast(HttpForecastProvider[ForecastSeries]):
             raise ValueError(
                 f"period must be one of {sorted(SOLCAST_PERIODS)} (the documented enum)"
             )
-        if (
-            not isinstance(capacity_kw, int | float)
-            or isinstance(capacity_kw, bool)
-            or not (float(capacity_kw) > 0)
-        ):
-            raise ValueError("capacity_kw must be positive (the installed kWp)")
         super().__init__(
             transport=transport,
             clock=clock,
@@ -135,9 +146,7 @@ class SolcastPvForecast(HttpForecastProvider[ForecastSeries]):
             stale_after_s=stale_after_s,
         )
         self._api_key = api_key.strip()
-        self._latitude = _geo(latitude, "latitude", 90.0)
-        self._longitude = _geo(longitude, "longitude", 180.0)
-        self._capacity_kw = float(capacity_kw)
+        self._resource_id = _checked_resource_id(resource_id)
         self._hours = hours
         self._period = period
 
@@ -147,17 +156,15 @@ class SolcastPvForecast(HttpForecastProvider[ForecastSeries]):
 
     async def _request(self) -> ForecastSeries:
         payload = await self._get_json(
-            SOLCAST_API_URL,
+            f"{SOLCAST_ROOFTOP_SITES_URL}/{self._resource_id}/forecasts",
             params={
-                "latitude": str(self._latitude),
-                "longitude": str(self._longitude),
-                "capacity": str(self._capacity_kw),
                 "hours": str(self._hours),
                 "period": self._period,
-                "output_parameters": ",".join(field for field, _ in _QUANTILE_FIELDS),
-                "format": "json",
             },
-            headers={"Authorization": f"Bearer {self._api_key}"},
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Accept": "application/json",
+            },
         )
         if not isinstance(payload, dict) or not isinstance(payload.get("forecasts"), list):
             raise ValueError("the payload carries no forecasts array")
