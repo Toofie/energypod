@@ -141,8 +141,9 @@ Request: `{"confirmation": "RENEW", "lease_s": <60..cap, required>}` —
 sliding: `new expires_at = now + lease_s`, never past `parked_at +
 max_lease_s`. Refuses `park_lease_cap_reached`
 (`{"parked_at", "max_total_s", "requested_expires_at"}`) and
-`park_lease_absent` (never parked / already closed — details carry the
-closing row's origin and time). 200 mirrors park's lease object + `as_of`.
+`park_lease_absent` (never parked / already closed — details
+`{"origin": <closing row's origin>, "closed_at": <ISO timestamp>}`).
+200 mirrors park's lease object + `as_of`.
 
 ### POST /api/v1/units/{unit_id}/resume
 
@@ -328,7 +329,10 @@ write.
 
 ## 7. Recovery advisory + delivery-bias estimator (companions)
 
-- `recovery_advisory` on unit detail + MCP: when the classifier holds
+- `recovery_advisory` on unit detail + MCP (pinned shape: present only
+  when the signature holds, `{"commissioned": bool,
+  "echo_classifications": [string]}` — `commissioned: false` is the
+  uncommissioned-honesty state, absence = no advisory): when the classifier holds
   `actuation_incoherent` with echo `objective_not_served` or
   `echo_matches_write`, render: "Soft recovery available: the park/resume
   cycle (proven live 2026-08-24). Operator act: disarm → park → resume
@@ -338,7 +342,9 @@ write.
   sentence owned: **the wedge recovery tool requires the `parking:` block
   commissioned** — the advisory renders as unavailable otherwise, never as
   a suggestion the site cannot execute.
-- `delivery_bias` on unit detail + MCP: bounded per-unit deque of
+- `delivery_bias` on unit detail + MCP (pinned shape:
+  `{"mean_bias_pct", "max_bias_pct", "sample_count", "window_s"}`,
+  evidence-only): bounded per-unit deque of
   (authorized, measured) samples while ACTIVE (window: last 600 cycles or
   15 min, whichever the memory bound allows; cap ~600 samples), projecting
   mean/max bias, sample count, window — labeled evidence-only. Motivated by
