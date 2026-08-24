@@ -275,6 +275,26 @@ referenced from CONTINUITY.md.)
    Status: OPEN (filed 2026-08-24; promoted if a charge leg shows the same
    bias at the policy cap).
 
+## Queue: night-V2 console wire gaps (2026-08-24, flagged by the console wave)
+
+1. Fallback forecast frames carry no age figure — the console cannot say
+   how old the fallback data is. Improvement: carry `fetched_at`/age on
+   the fallback frame shape.
+2. No wire surface for the Insights morning-landing attribution split —
+   A1's missed-vs-refused distinction has no read route; the console
+   cannot render it. Improvement: a read route (or snapshot key) serving
+   the attribution split.
+3. The 95 % completion ceiling is a design-pinned fact, not on the wire
+   — the console's 95-vs-100 clause is hard-coded wording. Improvement:
+   surface the ceiling (and its provenance) in the night projection.
+4. The tariff wire carries defaults only — not the operator's
+   commissioned 7.27 c night-window rate, so no night-cost figure can be
+   computed console-side. Improvement: serve the commissioned rates (or
+   the derived night cost) on the tariff wire.
+   Status: OPEN (all four filed 2026-08-24 from the cca356a console
+   wave; none blocks suggest-mode; revisit when act-mode promotion is
+   considered).
+
 ## Queue: CONTINUITY.md deferred P2 inventory (cross-checked 2026-08-23)
 
 Deduplicated against the queues above; statuses tracked here so the

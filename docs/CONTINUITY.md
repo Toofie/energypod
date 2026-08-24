@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-24 (Australia/Brisbane; the rhs transport-reconnect incident closed — post-boot reconnect implemented, fleet re-armed)
+Last updated: 2026-08-24 (Australia/Brisbane; the forecast/night-V2 round — the registry's first consumer live, the operator's tariff commissioned, night-V2 composed in suggest mode)
 
 ## Purpose
 
@@ -348,6 +348,20 @@ the writable workspace. If the interpreter is genuinely absent, do not patch
 the launcher. Reinstall/locate Python, recreate `.venv`, and reinstall from the
 pinned project configuration.
 
+Standing launch command for the live controller (as a harness-managed
+background task, per the rule above — never a subagent, never a bare
+`&`):
+
+```
+source var/solcast.env && export SOLCAST_API_KEY && \
+  ./.venv/Scripts/python.exe -m energypod.main run \
+  config/config.live-write-example.yaml
+```
+
+The Solcast key lives OUTSIDE the repo in `var/solcast.env` (the
+no-secrets rule); without it the provider composes out with a visible
+registry note — the controller still boots.
+
 ## Completion gates
 
 A component is not complete until contracts and tests agree, focused and full
@@ -359,6 +373,47 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-24 (forecast/night-V2 round — THE REGISTRY'S FIRST CONSUMER
+  LIVE, THE OPERATOR'S REAL TARIFF COMMISSIONED, NIGHT-V2 COMPOSED IN
+  SUGGEST MODE; base 586bbb6 → HEAD cca356a): enabling commits first —
+  dfded9f (the parking projection serves the commissioned cap with no
+  lease open; the console park surface unblocked) and 586bbb6 (Solcast
+  live enablement, the rooftop-sites hobbyist contract; the key lives
+  outside the repo in var/solcast.env, sourced by the standing launch
+  command now recorded in the runbook above). THE ROUND: 45c1053 the
+  scoreboard wave (GET /api/v1/forecast, ForecastOutlookControl as the
+  registry's FIRST consumer, the Insights solar-outlook + accuracy
+  panel; +42 tests) → 6454e33 + 500bf73 the night-V2 design contract
+  with the adversarial panel's twelve amendments folded → 5ba401d the
+  A1 pre-battery scorer basis fix → 838e1c7 per-day durable trust
+  records + the compound gate (schema v5) → cddab13 night-V2's
+  target_policy config + the section-6 cross-validations incl. the A3
+  FiT gate → 2a92399 THE V2 ADVISER — suggest-mode byte-identical
+  intent stream, one-directional completion, audit-derived retarget
+  caps (schema v6) → 8242c87 the historian night-claim attribution →
+  b6a6308 the tariff COMMISSIONED FROM THE OPERATOR'S BILL: 30.77 c
+  peak / 7.27 c off-peak 00:00–06:00 / 2.0 c FiT — the A3 gate passes
+  decisively (FiT 2.0 << ~6.5 break-even; no legacy-QLD inversion) →
+  cca356a the console wave (the V2 Night tile: suggest/act lines with
+  the does-not-govern clause and the 95-vs-100 clause, the trust line,
+  four fallback words, the A5 morning notice; +35 tests, 9 shots).
+  FINAL GATES: backend 2671 / web 925, ruff + strict mypy + builds
+  green, every wave gated on its committed tree. LIVE-VERIFIED on the
+  running controller: target_policy forecast_suggest composed, trust
+  provisioning 0/14, tariff composed, Solcast serving real 48 h
+  forecasts (fetch_count growing at the 2/day cadence inside the
+  10/day budget). The operator's bill numbers were the decisive input.
+  FOUR WIRE GAPS flagged by the console wave — filed in
+  DEFERRED_FINDINGS (fallback frames carry no age; no read route for
+  the A1 morning-landing split; the 95 ceiling is design-pinned, not
+  on the wire; the tariff wire carries defaults only, not the 7.27 c
+  night rate). RUNTIME STATE: the controller runs b6a6308 (backend
+  current; cca356a is web-only and Vite serves it — no restart
+  needed). STANDING GATES UNCHANGED: the operator's Docker stand-down
+  confirmation → night-V1 enable (arm already satisfied); V2 ACT-mode
+  additionally requires the 14-day trust clock AND a deliberate config
+  promotion.
 
 - 2026-08-24 (mid-run reconnect): THE 15:20:32 PERMANENT-DARK BUG FIXED — a
   single transient TCP failure on an established Waveshare session darkened a
