@@ -46,6 +46,13 @@ _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
 EVENTS_SUBPROTOCOL = "energypod-events"
 # API_CONTRACTS: the browser event-stream ticket is single-use with a short
 # TTL (at most 30 s) bound to one principal and to the events stream only.
+# API_CONTRACTS "Device-mode telemetry and dispatch gating": the facade's
+# dispatch refusal names its code as the ValueError message's own prefix
+# (``device_debug_mode_active: [units]``); the boundary maps that refusal onto
+# its 409 envelope with the message VERBATIM -- the wording is the pinned wire
+# truth -- and the structured provenance the facade attaches rides the
+# envelope's ``details`` additively when present (DESIGN_POD_PARKING section 3).
+_DEBUG_MODE_REFUSAL: Final[str] = "device_debug_mode_active"
 _MAX_EVENT_TICKET_TTL_S: Final[float] = 30.0
 _DEFAULT_EVENT_TICKET_TTL_S: Final[float] = 15.0
 
@@ -687,6 +694,35 @@ def create_api_app(
         except LookupError as exc:
             raise BoundaryError(404, "unit_not_found", "The unit identifier is not known") from exc
 
+    def _dispatch_invoke(
+        invoke: Callable[[], Awaitable[dict[str, Any]]]
+    ) -> Callable[[], Awaitable[dict[str, Any]]]:
+        """Map the facade's device-mode dispatch refusal onto its 409 envelope.
+
+        The refusal's MESSAGE is the envelope's message verbatim (the pinned
+        wording -- byte-compat); the structured per-unit provenance the facade
+        attaches (parked_provenance / resume_provenance / foreign_mode,
+        DESIGN_POD_PARKING section 3) gains ``details`` additively when
+        present, and the envelope stays shape-identical without it.  Every
+        other facade error keeps its existing path.
+        """
+
+        async def wrapped() -> dict[str, Any]:
+            try:
+                return await invoke()
+            except ValueError as exc:
+                if not str(exc).startswith(f"{_DEBUG_MODE_REFUSAL}:"):
+                    raise
+                details = getattr(exc, "details", None)
+                raise BoundaryError(
+                    409,
+                    _DEBUG_MODE_REFUSAL,
+                    str(exc),
+                    details if isinstance(details, Mapping) else None,
+                ) from exc
+
+        return wrapped
+
     @app.post(f"{API_PREFIX}/intents", status_code=202)
     async def submit_intent(
         body: IntentRequest,
@@ -700,11 +736,13 @@ def create_api_app(
             operation_name="submit_intent",
             payload=payload,
             status_code=202,
-            invoke=lambda: service.submit_intent(
-                **payload,
-                principal=identity,
-                idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
-                request_id=request.state.request_id,
+            invoke=_dispatch_invoke(
+                lambda: service.submit_intent(
+                    **payload,
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
             ),
         )
         return JSONResponse(status_code=result.status_code, content=dict(result.body))

@@ -2400,14 +2400,13 @@ export function snapshot(
 
 // ---------------------------------------------------------------------------
 // Pod parking (DESIGN_POD_PARKING.md, API_CONTRACTS.md "Pod parking") — the
-// whole family is PENDING-BACKEND: the `park_state` per-unit projection, the
-// three guarded routes, and the `unit.parked`/`unit.park_renewed`/
-// `unit.resumed`/`unit.park_expired` bus events are not live yet, so none of
-// these shapes is served by today's wire. The default snapshot unit omits
-// `park_state` entirely (an absent field is today's wire truth — the absent
-// key is also the UNCOMMISSIONED feature detection the contract pins). Attach
-// with `withParkState`; build the routes' refusals with
-// `parkRefusalEnvelope`.
+// backend has landed: the `park_state` per-unit projection, the three guarded
+// routes, and the `unit.parked`/`unit.park_renewed`/`unit.resumed`/
+// `unit.park_expired` bus events are live wherever the `parking:` block is
+// commissioned. The default snapshot unit still omits `park_state` — the
+// fixtures model the UNCOMMISSIONED site, whose absent key is the feature
+// detection the contract pins. Attach a commissioned unit with
+// `withParkState`; build the routes' refusals with `parkRefusalEnvelope`.
 // ---------------------------------------------------------------------------
 
 /**
@@ -2426,8 +2425,9 @@ export const PARK_ORIGIN_VALUES: readonly string[] = [
 /**
  * The parking bus vocabulary (§3): `unit.parked`, `unit.park_renewed`,
  * `unit.resumed` (typed payloads mirroring the audit rows) and
- * `unit.park_expired` (alert tier — the alarm-only expiry). PENDING-BACKEND —
- * not in PUBLISHED_EVENT_TYPES; the shell treats them feature-detectively.
+ * `unit.park_expired` (alert tier — the alarm-only expiry). Live on the wire
+ * since the parking round; the PUBLISHED_EVENT_TYPES checklist above predates
+ * them, and the shell treats them feature-detectively regardless.
  */
 export const UNIT_PARKED_EVENT = "unit.parked" as const;
 export const UNIT_PARK_RENEWED_EVENT = "unit.park_renewed" as const;

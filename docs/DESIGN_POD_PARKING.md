@@ -217,7 +217,7 @@ the stop first): `{"stop_ids": [...],
     refusal would violate the never-retry-a-denied-dispatch-unchanged
     doctrine. Coordinator ruling 2026-08-24, resolving the B1 ambiguity.
   - Foreign PQ objectives observed on a parked unit (the night-writer
-    case): the night-writer detector annotates those samples `unit_parked`
+    case): the night-writer detector annotates those samples `parked: true`
     — never silent, never an alert by itself. Consequence chain stated
     honestly: per the pinned conservative simulator model (§6) an ignored
     write leaves the served-objective words unchanged, so a foreign write

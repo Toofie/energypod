@@ -5,14 +5,15 @@
  * refusals, and the plain-word maps every parking surface (the Batteries chip
  * and banner, the park/resume dialogs, Home's fleet banner) shares.
  *
- * PENDING-BACKEND: the projection, the routes, and the `unit.parked` /
- * `unit.park_renewed` / `unit.resumed` / `unit.park_expired` bus events are
- * not live yet — every parser here is built feature-detectively against the
- * contract's pinned shapes (the adviser_state / schedule_state pattern): an
- * ABSENT `park_state` key is the not-commissioned feature detection and never
- * an error; a PRESENT-but-partial frame falls back per field to its honest
- * default (null / 0 / ""), never to a fabricated figure. No parking surface
- * renders while the snapshot carries no `park_state`.
+ * The backend has landed: the `parking:` config block composes the
+ * `park_state` projection, the three guarded routes, and the `unit.parked` /
+ * `unit.park_renewed` / `unit.resumed` / `unit.park_expired` bus events — and
+ * every parser here stays feature-detective against the contract's pinned
+ * shapes (the adviser_state / schedule_state pattern): an ABSENT `park_state`
+ * key is the not-commissioned feature detection (an uncommissioned site) and
+ * never an error; a PRESENT-but-partial frame falls back per field to its
+ * honest default (null / 0 / ""), never to a fabricated figure. No parking
+ * surface renders while the snapshot carries no `park_state`.
  *
  * Wire truth pinned here (the docs govern):
  * - `park_state`: `{parked, origin, parked_at, lease_expires_at, max_total_s,

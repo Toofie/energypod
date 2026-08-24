@@ -146,6 +146,10 @@ UNIT_DETAIL_PROJECTIONS: dict[str, dict[str, Any]] = {
 class RecordingEnergyService:
     calls: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     next_revision: int = 40
+    # The facade's dispatch refusal raised verbatim (the shape the boundary
+    # maps: a ValueError whose message prefixes the refusal code, with the
+    # structured per-unit provenance attached as ``details``).
+    intent_refusal: Any = None
     # The schedule surface's scripted answers (DESIGN_SCHEDULES §5): a view
     # body, an optional refusal (ScheduleRefusal-shaped), and an optional
     # validation error raised to the boundary.
@@ -386,6 +390,8 @@ class RecordingEnergyService:
 
     async def submit_intent(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("submit_intent", kwargs))
+        if self.intent_refusal is not None:
+            raise self.intent_refusal
         self.next_revision += 1
         return {
             "intent_id": "intent-server-1",

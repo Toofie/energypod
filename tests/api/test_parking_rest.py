@@ -305,6 +305,71 @@ def test_a_facade_validation_error_maps_to_422_never_500(
     assert "lease_s" in body["message"]
 
 
+# --- the dispatch refusal's provenance rides the intents 409 envelope ---------------
+
+
+def _debug_refusal(units: list[str], details: Any = None) -> ValueError:
+    """The facade's device-mode dispatch refusal, exactly as it is raised."""
+    error = ValueError(f"device_debug_mode_active: {sorted(units)}")
+    if details is not None:
+        error.details = details  # type: ignore[attr-defined]
+    return error
+
+
+def test_the_intents_refusal_carries_the_parked_provenance(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """DESIGN section 3's wire promise: the existing ``device_debug_mode_active``
+    refusal fires as it always has -- the message VERBATIM (byte-compat) --
+    and the structured provenance the facade attaches gains the 409 envelope's
+    ``details`` additively."""
+    provenance = {
+        "pod-a": {
+            "parked_provenance": {
+                "parked_at": "2026-08-24T02:00:00+00:00",
+                "authorizer": "person:operator",
+                "reason": "inverter work",
+                "lease_expires_at": "2026-08-24T06:00:00+00:00",
+            }
+        }
+    }
+    service.intent_refusal = _debug_refusal(["pod-a"], provenance)
+    with _client(service, authenticator) as client:
+        body = _assert_error(
+            client.post(
+                f"{API}/intents",
+                json={"unit_ids": ["pod-a"], "direction": "charge", "watts": 500, "ttl_s": 60},
+                headers=_mutation_headers("operator-token"),
+            ),
+            409,
+            "device_debug_mode_active",
+        )
+    assert body["message"] == "device_debug_mode_active: ['pod-a']"
+    assert body["details"] == provenance
+
+
+def test_the_intents_refusal_stays_shape_identical_without_provenance(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """The non-parked refusal (a debugging word the ledger does not name) is
+    the same envelope with empty details -- additive means additive: no
+    provenance, no new keys, the message still verbatim."""
+    service.intent_refusal = _debug_refusal(["pod-b"])
+    with _client(service, authenticator) as client:
+        body = _assert_error(
+            client.post(
+                f"{API}/intents",
+                json={"unit_ids": ["pod-b"], "direction": "charge", "watts": 500, "ttl_s": 60},
+                headers=_mutation_headers("operator-token"),
+            ),
+            409,
+            "device_debug_mode_active",
+        )
+    assert set(body) == {"code", "message", "details", "request_id"}
+    assert body["message"] == "device_debug_mode_active: ['pod-b']"
+    assert body["details"] == {}
+
+
 def test_an_unknown_unit_maps_to_404(
     service: RecordingEnergyService, authenticator: FakeAuthenticator
 ) -> None:

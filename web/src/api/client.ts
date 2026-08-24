@@ -153,10 +153,10 @@ export interface UnitDetail {
   energy_charge_kwh?: number | null;
   energy_discharge_kwh?: number | null;
   /**
-   * The pod-parking projection (API_CONTRACTS.md "Pod parking", PENDING on
-   * the wire): present on the detail read once the `parking:` config block is
-   * commissioned, ABSENT when it is not — the not-commissioned feature
-   * detection. Uninterpreted passthrough; web/src/app/park.ts narrows it.
+   * The pod-parking projection (API_CONTRACTS.md "Pod parking"): present on
+   * the detail read once the `parking:` config block is commissioned, ABSENT
+   * when it is not — the not-commissioned feature detection. Uninterpreted
+   * passthrough; web/src/app/park.ts narrows it.
    */
   park_state?: Record<string, unknown>;
   /**
