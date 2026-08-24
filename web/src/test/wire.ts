@@ -697,6 +697,10 @@ export const HEALTH_STATE_VALUES: readonly string[] = [
   "unreachable",
   "foreign_writer",
   "inhibited",
+  // DESIGN_POD_PARKING §3 (PENDING): the composable operator state — computed
+  // as ("parked", *healing) so a parked+balancing pod keeps its healing
+  // visibility; faults legitimately outrank it.
+  "parked",
 ];
 
 /** The self-healing reason codes the classifier derives (recovery.py). */
@@ -983,6 +987,14 @@ export interface WireUnitSnapshot {
    * wire truth). Attach it with `withObjective`.
    */
   readonly last_objective_observed?: WireLastObjective | null;
+  /**
+   * The pod-parking projection (API_CONTRACTS.md "Pod parking", PENDING):
+   * present once the `parking:` config block is commissioned; ABSENT (the
+   * default, today's wire — never null-standing-in) when it is not, and that
+   * absent key is the console's not-commissioned feature detection. Attach
+   * with `withParkState`.
+   */
+  readonly park_state?: WireParkState;
 }
 
 /**
@@ -2387,6 +2399,314 @@ export function snapshot(
 }
 
 // ---------------------------------------------------------------------------
+// Pod parking (DESIGN_POD_PARKING.md, API_CONTRACTS.md "Pod parking") — the
+// whole family is PENDING-BACKEND: the `park_state` per-unit projection, the
+// three guarded routes, and the `unit.parked`/`unit.park_renewed`/
+// `unit.resumed`/`unit.park_expired` bus events are not live yet, so none of
+// these shapes is served by today's wire. The default snapshot unit omits
+// `park_state` entirely (an absent field is today's wire truth — the absent
+// key is also the UNCOMMISSIONED feature detection the contract pins). Attach
+// with `withParkState`; build the routes' refusals with
+// `parkRefusalEnvelope`.
+// ---------------------------------------------------------------------------
+
+/**
+ * The park-writer vocabulary (§3): who the lease names. `unrecorded` covers
+ * word=1 with no lease AND no foreign evidence (crash-after-write residue);
+ * `foreign` is reserved for the vendor-app/foreign-flip class; `none` is the
+ * no-lease, word-0 answer.
+ */
+export const PARK_ORIGIN_VALUES: readonly string[] = [
+  "operator",
+  "foreign",
+  "unrecorded",
+  "none",
+];
+
+/**
+ * The parking bus vocabulary (§3): `unit.parked`, `unit.park_renewed`,
+ * `unit.resumed` (typed payloads mirroring the audit rows) and
+ * `unit.park_expired` (alert tier — the alarm-only expiry). PENDING-BACKEND —
+ * not in PUBLISHED_EVENT_TYPES; the shell treats them feature-detectively.
+ */
+export const UNIT_PARKED_EVENT = "unit.parked" as const;
+export const UNIT_PARK_RENEWED_EVENT = "unit.park_renewed" as const;
+export const UNIT_RESUMED_EVENT = "unit.resumed" as const;
+export const UNIT_PARK_EXPIRED_EVENT = "unit.park_expired" as const;
+
+/**
+ * The per-unit `park_state` projection (§3, verbatim keys): present on every
+ * snapshot unit and unit detail once the `parking:` config block is
+ * commissioned; ABSENT (never null-standing-in) when it is not — that absent
+ * key is the console's not-commissioned feature detection.
+ */
+export interface WireParkState {
+  readonly parked: boolean;
+  readonly origin: string;
+  readonly parked_at: string;
+  readonly lease_expires_at: string;
+  readonly max_total_s: number;
+  readonly remaining_cap_s: number;
+  readonly expired: boolean;
+  readonly reason: string;
+  readonly authorizer: string;
+  /** True when a foreign park landed over our unchanged lease (named, no write). */
+  readonly foreign_rewrite?: boolean;
+  /** The terminal sub-state: a failed write never reclassifies a lease. */
+  readonly write_unverified?: boolean;
+  /** A word ∈ {2..6} the controller refuses to normalize; never `parked: true`. */
+  readonly foreign_mode?: { readonly word: number; readonly name: string; readonly first_observed_at: string } | null;
+}
+
+/**
+ * A park-projection fixture. Defaults are the §0/§8 story's own figures: rhs
+ * parked by the operator at 02:00 local under a 4 h lease — 166 V observed
+ * while parked is the pack-voltage evidence the chip tooltip names. Explicit
+ * nulls and the optional booleans are preserved exactly as given.
+ */
+export function parkState(spec: Partial<WireParkState> = {}): WireParkState {
+  return {
+    parked: spec.parked ?? true,
+    origin: spec.origin ?? "operator",
+    parked_at: spec.parked_at ?? "2026-08-24T02:00:00+10:00",
+    lease_expires_at: spec.lease_expires_at ?? "2026-08-24T06:00:00+10:00",
+    max_total_s: spec.max_total_s ?? 14400,
+    remaining_cap_s: spec.remaining_cap_s ?? 14400,
+    expired: spec.expired ?? false,
+    reason: spec.reason ?? "evening standby",
+    authorizer: spec.authorizer ?? "operator:home",
+    ...(spec.foreign_rewrite === undefined ? {} : { foreign_rewrite: spec.foreign_rewrite }),
+    ...(spec.write_unverified === undefined ? {} : { write_unverified: spec.write_unverified }),
+    ...(spec.foreign_mode === undefined ? {} : { foreign_mode: spec.foreign_mode }),
+  };
+}
+
+/** Attach the pending park projection to a snapshot unit. */
+export function withParkState(unit: WireUnitSnapshot, park: WireParkState): WireUnitSnapshot {
+  return { ...unit, park_state: park };
+}
+
+/**
+ * The resume 200's `checklist` object (§2, verbatim keys): the honest
+ * after-park facts the operator reads before trusting the pod again.
+ */
+export interface WireResumeChecklist {
+  readonly comms_age_s: number | null;
+  readonly soc_drift_pct: number | null;
+  readonly soc_pct_at_park: number | null;
+  readonly measured_watts_now: number | null;
+  readonly faults_while_parked: readonly string[] | null;
+  readonly faults_retention_note: string;
+  readonly latched_stops: readonly string[];
+  readonly latched_inhibit: boolean;
+}
+
+/** A checklist fixture; explicit nulls are preserved (never zero-filled). */
+export function resumeChecklist(
+  spec: Partial<WireResumeChecklist> = {},
+): WireResumeChecklist {
+  return {
+    comms_age_s: spec.comms_age_s === undefined ? 1.8 : spec.comms_age_s,
+    soc_drift_pct: spec.soc_drift_pct === undefined ? -0.6 : spec.soc_drift_pct,
+    soc_pct_at_park: spec.soc_pct_at_park === undefined ? 64 : spec.soc_pct_at_park,
+    measured_watts_now: spec.measured_watts_now === undefined ? 0 : spec.measured_watts_now,
+    faults_while_parked: spec.faults_while_parked === undefined ? [] : spec.faults_while_parked,
+    faults_retention_note:
+      spec.faults_retention_note ??
+      "faults observed while parked were retained; the fault registers are the record",
+    latched_stops: spec.latched_stops === undefined ? [] : spec.latched_stops,
+    latched_inhibit: spec.latched_inhibit ?? false,
+  };
+}
+
+/** The park route's 200 body (§2): the verified write plus the minted lease. */
+export function parkOk(
+  spec: {
+    unit_id?: string;
+    prior_word?: number;
+    as_of?: string;
+    lease?: WireParkState;
+  } = {},
+): Record<string, unknown> {
+  return {
+    unit_id: spec.unit_id ?? "rhs",
+    action: "park",
+    prior_word: spec.prior_word ?? 0,
+    written_value: 1,
+    readback_word: 1,
+    verified: true,
+    as_of: spec.as_of ?? "2026-08-24T02:00:01+10:00",
+    lease: spec.lease ?? parkState(),
+    prior_state: { lifecycle: "disarmed", measured_watts: 0 },
+  };
+}
+
+/** The resume route's 200 body (§2): the verified write plus the checklist. */
+export function resumeOk(
+  spec: {
+    unit_id?: string;
+    prior_word?: number;
+    origin?: "operator" | "foreign" | "none";
+    checklist?: WireResumeChecklist;
+    as_of?: string;
+  } = {},
+): Record<string, unknown> {
+  return {
+    unit_id: spec.unit_id ?? "rhs",
+    action: "resume",
+    prior_word: spec.prior_word ?? 1,
+    written_value: 0,
+    readback_word: 0,
+    verified: true,
+    as_of: spec.as_of ?? "2026-08-24T05:31:00+10:00",
+    origin: spec.origin ?? "operator",
+    checklist: spec.checklist ?? resumeChecklist(),
+  };
+}
+
+/**
+ * A refusal envelope for the parking routes, shaped exactly as the thrown
+ * `ApiClientError` carries it (tests wrap: `new ApiClientError({...})`). Every
+ * named shape carries its contract-pinned details verbatim (API_CONTRACTS.md
+ * "Pod parking"). The one soft spot, named honestly: `park_lease_absent`'s
+ * details "carry the closing row's origin and time" without the contract
+ * pinning the key spellings — the fixture uses `origin` / `closed_at`, and
+ * the console's renderer reads those defensively.
+ */
+export function parkRefusalEnvelope(
+  code:
+    | "park_not_commissioned"
+    | "park_conflict_refused"
+    | "park_already_parked"
+    | "park_mode_out_of_scope"
+    | "park_write_failed"
+    | "park_readback_unverified"
+    | "park_foreign_word_acknowledgement_required"
+    | "park_lease_cap_reached"
+    | "park_lease_absent"
+    | "resume_stop_latched",
+  options: {
+    message?: string;
+    details?: Record<string, unknown>;
+    status?: number;
+  } = {},
+): { status: number; code: string; message: string; details: Record<string, unknown> | null; request_id: string } {
+  const defaults: Record<
+    string,
+    { status: number; message: string; details: Record<string, unknown> | null }
+  > = {
+    park_not_commissioned: {
+      status: 409,
+      message: "Parking is not commissioned in this deployment's config.",
+      details: { cause: "block_absent" },
+    },
+    park_conflict_refused: {
+      status: 409,
+      message: "The unit is not in a state where parking is permitted.",
+      details: { units: [{ unit_id: "rhs", cause: "armed" }] },
+    },
+    park_already_parked: {
+      status: 409,
+      message: "The unit is already parked — renew the lease instead.",
+      details: { lease: parkState() },
+    },
+    park_mode_out_of_scope: {
+      status: 409,
+      message: "The device is in a vendor-directed mode the controller never transitions.",
+      details: { prior_word: 3, vendor_name: "Circulation" },
+    },
+    park_write_failed: {
+      status: 409,
+      message: "The park write did not go through.",
+      details: { error_class: "gateway_timeout" },
+    },
+    park_readback_unverified: {
+      status: 409,
+      message: "The park write could not be verified by readback.",
+      details: { prior_word: 0, written_value: 1, readback_word: 0, retries: 1 },
+    },
+    park_foreign_word_acknowledgement_required: {
+      status: 409,
+      message: "The word is parked with no controller lease — resuming needs the takeover acknowledgement.",
+      details: { acknowledgement: "FOREIGN", prior_word: 1, observed_since: "2026-08-24T01:12:00+10:00" },
+    },
+    park_lease_cap_reached: {
+      status: 409,
+      message: "Renewal may not extend the lease past its maximum.",
+      details: {
+        parked_at: "2026-08-24T02:00:00+10:00",
+        max_total_s: 14400,
+        requested_expires_at: "2026-08-24T07:30:00+10:00",
+      },
+    },
+    park_lease_absent: {
+      status: 409,
+      message: "No open lease to renew.",
+      details: { origin: "operator", closed_at: "2026-08-24T05:31:00+10:00" },
+    },
+    resume_stop_latched: {
+      status: 409,
+      message: "A latched emergency stop names this unit — acknowledge the stop first.",
+      details: {
+        stop_ids: ["stop-7"],
+        acknowledgement_endpoint: "/api/v1/emergency-stop/stop-7/acknowledge",
+      },
+    },
+  };
+  const pinned = defaults[code]!;
+  return {
+    status: options.status ?? pinned.status,
+    code,
+    message: options.message ?? pinned.message,
+    details: options.details ?? pinned.details,
+    request_id: `req-${code}`,
+  };
+}
+
+/**
+ * The unit detail's `recovery_advisory` (DESIGN_POD_PARKING §7): present when
+ * the classifier holds `actuation_incoherent` with the wedge-signature echo
+ * (`objective_not_served` or `echo_matches_write`). PENDING-BACKEND, and the
+ * contract does not pin the object's inner fields — the fixture carries the
+ * echo classifications the classifier held, which is all the card's honest
+ * wording needs.
+ */
+export interface WireRecoveryAdvisory {
+  readonly echo_classifications: readonly string[];
+}
+
+export function recoveryAdvisory(
+  spec: Partial<WireRecoveryAdvisory> = {},
+): WireRecoveryAdvisory {
+  return {
+    echo_classifications: [...(spec.echo_classifications ?? ["echo_matches_write"])],
+  };
+}
+
+/**
+ * The unit detail's `delivery_bias` (§7): the bounded (authorized, measured)
+ * evidence window, labeled evidence-only — no control path reads it. The
+ * contract pins the figures (mean/max bias, sample count, window) but not the
+ * key spellings; the fixture uses the natural ones and the decoder reads them
+ * defensively. PENDING-BACKEND.
+ */
+export interface WireDeliveryBias {
+  readonly mean_bias_pct: number | null;
+  readonly max_bias_pct: number | null;
+  readonly sample_count: number;
+  readonly window_s: number | null;
+}
+
+export function deliveryBias(spec: Partial<WireDeliveryBias> = {}): WireDeliveryBias {
+  return {
+    mean_bias_pct: spec.mean_bias_pct === undefined ? 15.4 : spec.mean_bias_pct,
+    max_bias_pct: spec.max_bias_pct === undefined ? 16.1 : spec.max_bias_pct,
+    sample_count: spec.sample_count === undefined ? 212 : spec.sample_count,
+    window_s: spec.window_s === undefined ? 900 : spec.window_s,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Telemetry summary + unit detail (API_CONTRACTS.md "Application service
 // facade"; observation fields: src/energypod/domain/observations.py)
 // ---------------------------------------------------------------------------
@@ -2451,6 +2771,12 @@ export interface WireTelemetrySummary {
    */
   readonly grid_power_w: number | null;
   readonly load_power_w: number | null;
+  /**
+   * The vendor debug-mode readback (0x8100+0 — the parking/Standby word),
+   * one of the four device-mode readthroughs (API_CONTRACTS.md "Device-mode
+   * telemetry"): null when the block was not served, never zero-filled.
+   */
+  readonly debug_mode_w?: number | null;
 }
 
 /**
@@ -2483,6 +2809,7 @@ export function telemetrySummary(spec: Partial<WireTelemetrySummary> = {}): Wire
     // per-phase figures set them explicitly.
     grid_power_w: spec.grid_power_w === undefined ? null : spec.grid_power_w,
     load_power_w: spec.load_power_w === undefined ? null : spec.load_power_w,
+    debug_mode_w: spec.debug_mode_w === undefined ? null : spec.debug_mode_w,
     active_faults: spec.active_faults === undefined ? [] : spec.active_faults,
     active_warnings:
       spec.active_warnings === undefined
@@ -2544,6 +2871,23 @@ export interface WireUnitDetail {
   readonly cell_voltages_v: readonly number[] | null;
   readonly temperatures_c: readonly number[] | null;
   readonly quality: Readonly<Record<string, string>> | null;
+  /**
+   * The pod-parking projection on the detail read (PENDING): same shape and
+   * same absent-key feature detection as the snapshot unit's `park_state`.
+   */
+  readonly park_state?: WireParkState;
+  /**
+   * The wedge-signature recovery advisory (DESIGN_POD_PARKING §7, PENDING):
+   * present only while the classifier holds `actuation_incoherent` with the
+   * wedge echo. The advisory renders UNAVAILABLE (never a suggestion) when
+   * the `parking:` block is not commissioned — see `park_state`.
+   */
+  readonly recovery_advisory?: WireRecoveryAdvisory;
+  /**
+   * The delivery-bias evidence window (§7, PENDING): mean/max bias, sample
+   * count, window — evidence-only, never a warning, no control path reads it.
+   */
+  readonly delivery_bias?: WireDeliveryBias;
 }
 
 /**

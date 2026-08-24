@@ -336,6 +336,12 @@ export function sharedClient(plane: SharedDataPlane, real: ApiClient): ApiClient
     postIntent: (body, idempotencyKey) => real.postIntent(body, idempotencyKey),
     postIntentCancel: (intentId, idempotencyKey) =>
       real.postIntentCancel(intentId, idempotencyKey),
+    // The guarded parking routes pass straight through: they are interactive
+    // operator acts with their own idempotency keys, never coalesced reads.
+    postPark: (unitId, body, idempotencyKey) => real.postPark(unitId, body, idempotencyKey),
+    postParkRenew: (unitId, leaseS, idempotencyKey) =>
+      real.postParkRenew(unitId, leaseS, idempotencyKey),
+    postResume: (unitId, options) => real.postResume(unitId, options),
     postArm: (unitIds, idempotencyKey) => real.postArm(unitIds, idempotencyKey),
     postDisarm: (unitIds, idempotencyKey) => real.postDisarm(unitIds, idempotencyKey),
     postEmergencyStop: (unitIds, reason, idempotencyKey) =>

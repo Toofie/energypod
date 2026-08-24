@@ -18,6 +18,31 @@ export interface ShotStateDefinition {
   /** Builds the seeded snapshot world (fresh clone per call). */
   readonly world: () => WireSnapshot;
   /**
+   * The deterministic interaction the harness performs AFTER the settled
+   * render and BEFORE the capture (the pod-parking round's addition): a
+   * plain-data step list interpreted through the accessibility tree — clicks
+   * by role+name, fills by label, select-option by label — so a dialog or a
+   * post-action inline surface is on camera without the camera pretending to
+   * be the operator's state. Absent = the settled static picture (every
+   * earlier state).
+   */
+  readonly interact?: readonly ShotStep[];
+  /**
+   * The seeded guarded-route answers (PENDING wire family): the park and
+   * resume 200 bodies a parking interaction plays against. Absent = the
+   * seeded world refuses the routes loudly.
+   */
+  readonly park?: {
+    readonly park?: () => Record<string, unknown>;
+    readonly resume?: () => Record<string, unknown>;
+  };
+  /**
+   * The seeded unit-detail read (GET /api/v1/units/{id}, keyed by unit id):
+   * returning undefined refuses loudly (the honest error state the default
+   * seeded client answers with).
+   */
+  readonly unitDetail?: (unitId: string) => Record<string, unknown> | undefined;
+  /**
    * The seeded connection's fate (default "live"): "lost" ends the stream
    * after its authoritative first frame, so the view settles into its
    * connection-lost picture — march stopped, last-known figures dimmed —
@@ -60,3 +85,25 @@ export interface ShotStateDefinition {
    */
   readonly objectives?: () => Record<string, unknown>;
 }
+
+/**
+ * One deterministic interaction step (plain data so it crosses the page →
+ * orchestrator manifest boundary untouched): click a named control, fill a
+ * labelled field, choose a labelled select option, or pause for a settled
+ * re-render. Selectors are the accessibility tree's own — role+name and
+ * label — never CSS.
+ */
+export type ShotStep =
+  | {
+      readonly click: {
+        readonly role: "button" | "checkbox" | "tab";
+        readonly name: string;
+        /** Match the accessible name exactly (disambiguates "mid" from "Park mid"). */
+        readonly exact?: boolean;
+        /** Target inside the open dialog (its confirm, beside a same-named card control). */
+        readonly inDialog?: boolean;
+      };
+    }
+  | { readonly fill: { readonly label: string; readonly value: string } }
+  | { readonly select: { readonly label: string; readonly value: string } }
+  | { readonly pauseMs: number };

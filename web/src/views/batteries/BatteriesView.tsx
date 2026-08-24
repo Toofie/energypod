@@ -92,6 +92,19 @@ import {
   type EnergyUnitDay,
 } from "../../app/energy";
 import { UnitHealthTag } from "../../app/unitHealth";
+import { toParkState, toResumeChecklist, type ParkStateView, type ResumeChecklistView } from "../../app/park";
+import {
+  DeliveryBiasReadout,
+  ParkDialog,
+  ParkedBanner,
+  ParkedChip,
+  type ParkRefusalView,
+  RecoveryAdvisoryCard,
+  ResumeChecklistCard,
+  ResumeDialog,
+  type RecoveryAdvisoryView,
+  type DeliveryBiasView,
+} from "./Parking";
 import {
   formatKilowattHours,
   formatMillivolts,
@@ -160,6 +173,13 @@ interface TelemetryView {
   readonly loadPowerW: number | null;
   readonly activeFaults: readonly string[] | null;
   readonly activeWarnings: readonly string[] | null;
+  /**
+   * The vendor debug-mode readback (`debug_mode_w`, 0x8100+0 — the
+   * parking/standby word), readthrough-style: null when the block was not
+   * served. The parked chip's tooltip names this word and the pack voltage —
+   * telemetry's own figures, never a status metaphor.
+   */
+  readonly debugModeW: number | null;
 }
 
 interface ViewUnit {
@@ -186,6 +206,13 @@ interface ViewUnit {
    * card fact (the detail panel and the Objectives view carry it).
    */
   objective: UnitObjective | null;
+  /**
+   * The pod-parking projection (PENDING, feature-detected): present on every
+   * unit once the `parking:` config block is commissioned — null when the key
+   * is absent (the not-commissioned feature detection: no chip, no banner,
+   * and no Park/Resume affordance renders at all).
+   */
+  park: ParkStateView | null;
 }
 
 /** The GET /api/v1/units/{id} projection, parsed just as defensively. */
@@ -212,6 +239,12 @@ interface UnitDetailView {
   readonly energyPvKwh: number | null;
   readonly energyChargeKwh: number | null;
   readonly energyDischargeKwh: number | null;
+  /** The parking projection on the detail read (absent = not commissioned). */
+  readonly park: ParkStateView | null;
+  /** The wedge-signature recovery advisory; null when the read carries none. */
+  readonly recoveryAdvisory: RecoveryAdvisoryView | null;
+  /** The delivery-bias evidence window; null when the read carries none. */
+  readonly deliveryBias: DeliveryBiasView | null;
 }
 
 type DetailPhase = "loading" | "ready" | "error";
@@ -639,6 +672,7 @@ function parseTelemetryFields(value: Record<string, unknown>): TelemetryView {
     loadPowerW: parseNumber(value.load_power_w),
     activeFaults: parseStringArray(value.active_faults),
     activeWarnings: parseStringArray(value.active_warnings),
+    debugModeW: parseNumber(value.debug_mode_w),
   };
 }
 
@@ -691,6 +725,45 @@ function parseUnitDetail(raw: unknown): UnitDetailView | null {
     energyPvKwh: parseNumber(raw.energy_pv_kwh),
     energyChargeKwh: parseNumber(raw.energy_charge_kwh),
     energyDischargeKwh: parseNumber(raw.energy_discharge_kwh),
+    park: toParkState(raw.park_state),
+    recoveryAdvisory: parseRecoveryAdvisory(raw.recovery_advisory),
+    deliveryBias: parseDeliveryBias(raw.delivery_bias),
+  };
+}
+
+/**
+ * The wedge-signature advisory (DESIGN_POD_PARKING §7): presence of the key
+ * is the render signal; the echo classifications are the only inner field the
+ * card's wording reads, and they are read defensively — the contract pins the
+ * advisory's existence, not its inner shape.
+ */
+function parseRecoveryAdvisory(value: unknown): RecoveryAdvisoryView | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  return {
+    echoClassifications: parseStringArray(value.echo_classifications) ?? [],
+  };
+}
+
+/**
+ * The delivery-bias evidence window (§7): mean/max bias, sample count, and
+ * the window, every figure nullable — never zero-filled. The contract pins
+ * the figures; the key spellings below are the natural ones the decoder
+ * reads defensively.
+ */
+function parseDeliveryBias(value: unknown): DeliveryBiasView | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  return {
+    meanBiasPct: parseNumber(value.mean_bias_pct),
+    maxBiasPct: parseNumber(value.max_bias_pct),
+    sampleCount:
+      typeof value.sample_count === "number" && Number.isFinite(value.sample_count)
+        ? Math.max(0, value.sample_count)
+        : 0,
+    windowS: parseNumber(value.window_s),
   };
 }
 
@@ -722,6 +795,7 @@ function parseUnit(record: Record<string, unknown>): ViewUnit | null {
     inhibit,
     health: toUnitHealth(record),
     objective: toUnitObjective(record.last_objective_observed),
+    park: toParkState(record.park_state),
   };
 }
 
@@ -830,6 +904,12 @@ interface FleetCardProps {
    * arrive with time alone and never freezes between refreshes.
    */
   ageSeconds: number | null;
+  /**
+   * The WALL-clock now the lease countdown derives from (policy, not safety):
+   * distinct from the monotonic tick that drives re-renders — a lease instant
+   * is an epoch time and must never be compared against a monotonic clock.
+   */
+  nowWallMs: number;
   observation: ObservationTrack | undefined;
   /**
    * The snapshot's `energy_today` block (PENDING, feature-detected): null
@@ -839,6 +919,10 @@ interface FleetCardProps {
   today: EnergyToday | null;
   onOpenDetail: (unitId: string) => void;
   onAcknowledge: (unitId: string, opener: HTMLElement) => void;
+  /** Opens the guarded park dialog (offered only where parking is commissioned). */
+  onPark: (unitId: string, opener: HTMLElement) => void;
+  /** Opens the resume dialog (offered only where parking is commissioned). */
+  onResume: (unitId: string, opener: HTMLElement) => void;
 }
 
 /**
@@ -875,10 +959,13 @@ function acknowledgeOffered(unit: ViewUnit): boolean {
 function FleetCard({
   unit,
   ageSeconds,
+  nowWallMs,
   observation,
   today,
   onOpenDetail,
   onAcknowledge,
+  onPark,
+  onResume,
 }: FleetCardProps): JSX.Element {
   const dimmed = isStaleData(unit, ageSeconds);
   const imbalanceWarning = cellImbalanceWarning(unit);
@@ -892,7 +979,20 @@ function FleetCard({
         <button type="button" onClick={() => onOpenDetail(unit.unit_id)}>
           {unit.unit_id}
         </button>
+        {/* The parked chip: telemetry's own figures in the tooltip (the mode
+            word and the pack voltage), never a status metaphor. Renders only
+            where the parking projection speaks (feature detection). */}
+        {unit.park?.parked === true && (
+          <ParkedChip
+            park={unit.park}
+            modeWord={unit.telemetry?.debugModeW ?? null}
+            packVoltageV={unit.telemetry?.packVoltageV ?? null}
+          />
+        )}
       </div>
+      {/* The unit banner: the pinned countdown line (alert wording at expiry)
+          with the fixed not-isolation sentence always beside it. */}
+      {unit.park?.parked === true && <ParkedBanner park={unit.park} nowMs={nowWallMs} />}
       {/* The self-healing awareness badge: silent while healthy (and for the
           states the inhibit surfaces already tell), quiet-positive while the
           battery manages itself, the honest terminal when recovery fails.
@@ -979,6 +1079,27 @@ function FleetCard({
           Acknowledge inhibit
         </button>
       )}
+      {/* The park/resume affordance: offered exactly where the parking
+          projection speaks (the absent key is the not-commissioned feature
+          detection — a button that can only 409 is noise, not honesty). */}
+      {unit.park !== null &&
+        (unit.park.parked ? (
+          <button
+            type="button"
+            className="park-action"
+            onClick={(event) => onResume(unit.unit_id, event.currentTarget)}
+          >
+            Resume {unit.unit_id}
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="park-action"
+            onClick={(event) => onPark(unit.unit_id, event.currentTarget)}
+          >
+            Park {unit.unit_id}
+          </button>
+        ))}
     </div>
   );
 }
@@ -991,6 +1112,8 @@ interface UnitDetailProps {
   unit: ViewUnit;
   /** The unit's DISPLAYED (ticking) data age — the panels never re-derive it. */
   ageSeconds: number | null;
+  /** The WALL-clock now the lease countdown derives from (see FleetCard). */
+  nowWallMs: number;
   /** The whole fleet snapshot: a shared requested figure is a fleet total. */
   units: ViewUnit[];
   requestedByUnit: WattsByUnit | null;
@@ -1003,6 +1126,8 @@ interface UnitDetailProps {
   tab: TabKey;
   onTabChange: (tab: TabKey) => void;
   onBack: () => void;
+  onPark: (unitId: string, opener: HTMLElement) => void;
+  onResume: (unitId: string, opener: HTMLElement) => void;
   auditPage: AuditPage | null;
   auditError: ErrorView | null;
   onRetryAudit: () => void;
@@ -1017,6 +1142,7 @@ function SummaryPanel({
   unit,
   units,
   ageSeconds,
+  nowWallMs,
   requestedByUnit,
   authorizedByUnit,
   observation,
@@ -1027,6 +1153,7 @@ function SummaryPanel({
   unit: ViewUnit;
   units: ViewUnit[];
   ageSeconds: number | null;
+  nowWallMs: number;
   requestedByUnit: WattsByUnit | null;
   authorizedByUnit: WattsByUnit | null;
   observation: ObservationTrack | undefined;
@@ -1146,6 +1273,23 @@ function SummaryPanel({
       <p>
         <b>Recent trend:</b> no trend history is available from the API yet
       </p>
+      {/* The parked banner on the detail surface too: the pinned countdown
+          line (alert wording at expiry) with the fixed sentence beside it. */}
+      {unit.park?.parked === true && <ParkedBanner park={unit.park} nowMs={nowWallMs} />}
+      {/* The wedge-signature advisory (DESIGN_POD_PARKING §7): rendered where
+          the unit's read carries it — and honestly UNAVAILABLE where the site
+          has not commissioned parking, never a suggestion it cannot execute. */}
+      {detailData?.recoveryAdvisory != null && (
+        <RecoveryAdvisoryCard
+          advisory={detailData.recoveryAdvisory}
+          parkingComposed={unit.park !== null}
+        />
+      )}
+      {/* The delivery-bias evidence window: evidence styling, the
+          evidence-only label, never a warning. */}
+      {detailData?.deliveryBias != null && (
+        <DeliveryBiasReadout bias={detailData.deliveryBias} />
+      )}
       <LifetimeEnergyReadthroughs detailData={detailData} detailPhase={detailPhase} />
     </div>
   );
@@ -1496,6 +1640,21 @@ function DetailsPanel({
         <b>Unit ID:</b> {unit.unit_id}
       </p>
       <p>
+        <b>Mode word (debug):</b>{" "}
+        {unit.telemetry?.debugModeW == null
+          ? "not available"
+          : `${unit.telemetry.debugModeW}${
+              unit.telemetry.debugModeW === 1
+                ? " (Standby)"
+                : unit.telemetry.debugModeW === 0
+                  ? " (Normal)"
+                  : ""
+            }`}
+        {unit.park?.foreignMode != null && unit.park.foreignMode.name !== ""
+          ? ` — vendor mode ${unit.park.foreignMode.name} (word ${unit.park.foreignMode.word}), unexposed by this controller`
+          : ""}
+      </p>
+      <p>
         <b>Lifecycle (wire value):</b> {unit.lifecycle}
       </p>
       <p>
@@ -1520,6 +1679,7 @@ function DetailsPanel({
 function UnitDetail({
   unit,
   ageSeconds,
+  nowWallMs,
   units,
   requestedByUnit,
   authorizedByUnit,
@@ -1530,6 +1690,8 @@ function UnitDetail({
   tab,
   onTabChange,
   onBack,
+  onPark,
+  onResume,
   auditPage,
   auditError,
   onRetryAudit,
@@ -1569,6 +1731,34 @@ function UnitDetail({
       <button type="button" className="back" onClick={onBack}>
         Back to all batteries
       </button>
+      {/* The parked chip + banner on the detail surface: the same pinned
+          surfaces the card renders, on the view that stays open. */}
+      {unit.park?.parked === true && (
+        <ParkedChip
+          park={unit.park}
+          modeWord={unit.telemetry?.debugModeW ?? null}
+          packVoltageV={unit.telemetry?.packVoltageV ?? null}
+        />
+      )}
+      {unit.park !== null &&
+        (unit.park.parked ? (
+          <button
+            type="button"
+            className="park-action"
+            onClick={(event) => onResume(unit.unit_id, event.currentTarget)}
+          >
+            Resume {unit.unit_id}
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="park-action"
+            onClick={(event) => onPark(unit.unit_id, event.currentTarget)}
+          >
+            Park {unit.unit_id}
+          </button>
+        ))}
+      {unit.park?.parked === true && <ParkedBanner park={unit.park} nowMs={nowWallMs} />}
       <div
         role="tablist"
         aria-label={`${unit.unit_id} detail sections`}
@@ -1604,6 +1794,7 @@ function UnitDetail({
             unit={unit}
             units={units}
             ageSeconds={ageSeconds}
+            nowWallMs={nowWallMs}
             requestedByUnit={requestedByUnit}
             authorizedByUnit={authorizedByUnit}
             observation={observation}
@@ -1797,6 +1988,23 @@ export function BatteriesView({
   const [detailData, setDetailData] = useState<UnitDetailView | null>(null);
   const [detailPhase, setDetailPhase] = useState<DetailPhase>("loading");
   const [detailError, setDetailError] = useState<ErrorView | null>(null);
+  /**
+   * The guarded parking actions (DESIGN_POD_PARKING §8): one dialog open at a
+   * time, its refusal rendered beside the envelope verbatim, and the opener
+   * element kept so focus returns when the dialog closes. The park dialog's
+   * confirm stays disabled until the operator types the unit id; the resume
+   * dialog grows the foreign-takeover acknowledgement step exactly when the
+   * park wasn't ours.
+   */
+  const [parkUnitId, setParkUnitId] = useState<string | null>(null);
+  const [parkError, setParkError] = useState<ParkRefusalView | null>(null);
+  const [parkPending, setParkPending] = useState(false);
+  const [resumeUnitId, setResumeUnitId] = useState<string | null>(null);
+  const [resumeError, setResumeError] = useState<ParkRefusalView | null>(null);
+  const [resumePending, setResumePending] = useState(false);
+  /** The last resume's checklist, rendered inline until the operator dismisses it. */
+  const [checklist, setChecklist] = useState<{ unitId: string; checklist: ResumeChecklistView } | null>(null);
+  const parkOpenerRef = useRef<HTMLElement | null>(null);
 
   const cursorRef = useRef<number | undefined>(undefined);
   const streamStartedRef = useRef(false);
@@ -2207,12 +2415,135 @@ export function BatteriesView({
     })();
   };
 
+  // --- the guarded parking actions --------------------------------------------
+
+  /** A parking refusal as the dialog renders it: plain sentence + envelope. */
+  const asParkRefusal = (error: unknown): ParkRefusalView => {
+    if (error instanceof ApiClientError) {
+      return { code: error.code, message: error.message, details: error.details };
+    }
+    return {
+      code: "unexpected_error",
+      message: "Something went wrong while talking to the EnergyPod service.",
+      details: null,
+    };
+  };
+
+  const openPark = (unitId: string, opener: HTMLElement): void => {
+    parkOpenerRef.current = opener;
+    setParkError(null);
+    setParkPending(false);
+    setParkUnitId(unitId);
+  };
+
+  const cancelPark = (): void => {
+    setParkUnitId(null);
+    setParkError(null);
+    setParkPending(false);
+    parkOpenerRef.current?.focus();
+  };
+
+  const confirmPark = (reason: string, leaseS: number): void => {
+    if (parkUnitId === null || parkPending) {
+      return;
+    }
+    setParkPending(true);
+    setParkError(null);
+    const unitId = parkUnitId;
+    void (async () => {
+      try {
+        await client.postPark(unitId, { reason, leaseS });
+        const opener = parkOpenerRef.current;
+        setParkUnitId(null);
+        setParkPending(false);
+        opener?.focus();
+        // Post-park state is server authority: the chip, the banner, and the
+        // lease arrive through the refetched world, never optimistic local
+        // state. An open detail re-reads its full projection silently.
+        await loadSnapshot();
+        if (detailRef.current?.unitId === unitId && !detailReadInFlightRef.current) {
+          detailReadInFlightRef.current = true;
+          void fetchUnitDetailRef
+            .current(unitId, { silent: true })
+            .catch(() => undefined)
+            .finally(() => {
+              detailReadInFlightRef.current = false;
+            });
+        }
+      } catch (error) {
+        setParkPending(false);
+        setParkError(asParkRefusal(error));
+      }
+    })();
+  };
+
+  const openResume = (unitId: string, opener: HTMLElement): void => {
+    parkOpenerRef.current = opener;
+    setResumeError(null);
+    setResumePending(false);
+    setResumeUnitId(unitId);
+  };
+
+  const cancelResume = (): void => {
+    setResumeUnitId(null);
+    setResumeError(null);
+    setResumePending(false);
+    parkOpenerRef.current?.focus();
+  };
+
+  const confirmResume = (takeover: boolean): void => {
+    if (resumeUnitId === null || resumePending) {
+      return;
+    }
+    setResumePending(true);
+    setResumeError(null);
+    const unitId = resumeUnitId;
+    void (async () => {
+      try {
+        const body = await client.postResume(unitId, takeover ? { takeover: true } : {});
+        const record = body as Record<string, unknown>;
+        const list = toResumeChecklist(record.checklist);
+        if (list !== null) {
+          setChecklist({ unitId, checklist: list });
+        }
+        const opener = parkOpenerRef.current;
+        setResumeUnitId(null);
+        setResumePending(false);
+        opener?.focus();
+        await loadSnapshot();
+        if (detailRef.current?.unitId === unitId && !detailReadInFlightRef.current) {
+          detailReadInFlightRef.current = true;
+          void fetchUnitDetailRef
+            .current(unitId, { silent: true })
+            .catch(() => undefined)
+            .finally(() => {
+              detailReadInFlightRef.current = false;
+            });
+        }
+      } catch (error) {
+        // The refusal stays in the dialog: a takeover requirement grows the
+        // acknowledgement step (the 409 IS the routing); every other refusal
+        // renders its plain sentence beside the envelope verbatim.
+        setResumePending(false);
+        setResumeError(asParkRefusal(error));
+      }
+    })();
+  };
+
   // Displayed data ages are captured values plus elapsed monotonic time: the
   // shared plane republishes a fresh snapshot every couple of seconds while
   // the session is healthy, and between refreshes (and through any outage)
-  // the age keeps ticking instead of freezing at the captured figure.
-  const needsAgeTick = fleet?.units.some((unit) => unit.telemetry_age_s !== null) ?? false;
+  // the age keeps ticking instead of freezing at the captured figure. A
+  // parked banner's lease countdown rides the same once-a-second clock —
+  // policy time that must read as running, never frozen.
+  const needsAgeTick =
+    (fleet?.units.some((unit) => unit.telemetry_age_s !== null) ?? false) ||
+    (fleet?.units.some((unit) => unit.park?.parked === true) ?? false);
   const nowMs = useTickingNow(needsAgeTick);
+  // The wall-clock now the parked banners' lease countdowns derive from: the
+  // monotonic tick above only drives WHEN this line recomputes — the value it
+  // needs is an epoch instant, never a monotonic reading.
+  const nowWallMs = Date.now();
   const elapsedSeconds = Math.max(0, (nowMs - capturedAtRef.current) / 1000);
   /** A unit's displayed data age: the captured age plus elapsed time. The
    * row's own `ageText` lands on whole seconds (the display bound's rule). */
@@ -2303,13 +2634,25 @@ export function BatteriesView({
             key={unit.unit_id}
             unit={unit}
             ageSeconds={ageOf(unit)}
+            nowWallMs={nowWallMs}
             observation={observations[unit.unit_id]}
             today={fleet?.energyToday ?? null}
             onOpenDetail={(unitId) => setDetail({ unitId, tab: "summary" })}
             onAcknowledge={openAcknowledge}
+            onPark={openPark}
+            onResume={openResume}
           />
         ))}
       </div>
+      {/* The last resume's checklist, rendered inline until dismissed: the
+          after-park facts the operator reads before trusting the pod again. */}
+      {checklist !== null && (
+        <ResumeChecklistCard
+          unitId={checklist.unitId}
+          checklist={checklist.checklist}
+          onDismiss={() => setChecklist(null)}
+        />
+      )}
       {detail !== null &&
         (detailUnit === undefined ? (
           <p role="status">This unit is no longer in the current snapshot.</p>
@@ -2318,6 +2661,7 @@ export function BatteriesView({
             key={detailUnit.unit_id}
             unit={detailUnit}
             ageSeconds={ageOf(detailUnit)}
+            nowWallMs={nowWallMs}
             units={units}
             requestedByUnit={unitFigures.requestedByUnit}
             authorizedByUnit={unitFigures.authorizedByUnit}
@@ -2330,6 +2674,8 @@ export function BatteriesView({
               setDetail((previous) => (previous === null ? previous : { ...previous, tab }))
             }
             onBack={() => setDetail(null)}
+            onPark={openPark}
+            onResume={openResume}
             auditPage={auditPage}
             auditError={auditError}
             onRetryAudit={() => void fetchAudit()}
@@ -2358,6 +2704,34 @@ export function BatteriesView({
           onConfirm={confirmAcknowledge}
         />
       )}
+      {parkUnitId !== null &&
+        (() => {
+          const unit = units.find((entry) => entry.unit_id === parkUnitId);
+          return (
+            <ParkDialog
+              unitId={parkUnitId}
+              park={unit?.park ?? null}
+              error={parkError}
+              pending={parkPending}
+              onCancel={cancelPark}
+              onConfirm={confirmPark}
+            />
+          );
+        })()}
+      {resumeUnitId !== null &&
+        (() => {
+          const unit = units.find((entry) => entry.unit_id === resumeUnitId);
+          return (
+            <ResumeDialog
+              unitId={resumeUnitId}
+              park={unit?.park ?? null}
+              error={resumeError}
+              pending={resumePending}
+              onCancel={cancelResume}
+              onConfirm={confirmResume}
+            />
+          );
+        })()}
     </div>
   );
 }

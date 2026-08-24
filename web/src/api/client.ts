@@ -152,6 +152,25 @@ export interface UnitDetail {
   energy_pv_kwh?: number | null;
   energy_charge_kwh?: number | null;
   energy_discharge_kwh?: number | null;
+  /**
+   * The pod-parking projection (API_CONTRACTS.md "Pod parking", PENDING on
+   * the wire): present on the detail read once the `parking:` config block is
+   * commissioned, ABSENT when it is not — the not-commissioned feature
+   * detection. Uninterpreted passthrough; web/src/app/park.ts narrows it.
+   */
+  park_state?: Record<string, unknown>;
+  /**
+   * The wedge-signature recovery advisory (DESIGN_POD_PARKING §7, PENDING):
+   * present only while the classifier holds `actuation_incoherent` with the
+   * wedge echo. The advisory renders UNAVAILABLE — never a suggestion — when
+   * `park_state` is absent (parking not commissioned).
+   */
+  recovery_advisory?: Record<string, unknown>;
+  /**
+   * The delivery-bias evidence window (DESIGN_POD_PARKING §7, PENDING):
+   * mean/max bias, sample count, window — evidence-only, never a warning.
+   */
+  delivery_bias?: Record<string, unknown>;
 }
 
 /** One per-unit recovery row in the health view's `units` block (the
@@ -359,6 +378,45 @@ export interface ApiClient {
    * is data, not an error. The body is parsed by web/src/app/history.ts.
    */
   getPlantHistory(query: PlantHistoryQuery): Promise<Record<string, unknown>>;
+  /**
+   * The guarded park action (POST /api/v1/units/{id}/park, arm scope +
+   * interactive principal + Idempotency-Key; DESIGN_POD_PARKING §2):
+   * `{confirmation: "PARK", reason (1..500, required), lease_s? (60..
+   * max_lease_s)}`. The 200 is the synchronous verified-write body (prior /
+   * written / readback words, `as_of`, the minted `lease`); refusals reject
+   * with the typed 409 envelopes (park_not_commissioned,
+   * park_conflict_refused, park_already_parked, park_mode_out_of_scope,
+   * park_write_failed, park_readback_unverified).
+   */
+  postPark(
+    unitId: string,
+    body: { reason: string; leaseS?: number },
+    idempotencyKey?: string,
+  ): Promise<Record<string, unknown>>;
+  /**
+   * The lease renewal (POST /api/v1/units/{id}/park/renew):
+   * `{confirmation: "RENEW", lease_s (60..cap, required)}` — sliding, never
+   * past `parked_at + max_lease_s`. Refuses park_lease_cap_reached /
+   * park_lease_absent.
+   */
+  postParkRenew(
+    unitId: string,
+    leaseS: number,
+    idempotencyKey?: string,
+  ): Promise<Record<string, unknown>>;
+  /**
+   * The guarded resume (POST /api/v1/units/{id}/resume):
+   * `{confirmation: "RESUME", takeover?: "FOREIGN"}` — the takeover field is
+   * required exactly when the word is parked with no controller lease. The
+   * 200 carries the verified write plus the after-park `checklist`; a resume
+   * on a Normal word is the no-op `origin: "none"` 200. Refusals add
+   * park_foreign_word_acknowledgement_required and resume_stop_latched to the
+   * park twins.
+   */
+  postResume(
+    unitId: string,
+    options?: { takeover?: boolean; idempotencyKey?: string },
+  ): Promise<Record<string, unknown>>;
   openEvents(afterSequence?: number): AsyncIterable<StreamEvent>;
 }
 
@@ -713,6 +771,47 @@ export function createApiClient(token: string): ApiClient {
         params.set("points", String(query.points));
       }
       return request<Record<string, unknown>>(`/api/v1/history?${params.toString()}`);
+    },
+    postPark: (unitId, body, idempotencyKey) => {
+      const wireBody: Record<string, unknown> = {
+        confirmation: "PARK",
+        reason: body.reason,
+      };
+      if (body.leaseS !== undefined) {
+        wireBody.lease_s = body.leaseS;
+      }
+      return request<Record<string, unknown>>(
+        `/api/v1/units/${encodeURIComponent(unitId)}/park`,
+        {
+          method: "POST",
+          body: wireBody,
+          idempotencyKey: withKey(idempotencyKey),
+        },
+      );
+    },
+    postParkRenew: (unitId, leaseS, idempotencyKey) =>
+      request<Record<string, unknown>>(
+        `/api/v1/units/${encodeURIComponent(unitId)}/park/renew`,
+        {
+          method: "POST",
+          body: { confirmation: "RENEW", lease_s: leaseS },
+          idempotencyKey: withKey(idempotencyKey),
+        },
+      ),
+    postResume: (unitId, options = {}) => {
+      const body: Record<string, unknown> = { confirmation: "RESUME" };
+      if (options.takeover === true) {
+        // The arm-takeover pattern: per-request, audited, never persisted.
+        body.takeover = "FOREIGN";
+      }
+      return request<Record<string, unknown>>(
+        `/api/v1/units/${encodeURIComponent(unitId)}/resume`,
+        {
+          method: "POST",
+          body,
+          idempotencyKey: withKey(options.idempotencyKey),
+        },
+      );
     },
   };
 }

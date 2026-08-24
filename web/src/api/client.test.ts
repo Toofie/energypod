@@ -423,6 +423,57 @@ describe("createApiClient REST boundary", () => {
     expect(call.method).toBe("POST");
     expect(JSON.parse(String(call.body))).toEqual({ confirmation: "ACKNOWLEDGE" });
   });
+
+  it("parks a unit with the typed PARK confirmation, the reason, and the chosen lease", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ unit_id: "RHS", action: "park", verified: true }));
+    await client.postPark("RHS", { reason: "evening standby", leaseS: 3600 });
+    const call = lastCall();
+    expect(call.path).toBe("/api/v1/units/RHS/park");
+    expect(call.method).toBe("POST");
+    expect(JSON.parse(String(call.body))).toEqual({
+      confirmation: "PARK",
+      reason: "evening standby",
+      lease_s: 3600,
+    });
+  });
+
+  it("omits lease_s when the park body carries none (the site default applies)", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ unit_id: "RHS", action: "park" }));
+    await client.postPark("RHS", { reason: "evening standby" });
+    const call = lastCall();
+    expect(JSON.parse(String(call.body))).toEqual({
+      confirmation: "PARK",
+      reason: "evening standby",
+    });
+  });
+
+  it("renews a lease with the required RENEW confirmation and lease seconds", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ unit_id: "RHS", action: "renew" }));
+    await client.postParkRenew("RHS", 1800);
+    const call = lastCall();
+    expect(call.path).toBe("/api/v1/units/RHS/park/renew");
+    expect(call.method).toBe("POST");
+    expect(JSON.parse(String(call.body))).toEqual({
+      confirmation: "RENEW",
+      lease_s: 1800,
+    });
+  });
+
+  it("resumes with the RESUME confirmation, and the FOREIGN takeover only when taken", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ unit_id: "RHS", action: "resume", origin: "operator" }));
+    await client.postResume("RHS");
+    let call = lastCall();
+    expect(call.path).toBe("/api/v1/units/RHS/resume");
+    expect(call.method).toBe("POST");
+    expect(JSON.parse(String(call.body))).toEqual({ confirmation: "RESUME" });
+
+    await client.postResume("RHS", { takeover: true });
+    call = lastCall();
+    expect(JSON.parse(String(call.body))).toEqual({
+      confirmation: "RESUME",
+      takeover: "FOREIGN",
+    });
+  });
 });
 
 describe("error envelope contract", () => {

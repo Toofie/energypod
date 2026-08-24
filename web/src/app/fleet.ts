@@ -372,7 +372,8 @@ export type HealthState =
   | "not_responding"
   | "unreachable"
   | "foreign_writer"
-  | "inhibited";
+  | "inhibited"
+  | "parked";
 
 /** The wire vocabulary, as a runtime checklist (an unknown state is dropped). */
 export const HEALTH_STATES: readonly HealthState[] = [
@@ -383,6 +384,11 @@ export const HEALTH_STATES: readonly HealthState[] = [
   "unreachable",
   "foreign_writer",
   "inhibited",
+  // DESIGN_POD_PARKING §3 (PENDING): the composable operator state —
+  // ("parked", *healing) — so a parked+balancing pod keeps its healing
+  // visibility in `health_reasons`. The parked chip and banner surfaces tell
+  // the park itself; the badge renders only the healing reasons it carries.
+  "parked",
 ];
 
 /**

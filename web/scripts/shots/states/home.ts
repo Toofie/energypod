@@ -16,6 +16,7 @@ import {
   energyToday,
   lastObjectiveObserved,
   nightChargeState,
+  parkState,
   scheduleNextAction,
   scheduleState,
   snapshot,
@@ -26,6 +27,7 @@ import {
   withHealth,
   withNightChargeState,
   withObjective,
+  withParkState,
   withScheduleState,
 } from "../../../src/test/wire";
 import type { ShotStateDefinition } from "../types";
@@ -165,6 +167,34 @@ function nightWorld() {
   return world;
 }
 
+/**
+ * The parked household (DESIGN_POD_PARKING §8): the afternoon world with rhs
+ * standing by under a live operator lease — the fleet banner names it with
+ * its countdown and carries the fixed not-isolation sentence, while the other
+ * two batteries keep load-serving. Every unit carries the park projection
+ * (the commissioned site's own truth).
+ */
+function parkedAfternoonWorld() {
+  const base = afternoonWorld();
+  return {
+    ...base,
+    units: base.units.map((unit) =>
+      unit.unit_id === "rhs"
+        ? withParkState(
+            unit,
+            parkState({
+              reason: "evening standby",
+              // A live lease ~2 h out with capture slack, so the floored H:MM
+              // holds through the shot (a fixed 2026-08-24 instant would read
+              // expired the moment the wall clock moved past it).
+              lease_expires_at: new Date(Date.now() + (2 * 3600 + 30) * 1000).toISOString(),
+            }),
+          )
+        : withParkState(unit, parkState({ parked: false })),
+    ),
+  };
+}
+
 export const HOME_STATES: readonly ShotStateDefinition[] = [
   {
     id: "afternoon-live",
@@ -177,5 +207,11 @@ export const HOME_STATES: readonly ShotStateDefinition[] = [
     caption:
       "The supervised night: the night tile pacing at the cap, the schedules card naming the running window, one battery self-healing and one flagged foreign.",
     world: nightWorld,
+  },
+  {
+    id: "fleet-parked",
+    caption:
+      "A pod standing by: the parked fleet banner names rhs with its lease countdown and the fixed not-isolation sentence, while the other two batteries keep load-serving.",
+    world: parkedAfternoonWorld,
   },
 ];

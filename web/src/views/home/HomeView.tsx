@@ -114,7 +114,9 @@ import {
   type ScheduleState,
 } from "../../app/schedule";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
+import { toParkState, type ParkStateView } from "../../app/park";
 import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../../lib/format";
+import { ParkedFleetBanner } from "./ParkedFleetBanner";
 import { NextScheduleCard, toScheduleFacts, type ScheduleFacts } from "./NextScheduleCard";
 import { NightChargeTile } from "./NightChargeTile";
 import { SolarSurplusTile } from "./SolarSurplusTile";
@@ -223,6 +225,12 @@ interface UnitView {
    * never appears on Home (it is evidence, not a household fact).
    */
   objective: UnitObjective | null;
+  /**
+   * The pod-parking projection (PENDING, feature-detected): null when the key
+   * is absent — parking is not commissioned, and Home's fleet banner renders
+   * nothing at all.
+   */
+  park: ParkStateView | null;
 }
 
 interface SnapshotView {
@@ -306,6 +314,7 @@ function readUnit(value: unknown): UnitView | null {
     telemetry: readTelemetrySoc(record.telemetry),
     health: toUnitHealth(record),
     objective: toUnitObjective(record.last_objective_observed),
+    park: toParkState(record.park_state),
   };
 }
 
@@ -1488,6 +1497,9 @@ export function HomeView({ client }: HomeViewProps) {
   const needsAgeTick =
     (snapshot?.units.some((unit) => unit.telemetry_age_s !== null) ?? false) ||
     Object.keys(observations).length > 0 ||
+    // A parked fleet banner's lease countdowns ride the same clock: policy
+    // time reads as running, never frozen.
+    (snapshot?.units.some((unit) => unit.park?.parked === true) ?? false) ||
     // A schedule countdown on screen ticks too ("starts in", "ends in") — the
     // same once-a-second clock, never an animation.
     (snapshot?.scheduleState?.active === true && snapshot.scheduleState.endsInS !== null) ||
@@ -1621,6 +1633,20 @@ export function HomeView({ client }: HomeViewProps) {
         )}
         <p className="home-service-line">{serviceText(health)}</p>
       </section>
+
+      {/* The parked fleet banner (DESIGN_POD_PARKING §8): renders nothing at
+          all while no pod is parked. A parked battery stands by at zero watts
+          — the banner names each parked pod, carries the fixed not-isolation
+          sentence, and promotes to the alert wording the moment a lease reads
+          expired. The countdown derives from WALL-clock now (the monotonic
+          tick above only decides when this recomputes — a lease instant is an
+          epoch time, never a monotonic reading). */}
+      <ParkedFleetBanner
+        parked={(snapshot?.units ?? [])
+          .filter((unit) => unit.park?.parked === true)
+          .map((unit) => ({ unitId: unit.unit_id, park: unit.park! }))}
+        nowMs={Date.now()}
+      />
 
       <section className="home-card" aria-labelledby={powerHeadingId}>
         <h2 id={powerHeadingId}>What is powering the home?</h2>

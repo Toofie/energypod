@@ -122,6 +122,8 @@ function Probe({
       </output>
       <output data-testid="exhausted">{String(data.streamExhausted)}</output>
       <output data-testid="sequence">{data.snapshot?.sequence ?? -1}</output>
+      {/* The polite announcement list, joined for one probe-readable line. */}
+      <output data-testid="polite">{data.polite.join(" | ")}</output>
       {/* The shell's adviser-state slice, in one probe-readable line:
           "absent" is the feature detection; otherwise the participation and
           activity flags plus the watt figures the events refresh. */}
@@ -662,5 +664,98 @@ describe("useConsoleData — the night-charge event", () => {
       setTimeout(resolve, 100);
     });
     expect(getSnapshot.mock.calls.length).toBe(reads);
+  });
+});
+
+describe("useConsoleData — the pod-parking transitions", () => {
+  /** A controllable stream: yields the initial frames, then pushed frames. */
+  function eventChannel(initial: StreamEvent[]): {
+    open(): AsyncGenerator<StreamEvent, void, unknown>;
+    push(frame: StreamEvent): void;
+  } {
+    const queue: StreamEvent[] = [...initial];
+    let wake: (() => void) | null = null;
+    const notify = (): void => {
+      const release = wake;
+      wake = null;
+      release?.();
+    };
+    return {
+      open: () =>
+        (async function* channel(): AsyncGenerator<StreamEvent, void, unknown> {
+          while (true) {
+            while (queue.length > 0) {
+              const next = queue.shift();
+              if (next !== undefined) {
+                yield next;
+              }
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+          }
+        })(),
+      push: (frame) => {
+        queue.push(frame);
+        notify();
+      },
+    };
+  }
+
+  it("announces a park transition politely and re-reads the world (the parked surfaces follow at the data cadence)", async () => {
+    const getSnapshot = vi.fn(() => Promise.resolve(SNAPSHOT));
+    const channel = eventChannel([
+      { type: "snapshot", sequence: SNAPSHOT.snapshot_sequence, data: SNAPSHOT },
+    ]);
+    const client = mockClient({
+      getSnapshot,
+      openEvents: vi.fn(() => channel.open()),
+    });
+    render(<Probe client={client} onUnauthorized={vi.fn()} retryDelaysMs={[5]} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("status").textContent).toBe("live");
+    });
+    const reads = getSnapshot.mock.calls.length;
+
+    channel.push({
+      type: "unit.parked",
+      sequence: 60,
+      occurred_at: "2026-08-24T02:00:01+10:00",
+      payload: { unit_id: "rhs", written_value: 1, verified: true },
+    } as unknown as StreamEvent);
+
+    await waitFor(() => {
+      expect(getSnapshot.mock.calls.length).toBeGreaterThan(reads);
+    });
+  });
+
+  it("announces the lease expiry with the operator-act wording — never a timer's", async () => {
+    const getSnapshot = vi.fn(() => Promise.resolve(SNAPSHOT));
+    const channel = eventChannel([
+      { type: "snapshot", sequence: SNAPSHOT.snapshot_sequence, data: SNAPSHOT },
+    ]);
+    const client = mockClient({
+      getSnapshot,
+      openEvents: vi.fn(() => channel.open()),
+    });
+    render(<Probe client={client} onUnauthorized={vi.fn()} retryDelaysMs={[5]} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("status").textContent).toBe("live");
+    });
+
+    channel.push({
+      type: "unit.park_expired",
+      sequence: 61,
+      occurred_at: "2026-08-24T06:00:00+10:00",
+      payload: { unit_id: "rhs" },
+    } as unknown as StreamEvent);
+
+    // The polite region carries the expiry sentence; the assertive region
+    // stays empty (an expiry is the lease's alarm, not an emergency class).
+    await waitFor(() => {
+      expect(screen.getByTestId("polite").textContent).toContain(
+        "park lease expired — Resume required. Resuming is an operator act.",
+      );
+    });
   });
 });

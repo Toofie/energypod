@@ -21,6 +21,11 @@
  *   surfaces (the inhibit latch line and its acknowledge control on
  *   Batteries, the Inhibited badge on Home, the shell's latch announcements)
  *   already tell those stories, and duplicating them would be noise.
+ * - `parked` (DESIGN_POD_PARKING §3) renders NOTHING by itself — the parked
+ *   chip, the not-isolation banner, and Home's fleet banner own that story —
+ *   but it is the COMPOSABLE state: the badge still renders the healing
+ *   reasons the classifier carried ("parked", *healing), so a parked pod that
+ *   is balancing keeps its balancing visibility (the design's own pin).
  *
  * The same module owns the incoherence-alarm phrasings the shell announces
  * (one polite line per episode) so the badge, the announcement, and the
@@ -155,6 +160,16 @@ export function UnitHealthTag({
       // Already spoken for by the inhibit latch surfaces; duplicating them
       // here would be noise, never clarity.
       return null;
+    case "parked":
+      // The parked surfaces (chip, banner, Home's fleet banner) tell the
+      // park; this badge renders only the composable healing reasons the
+      // classifier carried alongside it. No healing reasons: silence.
+      if (health.reasons.length === 0) {
+        return null;
+      }
+      kind = "healing";
+      text = selfHealingText(health, measuredWatts);
+      break;
     case "self_healing":
       kind = "healing";
       text = selfHealingText(health, measuredWatts);

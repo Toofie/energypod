@@ -862,6 +862,32 @@ function applyEventFrame(
       // subscription; this case exists so the quietness is a pinned decision,
       // not an oversight.
       return false;
+    case "unit.parked":
+    case "unit.park_renewed":
+    case "unit.resumed":
+    case "unit.park_expired": {
+      // The pod-parking transitions (DESIGN_POD_PARKING §3, feature-detected —
+      // PENDING-BACKEND): each is a deliberate act that changes what the
+      // fleet may do (a parked unit's dispatch is refused; a resume restores
+      // eligibility), so the world is re-read and the parked chip / banner /
+      // Home banner follow at the data cadence, never frozen at the
+      // connect-time picture. One polite line names the transition; the
+      // expiry is the lease's own alarm — "Resume is an operator act", never
+      // a timer's, so the announcement says exactly that.
+      const payload = payloadOf(frame);
+      const unitId = typeof payload.unit_id === "string" ? payload.unit_id : "";
+      const named = unitId === "" ? "A battery" : unitId;
+      const text =
+        frame.type === "unit.parked"
+          ? `${named} is parked — not isolation. The lease is policy, never safety.`
+          : frame.type === "unit.park_renewed"
+            ? `${named}'s park lease was renewed.`
+            : frame.type === "unit.resumed"
+              ? `${named} resumed — back to Normal.`
+              : `${named}'s park lease expired — Resume required. Resuming is an operator act.`;
+      dispatch({ type: "polite", text });
+      return true;
+    }
     case "foreign_objective.observed": {
       // The night-writer detector's ALERT TIER (API_CONTRACTS.md "Night-writer
       // detector"): something else is writing this battery. Alert tier names

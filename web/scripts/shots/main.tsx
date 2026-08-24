@@ -21,7 +21,11 @@ import "../../src/styles.css";
 
 /** The manifest the orchestrator reads (view ids, state ids, viewports). */
 export interface ShotsManifest {
-  views: { id: string; label: string; states: { id: string; caption: string }[] }[];
+  views: {
+    id: string;
+    label: string;
+    states: { id: string; caption: string; interact?: readonly unknown[] }[];
+  }[];
   viewports: { id: string; width: number; height: number; deviceScaleFactor: number }[];
 }
 
@@ -47,7 +51,14 @@ window.__shotsManifest = () => ({
   views: SHOT_VIEWS.map((view) => ({
     id: view.id,
     label: view.label,
-    states: view.states.map((state) => ({ id: state.id, caption: state.caption })),
+    states: view.states.map((state) => ({
+      id: state.id,
+      caption: state.caption,
+      // The interaction steps ride the manifest as plain data so the Node
+      // orchestrator can play them through Playwright's accessibility-tree
+      // selectors before the capture.
+      ...(state.interact === undefined ? {} : { interact: [...state.interact] }),
+    })),
   })),
   viewports: SHOT_VIEWPORTS.map(({ id, width, height, deviceScaleFactor }) => ({
     id,
@@ -90,6 +101,15 @@ if (viewId === null || stateId === null) {
         ...(state.schedule === undefined ? {} : { schedule: state.schedule }),
         ...(state.energyDays === undefined ? {} : { energyDays: state.energyDays }),
         ...(state.objectives === undefined ? {} : { objectives: state.objectives }),
+        ...(state.park === undefined
+          ? {}
+          : {
+              park: {
+                ...(state.park.park === undefined ? {} : { park: state.park.park }),
+                ...(state.park.resume === undefined ? {} : { resume: state.park.resume }),
+              },
+            }),
+        ...(state.unitDetail === undefined ? {} : { unitDetail: state.unitDetail }),
       },
     );
     createRoot(root).render(

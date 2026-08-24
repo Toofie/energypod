@@ -243,3 +243,202 @@
   font-variant-numeric: tabular-nums;
   color: #57534e;
 }
+
+/* --- the pod-parking surfaces (DESIGN_POD_PARKING §8) --------------------
+   Scoped under .batteries-view where the dialog layer is involved (the
+   two-view collision precedent: this file and Now's are plain global CSS
+   once bundled, so this view's dialog panel is reachable only from here). */
+
+/* The chip: the one-word state, quiet amber — the tooltip carries the
+   honesty (mode word + pack voltage, telemetry's own figures). */
+.parked-chip {
+  display: inline-block;
+  margin-left: 0.5rem;
+  padding: 0.05rem 0.5rem;
+  border: 1px solid #8a6d2f;
+  border-radius: 0.6rem;
+  background: #fdf6e5;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #5c4a1e;
+  vertical-align: middle;
+}
+
+/* The unit banner: the pinned countdown line with the fixed not-isolation
+   sentence always beside it. The expired lease promotes to the alert family
+   (the lease's own alarm — Resume is an operator act). */
+.parked-banner {
+  border: 1px solid #b3892f;
+  border-radius: 0.5rem;
+  padding: 0.45rem 0.65rem;
+  background: #fdf8ee;
+}
+
+.parked-banner--expired {
+  border-color: #a03a3a;
+  background: #fdeeee;
+}
+
+.parked-banner-line {
+  margin: 0;
+  font-weight: 600;
+}
+
+.parked-banner-fixed {
+  margin: 0.2rem 0 0;
+  font-size: 0.85rem;
+  color: #57534e;
+}
+
+.parked-banner-note {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #7a4a1e;
+}
+
+.parked-banner-meta {
+  margin: 0.2rem 0 0;
+  font-size: 0.85rem;
+  color: #78716c;
+}
+
+/* The park/resume action: its own row, never nested in another affordance. */
+.park-action {
+  align-self: flex-start;
+}
+
+/* The guarded park dialog (this view's own dialog panel — see the scoping
+   note above): the amber guarded-action family, one width with the
+   acknowledge dialog. Its own height budget — the reason field, the lease
+   select with its policy note, the type-back, AND the fixed sentence above
+   the confirm must all sit above the internal scroll fold, or the very
+   sentence the design pins verbatim would hide behind it. */
+.batteries-view .park-dialog {
+  border-color: #8a6d2f;
+  max-height: min(42rem, calc(100vh - 5rem));
+}
+
+.batteries-view .park-dialog .park-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.batteries-view .park-dialog textarea {
+  resize: vertical;
+}
+
+.batteries-view .park-dialog .park-field-note {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #78716c;
+}
+
+/* The fixed sentence, immediately above the confirm button: emphasized the
+   way a standing safety fact is — bold, never truncated. */
+.batteries-view .park-fixed-sentence {
+  margin: 0.35rem 0 0;
+  padding: 0.4rem 0.55rem;
+  border: 1px solid #8a6d2f;
+  border-radius: 0.5rem;
+  background: #fdf6e5;
+  font-weight: 600;
+}
+
+.batteries-view .park-dialog .park-takeover {
+  border: 1px solid #b3892f;
+  border-radius: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  background: #fdf8ee;
+}
+
+.batteries-view .park-dialog .park-takeover p {
+  margin: 0 0 0.3rem;
+}
+
+.batteries-view .park-dialog .park-takeover-ack {
+  font-weight: 600;
+}
+
+/* The post-resume checklist: the honest after-park facts, inline. */
+.resume-checklist {
+  border: 1px solid #4a5d3a;
+  border-radius: 0.75rem;
+  padding: 0.6rem 0.9rem;
+  background: #f4f7ef;
+}
+
+.resume-checklist-title {
+  margin: 0 0 0.3rem;
+  font-weight: 600;
+}
+
+.resume-checklist ul {
+  margin: 0.25rem 0;
+  padding-left: 1.1rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.resume-checklist-stops li {
+  font-weight: 600;
+}
+
+.resume-checklist-note {
+  margin: 0.2rem 0 0;
+  font-size: 0.85rem;
+  color: #57534e;
+}
+
+/* The wedge-signature recovery advisory: the disarm → park → resume
+   walkthrough, quiet guidance — the uncommissioned honesty state renders the
+   SAME card in its unavailable words, never a suggestion the site cannot
+   execute. */
+.recovery-advisory {
+  border: 1px solid #b3892f;
+  border-radius: 0.6rem;
+  padding: 0.5rem 0.75rem;
+  background: #fdf8ee;
+}
+
+.recovery-advisory--unavailable {
+  border-color: #a03a3a;
+  background: #fdeeee;
+}
+
+.recovery-advisory-title {
+  margin: 0 0 0.25rem;
+  font-weight: 600;
+}
+
+.recovery-advisory p {
+  margin: 0.2rem 0;
+}
+
+.recovery-advisory-steps {
+  margin: 0.25rem 0;
+  padding-left: 1.4rem;
+}
+
+.recovery-advisory-note {
+  font-size: 0.85rem;
+  color: #78716c;
+}
+
+/* The delivery-bias evidence readout: EVIDENCE, never a warning — plain
+   text, no border weight, the evidence-only label. */
+.delivery-bias {
+  padding: 0.35rem 0;
+  font-variant-numeric: tabular-nums;
+  color: #57534e;
+}
+
+.delivery-bias p {
+  margin: 0.15rem 0;
+}
+
+.delivery-bias-note {
+  font-size: 0.85rem;
+  color: #78716c;
+}
+

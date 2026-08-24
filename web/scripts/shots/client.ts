@@ -58,6 +58,8 @@ export function seededClient(
     schedule?: () => Record<string, unknown>;
     energyDays?: () => Record<string, unknown>;
     objectives?: () => Record<string, unknown>;
+    park?: { park?: () => Record<string, unknown>; resume?: () => Record<string, unknown> };
+    unitDetail?: (unitId: string) => Record<string, unknown> | undefined;
   } = {},
 ): SeededClient {
   const lost = options.connection === "lost";
@@ -115,8 +117,12 @@ export function seededClient(
       return structuredClone(world);
     },
     getHealth: async () => health(),
-    getUnitDetail: async () => {
-      throw absent("a unit detail");
+    getUnitDetail: async (unitId: string) => {
+      const seeded = options.unitDetail === undefined ? undefined : options.unitDetail(unitId);
+      if (seeded === undefined) {
+        throw absent(`the ${unitId} unit detail`);
+      }
+      return structuredClone(seeded);
     },
     getAudit: async () => {
       countDataRead();
@@ -148,6 +154,21 @@ export function seededClient(
     },
     postNightCharging: async () => {
       throw absent("the night toggle");
+    },
+    postPark: async () => {
+      if (options.park?.park === undefined) {
+        throw absent("a park");
+      }
+      return structuredClone(options.park.park()) as Record<string, unknown>;
+    },
+    postParkRenew: async () => {
+      throw absent("a lease renewal");
+    },
+    postResume: async () => {
+      if (options.park?.resume === undefined) {
+        throw absent("a resume");
+      }
+      return structuredClone(options.park.resume()) as Record<string, unknown>;
     },
     getSchedule: async () => {
       try {

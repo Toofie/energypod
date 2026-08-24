@@ -806,3 +806,32 @@
   color: #1d5fa0;
   font-weight: 600;
 }
+
+/* --- the parked fleet banner (DESIGN_POD_PARKING §8) ----------------------
+   Renders only while a pod is parked: each parked battery named with its
+   lease countdown, the fixed not-isolation sentence always present, and the
+   alert family the moment any lease reads expired (the lease's own alarm —
+   Resume is an operator act). Same amber caution family as the other
+   household cautions; expired promotes to red. */
+.home-parked {
+  border: 1px solid #b3892f;
+  border-radius: 0.75rem;
+  padding: 0.6rem 0.9rem;
+  background: #fdf8ee;
+}
+
+.home-parked--expired {
+  border-color: #a03a3a;
+  background: #fdeeee;
+}
+
+.home-parked-line {
+  margin: 0;
+  font-weight: 600;
+}
+
+.home-parked-fixed {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  color: #57534e;
+}

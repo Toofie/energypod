@@ -97,6 +97,35 @@ function humanBytes(size) {
     : `${(size / 1024).toFixed(1)} KiB`;
 }
 
+/**
+ * Play one state's interaction steps through the accessibility tree (the
+ * plain-data `interact` list from the registry): clicks by role+name, fills
+ * and select-choices by label, a settle pause where the state asks for one.
+ * The camera never pretends to be the operator's state — a dialog or an
+ * inline post-action surface is opened the way an operator opens it.
+ */
+async function runInteractionSteps(page, steps) {
+  for (const step of steps) {
+    if (step.click !== undefined) {
+      const scope = step.click.inDialog === true ? page.getByRole("dialog") : page;
+      await scope
+        .getByRole(step.click.role, {
+          name: step.click.name,
+          ...(step.click.exact === true ? { exact: true } : {}),
+        })
+        .click();
+    } else if (step.fill !== undefined) {
+      await page.getByLabel(step.fill.label).fill(step.fill.value);
+    } else if (step.select !== undefined) {
+      await page.getByLabel(step.select.label).selectOption(step.select.value);
+    } else if (step.pauseMs !== undefined) {
+      await page.waitForTimeout(step.pauseMs);
+    } else {
+      throw new Error(`unknown interaction step: ${JSON.stringify(step)}`);
+    }
+  }
+}
+
 /** One capture: load the state page, wait for its settled render, shoot it. */
 async function captureState(page, baseUrl, view, state, viewport, path) {
   const errors = [];
@@ -118,6 +147,9 @@ async function captureState(page, baseUrl, view, state, viewport, path) {
       throw new Error(`mounted ${mountedView}/${mountedState}, wanted ${view.id}/${state.id}`);
     }
     await page.evaluate(() => document.fonts.ready);
+    if (Array.isArray(state.interact) && state.interact.length > 0) {
+      await runInteractionSteps(page, state.interact);
+    }
     await page.screenshot({ path, fullPage: true });
   } finally {
     page.off("pageerror", onError);
