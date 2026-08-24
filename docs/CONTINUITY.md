@@ -360,6 +360,46 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-24 (mid-run reconnect): THE 15:20:32 PERMANENT-DARK BUG FIXED — a
+  single transient TCP failure on an established Waveshare session darkened a
+  unit until process restart. Live diagnosis: the transport's
+  `_resync_after_failure` correctly closed and rebuilt its client (f788701's
+  rebuild doctrine) and set `_connected = False`, but nothing ever called
+  `connect()` again — the only connect submitter was `actor.start()` at boot,
+  so every later poll hit the instant not-connected check and the fleet
+  classified CONNECT_FAILED/gateway_unreachable forever while the gateway
+  kept accepting fresh connections (the console's "unreachable" label was
+  FALSE). The waveshare.py header doctrine ("reconnect and retry policy
+  belongs to the generation-fenced unit actor") was unimplemented. FIX
+  (mechanism: the ACTOR, not a `_LazyWaveshareTransport` retry — the proxy
+  stays the dumb forwarding shell the write_debug_mode incident (230265f)
+  proved it must be, and a proxy-level retry would put policy below the
+  actor and double the poll budget; waveshare.py and the proxy are
+  untouched): `_poll_owned` catches the connection class (`ConnectionError`,
+  the builtin `TransportConnectionError` derives from, so the actor port
+  stays duck-typed) and enqueues ONE fire-and-forget "reconnect" mailbox
+  message at priority 5 — below heartbeat (never delays a renewal), above
+  control/poll (the next poll rides the fresh socket) — carrying the
+  scheduling generation so a fenced epoch's late attempt dispatches as a
+  no-op; the attempt is heartbeat-margin bounded; only failed polls
+  schedule, at most one is queued at a time, bounding attempts at ONE per
+  fleet cycle (no busy-loop, no new task class); a persisting outage keeps
+  the honest unreachable classification, and a successful reconnect needs
+  no recovery-monitor change (the next poll's READ_OK clears streaks
+  through the existing path). Heartbeat write failures recover through the
+  NEXT poll's schedule within one cycle: the inhibit fences any queued
+  attempt and the live generation's own failed poll re-schedules. TESTS
+  (+4, tests/unit/test_actor.py): the live incident end to end (failure ->
+  connect-failure class -> exactly one reconnect on the REBUILT client ->
+  next poll reads OK, no restart); a persisting outage stays honest and
+  bounded (one attempt per cycle, nothing scheduled between polls,
+  restoration recovers); the stale-generation no-op via the real interleave
+  (a queued heartbeat's write-failed inhibit fences the scheduled attempt;
+  the live generation's own poll reconnects); and the wire-true variant —
+  the REAL WaveshareTransport under the real actor, ConnectionResetError
+  mid-run, reconnect landing on the factory-rebuilt client. GATES: backend
+  2556 passed (base 2552), ruff + MYPYPATH=src mypy strict clean.
+
 - 2026-08-24 (pod-parking round — PARK/RESUME LIVE-VERIFIED ON rhs, THE
   WRITE PATH MUTATION-PROVEN; base 9cd25c4 → HEAD 6765fe6, 20 commits):
   the arc held the contract-first line throughout — design contract v2

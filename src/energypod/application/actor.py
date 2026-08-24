@@ -35,6 +35,12 @@ from .generation import AuthorityGenerationCoordinator
 _SAFETY_QUALITY_FIELDS: Final[frozenset[str]] = Observation.REQUIRED_SAFETY_QUALITY_FIELDS
 
 _HEARTBEAT_PRIORITY: Final = 0
+# A mid-run reconnect (the transport doctrine assigns retry policy to this
+# actor) rides below heartbeat -- it may never delay a renewal -- but above
+# control and poll: the failed poll that scheduled it has already returned its
+# failure, and the NEXT poll, plus any control read queued behind the failure,
+# must ride the fresh socket.
+_RECONNECT_PRIORITY: Final = 5
 _CONTROL_PRIORITY: Final = 10
 _POLL_PRIORITY: Final = 20
 # An externally requested bounded zero outranks every scheduled operation
@@ -101,6 +107,18 @@ class _Message:
     operation: str
     argument: Any
     reply: asyncio.Future[Any]
+
+
+def _drain_unawaited_reply(reply: asyncio.Future[Any]) -> None:
+    """Consume a fire-and-forget reply's outcome so asyncio stays quiet.
+
+    The reconnect's reply future has no awaiter by design; without this
+    callback a recorded failure would surface at garbage-collection time as
+    "Future exception was never retrieved" noise, and a recorded success is
+    retrieved harmlessly.
+    """
+    if not reply.cancelled():
+        _ = reply.exception()
 
 
 class EnergyPodActor:
@@ -267,6 +285,11 @@ class EnergyPodActor:
         # DESIGN_ENERGY_SCORECARD section 5: the day-rollover promotion flag
         # (consumed by exactly one poll; see request_energy_refresh).
         self._energy_refresh_requested = False
+        # Whether one bounded reconnect already sits in the mailbox (the
+        # 2026-08-24 mid-run reconnect policy): only a failed poll schedules,
+        # and at most one attempt may be queued at a time, bounding the
+        # attempt rate by the poll rate — one per fleet cycle, no busy-loop.
+        self._reconnect_pending = False
 
         self._mailbox: asyncio.PriorityQueue[tuple[int, int, _Message]] = asyncio.PriorityQueue()
         self._sequence = itertools.count()
@@ -593,6 +616,8 @@ class EnergyPodActor:
             return await self._disarm_owned()
         if operation == "poll":
             return await self._poll_owned()
+        if operation == "reconnect":
+            return await self._reconnect_owned(int(argument))
         if operation == "heartbeat":
             return await self._heartbeat_owned()
         if operation == "zero":
@@ -664,7 +689,32 @@ class EnergyPodActor:
         ownership is unchanged), the decoded observation is delivered through
         the same accept-observation path the public mailbox operation uses,
         and the essential registers are returned to the caller.
+
+        A poll failing with the transport's connection class additionally
+        schedules one bounded reconnect (see ``_schedule_reconnect``); the
+        failure itself propagates unchanged so the fleet's honest
+        CONNECT_FAILED classification keeps standing while the gateway is
+        truly unreachable.
         """
+        try:
+            return await self._poll_cycle_owned()
+        except asyncio.CancelledError:
+            raise
+        except ConnectionError:
+            # The 2026-08-24 15:20:32 live incident: one OSError on an
+            # established session leaves the transport connectionless (the
+            # resync closes and rebuilds the client) and — before this
+            # policy — nothing ever connected again: every later poll failed
+            # the instant not-connected check until process restart while the
+            # gateway kept accepting fresh connections.  ``ConnectionError``
+            # is the structural connect-failure class (the adapter's
+            # TransportConnectionError derives from the builtin), so this
+            # actor keeps its duck-typed port and still owns the reconnect
+            # policy the transport's doctrine assigns it.
+            self._schedule_reconnect()
+            raise
+
+    async def _poll_cycle_owned(self) -> Any:
         telemetry = self._telemetry
         if telemetry is None:
             return await self._transport.read_holding(
@@ -699,6 +749,52 @@ class EnergyPodActor:
         observation = telemetry.decode(blocks, self.lifecycle)
         await self._accept_observation_owned(observation)
         return blocks[essential]
+
+    def _schedule_reconnect(self) -> None:
+        """Enqueue one bounded reconnect behind a connection-class poll failure.
+
+        Fire-and-forget by design: the failed poll must return its failure to
+        the fleet loop immediately (the honest CONNECT_FAILED classification
+        and the recovery monitor's evidence are unchanged), while this single
+        mailbox message — at most one queued at a time — reconnects before any
+        later poll.  Only a failed poll schedules, so the attempt rate is
+        bounded by the poll rate: at most one attempt per fleet cycle, no
+        busy-loop, and a persisting outage keeps failing every poll exactly as
+        before.  The message carries the scheduling generation so a fenced
+        epoch's late attempt can be recognized and dropped at dispatch.
+        """
+        if self._stopping or self._closed or self._reconnect_pending:
+            return
+        self._reconnect_pending = True
+        reply: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        reply.add_done_callback(_drain_unawaited_reply)
+        self._mailbox.put_nowait(
+            (
+                _RECONNECT_PRIORITY,
+                next(self._sequence),
+                _Message("reconnect", self.generation, reply),
+            )
+        )
+
+    async def _reconnect_owned(self, fence_generation: int) -> None:
+        """One bounded reconnect attempt for the generation that scheduled it.
+
+        The generation fence keeps a stale epoch's late connect a no-op — an
+        inhibition, takeover fence, or shutdown that advanced the generation
+        between the failed poll and this dispatch drops the attempt, and the
+        live generation's own next failed poll schedules a fresh one.  The
+        attempt is bounded by the heartbeat margin like every other
+        non-boot transport operation; a failure raises into the drained
+        fire-and-forget reply, the honest unreachable classification stands,
+        and the next cycle's failed poll schedules exactly one more attempt.
+        """
+        self._reconnect_pending = False
+        if self._stopping or self._closed:
+            return
+        if fence_generation != self.generation:
+            return
+        async with asyncio.timeout(self._heartbeat_margin or 0.1):
+            await self._transport.connect()
 
     def request_energy_refresh(self) -> None:
         """Schedule this unit's NEXT telemetry cycle to include 0x4101.

@@ -1245,3 +1245,294 @@ async def test_concurrent_shutdown_is_idempotent_and_stop_dominates_queued_renew
     assert transport.writes.count(EncodedWrite(0x0200, (1, 0, 0))) == 1
     assert [name for name, _ in transport.history].count("close:start") == 1
     assert actor.lifecycle is contract.UnitLifecycle.STOPPING
+
+
+# --- the 2026-08-24 15:20:32 incident: mid-run reconnect policy ------------------
+#
+# One OSError on an established Waveshare session made a unit permanently
+# dark: the transport's resync correctly closed and rebuilt its client (and
+# set connectionless), but nothing ever called connect() again -- every later
+# poll failed the instant not-connected check until process restart while the
+# gateway kept accepting fresh connections, so the console's "unreachable"
+# label was false.  The transport doctrine ("reconnect and retry policy
+# belongs to the generation-fenced unit actor") is now implemented: a poll
+# failing with the connection class schedules ONE bounded reconnect through
+# the actor's own mailbox, and the next poll rides the fresh socket.
+
+
+class SessionTransport:
+    """A Waveshare-shaped double: one session, resync-on-failure, rebuild.
+
+    Mirrors the production transport the policy rides on
+    (adapters/modbus/waveshare.py): ``connect()`` opens the session; an
+    operation failure on the connection class resyncs -- the session is
+    marked connectionless and the underlying CLIENT IS REBUILT (the live
+    15:20:32 shape) -- and while connectionless every operation raises the
+    instant not-connected connection error the fleet classifies
+    CONNECT_FAILED.  ``gateway_down`` models a gateway refusing fresh
+    connections, and ``client_epoch`` identifies which client generation an
+    attempt or read rode.
+    """
+
+    def __init__(self) -> None:
+        self.client_epoch = 0
+        self.connected = False
+        self.closed = False
+        self.gateway_down = False
+        self.fail_next_reads = False
+        self.read_gate: Gate | None = None
+        self.connect_attempts: list[int] = []
+        self.reads: list[tuple[int, tuple[int, int]]] = []
+        self.writes: list[tuple[int, tuple[int, int]]] = []
+
+    async def connect(self) -> None:
+        self.connect_attempts.append(self.client_epoch)
+        if self.closed or self.gateway_down:
+            raise ConnectionError("unable to connect to Waveshare gateway")
+        self.connected = True
+
+    async def read_holding(self, address: int, count: int) -> tuple[int, ...]:
+        if self.read_gate is not None:
+            await self.read_gate.wait()
+        if not self.connected:
+            raise ConnectionError("Waveshare transport is not connected")
+        if self.fail_next_reads:
+            self._resync_after_failure()
+            raise ConnectionError("connection lost during Modbus read")
+        self.reads.append((self.client_epoch, (address, count)))
+        return tuple(0 for _ in range(count))
+
+    async def write_registers(self, address: int, values: tuple[int, ...]) -> None:
+        if not self.connected:
+            raise ConnectionError("Waveshare transport is not connected")
+        self.writes.append((self.client_epoch, (address, tuple(values))))
+
+    def _resync_after_failure(self) -> None:
+        self.connected = False
+        self.fail_next_reads = False
+        self.client_epoch += 1
+
+    async def close(self) -> None:
+        self.closed = True
+        self.connected = False
+
+
+async def test_a_midrun_connection_failure_reconnects_without_restart(
+    contract: Any,
+) -> None:
+    """The live incident, end to end: a single transient TCP failure darkens
+    the unit for exactly the cycles the gateway is unreachable -- never until
+    process restart.  The failed poll still reports the connection-failure
+    class (the fleet's honest CONNECT_FAILED classification is unchanged);
+    the actor then schedules one bounded reconnect through its own mailbox on
+    the REBUILT client, and the next poll reads OK."""
+    transport = SessionTransport()
+    actor, _, _, _, _ = make_actor(contract, transport=transport)
+
+    await actor.start()
+    assert transport.connect_attempts == [0], "boot connects exactly once, unchanged"
+    await actor.poll_once()
+    assert transport.reads == [(0, (0x5000, 7))]
+
+    # The gateway drops the established session mid-run (the 15:20:32 shape).
+    transport.fail_next_reads = True
+    with pytest.raises(ConnectionError, match="connection lost"):
+        await actor.poll_once()
+    assert transport.client_epoch == 1, "the transport resynced and rebuilt its client"
+
+    # Recovery without restart: exactly one reconnect lands on the rebuilt
+    # client generation.
+    assert await settle_until(lambda: len(transport.connect_attempts) >= 2)
+    assert transport.connect_attempts == [0, 1]
+
+    essential = await actor.poll_once()
+    assert essential == (0, 0, 0, 0, 0, 0, 0)
+    assert transport.reads[-1] == (1, (0x5000, 7)), "the poll rode the fresh client"
+    await actor.shutdown()
+
+
+async def test_a_persisting_outage_stays_honest_and_bounded(contract: Any) -> None:
+    """While the gateway truly refuses fresh connections, every poll keeps
+    reporting the instant not-connected class (the honest gateway-unreachable
+    classification stands), each poll cycle schedules EXACTLY ONE connect
+    attempt, and nothing is scheduled between polls -- no busy-loop.  The
+    moment the path is restored, the next cycle's attempt reconnects and the
+    following poll reads OK."""
+    transport = SessionTransport()
+    actor, _, _, _, _ = make_actor(contract, transport=transport)
+    await actor.start()
+
+    # The gateway drops the session AND refuses fresh connections: the
+    # reconnect attempt the failing poll schedules must fail too.
+    transport.fail_next_reads = True
+    transport.gateway_down = True
+    with pytest.raises(ConnectionError, match="connection lost"):
+        await actor.poll_once()
+    assert await settle_until(lambda: len(transport.connect_attempts) >= 2), (
+        "the failed poll must still have scheduled its one reconnect attempt"
+    )
+
+    # The attempt failed; with no new poll arriving, nothing more schedules.
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert transport.connect_attempts == [0, 1]
+
+    # Two more fleet cycles against the down gateway: one attempt per cycle,
+    # every poll reporting the connect-failure class.
+    for expected_attempts in (3, 4):
+        with pytest.raises(ConnectionError, match="not connected"):
+            await actor.poll_once()
+        assert await settle_until(
+            lambda expected=expected_attempts: len(transport.connect_attempts) >= expected
+        )
+    assert transport.connect_attempts == [0, 1, 1, 1], "exactly one attempt per cycle"
+
+    # The path is restored: the next cycle's single attempt reconnects and
+    # the poll after it reads OK -- recovery without restart.
+    transport.gateway_down = False
+    with pytest.raises(ConnectionError, match="not connected"):
+        await actor.poll_once()
+    assert await settle_until(lambda: len(transport.connect_attempts) >= 5)
+    await actor.poll_once()
+    assert transport.reads[-1] == (1, (0x5000, 7))
+    await actor.shutdown()
+
+
+async def test_a_stale_generation_s_late_connect_is_a_noop(contract: Any) -> None:
+    """The reconnect reuses the authority generation fence.  A higher-priority
+    operation that fences the generation between the failed poll and the
+    attempt's dispatch (the live shape: the fleet cycle's heartbeat write
+    fails on the same dead socket and inhibits with a generation advance)
+    makes the scheduled attempt a NO-OP -- no connect rides a stale epoch --
+    and the live generation's own next failed poll schedules the fresh
+    attempt that reconnects."""
+    transport = SessionTransport()
+    repository = FakeAuthorizationRepository(AuthorizationRecord())
+    actor, _, _, _, _ = make_actor(
+        contract,
+        transport=transport,
+        observations=FakeObservationRepository(ObservationRecord()),
+        authorizations=repository,
+    )
+    await ready_actor(actor)
+
+    # Hold the poll's read in flight, then queue the heartbeat behind it: the
+    # mailbox will dispatch the heartbeat (priority above the reconnect)
+    # between the failed poll and the reconnect it schedules.
+    gate = Gate()
+    transport.read_gate = gate
+    poll = asyncio.create_task(actor.poll_once())
+    assert await settle_until(gate.entered.is_set)
+    heartbeat = asyncio.create_task(actor.heartbeat_once())
+    await asyncio.sleep(0)  # let the heartbeat message land in the mailbox
+
+    transport.fail_next_reads = True
+    gate.release.set()
+    await asyncio.gather(poll, heartbeat, return_exceptions=True)
+    assert actor.lifecycle is contract.UnitLifecycle.INHIBITED
+    assert actor.inhibit_reason == "write_failed"
+    assert actor.generation == 1, "the heartbeat's write failure fenced the generation"
+
+    # The scheduled reconnect carried generation 0: it must dispatch as a
+    # no-op and never touch the rebuilt client.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert transport.connect_attempts == [0], "a stale generation's late connect"
+
+    # The live generation recovers on its own failed poll's fresh schedule.
+    with pytest.raises(ConnectionError, match="not connected"):
+        await actor.poll_once()
+    assert await settle_until(lambda: len(transport.connect_attempts) >= 2)
+    assert transport.connect_attempts == [0, 1]
+    await actor.poll_once()
+    assert transport.reads[-1] == (1, (0x5000, 7))
+    await actor.shutdown()
+
+
+class _SessionRegisters:
+    """The pymodbus response surface ``WaveshareTransport`` validates."""
+
+    def __init__(self, *, function_code: int, count: int, dev_id: int) -> None:
+        self.function_code = function_code
+        self.registers = [0] * count
+        self.dev_id = dev_id
+
+    def isError(self) -> bool:
+        return False
+
+
+class _SessionClient:
+    """The pymodbus client surface the real transport drives, scripted."""
+
+    def __init__(self, host: str, **kwargs: Any) -> None:
+        self.host = host
+        self.constructor_kwargs = kwargs
+        self.connected = False
+        self.closed = False
+        self.read_error: BaseException | None = None
+        self.read_calls = 0
+
+    async def connect(self) -> bool:
+        self.connected = True
+        return True
+
+    async def read_holding_registers(
+        self, address: int, *, count: int, device_id: int
+    ) -> _SessionRegisters:
+        self.read_calls += 1
+        if self.read_error is not None:
+            raise self.read_error
+        return _SessionRegisters(function_code=3, count=count, dev_id=device_id)
+
+    def close(self) -> None:
+        self.closed = True
+        self.connected = False
+
+
+class _SessionClientFactory:
+    """Records every client the transport constructs, including resyncs."""
+
+    def __init__(self) -> None:
+        self.clients: list[_SessionClient] = []
+
+    def __call__(self, host: str, **kwargs: Any) -> _SessionClient:
+        client = _SessionClient(host, **kwargs)
+        self.clients.append(client)
+        return client
+
+
+async def test_the_real_transport_reconnects_through_the_actor_after_a_midrun_failure(
+    contract: Any,
+) -> None:
+    """The wire-true variant: the REAL WaveshareTransport (with its resync
+    client rebuild) under the real actor.  One OSError on an established
+    session resyncs and leaves the transport connectionless; the actor's
+    bounded reconnect connects the rebuilt client and the next poll reads
+    through it -- the exact sequence that stayed dark until restart before
+    the policy existed."""
+    waveshare = importlib.import_module("energypod.adapters.modbus.waveshare")
+    factory = _SessionClientFactory()
+    transport = waveshare.WaveshareTransport(
+        config=waveshare.WaveshareTransportConfig(host="192.168.1.11"),
+        client_factory=factory,
+    )
+    actor, _, _, _, _ = make_actor(contract, transport=transport)
+
+    await actor.start()
+    await actor.poll_once()
+    assert len(factory.clients) == 1
+    assert factory.clients[0].read_calls == 1
+
+    # The established session dies mid-run.
+    factory.clients[0].read_error = ConnectionResetError("synthetic reset")
+    with pytest.raises(waveshare.TransportConnectionError, match="connection lost"):
+        await actor.poll_once()
+    assert factory.clients[0].closed is True
+    assert len(factory.clients) == 2, "the resync rebuilt the client from the factory"
+
+    assert await settle_until(lambda: factory.clients[1].connected), (
+        "the actor must reconnect the rebuilt client without any restart"
+    )
+    await actor.poll_once()
+    assert factory.clients[1].read_calls == 1, "the poll rode the fresh socket"
+    await actor.shutdown()
