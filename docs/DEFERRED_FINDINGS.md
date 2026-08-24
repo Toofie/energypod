@@ -326,3 +326,81 @@ CONTINUITY paragraph can shrink to a pointer.
 19. `energypod.main` entry point absent though declared in pyproject.
     Status: RESOLVED-BY f99bda1 (Milestone C packaging; tests in
     tests/unit/test_main_entry.py).
+
+## Queue: pod-parking mutation round (2026-08-24, isolated worktree run)
+
+Run by the mutation-testing agent in a dedicated worktree at a084920 (the
+parking-round HEAD at run start), removed afterwards; the main tree never ran
+mutants. mutmut 2.4.5, per-target runners (the parking test set, the facade
+test set, the transport contract tests). Kill rates: waveshare.py 48.4% (217
+mutants: 105/112/0 killed/survived/timeout — but inside the write_debug_mode
+target region every SEMANTIC mutant died: the {0,1} bound, the FC16 shape,
+the echo validation, the resync discipline; the in-region survivors were six
+message strings and the _is_error defensive branches); parking.py 56.7% (891:
+505/386/0); service.py scoped to the parking facade surface 42.7% (96: 41/55/
+0 — the facade methods were extracted verbatim into a worktree-only scope
+module rebound at import, so the 3770-line module stayed out of the run).
+The service.py facade finding that matters most: renew_park_lease's real body
+was executed by no test at all (REST/MCP contract suites fake the service;
+the composition suite pins only the route string).
+
+Killing tests landed in the main tree after per-cluster mutant verification
+in the worktree (39 tests): tests/unit/test_parking_mutation_kills.py (the
+REAL facade: interactive principal per method, confirmation/takeover
+literals, block-absent and unknown-unit per method, lease bounds, correlation
+keys, renew sliding + anti-rollover boundary, the exact dispatch refusal
+message), tests/unit/test_parking_controller_kills.py (wire-code literals,
+commissioning/lease-domain/wall-clock validation, exact park/expiry row
+shapes with independently recomputed fingerprints, inherited-park semantics,
+expiry and boot boundaries, parked_facts postures, conflict classes, the
+unmapped vendor word > 6, takeover observed_since, degraded resume,
+checklist clamp/latch, foreign_mode details, the provenance window boundary,
+closing-detail origins), tests/integration/test_waveshare_mutation_kills.py
+(the exact domain-refusal/echo-validation messages, the ModbusException
+mapping, _is_error fail-closed). Residue, by class:
+
+1. Audit-payload KEY clusters (~150 survivors): "XXkeyXX"-class mutants over
+   the park/resume/renew row payloads and event bodies. Narrative rows carry
+   their payload only as a fingerprint (AuditEvent has no payload field), so
+   keys are observable only through recomputed fingerprints.
+   Concrete improvement: a row-pinning pass recomputing fingerprints from
+   expected payloads per mutation (the test_facade_audit_content pattern),
+   or asserting the lease store's committed payload projections.
+   Status: QUEUED (highest-value residue).
+2. Message-text clusters (~90): refusal messages, vendor-name fallbacks, the
+   faults retention note, _map_debug_mode_error texts. The load-bearing ones
+   (domain refusal, hints, degraded codes, expiry row) are now pinned;
+   the rest is the standing accepted noise class.
+   Status: ACCEPTED (message vocabulary), with the pinned exceptions above.
+3. Equivalent mutants (~35): _FOREIGN_MODE_WORDS set elements (the `> 1`
+   disjunct dominates), the empty `elif LEASE_EXPIRED: pass` inversion,
+   _is_error's None branch (the function-code check catches None), the
+   vendor-word guard `> 1` -> `> 2` (the 2-6 set covers the delta),
+   supervise's post-expiry in-flight lease copy (table truth governs the
+   projection), the LEASE_OPEN closing-details entry (unreachable through
+   renew refusals), annotation-only `|`->`&` edits, slots/frozen flags.
+   Status: ACCEPTED as noise.
+4. Out-of-round transport surface (~100 survivors in waveshare.py outside
+   write_debug_mode): WaveshareTransportConfig's constructor validation is
+   entirely untested (~36), the generic write_registers gate boundary
+   arithmetic (~20), close/ensure state mutants, the FC03 read-validation
+   message cluster. Severity-if-fixed-later: P2 (the config block guards
+   retries==0 and the address domains; all are fail-closed raises).
+   Status: QUEUED — a compact config-validation parametrize plus gate
+   boundary cases kills the cluster.
+5. Controller residue (~70): divergence-memory partial branches (the
+   word=1 first-look vs transition split), the faults-window scan boundaries
+   (continue-vs-break on unit mismatch and pre-park rows, the
+   exactly-at-parked_at edge), checklist rounding digits, _optional_word
+   boundaries, the boot scan's continue past unknown units (mutant 525),
+   _enum_text/_actor_lifecycle fallbacks behind present actors.
+   Status: QUEUED (SKIPPED for time this round).
+6. Never-mutated new code: the boot-adoption feature (1116ded,
+   _adopt_pending_park and its ~180 lines plus tests) landed after the
+   a084920 snapshot — it has had no mutation round.
+   Status: QUEUED for the next round's parking target list.
+
+Run mechanics worth recording: a mutmut 2.4.5 pony cache bug ("Mutant.line
+is required") fires on interrupted registrations; it was worked around with a
+reversible local venv patch (restored afterwards — the shared .venv is clean
+again), and interrupted runs resumed from the sqlite cache.
