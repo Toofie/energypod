@@ -207,6 +207,48 @@ class WaveshareTransport:
             self._ensure_connected()
             self._validate_write_response(response, address, len(registers))
 
+    async def write_debug_mode(self, value: int) -> None:
+        """Write the sanctioned vendor debug-mode word: FC16 ``[value]`` at 0x8000.
+
+        The separately named method pod parking composes (DESIGN_POD_PARKING
+        section 5, item 1): the generic ``write_registers`` predicate stays
+        byte-identical and can never reach 0x8000 -- only this method can, and
+        only when the ``parking:`` config block commissioned it.  The value
+        domain is structural here at the transport layer, not caller
+        discipline: exactly ``{0, 1}`` (0 Normal / 1 Standby), the pair
+        live-proven on rhs 2026-08-24 (docs/evidence/standby-cycle-2026-
+        08-24.md -- the FC16 echo-validated ACK, the ~1 s readback
+        transitions at 0x8100, and the clean exit); the vendor values 2-6
+        (Charge, Discharge, Circulation, Fixing SOC, Verify Capacity) are
+        PERMANENTLY UNEXPOSED, and so is every other shape.  The write runs
+        under the same lock, inter-frame gap, ACK-echo validation, and
+        resync-after-failure discipline as the PQ objective.
+        """
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError(
+                "write_debug_mode accepts only 0 (Normal) or 1 (Standby): the vendor "
+                "values 2-6 are permanently unexposed"
+            )
+        async with self._lock:
+            self._ensure_connected()
+            await self._respect_inter_request_gap()
+            try:
+                response = await self._client.write_registers(
+                    0x8000,
+                    [value],
+                    device_id=self._config.device_id,
+                )
+            except ModbusException as error:
+                await self._resync_after_failure()
+                raise ModbusResponseError(
+                    "Modbus write did not produce a valid acknowledgement"
+                ) from error
+            except OSError as error:
+                await self._resync_after_failure()
+                raise TransportConnectionError("connection lost during Modbus write") from error
+            self._ensure_connected()
+            self._validate_write_response(response, 0x8000, 1)
+
     async def close(self) -> None:
         # Closing must not queue behind a cancellation-resistant socket operation:
         # closing the underlying client is the mechanism that unblocks that I/O.

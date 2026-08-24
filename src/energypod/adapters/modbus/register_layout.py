@@ -90,8 +90,19 @@ _COMMON_READS = (
     _read(0x8106, 2),
     _read(0x8102, 56),
 )
+# The structural write whitelist (DESIGN_POD_PARKING section 5, item 4): the
+# evidenced PQ objective plus the sanctioned standby debug-mode word -- TWO
+# named operations, no more.  Every other maintenance/debug write the vendor
+# code names stays absent from this catalog, which is the single admission
+# list.  NOTE the deliberate address asymmetry: the debug-mode word is
+# WRITTEN at 0x8000 and READ BACK one block higher at 0x8100 (a common_reads
+# block above) -- both spellings live-proven on rhs 2026-08-24
+# (docs/evidence/standby-cycle-2026-08-24.md).  Do not "normalize" the pair.
 _WRITE_BLOCKS: Mapping[str, RegisterBlock] = MappingProxyType(
-    {"pq_objective": RegisterBlock(0x0200, 3, 16, False)}
+    {
+        "pq_objective": RegisterBlock(0x0200, 3, 16, False),
+        "debug_mode": RegisterBlock(0x8000, 1, 16, False),
+    }
 )
 _CLAIM_STATUSES = {
     "waveshare_rtu_over_tcp_framing": EvidenceStatus.CORROBORATED_OPERATIONALLY,
@@ -120,7 +131,14 @@ _CLAIMS: Mapping[str, EvidenceClaim] = MappingProxyType(
 
 
 class RegisterCatalog:
-    """Immutable register catalog; maintenance and debug writes are absent."""
+    """Immutable register catalog.
+
+    The writable set is exactly the two named blocks -- the evidenced
+    three-register PQ objective and the sanctioned standby debug-mode word
+    (DESIGN_POD_PARKING section 5; live rhs cycle 2026-08-24) -- reachable
+    only through the transport's separately named methods.  Every other
+    maintenance or debug write the vendor code names stays absent.
+    """
 
     __slots__ = ()
 

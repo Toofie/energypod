@@ -1407,3 +1407,140 @@ def test_a_present_plant_history_block_requires_the_storage_block() -> None:
     assert any("storage" in str(item["msg"]) for item in error.errors()), (
         "the refusal must name the missing storage block"
     )
+
+
+# --- pod parking (DESIGN_POD_PARKING section 5.1 -- the T-PARK-COMMISSIONING
+# --- config half) ------------------------------------------------------------------
+#
+# Block-presence doctrine, the night pattern verbatim: a PRESENT ``parking:``
+# block commissions the sanctioned standby write (the one surface that may
+# ever compose 0x8000); an ABSENT block composes nothing.  The block is
+# validated on PRESENCE, so a parking block on an observe-only site is a
+# validation error naming its own cause, never a silently-incapable site.
+
+
+def _parking_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "max_lease_s": 14400,
+        "default_lease_s": 14400,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _parking_config(**overrides: Any) -> dict[str, Any]:
+    payload = _valid_config()
+    payload["parking"] = _parking_payload(**overrides)
+    return payload
+
+
+def _assert_parking_rule(payload: dict[str, Any], *, message_contains: str) -> ValidationError:
+    """Refuse the block by its OWN commissioning rule, not by key ignorance
+    (the night pattern's helper, verbatim in intent)."""
+    with pytest.raises(ValidationError) as caught:
+        _validate(payload)
+    error = caught.value
+    parking_errors = [
+        item for item in error.errors() if item["loc"] and item["loc"][0] == "parking"
+    ]
+    assert parking_errors, f"expected a parking error, got {error.errors()!r}"
+    assert all(item["type"] != "extra_forbidden" for item in parking_errors), (
+        "the parking block must be a known key refused by its commissioning rule, "
+        "not rejected as an unknown key"
+    )
+    assert message_contains.lower() in str(error).lower()
+    return error
+
+
+def test_parking_block_is_absent_by_default() -> None:
+    """An absent block composes nothing: no park surface, no lease, no mode
+    write -- byte-identical to the pre-parking controller."""
+    parsed = _validate(_valid_config())
+    assert getattr(parsed, "parking", "__missing__") is None
+
+
+def test_a_present_parking_block_carries_the_pinned_defaults() -> None:
+    """Section 5.1: the commissioned shape -- a four-hour default lease under
+    a four-hour cap, both inside the 360..86400 window."""
+    parsed = _validate(_parking_config())
+
+    block = parsed.parking
+    assert block is not None
+    assert block.max_lease_s == 14400
+    assert block.default_lease_s == 14400
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"max_lease_s": 359},
+        {"max_lease_s": 86401},
+        {"default_lease_s": 59},
+        {"default_lease_s": -60},
+        {"default_lease_s": 14401},  # above the cap
+        {"max_lease_s": 360, "default_lease_s": 361},
+    ],
+)
+def test_parking_lease_bounds_are_refused(overrides: dict[str, Any]) -> None:
+    """max_lease_s in 360..86400; default_lease_s >= 60 and <= max_lease_s."""
+    _assert_parking_rule(_parking_config(**overrides), message_contains="lease")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"max_lease_s": 360, "default_lease_s": 360},
+        {"max_lease_s": 86400, "default_lease_s": 86400},
+        {"max_lease_s": 3600, "default_lease_s": 60},
+    ],
+)
+def test_parking_lease_bounds_commission_at_their_edges(overrides: dict[str, Any]) -> None:
+    """The window's own edges commission: a six-minute cap with its matching
+    default, the one-day ceiling, and a minimal default under a wider cap."""
+    parsed = _validate(_parking_config(**overrides))
+    assert parsed.parking is not None
+
+
+def test_a_present_parking_block_requires_write_enabled_mode() -> None:
+    """The night pattern: an observe-only composition can never actuate, so a
+    parking block on an observe-only site is refused at validation time -- a
+    present block that could never write is a validation error, never a
+    silently-incapable site."""
+    payload = _parking_config()
+    payload["mode"] = "observe_only"
+    payload.pop("authentication")
+    _assert_parking_rule(payload, message_contains="write_enabled")
+
+
+def test_a_present_parking_block_requires_the_policy_block() -> None:
+    payload = _parking_config()
+    payload.pop("policy")
+    _assert_parking_rule(payload, message_contains="policy")
+
+
+def test_unknown_parking_keys_are_refused() -> None:
+    with pytest.raises(ValidationError) as caught:
+        _validate(_parking_config(enabled=True))
+    parking_errors = [
+        item for item in caught.value.errors() if item["loc"] and item["loc"][0] == "parking"
+    ]
+    assert parking_errors
+    assert all(item["type"] == "extra_forbidden" for item in parking_errors), (
+        "there is deliberately NO enabled key: the block IS the commissioning act, "
+        "and a second master switch would be a second way to be silently off"
+    )
+
+
+def test_debug_modes_enabled_stays_the_always_false_tombstone() -> None:
+    """Section 5.1: ``policy.debug_modes_enabled`` remains the always-false
+    tombstone, superseded by NOTHING -- its refusal names the ``parking``
+    block as the one and only policy flag that can ever compose the 0x8000
+    debug-mode write."""
+    payload = _valid_config()
+    payload["policy"]["debug_modes_enabled"] = True
+    error = _assert_invalid(payload, location_contains="policy")
+    message = str(error).lower()
+    assert "parking" in message, (
+        "the tombstone's refusal must name the parking block as the sole composer "
+        f"of the debug-mode write, got {message!r}"
+    )

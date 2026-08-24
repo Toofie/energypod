@@ -273,6 +273,11 @@ class PolicyConfig(_FrozenModel):
     # chooses -- observed live: a synchronized pair while a full third
     # floated).  A lone pod never qualifies.
     foreign_objective_expected_min_units: Annotated[StrictInt, Field(ge=2, le=50)] = 2
+    # The always-false tombstone, superseded by NOTHING except the parking
+    # block below (DESIGN_POD_PARKING section 5.1): ``policy.debug_modes_enabled``
+    # can never compose the 0x8000 debug-mode write -- the ``parking:`` block
+    # is the one and only policy flag that ever can, and it says {0, 1}, never
+    # the vendor values 2-6.
     debug_modes_enabled: StrictBool
 
     @field_validator("threshold_provenance")
@@ -338,7 +343,12 @@ class PolicyConfig(_FrozenModel):
         if self.minimum_temperature_c >= self.maximum_temperature_c:
             raise ValueError("minimum temperature must be below maximum temperature")
         if self.debug_modes_enabled:
-            raise ValueError("debug modes are prohibited in the production controller")
+            raise ValueError(
+                "debug_modes_enabled stays false forever: the parking block "
+                "(DESIGN_POD_PARKING section 5.1) is the one and only composer of the "
+                "0x8000 debug-mode write, and it writes {0, 1} only -- the vendor values "
+                "2-6 are permanently unexposed"
+            )
         return self
 
 
@@ -765,6 +775,41 @@ class ForecastProvidersConfig(_FrozenModel):
         return self
 
 
+class ParkingConfig(_FrozenModel):
+    """DESIGN_POD_PARKING section 5.1: the ``parking:`` commissioning block.
+
+    Block-presence doctrine, the night pattern: a PRESENT block commissions the
+    sanctioned standby write -- the park/resume surface, the lease ledger, and
+    the transport's named ``write_debug_mode`` are composed from it and from
+    nothing else; an ABSENT block composes nothing (byte-identical to the
+    pre-parking controller, and both routes answer ``park_not_commissioned``).
+    There is deliberately NO ``enabled`` key: commissioning the block IS the
+    operator's standing decision, and a second master switch would be a second
+    way to be silently off.  The lease arithmetic is validated here because
+    both bounds live in this block; the mode/policy presence gates live on
+    ``ControllerConfig`` (the night pattern), where the mode and policy the
+    write depends on are already validated.
+    """
+
+    # The anti-rollover cap (ISA-TR84): renewal may never extend a lease past
+    # ``parked_at + max_lease_s``, and the cap itself sits inside the
+    # commissioned 360 s..86400 s window (six minutes to one day).
+    max_lease_s: Annotated[StrictInt, Field(ge=360, le=86400)] = 14400
+    # The default lease a PARK without an explicit ``lease_s`` carries: at
+    # least a minute (a lease shorter than an operator's glance is theater)
+    # and never past the cap.
+    default_lease_s: Annotated[StrictInt, Field(ge=60, le=86400)] = 14400
+
+    @model_validator(mode="after")
+    def validate_lease_bounds(self) -> Self:
+        if self.default_lease_s > self.max_lease_s:
+            raise ValueError(
+                "parking.default_lease_s must not exceed parking.max_lease_s: the default "
+                "lease a PARK carries can never reach past the anti-rollover cap"
+            )
+        return self
+
+
 class ControllerConfig(_FrozenModel):
     schema_version: Annotated[StrictInt, Field(ge=1)]
     revision: Annotated[StrictInt, Field(ge=1)]
@@ -800,6 +845,10 @@ class ControllerConfig(_FrozenModel):
     # declared last beside its siblings so its cross-block validator sees
     # the already-validated plant_history block the load baseline reads.
     forecast_providers: ForecastProvidersConfig | None = None
+    # DESIGN_POD_PARKING section 5.1: the parking commissioning block,
+    # declared last beside its siblings so its commissioning validator sees
+    # the already-validated mode and policy the sanctioned write depends on.
+    parking: ParkingConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -1184,6 +1233,37 @@ class ControllerConfig(_FrozenModel):
                 "without the historian it would be silently empty forever"
             )
         return providers
+
+    @field_validator("parking")
+    @classmethod
+    def validate_parking(
+        cls, parking: ParkingConfig | None, info: ValidationInfo
+    ) -> ParkingConfig | None:
+        """DESIGN_POD_PARKING section 5.1: the commissioning gates for a
+        PRESENT parking block (the night pattern, verbatim in shape).
+
+        The block is the one and only policy flag that can ever compose the
+        0x8000 debug-mode write, so it is validated on block-PRESENCE: a
+        present block on a site that cannot actuate -- observe-only mode, or a
+        write-enabled mode without its policy block -- is a validation error
+        naming its own cause, never a silently-incapable site.  An ABSENT
+        block changes nothing anywhere.
+        """
+        if parking is None:
+            return parking
+        values = info.data
+        if values.get("mode") is not ControllerMode.WRITE_ENABLED:
+            raise ValueError(
+                "parking requires mode write_enabled: an observe-only composition can "
+                "never actuate, so a present parking block is refused at validation "
+                "time -- the site is not silently incapable, it is told"
+            )
+        if values.get("policy") is None:
+            raise ValueError(
+                "parking requires a policy block: the park surface composes against the "
+                "commissioned control policy (armed/latched refusal checks and audit)"
+            )
+        return parking
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:

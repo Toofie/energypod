@@ -501,3 +501,157 @@ async def test_real_pymodbus_rejects_malformed_or_mismatched_rtu_responses(
     finally:
         await transport.close()
         await peer.close()
+
+
+# --- pod parking: the sanctioned debug-mode write (DESIGN_POD_PARKING section 5) --
+#
+# The structural write whitelist grows from ONE operation to TWO: the PQ
+# objective at 0x0200 and the vendor debug-mode word at 0x8000, value domain
+# {0, 1} ONLY (Standby/Normal -- the live rhs standby cycle of 2026-08-24,
+# docs/evidence/standby-cycle-2026-08-24.md).  The named write_debug_mode
+# method is the sole reachable path; the generic write_registers predicate
+# stays byte-identical and architecturally unable to reach 0x8000.
+
+_DEBUG_MODE_ADDRESS = 0x8000
+_DEBUG_MODE_REFUSAL = "only 0 \\(Normal\\) or 1 \\(Standby\\)"
+_PQ_GATE_MESSAGE = "only the evidenced three-register PQ objective is writable"
+
+
+@pytest.mark.parametrize("value", [0, 1])
+async def test_write_debug_mode_writes_the_single_word_and_validates_the_ack(
+    contract: Any, value: int
+) -> None:
+    """T-PARK-TRANSPORT-001 / standby-cycle-2026-08-24 / S0: FC16 [value] at
+    0x8000 under the same lock, inter-frame gap, and ACK-echo validation as
+    the PQ write."""
+    transport, client = _make_transport(contract)
+    client.write_responses.append(
+        StubResponse(function_code=16, address=_DEBUG_MODE_ADDRESS, count=1, dev_id=4)
+    )
+    await transport.connect()
+
+    await transport.write_debug_mode(value)
+
+    assert client.write_calls == [(_DEBUG_MODE_ADDRESS, (value,), 4)]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [2, 3, 4, 5, 6, -1, 7, 0x10000, True, 1.0, "1", None],
+)
+async def test_write_debug_mode_refuses_everything_outside_the_sanctioned_domain(
+    contract: Any, value: Any
+) -> None:
+    """T-PARK-TRANSPORT-002 / DESIGN_POD_PARKING 0+5 item 2 / S0: the {0,1}
+    bound is STRUCTURAL at the transport layer, not caller discipline -- the
+    vendor values 2-6 (Charge, Discharge, Circulation, Fixing SOC, Verify
+    Capacity) are permanently unexposed, and no other shape reaches the wire."""
+    transport, client = _make_transport(contract)
+    await transport.connect()
+
+    with pytest.raises(ValueError, match=_DEBUG_MODE_REFUSAL):
+        await transport.write_debug_mode(value)
+
+    assert client.write_calls == [], "a refused mode value must never reach the bus"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        StubResponse(function_code=16, address=_DEBUG_MODE_ADDRESS, count=1, error=True),
+        StubResponse(function_code=6, address=_DEBUG_MODE_ADDRESS, count=1),
+        StubResponse(function_code=16, address=0x8001, count=1),
+        StubResponse(function_code=16, address=_DEBUG_MODE_ADDRESS, count=3),
+        StubResponse(function_code=16, address=_DEBUG_MODE_ADDRESS, count=1, dev_id=5),
+    ],
+)
+async def test_write_debug_mode_rejects_error_or_acknowledgement_mismatch(
+    contract: Any, response: StubResponse
+) -> None:
+    """T-PARK-TRANSPORT-003 / INV-ACK-001 / S0: the mode write owes the same
+    strict FC16 echo validation as the PQ write."""
+    transport, client = _make_transport(contract)
+    client.write_responses.append(response)
+    await transport.connect()
+
+    with pytest.raises(contract.ModbusResponseError):
+        await transport.write_debug_mode(1)
+
+
+async def test_write_debug_mode_resyncs_after_failure(contract: Any) -> None:
+    """T-PARK-TRANSPORT-004 / the resync-after-failure discipline / S0: an
+    operation failure reopens the stream (the late-response offset guard) and
+    the failure still propagates, never retried inside the transport."""
+    transport, client = _make_transport(contract)
+    await transport.connect()
+
+    client.write_responses.append(ConnectionResetError("synthetic reset"))
+    with pytest.raises(contract.TransportConnectionError):
+        await transport.write_debug_mode(1)
+    assert client.write_calls == [(_DEBUG_MODE_ADDRESS, (1,), 4)]
+    assert client.closed is True, "the failed operation must have closed the stale stream"
+
+
+async def test_write_debug_mode_serializes_with_reads_on_one_client(contract: Any) -> None:
+    """T-PARK-TRANSPORT-005 / INV-ACTOR-001 / S0: the named write runs under
+    the same single lock as every other bus operation."""
+    transport, client = _make_transport(contract)
+    client.read_release = asyncio.Event()
+    await transport.connect()
+
+    read = asyncio.create_task(transport.read_holding(0x5000, 7))
+    await client.read_entered.wait()
+    mode_write = asyncio.create_task(transport.write_debug_mode(1))
+    await asyncio.sleep(0)
+
+    assert client.write_calls == []
+    client.read_release.set()
+    await asyncio.gather(read, mode_write)
+    assert client.write_calls == [(_DEBUG_MODE_ADDRESS, (1,), 4)]
+
+
+@pytest.mark.parametrize(
+    ("address", "values"),
+    [
+        (_DEBUG_MODE_ADDRESS, (0,)),
+        (_DEBUG_MODE_ADDRESS, (1,)),
+        (_DEBUG_MODE_ADDRESS, (2,)),
+        (_DEBUG_MODE_ADDRESS, (1, 0)),
+        (0x8001, (0xFF00,)),
+        (0x0201, (1, 0, 0)),
+        (0x0200, (2, 0, 0)),
+        (0x0200, (1, 0)),
+    ],
+)
+async def test_the_generic_write_path_can_never_reach_the_debug_register(
+    contract: Any, address: int, values: tuple[int, ...]
+) -> None:
+    """T-PARK-TRANSPORT-006 / architecture-fitness (DESIGN_POD_PARKING 5 item
+    1) / S0: ``write_registers`` -- the generic path -- refuses the mode
+    register and every other non-PQ shape with the byte-identical pinned
+    message, BEFORE any bus operation.  Only the named method can compose a
+    0x8000 write, and only when the ``parking:`` block commissioned it."""
+    transport, client = _make_transport(contract)
+    await transport.connect()
+
+    with pytest.raises(ValueError, match=f"^{_PQ_GATE_MESSAGE}$"):
+        await transport.write_registers(address, values)
+
+    assert client.write_calls == [], "the generic path must never reach the bus for 0x8000"
+
+
+async def test_the_pq_write_gate_predicate_is_byte_identical(contract: Any) -> None:
+    """T-PARK-TRANSPORT-007 / DESIGN_POD_PARKING 5 item 1 / S0: the standing
+    gate is unchanged by the new named write -- the exact refusal message is
+    pinned, and the evidenced three-register PQ objective at 0x0200 still
+    passes through it exactly as before."""
+    transport, client = _make_transport(contract)
+    await transport.connect()
+
+    for rejected in ((0x0200, (2, 0, 0)), (0x0200, (1, 0)), (_DEBUG_MODE_ADDRESS, (1,))):
+        with pytest.raises(ValueError, match=f"^{_PQ_GATE_MESSAGE}$"):
+            await transport.write_registers(*rejected)
+    assert client.write_calls == []
+
+    await transport.write_registers(0x0200, (1, 0xFA24, 0))
+    assert client.write_calls == [(0x0200, (1, 0xFA24, 0), 4)]

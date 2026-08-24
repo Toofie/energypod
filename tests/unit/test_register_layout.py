@@ -93,21 +93,26 @@ def test_legacy_read_plan_matches_fixed_and_per_becu_vendor_calls(layout: Any) -
     assert _pairs(blocks) == expected
 
 
-def test_production_write_catalog_exposes_only_dormant_pq_objective(layout: Any) -> None:
-    """T-UNIT-LAYOUT-004 / V-WRITE / S0.
+def test_production_write_catalog_exposes_the_two_sanctioned_blocks(layout: Any) -> None:
+    """T-UNIT-LAYOUT-004 (amended, DESIGN_POD_PARKING 5 item 4) / V-WRITE +
+    standby-cycle-2026-08-24 / S0.
 
-    Vendor-code evidence for a maintenance write does not justify putting that write in the
-    production adapter.  The production catalog is deliberately narrower than the evidence ledger.
+    The structural write whitelist grows from ONE operation to TWO: the
+    evidenced PQ objective and the sanctioned standby debug-mode word (live
+    rhs cycle 2026-08-24).  Everything else the vendor code names stays a
+    forbidden maintenance address: vendor-code evidence for a maintenance
+    write still does not justify putting that write in the production
+    adapter, and values 2-6 remain permanently unexposed.
     """
     writes = layout.RegisterCatalog().write_blocks
 
     assert {name: (spec.address, spec.count) for name, spec in writes.items()} == {
-        "pq_objective": (0x0200, 3)
+        "pq_objective": (0x0200, 3),
+        "debug_mode": (0x8000, 1),
     }
     assert all(spec.function_code == 16 for spec in writes.values())
     assert all(not spec.live_actuation_eligible for spec in writes.values())
     forbidden_maintenance_addresses = {
-        0x8000,
         0x8001,
         0x8002,
         0x8008,
@@ -118,6 +123,27 @@ def test_production_write_catalog_exposes_only_dormant_pq_objective(layout: Any)
         0x8037,
     }
     assert forbidden_maintenance_addresses.isdisjoint(spec.address for spec in writes.values())
+
+
+def test_the_debug_mode_write_and_readback_addresses_stay_asymmetric(layout: Any) -> None:
+    """T-UNIT-LAYOUT-004A / DESIGN_POD_PARKING 5 item 4 / S0.
+
+    The vendor debug-mode word is WRITTEN at 0x8000 and READ BACK one block
+    higher at 0x8100 (standby-cycle-2026-08-24.md: FC16 to 0x8000, readback at
+    0x8100).  The asymmetry is a live-proven vendor fact, pinned here so no
+    implementer "normalizes" the pair: the write block is not a readable
+    block, and the readback block is not writable.
+    """
+    catalog = layout.RegisterCatalog()
+
+    write_addresses = {spec.address for spec in catalog.write_blocks.values()}
+    read_addresses = {block.address for block in catalog.common_reads}
+    assert 0x8000 in write_addresses
+    assert 0x8000 not in read_addresses, "the write address is never served as a read block"
+    assert 0x8100 in read_addresses
+    assert 0x8100 not in write_addresses, "the readback address is not a writable block"
+    assert catalog.write_blocks["debug_mode"].count == 1
+    assert catalog.write_blocks["debug_mode"].function_code == 16
 
 
 @pytest.mark.parametrize(
