@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-24 (Australia/Brisbane; the pod-parking round — park/resume live-verified on rhs, the write path mutation-proven)
+Last updated: 2026-08-24 (Australia/Brisbane; the rhs transport-reconnect incident closed — post-boot reconnect implemented, fleet re-armed)
 
 ## Purpose
 
@@ -399,6 +399,17 @@ direction, freshness, and watchdog timing per physical unit.
   the REAL WaveshareTransport under the real actor, ConnectionResetError
   mid-run, reconnect landing on the factory-rebuilt client. GATES: backend
   2556 passed (base 2552), ruff + MYPYPATH=src mypy strict clean.
+  RECOVERY EXECUTED LIVE: the controller was restarted onto 7664cdd
+  (harness-managed task bfltgb5vw), rhs telemetry resumed on the FIRST
+  cycle, and all three units were re-armed to the operator's 14:58 state
+  (sole_writer, armed_idle, verified) — re-verified read-only
+  post-recovery: control readiness ARMED, all units self_healing on live
+  observations, zero foreign objectives. CUTOVER CONSEQUENCE: the night
+  cutover's ARM step is already satisfied; only the night-enable
+  remains, still gated on the operator's Docker stand-down confirmation
+  (night stays off by config until then). ROUND CLOSURE: this closes the
+  only post-ledger event of the pod-parking round; that round's task
+  list is complete.
 
 - 2026-08-24 (pod-parking round — PARK/RESUME LIVE-VERIFIED ON rhs, THE
   WRITE PATH MUTATION-PROVEN; base 9cd25c4 → HEAD 6765fe6, 20 commits):
