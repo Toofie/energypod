@@ -215,6 +215,16 @@ async def test_mcp_never_exposes_arm_policy_stop_ack_or_debug_even_when_write_en
         "set_policy",
         "write_registers",
         "set_debug_mode",
+        # DESIGN_POD_PARKING section 1: MCP observes and recommends; it does
+        # not park.  v1 ships no parking mutation tool under any flag --
+        # park/resume/renew are the operator-only REST surface.
+        "park_unit",
+        "park",
+        "renew_park_lease",
+        "renew",
+        "resume_unit",
+        "resume",
+        "write_debug_mode",
     }
     assert names.isdisjoint(forbidden)
 
@@ -440,3 +450,62 @@ async def test_mcp_plant_history_is_a_read_only_ride_along(
     assert forwarded[1]["fields"] == ["battery_watts", "commanded"]
     assert forwarded[1]["points"] == 1200
     assert len(forwarded) == 2, "a refused window never reaches the service"
+
+
+@pytest.mark.asyncio
+async def test_mcp_serves_the_parking_read_fields_and_no_parking_mutation_tool(
+    service: RecordingEnergyService,
+) -> None:
+    """DESIGN_POD_PARKING sections 1/7 (T-PARK-MCP): MCP observes and
+    recommends; it does not park.  ``get_unit_detail`` passes the facade's
+    ``park_state`` / ``recovery_advisory`` / ``delivery_bias`` projections
+    through verbatim, and the tool enumeration proves no park/renew/resume
+    mutation tool exists under ANY flag."""
+
+    class ParkingDetailService(RecordingEnergyService):
+        async def unit_detail(self, **kwargs: Any) -> dict[str, Any]:
+            projection = dict(await super().unit_detail(**kwargs))
+            if kwargs.get("unit_id") == "MID":
+                projection["park_state"] = {
+                    "parked": True,
+                    "origin": "operator",
+                    "parked_at": "2026-08-24T02:00:00+00:00",
+                    "lease_expires_at": "2026-08-24T06:00:00+00:00",
+                    "max_total_s": 14400,
+                    "remaining_cap_s": 14350,
+                    "expired": False,
+                    "reason": "inverter work",
+                    "authorizer": "person:operator",
+                }
+                projection["recovery_advisory"] = {
+                    "commissioned": True,
+                    "echo_classifications": ["objective_not_served"],
+                }
+                projection["delivery_bias"] = {
+                    "mean_bias_pct": 15.5,
+                    "max_bias_pct": 16.2,
+                    "sample_count": 240,
+                    "window_s": 360.0,
+                }
+            return projection
+
+    parking_service = ParkingDetailService()
+    server = await _server(parking_service, principal_name="viewer-token")
+    async with Client(server) as client:
+        detail = await client.call_tool("get_unit_detail", {"unit_id": "MID"})
+        assert detail.data["park_state"]["parked"] is True
+        assert detail.data["park_state"]["origin"] == "operator"
+        assert detail.data["recovery_advisory"] == {
+            "commissioned": True,
+            "echo_classifications": ["objective_not_served"],
+        }
+        assert set(detail.data["delivery_bias"]) == {
+            "mean_bias_pct",
+            "max_bias_pct",
+            "sample_count",
+            "window_s",
+        }
+        names = await _tool_names(client)
+    assert names.isdisjoint(
+        {"park_unit", "park", "renew_park_lease", "renew", "resume_unit", "resume"}
+    ), "MCP observes and recommends; the park/resume cycle is the operator's REST act"

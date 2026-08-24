@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from typing import Any, Final, Literal, Protocol
@@ -397,6 +397,12 @@ REASON_PLAN_CHANGED: Final[str] = "plan_changed"
 # controllable lifecycle, and outranks it: a disarmed unit claimed by a higher
 # source is disarmed first (the night strategy's own precedence).
 REASON_UNITS_DISARMED: Final[str] = "units_disarmed"
+# DESIGN_POD_PARKING section 3: the projection-level parked code, riding the
+# ``units_disarmed`` mechanism verbatim.  The RUNNER stays dumb (DESIGN_
+# SCHEDULES section 7 "no claim checks"): it submits the published fact, the
+# facade refuses ``device_debug_mode_active`` with park provenance, and the
+# per-cycle failure is survivable per its standing doctrine.
+REASON_UNIT_PARKED: Final[str] = "unit_parked"
 
 # The lifecycles a unit can actuate from (the safety kernel's
 # ``lifecycle_not_controllable`` deny set, the night strategy's set).
@@ -450,6 +456,7 @@ class ScheduleRunner:
         bus: ScheduleBusPort | None = None,
         posture: str = "yield",
         initial_plan: SchedulePlan | None = None,
+        parked_units: Callable[[], frozenset[str]] | None = None,
     ) -> None:
         self._store = store
         self._evaluator = evaluator
@@ -459,6 +466,10 @@ class ScheduleRunner:
         self._observations = observations
         self._bus = bus
         self._posture = posture
+        # DESIGN_POD_PARKING section 3: the parked view names the projection
+        # code only -- it never gates the submit above (the runner stays
+        # dumb; the facade's refusal is the fence).
+        self._parked_units = parked_units
         # Held-intent state: the live intent id plus the window key it serves.
         self._held_intent_id: str | None = None
         self._held_key: tuple[int, str] | None = None
@@ -532,7 +543,11 @@ class ScheduleRunner:
             await self._submit_window(plan, evaluated, entry, ends_at, announce=True)
             action = "submit"
         reasons: tuple[str, ...] = (REASON_WINDOW_OPEN,)
-        if await self._fleet_disarmed(evaluated.unit_ids):
+        if self._any_unit_parked(evaluated.unit_ids):
+            # A parked unit renders ``unit_parked`` beside ``window_open``
+            # (the units_disarmed mechanism verbatim, additive).
+            reasons = (REASON_WINDOW_OPEN, REASON_UNIT_PARKED)
+        elif await self._fleet_disarmed(evaluated.unit_ids):
             reasons = (REASON_WINDOW_OPEN, REASON_UNITS_DISARMED)
         elif await self._waiting_for_higher_priority(evaluated.unit_ids, now_mono):
             reasons = (REASON_WINDOW_OPEN, REASON_WAITING)
@@ -655,6 +670,22 @@ class ScheduleRunner:
             if value in _CONTROLLABLE_LIFECYCLES:
                 return False
         return True
+
+    def _any_unit_parked(self, unit_ids: frozenset[str]) -> bool:
+        """Honesty only: the lease ledger holds a window unit parked.
+
+        A failing or unwired view renders nothing (unknown is not parked);
+        the answer NEVER gates the submit above -- the facade's
+        ``device_debug_mode_active`` refusal with park provenance is the
+        fence (the runner stays dumb by design).
+        """
+        if self._parked_units is None or not unit_ids:
+            return False
+        try:
+            parked = frozenset(self._parked_units())
+        except Exception:
+            return False
+        return bool(parked & frozenset(unit_ids))
 
     async def _waiting_for_higher_priority(self, unit_ids: frozenset[str], now_mono: float) -> bool:
         """Honesty only: every unit claimed by a higher-priority live intent.

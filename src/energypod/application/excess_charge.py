@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final, Literal, Protocol, TypeGuard
 
@@ -270,6 +270,7 @@ class ExcessChargeAdviser:
         submit: _SubmitPort,
         participation: _ParticipationPort | None = None,
         yield_to_schedule: bool = True,
+        parked_units: Callable[[], frozenset[str]] | None = None,
     ) -> None:
         self._settings = settings
         self._policy = policy
@@ -278,6 +279,12 @@ class ExcessChargeAdviser:
         self._intents = intents
         self._submit = submit
         self._participation = participation
+        # DESIGN_POD_PARKING section 3 (coordinator ruling 2026-08-24): the
+        # excess adviser EXCLUDES parked units at selection -- an adviser
+        # repeatedly submitting into a standing refusal would violate the
+        # never-retry-a-denied-dispatch-unchanged doctrine.  ``None``
+        # (isolated compositions) excludes nothing.
+        self._parked_units = parked_units
         # DESIGN_SCHEDULES §4: the adviser's own setting, because it is the
         # adviser's own behavior — one extra source in the yield set.
         self._yield_sources: frozenset[IntentSource] = (
@@ -289,6 +296,21 @@ class ExcessChargeAdviser:
         # whether it is intervening (inside the hysteresis band).
         self._held_intent_id: str | None = None
         self._intervening = False
+        # The last selection pass's per-unit exclusion causes (projection
+        # vocabulary only -- DESIGN_POD_PARKING section 3: ``unit_parked``
+        # renders in place of ``no_eligible_target`` when every otherwise-
+        # eligible unit's exclusion cause is park).
+        self.last_exclusion_causes: dict[str, str] = {}
+
+    def _parked_view(self) -> frozenset[str]:
+        """The parked-unit selection view; a failing view excludes nothing."""
+        if self._parked_units is None:
+            return frozenset()
+        try:
+            units = self._parked_units()
+        except Exception:
+            return frozenset()
+        return frozenset(units)
 
     @property
     def held_intent_id(self) -> str | None:
@@ -351,7 +373,7 @@ class ExcessChargeAdviser:
                 )
             if target is None:
                 return await self._withdraw(
-                    bound_w, ("no_eligible_target",), evidence, fleet_export_w
+                    bound_w, self._no_target_reasons(), evidence, fleet_export_w
                 )
             return await self._withdraw(
                 bound_w, ("below_exit_hysteresis",), evidence, fleet_export_w
@@ -360,7 +382,7 @@ class ExcessChargeAdviser:
         if bound_w <= 0:
             return self._idle(bound_w, ("no_export_headroom",), evidence, fleet_export_w)
         if target is None:
-            return self._idle(bound_w, ("no_eligible_target",), evidence, fleet_export_w)
+            return self._idle(bound_w, self._no_target_reasons(), evidence, fleet_export_w)
         if achievable_w < entry_w:
             # Below autonomy + margin the pod's own self-consumption is
             # faster than anything the adviser could command: commanding
@@ -390,6 +412,18 @@ class ExcessChargeAdviser:
 
     # --- internals -------------------------------------------------------
 
+    def _no_target_reasons(self) -> tuple[str, ...]:
+        """``unit_parked`` in place of ``no_eligible_target`` when every
+        otherwise-eligible unit's exclusion cause is park (DESIGN section 3).
+
+        "Otherwise-eligible" is the selection pass's own bookkeeping: units
+        it excluded for lifecycle/SOC/headroom reasons never mask a park.
+        """
+        causes = dict(self.last_exclusion_causes)
+        if causes and set(causes.values()) == {"unit_parked"}:
+            return ("unit_parked",)
+        return ("no_eligible_target",)
+
     def _select_target(self, latest: Mapping[str, Any]) -> str | None:
         """The neediest eligible unit; ties break by unit id.
 
@@ -403,8 +437,15 @@ class ExcessChargeAdviser:
         best: tuple[float, str] | None = None
         for unit_id in sorted(latest):
             observation = latest[unit_id]
+            if unit_id in self._parked_view():
+                # Selection-side exclusion with the stated cause (DESIGN_
+                # POD_PARKING section 3): a parked unit's dispatch would be
+                # refused on the wire-level debug-mode gate.
+                self.last_exclusion_causes[unit_id] = "unit_parked"
+                continue
             lifecycle = getattr(observation, "lifecycle", None)
             if lifecycle not in _CONTROLLABLE_LIFECYCLES:
+                self.last_exclusion_causes[unit_id] = "units_disarmed"
                 continue
             # The BMS SOC is the authoritative SOC (2026-08-24 operator
             # ruling): neediness and the ceiling skip follow the battery's
@@ -412,11 +453,15 @@ class ExcessChargeAdviser:
             # once per connection and may hold stale for hours.
             soc_pct = getattr(observation, "authoritative_soc_pct", None)
             if not _finite_number(soc_pct):
+                self.last_exclusion_causes[unit_id] = "soc_unreadable"
                 continue
             if soc_pct >= self._policy.max_soc_pct:
+                self.last_exclusion_causes[unit_id] = "at_ceiling"
                 continue
             if self._achievable_w(1 << 62, unit_id, latest) <= 0:
+                self.last_exclusion_causes[unit_id] = "no_charge_headroom"
                 continue
+            self.last_exclusion_causes.pop(unit_id, None)
             key = (soc_pct, str(unit_id))
             if best is None or key < best:
                 best = key

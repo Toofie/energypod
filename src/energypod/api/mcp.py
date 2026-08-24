@@ -116,15 +116,22 @@ def create_mcp_server(
         """Return the current authoritative fleet snapshot -- the first read of every agent loop.
 
         Each unit carries lifecycle, telemetry age and quality,
-        requested/authorized/measured power, and the per-unit intent
-        figures; the top level carries the live ``intent`` view, latched
-        emergency stops (``active_stops`` -- any entry means no other
-        intent can act on those units), and the feature-detected
+        requested/authorized/measured power, the per-unit intent figures,
+        and -- when the ``parking:`` block is commissioned -- the
+        ``park_state`` projection (``parked``, ``origin``, lease expiry,
+        ``expired``); the top level carries the live ``intent`` view,
+        latched emergency stops (``active_stops`` -- any entry means no
+        other intent can act on those units), and the feature-detected
         ``schedule_state`` / ``adviser_state`` / ``night_charge_state``
-        projections when those blocks are commissioned.  Poll this no
-        faster than the site's control period: state cannot change between
-        control cycles, so faster polling adds load and buys nothing.
-        Snapshot reads never actuate.
+        projections when those blocks are commissioned.  Never dispatch
+        onto a parked unit: the debug-mode word is the vendor's own
+        refused-send precondition, so a dispatch would be silently
+        ignored -- recommend the park/resume cycle to the human operator
+        instead (it is the operator-only REST surface; no MCP tool can
+        park, renew, or resume).  Poll this no faster than the site's
+        control period: state cannot change between control cycles, so
+        faster polling adds load and buys nothing.  Snapshot reads never
+        actuate.
         """
         _require(session_principal, "observe")
         return await service.snapshot(principal=session_principal)
@@ -139,10 +146,17 @@ def create_mcp_server(
         quality map, and active faults and warnings.  This is the
         diagnostic read for a denied or clamped dispatch: read it (with
         ``get_recent_audit``) to see WHICH safety fact -- cells,
-        temperature, SOC bounds, staleness, or per-field quality --
-        produced a deny reason, then remove or wait out that cause instead
-        of re-submitting.  Read-only; an unknown unit id is an error,
-        never an empty view.
+        temperature, SOC bounds, staleness, per-field quality, or a parked
+        lease (``park_state``) -- produced a deny reason, then remove or
+        wait out that cause instead of re-submitting.  When the recovery
+        classifier holds the wedge signature, ``recovery_advisory`` names
+        the soft-recovery path -- disarm -> park -> resume, an operator act
+        (``commissioned: false`` means this site has no ``parking:`` block,
+        so the cycle is NOT available here); ``delivery_bias`` is the
+        evidence-only authorized-vs-measured overshoot readout (never a
+        warning, read by no control path).  Read-only; an unknown unit id
+        is an error, never an empty view.  No MCP surface can park, renew,
+        or resume a pod -- recommend the cycle to the human operator.
         """
         # Mirrors the REST unit boundary: the identifier is validated to the
         # canonical shape BEFORE the service is reached (CONTROL_SURFACE_GAP_

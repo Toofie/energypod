@@ -244,6 +244,10 @@ class ObjectiveSample:
     work_mode_w: int | None
     debug_mode_w: int | None
     grid_power_w: float | None
+    # DESIGN_POD_PARKING section 3: the parked annotation -- a foreign PQ
+    # objective observed on a PARKED unit is named ``unit_parked`` on the
+    # sample, never silent and never an alert by itself.
+    parked: bool = False
 
     def payload(self) -> dict[str, Any]:
         """The FULL evidence record (the read endpoint's shape)."""
@@ -260,6 +264,7 @@ class ObjectiveSample:
             "work_mode_w": self.work_mode_w,
             "debug_mode_w": self.debug_mode_w,
             "grid_power_w": self.grid_power_w,
+            **({"parked": True} if self.parked else {}),
         }
 
     def summary(self) -> dict[str, Any]:
@@ -362,6 +367,7 @@ class ForeignObjectiveMonitor:
         authorized_watts: int,
         observation: Any,
         now_mono: float,
+        parked: bool = False,
     ) -> None:
         """Fold one unit's cycle facts in and sample when eligible.
 
@@ -476,6 +482,10 @@ class ForeignObjectiveMonitor:
                 work_mode_w=sample.work_mode_w,
                 debug_mode_w=sample.debug_mode_w,
                 grid_power_w=sample.grid_power_w,
+                # The parked annotation rides the sample verbatim: the
+                # classification itself is untouched (never an alert by
+                # itself), and the evidence never goes silent.
+                parked=bool(parked),
             )
         )
         self._prune(record)

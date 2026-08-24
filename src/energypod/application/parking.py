@@ -1114,6 +1114,22 @@ class ParkController:
         """The sync parked view advisers and readiness reasons read."""
         return frozenset(self._parked_mirror)
 
+    def parked_facts(self, unit_id: str) -> dict[str, bool]:
+        """The health classifier's parked inputs, from the lease mirror.
+
+        ``{parked, expired, write_unverified}`` -- the composable-state
+        wiring (DESIGN section 3): the expiry hint and the write_unverified
+        posture name their own reasons beside ``parked``.
+        """
+        lease = self._lease_mirror.get(unit_id)
+        if lease is None or not lease.parked:
+            return {"parked": False, "expired": False, "write_unverified": False}
+        return {
+            "parked": True,
+            "expired": lease.state == LEASE_EXPIRED,
+            "write_unverified": lease.write_unverified,
+        }
+
     def unit_is_parked(self, unit_id: str) -> bool:
         return unit_id in self._parked_mirror
 

@@ -171,11 +171,16 @@ class FakeIntents:
 
 
 class FakeAudit:
-    """The event-only audit port; also the fault-window evidence source."""
+    """The event-only audit port; also the fault-window evidence source.
+
+    ``retention_limit`` models the bounded store's eviction: when set, only
+    the newest that-many rows answer ``recent`` (the outlived-window case).
+    """
 
     def __init__(self) -> None:
         self.events: list[AuditEvent] = []
         self.failing = False
+        self.retention_limit: int | None = None
 
     async def append(self, event: AuditEvent) -> None:
         if self.failing:
@@ -183,7 +188,11 @@ class FakeAudit:
         self.events.append(event)
 
     async def recent(self, *, limit: int, after_sequence: int | None = None) -> tuple[Any, ...]:
-        return tuple(self.events[-limit:])
+        if self.retention_limit is None:
+            retained = self.events
+        else:
+            retained = self.events[-self.retention_limit :]
+        return tuple(retained[-limit:])
 
     def of_type(self, event_type: str) -> list[AuditEvent]:
         return [event for event in self.events if event.event_type == event_type]
@@ -834,3 +843,79 @@ async def test_lease_bounds_are_validated(rig: Rig) -> None:
     # The default lease rides the block's default_lease_s.
     result = await rig.park(lease_s=None)
     assert result["lease"]["max_total_s"] == 14400
+
+
+# --- the resume checklist's fault window -------------------------------------------
+
+
+async def test_faults_while_parked_collect_the_audit_window_facts(rig: Rig) -> None:
+    rig.observations.serve("mid", authoritative_soc_pct=50.0)
+    await rig.park(lease_s=3600)
+    # Two fault-class facts inside the park window, one benign row.
+    rig.audit.events.append(
+        _fault_row("heartbeat_failed", ("suppressed_exception",), WALL + timedelta(minutes=5))
+    )
+    rig.audit.events.append(
+        _fault_row(
+            "actuation_incoherent",
+            ("authorized_not_actuating",),
+            WALL + timedelta(minutes=6),
+        )
+    )
+    rig.audit.events.append(
+        _fault_row("unit_parked", ("readback_verified",), WALL + timedelta(minutes=7))
+    )
+    rig.actors["mid"].word = 1
+    result = await rig.resume()
+    faults = result["checklist"]["faults_while_parked"]
+    assert faults is not None
+    assert "heartbeat_failed:suppressed_exception" in faults
+    assert "actuation_incoherent:authorized_not_actuating" in faults
+    assert all(not fault.startswith("unit_parked") for fault in faults), (
+        "the narrative rows are not fault-class facts"
+    )
+    assert result["checklist"]["faults_retention_note"] is None
+
+
+async def test_an_outlived_evidence_window_null_degrades_with_the_retention_note(
+    rig: Rig,
+) -> None:
+    """The audit window's bounded recent read no longer reaches parked_at:
+    the faults null-degrade and the note says so -- never a fabricated empty
+    list that would read as 'nothing happened while parked'."""
+    rig.observations.serve("mid", authoritative_soc_pct=50.0)
+    await rig.park(lease_s=3600)
+    # The retained trail starts AFTER the park (the older rows evicted).
+    rig.audit.events.append(
+        _fault_row("heartbeat_failed", ("suppressed_exception",), WALL + timedelta(hours=2))
+    )
+    rig.audit.retention_limit = 2  # the parked-at rows are gone from the window
+    rig.clock.advance(3 * 3600.0)  # the resume happens hours later
+    rig.actors["mid"].word = 1
+    result = await rig.resume()
+    assert result["checklist"]["faults_while_parked"] is None
+    assert result["checklist"]["faults_retention_note"] is not None
+    assert "unknowable" in result["checklist"]["faults_retention_note"]
+
+
+def _fault_row(event_type: str, codes: tuple[str, ...], occurred: datetime) -> AuditEvent:
+    return AuditEvent(
+        event_id=f"fault-{event_type}-{occurred.isoformat()}",
+        occurred_at=occurred,
+        monotonic_offset_s=1.0,
+        process_instance_id="process-1",
+        event_type=event_type,
+        unit_id="mid",
+        principal="energypod:runtime",
+        correlation_id="fleet-heartbeat",
+        policy_version="runtime",
+        configuration_version=1,
+        observation_sequences={},
+        reason_codes=codes,
+        requested_active_w=0,
+        authorized_active_w=0,
+        request_fingerprint="fingerprint",
+        response_fingerprint="fingerprint",
+        result="suppressed",
+        lifecycle=UnitLifecycle.DISARMED,
+    )

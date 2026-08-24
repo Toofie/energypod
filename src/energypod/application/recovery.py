@@ -74,13 +74,26 @@ MODE_CHECK_HINT = (
     "re-dispatch (docs/POD_RECOVERY_RESEARCH.md R2a)"
 )
 
+# DESIGN_POD_PARKING sections 1/3: the expiry hint (the pinned sentence) and
+# the terminal write-unverified posture's hint.  Resuming a device is an
+# enabling act -- an interactive operator act, never a timer.
+PARK_EXPIRY_HINT = "lease expired — Resume is an operator act"
+PARK_WRITE_UNVERIFIED_HINT = (
+    "resume write unverified — the pod may still be parked; repeat RESUME and "
+    "watch the readback, and verify the mode word in the vendor app before any "
+    "physical work (parking is not electrical isolation)"
+)
+
 
 class HealthState(StrEnum):
     """The per-unit recovery vocabulary served on snapshot and health views.
 
     Classification precedence, highest first: ``unreachable``,
     ``not_responding``, ``foreign_writer``, ``inhibited``,
-    ``actuation_incoherent``, ``self_healing``, ``healthy``.
+    ``actuation_incoherent``, ``parked``, ``self_healing``, ``healthy``.
+    The fault classes (everything above ``parked``) legitimately outrank a
+    park -- fault beats operator state, pinned so nobody "fixes" it
+    (DESIGN_POD_PARKING section 3).
     """
 
     HEALTHY = "healthy"
@@ -90,6 +103,10 @@ class HealthState(StrEnum):
     UNREACHABLE = "unreachable"
     FOREIGN_WRITER = "foreign_writer"
     INHIBITED = "inhibited"
+    # DESIGN_POD_PARKING section 3: PARKED is a COMPOSABLE state -- the
+    # healing-reason list is computed first (pure), then `("parked",
+    # *healing)`, so a parked+balancing pod keeps its balancing visibility.
+    PARKED = "parked"
 
 
 # Objective-echo classifications (P1 iii; vendor precedent MiniESapp.cs:2166
@@ -210,6 +227,12 @@ class _UnitRecord:
     claimed: bool = False
     measured_watts: float | None = None
     cell_spread_v: float | None = None
+    # DESIGN_POD_PARKING section 3: the parked inputs, fed from the lease
+    # state by the supervision pass.  ``park_expired`` and
+    # ``park_write_unverified`` name their own reasons beside ``parked``.
+    parked: bool = False
+    park_expired: bool = False
+    park_write_unverified: bool = False
 
 
 class Clock(Protocol):
@@ -302,6 +325,9 @@ class RecoveryMonitor:
         inhibit_reason: str | None,
         observation: Any,
         now_mono: float,
+        parked: bool = False,
+        park_expired: bool = False,
+        park_write_unverified: bool = False,
     ) -> CycleFindings:
         """Record one unit's cycle facts and derive the recovery view.
 
@@ -309,8 +335,10 @@ class RecoveryMonitor:
         after the heartbeats and polls: ``authorized_watts`` is the authority
         the heartbeat just consumed (peeked before the write), the
         observation is the poll's fresh decode, and ``claimed`` says whether
-        a live intent names the unit.  Returns what the runtime should do
-        next (perform the objective echo read-back on a coherence trigger).
+        a live intent names the unit.  The ``park_*`` inputs are fed from the
+        lease ledger (DESIGN_POD_PARKING section 3).  Returns what the
+        runtime should do next (perform the objective echo read-back on a
+        coherence trigger).
         """
         record = self._records.get(unit_id)
         if record is None:
@@ -323,6 +351,9 @@ class RecoveryMonitor:
         record.claimed = bool(claimed)
         record.measured_watts = measured
         record.cell_spread_v = spread
+        record.parked = bool(parked)
+        record.park_expired = bool(park_expired)
+        record.park_write_unverified = bool(park_write_unverified)
 
         trigger = self._track_coherence(record, authorized_watts, authorized_direction, measured)
         if trigger:
@@ -569,6 +600,19 @@ class RecoveryMonitor:
             low, high = settings.expected_autonomy_band_w
             if low <= measured <= high:
                 healing.append("autonomous_self_charge")
+        if record.parked:
+            # The composable park (DESIGN_POD_PARKING section 3): the healing
+            # list is computed FIRST, then ("parked", *healing) -- a parked
+            # pod balancing its cells keeps the balancing visibility.  The
+            # terminal write_unverified posture names the operator resume;
+            # expiry's hint names the operator act.
+            reasons = ("parked", *healing)
+            if record.park_write_unverified:
+                reasons = ("park_write_unverified", *reasons)
+                return HealthState.PARKED, reasons, PARK_WRITE_UNVERIFIED_HINT
+            if record.park_expired:
+                return HealthState.PARKED, reasons, PARK_EXPIRY_HINT
+            return HealthState.PARKED, reasons, None
         if healing:
             return HealthState.SELF_HEALING, tuple(healing), None
         return HealthState.HEALTHY, (), None

@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
 from typing import Any, Final, Literal, Protocol, TypeGuard
@@ -434,6 +434,7 @@ class NightChargeAdviser:
         intents: _IntentPort,
         submit: _SubmitPort,
         participation: _ParticipationPort | None = None,
+        parked_units: Callable[[], frozenset[str]] | None = None,
     ) -> None:
         self._settings = settings
         self._policy = policy
@@ -442,6 +443,12 @@ class NightChargeAdviser:
         self._intents = intents
         self._submit = submit
         self._participation = participation
+        # DESIGN_POD_PARKING section 3 (coordinator ruling 2026-08-24): the
+        # night adviser EXCLUDES parked units at selection -- resume, not
+        # arm, is the true next step, and repeatedly submitting into a
+        # standing refusal would violate the never-retry-a-denied-dispatch
+        # doctrine.  ``None`` (isolated compositions) excludes nothing.
+        self._parked_units = parked_units
         self._zone = ZoneInfo(settings.timezone)
         self._held_intent_id: str | None = None
         # Window-scoped state, reset at every window boundary (§2.4: the hold
@@ -695,6 +702,10 @@ class NightChargeAdviser:
         # 1. Eligibility, each sit-out honest (never a fabricated target).
         if observation is None:
             return self._sitting_out(unit_id, "no_charge_headroom", None), False, False
+        if unit_id in self._parked_view():
+            # DESIGN_POD_PARKING section 3: the parked exclusion outranks
+            # units_disarmed for a parked unit -- resume is the next step.
+            return self._sitting_out(unit_id, "unit_parked", observation), False, False
         lifecycle = getattr(observation, "lifecycle", None)
         if lifecycle not in _CONTROLLABLE_LIFECYCLES:
             return self._sitting_out(unit_id, "units_disarmed", observation), False, False
@@ -817,6 +828,16 @@ class NightChargeAdviser:
         else:
             self._holding_fleet = held
 
+    def _parked_view(self) -> frozenset[str]:
+        """The parked-unit selection view; a failing view excludes nothing."""
+        if self._parked_units is None:
+            return frozenset()
+        try:
+            units = self._parked_units()
+        except Exception:
+            return frozenset()
+        return frozenset(units)
+
     def _sitting_out(self, unit_id: str, reason: str, observation: Any) -> NightUnitPlan:
         soc = getattr(observation, "authoritative_soc_pct", None)
         return NightUnitPlan(
@@ -869,6 +890,12 @@ def _no_participant_reasons(plans: tuple[NightUnitPlan, ...]) -> tuple[str, ...]
     if not plans:
         return ("no_eligible_units",)
     reasons = {plan.reason for plan in plans}
+    if reasons == {"unit_parked"}:
+        # DESIGN_POD_PARKING section 3: additive, and it outranks
+        # units_disarmed -- a parked unit cannot be armed usefully anyway.
+        return ("unit_parked",)
+    if "unit_parked" in reasons and "units_disarmed" in reasons:
+        return ("unit_parked", "units_disarmed")
     if reasons == {"units_disarmed"}:
         return ("units_disarmed",)
     if reasons <= {"at_ceiling"}:

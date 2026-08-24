@@ -406,6 +406,16 @@ class PlantHistorySurface(Protocol):
     ) -> dict[str, Any]: ...
 
 
+class DeliveryBiasView(Protocol):
+    """The delivery-bias estimator's read surface (DESIGN_POD_PARKING §7).
+
+    Evidence-only: the facade projects it onto unit detail and nothing in
+    control ever reads it.
+    """
+
+    def projection(self, unit_id: str, *, now_mono: float) -> dict[str, Any]: ...
+
+
 class ParkControl(Protocol):
     """The composed park controller's facade-facing surface (block presence).
 
@@ -1095,6 +1105,7 @@ class EnergyServiceFacade:
         history: PlantHistorySurface | None = None,
         night: NightChargingControl | None = None,
         parking: ParkControl | None = None,
+        delivery_bias: DeliveryBiasView | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -1121,6 +1132,7 @@ class EnergyServiceFacade:
         self._history = history
         self._night = night
         self._parking = parking
+        self._delivery_bias = delivery_bias
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._schedule_correlations = itertools.count(1)
@@ -1233,6 +1245,20 @@ class EnergyServiceFacade:
             # DESIGN_POD_PARKING section 3: absent key when uncommissioned;
             # present (with honest nulls) whenever the block is composed.
             projection["park_state"] = dict(park_state)
+        advisory = await self._recovery_advisory(canonical_unit)
+        if advisory is not None:
+            # DESIGN_POD_PARKING section 7: present ONLY when the wedge
+            # signature holds (actuation_incoherent with an objective_not_
+            # served / echo_matches_write echo); ``commissioned: false`` is
+            # the uncommissioned-honesty state, never a silent suggestion.
+            projection["recovery_advisory"] = advisory
+        if self._delivery_bias is not None:
+            # Section 7's evidence-only label: the pinned four-key projection,
+            # never a warning and never read by any control path.
+            with contextlib.suppress(Exception):
+                projection["delivery_bias"] = self._delivery_bias.projection(
+                    canonical_unit, now_mono=float(self._clock.monotonic())
+                )
         return projection
 
     async def health(self, *, principal: Principal) -> dict[str, Any]:
@@ -3429,6 +3455,30 @@ class EnergyServiceFacade:
             return await self._parking.park_states()
         except Exception:
             return {}
+
+    async def _recovery_advisory(self, unit_id: str) -> dict[str, Any] | None:
+        """The wedge-signature soft-recovery advisory (DESIGN section 7).
+
+        Renders only when the classifier holds ``actuation_incoherent`` with
+        an ``objective_not_served``/``echo_matches_write`` echo -- the
+        wedge signature the park/resume cycle addresses.  The pinned shape
+        carries ``commissioned`` (the parking-block honesty: the advisory
+        never suggests a tool the site cannot execute) plus the matching
+        echo classifications.
+        """
+        states = await self._recovery_states()
+        view = states.get(unit_id) if states is not None else None
+        if view is None:
+            return None
+        if _enum_value(getattr(view, "state", None)) != "actuation_incoherent":
+            return None
+        reasons = [str(reason) for reason in (getattr(view, "reasons", ()) or ())]
+        echoes = [
+            reason for reason in reasons if reason in ("objective_not_served", "echo_matches_write")
+        ]
+        if not echoes:
+            return None
+        return {"commissioned": self._parking is not None, "echo_classifications": echoes}
 
     def _last_objective_summary(self, unit_id: str) -> dict[str, Any] | None:
         """The detector's COMPACT five-key per-unit summary, null on absence.

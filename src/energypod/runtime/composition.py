@@ -107,6 +107,7 @@ from energypod.application.actor import EnergyPodActor
 from energypod.application.arbiter import STOP_ACKNOWLEDGE_SCOPE, IntentArbiter
 from energypod.application.audit import AuditEventFactory
 from energypod.application.control_kernel import ControlKernel
+from energypod.application.delivery_bias import DeliveryBiasEstimator
 from energypod.application.energy import (
     EnergyAccountant,
     EnergyAccountingSettings,
@@ -1973,6 +1974,7 @@ class _Supervision:
         energy_accountant: EnergyAccountant | None = None,
         historian: TelemetryHistorian | None = None,
         parking: ParkController | None = None,
+        delivery_bias: DeliveryBiasEstimator | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -2021,6 +2023,10 @@ class _Supervision:
         # and the word-vs-ledger reconciliation ride THIS existing supervision
         # pass -- no new task class; the composition contract starts nothing.
         self._parking = parking
+        # DESIGN_POD_PARKING section 7: the delivery-bias estimator's record
+        # pass rides the same cycle (evidence-only; a failure records
+        # nothing and never delays control).
+        self._delivery_bias = delivery_bias
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
@@ -2195,6 +2201,30 @@ class _Supervision:
             if self._parking is not None:
                 with contextlib.suppress(Exception, asyncio.TimeoutError):
                     await asyncio.wait_for(self._parking.supervise(), timeout=self._interval_s)
+            if self._delivery_bias is not None and self._observations_port is not None:
+                # DESIGN_POD_PARKING section 7: one evidence pair per cycle
+                # while a unit holds positive authority (ACTIVE); fully
+                # suppressed -- observability never gates the tick.
+                with contextlib.suppress(Exception):
+                    now_mono = float(self._clock.monotonic())
+                    for actor in self._actors:
+                        held = authorized.get(actor.unit_id)
+                        if held is None or held[0] <= 0:
+                            continue
+                        observation = await self._observations_port.latest(actor.unit_id)
+                        measured = getattr(observation, "battery_watts", None)
+                        if measured is None:
+                            continue
+                        # Direction-aligned magnitude (the telemetry sign
+                        # convention is negative = charge): the pair judges
+                        # DELIVERY against the authorized figure either way.
+                        sign = -1.0 if held[1] == "charge" else 1.0
+                        self._delivery_bias.record(
+                            actor.unit_id,
+                            authorized_w=float(held[0]),
+                            measured_w=sign * float(measured),
+                            now_mono=now_mono,
+                        )
             # Night-writer detector: one bounded, fully suppressed observation
             # pass after the polls and the recovery pass (API_CONTRACTS
             # "Supervision driving") -- zero extra frames, a failed sample a
@@ -2408,6 +2438,12 @@ class _Supervision:
                 with contextlib.suppress(Exception):
                     observation = await self._observations_port.latest(unit_id)
             is_claimed = True if claimed is None else unit_id in claimed
+            # DESIGN_POD_PARKING section 3: the parked inputs fed from the
+            # lease ledger (an unwired or failing view parks nothing).
+            parked_facts: dict[str, bool] = {"parked": False, "expired": False}
+            if self._parking is not None:
+                with contextlib.suppress(Exception):
+                    parked_facts = dict(self._parking.parked_facts(unit_id))
             with contextlib.suppress(Exception):
                 findings = await self._recovery.observe_cycle(
                     unit_id,
@@ -2419,6 +2455,9 @@ class _Supervision:
                     inhibit_reason=actor.inhibit_reason,
                     observation=observation,
                     now_mono=now_mono,
+                    parked=parked_facts.get("parked", False),
+                    park_expired=parked_facts.get("expired", False),
+                    park_write_unverified=parked_facts.get("write_unverified", False),
                 )
                 if findings is not None and findings.coherence_trigger:
                     classification, served_active, served_reactive = await self._objective_echo(
@@ -2481,6 +2520,13 @@ class _Supervision:
                 with contextlib.suppress(Exception):
                     observation = await self._observations_port.latest(unit_id)
             is_claimed = True if claimed is None else unit_id in claimed
+            # DESIGN_POD_PARKING section 3: samples observed on a PARKED unit
+            # carry the unit_parked annotation (never silent, never an alert
+            # by itself); an unwired or failing view annotates nothing.
+            is_parked = False
+            if self._parking is not None:
+                with contextlib.suppress(Exception):
+                    is_parked = bool(self._parking.parked_facts(unit_id).get("parked"))
             with contextlib.suppress(Exception):
                 await monitor.observe_cycle(
                     unit_id,
@@ -2489,6 +2535,7 @@ class _Supervision:
                     authorized_watts=0 if held is None else held[0],
                     observation=observation,
                     now_mono=now_mono,
+                    parked=is_parked,
                 )
 
     async def _record_suppressed_heartbeat(
@@ -3638,6 +3685,12 @@ def _build_runtime(
             tariff=registry_tariff,
             notes=tuple(registry_notes),
         )
+    # --- delivery-bias estimator (DESIGN_POD_PARKING section 7) -----------
+    # Composed ALWAYS (evidence-only, no config, no control path reads it):
+    # supervision records the peeked-authorization vs measured pairs while a
+    # unit is ACTIVE, and unit detail/MCP project the bounded window.
+    delivery_bias = DeliveryBiasEstimator(unit_ids=unit_ids)
+
     facade = _ComposedFacade(
         site_id=config.site.site_id,
         clock=resolved_clock,
@@ -3656,11 +3709,23 @@ def _build_runtime(
         energy=energy_surface,
         history=history_surface,
         parking=park_controller,
+        delivery_bias=delivery_bias,
     )
     if park_controller is not None:
         # The park controller's conflict/resume guards read the facade's own
         # latched-stop registry (fleet-wide stops name every unit).
         park_controller.bind_latched_stop_units(facade)
+
+    def _parked_units() -> frozenset[str]:
+        """The advisers' selection-side exclusion view (DESIGN_POD_PARKING
+        section 3): the lease ledger's parked units; a missing controller
+        parks nothing."""
+        if park_controller is None:
+            return frozenset()
+        try:
+            return park_controller.parked_unit_ids()
+        except Exception:
+            return frozenset()
 
     # --- excess-solar advisory composition ---------------------------------
     excess_adviser: ExcessChargeAdviser | None = None
@@ -3690,6 +3755,7 @@ def _build_runtime(
             )
 
         excess_adviser = ExcessChargeAdviser(
+            parked_units=_parked_units,
             settings=ExcessChargeSettings(
                 assumed_autonomous_charge_w=excess_config.assumed_autonomous_charge_w,
                 min_acceleration_w=excess_config.min_acceleration_w,
@@ -3744,6 +3810,7 @@ def _build_runtime(
             )
 
         schedule_runner = ScheduleRunner(
+            parked_units=_parked_units,
             store=schedule_surface,
             evaluator=ScheduleEvaluator(intent_ttl_s=float(schedule_config.intent_ttl_s)),
             clock=resolved_clock,
@@ -3794,6 +3861,7 @@ def _build_runtime(
             )
 
         night_adviser = NightChargeAdviser(
+            parked_units=_parked_units,
             settings=NightChargeSettings(
                 rate_cap_w=int(night_config.rate_cap_w),
                 hold_rate_w=int(night_config.hold_rate_w),
@@ -3887,6 +3955,7 @@ def _build_runtime(
         energy_accountant=energy_accountant,
         historian=historian,
         parking=park_controller,
+        delivery_bias=delivery_bias,
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision
