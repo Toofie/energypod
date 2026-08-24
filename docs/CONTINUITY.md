@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the history strip geometry fix — the bands render inside the box)
+Last updated: 2026-08-25 (Australia/Brisbane; the history strip's fitted band labels — measured pixels, tiered honest words, never an ellipsis)
 
 ## Purpose
 
@@ -373,6 +373,47 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (history strip fitted band labels — NEVER A MID-WORD
+  ELLIPSIS; 1b9d6a7, web-only): the operator's second strip report —
+  in-bar text ALWAYS truncated. DIAGNOSIS: StripSegments placed one
+  fixed label per band with CSS ellipsis (nowrap + text-overflow), and
+  the Commanded row used the FULL clause as the label ("the
+  night-charge adviser — charging 2,500 W" ≈ 284 px on a 231 px band) —
+  unfixable by construction; a 12-minute self-healing sliver (≈12 px)
+  could never hold "Self-healing" (~70 px). DESIGN (grounded in
+  Highcharts xrange dataLabels crop/inside, vis-timeline clipping, and
+  d3-time-format's abbreviation ladder; primary docs fetched directly
+  when Firecrawl/WebSearch rate-limited): tiered short words chosen
+  against MEASURED pixels — every candidate renders once in a hidden
+  measurer (.history-band-measure) under the band's font rules, row
+  width read pre-paint + ResizeObserver, and the pure fittingBandLabel
+  chooser (history.ts) walks the tiers fullest → shorter honest word →
+  none. Commanded bars carry SOURCE short words (night adviser/night,
+  solar adviser/solar, manual, agent, schedule, optimizer, nothing
+  commanded/none) keyed on the clause's null rule; no-intent stretches
+  render quieter (pale cream vs gold). Lifecycle/health compact tiers
+  only where no different claim ("Self-healing" → "Healing";
+  deliberately NO tier for "Armed and idle" or "Foreign writer").
+  GUARDS: 68d0f04's geometry untouched, its regression test passes
+  unchanged; the change-point listing stays byte-identical as the
+  accessible surface; tooltips unchanged; unmeasurable DOM (jsdom)
+  renders the fullest tier — suppression only by measured refusal.
+  GATES: 961 web tests green (37 files), tsc -b clean, build green, 99
+  shots regenerated; independent native-resolution vision check —
+  Lifecycle "Disarmed", Health "Healthy", Commanded "nothing
+  commanded"/"night adviser"/"none", zero ellipsis fragments at any
+  viewport; narrow-390 honestly renders bare slivers with the listing
+  carrying them.
+
+- 2026-08-25 (PVOutput reporting integration — RESEARCH COMPLETE, NO
+  CODE, AWAITING OPERATOR DECISIONS): a second workstream delivered the
+  PVOutput reporting-integration design; the full report was relayed to
+  the operator. BLOCKED ON OPERATOR INPUT: cutover ordering (the Docker
+  container is BOTH the site's night writer AND the current PVOutput
+  v7–v12 writer — its stand-down now has TWO consumers), v1–v6 history
+  ownership, and donation-tier confirmation. No implementation until
+  those decisions land.
 
 - 2026-08-25 (history strip geometry — THE BANDS RENDER INSIDE THE BOX;
   68d0f04, web-only): the operator reported EMPTY band boxes with the
