@@ -290,7 +290,7 @@ All entries are holding registers. Counts are 16-bit registers. `i` is zero-base
 | `0x8036` / 32822 | 1 | Parameter-setting enable | **Confirmed by vendor code** | `MiniESapp.cs:2524-2573` |
 | `0x8037` / 32823 | 1: `0xFF00` | Clear battery low-voltage protection latch | **Confirmed by vendor code** | `MiniESapp.cs:2576-2588` |
 
-The maintenance/configuration writes are evidence only. They are not safe production-control interfaces.
+The maintenance/configuration writes are evidence only. They are not safe production-control interfaces — with one sanctioned exception (2026-08-24): the `0x8000` debug-mode write at values {0, 1} composes the guarded parking surface of `docs/DESIGN_POD_PARKING.md` §5; every other write in this table, and values 2–6 of `0x8000`, remain evidence-only.
 
 ## 6. Field decoding, signedness, scaling, and endianness
 
@@ -466,12 +466,12 @@ No persistent charge/discharge override is established by the evidence. The leas
 
 ## 8. Debug / maintenance modes
 
-The mode is written with FC16 to `0x8000` and read from `0x8100`. The UI immediately rereads after a selection. The names and values are confirmed; firmware-side behavior is not present in the application.
+The mode is written with FC16 to `0x8000` and read from `0x8100`. The UI immediately rereads after a selection. The names and values are confirmed; firmware-side behavior is not present in the application. Values 0 and 1 are additionally **live-observed on this fleet** (2026-08-24, the authorized standby-cycle trial, `docs/evidence/standby-cycle-2026-08-24.md`; the sanctioned product surface is `docs/DESIGN_POD_PARKING.md`); values 2–6 remain vendor-label-only and permanently unexposed.
 
 | Value | Vendor UI name | Classification of name/value | What the evidence proves about function |
 |---:|---|---|---|
-| 0 | Normal Mode | **Confirmed by vendor code** | Required by this UI before PQ dispatch. Exact autonomous strategy is **Unknown**. |
-| 1 | Standby | **Confirmed by vendor code** | Label only; voltage, contactor, and trickle behavior are **Unknown**. |
+| 0 | Normal Mode | **Confirmed by vendor code** | **Live-observed on this fleet (2026-08-24, docs/evidence/standby-cycle-2026-08-24.md)**: required before PQ dispatch (the vendor sender's precondition, `MiniESapp.cs:2180-2184`) and the return-to-state — the exit write `0x8000 ← 0` returned the pod to Normal, readback 0 within ~1 s, autonomy resumed immediately, no wedge. Exact autonomous strategy is **Unknown**. |
+| 1 | Standby | **Confirmed by vendor code** | **Live-observed on this fleet (2026-08-24, docs/evidence/standby-cycle-2026-08-24.md)** on rhs — exactly what was observed: enter (`0x8000 ← 1`, readback 1 within ~2 s), park behavior (PCS stops participating — measured power → 0; comms, telemetry, pack voltage ~166 V, and SOC reporting stay alive; NOT electrical isolation), exit (`0x8000 ← 0` → readback 0 within ~1 s, no wedge; a parked pod still ACKs writes — the ACK-then-ignore model). Contactor state and trickle behavior are **Unknown**. |
 | 2 | Charge | **Confirmed by vendor code** | Label only; power/current target, termination, and protections are **Unknown**. |
 | 3 | Discharge | **Confirmed by vendor code** | Label only; power/current target, termination, and protections are **Unknown**. |
 | 4 | Circulation | **Confirmed by vendor code** | Label only; whether this cycles charge/discharge and under what limits is **Unknown**. |
@@ -591,7 +591,7 @@ These are intentionally unresolved:
 8. Exact Waveshare model/configuration, serial-side baud/parity settings, frame boundary behavior, idle timeout, and reconnect behavior.
 9. Raw RTU-over-TCP request/response bytes for representative reads, full PQ write, active-only write, exception response, and timeout.
 10. Meanings of reserved bits and whether maps differ by firmware version or layout.
-11. Firmware semantics, entry conditions, targets, termination, persistence, and interruption behavior for Standby, Charge, Discharge, Circulation, Fixing SOC, and Verify Capacity debug modes.
+11. Firmware semantics, entry conditions, targets, termination, persistence, and interruption behavior for the Charge, Discharge, Circulation, Fixing SOC, and Verify Capacity debug modes (values 2–6 — still vendor-label-only, no live evidence). For Standby and Normal (values 1/0) the enter/park-behavior/exit and return-to-state semantics are now live-observed (§8; `docs/evidence/standby-cycle-2026-08-24.md`, `docs/DESIGN_POD_PARKING.md` §0), but persistence across a power cycle was NOT observed and stays open — for every value including 0 and 1 — alongside contactor state and trickle behavior.
 12. Engineering unit for the system-history counters at `0x0103..0x0106`.
 13. Actual legacy PCS inverter-current register (the application likely decodes the wrong offset).
 14. IoT cell/temperature/balance layout for BIC counts greater than six.
@@ -612,6 +612,6 @@ This section is not an implementation design; it defines what evidence would be 
 | Unit identity/layout | Read-only identity, firmware, `0x5000` probe, BIC count, and cell-range snapshot for each configured endpoint |
 | Fault mapping | Injected or naturally observed raw word correlated with application log and workbook bit description |
 | Active-only command equivalence | Side-by-side trace and measured behavior for vendor full write versus `0x0201`-only write |
-| Any debug/maintenance mode | Official service documentation plus controlled, isolated procedure approved for that mode |
+| Any debug/maintenance mode | Split (2026-08-24, `docs/DESIGN_POD_PARKING.md` §11): values {0, 1} are superseded — by the authorized live trial (`docs/evidence/standby-cycle-2026-08-24.md`) and by the design's guarded parking surface (the `{0, 1}`-whitelisted `write_debug_mode` path: operator-only, typed confirmation, leased, audited per write); values 2–6 are unchanged — official service documentation plus controlled, isolated procedure approved for that mode |
 
-Until those gates are met, the only control facts suitable for implementation are the vendor application's full PQ frame shape, signed 16-bit encoding, normal-debug-mode precondition used by the UI, and explicit zero-on-stop behavior. Even those require a non-actuating byte-level simulator test before any live write.
+Until those gates are met, the only control facts suitable for implementation are the vendor application's full PQ frame shape, signed 16-bit encoding, normal-debug-mode precondition used by the UI, and explicit zero-on-stop behavior — plus, from 2026-08-24, the sanctioned {0, 1} standby writes under the parking design's guarded surface only. Even those require a non-actuating byte-level simulator test before any live write.

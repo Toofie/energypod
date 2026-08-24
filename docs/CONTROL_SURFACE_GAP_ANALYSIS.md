@@ -135,7 +135,7 @@ effect and a classification:
 
 | Control | Wire effect | Class |
 |---|---|---|
-| Debug mode combo: Normal Mode / Standby / Charge / Discharge / Circulation / Fixing SOC / Verify Capacity (values 0-6) | Bind list `bindDebugModeType` `MiniESapp.cs:2101-2157`; any selection writes one register at `0x8000` via `SendSysCtrl` and immediately rereads `0x8100` (`MiniESapp.cs:2159-2170`; readback `DebugModeRead` `SysControl.cs:372-396`). Mode names `GlobalFun.cs:152-165`. Firmware behavior of every non-zero value is Unknown (PROTOCOL_EVIDENCE §8). | **(c) — excluded from product exposure.** Read-only visibility of the word is recommended (Part 3, R1); the write never surfaces. |
+| Debug mode combo: Normal Mode / Standby / Charge / Discharge / Circulation / Fixing SOC / Verify Capacity (values 0-6) | Bind list `bindDebugModeType` `MiniESapp.cs:2101-2157`; any selection writes one register at `0x8000` via `SendSysCtrl` and immediately rereads `0x8100` (`MiniESapp.cs:2159-2170`; readback `DebugModeRead` `SysControl.cs:372-396`). Mode names `GlobalFun.cs:152-165`. Firmware behavior of values 2-6 is Unknown (PROTOCOL_EVIDENCE §8); values 0/1 are live-observed 2026-08-24 (`docs/evidence/standby-cycle-2026-08-24.md`). | **(c) for values 2-6 — excluded from product exposure, permanently.** Read-only visibility of the word is recommended (Part 3, R1); those writes never surface. **(a) for values {0, 1} — the one sanctioned exception (2026-08-24):** Normal/Standby compose the guarded pod-parking surface (`docs/DESIGN_POD_PARKING.md`) — operator-only park/resume with typed confirmation, lease, durable-first audit, and a transport-level {0,1} whitelist (Part 4). |
 
 ### 2.4 Settings page — device configuration writes
 
@@ -409,9 +409,16 @@ product advantages that no gap-closing work should erode:
    ids — the vendor logs only fault transitions to a local file.
 7. **Scoped, rotatable credentials**; no shared hardcoded passwords; browser
    sessions use single-use tickets, never query-string tokens.
-8. **No maintenance surface at all**: the product is structurally incapable of the
-   writes in Part 4 (the transport write gate permits only `0x0200` PQ;
-   `register_layout.py:93-94`, API_CONTRACTS "Write-enabled run mode").
+8. **No maintenance surface except exactly one guarded act** (amended 2026-08-24):
+   the transport write gate permits only `0x0200` PQ and the debug-mode word at
+   `0x8000` restricted to values {0, 1} through the named `write_debug_mode`
+   path composed only when a `parking:` block is present
+   (`register_layout.py:93-94`; API_CONTRACTS "Write-enabled run mode" and
+   "Pod parking"; `docs/DESIGN_POD_PARKING.md` §5). Park/resume is the product's
+   one maintenance-class act — operator-only, typed-confirmation, leased,
+   audited per write, values 2-6 structurally refused — live-proven
+   (`docs/evidence/standby-cycle-2026-08-24.md`). Every other Part 4 write
+   remains structurally impossible.
 9. **Fleet-native** identity-pinned units, per-unit topology commissioning, and
    honest not-yet placeholders instead of dead controls.
 
@@ -428,7 +435,7 @@ appear in the console, REST, or MCP — not gated, not role-hidden, not
 
 | Excluded capability | Wire write | Evidence |
 |---|---|---|
-| Debug/service mode selection — Standby, Charge, Discharge, Circulation, Fixing SOC, Verify Capacity (any non-zero value) | `0x8000` (values 0-6) | PROTOCOL_EVIDENCE §8; write site `MiniESapp.cs:2159-2170`; firmware semantics Unknown for all non-zero values |
+| Debug/service mode selection — Charge, Discharge, Circulation, Fixing SOC, Verify Capacity (values 2-6), and any use of the mode register outside the parking exception below | `0x8000` (values 2-6 always; and any {0, 1} write composed outside the parking surface) | PROTOCOL_EVIDENCE §8 (values 2-6 label-only, permanently unexposed); write site `MiniESapp.cs:2159-2170`; `docs/DESIGN_POD_PARKING.md` §0 |
 | Clear historical energy counters | `0x8001` + `0xFF00` | PROTOCOL_EVIDENCE §5 writes table; write sites `MiniESapp.cs:2262-2275, 2444-2459`; CONTINUITY 2026-08-21 (evidenced and kept absent from production interfaces) |
 | Clear battery low-voltage protection (defeats a <2.0 V/cell startup lockout) | `0x8037` + `0xFF00` | PROTOCOL_EVIDENCE §5; write site `MiniESapp.cs:2576-2590` |
 | Device identity/network/grid-standard configuration: RS485 params, MAC, server IPs/ports, serial number, grid standard, region, DRED enable, parameter-set enable | `0x8002`, `0x8008`, `0x8018`, `0x8034`, `0x8035`, `0x8036` | PROTOCOL_EVIDENCE §5; write sites `SysControl.cs:1478-1527`, `MiniESapp.cs:2277-2402, 2487-2574`. Commissioning/service procedures at most, separately evidenced — never console surface |
@@ -436,9 +443,21 @@ appear in the console, REST, or MCP — not gated, not role-hidden, not
 | Prior-attempt pseudo-contracts: `0x0201` active-only writes, `EssForceState` values at 512, `0x1001` "function selected" writes, 40120-40124 "passive-voltage profile" | see table | PROTOCOL_EVIDENCE §12 — rejected claims that must not become contracts |
 | Reactive-power (Q) control as an operator capability | `0x0200` word 3 | PROTOCOL_EVIDENCE §13 item 6 (reactive limits/feasibility unresolved); policy reactive limit is zero by default |
 
-Two boundary notes. First, mode-word **read** (`0x8100`, `0x0100+1/+2`) is not only
-allowed but recommended (R1) — the exclusion is on the write and on treating
-non-Normal modes as product features. Second, if a maintenance function is ever
+Three boundary notes. First, mode-word **read** (`0x8100`, `0x0100+1/+2`) is not only
+allowed but recommended (R1) — the exclusion is on the write outside the parking
+exception, and on treating any mode other than the sanctioned Standby/Normal pair
+as a product feature. Second, the **{0, 1} parking exception** (2026-08-24,
+`docs/DESIGN_POD_PARKING.md` §5, superseding the blanket write exclusion for
+exactly those two values; live trial `docs/evidence/standby-cycle-2026-08-24.md`)
+carries four doctrine-preserving conditions, all required: (1) a separately named
+`write_debug_mode(value)` transport method — the generic `write_registers` path can
+NEVER reach `0x8000`, pinned by an architecture-fitness test; (2) transport-layer
+{0, 1} validation (the bound is structural, not caller discipline; values 2-6
+permanently unexposed); (3) a per-write ledger promise — every call appends exactly
+one durable-first audit row with prior/written/readback words and actor; (4) the
+write catalog admission (`_WRITE_BLOCKS`) composed only when a `parking:` block is
+present on a write-enabled site — operator-only REST routes with typed
+confirmation and lease, never MCP. Third, if any other maintenance function is ever
 genuinely needed (for example a vendor-sanctioned capacity verification), the
 roadmap's bar applies: an isolated, locally enabled service procedure after vendor
 behaviour, termination conditions, and hazards are independently established — a

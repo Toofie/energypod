@@ -109,7 +109,9 @@ For each configured fleet unit, inside the window and while enabled:
    never in the submitted unit set — "batteries already at the ceiling sit
    out"); dynamic limit 0 W (rhs tonight) → `no_charge_headroom` (the BMS's
    own honest refusal — the adviser does not ask what the battery just
-   refused); not controllable → `units_disarmed`.
+   refused); not controllable → `units_disarmed`; parked → `unit_parked`
+   (2026-08-24, `docs/DESIGN_POD_PARKING.md` §3 — outranks `units_disarmed`
+   for a parked unit: resume, not arm, is the true next step).
 2. **Target.** Reach `policy.max_soc_pct` (95) by window end. A unit already
    at/above it sits out for the whole window (`skipped_full`).
 3. **The rate, under the pinned pacing rule** (config `pacing`, two values):
@@ -552,9 +554,12 @@ mirror); `active` derives from `held_intent_id`, never a lifecycle guess:
   `on_plan`, `deadline_at_risk`, `demand_above_threshold`,
   `demand_below_exit`, `demand_evidence_missing`, `demand_evidence_bad`,
   `demand_evidence_stale`, `at_ceiling`, `no_charge_headroom`,
-  `target_reached`, `no_eligible_units`, `units_disarmed`,
+  `target_reached`, `no_eligible_units`, `units_disarmed`, `unit_parked`,
   `yielding_to_higher_priority`, `disabled_by_config`, `disabled_by_runtime`,
-  `night_acknowledgement_required`.
+  `night_acknowledgement_required` (`unit_parked` added 2026-08-24,
+  `docs/DESIGN_POD_PARKING.md` §3 — additive, and it outranks
+  `units_disarmed` for a parked unit: resume, not arm, is the true next
+  step).
 - Countdowns (`window_ends_in_s`, `next_window_at`) are snapshot-derived; the
   pure window helpers are the single implementation (§2.3).
 

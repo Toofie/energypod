@@ -108,6 +108,7 @@ for the same facts is exactly the drift class the EE-calibration incident taught
 | `no_acceleration_over_autonomy` | tick (verbatim) | achievable < autonomy + `min_acceleration_w`; taking over would slow charging |
 | `below_exit_hysteresis` | tick (verbatim) | was intervening; achievable fell to the exit threshold — handing back |
 | `no_eligible_target` | tick (verbatim) | no unit is controllable, under the SOC ceiling, and headroom-positive |
+| `unit_parked` | projection (2026-08-24, DESIGN_POD_PARKING §3) | renders in place of `no_eligible_target` when every otherwise-eligible unit's exclusion cause is park — resuming is an operator act, never the adviser's |
 | `yielding_to_higher_priority` | tick (verbatim) | a live emergency stop, or a manual/agent intent claims the target |
 | `export_headroom_available` | tick (verbatim) | commanding (propose/renew) |
 
@@ -390,6 +391,9 @@ feature's whole story in one glance.
     own charging."
   - `no_eligible_target` → "Solar surplus available, but no battery needs
     charging (full, inhibited, or not armed)."
+  - `unit_parked` → "Solar surplus available, but the battery is parked —
+    resuming it is an operator act." (DESIGN_POD_PARKING §3, 2026-08-24;
+    renders in place of `no_eligible_target` when park is the exclusion cause)
   - `yielding_to_higher_priority` → "Standing down — a manual request has
     {target_unit_id}."
 - Per-phase figures in the tile body: one row per unit from the snapshot's

@@ -376,24 +376,30 @@ this section is the wire contract.
   `held_intent_id`): `{version, active, entry_id, held_intent_id, ends_at, ends_in_s, next,
   posture, last_action: idle|submit|renew|remove, last_tick_at, reason_codes}` with the pinned
   vocabulary `no_plan | no_window_open | window_open | waiting_for_higher_priority |
-  window_ended | plan_changed | units_disarmed` (`units_disarmed`: a window is open and the
+  window_ended | plan_changed | units_disarmed | unit_parked` (`units_disarmed`: a window is open and the
   plan holds, but no unit is controllable — the fleet sits disarmed, so the runner still
   publishes its claim yet nothing can act on it; joins the list additively, outranks
-  `waiting_for_higher_priority`).
+  `waiting_for_higher_priority`; `unit_parked` — 2026-08-24, DESIGN_POD_PARKING §3 —
+  the same mechanism verbatim: the runner does NOT exclude parked units, it submits the
+  published fact, the facade refuses `device_debug_mode_active` with park provenance, and
+  the projection carries the code).
 
 ## API and MCP
 
 - REST is versioned at `/api/v1`. The service API uses bearer authentication; reads require
   `observe` (and audit additionally requires `audit:read`), intent mutations require `dispatch`,
-  and arming requires both `arm` and an interactive human principal. Maintenance is absent. The
+  and arming requires both `arm` and an interactive human principal. Maintenance is absent except
+  the one guarded parking surface ("Pod parking" below — operator-only REST, never MCP). The
   browser session/OIDC adapter is a separate boundary and must use secure HTTP-only same-site
   cookies, CSRF protection, trusted origins, and recent-authentication policy before deployment; a
   raw ambient cookie is never accepted as a service-API bearer credential.
 - MCP is read-only by default. Optional dispatch requires explicit configuration, the `dispatch`
   scope, and a separately issued rotatable automation credential (human operator sessions may also
   hold that scope). It submits ordinary bounded, expiring intents and cannot arm, acknowledge stops
-  or inhibits, change policy, or use debug/maintenance modes. Its audit view requires both
-  `observe` and `audit:read`, matching the REST boundary.
+  or inhibits, change policy, or use debug/maintenance modes — park/resume is the one
+  debug/maintenance-class capability, and it is an operator-only REST surface (interactive human
+  principal, typed confirmation; never an MCP tool — DESIGN_POD_PARKING §1/§11). Its audit view
+  requires both `observe` and `audit:read`, matching the REST boundary.
 - The MCP read surface (2026-08-24) is `get_snapshot`, `get_unit_detail(unit_id)` (the REST
   `GET /api/v1/units/{unit_id}` projection verbatim, `observe`; a malformed or unknown unit id is
   a tool error, never an empty view), `get_health`, `get_schedule()` (the Schedule §5 GET view as
@@ -489,10 +495,17 @@ this section is the wire contract.
     the beyond-band objective still latches. No acknowledgement or
     classification is ever persisted — boot stays observe-only and a fresh
     process holds no provenance (unchanged).
-- The only writable registers remain `[1, signed P, signed Q]` at `0x0200`
-  (negative P = charge, positive P = discharge — live-proven 2026-08-22);
-  the transport write gate is unchanged and no other address is writable by
-  any composition, mode, or tool.
+- The writable registers are exactly two named blocks with value domains
+  (DESIGN_POD_PARKING §5, 2026-08-24): `[1, P, Q]` at `0x0200` (negative P =
+  charge, positive P = discharge — live-proven 2026-08-22) and the debug-mode
+  word at `0x8000` with `v ∈ {0, 1}` (live-proven 2026-08-24,
+  `docs/evidence/standby-cycle-2026-08-24.md`), reachable only through the
+  separately named `write_debug_mode(value)` transport method — the generic
+  `write_registers` path can never reach `0x8000` (pinned by an
+  architecture-fitness test), the {0, 1} bound is enforced at the transport
+  layer, and the named method is composed only when a `parking:` block is
+  present (§5.1 there; values 2–6 remain permanently unexposed). No other
+  address is writable by any composition, mode, or tool.
 - Emergency stop, fence, and shutdown behavior are unchanged and dominate
   renewal; a latched stop or inhibit during ACTIVE stops renewal writes
   immediately and issues the bounded zero.
@@ -888,7 +901,9 @@ observes it. `reason_codes` is ONE pinned vocabulary — the tick's own codes ve
 `no_eligible_target`, `yielding_to_higher_priority`, `export_headroom_available`) plus
 exactly the projection states the tick alone cannot see (`disabled_by_config`,
 `disabled_by_runtime`, `economics_acknowledgement_required`, `export_evidence_missing`,
-`export_evidence_bad`, `export_evidence_stale`); it is never empty. When the rollup
+`export_evidence_bad`, `export_evidence_stale`, and `unit_parked` — 2026-08-24,
+DESIGN_POD_PARKING §3 — which renders in place of `no_eligible_target` when every
+otherwise-eligible unit's exclusion cause is park); it is never empty. When the rollup
 collapses, the evidence word REPLACES `no_export_headroom` (whose definition requires GOOD
 evidence).
 
@@ -1120,7 +1135,10 @@ temperature_max_c`); `points` 50..2000 (default 600). Errors: 422
   with `device_mode_not_remote: [units]` while its ctrlMode is not Remote (2 = Local). Absent
   evidence — a read plan without the mode blocks, or a unit yet to publish — refuses nothing: the
   advisory doctrine, with the safety kernel's staleness gates as the backstop. The controller never
-  writes `0x8000`/`0x0101`; the mode words are read-only evidence.
+  writes `0x0101`; `0x8000` is written only as the {0, 1} parking exception (the named
+  `write_debug_mode` path under the `parking:` block, DESIGN_POD_PARKING §5 — live-proven
+  2026-08-24, `docs/evidence/standby-cycle-2026-08-24.md`; values 2–6 structurally refused);
+  outside that exception the mode words are read-only evidence.
 - Read-plan tier correction + fresh re-read before refusal (SYNC_RESILIENCE_AUDIT B5, 2026-08-24):
   the system overview block (0x0100 — ctrlMode +1, workMode +2, the advisory system SOC +17) rides
   the COLD RING (one window every 8th cycle, ~108 s rotation) — it is no longer a once-per-process
@@ -1484,8 +1502,10 @@ non-participants. Full design and rationale: `docs/DESIGN_NIGHT_CHARGE.md`.
   vocabulary (ONE): `outside_window, window_open, on_plan, deadline_at_risk,
   demand_above_threshold, demand_below_exit, demand_evidence_missing, demand_evidence_bad,
   demand_evidence_stale, at_ceiling, no_charge_headroom, target_reached,
-  no_eligible_units, units_disarmed, yielding_to_higher_priority, disabled_by_config,
-  disabled_by_runtime, night_acknowledgement_required`. Bus
+  no_eligible_units, units_disarmed, unit_parked, yielding_to_higher_priority,
+  disabled_by_config, disabled_by_runtime, night_acknowledgement_required`
+  (`unit_parked` — 2026-08-24, DESIGN_POD_PARKING §3 — joins additively and outranks
+  `units_disarmed` for a parked unit: resume, not arm, is the true next step). Bus
   `night_charge.state_changed`: published on the semantic tuple `(enabled, enabled_origin,
   acknowledged_partition, active, phase, active_unit_ids, demand_evidence, reason_codes)`
   — watts/SOC ride but never trigger — with the 30 s heartbeat while enabled and NOTHING
@@ -1498,6 +1518,197 @@ non-participants. Full design and rationale: `docs/DESIGN_NIGHT_CHARGE.md`.
   cutover sequence (grant → arm → stand Docker down → enable → one supervised night →
   decommission, verified by the night-writer detector's quiet window) and the verbatim
   operator decisions: DESIGN_NIGHT_CHARGE §3.4 and §8.
+
+## Pod parking (the sanctioned standby mode — DESIGN_POD_PARKING, 2026-08-24)
+
+Parking a pod writes the vendor debug-mode register `0x8000 ← 1` (Standby)
+through the controller's named `write_debug_mode` transport path; resuming
+writes `0x8000 ← 0` (Normal). Live-proven on rhs 2026-08-24
+(`docs/evidence/standby-cycle-2026-08-24.md`): Standby parks the PCS control
+path (measured power → 0) while comms, telemetry, pack voltage, and SOC
+reporting stay alive, and the exit write returns the pod to Normal in ~1 s with
+no wedge. **Parking is not electrical isolation** — the battery stays connected
+at full voltage (166 V observed while parked); never perform physical work on a
+parked pod, and the lease countdown is policy, never safety. Values 2–6
+(Charge, Discharge, Circulation, Fixing SOC, Verify Capacity) are permanently
+unexposed: unreachable in code (transport-layer {0, 1} validation), refused on
+approach, never normalized by any surface. Full doctrine, lease durability,
+restart semantics, simulator contract, and test matrix:
+`docs/DESIGN_POD_PARKING.md`; this section pins the wire-facing shapes.
+
+All three routes require the `arm` scope AND an interactive human principal
+plus an Idempotency-Key (the shared `mutation()` wrapper); refusals are typed
+409 envelopes with pinned details shapes.
+
+### POST /api/v1/units/{unit_id}/park
+
+Request: `{"confirmation": "PARK", "reason": "<1..500, required>", "lease_s":
+<60..max_lease_s, optional, default min(default_lease_s, max_lease_s)>}`.
+
+200: `{unit_id, action: "park", prior_word, written_value: 1, readback_word,
+verified: true, as_of, lease: {parked_at, expires_at, max_total_s, reason,
+authorizer, epoch}, prior_state: {lifecycle, measured_watts}}`. The response is
+synchronous, not an action object — write→readback is one serialized actor
+operation bounded well under a second; a replayed Idempotency-Key answer
+describes the ORIGINAL operation, never current state, and a retried park
+after restart or entry eviction resolves as `park_already_parked`.
+
+Refusals, details shapes pinned:
+
+- 409 `park_not_commissioned` — no `parking:` block, or mode not
+  write_enabled: `{"cause": "block_absent" | "mode_not_write_enabled"}`.
+- 409 `park_conflict_refused` — armed / under intent / latched stop:
+  `{"units": [{"unit_id", "cause"}]}` (the arm outcomes shape; singular unit on
+  a per-unit route).
+- 409 `park_already_parked` — `{"lease": {...}}`; renew instead.
+- 409 `park_mode_out_of_scope` — `prior_word ∈ {2..6}`:
+  `{"prior_word", "vendor_name"}` (GlobalFun.cs:152-165). The controller never
+  transitions a vendor-directed mode it did not set.
+- 409 `park_write_failed` — transport refused/timeout: `{"error_class"}`. One
+  bounded retry, then refuse.
+- 409 `park_readback_unverified` — ACKed but 0x8100 ≠ 1 after ONE retry:
+  `{"prior_word", "written_value", "readback_word", "retries"}`. No lease; the
+  `write_unverified` posture applies if the word moved.
+
+### POST /api/v1/units/{unit_id}/park/renew
+
+Request: `{"confirmation": "RENEW", "lease_s": <60..cap, required>}` — sliding:
+`new expires_at = now + lease_s`, never past `parked_at + max_lease_s`
+(anti-rollover; after expiry a NEW park requires fresh confirmation — an
+ordinary `PARK`, keyed to a new lease). 200 mirrors park's lease object plus
+`as_of`. Refusals: 409 `park_lease_cap_reached` (`{"parked_at", "max_total_s",
+"requested_expires_at"}`) and 409 `park_lease_absent` (never parked / already
+closed — details carry the closing row's origin and time).
+
+### POST /api/v1/units/{unit_id}/resume
+
+Request: `{"confirmation": "RESUME", "takeover": "FOREIGN"?}` — `takeover` is
+required exactly when `prior_word == 1` with no controller lease (the arm
+takeover pattern: per-request, audited `foreign_takeover_acknowledged`, never
+persisted). Resuming our own expired lease needs no takeover — the operator's
+fresh RESUME is the act.
+
+200: `{unit_id, action: "resume", prior_word, written_value: 0, readback_word,
+verified: true, as_of, origin: "operator" | "foreign" | "none", checklist:
+{comms_age_s, soc_drift_pct, soc_pct_at_park, measured_watts_now,
+faults_while_parked, faults_retention_note, latched_stops: [ids],
+latched_inhibit: bool}}`. Resume on a Normal word is a no-op 200, `origin:
+"none"` — idempotent honesty, no error theater.
+
+Refusals: the commissioning/write/readback twins above; 409
+`park_foreign_word_acknowledgement_required` (`{"acknowledgement": "FOREIGN",
+"prior_word", "observed_since"}`); 409 `park_mode_out_of_scope` for
+`prior_word ∈ {2..6}` — normalizing a vendor-directed mode is its own
+acknowledged act, never a resume alias; 409 `resume_stop_latched` when a
+latched emergency stop names the unit (resume would re-enable autonomy under a
+standing stop instruction — acknowledge the stop first).
+
+### Audit doctrine pins that shape the responses
+
+- **Durable-first, no inverse** (the `acknowledge_inhibit` pattern): the audit
+  row is appended BEFORE the register write with `result: pending`, then
+  completed (`parked` / `refused`) by the verified write→readback. A failed
+  append refuses the park (fail-closed, retryable); a failed write leaves
+  `refused`, mints no lease, and — if the word actually moved — takes the
+  `write_unverified` posture. A resume is never rolled back by bookkeeping;
+  `degraded: [audit_unavailable]` rides the response exactly like disarm's.
+- **The lease is the expiry ALARM, not the expiry ACTOR**: at TTL expiry the
+  controller performs no write — it appends `unit_park_expired`, publishes the
+  alert-tier event, moves the projection to `{parked: true, expired: true}`, and
+  holds `health_state: PARKED` with the hint "lease expired — Resume is an
+  operator act". Boot reconstructs and alarms the same way; boot never parks,
+  never un-parks.
+- **Divergence is alarmed, never fought**: `word=1, no lease` → `origin:
+  foreign`; `word=0, lease open` → observed foreign resume — the lease closes
+  as `unit_resumed` / `result: observed_foreign` (`written_value: null`, no
+  write), one alert-tier event carries `origin: foreign` + the observed
+  transition time, and the following dispatch-provenance window renders
+  `resume_provenance: {observed_at, origin: foreign}`. A foreign park over our
+  unchanged lease renders `park_state.foreign_rewrite: true` — named, no write.
+  The controller never re-parks in response.
+- **Single-flight per unit**: every mutation runs guards AND state transition
+  inside one critical section carrying `expected_lease_epoch`; a mutation on a
+  closed epoch refuses (`park_lease_absent` family) instead of acting on a
+  stale view. The write→readback→verify sequence is ONE actor-mailbox message —
+  a heartbeat PQ write can never interleave between our write and readback.
+  Arm-while-parked is legal (dispatch remains the gate); park re-checks armed
+  inside the critical section.
+
+### State, projections, and vocabulary
+
+- `park_state` per unit (snapshot + unit detail): `{parked: bool, origin:
+  "operator" | "foreign" | "unrecorded" | "none", parked_at, lease_expires_at,
+  max_total_s, remaining_cap_s, expired: bool, reason, authorizer,
+  foreign_rewrite: bool?, write_unverified: bool?, foreign_mode: {word, name,
+  first_observed_at}?}` — absent key when uncommissioned. `unrecorded` covers
+  word=1 with no lease AND no foreign evidence (crash-after-write residue);
+  `foreign` is reserved for the vendor-app/foreign-flip class. A lease ends
+  only by verified resume write, observed foreign resume, or expiry
+  (alarm-only); under any other ending it persists in the terminal sub-state
+  `write_unverified` (`parked: true, write_unverified: true`, health reason
+  `park_write_unverified`) — a failed write never reclassifies a
+  controller-minted lease as foreign.
+- `health_state` gains `PARKED`, ladder position between `actuation_incoherent`
+  and `self_healing`, implemented as a composable state — the healing-reason
+  list is computed first (pure), then `("parked", *healing)`, so a
+  parked+balancing pod keeps its balancing visibility. `unreachable`,
+  `not_responding`, `foreign_writer`, `inhibited`, `actuation_incoherent`
+  legitimately outrank a park (fault beats operator state — pinned so nobody
+  "fixes" it). `unit.health_changed` carries the transitions both directions.
+- Dispatch: the existing `device_debug_mode_active` refusal fires as today;
+  its details gain `parked_provenance: {parked_at, authorizer, reason,
+  lease_expires_at}` when the ledger names the unit, and `resume_provenance:
+  {observed_at, origin: foreign}` for the window after an observed foreign
+  resume. A word ∈ {2..6} renders `foreign_mode` in the details ("device in an
+  unexposed vendor mode"), never `parked: true`. Control-readiness reasons gain
+  `unit:parked`.
+- **Adviser vocabulary (`unit_parked`, additive — one vocabulary per feature,
+  DESIGN_POD_PARKING §3):**
+  - Schedule projection (`schedule_state.reason_codes`): the `units_disarmed`
+    mechanism verbatim — the ScheduleRunner does NOT exclude parked units (it
+    stays dumb per DESIGN_SCHEDULES §7 "no claim checks"): it submits the
+    published fact, the facade refuses `device_debug_mode_active` with park
+    provenance, and the projection carries `unit_parked` as a projection-level
+    code.
+  - Night-charge projection (`night_charge_state.reason_codes`): joins
+    additively and outranks `units_disarmed` for a parked unit — resume, not
+    arm, is the true next step.
+  - Excess adviser (`adviser_state.reason_codes`): renders in place of
+    `no_eligible_target` when every otherwise-eligible unit's exclusion cause
+    is park.
+  - Foreign PQ objectives observed on a parked unit (the night-writer case):
+    the detector annotates those samples `unit_parked` — never silent, never an
+    alert by itself; per the pinned conservative simulator model an ignored
+    write leaves the served-objective words unchanged, so a foreign write
+    during our park shows at readback and the next arm classifies it by the
+    standing rules (possibly `external_writer` + takeover).
+- Audit rows: `unit_parked`, `unit_park_renewed`, `unit_resumed`,
+  `unit_park_expired` — per unit; `result` ∈ {pending → parked, renewed,
+  resumed, observed_foreign, expired, refused}; reason codes carry
+  `readback_verified` / `readback_mismatch` / `foreign_takeover_acknowledged` /
+  `adopted_foreign_park` (a park over a foreign word=1 records the origin
+  transition — the ledger never claims we initiated a park we inherited);
+  payload `{prior_word, written_value, readback_word, verified, origin,
+  authorizer, reason, lease fields, epoch, checklist on resume}`. The durable
+  `park_leases` row is written in the same transaction boundary as the audit
+  append — the table is the machine truth, the audit row the narrative.
+- Bus events: `unit.parked`, `unit.park_renewed`, `unit.resumed`,
+  `unit.park_expired` (alert tier on expiry), typed payloads mirroring the rows.
+- MCP observes and recommends; it does not park: v1 ships no MCP mutation tool;
+  `get_unit_detail`/`get_snapshot` gain the park projection, and the agent-loop
+  contract text gains "never dispatch onto a parked unit; recommend the
+  park/resume cycle to the human operator for the wedge signature."
+
+### Commissioning (the `parking:` block)
+
+Block-PRESENCE doctrine: `max_lease_s: 14400` (360..86400; `lease_s` ∈ [60,
+max_lease_s]) and `default_lease_s: 14400` (>= 60, <= max_lease_s), validated
+at config load — a PRESENT block is refused unless `mode: write_enabled` AND a
+`policy` block is present (a present block on an observe-only site is a
+validation error, never silently incapable). `policy.debug_modes_enabled`
+remains the always-false tombstone it is today, superseded by nothing: the
+`parking:` block is the one and only policy flag that can ever compose this
+write.
 
 ## Control-decision audit attribution
 
@@ -1678,8 +1889,9 @@ and its gates validated, including while suspended. `health` is unchanged.
   projection-level states): `disabled_by_config`, `disabled_by_runtime`,
   `economics_acknowledgement_required`, `export_evidence_missing`, `export_evidence_bad`,
   `export_evidence_stale`, `no_export_headroom`, `no_acceleration_over_autonomy`,
-  `below_exit_hysteresis`, `no_eligible_target`, `yielding_to_higher_priority`,
-  `export_headroom_available`.
+  `below_exit_hysteresis`, `no_eligible_target`, `unit_parked`, `yielding_to_higher_priority`,
+  `export_headroom_available` (`unit_parked` — 2026-08-24, DESIGN_POD_PARKING §3 — renders in
+  place of `no_eligible_target` when every otherwise-eligible unit's exclusion cause is park).
 - The projection has ONE writer (the fleet loop's post-tick update; the toggle flips only the
   participation flag and the next tick observes it), so it can never claim inactive while an
   adviser intent is still live.

@@ -508,7 +508,13 @@ claimed by a higher-priority live intent — the honest "waiting" sentence on
 Home), `window_ended`, `plan_changed`, `units_disarmed` (a window holds and
 the plan submits, but no unit is controllable — the fleet sits disarmed; the
 claim is still a published fact, the code says why nothing acts on it;
-outranks `waiting_for_higher_priority`). `last_action` is the runner's action
+outranks `waiting_for_higher_priority`), and `unit_parked` (added 2026-08-24,
+`docs/DESIGN_POD_PARKING.md` §3 — the `units_disarmed` mechanism verbatim:
+the runner does NOT exclude parked units, staying dumb per §7's "no claim
+checks"; it submits the published fact, the facade refuses
+`device_debug_mode_active` with park provenance, the per-cycle failure is
+survivable per its standing doctrine, and the projection carries the code).
+`last_action` is the runner's action
 vocabulary: `idle | submit | renew | remove`.
 
 ### 5.4 The pure next-occurrence helpers
