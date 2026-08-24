@@ -163,6 +163,15 @@
    view's own panel — the safety-positive green frame. Scoped to the view so
    the Now view's `.dialog` panel can never collide with it (both files are
    plain global CSS once bundled). */
+/* The dialog panel is a FLEX COLUMN: the body scrolls, the actions pin. The
+   whole-panel `overflow: auto` this replaces carried a live defect — once the
+   content outgrew the height budget the scroll fold sat ABOVE the actions row,
+   so Cancel/confirm (and the pinned sentence beside them) fell below the
+   visible panel (park-dialog.desktop-1440.png, 2026-08-24). The panel-level
+   `overflow: auto` stays as the floor for a viewport too short for even the
+   footer alone; every ordinary overflow now scrolls inside `.dialog-body`
+   while `.dialog-footer` (the hint, the fixed sentence, the actions) stays
+   visible whatever the content or the viewport. */
 .batteries-view .dialog {
   width: min(28rem, 100%);
   max-height: min(30rem, calc(100vh - 5rem));
@@ -181,10 +190,42 @@
   margin: 0;
 }
 
+/* The scrollable body: everything the operator can re-read (title, intro,
+   the guarded fields, the refusal record) scrolls HERE, never carrying the
+   actions with it. min-height: 0 is what lets the flex item shrink past its
+   content into its own scroll. */
+.batteries-view .dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+/* The pinned footer: the disabled-reason hint, the fixed sentence, and the
+   actions row — never shrunk, never scrolled away. */
+.batteries-view .dialog-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
 .batteries-view .dialog-actions {
   display: flex;
   gap: 0.5rem;
   justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+/* The disabled-reason hint: ONE small muted line in the pinned footer naming
+   exactly what is missing — a grayed confirm never sits unexplained. Never
+   rendered while a write is pending (the component guards it). */
+.batteries-view .dialog-hint {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #78716c;
 }
 
 /* The per-unit cell-imbalance early-warning line (2026-08-23 policy
@@ -310,10 +351,10 @@
 
 /* The guarded park dialog (this view's own dialog panel — see the scoping
    note above): the amber guarded-action family, one width with the
-   acknowledge dialog. Its own height budget — the reason field, the lease
-   select with its policy note, the type-back, AND the fixed sentence above
-   the confirm must all sit above the internal scroll fold, or the very
-   sentence the design pins verbatim would hide behind it. */
+   acknowledge dialog. Its own height budget is the room the guarded fields
+   want before the body's internal scroll engages; the fixed sentence and the
+   actions live in the pinned footer, so they hold above that fold whatever
+   the content costs. */
 .batteries-view .park-dialog {
   border-color: #8a6d2f;
   max-height: min(42rem, calc(100vh - 5rem));

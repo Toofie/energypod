@@ -38,11 +38,13 @@ import {
   leaseDurationText,
   leaseIsExpired,
   NOT_ISOLATION_SENTENCE,
+  parkConfirmHintText,
   parkOriginText,
   parkRefusalText,
   parkedBannerFixedLine,
   parkedBannerLine,
   parkedChipTooltip,
+  resumeConfirmHintText,
   takeoverRequired,
   writeUnverifiedText,
   type ParkStateView,
@@ -212,7 +214,11 @@ export interface ParkDialogProps {
  * button, a required reason (1..500), the lease duration bounded by the
  * site's own budget, and the type-back guard — confirm stays disabled until
  * the operator types the unit id exactly. The lease line names the policy:
- * the countdown is never safety.
+ * the countdown is never safety. The panel is a flex column (see
+ * BatteriesView.css): the guarded fields scroll in `.dialog-body`, while the
+ * disabled-reason hint, the fixed sentence, and the actions pin in
+ * `.dialog-footer` — Cancel/confirm are visible whatever the content or the
+ * viewport, and the grayed confirm always names what is missing.
  */
 export function ParkDialog({
   unitId,
@@ -231,6 +237,16 @@ export function ParkDialog({
   const reasonValid = reason.trim().length >= 1 && reason.trim().length <= 500;
   const typedMatches = typed === unitId;
   const canConfirm = reasonValid && typedMatches && leaseS !== null && !pending;
+  // The disabled-reason hint renders only while the confirm is genuinely
+  // held by a missing input — never while a write is pending (that is the
+  // wire's own state, not the operator's unfinished form).
+  const hint = pending
+    ? ""
+    : parkConfirmHintText(unitId, {
+        reasonValid,
+        typedMatches,
+        leaseChosen: leaseS !== null,
+      });
   const cap = park === null ? null : park.remainingCapS > 0 ? Math.min(park.maxTotalS, park.remainingCapS) : park.maxTotalS;
   return (
     <div className="dialog-backdrop">
@@ -242,72 +258,83 @@ export function ParkDialog({
         className="dialog park-dialog"
         onKeyDown={handleKeyDown}
       >
-        <h2 id="park-dialog-title">Park {unitId}</h2>
-        <p>
-          Parking stands the battery down (the vendor&apos;s Standby mode word) while comms and
-          telemetry stay alive.
-          {cap !== null && cap >= 60
-            ? ` Lease up to ${leaseDurationText(cap)} on this site.`
-            : ""}
-        </p>
-        <div className="park-field">
-          <label htmlFor={`park-reason-${unitId}`}>Reason (required)</label>
-          <textarea
-            id={`park-reason-${unitId}`}
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-            disabled={pending}
-            rows={2}
-          />
-        </div>
-        {choices.length > 0 ? (
+        <div className="dialog-body">
+          <h2 id="park-dialog-title">Park {unitId}</h2>
+          <p>
+            Parking stands the battery down (the vendor&apos;s Standby mode word) while comms and
+            telemetry stay alive.
+            {cap !== null && cap >= 60
+              ? ` Lease up to ${leaseDurationText(cap)} on this site.`
+              : ""}
+          </p>
           <div className="park-field">
-            <label htmlFor={`park-lease-${unitId}`}>Lease duration</label>
-            <select
-              id={`park-lease-${unitId}`}
-              value={leaseS === null ? "" : String(leaseS)}
-              onChange={(event) => {
-                const next = Number(event.target.value);
-                setLeaseS(Number.isFinite(next) ? next : null);
-              }}
+            <label htmlFor={`park-reason-${unitId}`}>Reason (required)</label>
+            <textarea
+              id={`park-reason-${unitId}`}
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
               disabled={pending}
-            >
-              {choices.map((choice) => (
-                <option key={choice.seconds} value={String(choice.seconds)}>
-                  {choice.label}
-                </option>
-              ))}
-            </select>
-            <p className="park-field-note">
-              The lease is the expiry alarm, not a safety bound — at its end the console asks for
-              a Resume; nothing writes the battery on its own.
-            </p>
+              rows={2}
+            />
           </div>
-        ) : (
-          <p className="park-field-note">No lease budget is available for this battery right now.</p>
-        )}
-        <div className="park-field">
-          <label htmlFor={`park-typed-${unitId}`}>Type {unitId} to enable park</label>
-          <input
-            id={`park-typed-${unitId}`}
-            value={typed}
-            onChange={(event) => setTyped(event.target.value)}
-            disabled={pending}
-            autoComplete="off"
-          />
+          {choices.length > 0 ? (
+            <div className="park-field">
+              <label htmlFor={`park-lease-${unitId}`}>Lease duration</label>
+              <select
+                id={`park-lease-${unitId}`}
+                value={leaseS === null ? "" : String(leaseS)}
+                onChange={(event) => {
+                  const next = Number(event.target.value);
+                  setLeaseS(Number.isFinite(next) ? next : null);
+                }}
+                disabled={pending}
+              >
+                {choices.map((choice) => (
+                  <option key={choice.seconds} value={String(choice.seconds)}>
+                    {choice.label}
+                  </option>
+                ))}
+              </select>
+              <p className="park-field-note">
+                The lease is the expiry alarm, not a safety bound — at its end the console asks
+                for a Resume; nothing writes the battery on its own.
+              </p>
+            </div>
+          ) : (
+            <p className="park-field-note">No lease budget is available for this battery right now.</p>
+          )}
+          <div className="park-field">
+            <label htmlFor={`park-typed-${unitId}`}>Type {unitId} to enable park</label>
+            <input
+              id={`park-typed-${unitId}`}
+              value={typed}
+              onChange={(event) => setTyped(event.target.value)}
+              disabled={pending}
+              autoComplete="off"
+              placeholder={unitId}
+            />
+          </div>
+          {error !== null && <ParkRefusalBlock refusal={error} />}
         </div>
-        {error !== null && <ParkRefusalBlock refusal={error} />}
-        {/* The fixed sentence, verbatim, immediately above the confirm button. */}
-        <p role="note" className="park-fixed-sentence">
-          {NOT_ISOLATION_SENTENCE}
-        </p>
-        <div className="dialog-actions">
-          <button type="button" onClick={onCancel} disabled={pending}>
-            Cancel
-          </button>
-          <button type="button" onClick={() => onConfirm(reason.trim(), leaseS ?? 60)} disabled={!canConfirm}>
-            Park {unitId}
-          </button>
+        {/* The pinned footer: the hint, the fixed sentence VERBATIM immediately
+            above the confirm button, and the actions — never scrolled away. */}
+        <div className="dialog-footer">
+          {hint !== "" && (
+            <p className="dialog-hint" role="status">
+              {hint}
+            </p>
+          )}
+          <p role="note" className="park-fixed-sentence">
+            {NOT_ISOLATION_SENTENCE}
+          </p>
+          <div className="dialog-actions">
+            <button type="button" onClick={onCancel} disabled={pending}>
+              Cancel
+            </button>
+            <button type="button" onClick={() => onConfirm(reason.trim(), leaseS ?? 60)} disabled={!canConfirm}>
+              Park {unitId}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -327,7 +354,10 @@ export interface ResumeDialogProps {
  * The resume dialog: a plain confirm for our own lease (live or expired — the
  * operator's fresh RESUME is the act), and its own acknowledgement step
  * exactly when the park wasn't ours (origin foreign/unrecorded) — the checkbox
- * the 409 refusal also routes into, because the refusal IS the routing.
+ * the 409 refusal also routes into, because the refusal IS the routing. The
+ * same pinned-footer pattern as the park dialog: the takeover step and the
+ * refusal record scroll in the body; the disabled-reason hint and the actions
+ * stay visible, so the grayed confirm always names what is missing.
  */
 export function ResumeDialog({
   unitId,
@@ -344,6 +374,7 @@ export function ResumeDialog({
   // predict it (the word moved between reads).
   const takeover = takeoverRequired(park) || (error !== null && isTakeoverRefusal(error));
   const canConfirm = !pending && (!takeover || acknowledged);
+  const hint = pending ? "" : resumeConfirmHintText(takeover && !acknowledged);
   return (
     <div className="dialog-backdrop">
       <div
@@ -354,51 +385,60 @@ export function ResumeDialog({
         className="dialog park-dialog"
         onKeyDown={handleKeyDown}
       >
-        <h2 id="resume-dialog-title">Resume {unitId}</h2>
-        <p>
-          Resuming writes the Normal mode word and brings the battery back under this
-          controller&apos;s authority. It takes about a second.
-        </p>
-        {takeover ? (
-          <div className="park-takeover">
-            <p>
-              This battery was {parkOriginText(park?.origin ?? "foreign")} — the park is not this
-              controller&apos;s lease. Resuming is a deliberate takeover:
-              {park?.origin === "unrecorded"
-                ? " the lease record is missing, so what parked it cannot be named."
-                : " another writer parked it."}
-            </p>
-            <label className="park-takeover-ack">
-              <input
-                type="checkbox"
-                checked={acknowledged}
-                onChange={(event) => setAcknowledged(event.target.checked)}
-                disabled={pending}
-              />{" "}
-              I understand I am taking over a park this controller did not make.
-            </label>
-          </div>
-        ) : (
+        <div className="dialog-body">
+          <h2 id="resume-dialog-title">Resume {unitId}</h2>
           <p>
-            {park === null
-              ? "No park projection is available — resuming is still the operator act."
-              : park.parked
-                ? `Parked ${parkOriginText(park.origin)}${park.expired ? " — the lease has expired; this fresh Resume is the act." : "."}`
-                : "The battery reads un-parked; a resume on a Normal word is a harmless no-op."}
+            Resuming writes the Normal mode word and brings the battery back under this
+            controller&apos;s authority. It takes about a second.
           </p>
-        )}
-        {error !== null && <ParkRefusalBlock refusal={error} />}
-        <div className="dialog-actions">
-          <button type="button" onClick={onCancel} disabled={pending}>
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={() => onConfirm(takeover)}
-            disabled={!canConfirm}
-          >
-            Resume {unitId}
-          </button>
+          {takeover ? (
+            <div className="park-takeover">
+              <p>
+                This battery was {parkOriginText(park?.origin ?? "foreign")} — the park is not this
+                controller&apos;s lease. Resuming is a deliberate takeover:
+                {park?.origin === "unrecorded"
+                  ? " the lease record is missing, so what parked it cannot be named."
+                  : " another writer parked it."}
+              </p>
+              <label className="park-takeover-ack">
+                <input
+                  type="checkbox"
+                  checked={acknowledged}
+                  onChange={(event) => setAcknowledged(event.target.checked)}
+                  disabled={pending}
+                />{" "}
+                I understand I am taking over a park this controller did not make.
+              </label>
+            </div>
+          ) : (
+            <p>
+              {park === null
+                ? "No park projection is available — resuming is still the operator act."
+                : park.parked
+                  ? `Parked ${parkOriginText(park.origin)}${park.expired ? " — the lease has expired; this fresh Resume is the act." : "."}`
+                  : "The battery reads un-parked; a resume on a Normal word is a harmless no-op."}
+            </p>
+          )}
+          {error !== null && <ParkRefusalBlock refusal={error} />}
+        </div>
+        <div className="dialog-footer">
+          {hint !== "" && (
+            <p className="dialog-hint" role="status">
+              {hint}
+            </p>
+          )}
+          <div className="dialog-actions">
+            <button type="button" onClick={onCancel} disabled={pending}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => onConfirm(takeover)}
+              disabled={!canConfirm}
+            >
+              Resume {unitId}
+            </button>
+          </div>
         </div>
       </div>
     </div>

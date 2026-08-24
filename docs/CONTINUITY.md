@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-24 (Australia/Brisbane; the six-workstream round — live-refresh, polish, excess, night standby, providers, MCP)
+Last updated: 2026-08-24 (Australia/Brisbane; the park-dialog fold fix — pinned actions + the disabled-reason hint)
 
 ## Purpose
 
@@ -358,6 +358,35 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-24 (console park-dialog fix): THE DIALOG FOLD AND THE SILENT GRAYED
+  CONFIRM FIXED — the operator hit it live: the park dialog's actions
+  (Cancel / Park rhs) fell below the panel's internal scroll fold once the
+  content outgrew its height budget, and the grayed confirm gave no hint why
+  (pixel-proven on the pre-fix park-dialog.desktop-1440.png: NO buttons
+  visible, the fixed sentence clipped mid-line). (1) THE PATTERN (not one
+  number): the batteries family's `.batteries-view .dialog` is now a flex
+  column — a new `.dialog-body` (`overflow-y: auto; min-height: 0; flex: 1`)
+  scrolls the guarded fields, a new `.dialog-footer` (`flex-shrink: 0`) pins
+  the hint + the fixed sentence + the actions; the panel's own `overflow:
+  auto` stays only as the floor for a viewport too short for the footer
+  alone. Applied to all THREE dialogs sharing the class: ParkDialog,
+  ResumeDialog (Parking.tsx), and the inhibit-acknowledge dialog
+  (BatteriesView.tsx). The fixed not-isolation sentence lives in the pinned
+  footer immediately above the actions — the §8 verbatim pin holds at every
+  content height. (2) DISCOVERABILITY: the type-back input carries
+  `placeholder={unitId}`, and a held confirm renders ONE muted
+  `.dialog-hint` line in the footer naming exactly what is missing —
+  park.ts gained `parkConfirmHintText` (composes "Reason required" / "lease
+  duration required" / "Type {unit} to enable park" with " · ", one sentence)
+  and `resumeConfirmHintText` ("Acknowledge the takeover to enable
+  resume."); never rendered while a write is pending. (3) TESTS: web 854 →
+  861 (+7; full suite green, tsc -b clean) — pinned-footer-not-scroll-body
+  structure pins for park + resume, the placeholder pin, hint-composition
+  combinations incl. the no-lease-budget world and the pending guard, and
+  park.test.ts composer pins. Batteries shots regenerated (18 PNGs) and the
+  park-dialog state vision-verified at ALL THREE viewports: Cancel + Park
+  rhs visible, the fixed sentence complete, nothing clipped.
 
 - 2026-08-24 (six-workstream round — LIVE-REFRESH FIXED, THE STANDBY
   POSTURE, THE PROVIDERS LAYER BORN, THE MCP READ SURFACE COMPLETE):

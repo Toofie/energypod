@@ -358,6 +358,91 @@ describe("BatteriesView — the guarded park dialog", () => {
     expect(confirm).toBeEnabled();
   });
 
+  it("pins the actions in a footer outside the scrollable body — Cancel/confirm never ride the fold", async () => {
+    await openParkDialog(makeClient(), fleetWorld(parkState({ parked: false })));
+    const dialog = screen.getByRole("dialog");
+    const footer = dialog.querySelector(".dialog-footer");
+    const body = dialog.querySelector(".dialog-body");
+    expect(footer).not.toBeNull();
+    expect(body).not.toBeNull();
+    // The footer is a sibling of the body — nothing pinned lives inside the scroll.
+    expect(footer!.contains(body!)).toBe(false);
+
+    const actions = within(dialog)
+      .getByRole("button", { name: "Park rhs" })
+      .closest(".dialog-actions");
+    expect(actions).not.toBeNull();
+    expect(actions!.closest(".dialog-footer")).toBe(footer);
+    expect(actions!.closest(".dialog-body")).toBeNull();
+
+    // The fixed sentence rides the pinned footer too, immediately above the
+    // actions row (the design contract's pin holds in the new structure).
+    const sentence = within(dialog)
+      .getByText(/Never perform physical work/)
+      .closest(".park-fixed-sentence");
+    expect(sentence!.parentElement).toBe(footer);
+    expect(sentence!.nextElementSibling).toBe(actions);
+    expect(body!.contains(sentence!)).toBe(false);
+  });
+
+  it("carries the unit id as the type-back field's placeholder", async () => {
+    await openParkDialog(makeClient(), fleetWorld(parkState({ parked: false })));
+    expect(
+      screen.getByLabelText("Type rhs to enable park").getAttribute("placeholder"),
+    ).toBe("rhs");
+  });
+
+  it("names exactly what is missing in one hint line pinned above the actions — never while pending", async () => {
+    const client = makeClient();
+    const user = await openParkDialog(client, fleetWorld(parkState({ parked: false })));
+    const dialog = screen.getByRole("dialog");
+    const hint = () => dialog.querySelector(".dialog-hint");
+
+    // Nothing entered (the lease is chosen by default): both halves named.
+    expect(hint()!.textContent).toBe("Reason required · type rhs to enable park.");
+    // The hint rides the pinned footer, directly above the fixed sentence
+    // and the actions — visible at any content height.
+    expect(hint()!.parentElement).toBe(dialog.querySelector(".dialog-footer"));
+
+    await user.type(within(dialog).getByLabelText("Reason (required)"), "evening standby");
+    expect(hint()!.textContent).toBe("Type rhs to enable park.");
+
+    // A mid-typing type-back is still a mismatch: the reason alone drops out.
+    await user.type(within(dialog).getByLabelText("Type rhs to enable park"), "rh");
+    expect(hint()!.textContent).toBe("Type rhs to enable park.");
+    await user.type(within(dialog).getByLabelText("Type rhs to enable park"), "s");
+    expect(hint()).toBeNull();
+
+    // A held write is the wire's own state, never a missing input: no hint.
+    let release: ((value: Record<string, unknown>) => void) | undefined;
+    client.postPark.mockImplementation(
+      () =>
+        new Promise<Record<string, unknown>>((resolve) => {
+          release = resolve;
+        }),
+    );
+    await user.click(within(dialog).getByRole("button", { name: "Park rhs" }));
+    expect(within(dialog).getByRole("button", { name: "Park rhs" })).toBeDisabled();
+    expect(hint()).toBeNull();
+    release!(parkOk());
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("names the lease too when the site offers no budget at all", async () => {
+    await openParkDialog(
+      makeClient(),
+      fleetWorld(parkState({ parked: false, max_total_s: 0, remaining_cap_s: 0 })),
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.querySelector(".dialog-hint")!.textContent).toBe(
+      "Reason required · lease duration required · type rhs to enable park.",
+    );
+    // The body's own honest line stands beside the hint.
+    expect(
+      within(dialog).getByText("No lease budget is available for this battery right now."),
+    ).not.toBeNull();
+  });
+
   it("bounds the lease select to the site's budget and sends the typed confirmation with the chosen lease", async () => {
     const client = makeClient();
     const user = await openParkDialog(client, fleetWorld(parkState({ parked: false, max_total_s: 7200, remaining_cap_s: 7200 })));
@@ -506,6 +591,29 @@ describe("BatteriesView — the resume dialog and the after-park checklist", () 
 
     await waitFor(() => expect(client.postResume).toHaveBeenCalled());
     expect(client.postResume.mock.calls[0]![1]).toEqual({ takeover: true });
+  });
+
+  it("pins its actions beside the takeover hint — the one enable condition named until it lands", async () => {
+    const client = makeClient();
+    const user = await openResumeDialog(client, fleetWorld(parkState({ origin: "foreign" })));
+    const dialog = screen.getByRole("dialog");
+    const footer = dialog.querySelector(".dialog-footer");
+    expect(footer).not.toBeNull();
+
+    // The actions row lives in the pinned footer, never the scrollable body.
+    const actions = within(dialog)
+      .getByRole("button", { name: "Resume rhs" })
+      .closest(".dialog-actions");
+    expect(actions!.closest(".dialog-footer")).toBe(footer);
+    expect(actions!.closest(".dialog-body")).toBeNull();
+
+    // The grayed confirm names exactly what is missing, in the footer.
+    const hint = dialog.querySelector(".dialog-hint");
+    expect(hint!.textContent).toBe("Acknowledge the takeover to enable resume.");
+    expect(hint!.parentElement).toBe(footer);
+
+    await user.click(within(dialog).getByRole("checkbox"));
+    expect(dialog.querySelector(".dialog-hint")).toBeNull();
   });
 
   it("routes the takeover step from the 409 itself when the projection did not predict it", async () => {

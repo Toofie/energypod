@@ -33,10 +33,12 @@ import {
   leaseIsExpired,
   leaseSecondsRemaining,
   NOT_ISOLATION_SENTENCE,
+  parkConfirmHintText,
   parkRefusalText,
   parkedBannerFixedLine,
   parkedBannerLine,
   parkedChipTooltip,
+  resumeConfirmHintText,
   toParkState,
   toResumeChecklist,
   takeoverRequired,
@@ -270,6 +272,28 @@ describe("the takeover rule", () => {
   it("routes the takeover from the refusal envelope itself (the 409 IS the routing)", () => {
     expect(isTakeoverRefusal(refusal("park_foreign_word_acknowledgement_required"))).toBe(true);
     expect(isTakeoverRefusal(refusal("park_write_failed"))).toBe(false);
+  });
+});
+
+describe("the guarded dialogs' disabled-reason hints", () => {
+  it("names exactly the missing park inputs — one sentence, lowercase after the separator", () => {
+    const all = { reasonValid: true, typedMatches: true, leaseChosen: true };
+    expect(parkConfirmHintText("rhs", all)).toBe("");
+    expect(parkConfirmHintText("rhs", { ...all, reasonValid: false })).toBe("Reason required.");
+    expect(parkConfirmHintText("rhs", { ...all, leaseChosen: false })).toBe("Lease duration required.");
+    expect(parkConfirmHintText("rhs", { ...all, typedMatches: false })).toBe("Type rhs to enable park.");
+    expect(parkConfirmHintText("mid", { ...all, typedMatches: false })).toBe("Type mid to enable park.");
+    expect(parkConfirmHintText("rhs", { ...all, reasonValid: false, typedMatches: false })).toBe(
+      "Reason required · type rhs to enable park.",
+    );
+    expect(
+      parkConfirmHintText("rhs", { reasonValid: false, typedMatches: false, leaseChosen: false }),
+    ).toBe("Reason required · lease duration required · type rhs to enable park.");
+  });
+
+  it("names the resume dialog's one enable condition", () => {
+    expect(resumeConfirmHintText(true)).toBe("Acknowledge the takeover to enable resume.");
+    expect(resumeConfirmHintText(false)).toBe("");
   });
 });
 

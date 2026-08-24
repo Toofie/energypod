@@ -316,6 +316,51 @@ export function leaseChoices(park: ParkStateView | null): LeaseChoice[] {
   return choices;
 }
 
+// --- the guarded dialogs' disabled-reason hints ---------------------------------
+
+/** What the park dialog's confirm still needs, per its own guard flags. */
+export interface ParkConfirmMissing {
+  reasonValid: boolean;
+  typedMatches: boolean;
+  leaseChosen: boolean;
+}
+
+/**
+ * The park dialog's disabled-reason hint (§8's discoverability): ONE line
+ * naming exactly what is missing, in the house vocabulary — "Reason
+ * required." / "Type rhs to enable park." / "Reason required · type rhs to
+ * enable park." — so the grayed confirm never sits unexplained. The line is
+ * one sentence: the first missing item leads capitalized, the rest join
+ * lowercased after the " · " separator. "" when nothing is missing (or while
+ * a write is pending; the component guards that half — a pending write is not
+ * a missing input).
+ */
+export function parkConfirmHintText(unitId: string, missing: ParkConfirmMissing): string {
+  const parts: string[] = [];
+  if (!missing.reasonValid) {
+    parts.push("reason required");
+  }
+  if (!missing.leaseChosen) {
+    parts.push("lease duration required");
+  }
+  if (!missing.typedMatches) {
+    parts.push(`type ${unitId} to enable park`);
+  }
+  if (parts.length === 0) {
+    return "";
+  }
+  const sentence = parts.join(" · ");
+  return `${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`;
+}
+
+/**
+ * The resume dialog's own disabled-reason hint: "" unless the foreign-takeover
+ * acknowledgement is the one thing still holding the confirm.
+ */
+export function resumeConfirmHintText(takeoverUnacknowledged: boolean): string {
+  return takeoverUnacknowledged ? "Acknowledge the takeover to enable resume." : "";
+}
+
 // --- the takeover rule ---------------------------------------------------------
 
 /**

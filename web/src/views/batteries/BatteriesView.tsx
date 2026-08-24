@@ -1926,27 +1926,33 @@ function AcknowledgeDialog({
         className="dialog"
         onKeyDown={handleKeyDown}
       >
-        <h2 id="inhibit-ack-title">Acknowledge inhibit on {unitId}</h2>
-        <p>
-          <b>Reason:</b> {reasonText}
-        </p>
-        <p>
-          Acknowledging clears the latched inhibit. Re-arming the unit is a separate deliberate
-          step.
-        </p>
-        {error !== null && (
-          <div role="alert" className="dialog-error">
-            <p>{error.code}</p>
-            <p>{error.message}</p>
+        {/* The view family's pinned-footer pattern (see BatteriesView.css):
+            the reason and any refusal scroll in the body, the actions pin. */}
+        <div className="dialog-body">
+          <h2 id="inhibit-ack-title">Acknowledge inhibit on {unitId}</h2>
+          <p>
+            <b>Reason:</b> {reasonText}
+          </p>
+          <p>
+            Acknowledging clears the latched inhibit. Re-arming the unit is a separate deliberate
+            step.
+          </p>
+          {error !== null && (
+            <div role="alert" className="dialog-error">
+              <p>{error.code}</p>
+              <p>{error.message}</p>
+            </div>
+          )}
+        </div>
+        <div className="dialog-footer">
+          <div className="dialog-actions">
+            <button type="button" onClick={onCancel} disabled={pending}>
+              Cancel
+            </button>
+            <button type="button" onClick={onConfirm} disabled={pending}>
+              Confirm acknowledgement
+            </button>
           </div>
-        )}
-        <div className="dialog-actions">
-          <button type="button" onClick={onCancel} disabled={pending}>
-            Cancel
-          </button>
-          <button type="button" onClick={onConfirm} disabled={pending}>
-            Confirm acknowledgement
-          </button>
         </div>
       </div>
     </div>
