@@ -244,6 +244,47 @@ class RecordingEnergyService:
     history_refusal: Any = None
     history_error: Any = None
     history_units: tuple[str, ...] = ("mid", "rhs")
+    # The forecast read surface's scripted answers: an outlook body and an
+    # optional refusal raised to the boundary.
+    forecast_view: dict[str, Any] = field(
+        default_factory=lambda: {
+            "as_of": "2026-08-25T10:15:00+00:00",
+            "history_composed": True,
+            "pv": {
+                "source": "solcast",
+                "variable": "pv_power_w",
+                "fetched_at": "2026-08-25T10:00:00+00:00",
+                "issued_at": None,
+                "quantiled": True,
+                "horizon_from": "2026-08-25T10:00:00+00:00",
+                "horizon_to": "2026-08-27T10:00:00+00:00",
+                "intervals": [
+                    {
+                        "start": "2026-08-25T10:00:00+00:00",
+                        "end": "2026-08-25T10:30:00+00:00",
+                        "w": 1000.0,
+                        "q10": 400.0,
+                        "q90": 1600.0,
+                    }
+                ],
+            },
+            "provider": {
+                "source": "solcast",
+                "staleness": {
+                    "fetched_at": "2026-08-25T10:00:00+00:00",
+                    "age_s": 900.0,
+                    "stale": False,
+                    "last_error": None,
+                    "fetch_count": 4,
+                    "error_count": 0,
+                },
+            },
+            "notes": [],
+            "score": None,
+            "scoreboard": None,
+        }
+    )
+    forecast_refusal: Any = None
     # The energy scorecard's scripted answers (API_CONTRACTS "Energy
     # scorecard"): the days body and an optional refusal.
     energy_days_view: dict[str, Any] = field(
@@ -619,6 +660,12 @@ class RecordingEnergyService:
         if self.history_error is not None:
             raise self.history_error
         return dict(self.history_view)
+
+    async def get_forecast_outlook(self, *, principal: Any) -> dict[str, Any]:
+        self.calls.append(("get_forecast_outlook", {"principal": principal}))
+        if self.forecast_refusal is not None:
+            raise self.forecast_refusal
+        return dict(self.forecast_view)
 
     async def get_observed_objectives(self, *, principal: Any, last: str = "24h") -> dict[str, Any]:
         self.calls.append(("get_observed_objectives", {"principal": principal, "last": last}))

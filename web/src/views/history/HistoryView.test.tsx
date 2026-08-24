@@ -59,7 +59,14 @@ vi.mock("../../api/client", async (importOriginal) => ({
 
 // --- fixtures -----------------------------------------------------------------
 
-const RECORDED_AT = "2026-08-24T06:03:00+00:00";
+/**
+ * A recording stamp 30 s before the read: the recording note compares the
+ * snapshot's `last_sample_at` against the REAL wall clock, so a fixed
+ * calendar stamp would flip the note to "fallen quiet" a minute after it was
+ * written (the 2026-08-24 time bomb this suite shipped with). A fresh stamp
+ * keeps the note's word deterministic: "History is recording".
+ */
+const recordedAtIso = (): string => new Date(Date.now() - 30_000).toISOString();
 
 function snapshotWith(units: string[]): ReturnType<typeof snapshot> {
   return withHistoryState(
@@ -72,10 +79,10 @@ function snapshotWith(units: string[]): ReturnType<typeof snapshot> {
           measured_watts: null,
         }),
       ),
-      { captured_at: RECORDED_AT },
+      { captured_at: recordedAtIso() },
     ),
     historyState({
-      last_sample_at: Object.fromEntries(units.map((unitId) => [unitId, RECORDED_AT])),
+      last_sample_at: Object.fromEntries(units.map((unitId) => [unitId, recordedAtIso()])),
     }),
   );
 }
@@ -345,7 +352,7 @@ describe("History view — the ready window", () => {
 
   it("renders the hourly badge, its whole-window caveat, and the band wording", async () => {
     api.client.getSnapshot.mockResolvedValueOnce(
-      withHistoryState(snapshot([unitSnapshot({ unit_id: "mid", lifecycle: "disarmed", telemetry: null, measured_watts: null })]), historyState({ last_sample_at: { mid: RECORDED_AT } })),
+      withHistoryState(snapshot([unitSnapshot({ unit_id: "mid", lifecycle: "disarmed", telemetry: null, measured_watts: null })]), historyState({ last_sample_at: { mid: recordedAtIso() } })),
     );
     api.client.getPlantHistory.mockResolvedValueOnce(hourlyWindow());
     render(<HistoryView client={injectedClient()} />);

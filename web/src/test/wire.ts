@@ -3574,3 +3574,261 @@ export function historyNotCommissionedRefusal(): Record<string, unknown> {
     request_id: "req-history-1",
   };
 }
+
+// ---------------------------------------------------------------------------
+// Forecast providers (ARCHITECTURE section 17, the advisory outlook read) —
+// `GET /api/v1/forecast` (observe scope, read-only). The route is LIVE: it
+// answers 200 whenever the `forecast_providers` block is PRESENT and ENABLED
+// and 409 `forecast_providers_not_commissioned` otherwise (the block-presence
+// doctrine). Every honest absence rides INSIDE the 200 as a null, never as an
+// error: a missing provider family (the registry's `notes` say why), a failed
+// fetch with no cache (the `provider.staleness` report carries the failure's
+// words), and an accuracy scoreboard with nothing accumulated yet. The scorer
+// is the provider round's cross-check (`adapters/providers/cross_check.py`):
+// the historian's fleet-summed `grid_power_w` (positive = export) is the only
+// truth, scored over the ELAPSED window of the current fetch. Defaults are
+// Solcast-shaped (quantiled, half-hourly, a 48 h horizon).
+// ---------------------------------------------------------------------------
+
+/** The provider source vocabulary the outlook can name today. */
+export const FORECAST_SOURCES: readonly string[] = ["solcast", "open-meteo"];
+
+/** One forecast interval: the central watts plus the claimed [q10, q90] band. */
+export interface WireForecastInterval {
+  readonly start: string;
+  readonly end: string;
+  readonly w: number;
+  /** Absent for a deterministic source (Open-Meteo derives no band). */
+  readonly q10?: number;
+  readonly q90?: number;
+}
+
+/** The honest age report the wire-backed provider carries on every read. */
+export interface WireForecastStaleness {
+  readonly fetched_at: string | null;
+  readonly age_s: number | null;
+  readonly stale: boolean;
+  readonly last_error: string | null;
+  readonly fetch_count: number;
+  readonly error_count: number;
+}
+
+/** The normalized PV series, verbatim from the provider's cache. */
+export interface WireForecastPv {
+  readonly source: string;
+  readonly variable: "pv_power_w";
+  readonly fetched_at: string;
+  readonly issued_at: string | null;
+  readonly quantiled: boolean;
+  readonly horizon_from: string;
+  readonly horizon_to: string;
+  readonly intervals: readonly WireForecastInterval[];
+}
+
+/** The wire-backed provider's own report (present even when the fetch failed). */
+export interface WireForecastProvider {
+  readonly source: string;
+  readonly staleness: WireForecastStaleness;
+}
+
+/** One fetch's cross-check against the recorded surplus (the elapsed window). */
+export interface WireForecastScore {
+  readonly source: string;
+  readonly fetched_at: string;
+  readonly window_from: string;
+  readonly window_to: string;
+  readonly samples: number;
+  readonly mae_w: number;
+  /** Positive = over-forecast (an optimistic promise). */
+  readonly bias_w: number;
+  readonly rmse_w: number;
+  /** The share of recorded surplus inside [q10, q90]; null when no band claimed. */
+  readonly inside_band: number | null;
+  /**
+   * The corrected basis's raw inputs (amendment A1): the scorer's own paired
+   * timestamps, carrying the mean recorded export, the mean fleet charging
+   * rate, the mean reconstructed PRE-battery surplus, and the mean forecast
+   * watts. Means only — never integrated kWh; night-v2 owns the integration.
+   */
+  readonly basis?: WireForecastBasis;
+}
+
+/** The amendment-A1 raw inputs, served per read. */
+export interface WireForecastBasis {
+  readonly paired_samples: number;
+  readonly mean_forecast_w: number;
+  readonly mean_export_w: number;
+  readonly mean_pre_battery_surplus_w: number | null;
+  readonly mean_charging_w: number | null;
+}
+
+/** The accumulating per-fetch evidence (in memory only — `durable: false`). */
+export interface WireForecastScoreboard {
+  readonly source: string;
+  readonly since: string;
+  readonly records: number;
+  readonly total_samples: number;
+  readonly mean_bias_w: number | null;
+  readonly mean_mae_w: number | null;
+  readonly mean_inside_band: number | null;
+  readonly durable: false;
+}
+
+/** The whole 200 body. */
+export interface WireForecastOutlook {
+  readonly as_of: string;
+  readonly history_composed: boolean;
+  readonly pv: WireForecastPv | null;
+  readonly provider: WireForecastProvider | null;
+  readonly notes: readonly string[];
+  readonly score: WireForecastScore | null;
+  readonly scoreboard: WireForecastScoreboard | null;
+}
+
+/** One interval fixture; defaults are the first slot of a Solcast-shaped day. */
+export function forecastInterval(
+  spec: Partial<WireForecastInterval> & { start: string; end: string },
+): WireForecastInterval {
+  return {
+    start: spec.start,
+    end: spec.end,
+    w: spec.w ?? 1000,
+    ...(spec.q10 === undefined ? {} : { q10: spec.q10 }),
+    ...(spec.q90 === undefined ? {} : { q90: spec.q90 }),
+  };
+}
+
+/**
+ * A quantiled PV outlook fixture: half-hourly slots over the given instants,
+ * a bell-shaped central curve with the band at roughly ±35%/+50%. The default
+ * horizon is the design's own illustrative next-48-hours window.
+ */
+export function forecastPv(
+  spec: Partial<WireForecastPv> & {
+    intervalStarts?: readonly string[];
+  } = {},
+): WireForecastPv {
+  const starts = spec.intervalStarts ?? [
+    "2026-08-25T10:00:00+00:00",
+    "2026-08-25T10:30:00+00:00",
+    "2026-08-25T11:00:00+00:00",
+    "2026-08-25T11:30:00+00:00",
+  ];
+  const central = [600, 1400, 2100, 1700];
+  const intervals = starts.map((start, index) => {
+    const w = central[index % central.length]!;
+    return forecastInterval({
+      start,
+      end: spec.horizon_to ?? "2026-08-27T12:00:00+00:00",
+      w,
+      q10: Math.round(w * 0.45),
+      q90: Math.round(w * 1.55),
+    });
+  });
+  return {
+    source: spec.source ?? "solcast",
+    variable: "pv_power_w",
+    fetched_at: spec.fetched_at ?? "2026-08-25T10:00:00+00:00",
+    issued_at: spec.issued_at === undefined ? null : spec.issued_at,
+    quantiled: spec.quantiled ?? true,
+    horizon_from: spec.horizon_from ?? starts[0]!,
+    horizon_to: spec.horizon_to ?? "2026-08-27T12:00:00+00:00",
+    intervals: spec.intervals ?? intervals,
+  };
+}
+
+/** The provider report fixture; defaults are a healthy 15-minute-old cache. */
+export function forecastProvider(
+  spec: Partial<WireForecastProvider> = {},
+): WireForecastProvider {
+  return {
+    source: spec.source ?? "solcast",
+    staleness: {
+      fetched_at: spec.staleness?.fetched_at ?? "2026-08-25T10:00:00+00:00",
+      age_s: spec.staleness?.age_s ?? 900,
+      stale: spec.staleness?.stale ?? false,
+      last_error: spec.staleness?.last_error ?? null,
+      fetch_count: spec.staleness?.fetch_count ?? 4,
+      error_count: spec.staleness?.error_count ?? 0,
+    },
+  };
+}
+
+/**
+ * One cross-check record fixture (the first fetch's elapsed quarter-hour).
+ * The basis rides by default — on the real wire a score exists only when the
+ * pairing is non-empty, and a non-empty pairing always carries the inputs.
+ */
+export function forecastScore(
+  spec: Partial<WireForecastScore> = {},
+): WireForecastScore {
+  const basis: Partial<WireForecastBasis> = spec.basis ?? {};
+  return {
+    source: spec.source ?? "solcast",
+    fetched_at: spec.fetched_at ?? "2026-08-25T10:00:00+00:00",
+    window_from: spec.window_from ?? "2026-08-25T10:00:00+00:00",
+    window_to: spec.window_to ?? "2026-08-25T10:15:00+00:00",
+    samples: spec.samples ?? 30,
+    mae_w: spec.mae_w ?? 312,
+    bias_w: spec.bias_w ?? 312,
+    rmse_w: spec.rmse_w ?? 401,
+    inside_band: spec.inside_band === undefined ? 0.75 : spec.inside_band,
+    basis: {
+      paired_samples: basis.paired_samples ?? 30,
+      mean_forecast_w: basis.mean_forecast_w ?? 1000,
+      mean_export_w: basis.mean_export_w ?? 700,
+      mean_pre_battery_surplus_w:
+        basis.mean_pre_battery_surplus_w === undefined
+          ? 900
+          : basis.mean_pre_battery_surplus_w,
+      mean_charging_w: basis.mean_charging_w === undefined ? 200 : basis.mean_charging_w,
+    },
+  };
+}
+
+/** A scoreboard fixture; defaults are one honest small-n fetch checked. */
+export function forecastScoreboard(
+  spec: Partial<WireForecastScoreboard> = {},
+): WireForecastScoreboard {
+  return {
+    source: spec.source ?? "solcast",
+    since: spec.since ?? "2026-08-25T10:00:00+00:00",
+    records: spec.records ?? 1,
+    total_samples: spec.total_samples ?? 30,
+    mean_bias_w: spec.mean_bias_w ?? 312,
+    mean_mae_w: spec.mean_mae_w ?? 312,
+    mean_inside_band: spec.mean_inside_band === undefined ? 0.75 : spec.mean_inside_band,
+    durable: false,
+  };
+}
+
+/** The route's 200 body around one outlook. */
+export function forecastOutlook(
+  spec: Partial<WireForecastOutlook> = {},
+): WireForecastOutlook {
+  const pv = spec.pv === undefined ? forecastPv() : spec.pv;
+  return {
+    as_of: spec.as_of ?? "2026-08-25T10:15:00+00:00",
+    history_composed: spec.history_composed ?? true,
+    pv,
+    provider: spec.provider === undefined ? forecastProvider() : spec.provider,
+    notes: spec.notes ?? [],
+    score: spec.score === undefined ? null : spec.score,
+    scoreboard: spec.scoreboard === undefined ? null : spec.scoreboard,
+  };
+}
+
+/** The route's not-commissioned refusal, exactly as the boundary pins it. */
+export function forecastNotCommissionedEnvelope(options: {
+  message?: string;
+} = {}): { status: number; code: string; message: string; details: Record<string, unknown> | null; request_id: string } {
+  return {
+    status: 409,
+    code: "forecast_providers_not_commissioned",
+    message:
+      options.message ??
+      "the forecast providers are not composed on this site",
+    details: null,
+    request_id: "req-forecast-1",
+  };
+}

@@ -53,6 +53,7 @@ import {
   toEnergyDaysView,
   type EnergyDayRecord,
 } from "../../app/energy";
+import { SolarOutlookSection } from "./SolarOutlook";
 import "./insights.css";
 
 /** How many more days each "Load more" widens the window by. */
@@ -259,6 +260,7 @@ export function InsightsView({ client }: InsightsViewProps): JSX.Element {
         <p role="status" className="insights-loading">
           Loading the energy ledger…
         </p>
+        <SolarOutlookSection client={client} />
       </section>
     );
   }
@@ -283,6 +285,9 @@ export function InsightsView({ client }: InsightsViewProps): JSX.Element {
             Check again
           </button>
         </div>
+        {/* The solar section is its own feature: an uncommissioned scorecard
+            never hides a commissioned forecast stack (and vice versa). */}
+        <SolarOutlookSection client={client} />
       </section>
     );
   }
@@ -306,6 +311,7 @@ export function InsightsView({ client }: InsightsViewProps): JSX.Element {
             Try again
           </button>
         </div>
+        <SolarOutlookSection client={client} />
       </section>
     );
   }
@@ -371,6 +377,9 @@ export function InsightsView({ client }: InsightsViewProps): JSX.Element {
           <p className="insights-error-message">{moreError.message}</p>
         </div>
       )}
+      {/* The solar section fetches on its own rhythm and keeps its own honest
+          states: a not-commissioned forecast stack never hides the ledger. */}
+      <SolarOutlookSection client={client} />
       <p className="insights-footnote">{SOLAR_FOOTNOTE}</p>
     </section>
   );

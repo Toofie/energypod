@@ -379,6 +379,20 @@ export interface ApiClient {
    */
   getPlantHistory(query: PlantHistoryQuery): Promise<Record<string, unknown>>;
   /**
+   * The advisory forecast read (GET /api/v1/forecast, observe scope;
+   * ARCHITECTURE section 17's provider round): the PV outlook the composed
+   * provider family serves (intervals, the central figure, the [q10, q90]
+   * band where the source claims one, the provider's own staleness report)
+   * plus the accuracy scoreboard — the cross-check scorer's figures against
+   * the historian's recorded surplus, accumulated per fetch in memory. A
+   * deployment without an enabled `forecast_providers` block refuses with
+   * 409 `forecast_providers_not_commissioned`; a composed surface ALWAYS
+   * answers 200 — a missing family, a failed fetch with no cache, and an
+   * empty scoreboard are honest nulls inside the body, never errors. The
+   * body is parsed by web/src/app/forecast.ts.
+   */
+  getForecast(): Promise<Record<string, unknown>>;
+  /**
    * The guarded park action (POST /api/v1/units/{id}/park, arm scope +
    * interactive principal + Idempotency-Key; DESIGN_POD_PARKING §2):
    * `{confirmation: "PARK", reason (1..500, required), lease_s? (60..
@@ -772,6 +786,7 @@ export function createApiClient(token: string): ApiClient {
       }
       return request<Record<string, unknown>>(`/api/v1/history?${params.toString()}`);
     },
+    getForecast: () => request<Record<string, unknown>>("/api/v1/forecast"),
     postPark: (unitId, body, idempotencyKey) => {
       const wireBody: Record<string, unknown> = {
         confirmation: "PARK",

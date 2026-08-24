@@ -33,6 +33,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from energypod.application.energy import EnergyScorecardRefusal
 from energypod.application.excess_charge import ExcessChargingRefusal
+from energypod.application.forecast import ForecastRefusal
 from energypod.application.history import PlantHistoryRefusal
 from energypod.application.night_charge import NightChargingRefusal
 from energypod.application.parking import ParkingRefusal
@@ -91,6 +92,7 @@ class EnergyService(Protocol):
     async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_energy_days(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_plant_history(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_forecast_outlook(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_observed_objectives(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
@@ -1324,6 +1326,23 @@ def create_api_app(
             raise BoundaryError(409, exc.code, exc.message) from exc
         except ValueError as exc:
             raise BoundaryError(422, "validation_error", str(exc)) from exc
+
+    @app.get(f"{API_PREFIX}/forecast")
+    async def get_forecast(identity: Principal = observe_dependency) -> Any:
+        """The advisory forecast read (the console's solar outlook).
+
+        Observe scope, read-only (no mutation exists on this surface; the
+        providers stay advisory-only, ARCHITECTURE section 17).  Answers 409
+        ``forecast_providers_not_commissioned`` when the ``forecast_providers``
+        block is absent or disabled; a composed surface ALWAYS answers 200 --
+        a missing provider family (its registry ``notes`` say why), a failed
+        fetch with no cache, and an empty accuracy scoreboard are honest
+        nulls, never errors.
+        """
+        try:
+            return await service.get_forecast_outlook(principal=identity)
+        except ForecastRefusal as exc:
+            raise BoundaryError(409, exc.code, exc.message) from exc
 
     @app.get(f"{API_PREFIX}/objectives/observed")
     async def get_observed_objectives(

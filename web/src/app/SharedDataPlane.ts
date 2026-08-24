@@ -333,6 +333,10 @@ export function sharedClient(plane: SharedDataPlane, real: ApiClient): ApiClient
     // publishes no bus event by design — samples are projections, not acts),
     // so coalescing would only tie two ranges' reads together.
     getPlantHistory: (query) => real.getPlantHistory(query),
+    // The advisory forecast read passes through the same way: the solar
+    // section owns its own cadence, and the provider's own cache gate already
+    // coalesces the wire legs better than a plane window could.
+    getForecast: () => real.getForecast(),
     postIntent: (body, idempotencyKey) => real.postIntent(body, idempotencyKey),
     postIntentCancel: (intentId, idempotencyKey) =>
       real.postIntentCancel(intentId, idempotencyKey),

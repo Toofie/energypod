@@ -1118,6 +1118,59 @@ temperature_max_c`); `points` 50..2000 (default 600). Errors: 422
   decisions — a history row's commanded triple is the sampled 30 s
   projection, and where the two disagree the audit row is the record.
 
+## Forecast providers (the advisory outlook read — ARCHITECTURE section 17)
+
+The provider round's advisory stack stays advisory: no fleet-loop slot, no
+kernel input, no snapshot key. Its one exposure is a READ route the console's
+Insights view (the "Solar outlook & forecast accuracy" section) consumes.
+
+- **`GET /api/v1/forecast`** (observe scope; read-only, no mutation exists on
+  this surface): 200 whenever the `forecast_providers` block is PRESENT and
+  ENABLED, 409 `forecast_providers_not_commissioned` otherwise (the
+  block-presence doctrine). A composed surface ALWAYS answers 200 — a missing
+  provider family, a failed fetch with no cache, and an empty scoreboard are
+  honest nulls inside the body, never errors. The read fetches through the
+  provider's own cache gate (the wire-leg budget stays the provider's), so a
+  console polling faster than `refresh_interval_s` burns no quota.
+- **Response:** `{"as_of", "history_composed", "pv": null | {source,
+  variable, fetched_at, issued_at, quantiled, horizon_from, horizon_to,
+  "intervals": [{start, end, w, q10?, q90?}]}, "provider": null | {source,
+  "staleness": {fetched_at, age_s, stale, last_error, fetch_count,
+  error_count}}, "notes": [str], "score": null | {...}, "scoreboard": null |
+  {...}}`. The intervals project the normalized series verbatim: half-open
+  slots, the central figure (`w`; the 0.5 quantile where the source claims
+  one, the point value otherwise), and `q10`/`q90` ONLY where the source
+  issued deciles — a deterministic source (Open-Meteo) never gains a
+  fabricated band. `notes` carries the registry's own omissions verbatim
+  (a declared Solcast family whose key reference does not resolve).
+- **`score`** is the provider round's cross-check scorer applied to the
+  fetch's ELAPSED window: the historian's fleet-summed `grid_power_w`
+  (positive = export) at fully-reported timestamps paired into the forecast
+  intervals that contain them. `{source, fetched_at, window_from, window_to,
+  samples, mae_w, bias_w, rmse_w, inside_band, "basis": {...}}`; null when
+  nothing recorded aligns yet (a fresh fetch) or the `plant_history` block is
+  absent (`history_composed: false` names that state). `inside_band` is the
+  share of paired surplus inside [q10, q90], null when the source claims no
+  band.
+- **Basis honesty (amendment A1, 2026-08-24):** the scorer's recorded basis —
+  grid export — is surplus AFTER the batteries absorb it; absorption (the
+  desired outcome) collapses export and scores as a miss that is not the
+  forecast's. The corrected basis's RAW INPUTS therefore ride every score as
+  `"basis": {paired_samples, mean_forecast_w, mean_export_w,
+  mean_pre_battery_surplus_w, mean_charging_w}` — means over the same paired
+  timestamps, with `mean_pre_battery_surplus_w = max(0, export + charging)`
+  per timestamp; never integrated kWh (integration owns a cadence assumption
+  the read surface does not). The night-v2 round rebuilds the scorer on these
+  inputs; the console renders them as inputs, never a second verdict.
+- **`scoreboard`** is the accumulating evidence: PER FETCH (one distinct
+  `fetched_at` = one record, re-scored as its elapsed window grows) and in
+  memory only (`durable: false` on every response; a restart starts the
+  evidence over). `{source, since, records, total_samples, mean_bias_w,
+  mean_mae_w, mean_inside_band, durable}`; null until the first fetch
+  outlives its own refresh interval with recorded surplus behind it. Day-
+  scale per-day kWh records are a persistence round this route deliberately
+  does not attempt.
+
 ## Device-mode telemetry and dispatch gating
 
 - `Observation` gains four more ADVISORY words (2026-08-23 incident 1), same doctrine as the CT

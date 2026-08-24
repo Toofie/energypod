@@ -2220,3 +2220,58 @@ def test_the_history_surface_has_no_mutation(
         for method in ("post", "put", "delete"):
             response = getattr(client, method)(f"{API}/history", headers=_auth("operator-token"))
             assert response.status_code == 405, method
+
+
+# --- the forecast read surface (the console's solar outlook) -----------------------
+
+
+def test_forecast_requires_authentication_and_serves_the_pinned_body(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """Observe scope; GET /api/v1/forecast serves the outlook body verbatim."""
+    with _client(service, authenticator) as client:
+        anonymous = client.get(f"{API}/forecast")
+        unscoped = client.get(f"{API}/forecast", headers=_auth("audit-only-token"))
+        viewed = client.get(f"{API}/forecast", headers=_auth("viewer-token"))
+
+    _assert_error(anonymous, 401, "authentication_required")
+    _assert_error(unscoped, 403, "insufficient_scope")
+    assert viewed.status_code == 200
+    body = viewed.json()
+    assert set(body) == {
+        "as_of",
+        "history_composed",
+        "pv",
+        "provider",
+        "notes",
+        "score",
+        "scoreboard",
+    }
+    assert body["pv"]["source"] == "solcast"
+    assert body["pv"]["intervals"][0]["q10"] == 400.0
+    forwarded = [values for name, values in service.calls if name == "get_forecast_outlook"]
+    assert forwarded[0]["principal"].subject == "person:viewer"
+
+
+def test_forecast_maps_the_not_commissioned_refusal_verbatim(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    from energypod.application.forecast import ForecastRefusal
+
+    service.forecast_refusal = ForecastRefusal(
+        "forecast_providers_not_commissioned",
+        "the forecast providers are not composed on this site",
+    )
+    with _client(service, authenticator) as client:
+        response = client.get(f"{API}/forecast", headers=_auth("viewer-token"))
+    _assert_error(response, 409, "forecast_providers_not_commissioned")
+
+
+def test_the_forecast_surface_has_no_mutation(
+    service: RecordingEnergyService, authenticator: FakeAuthenticator
+) -> None:
+    """Read-only by construction: no mutation exists on this surface."""
+    with _client(service, authenticator) as client:
+        for method in ("post", "put", "delete"):
+            response = getattr(client, method)(f"{API}/forecast", headers=_auth("operator-token"))
+            assert response.status_code == 405, method

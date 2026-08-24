@@ -51,6 +51,7 @@ from .actor import ArmRefused
 from .arbiter import IntentArbiter
 from .energy import EnergyScorecardRefusal
 from .excess_charge import ExcessChargingRefusal
+from .forecast import FORECAST_PROVIDERS_NOT_COMMISSIONED, ForecastRefusal
 from .foreign_objective import empty_objective_entry
 from .history import PLANT_HISTORY_NOT_COMMISSIONED, PlantHistoryRefusal
 from .night_charge import NightChargingRefusal
@@ -404,6 +405,18 @@ class PlantHistorySurface(Protocol):
         points: int = 600,
         now_utc: datetime | None = None,
     ) -> dict[str, Any]: ...
+
+
+class ForecastOutlookSurface(Protocol):
+    """The composed forecast read surface's facade-facing half (block presence).
+
+    ``energypod.application.forecast.ForecastOutlookControl`` is the composed
+    implementation.  Pure projection reads: the facade serves the outlook
+    route, and NOTHING on this surface mutates anything -- forecasts stay
+    advisory-only (ARCHITECTURE section 17).
+    """
+
+    async def outlook_payload(self, *, now_utc: datetime | None = None) -> dict[str, Any]: ...
 
 
 class DeliveryBiasView(Protocol):
@@ -1106,6 +1119,7 @@ class EnergyServiceFacade:
         night: NightChargingControl | None = None,
         parking: ParkControl | None = None,
         delivery_bias: DeliveryBiasView | None = None,
+        forecast: ForecastOutlookSurface | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -1133,6 +1147,7 @@ class EnergyServiceFacade:
         self._night = night
         self._parking = parking
         self._delivery_bias = delivery_bias
+        self._forecast = forecast
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._schedule_correlations = itertools.count(1)
@@ -1424,6 +1439,25 @@ class EnergyServiceFacade:
             fields=fields,
             points=points,
             now_utc=self._clock.wall_now().astimezone(UTC),
+        )
+
+    async def get_forecast_outlook(self, *, principal: Principal) -> dict[str, Any]:
+        """The advisory forecast read (the console's solar outlook + scoreboard).
+
+        Observe scope, read-only (no mutation exists on this surface).
+        Answers 409 ``forecast_providers_not_commissioned`` when the
+        ``forecast_providers`` block is absent or disabled; a composed surface
+        ALWAYS answers 200 -- a missing provider family, a failed fetch with
+        no cache, and an empty scoreboard are honest nulls, never errors.
+        """
+        self._admit(principal, "observe")
+        if self._forecast is None:
+            raise ForecastRefusal(
+                FORECAST_PROVIDERS_NOT_COMMISSIONED,
+                "the forecast providers are not composed on this site",
+            )
+        return await self._forecast.outlook_payload(
+            now_utc=self._clock.wall_now().astimezone(UTC)
         )
 
     async def get_observed_objectives(

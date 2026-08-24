@@ -120,6 +120,7 @@ from energypod.application.excess_charge import (
     ExcessChargeSettings,
     eligible_export_charge_w,
 )
+from energypod.application.forecast import ForecastOutlookControl
 from energypod.application.foreign_objective import (
     ForeignObjectiveMonitor,
     ForeignObjectiveSettings,
@@ -3706,6 +3707,26 @@ def _build_runtime(
             tariff=registry_tariff,
             notes=tuple(registry_notes),
         )
+    # --- the forecast read surface (the registry's first consumer) ---------
+    # The advisory doctrine keeps its shape: this is a READ surface only (the
+    # console's GET /api/v1/forecast), never a fleet-loop slot -- the wire-leg
+    # budget stays the providers' own cache gate, and the historian read feeds
+    # the cross-check scorer alone.  Composed exactly when the registry is
+    # (the ``forecast_providers`` block PRESENT and ENABLED); None otherwise.
+    forecast_surface = None
+    if forecast_registry is not None:
+        # The scorer is injected, not imported by the application module
+        # (section 24's advisory-only pin: the application layer never
+        # imports the provider adapters; the composition root may).
+        from energypod.adapters.providers.cross_check import score_forecast_against_surplus
+
+        forecast_surface = ForecastOutlookControl(
+            unit_ids=tuple(unit.unit_id for unit in config.units),
+            pv=forecast_registry.pv,
+            scorer=score_forecast_against_surplus,
+            notes=forecast_registry.notes,
+            history=history_store if history_store is not None else None,
+        )
     # --- delivery-bias estimator (DESIGN_POD_PARKING section 7) -----------
     # Composed ALWAYS (evidence-only, no config, no control path reads it):
     # supervision records the peeked-authorization vs measured pairs while a
@@ -3731,6 +3752,7 @@ def _build_runtime(
         history=history_surface,
         parking=park_controller,
         delivery_bias=delivery_bias,
+        forecast=forecast_surface,
     )
     if park_controller is not None:
         # The park controller's conflict/resume guards read the facade's own

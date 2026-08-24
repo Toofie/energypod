@@ -18,6 +18,7 @@ import {
   energyDayRecord,
   energyDayRolled,
   energyNotCommissionedEnvelope,
+  forecastOutlook,
   getEnergyDaysOk,
   type WireEnergyDayRecord,
 } from "../../test/wire";
@@ -69,16 +70,25 @@ function liveChannel(initial: readonly StreamEvent[]): {
 }
 
 interface Harness {
-  client: ApiClient & { getEnergyDays: ReturnType<typeof vi.fn> };
+  client: ApiClient & {
+    getEnergyDays: ReturnType<typeof vi.fn>;
+    getForecast: ReturnType<typeof vi.fn>;
+  };
 }
 
 function installHarness(options: {
   getEnergyDays?: ReturnType<typeof vi.fn>;
+  getForecast?: ReturnType<typeof vi.fn>;
   openEvents?: () => AsyncIterable<StreamEvent>;
 } = {}): Harness {
   const client = {
     getEnergyDays:
       options.getEnergyDays ?? vi.fn(() => Promise.resolve(getEnergyDaysOk({ days: [] }))),
+    // The solar section rides the same view; the default is the quiet honest
+    // 200 (no provider family serving) so it never dominates a ledger test.
+    getForecast:
+      options.getForecast ??
+      vi.fn(() => Promise.resolve(forecastOutlook({ pv: null, provider: null }))),
     getSnapshot: vi.fn(),
     getHealth: vi.fn(),
     getAudit: vi.fn(() => Promise.resolve({ events: [], next_cursor: null })),

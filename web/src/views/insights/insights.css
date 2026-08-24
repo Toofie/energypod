@@ -225,3 +225,211 @@
 .insights-crosscheck summary:focus-visible {
   outline-offset: 2px;
 }
+
+/* --- the solar outlook & forecast accuracy section (the provider round) ---
+ * Same paper-and-ink family: a quiet boxed section under the ledger, the
+ * gold the solar family owns, tabular numbers for every figure. */
+
+.insights-solar {
+  margin-top: 0.6rem;
+  border: 1px solid #d6d0c4;
+  border-radius: 0.7rem;
+  padding: 0.7rem 0.9rem;
+  background: #fffefb;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.insights-solar h3 {
+  margin: 0;
+  font-size: 1.02rem;
+  color: #3f3a30;
+}
+
+.insights-solar h4 {
+  margin: 0.2rem 0 0.15rem;
+  font-size: 0.92rem;
+  color: #3f3a30;
+}
+
+.insights-solar-intro {
+  margin: 0;
+  color: #57534e;
+  font-size: 0.9rem;
+}
+
+.insights-solar-loading {
+  margin: 0;
+  color: #57534e;
+}
+
+.insights-solar-refresh-row {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.insights-solar-outlook,
+.insights-solar-scoreboard {
+  border-top: 1px dashed #d6d0c4;
+  padding-top: 0.5rem;
+}
+
+.insights-solar-facts {
+  margin: 0;
+  color: #57534e;
+  font-size: 0.9rem;
+}
+
+.insights-solar-source {
+  color: #3f3a30;
+}
+
+.insights-solar-fetched {
+  font-variant-numeric: tabular-nums;
+}
+
+/* The provider's OWN stale verdict, rendered as the warn gold — the word
+ * rides beside it (never color-only). */
+.insights-solar-fetched--stale {
+  color: #8a5a00;
+  font-weight: 600;
+}
+
+.insights-solar-absent {
+  margin: 0;
+  color: #57534e;
+}
+
+.insights-solar-provider-error {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  color: #9b2c2c;
+}
+
+.insights-solar-notes {
+  margin: 0.3rem 0 0;
+  padding-left: 1.1rem;
+  color: #78716c;
+  font-size: 0.85rem;
+}
+
+.insights-solar-chart {
+  margin-top: 0.35rem;
+}
+
+.insights-solar-score {
+  margin: 0;
+  color: #3f3a30;
+  font-size: 0.92rem;
+}
+
+.insights-solar-bias {
+  font-variant-numeric: tabular-nums;
+}
+
+/* The basis disclosure and its raw inputs: quiet but always present wherever
+ * an accuracy figure renders — a number without its basis would be a verdict
+ * the physics does not support. */
+.insights-solar-basis {
+  margin: 0.25rem 0 0;
+  font-size: 0.82rem;
+  color: #78716c;
+}
+
+.insights-solar-basis-inputs {
+  margin: 0.25rem 0 0;
+  font-size: 0.88rem;
+  color: #3f3a30;
+  font-variant-numeric: tabular-nums;
+}
+
+.insights-solar-board-main {
+  margin: 0;
+  color: #3f3a30;
+  font-size: 0.92rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.insights-solar-board-evidence {
+  margin: 0.2rem 0 0;
+  color: #57534e;
+  font-size: 0.88rem;
+}
+
+.insights-solar-board-durable {
+  margin: 0.2rem 0 0;
+  color: #78716c;
+  font-size: 0.85rem;
+}
+
+.insights-solar-board-note {
+  margin: 0;
+  color: #57534e;
+  font-size: 0.88rem;
+}
+
+.insights-solar-night-note {
+  margin: 0.25rem 0 0;
+  color: #78716c;
+  font-size: 0.85rem;
+}
+
+.insights-solar-not-commissioned {
+  border: 1px solid #d6d0c4;
+  border-radius: 0.6rem;
+  padding: 0.7rem 0.9rem;
+  background: #fffdf7;
+}
+
+.insights-solar-not-commissioned p {
+  margin: 0.2rem 0;
+}
+
+.insights-solar-error {
+  border: 1px solid #e7c8c4;
+  border-radius: 0.6rem;
+  padding: 0.7rem 0.9rem;
+  background: #fdf6f5;
+}
+
+.insights-solar-error p {
+  margin: 0.2rem 0;
+}
+
+.insights-solar-error-title {
+  font-weight: 600;
+  color: #9b2c2c;
+}
+
+.insights-solar-error--refresh {
+  border-color: #e7c8c4;
+}
+
+.insights-solar-error-code code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.insights-solar-error-message {
+  color: #3f3a30;
+}
+
+.insights-solar-error-request code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.insights-solar-retry {
+  font: inherit;
+  padding: 0.35rem 1.1rem;
+  border: 1px solid #b8b2a7;
+  border-radius: 0.6rem;
+  background: #fffefb;
+  color: #3f3a30;
+  cursor: pointer;
+}
+
+.insights-solar-retry:focus-visible {
+  outline-offset: 2px;
+}
