@@ -813,7 +813,7 @@ class TestPersistence:
         from energypod.adapters.persistence.sqlite import SQLiteDatabase
         from energypod.db.schema import SCHEMA_VERSION
 
-        assert SCHEMA_VERSION == 6
+        assert SCHEMA_VERSION == 7
         path = tmp_path / "trust-migrate.sqlite3"
         raw = sqlite3.connect(path)
         try:
@@ -835,7 +835,7 @@ class TestPersistence:
             stamped = database.connection.execute(
                 "SELECT version FROM schema_version WHERE singleton = 1"
             ).fetchone()
-            assert stamped == (6,)
+            assert stamped == (7,)
             assert database.connection.execute(
                 "SELECT COUNT(*) FROM park_leases"
             ).fetchone() == (1,), "an in-place upgrade touches no existing table's rows"

@@ -88,6 +88,8 @@ function mockClient(overrides: Partial<ApiClient> = {}): ApiClient {
     postEmergencyStop: vi.fn(() => Promise.reject(refused)),
     postStopAcknowledgement: vi.fn(() => Promise.reject(refused)),
     postInhibitAcknowledgement: vi.fn(() => Promise.reject(refused)),
+    getPvOutputStatus: async () => ({}),
+    postPvOutput: async () => ({}),
     openEvents: vi.fn(() => liveThenQuiet()),
     ...overrides,
   } as unknown as ApiClient;

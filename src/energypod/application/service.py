@@ -61,6 +61,7 @@ from .parking import (
     ParkCommissioning,
     ParkingRefusal,
 )
+from .pvoutput_upload import PVOUTPUT_CONFIRMATION, PvOutputRefusal, PvOutputUploader
 from .scheduling import (
     SchedulePolicy,
     SchedulePublishValidationError,
@@ -417,6 +418,28 @@ class ForecastOutlookSurface(Protocol):
     """
 
     async def outlook_payload(self, *, now_utc: datetime | None = None) -> dict[str, Any]: ...
+
+
+class PvOutputSurface(Protocol):
+    """The composed pvoutput reporter's facade-facing surface (block presence).
+
+    ``energypod.application.pvoutput_upload.PvOutputUploader`` is the composed
+    implementation.  The facade PROJECTS the health snapshot and drives the
+    guarded runtime toggle: the durable write happens inside the control
+    (store first, in-memory flip second), and every commissioned fact -- the
+    slot layout, the cadence, the freshness bound -- is a composition fact
+    this port cannot touch.
+    """
+
+    @property
+    def enabled(self) -> bool: ...
+
+    @property
+    def enabled_origin(self) -> str: ...
+
+    def status_payload(self) -> dict[str, Any]: ...
+
+    def set_enabled(self, enabled: bool) -> None: ...
 
 
 class DeliveryBiasView(Protocol):
@@ -1120,6 +1143,7 @@ class EnergyServiceFacade:
         parking: ParkControl | None = None,
         delivery_bias: DeliveryBiasView | None = None,
         forecast: ForecastOutlookSurface | None = None,
+        pvoutput: PvOutputUploader | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -1148,6 +1172,7 @@ class EnergyServiceFacade:
         self._parking = parking
         self._delivery_bias = delivery_bias
         self._forecast = forecast
+        self._pvoutput = pvoutput
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._schedule_correlations = itertools.count(1)
@@ -2886,6 +2911,92 @@ class EnergyServiceFacade:
             "persisted": False,
             "acknowledged_partition": control.acknowledged_partition,
             "night_charge_state": control.state_payload(),
+        }
+
+    # --- the pvoutput.org reporter surface (the retiring Docker writer's
+    # replacement): the health read and the guarded runtime toggle.  The
+    # toggle is the night pattern with ONE deliberate difference the response
+    # names -- ``persisted: true``: the operator's choice lands in the durable
+    # store (schema v7) and SURVIVES a restart, because "I'll turn it on when
+    # I'm ready and disable the other container" is a standing decision, not a
+    # per-process one.
+    async def get_pvoutput_status(self, *, principal: Principal) -> dict[str, Any]:
+        """The uploader's health snapshot (block-presence refusal otherwise)."""
+        self._admit(principal, "observe")
+        control = self._pvoutput
+        if control is None:
+            raise PvOutputRefusal(
+                "pvoutput_not_commissioned",
+                "the pvoutput feature is not composed on this site",
+            )
+        return control.status_payload()
+
+    async def set_pvoutput(
+        self,
+        *,
+        action: Any,
+        confirmation: Any,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """The guarded pvoutput activation toggle (the night pattern).
+
+        The arm/disarm asymmetry exactly: enabling starts reporting -- a
+        control-adjacent act that needs an interactive human -- while
+        disabling is safety-positive and stays open to any arm-scoped
+        principal.  The durable write happens INSIDE the control (store
+        first, flip second; a failing store write refuses with
+        ``pvoutput_toggle_failed``), and Impl-10 commit-then-audit applies:
+        the flip has committed, the audit row follows, and no audit failure
+        ever rolls the operator's choice back.
+        """
+        if action not in ("enable", "disable"):
+            raise ValueError("action must be 'enable' or 'disable'")
+        if confirmation != PVOUTPUT_CONFIRMATION:
+            raise ValueError(f"confirmation must be the literal {PVOUTPUT_CONFIRMATION!r}")
+        self._admit(principal, "arm", interactive=(action == "enable"))
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        control = self._pvoutput
+        if control is None:
+            # Block-presence doctrine: an ABSENT block composes nothing -- no
+            # uploader, no status surface, and nothing to toggle.
+            raise PvOutputRefusal(
+                "pvoutput_not_commissioned",
+                "the pvoutput feature is not composed on this site",
+            )
+        enabled = action == "enable"
+        result = "noop"
+        if enabled and not control.enabled:
+            control.set_enabled(True)
+            result = "enabled"
+        elif not enabled and control.enabled:
+            control.set_enabled(False)
+            result = "disabled"
+        await self._append_audit(
+            self._mutation_audit(
+                event_type="pvoutput_toggled",
+                subject=principal.subject,
+                result=result,
+                request_id=request,
+                reason_codes=(result,),
+                lifecycle=self._fleet_lifecycle(),
+                payload={
+                    "action": action,
+                    "enabled": control.enabled,
+                    "enabled_origin": control.enabled_origin,
+                },
+            )
+        )
+        return {
+            "feature": "pvoutput",
+            "enabled": control.enabled,
+            "enabled_origin": control.enabled_origin,
+            # The night twin answers False (participation resets at boot);
+            # this toggle is a DURABLE fact and says so.
+            "persisted": True,
+            "pvoutput_state": control.status_payload(),
         }
 
     async def replace_schedule(

@@ -60,6 +60,7 @@ export function seededClient(
     objectives?: () => Record<string, unknown>;
     park?: { park?: () => Record<string, unknown>; resume?: () => Record<string, unknown> };
     unitDetail?: (unitId: string) => Record<string, unknown> | undefined;
+    pvoutput?: () => Record<string, unknown>;
   } = {},
 ): SeededClient {
   const lost = options.connection === "lost";
@@ -154,6 +155,19 @@ export function seededClient(
     },
     postNightCharging: async () => {
       throw absent("the night toggle");
+    },
+    getPvOutputStatus: async () => {
+      try {
+        if (options.pvoutput === undefined) {
+          throw absent("the pvoutput status");
+        }
+        return structuredClone(options.pvoutput()) as Record<string, unknown>;
+      } finally {
+        countDataRead();
+      }
+    },
+    postPvOutput: async () => {
+      throw absent("the pvoutput toggle");
     },
     postPark: async () => {
       if (options.park?.park === undefined) {

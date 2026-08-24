@@ -682,6 +682,56 @@ class RecordingEnergyService:
         payload["window_s"] = hours * 3600
         return payload
 
+    # The pvoutput reporter's scripted answers (the retiring Docker writer's
+    # replacement): the status body, the toggle 200, and an optional typed
+    # refusal raised to the boundary.
+    pvoutput_status_view: dict[str, Any] = field(
+        default_factory=lambda: {
+            "feature": "pvoutput",
+            "enabled": False,
+            "enabled_origin": "config",
+            "disabled_reason": None,
+            "credentials_note": None,
+            "interval_s": 300.0,
+            "unit_slots": {"lhs": ["v7", "v8"], "mid": ["v11", "v12"], "rhs": ["v9", "v10"]},
+            "native_battery_fields": True,
+            "as_of": "2026-08-25T04:00:00+00:00",
+            "last_success_at": None,
+            "last_post_age_s": None,
+            "last_posted_slot": None,
+            "last_error": None,
+            "consecutive_failures": 0,
+            "rate_remaining": None,
+            "slots_skipped_stale": 0,
+        }
+    )
+    pvoutput_result: dict[str, Any] = field(
+        default_factory=lambda: {
+            "feature": "pvoutput",
+            "enabled": True,
+            "enabled_origin": "runtime",
+            "persisted": True,
+            "pvoutput_state": {
+                "enabled": True,
+                "enabled_origin": "runtime",
+                "disabled_reason": None,
+            },
+        }
+    )
+    pvoutput_refusal: Any = None
+
+    async def get_pvoutput_status(self, *, principal: Any) -> dict[str, Any]:
+        self.calls.append(("get_pvoutput_status", {"principal": principal}))
+        if self.pvoutput_refusal is not None:
+            raise self.pvoutput_refusal
+        return dict(self.pvoutput_status_view)
+
+    async def set_pvoutput(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("set_pvoutput", kwargs))
+        if self.pvoutput_refusal is not None:
+            raise self.pvoutput_refusal
+        return dict(self.pvoutput_result)
+
     async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("replace_schedule", kwargs))
         if self.schedule_refusal is not None:

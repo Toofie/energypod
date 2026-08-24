@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
-SCHEMA_VERSION: Final[int] = 6
+SCHEMA_VERSION: Final[int] = 7
 BASELINE_VERSION: Final[int] = 0
 
 _CREATE_VERSION_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS schema_version (
@@ -154,6 +154,20 @@ _CREATE_NIGHT_TARGET_REVISIONS_TABLE: Final[str] = (
     PRIMARY KEY (window_date, revised_at)
 ) WITHOUT ROWID"""
 )
+# The pvoutput.org reporter's durable runtime toggle (the retiring Docker
+# writer's replacement): ONE singleton row holding the operator's last
+# enable/disable act and its wall-clock moment.  The park-lease doctrine
+# verbatim -- the audit trail is the narrative (every toggle appends its
+# pvoutput_toggled row), but the in-memory audit mirror is a bounded deque and
+# the keyed-existence acknowledgement pattern is one-bit, so a TWO-STATE
+# toggle that must survive restarts and later flips gets its own queryable
+# table.  An absent row means "boot from the config's own ``enabled``"; every
+# toggle upserts, so the newest act is always the row.
+_CREATE_PVOUTPUT_STATE_TABLE: Final[str] = """CREATE TABLE IF NOT EXISTS pvoutput_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    updated_at TEXT NOT NULL
+)"""
 
 
 @dataclass(frozen=True)
@@ -187,7 +201,9 @@ class MigrationResult:
 # night_trust_day keyed by civil date, one payload per scored morning.
 # Version 6 adds the night-V2 morning archive and re-target instants
 # (DESIGN_NIGHT_CHARGE_V2 sections 3.2+5.2): the queryable twins of the
-# night_target_set/night_target_revised audit rows.
+# night_target_set/night_target_revised audit rows.  Version 7 adds the
+# pvoutput reporter's durable runtime-toggle singleton (the park-lease
+# doctrine: machine truth beside the audit narrative).
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, statements=(_CREATE_VERSION_TABLE,)),
     Migration(
@@ -207,6 +223,7 @@ MIGRATIONS: tuple[Migration, ...] = (
             _CREATE_NIGHT_TARGET_REVISIONS_TABLE,
         ),
     ),
+    Migration(version=7, statements=(_CREATE_PVOUTPUT_STATE_TABLE,)),
 )
 
 

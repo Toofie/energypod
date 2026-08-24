@@ -80,6 +80,7 @@ from energypod.adapters.persistence.memory import (
     InMemoryNightTrustRepository,
     InMemoryObservationRepository,
     InMemoryParkLeaseRepository,
+    InMemoryPvOutputStateRepository,
     InMemoryTelemetryHistoryRepository,
 )
 from energypod.adapters.persistence.sqlite import (
@@ -89,6 +90,7 @@ from energypod.adapters.persistence.sqlite import (
     SQLiteEnergyLedgerRepository,
     SQLiteNightTrustRepository,
     SQLiteParkLeaseRepository,
+    SQLitePvOutputStateRepository,
     SQLiteScheduleRepository,
     SQLiteTelemetryHistoryRepository,
 )
@@ -103,6 +105,7 @@ from energypod.adapters.providers.ports import (
 from energypod.adapters.providers.registry import ForecastProviderRegistry
 from energypod.adapters.providers.solcast import SolcastPvForecast
 from energypod.adapters.providers.tariff_static import StaticTariffProvider, TariffRateWindow
+from energypod.adapters.pvoutput.client import HttpxPvOutputTransport, PvOutputStatusClient
 from energypod.api.mcp import create_mcp_server
 from energypod.api.rest import create_api_app
 from energypod.application.actor import EnergyPodActor
@@ -140,6 +143,7 @@ from energypod.application.night_trust import (
     TrustGateSettings,
 )
 from energypod.application.parking import ParkCommissioning, ParkController
+from energypod.application.pvoutput_upload import PvOutputUploader
 from energypod.application.recovery import (
     CONNECT_FAILED,
     ECHO_UNREADABLE,
@@ -2179,6 +2183,7 @@ class _Supervision:
         historian: TelemetryHistorian | None = None,
         parking: ParkController | None = None,
         delivery_bias: DeliveryBiasEstimator | None = None,
+        pvoutput: PvOutputUploader | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -2232,6 +2237,11 @@ class _Supervision:
         # pass rides the same cycle (evidence-only; a failure records
         # nothing and never delays control).
         self._delivery_bias = delivery_bias
+        # The pvoutput.org reporter (the retiring Docker writer's
+        # replacement): one bounded, fully suppressed posting tick per fleet
+        # cycle, the historian's own envelope -- a failure inside it is a gap
+        # on the operator's dashboard, never a delay to control.
+        self._pvoutput = pvoutput
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
@@ -2510,6 +2520,17 @@ class _Supervision:
                 # authority (the same dict the heartbeats consumed).
                 with contextlib.suppress(Exception, asyncio.TimeoutError):
                     await asyncio.wait_for(self._history_step(authorized), timeout=self._interval_s)
+            if self._pvoutput is not None:
+                # The pvoutput.org reporter's own pass, the historian's exact
+                # envelope: AFTER the polls (it reads the same latest
+                # observations the historian samples) and BEFORE the kernel
+                # tick.  The uploader's internal cadence gate does nothing
+                # until a 5-minute slot boundary plus its grace has passed;
+                # a failure anywhere inside it is a gap on the dashboard,
+                # never a delay to control, and an exploding uploader can
+                # never raise into this loop.
+                with contextlib.suppress(Exception, asyncio.TimeoutError):
+                    await asyncio.wait_for(self._pvoutput.tick(), timeout=self._interval_s)
             # A kernel tick that overruns the interval is a component failure,
             # not a survivable per-unit fault. Cancelling it is safe — the
             # kernel's BaseException path revokes authority first (shielded)
@@ -3163,6 +3184,15 @@ class ComposedRuntime:
     # wires its own fetch loop against it.  ``notes`` records every declared
     # provider the environment could not deliver (a missing Solcast key).
     forecast_providers: ForecastProviderRegistry | None = None
+    # The pvoutput.org reporter (the retiring Docker writer's replacement),
+    # composed only when the ``pvoutput`` block is PRESENT -- the uploader
+    # control (the cadence gate, the snapshot assembly, the durable runtime
+    # toggle, and the health state GET /api/v1/pvoutput/status serves).
+    # None otherwise (block-absent doctrine).  The wire CLIENT inside it is
+    # None whenever the credential references do not resolve (the status
+    # surface then carries the note; the Solcast pattern, never a boot
+    # failure).
+    pvoutput: PvOutputUploader | None = None
 
 
 def _simulator_pod(
@@ -3848,6 +3878,72 @@ def _build_runtime(
             retention_full_resolution_days=int(history_config.retention_full_resolution_days),
             repository=history_store,
         )
+    # --- the pvoutput.org reporter (the retiring Docker writer's replacement) ---
+    # Composed exactly when the ``pvoutput`` block is PRESENT (the
+    # block-presence doctrine): the uploader control the fleet loop ticks,
+    # the durable runtime-toggle singleton the guarded route drives, and the
+    # health state the status route serves.  The credential REFERENCES
+    # resolve here, once, at composition -- an unset reference composes the
+    # surface WITHOUT its wire client and a note says so (the Solcast
+    # pattern: an observability provider's absence degrades its own data
+    # only, never a boot failure).  The toggle store rides the existing
+    # database (schema v7); simulate mode composes the explicitly non-durable
+    # in-memory twin, for scenario tests.
+    pvoutput_uploader: PvOutputUploader | None = None
+    pvoutput_config = config.pvoutput
+    if pvoutput_config is not None:
+        pvoutput_store: SQLitePvOutputStateRepository | InMemoryPvOutputStateRepository
+        if database is not None and not simulate:
+            pvoutput_store = SQLitePvOutputStateRepository(database)
+        else:
+            pvoutput_store = InMemoryPvOutputStateRepository()
+        pvoutput_api_key = environ.get(pvoutput_config.api_key_env)
+        pvoutput_system_id = environ.get(pvoutput_config.system_id_env)
+        pvoutput_client = None
+        pvoutput_note: str | None = None
+        if pvoutput_api_key and pvoutput_system_id:
+            pvoutput_client = PvOutputStatusClient(
+                transport=HttpxPvOutputTransport(
+                    timeout_s=float(pvoutput_config.request_timeout_s)
+                ),
+                api_key=pvoutput_api_key,
+                system_id=pvoutput_system_id,
+                timezone_name=config.site.timezone,
+            )
+        else:
+            # Name the missing REFERENCES (the secret values themselves never
+            # ride anywhere): the operator reading the status surface sees
+            # exactly which variable to set.
+            missing = [
+                name
+                for name, value in (
+                    (pvoutput_config.api_key_env, pvoutput_api_key),
+                    (pvoutput_config.system_id_env, pvoutput_system_id),
+                )
+                if not value
+            ]
+            pvoutput_note = (
+                "the credential environment variables "
+                + ", ".join(missing)
+                + " are not set; the uploader is composed without its wire client and "
+                "posts nothing until the references resolve"
+            )
+        pvoutput_uploader = PvOutputUploader(
+            unit_ids=tuple(unit.unit_id for unit in config.units),
+            unit_slots=dict(pvoutput_config.unit_slots),
+            timezone_name=config.site.timezone,
+            interval_s=float(pvoutput_config.interval_s),
+            max_sample_age_s=float(pvoutput_config.max_sample_age_s),
+            retry_max=int(pvoutput_config.retry_max),
+            native_battery_fields=bool(pvoutput_config.native_battery_fields),
+            config_enabled=bool(pvoutput_config.enabled),
+            client=pvoutput_client,
+            clock=resolved_clock,
+            observations=observation_port,
+            store=pvoutput_store,
+            credentials_note=pvoutput_note,
+        )
+
     # --- advisory forecast providers (ARCHITECTURE section 17) -----------
     # Composed only when the ``forecast_providers`` block is PRESENT and
     # ENABLED (an absent or disabled block composes NOTHING -- the staged
@@ -4035,6 +4131,7 @@ def _build_runtime(
         parking=park_controller,
         delivery_bias=delivery_bias,
         forecast=forecast_surface,
+        pvoutput=pvoutput_uploader,
     )
     if park_controller is not None:
         # The park controller's conflict/resume guards read the facade's own
@@ -4320,6 +4417,7 @@ def _build_runtime(
         historian=historian,
         parking=park_controller,
         delivery_bias=delivery_bias,
+        pvoutput=pvoutput_uploader,
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision
@@ -4359,6 +4457,7 @@ def _build_runtime(
         history_repository=history_store,
         history_surface=history_surface,
         forecast_providers=forecast_registry,
+        pvoutput=pvoutput_uploader,
     )
 
 

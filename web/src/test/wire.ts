@@ -1577,6 +1577,48 @@ export function scheduleWindowClosing(
 }
 
 /** The GET /api/v1/schedule 200 body. PENDING-BACKEND. */
+/**
+ * The GET /api/v1/pvoutput/status 200 body (the reporter's health snapshot;
+ * web/src/app/pvoutput.ts narrows it).  Every nullable field defaults to its
+ * honest null, never zero.
+ */
+export function pvoutputStatus(view: {
+  enabled?: boolean;
+  enabled_origin?: "config" | "runtime";
+  disabled_reason?: string | null;
+  credentials_note?: string | null;
+  interval_s?: number;
+  native_battery_fields?: boolean;
+  as_of?: string;
+  last_success_at?: string | null;
+  last_post_age_s?: number | null;
+  last_posted_slot?: string | null;
+  last_error?: string | null;
+  consecutive_failures?: number;
+  rate_remaining?: number | null;
+  slots_skipped_stale?: number;
+  unit_slots?: Record<string, [string, string]>;
+} = {}): Record<string, unknown> {
+  return {
+    feature: "pvoutput",
+    enabled: view.enabled ?? false,
+    enabled_origin: view.enabled_origin ?? "config",
+    disabled_reason: view.disabled_reason === undefined ? null : view.disabled_reason,
+    credentials_note: view.credentials_note === undefined ? null : view.credentials_note,
+    interval_s: view.interval_s ?? 300,
+    unit_slots: view.unit_slots ?? { lhs: ["v7", "v8"], rhs: ["v9", "v10"], mid: ["v11", "v12"] },
+    native_battery_fields: view.native_battery_fields ?? true,
+    as_of: view.as_of ?? "2026-08-27T01:31:00+00:00",
+    last_success_at: view.last_success_at === undefined ? null : view.last_success_at,
+    last_post_age_s: view.last_post_age_s === undefined ? null : view.last_post_age_s,
+    last_posted_slot: view.last_posted_slot === undefined ? null : view.last_posted_slot,
+    last_error: view.last_error === undefined ? null : view.last_error,
+    consecutive_failures: view.consecutive_failures ?? 0,
+    rate_remaining: view.rate_remaining === undefined ? null : view.rate_remaining,
+    slots_skipped_stale: view.slots_skipped_stale ?? 0,
+  };
+}
+
 export function getScheduleOk(view: {
   plan?: WireSchedulePlan | null;
   policy?: WireSchedulePolicy;

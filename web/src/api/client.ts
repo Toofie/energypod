@@ -431,6 +431,29 @@ export interface ApiClient {
     unitId: string,
     options?: { takeover?: boolean; idempotencyKey?: string },
   ): Promise<Record<string, unknown>>;
+  /**
+   * The PVOutput reporter's health read (GET /api/v1/pvoutput/status,
+   * observe scope): the durable toggle state, the last accepted post's age
+   * and slot, the last error word (PVOutput's refusal text verbatim), the
+   * hourly post budget PVOutput reports, and the stale-gap count.  A
+   * deployment without the `pvoutput` config block refuses with 409
+   * `pvoutput_not_commissioned` — the card's honest not-commissioned
+   * state.  The body is parsed by web/src/app/pvoutput.ts.
+   */
+  getPvOutputStatus(): Promise<Record<string, unknown>>;
+  /**
+   * The guarded PVOutput activation toggle (POST /api/v1/pvoutput, arm
+   * scope + interactive principal to enable + Idempotency-Key):
+   * `{action, confirmation: "PVOUTPUT"}` — the typed confirmation is
+   * required for BOTH actions.  The 200 carries `{feature, enabled,
+   * enabled_origin, persisted: true, pvoutput_state}` (the post-toggle
+   * snapshot for optimistic adoption); refusals reject with the envelope
+   * (409 pvoutput_not_commissioned / pvoutput_toggle_failed).
+   */
+  postPvOutput(
+    action: "enable" | "disable",
+    idempotencyKey?: string,
+  ): Promise<Record<string, unknown>>;
   openEvents(afterSequence?: number): AsyncIterable<StreamEvent>;
 }
 
@@ -756,6 +779,14 @@ export function createApiClient(token: string): ApiClient {
     },
     openEvents: (afterSequence?: number) =>
       streamEvents(eventsUrl(afterSequence), fetchEventsTicket),
+    getPvOutputStatus: () =>
+      request<Record<string, unknown>>("/api/v1/pvoutput/status"),
+    postPvOutput: (action, idempotencyKey) =>
+      request<Record<string, unknown>>("/api/v1/pvoutput", {
+        method: "POST",
+        body: { action, confirmation: "PVOUTPUT" },
+        idempotencyKey: withKey(idempotencyKey),
+      }),
     getSchedule: () => request<Record<string, unknown>>("/api/v1/schedule"),
     putSchedule: (body, idempotencyKey) =>
       request<Record<string, unknown>>("/api/v1/schedule", {

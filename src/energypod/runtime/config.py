@@ -7,11 +7,12 @@ unknown keys are rejected at every nesting level.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Sequence
 from enum import StrEnum
 from ipaddress import IPv4Network, IPv6Network
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, Final, Literal, Self
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -990,6 +991,133 @@ class ParkingConfig(_FrozenModel):
         return self
 
 
+#: The PVOutput extended-value slots the custom per-unit fields may own (the
+#: addstatus specification's ``v7``..``v12`` — donation-tier "Extended Value"
+#: parameters, number-typed, user-defined units).
+_PVOUTPUT_SLOT_NAMES: Final[tuple[str, ...]] = tuple(f"v{number}" for number in range(7, 13))
+
+#: One environment-variable NAME the credential references resolve through:
+#: POSIX identifier shape (a letter or underscore, then letters, digits, or
+#: underscores) so a reference can never smuggle whitespace or shell syntax
+#: into ``os.environ`` lookups.
+_ENV_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _valid_pvoutput_slot(value: str) -> str:
+    """Validate one ``v7``..``v12`` slot spelling (the wire's own enum)."""
+    cleaned = _plain(value, label="pvoutput slot")
+    if cleaned not in _PVOUTPUT_SLOT_NAMES:
+        raise ValueError(
+            f"pvoutput slot must be one of {list(_PVOUTPUT_SLOT_NAMES)} (the addstatus "
+            f"specification's extended-value parameters); got {cleaned!r}"
+        )
+    return cleaned
+
+
+class PvOutputConfig(_FrozenModel):
+    """The pvoutput.org reporting block (the retiring Docker writer's replacement).
+
+    Block-presence doctrine, the night pattern: a PRESENT block composes the
+    reporting surface — the uploader control in the fleet cycle, the health
+    snapshot at ``GET /api/v1/pvoutput/status``, and the guarded runtime
+    toggle — with ``enabled`` gating whether any POST is made; an ABSENT block
+    composes NOTHING and the status route answers 409
+    ``pvoutput_not_commissioned``.
+
+    The reporter is OBSERVABILITY-ONLY: it reads observations through the same
+    port the energy accountant reads and never touches a register, an intent,
+    or the control path.  Secrets are REFERENCES (``api_key_env`` /
+    ``system_id_env`` name environment variables the composition root resolves
+    at boot); an unset reference composes the surface with a registry note,
+    never a boot failure (the Solcast pattern).
+
+    Field mapping (PINNED for dashboard continuity — the old container's exact
+    layout, byd/config.py): each commissioned unit owns ONE extended-value pair
+    ``unit_slots`` — ``[soc_slot, power_slot]`` — with SoC from the REAL BMS
+    word ``bms_soc_pct`` (the old container posted a voltage-curve estimate;
+    strictly better) and power from the signed ``battery_watts``.  The solar
+    inverter's own integration owns v1-v6 on this site: this block never
+    writes generation, consumption, temperature, or voltage.
+
+    Sign continuity (PROTOCOL_EVIDENCE 4b): the battery power family (BMS
+    0x5008 / DCDC 0x2009 / system 0x0114 — and the PCS grid P at 0x1007 the
+    operator remembers as "reg 4103") is NEGATIVE = CHARGE, POSITIVE =
+    DISCHARGE on live-proven firmware, which is exactly pod-manager's
+    ``battery_watts`` convention — so v8/v10/v12 post the word UNNEGATED and
+    the existing dashboard graphs stay continuous.  PVOutput's native battery
+    fields are the opposite (``b1`` positive = charge per the addstatus
+    specification), so the adapter flips the fleet aggregate at its boundary.
+    """
+
+    enabled: StrictBool = False
+    api_key_env: NonEmpty = "PVOUTPUT_API_KEY"
+    system_id_env: NonEmpty = "PVOUTPUT_SYSTEM_ID"
+    # One POST per slot: the interval may never be finer than the pinned
+    # 5-minute slot grid (PVOutput rounds ``t`` to the site's status interval;
+    # posting finer would double-post slots) nor coarser than hourly (coarser
+    # is a schedule, not a cadence — take the block out instead).
+    interval_s: Annotated[StrictFloat, Field(ge=300.0, le=3600.0)] = 300.0
+    max_sample_age_s: PositiveFiniteFloat = 120.0
+    request_timeout_s: PositiveFiniteFloat = 10.0
+    # Transient-failure retries per slot, spaced (never bursts); a slot that
+    # still fails is a gap -- no backfill, ever.
+    retry_max: Annotated[StrictInt, Field(ge=0, le=10)] = 1
+    # The old container's exact per-unit layout (byd/config.py): lhs v7/v8,
+    # rhs v9/v10, mid v11/v12 -- [SoC slot, power slot] per unit.
+    unit_slots: dict[NonEmpty, tuple[NonEmpty, NonEmpty]] = {
+        "lhs": ("v7", "v8"),
+        "rhs": ("v9", "v10"),
+        "mid": ("v11", "v12"),
+    }
+    # b1/b2 fleet aggregates ride the SAME POST (b1 = sum of per-pod
+    # battery_watts with the spec's sign flip, b2 = mean SoC over identical
+    # capacities); b1 is mandatory when any battery field is sent, so b2 is
+    # omitted together with b1 whenever b1 cannot be computed fresh.
+    native_battery_fields: StrictBool = True
+
+    @field_validator("api_key_env", "system_id_env")
+    @classmethod
+    def validate_env_reference(cls, value: str, info: object) -> str:
+        name = getattr(info, "field_name", "environment reference")
+        value = _plain(value, label=name)
+        if _ENV_NAME_PATTERN.fullmatch(value) is None:
+            raise ValueError(
+                f"{name} must be an environment variable NAME (a letter or underscore, "
+                "then letters, digits, or underscores)"
+            )
+        return value
+
+    @field_validator("unit_slots")
+    @classmethod
+    def validate_unit_slots(
+        cls, values: dict[str, tuple[str, str]]
+    ) -> dict[str, tuple[str, str]]:
+        if not values:
+            raise ValueError(
+                "pvoutput.unit_slots must name at least one unit (each commissioned unit "
+                "owns one [SoC slot, power slot] pair)"
+            )
+        cleaned: dict[str, tuple[str, str]] = {}
+        for unit_raw, (soc_raw, power_raw) in values.items():
+            unit = _plain(unit_raw, label="pvoutput.unit_slots key")
+            soc = _valid_pvoutput_slot(soc_raw)
+            power = _valid_pvoutput_slot(power_raw)
+            if soc == power:
+                raise ValueError(
+                    f"pvoutput.unit_slots[{unit!r}] must pair two DISTINCT slots "
+                    f"(got {soc!r} twice: SoC and power need one slot each)"
+                )
+            cleaned[unit] = (soc, power)
+        slots = [slot for pair in cleaned.values() for slot in pair]
+        if len(set(slots)) != len(slots):
+            raise ValueError(
+                "pvoutput.unit_slots slots must not collide: every v7..v12 slot is owned "
+                "by exactly one field of one unit (a collision would make the dashboard "
+                "slot mean two batteries at once)"
+            )
+        return cleaned
+
+
 class ControllerConfig(_FrozenModel):
     schema_version: Annotated[StrictInt, Field(ge=1)]
     revision: Annotated[StrictInt, Field(ge=1)]
@@ -1031,6 +1159,11 @@ class ControllerConfig(_FrozenModel):
     # declared last beside its siblings so its commissioning validator sees
     # the already-validated mode and policy the sanctioned write depends on.
     parking: ParkingConfig | None = None
+    # The pvoutput.org reporting block, declared last beside its siblings so
+    # its commissioning validator sees the already-validated units, timing,
+    # and storage blocks the reporter's slot layout, freshness bound, and
+    # durable runtime toggle depend on.
+    pvoutput: PvOutputConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -1565,6 +1698,58 @@ class ControllerConfig(_FrozenModel):
                 "commissioned control policy (armed/latched refusal checks and audit)"
             )
         return parking
+
+    @field_validator("pvoutput")
+    @classmethod
+    def validate_pvoutput(
+        cls, pvoutput: PvOutputConfig | None, info: ValidationInfo
+    ) -> PvOutputConfig | None:
+        """The commissioning gates for a PRESENT reporting block.
+
+        The gates bind to block-PRESENCE (the night pattern: a disabled block
+        that could never be enabled safely is refused at validation time,
+        because the runtime toggle can raise participation but never a slot
+        layout or a freshness bound):
+
+        - ``unit_slots`` must cover EXACTLY the configured units — every
+          commissioned battery reports, and a stray key names no battery;
+        - ``max_sample_age_s`` must exceed ``timing.control_period_s`` — a
+          freshness bound tighter than one fleet cycle could never hold, and
+          the uploader would gap every slot forever;
+        - the ``storage`` block is REQUIRED — the runtime toggle's whole point
+          is surviving a restart, and a deployment without a durable store
+          would silently reset the operator's choice on every boot (the
+          invisible-off class this project refuses).
+        """
+        if pvoutput is None:
+            return pvoutput
+        values = info.data
+        fleet_units = {unit.unit_id for unit in values.get("units", ()) or ()}
+        declared = set(pvoutput.unit_slots)
+        if declared != fleet_units:
+            missing = sorted(fleet_units - declared)
+            stray = sorted(declared - fleet_units)
+            raise ValueError(
+                "pvoutput.unit_slots must cover exactly the configured units "
+                f"(missing: {missing or []}; names no battery: {stray or []}): every "
+                "commissioned battery owns one [SoC slot, power slot] pair"
+            )
+        timing = values.get("timing")
+        if timing is not None and pvoutput.max_sample_age_s <= timing.control_period_s:
+            raise ValueError(
+                "pvoutput.max_sample_age_s must exceed timing.control_period_s: the "
+                "uploader judges observations once per fleet cycle, so a freshness "
+                "bound at or below the cycle could never hold and every slot would "
+                "be a gap"
+            )
+        if values.get("storage") is None:
+            raise ValueError(
+                "pvoutput requires the storage block: the runtime enable/disable "
+                "toggle is a durable fact that must survive a controller restart, "
+                "and a deployment without a durable store would silently reset the "
+                "operator's choice on every boot"
+            )
+        return pvoutput
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:

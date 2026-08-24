@@ -28,6 +28,7 @@ import {
   nightTrust,
   nightUnitState,
   parkState,
+  pvoutputStatus,
   scheduleNextAction,
   scheduleState,
   snapshot,
@@ -309,14 +310,24 @@ export const HOME_STATES: readonly ShotStateDefinition[] = [
   {
     id: "afternoon-live",
     caption:
-      "The daytime answer: an armed fleet load-serving under a per-battery request, the Today card, and the solar tile active on a real 1,930 W export.",
+      "The daytime answer: an armed fleet load-serving under a per-battery request, the Today card, the solar tile active on a real 1,930 W export, and the PVOutput reporter composed but off (the config's own setting).",
     world: afternoonWorld,
+    pvoutput: () => pvoutputStatus({ enabled: false, enabled_origin: "config" }),
   },
   {
     id: "supervised-night",
     caption:
-      "The supervised night: the night tile pacing at the cap, the schedules card naming the running window, one battery self-healing and one flagged foreign.",
+      "The supervised night: the night tile pacing at the cap, the schedules card naming the running window, one battery self-healing and one flagged foreign, and the PVOutput reporter posting (the console's own enable, kept across restarts).",
     world: nightWorld,
+    pvoutput: () =>
+      pvoutputStatus({
+        enabled: true,
+        enabled_origin: "runtime",
+        last_success_at: "2026-08-26T15:30:01+00:00",
+        last_post_age_s: 112,
+        last_posted_slot: "2026-08-27 01:30",
+        rate_remaining: 43,
+      }),
   },
   {
     id: "night-forecast-suggest",
@@ -339,7 +350,40 @@ export const HOME_STATES: readonly ShotStateDefinition[] = [
   {
     id: "fleet-parked",
     caption:
-      "A pod standing by: the parked fleet banner names rhs with its lease countdown and the fixed not-isolation sentence, while the other two batteries keep load-serving.",
+      "A pod standing by: the parked fleet banner names rhs with its lease countdown and the fixed not-isolation sentence, the other two batteries keep load-serving, and the PVOutput reporter names one honestly-skipped slot.",
     world: parkedAfternoonWorld,
+    pvoutput: () =>
+      pvoutputStatus({
+        enabled: true,
+        enabled_origin: "runtime",
+        last_success_at: "2026-08-26T04:30:01+00:00",
+        last_post_age_s: 392,
+        last_posted_slot: "2026-08-26 14:30",
+        rate_remaining: 38,
+        slots_skipped_stale: 1,
+      }),
+  },
+  {
+    id: "pvoutput-failing",
+    caption:
+      "The reporter's loud failure state: PVOutput refused the key (read-only), so the uploader disabled itself with the refusal's own words beside the toggle -- re-enabling is the operator's retry.",
+    world: nightWorld,
+    pvoutput: () =>
+      pvoutputStatus({
+        enabled: true,
+        enabled_origin: "runtime",
+        disabled_reason: "auth_failed",
+        last_error: "Read only key",
+        last_success_at: "2026-08-26T13:35:01+00:00",
+        last_post_age_s: 5412,
+        last_posted_slot: "2026-08-26 23:35",
+        consecutive_failures: 3,
+      }),
+  },
+  {
+    id: "pvoutput-not-commissioned",
+    caption:
+      "The structured not-commissioned state: a controller without the pvoutput config block answers the status route with its 409, and the card's one honest sentence says commissioning is a config change -- there is no toggle to present.",
+    world: afternoonWorld,
   },
 ];

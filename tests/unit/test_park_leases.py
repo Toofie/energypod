@@ -185,7 +185,7 @@ def test_schema_v4_migrates_a_version_three_database_in_place(tmp_path: Path) ->
     tables are untouched, and ``park_leases`` exists."""
     from energypod.db.schema import SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION == 7
     path = tmp_path / "park-migrate.sqlite3"
     raw = sqlite3.connect(path)
     try:
@@ -207,7 +207,7 @@ def test_schema_v4_migrates_a_version_three_database_in_place(tmp_path: Path) ->
         stamped = database.connection.execute(
             "SELECT version FROM schema_version WHERE singleton = 1"
         ).fetchone()
-        assert stamped == (6,)
+        assert stamped == (7,)
         assert database.connection.execute("SELECT COUNT(*) FROM telemetry_sample").fetchone() == (
             1,
         ), "an in-place upgrade touches no existing table's rows"

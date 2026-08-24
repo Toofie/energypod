@@ -928,3 +928,148 @@
   font-size: 0.85rem;
   color: #57534e;
 }
+
+/* --- PVOutput reporting card (the retiring Docker writer's replacement) -- */
+/* The night tile's quiet-paper vocabulary, mirrored: a status sentence whose
+   data-* attributes carry the state, tabular fact lines, a guarded toggle
+   footer with the typed-confirmation dialog, and loud-but-calm refusal
+   blocks. */
+
+.home-pvoutput-status {
+  margin: 0 0 0.5rem;
+  color: #3f3a30;
+}
+
+.home-pvoutput-status[data-state="not_commissioned"],
+.home-pvoutput-status[data-state="error"] {
+  color: #78716c;
+}
+
+.home-pvoutput-status[data-disabled-reason="auth_failed"] {
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid #9b2c2c;
+  background: #fdf0ef;
+  border-radius: 0 0.4rem 0.4rem 0;
+}
+
+.home-pvoutput-status[data-disabled-reason="missing_credentials"] {
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid #d69e2e;
+  background: #fdf6e9;
+  border-radius: 0 0.4rem 0.4rem 0;
+}
+
+.home-pvoutput-lastpost {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  color: #57534e;
+  font-variant-numeric: tabular-nums;
+}
+
+.home-pvoutput-gaps {
+  margin: 0 0 0.4rem;
+  font-size: 0.9rem;
+  color: #78716c;
+}
+
+.home-pvoutput-credentials {
+  margin: 0 0 0.4rem;
+  padding: 0.4rem 0.7rem;
+  border-left: 3px solid #d69e2e;
+  background: #fdf6e9;
+  border-radius: 0 0.4rem 0.4rem 0;
+  font-size: 0.9rem;
+  color: #57534e;
+}
+
+.home-pvoutput-toggle {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.8rem;
+  padding-top: 0.7rem;
+  border-top: 1px solid #e7e2d6;
+}
+
+.home-pvoutput-toggle-state {
+  margin: 0;
+  color: #57534e;
+}
+
+.home-pvoutput-switch {
+  font: inherit;
+  padding: 0.3rem 0.9rem;
+  border: 1px solid #b8b2a7;
+  border-radius: 999px;
+  background: #fffefb;
+  color: #57534e;
+  cursor: pointer;
+}
+
+.home-pvoutput-switch.is-on {
+  border-color: #b3c7e8;
+  background: #f0f6ff;
+  color: #2c5282;
+}
+
+.home-pvoutput-dialog {
+  margin-top: 0.8rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid #d6d3d1;
+  border-radius: 0.7rem;
+  background: #fffdf9;
+}
+
+.home-pvoutput-dialog h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+  color: #3f3a30;
+}
+
+.home-pvoutput-dialog p {
+  margin: 0 0 0.5rem;
+  color: #57534e;
+}
+
+.home-pvoutput-typed {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.home-pvoutput-typed input {
+  font: inherit;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid #b8b2a7;
+  border-radius: 0.4rem;
+  max-width: 14rem;
+}
+
+.home-pvoutput-refusal {
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid #9b2c2c;
+  background: #fdf0ef;
+  border-radius: 0 0.4rem 0.4rem 0;
+}
+
+.home-pvoutput-refusal p {
+  margin: 0 0 0.25rem;
+}
+
+.home-pvoutput-refusal code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 0.85rem;
+}
+
+.home-pvoutput-dialog-actions {
+  display: flex;
+  gap: 0.6rem;
+  margin-top: 0.7rem;
+}
+
+.home-pvoutput-confirm:not(:disabled) {
+  border-color: #b3c7e8;
+  background: #f0f6ff;
+  color: #2c5282;
+}

@@ -37,6 +37,7 @@ from energypod.application.forecast import ForecastRefusal
 from energypod.application.history import PlantHistoryRefusal
 from energypod.application.night_charge import NightChargingRefusal
 from energypod.application.parking import ParkingRefusal
+from energypod.application.pvoutput_upload import PvOutputRefusal
 from energypod.application.scheduling import SchedulePublishValidationError, ScheduleRefusal
 
 from .idempotency import IdempotencyConflictError, IdempotencyCoordinator, StoredResult
@@ -85,6 +86,8 @@ class EnergyService(Protocol):
     async def acknowledge_inhibit(self, **kwargs: Any) -> dict[str, Any]: ...
     async def set_excess_charging(self, **kwargs: Any) -> dict[str, Any]: ...
     async def set_night_charging(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_pvoutput_status(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def set_pvoutput(self, **kwargs: Any) -> dict[str, Any]: ...
     async def park_unit(self, **kwargs: Any) -> dict[str, Any]: ...
     async def renew_park_lease(self, **kwargs: Any) -> dict[str, Any]: ...
     async def resume_unit(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -246,6 +249,18 @@ class NightChargingRequest(StrictRequest):
     action: Literal["enable", "disable"]
     confirmation: Literal["NIGHT"]
     night_posture: Literal["PARTITION_ACKNOWLEDGED"] | None = None
+
+
+class PvOutputRequest(StrictRequest):
+    """The pvoutput.org reporter's guarded activation toggle body.
+
+    The night toggle's shape with this feature's own literal: the typed
+    ``PVOUTPUT`` confirmation is required for BOTH actions (enabling starts
+    an external write -- a deliberate, audited act; disabling stops one).
+    """
+
+    action: Literal["enable", "disable"]
+    confirmation: Literal["PVOUTPUT"]
 
 
 class ParkRequest(StrictRequest):
@@ -1071,6 +1086,62 @@ def create_api_app(
             request=request,
             identity=identity,
             operation_name="set_night_charging",
+            payload=payload,
+            status_code=200,
+            invoke=invoke,
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.get(f"{API_PREFIX}/pvoutput/status")
+    async def get_pvoutput_status(identity: Principal = observe_dependency) -> Any:
+        """The reporter's health snapshot (the retiring Docker writer's
+        replacement): the toggle state, the last post's age, the last error
+        word, the rate budget PVOutput reports, and the stale-gap count.  A
+        deployment without the ``pvoutput`` config block refuses with 409
+        ``pvoutput_not_commissioned`` -- the reporter's honest
+        not-commissioned state."""
+        try:
+            return await service.get_pvoutput_status(principal=identity)
+        except PvOutputRefusal as exc:
+            raise BoundaryError(409, exc.code, exc.message, exc.details) from exc
+
+    @app.post(f"{API_PREFIX}/pvoutput")
+    async def set_pvoutput(
+        body: PvOutputRequest,
+        request: Request,
+        identity: Principal = arm_dependency,
+    ) -> JSONResponse:
+        """The guarded pvoutput activation toggle (the night pattern exactly).
+
+        Enabling starts reporting -- a control-adjacent act that needs an
+        interactive human; disabling is safety-positive and stays open to any
+        arm-scoped principal.  The toggle is a DURABLE fact (schema v7): a
+        controller restart keeps the operator's choice.  Refusal envelopes
+        map verbatim (409 pvoutput_not_commissioned / pvoutput_toggle_failed).
+        """
+        if body.action == "enable" and not identity.interactive:
+            raise BoundaryError(
+                403,
+                "interactive_operator_required",
+                "Interactive operator required",
+            )
+        payload = body.model_dump(mode="json")
+
+        async def invoke() -> dict[str, Any]:
+            try:
+                return await service.set_pvoutput(
+                    **payload,
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
+            except PvOutputRefusal as exc:
+                raise BoundaryError(409, exc.code, exc.message, exc.details) from exc
+
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="set_pvoutput",
             payload=payload,
             status_code=200,
             invoke=invoke,

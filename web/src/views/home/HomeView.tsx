@@ -119,6 +119,7 @@ import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../
 import { ParkedFleetBanner } from "./ParkedFleetBanner";
 import { NextScheduleCard, toScheduleFacts, type ScheduleFacts } from "./NextScheduleCard";
 import { NightChargeTile } from "./NightChargeTile";
+import { PvOutputCard } from "./PvOutputCard";
 import { SolarSurplusTile } from "./SolarSurplusTile";
 import { TodayCard } from "./TodayCard";
 import "./home.css";
@@ -1726,6 +1727,14 @@ export function HomeView({ client }: HomeViewProps) {
           );
         }}
       />
+
+      {/* The PVOutput reporting card: the retiring Docker writer's
+          replacement -- the operator's cutover toggle and the reporter's
+          health facts, right beside the night tile it shares the cutover
+          with. Renders its own not-commissioned / reading states honestly
+          (the status route's 409 IS the state); a client without the
+          surface renders nothing at all. */}
+      <PvOutputCard client={client} />
 
       <section className="home-card" aria-labelledby={reserveHeadingId}>
         <h2 id={reserveHeadingId}>How full are the batteries?</h2>

@@ -60,7 +60,7 @@
 #     `energypod db backup`/`restore` see one durable store, and is distinct
 #     from the observe-only deployment's database.
 schema_version: 1
-revision: 6
+revision: 7
 mode: write_enabled
 
 site:
@@ -820,3 +820,77 @@ forecast_providers:
       - window_local: ["00:00", "06:00"]
         import_cents_per_kwh: 7.2727
         export_cents_per_kwh: 2.0
+
+# ---------------------------------------------------------------------------
+# PVOUTPUT.ORG REPORTING (the retiring Docker writer's replacement) —
+# observability only, one POST per 5-minute slot.
+#
+# The site already reports to PVOutput through the old Docker container
+# (byd/scheduler.py::_post_pv_metrics, every 5 minutes per battery).  This
+# block replaces its WRITER role inside the controller; the cutover is the
+# operator's standing order — enable this at the console toggle and disable
+# the other container, in either order (the two writers posting the same
+# slot is harmless: PVOutput add-status is add-or-update).
+#
+# BLOCK PRESENCE: a PRESENT block composes the surface — the uploader tick
+# in the fleet cycle (bounded and fully suppressed, the historian's own
+# envelope: a failure inside it is a gap on the dashboard, never a delay to
+# control), the health snapshot at GET /api/v1/pvoutput/status, and the
+# guarded runtime toggle POST /api/v1/pvoutput (arm scope, an interactive
+# principal to enable, Idempotency-Key, typed confirmation PVOUTPUT).  An
+# ABSENT block composes nothing and the status route answers 409
+# pvoutput_not_commissioned.  `enabled: false` (below) keeps participation
+# suspended at boot — the toggle starts it, and UNLIKE the night twin the
+# choice is DURABLE (schema v7): a controller restart keeps whatever the
+# operator last chose.
+#
+# THE FIELD LAYOUT is PINNED for dashboard continuity — the old container's
+# exact mapping (byd/config.py), declared here so the dashboard's per-battery
+# graphs keep their slots: lhs owns v7 (SoC %) + v8 (power W), rhs v9 + v10,
+# mid v11 + v12.  v1-v6 are NEVER written (the solar inverter's integration
+# owns those slots on this site).  SoC is the REAL BMS word (bms_soc_pct,
+# 0x5000+9 — the old container posted a voltage-curve estimate; strictly
+# better); power is the signed battery_watts posted UNNEGATED, because the
+# battery power family (BMS 0x5008 / DCDC 0x2009 / system 0x0114, and the
+# PCS 0x1007 grid P the operator remembers as "reg 4103") is live-proven
+# NEGATIVE = CHARGE / POSITIVE = DISCHARGE (PROTOCOL_EVIDENCE 4b/4c) — the
+# same convention pod-manager decodes, so the graphs stay continuous.
+#
+# NATIVE BATTERY FIELDS: b1/b2 fleet aggregates ride the SAME POST
+# (b1 = sum of per-pod battery_watts, b2 = mean SoC over the identical pod
+# capacities).  PVOutput's b1 uses the OPPOSITE sign (its add-status
+# specification: positive = charge, "-200 (Discharge), 200 (Charge)"), so the
+# adapter NEGATES the aggregate at the wire boundary — the one place either
+# convention is translated.  b1 is mandatory when any battery field is sent,
+# so b2 omits together with b1 whenever b1 cannot be computed fresh.
+#
+# HONESTY RULES: every field rides its own quality gate — a stale/bad SoC or
+# power word is OMITTED from the POST, never zero-filled; a slot where no
+# pod is fresh enough (max_sample_age_s, sized to cover the ~72-108 s cold
+# ring that serves the system-block power word) is skipped entirely, a gap
+# on the dashboard; no backfill, ever.  Auth-class refusals (bad/read-only
+# key, or PVOutput's donation-mode 403 — v7-v12 and b1/b2 are donation-tier
+# parameters) disable the uploader with a LOUD note on the status surface;
+# the rate 403 backs off to PVOutput's own reset instant; a 400 surfaces
+# PVOutput's reason text verbatim; transient failures retry at most
+# retry_max times per slot, spaced — never bursts.
+#
+# SECRETS ARE REFERENCES: api_key_env / system_id_env name environment
+# variables the controller launch sources from var/pvoutput.env (the
+# var/solcast.env pattern, outside the repo per the no-secrets rule).  An
+# unset reference composes the surface WITHOUT the wire client and the
+# status carries the note — never a boot failure.
+#
+# COMMISSIONED 2026-08-25, PRESENT-BUT-DISABLED: the machinery and the
+# console card compose now; the operator's toggle starts the posting when
+# the other container stands down.
+pvoutput:
+  enabled: false
+  api_key_env: PVOUTPUT_API_KEY
+  system_id_env: PVOUTPUT_SYSTEM_ID
+  interval_s: 300.0          # one POST per 5-minute slot (+30 s posting grace)
+  max_sample_age_s: 120.0    # covers the cold ring that serves the power word
+  request_timeout_s: 10.0
+  retry_max: 1
+  unit_slots: {lhs: [v7, v8], rhs: [v9, v10], mid: [v11, v12]}
+  native_battery_fields: true

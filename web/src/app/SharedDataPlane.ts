@@ -337,6 +337,10 @@ export function sharedClient(plane: SharedDataPlane, real: ApiClient): ApiClient
     // section owns its own cadence, and the provider's own cache gate already
     // coalesces the wire legs better than a plane window could.
     getForecast: () => real.getForecast(),
+    // The PVOutput reporter's health read passes through: a plain observe
+    // read on the card's own poll cadence, no coalescing value.
+    getPvOutputStatus: () => real.getPvOutputStatus(),
+    postPvOutput: (action, idempotencyKey) => real.postPvOutput(action, idempotencyKey),
     postIntent: (body, idempotencyKey) => real.postIntent(body, idempotencyKey),
     postIntentCancel: (intentId, idempotencyKey) =>
       real.postIntentCancel(intentId, idempotencyKey),

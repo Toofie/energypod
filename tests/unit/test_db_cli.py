@@ -319,9 +319,10 @@ def _no_temporary_files(directory: Path) -> list[str]:
 
 def test_schema_version_is_stamped_from_day_one(tmp_path: Path) -> None:
     """Opening a fresh database stamps the latest known version before
-    anything else runs (version 5 added the night-trust day table)."""
+    anything else runs (version 7 added the pvoutput reporter's durable
+    runtime-toggle singleton)."""
     _require_contract()
-    assert SCHEMA_VERSION == 6
+    assert SCHEMA_VERSION == 7
     database = SQLiteDatabase(tmp_path / "controller.sqlite3")
     database.open()
     try:
@@ -333,6 +334,7 @@ def test_schema_version_is_stamped_from_day_one(tmp_path: Path) -> None:
             "energy_baseline",
             "telemetry_sample",
             "telemetry_rollup_hourly",
+            "pvoutput_state",
             "park_leases",
             "night_trust_day",
         ):

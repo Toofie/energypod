@@ -1426,3 +1426,73 @@ class SQLiteTelemetryHistoryRepository:
             sample_count=int(values["sample_count"]),
             worst_quality=str(values["worst_quality"]),
         )
+
+
+class SQLitePvOutputStateRepository:
+    """The durable pvoutput runtime-toggle singleton (schema version 7).
+
+    One row (the ``singleton`` CHECK pins it): the operator's LAST
+    enable/disable act and its wall-clock moment.  ``state()`` returns
+    ``None`` while no toggle has ever landed -- boot then composes from the
+    config's own ``enabled`` -- and every ``store`` upserts inside one
+    ``BEGIN IMMEDIATE`` transaction so the newest act is always the row and a
+    crashed toggle can never leave a half-written choice.
+    """
+
+    def __init__(self, database: SQLiteDatabase) -> None:
+        self._database = database
+        try:
+            with database.lock:
+                database.connection.execute(
+                    """CREATE TABLE IF NOT EXISTS pvoutput_state (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                        updated_at TEXT NOT NULL
+                    )"""
+                )
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError(
+                    "pvoutput state database is busy during initialization"
+                ) from exc
+            raise
+
+    def state(self) -> tuple[bool, str] | None:
+        """The stored (enabled, updated_at) pair, or None when never toggled."""
+        try:
+            with self._database.lock:
+                row = self._database.connection.execute(
+                    "SELECT enabled, updated_at FROM pvoutput_state WHERE singleton = 1"
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("pvoutput state database is busy") from exc
+            raise
+        if row is None:
+            return None
+        return bool(row[0]), str(row[1])
+
+    def store(self, *, enabled: bool, updated_at: str) -> None:
+        """Upsert the singleton row; the newest toggle always wins."""
+        if not isinstance(updated_at, str) or not updated_at:
+            raise ValueError("updated_at must be a non-empty ISO-8601 string")
+        try:
+            with self._database.lock:
+                connection = self._database.connection
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    connection.execute(
+                        "INSERT INTO pvoutput_state(singleton, enabled, updated_at)"
+                        " VALUES (1, ?, ?)"
+                        " ON CONFLICT(singleton) DO UPDATE SET enabled = excluded.enabled,"
+                        " updated_at = excluded.updated_at",
+                        (1 if enabled else 0, updated_at),
+                    )
+                    connection.execute("COMMIT")
+                except BaseException:
+                    connection.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            if _is_busy(exc):
+                raise PersistenceBusyError("pvoutput state database is busy") from exc
+            raise

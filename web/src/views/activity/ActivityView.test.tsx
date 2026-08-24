@@ -207,6 +207,8 @@ const makeClient = (): ApiClient => ({
   postResume: vi.fn(),
   getSchedule: vi.fn(),
   putSchedule: vi.fn(),
+  getPvOutputStatus: async () => ({}),
+  postPvOutput: async () => ({}),
   openEvents: vi.fn(async function* () {}),
 });
 

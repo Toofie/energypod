@@ -101,6 +101,7 @@ if (viewId === null || stateId === null) {
         ...(state.schedule === undefined ? {} : { schedule: state.schedule }),
         ...(state.energyDays === undefined ? {} : { energyDays: state.energyDays }),
         ...(state.objectives === undefined ? {} : { objectives: state.objectives }),
+        ...(state.pvoutput === undefined ? {} : { pvoutput: state.pvoutput }),
         ...(state.park === undefined
           ? {}
           : {

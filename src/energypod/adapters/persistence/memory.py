@@ -654,3 +654,27 @@ class InMemoryTelemetryHistoryRepository:
         if len(set(normalized)) != len(normalized):
             raise ValueError("unit_ids must be unique")
         return normalized
+
+
+class InMemoryPvOutputStateRepository:
+    """Process-local pvoutput runtime toggle (the SQLite twin's simulate shape).
+
+    Explicitly NON-durable: the composition wires it for simulate mode and
+    database-less tests, where a restart recomposing from the config is the
+    documented behavior (the config validation still requires ``storage`` for
+    the real deployment -- the durable toggle is the point there).
+    """
+
+    def __init__(self) -> None:
+        self._state: tuple[bool, str] | None = None
+        self._lock = RLock()
+
+    def state(self) -> tuple[bool, str] | None:
+        with self._lock:
+            return self._state
+
+    def store(self, *, enabled: bool, updated_at: str) -> None:
+        if not isinstance(updated_at, str) or not updated_at:
+            raise ValueError("updated_at must be a non-empty ISO-8601 string")
+        with self._lock:
+            self._state = (bool(enabled), updated_at)
