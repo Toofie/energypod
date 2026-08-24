@@ -530,6 +530,22 @@ night_charging:
   intent_ttl_s: 10.0
 
 # ---------------------------------------------------------------------------
+# POD PARKING (DESIGN_POD_PARKING) — the sanctioned standby mode.
+# Commissioned 2026-08-24 on the live-proven rhs cycle
+# (docs/evidence/standby-cycle-2026-08-24.md): Standby parks the PCS control
+# path while comms/telemetry stay alive; the exit write returns the pod to
+# Normal. This block is the ONE AND ONLY policy flag that can ever compose
+# the 0x8000 {0,1} write — `debug_modes_enabled` stays its always-false
+# tombstone, and values 2-6 remain permanently unreachable in code.
+# Doctrine: the lease is the expiry ALARM, never the actor — expiry writes
+# nothing and alarms; park/resume are interactive operator acts both
+# directions; parking is NOT electrical isolation (the pack stays connected
+# at full voltage).
+parking:
+  max_lease_s: 14400        # 4 h cap; lease_s ∈ [60, max_lease_s]
+  default_lease_s: 14400
+
+# ---------------------------------------------------------------------------
 # THE DAILY ENERGY SCORECARD (DESIGN_ENERGY_SCORECARD; advisory-only).
 #
 # A PRESENT block composes the daily energy account: the accountant tick in
