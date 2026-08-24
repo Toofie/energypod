@@ -68,6 +68,34 @@ export function lifecycleWord(lifecycle: string): string {
   return LIFECYCLE_WORDS[lifecycle] ?? humanizeCode(lifecycle);
 }
 
+/**
+ * The lifecycle vocabulary's COMPACT tier — the History strip's band labels
+ * when the full word cannot fit a proportional band (the axis-tick doctrine:
+ * the fullest word that fits, a shorter honest word next, no word below
+ * that). The full word above stays the ONLY word on every other surface, and
+ * a compact form exists ONLY where it makes no different claim —
+ * "Armed and idle" deliberately has none (the idle half is the fact, per the
+ * unification above; "Armed" would be the badge word wearing the wrong
+ * surface), and a stranger code keeps its single humanized word rather than
+ * being cut into a meaningless fragment.
+ */
+const LIFECYCLE_SHORT_WORDS: Record<string, string> = {
+  boot: "Starting",
+  observe_only: "Observe",
+};
+
+/**
+ * The lifecycle band's label tiers, fullest first: [full word] or
+ * [full word, compact word]. The History strip's bands choose against these
+ * by measured pixels (history.ts `fittingBandLabel`); every other surface
+ * keeps `lifecycleWord` alone.
+ */
+export function lifecycleBandWords(lifecycle: string): readonly string[] {
+  const word = lifecycleWord(lifecycle);
+  const short = LIFECYCLE_SHORT_WORDS[lifecycle];
+  return short === undefined || short === word ? [word] : [word, short];
+}
+
 export interface PowerFigure {
   direction: string;
   watts: number;
@@ -435,6 +463,31 @@ export const HEALTH_WORDS: Record<string, string> = {
 /** The health state's short word; an unknown code is humanized, never shown raw. */
 export function healthWord(state: string): string {
   return HEALTH_WORDS[state] ?? humanizeCode(state);
+}
+
+/**
+ * The recovery vocabulary's COMPACT tier — the History strip's band labels
+ * when the full word cannot fit a proportional band, same doctrine as
+ * `LIFECYCLE_SHORT_WORDS`: honest shortenings only ("Incoherent" is still
+ * the actuation-incoherence claim), and no entry where a shorter form would
+ * say something else ("Foreign writer" is the whole claim — "Foreign" alone
+ * is a different sentence).
+ */
+const HEALTH_SHORT_WORDS: Record<string, string> = {
+  self_healing: "Healing",
+  actuation_incoherent: "Incoherent",
+  not_responding: "No response",
+};
+
+/**
+ * The health band's label tiers, fullest first: [full word] or
+ * [full word, compact word] — the same fitted-label contract as
+ * `lifecycleBandWords`.
+ */
+export function healthBandWords(state: string): readonly string[] {
+  const word = healthWord(state);
+  const short = HEALTH_SHORT_WORDS[state];
+  return short === undefined || short === word ? [word] : [word, short];
 }
 
 /**

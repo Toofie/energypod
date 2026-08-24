@@ -753,16 +753,103 @@ export function wordSegments(
 
 // --- the archaeology strip's text half (the change-point listings) ---------------
 
-/** One strip segment ready for wording: the band's label, the tooltip's fuller sentence, the listing's clause. */
+/** One strip segment ready for wording: the band's label tiers, the tooltip's fuller sentence, the listing's clause. */
 export interface StripWordSegment {
   readonly from: number;
   readonly to: number;
-  /** The band's short label — the word map's word, never the raw code. */
-  readonly label: string;
+  /**
+   * The band's on-bar label TIERS, fullest word first — the fitted-label
+   * chooser (`fittingBandLabel`) walks these against the band's measured
+   * pixels: the fullest word that fits, a shorter honest word when only that
+   * fits, and NO word when even the shortest cannot (an ellipsis mid-word
+   * reads as an error; the tooltip and the listing below carry every segment
+   * regardless, so nothing is lost — the listing is the strip's accessible
+   * half and never narrows with the bands).
+   */
+  readonly bandLabels: readonly string[];
+  /**
+   * The commanded row's no-intent segments ("nothing commanded") render one
+   * step quieter than a command — the gold belongs to the writers. Purely a
+   * presentation fact derived from the wire's own null triple, never a
+   * second word for it.
+   */
+  readonly quietBand: boolean;
   /** The tooltip's fuller sentence (the UnitHealthTag sentence, the full clause). */
   readonly title: string;
   /** The change-point listing's clause ("Disarmed", "nothing commanded"). */
   readonly clause: string;
+}
+
+/**
+ * The commanded band's label tiers — the SOURCE in the operator's short
+ * words, never the full clause: a proportional band can hold a word, not a
+ * sentence ("the night-charge adviser — charging 2,500 W" is the tooltip's
+ * and the listing's half, and the watts step rides the commanded overlay
+ * directly above the strip). The band names WHO was writing — the
+ * archaeology fact — and the all-null triple keeps its own words. The tiers
+ * key on the same null rule as `commandedSegmentText` (the wire writes the
+ * triple all-null together, but the band may never contradict the clause).
+ */
+export function commandedBandLabels(
+  segment: Pick<CommandedSegment, "source" | "direction">,
+): readonly string[] {
+  if (segment.source === null || segment.direction === null) {
+    return ["nothing commanded", "none"];
+  }
+  switch (segment.source) {
+    case "manual":
+      return ["manual"];
+    case "agent":
+      return ["agent"];
+    case "schedule":
+      return ["schedule"];
+    case "excess_adviser":
+      return ["solar adviser", "solar"];
+    case "night_adviser":
+      return ["night adviser", "night"];
+    case "optimizer":
+      return ["optimizer"];
+    // A stranger source is a wire-contract stranger; the clause's own default
+    // ("no command — …") gets the same words on the bar, never a raw code.
+    default:
+      return ["no command", "none"];
+  }
+}
+
+/**
+ * The horizontal pixels a band's label must yield to the band's own chrome:
+ * both 0.35 rem side paddings (11.2 px at the console's 16 px root), the 1 px
+ * segment separator, and a small margin so a tier is chosen only when it
+ * truly fits (the CSS ellipsis stays as the last-resort guard for a
+ * user-set root font size, never the common case — see history.css).
+ */
+export const BAND_LABEL_CHROME_PX = 16;
+
+/**
+ * The fitted band label: the first tier whose measured width fits the band's
+ * measured pixels, "" when even the last tier cannot (the band stays, bare —
+ * its tooltip and its listing item still carry the segment). Widths the
+ * measurer never produced are skipped, never guessed; and when the pixels
+ * are UNKNOWN (a DOM that reports no widths — the test environment, or a
+ * measurer that has not answered yet) the FULLEST word renders: a word is
+ * suppressed only by a measured refusal, never by ignorance.
+ */
+export function fittingBandLabel(
+  candidates: readonly string[],
+  bandWidthPx: number | null,
+  labelWidths: ReadonlyMap<string, number> | null,
+): string {
+  if (bandWidthPx === null || bandWidthPx <= 0 || labelWidths === null) {
+    return candidates[0] ?? "";
+  }
+  const availablePx = bandWidthPx - BAND_LABEL_CHROME_PX;
+  for (const candidate of candidates) {
+    const widthPx = labelWidths.get(candidate);
+    if (widthPx !== undefined && widthPx <= availablePx) {
+      return candidate;
+    }
+  }
+  return "";
 }
 
 /**

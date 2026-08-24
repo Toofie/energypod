@@ -297,7 +297,7 @@ export const HISTORY_STATES: readonly ShotStateDefinition[] = [
   {
     id: "battery-night-archaeology-strip",
     caption:
-      "One battery's night as the archaeology strip READS it: lifecycle, health and commanded rows of worded bands, each with its change-point listing underneath — every segment's word and time survives even where its band is an invisible sliver, and the health row's tooltip carries the tag's own sentence.",
+      "One battery's night as the archaeology strip READS it: lifecycle, health and commanded rows of proportional bands whose labels are fitted to measured pixels (the fullest word that fits, a shorter honest word next, none when even that cannot — the commanded bar carries the source's short words, never the full clause), the no-intent stretches one step quieter than the commands, and each row's change-point listing underneath carrying every segment's word and time even where its band is an invisible sliver; the health row's tooltip carries the tag's own sentence.",
     world: historyWorld(iso(TO)),
     history: recordedNight,
     interact: [{ click: { role: "button", name: "mid" } }],

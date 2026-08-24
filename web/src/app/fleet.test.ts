@@ -17,8 +17,10 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  healthBandWords,
   HEALTH_STATES,
   healthWord,
+  lifecycleBandWords,
   LIFECYCLE_WORDS,
   lifecycleWord,
 } from "./fleet";
@@ -58,6 +60,29 @@ describe("fleet maps — the lifecycle words", () => {
   });
 });
 
+describe("fleet maps — the lifecycle band tiers", () => {
+  it("leads with the full word for every lifecycle — tiers only ever shorten", () => {
+    for (const lifecycle of [...LIFECYCLE_VALUES, "some_new_state"]) {
+      const tiers = lifecycleBandWords(lifecycle);
+      expect(tiers[0]).toBe(lifecycleWord(lifecycle));
+      for (const tier of tiers) {
+        expect(tier.length).toBeGreaterThan(0);
+        expect(tier).not.toMatch(/_/);
+      }
+    }
+  });
+
+  it("offers a compact tier only where it makes no different claim", () => {
+    expect(lifecycleBandWords("boot")).toEqual(["Starting up", "Starting"]);
+    expect(lifecycleBandWords("observe_only")).toEqual(["Observe only", "Observe"]);
+    // "Armed and idle" keeps its full word alone — "Armed" is the badge word
+    // wearing the wrong surface (the unification above), not a compact tier.
+    expect(lifecycleBandWords("armed_idle")).toEqual(["Armed and idle"]);
+    // A stranger code is never cut into a meaningless fragment.
+    expect(lifecycleBandWords("some_new_state")).toEqual(["Some new state"]);
+  });
+});
+
 describe("fleet maps — the health short words", () => {
   it("words every recovery state the monitor can serve, never a raw code", () => {
     for (const state of HEALTH_STATES) {
@@ -81,5 +106,30 @@ describe("fleet maps — the health short words", () => {
 
   it("humanizes an unknown code instead of showing it raw", () => {
     expect(healthWord("new_monitor_state")).toBe("New monitor state");
+  });
+});
+
+describe("fleet maps — the health band tiers", () => {
+  it("leads with the full word for every state — tiers only ever shorten", () => {
+    for (const state of [...HEALTH_STATES, "new_monitor_state"]) {
+      const tiers = healthBandWords(state);
+      expect(tiers[0]).toBe(healthWord(state));
+      for (const tier of tiers) {
+        expect(tier.length).toBeGreaterThan(0);
+        expect(tier).not.toMatch(/_/);
+      }
+    }
+  });
+
+  it("offers a compact tier only where the shorter word keeps the claim", () => {
+    expect(healthBandWords("self_healing")).toEqual(["Self-healing", "Healing"]);
+    expect(healthBandWords("actuation_incoherent")).toEqual([
+      "Actuation incoherent",
+      "Incoherent",
+    ]);
+    expect(healthBandWords("not_responding")).toEqual(["Not responding", "No response"]);
+    // "Foreign writer" is the whole claim — "Foreign" alone is a different
+    // sentence, so no compact tier exists for it.
+    expect(healthBandWords("foreign_writer")).toEqual(["Foreign writer"]);
   });
 });

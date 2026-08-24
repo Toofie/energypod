@@ -17,6 +17,12 @@
  * - FLEET VS PER-BATTERY: the fleet block renders the summed flows; a
  *   battery scope adds the per-unit facts line, the charge-level chart, the
  *   archaeology strip, and the secondary cells/temperature group.
+ * - THE STRIP'S BANDS LABEL THEMSELVES IN FITTED TIERS (the axis-tick
+ *   doctrine): the fullest word that fits the band's measured pixels, a
+ *   shorter honest word when only that fits, and no word when even the
+ *   shortest cannot — the commanded bar carries the SOURCE's short words
+ *   (never the full clause), and the change-point listing below stays the
+ *   row's accessible half, carrying every segment regardless.
  * - RANGE SWITCHING re-queries with the new preset's window.
  * - A FAILED REFRESH KEEPS THE LAST WINDOW (never a blank flash), with the
  *   refusal surfaced above it.
@@ -453,6 +459,112 @@ describe("History view — the archaeology strip", () => {
     );
     expect(Number.parseFloat(lifecycleBand?.style.left ?? "nan")).toBeCloseTo(0.139, 2);
     expect(Number.parseFloat(lifecycleBand?.style.width ?? "nan")).toBeCloseTo(99.861, 2);
+  });
+
+  /** Every band's on-bar label span, in row order (null where a band holds no word). */
+  function bandLabels(row: string): (string | null)[] {
+    return Array.from(document.querySelectorAll<HTMLElement>(`${row} .history-band`)).map(
+      (band) => band.querySelector(".history-band-label")?.textContent ?? null,
+    );
+  }
+
+  it("labels bands with the tier words — the commanded bar carries the source, never the clause", async () => {
+    await landStrip();
+    // The unmeasurable test DOM falls back to each row's FULLEST tier — the
+    // words are never suppressed on ignorance (the fitting doctrine).
+    expect(bandLabels(".history-bands--lifecycle")).toEqual(["Disarmed"]);
+    expect(bandLabels(".history-bands--health")).toEqual(["Healthy"]);
+    // The commanded bands: the null triple's own words, the source's short
+    // word, the null triple again — the full clause never rides a bar.
+    expect(bandLabels(".history-bands--command")).toEqual([
+      "nothing commanded",
+      "night adviser",
+      "nothing commanded",
+    ]);
+    const labels = Array.from(document.querySelectorAll(".history-band-label"));
+    expect(labels.length).toBeGreaterThan(0);
+    for (const label of labels) {
+      expect(label.textContent ?? "").not.toContain("—");
+      expect(label.textContent ?? "").not.toContain("2,500 W");
+    }
+    // The clause keeps its two homes: every band's tooltip, and the listing.
+    const bands = Array.from(document.querySelectorAll<HTMLElement>(
+      ".history-bands--command .history-band",
+    ));
+    expect(bands[1]?.getAttribute("title")).toContain(
+      "the night-charge adviser — charging 2,500 W",
+    );
+    expect(screen.getByLabelText("Commanded").textContent).toContain(
+      "the night-charge adviser — charging 2,500 W",
+    );
+  });
+
+  it("renders the commanded row's no-intent segments one step quieter than its commands", async () => {
+    await landStrip();
+    const bands = Array.from(document.querySelectorAll<HTMLElement>(
+      ".history-bands--command .history-band",
+    ));
+    expect(bands).toHaveLength(3);
+    // The null triples render quiet — the gold belongs to the writers…
+    expect(bands[0]?.classList.contains("history-band--quiet")).toBe(true);
+    expect(bands[2]?.classList.contains("history-band--quiet")).toBe(true);
+    // …the night-charge segment does not, and neither do the other rows.
+    expect(bands[1]?.classList.contains("history-band--quiet")).toBe(false);
+    for (const row of [".history-bands--lifecycle", ".history-bands--health"]) {
+      for (const band of Array.from(document.querySelectorAll(`${row} .history-band`))) {
+        expect(band.classList.contains("history-band--quiet")).toBe(false);
+      }
+    }
+  });
+
+  it("fits each band's word to measured pixels — a shorter tier when only it fits, none when nothing does", async () => {
+    // Stub the component's two measurement seams: a span's offsetWidth (7 px
+    // per character — a synthetic measurer) and the ResizeObserver that
+    // reports the row's width (360 px, a narrow-ish desktop strip).
+    const offsetWidth = vi
+      .spyOn(HTMLElement.prototype, "offsetWidth", "get")
+      .mockImplementation(function (this: HTMLElement) {
+        return (this.textContent?.length ?? 0) * 7;
+      });
+    const observers: ((width: number) => void)[] = [];
+    class ResizeObserverStub {
+      constructor(callback: ResizeObserverCallback) {
+        observers.push((width) =>
+          callback(
+            [{ contentRect: { width } } as unknown as ResizeObserverEntry],
+            this as unknown as ResizeObserver,
+          ),
+        );
+      }
+      observe(): void {}
+      unobserve(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal("ResizeObserver", ResizeObserverStub);
+    try {
+      await landStrip();
+      // The 6 h fixture at 360 px: the 90-second opening null command is
+      // 0.42% ≈ 1.5 px — no tier can live there, the band goes bare; the
+      // 3 h 58 m night charge holds its fullest tier; the 2 h closing null
+      // command (120 px) cannot hold "nothing commanded" (17 chars ≈
+      // 119 px + chrome) and steps down to "none".
+      observers.forEach((fire) => {
+        fire(360);
+      });
+      await waitFor(() => {
+        expect(bandLabels(".history-bands--command")).toEqual([null, "night adviser", "none"]);
+      });
+      // The wide rows keep their fullest words, and the listing — the
+      // accessible half — still carries every segment, fitted bands or not.
+      expect(bandLabels(".history-bands--lifecycle")).toEqual(["Disarmed"]);
+      expect(bandLabels(".history-bands--health")).toEqual(["Healthy"]);
+      expect(
+        Array.from(within(screen.getByLabelText("Commanded")).getAllByRole("listitem")),
+      ).toHaveLength(3);
+    } finally {
+      offsetWidth.mockRestore();
+      vi.unstubAllGlobals();
+    }
   });
 
   it("explains what each row asserts and carries the §6 caveat beside them", async () => {

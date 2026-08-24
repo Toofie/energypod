@@ -377,9 +377,26 @@
   white-space: nowrap;
 }
 
+/* The label a band carries is chosen against MEASURED pixels (the component
+ * renders only a tier that fits — history.ts fittingBandLabel); the ellipsis
+ * below is the last-resort guard for a user-set root font size shifting the
+ * chrome constant, never the common case. An unworded band is a SUPPRESSED
+ * tier (too narrow for even its shortest word), not a styling bug: the
+ * tooltip and the listing below still carry the segment. */
 .history-band-label {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* The fitted label's hidden measurer: every candidate word lays out once
+ * with the band's own font rules and never paints (height 0 clips it). Its
+ * spans' offsetWidths are the widths the fit decision uses — the real
+ * rendered glyphs, not a guessed average character. */
+.history-band-measure {
+  height: 0;
+  overflow: hidden;
+  font-size: 0.78rem;
+  white-space: pre;
 }
 
 .history-bands--lifecycle .history-band {
@@ -395,6 +412,15 @@
 .history-bands--command .history-band {
   background: #f3efe3;
   color: var(--armed);
+}
+
+/* The commanded row's no-intent segments ("nothing commanded"): one step
+ * quieter than a command, so the gold belongs to the writers — but still a
+ * visible band, never a hollow stretch (the strip's boxes must read as
+ * full, not empty). Sits after the tone rule it tempers. */
+.history-bands--command .history-band--quiet {
+  background: #f7f3e8;
+  color: var(--ink-soft);
 }
 
 /* Narrow widths: the row's label stacks above its bands and listing — the

@@ -27,16 +27,18 @@
  * its own cadence — the historian publishes no bus event by design (samples
  * are projections, not acts), so polling IS the update path.
  */
-import { useCallback, useEffect, useMemo, useState, type JSX } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type JSX } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient } from "../../api/client";
 import {
+  commandedBandLabels,
   commandedSegmentText,
   commandedSegments,
   commandedWattsSigned,
   coverageFraction,
   emptyWindowNote,
   extremeText,
+  fittingBandLabel,
   gapText,
   GAP_REASON_TEXT,
   HEALTH_NOT_RECORDED_TEXT,
@@ -64,8 +66,10 @@ import {
 } from "../../app/history";
 import type { HistoryRangeId } from "../../app/history";
 import {
+  healthBandWords,
   HEALTH_STATES,
   healthWord,
+  lifecycleBandWords,
   lifecycleWord,
   type HealthState,
 } from "../../app/fleet";
@@ -643,7 +647,14 @@ function StepStrip({
   }
   const lifecycleRows = lifecycle.map((segment) => {
     const word = lifecycleWord(segment.v);
-    return { from: segment.from, to: segment.to, label: word, title: word, clause: word };
+    return {
+      from: segment.from,
+      to: segment.to,
+      bandLabels: lifecycleBandWords(segment.v),
+      quietBand: false,
+      title: word,
+      clause: word,
+    };
   });
   const healthRows = health.map((segment) => {
     const word = healthWord(segment.v);
@@ -657,11 +668,30 @@ function StepStrip({
           remediationHint: null,
         })
       : null;
-    return { from: segment.from, to: segment.to, label: word, title: sentence ?? word, clause: word };
+    return {
+      from: segment.from,
+      to: segment.to,
+      bandLabels: healthBandWords(segment.v),
+      quietBand: false,
+      title: sentence ?? word,
+      clause: word,
+    };
   });
   const commandedRows = commanded.map((segment) => {
     const clause = commandedSegmentText(segment);
-    return { from: segment.from, to: segment.to, label: clause, title: clause, clause };
+    return {
+      from: segment.from,
+      to: segment.to,
+      // The bar carries the SOURCE's short words; the clause is the tooltip's
+      // and the listing's half (commandedBandLabels' own doctrine).
+      bandLabels: commandedBandLabels(segment),
+      // Quiet exactly where the clause itself says "nothing commanded" (the
+      // same null rule the tiers key on — the bar may never argue with its
+      // own listing item).
+      quietBand: segment.source === null || segment.direction === null,
+      title: clause,
+      clause,
+    };
   });
   const span = Math.max(1, window.to - window.from);
   return (
@@ -704,11 +734,11 @@ function StripRow({ label, children }: { label: string; children: JSX.Element })
 }
 
 /**
- * One strip row's two halves: the proportional bands (visual, worded labels,
- * fuller sentence + instants on the tooltip) and, under them, the
- * change-point listing — the row's ACCESSIBLE surface, one item per segment
- * in the gap-notes rhythm, where every segment's word and time survive even
- * when its band is an invisible sliver.
+ * One strip row's two halves: the proportional bands (visual, labels fitted
+ * to measured pixels, fuller sentence + instants on the tooltip) and, under
+ * them, the change-point listing — the row's ACCESSIBLE surface, one item
+ * per segment in the gap-notes rhythm, where every segment's word and time
+ * survive even when its band is an invisible sliver or holds no word at all.
  */
 function StripSegments({
   segments,
@@ -732,7 +762,115 @@ function StripSegments({
   const name = tone === "lifecycle" ? "Lifecycle" : tone === "health" ? "Health" : "Commanded";
   return (
     <>
-      <ul className={`history-bands history-bands--${tone}`} aria-hidden="true">
+      <StripBands segments={segments} span={span} windowFrom={windowFrom} tone={tone} time={time} />
+      <ul className="history-strip-listing" aria-label={name}>
+        {listings.map((item, index) => (
+          <li key={index}>{item}</li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
+/**
+ * One strip row's band half. The word each band carries is CHOSEN AGAINST
+ * MEASURED PIXELS, the axis-tick doctrine: every candidate word is laid out
+ * once in a hidden measurer carrying the band's own font rules, the row's
+ * width is read at mount and held current by a ResizeObserver, and each band
+ * shows the fullest tier that fits — a shorter honest word when only that
+ * fits, and NO word when even the shortest cannot (a 12-minute spell in a
+ * 16-hour window is a sliver; an ellipsis mid-word there reads as an error,
+ * and the segment still lives in the tooltip and the listing). Where widths
+ * cannot be measured at all (a canvas-less test DOM whose boxes report 0),
+ * the fullest tier renders — a word is suppressed only by a measured
+ * refusal, never by ignorance (see `fittingBandLabel`).
+ */
+function StripBands({
+  segments,
+  span,
+  windowFrom,
+  tone,
+  time,
+}: {
+  segments: readonly StripWordSegment[];
+  span: number;
+  windowFrom: number;
+  tone: "lifecycle" | "health" | "command";
+  time: (epochMs: number) => string;
+}): JSX.Element {
+  const bandsRef = useRef<HTMLUListElement | null>(null);
+  const measureRef = useRef<HTMLDivElement | null>(null);
+  const [rowWidthPx, setRowWidthPx] = useState<number | null>(null);
+  const [labelWidths, setLabelWidths] = useState<ReadonlyMap<string, number> | null>(null);
+
+  // The row's own width: read once before first paint, then held current by
+  // a ResizeObserver — a percentage-width band's pixels change whenever the
+  // viewport or the window's layout moves under it.
+  useLayoutEffect(() => {
+    const element = bandsRef.current;
+    if (element === null) {
+      return;
+    }
+    const px = element.getBoundingClientRect().width;
+    if (px > 0) {
+      setRowWidthPx(px);
+    }
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[entries.length - 1];
+      const next = entry === undefined ? 0 : entry.contentRect.width;
+      setRowWidthPx(next > 0 ? next : null);
+    });
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  // The candidate words, deduped across the row's segments — the measurer's
+  // contents and the effect's key, so a re-worded window re-measures.
+  const candidates = useMemo(() => {
+    const unique: string[] = [];
+    const seen = new Set<string>();
+    for (const segment of segments) {
+      for (const word of segment.bandLabels) {
+        if (!seen.has(word)) {
+          seen.add(word);
+          unique.push(word);
+        }
+      }
+    }
+    return unique;
+  }, [segments]);
+
+  // The words' rendered widths: each candidate lays out once inside the
+  // hidden measurer (same font rules as a band label — history.css), and its
+  // offsetWidth IS its width in the operator's own font — no per-platform
+  // glyph guessing. A span that reports no width voids the whole map, which
+  // falls the fit back to the fullest word rather than suppressing on
+  // ignorance.
+  useLayoutEffect(() => {
+    const host = measureRef.current;
+    if (host === null) {
+      return;
+    }
+    const widths = new Map<string, number>();
+    for (const span of host.querySelectorAll<HTMLSpanElement>("span")) {
+      const width = span.offsetWidth;
+      if (width <= 0) {
+        setLabelWidths(null);
+        return;
+      }
+      widths.set(span.textContent ?? "", width);
+    }
+    setLabelWidths(widths);
+  }, [candidates]);
+
+  return (
+    <>
+      <ul ref={bandsRef} className={`history-bands history-bands--${tone}`} aria-hidden="true">
         {segments.map((segment, index) => {
           // Window-relative percentages, clamped into the box: a change that
           // predates the window renders from 0, never a negative left.
@@ -742,23 +880,28 @@ function StripSegments({
             0,
             ((segment.to - segment.from) / span) * 100 - (left - rawLeft),
           );
+          const label = fittingBandLabel(
+            segment.bandLabels,
+            rowWidthPx === null ? null : (width / 100) * rowWidthPx,
+            labelWidths,
+          );
           return (
             <li
               key={`${segment.from}-${index}`}
-              className="history-band"
+              className={segment.quietBand ? "history-band history-band--quiet" : "history-band"}
               style={{ left: `${left}%`, width: `${width}%` }}
               title={`${segment.title} · ${time(segment.from)}–${time(segment.to)}`}
             >
-              <span className="history-band-label">{segment.label}</span>
+              {label === "" ? null : <span className="history-band-label">{label}</span>}
             </li>
           );
         })}
       </ul>
-      <ul className="history-strip-listing" aria-label={name}>
-        {listings.map((item, index) => (
-          <li key={index}>{item}</li>
+      <div ref={measureRef} className="history-band-measure" aria-hidden="true">
+        {candidates.map((word) => (
+          <span key={word}>{word}</span>
         ))}
-      </ul>
+      </div>
     </>
   );
 }

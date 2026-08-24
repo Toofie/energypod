@@ -24,7 +24,9 @@
  */
 import { describe, expect, it } from "vitest";
 import {
+  BAND_LABEL_CHROME_PX,
   COMMANDED_SOURCES,
+  commandedBandLabels,
   commandedSegmentText,
   commandedSegments,
   commandedSourceText,
@@ -32,6 +34,7 @@ import {
   coverageFraction,
   emptyWindowNote,
   extremeText,
+  fittingBandLabel,
   gapText,
   HEALTH_NOT_RECORDED_TEXT,
   HISTORY_FIELDS,
@@ -543,6 +546,96 @@ describe("history model — the strip's change-point listings", () => {
     );
     expect(items).toHaveLength(3);
     expect(items[1]).toBe(`Self-healing ${localTime(T2)}–${localTime(sliverEnd)}`);
+  });
+});
+
+describe("history model — the strip's fitted band labels", () => {
+  /** A measured world: every word is 10 px wide per character, like a
+   * measurer reporting glyph widths. */
+  const widths = (words: readonly string[], pxPerChar = 10): Map<string, number> =>
+    new Map(words.map((word) => [word, word.length * pxPerChar]));
+
+  it("words the commanded band by its SOURCE — the full clause never rides a bar", () => {
+    expect(commandedBandLabels({ source: "night_adviser", direction: "charge" })).toEqual([
+      "night adviser",
+      "night",
+    ]);
+    expect(commandedBandLabels({ source: "excess_adviser", direction: "discharge" })).toEqual([
+      "solar adviser",
+      "solar",
+    ]);
+    expect(commandedBandLabels({ source: "schedule", direction: "charge" })).toEqual(["schedule"]);
+    expect(commandedBandLabels({ source: "manual", direction: "idle" })).toEqual(["manual"]);
+    expect(commandedBandLabels({ source: "agent", direction: "charge" })).toEqual(["agent"]);
+    expect(commandedBandLabels({ source: "optimizer", direction: "charge" })).toEqual([
+      "optimizer",
+    ]);
+  });
+
+  it("keeps the all-null triple's own words, on the same null rule as the clause", () => {
+    expect(commandedBandLabels({ source: null, direction: null })).toEqual([
+      "nothing commanded",
+      "none",
+    ]);
+    // The wire writes the triple all-null together, but a half-null triple
+    // words "nothing commanded" in the clause — the band may never argue with
+    // its own listing item.
+    expect(commandedBandLabels({ source: "night_adviser", direction: null })).toEqual([
+      "nothing commanded",
+      "none",
+    ]);
+    // A stranger source keeps the clause default's own words, never a raw code.
+    expect(commandedBandLabels({ source: "mystery_writer", direction: "charge" })).toEqual([
+      "no command",
+      "none",
+    ]);
+  });
+
+  it("never offers a tier holding the clause's sentence shape", () => {
+    for (const source of COMMANDED_SOURCES) {
+      const tiers = commandedBandLabels({ source, direction: "charge" });
+      for (const tier of tiers) {
+        expect(tier).not.toMatch(/—|,|\d/);
+        expect(tier.length).toBeLessThan(commandedSegmentText({
+          from: 0,
+          to: 1,
+          source,
+          direction: "charge",
+          watts: 2500,
+        }).length);
+      }
+    }
+  });
+
+  it("walks the tiers against measured pixels: fullest fit, shorter fit, then none", () => {
+    const map = widths(["Self-healing", "Healing"]);
+    // "Self-healing" is 120 px; a band that holds it with chrome to spare takes it.
+    expect(fittingBandLabel(["Self-healing", "Healing"], 120 + BAND_LABEL_CHROME_PX, map)).toBe(
+      "Self-healing",
+    );
+    // Narrower than the full word but wider than the compact one: tier 2.
+    expect(fittingBandLabel(["Self-healing", "Healing"], 70 + BAND_LABEL_CHROME_PX, map)).toBe(
+      "Healing",
+    );
+    // Narrower than every tier: NO word — the band stays bare, its segment
+    // still carried by the tooltip and the listing.
+    expect(fittingBandLabel(["Self-healing", "Healing"], 30, map)).toBe("");
+  });
+
+  it("never suppresses on ignorance — unknown pixels keep the fullest word", () => {
+    const map = widths(["Self-healing", "Healing"]);
+    // The row's width unknown (never measured, or a zero-width report)…
+    expect(fittingBandLabel(["Self-healing", "Healing"], null, map)).toBe("Self-healing");
+    expect(fittingBandLabel(["Self-healing", "Healing"], 0, map)).toBe("Self-healing");
+    // …or the words' widths unknown (the measurer could not answer).
+    expect(fittingBandLabel(["Self-healing", "Healing"], 30, null)).toBe("Self-healing");
+  });
+
+  it("skips a tier that was never measured — never renders a word blind", () => {
+    const map = widths(["Healing"]);
+    // "Self-healing" has no measured width: only the measured tier may render.
+    expect(fittingBandLabel(["Self-healing", "Healing"], 500, map)).toBe("Healing");
+    expect(fittingBandLabel(["Self-healing"], 500, map)).toBe("");
   });
 });
 
