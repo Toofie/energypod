@@ -3802,28 +3802,33 @@ def _build_runtime(
                 }
             ),
         )
-    # --- telemetry historian composition (DESIGN_PLANT_HISTORY sections 2.1+2.5) ---
-    # Composed exactly when the ``plant_history`` block is PRESENT, reading
-    # the observation port and the injected recovery view (health_state),
-    # attributing OPTIMIZER winners through the advisers' own single-writer
-    # projections.  Observability only: nothing in control reads it back.
+    # The night controller is composed AFTER the historian; the claims read
+    # is late-bound through this cell so the commanded triple can attribute
+    # the night adviser's held units (the DESIGN_PLANT_HISTORY section 6
+    # archaeology pin -- the night surface has composed since the night
+    # program; night-V2 closes the documented gap).
+    night_claim_source: dict[str, Any] = {"controller": None}
+
+    def _adviser_claims() -> dict[str, str]:
+        # The adviser attribution the commanded triple reads: each
+        # single-writer fleet-loop projection names the units it claims.
+        claims: dict[str, str] = {}
+        if excess_controller is not None:
+            state = excess_controller.state()
+            if state.active and state.target_unit_id is not None:
+                claims[state.target_unit_id] = "excess_adviser"
+        night_controller_bound = night_claim_source["controller"]
+        if night_controller_bound is not None:
+            state = night_controller_bound.state()
+            if state.active:
+                for unit_id in state.active_unit_ids:
+                    claims[unit_id] = "night_adviser"
+        return claims
+
     historian: TelemetryHistorian | None = None
     history_surface: PlantHistoryControl | None = None
     if history_present and history_config is not None and history_store is not None:
         configured_units = tuple(unit.unit_id for unit in config.units)
-
-        def _adviser_claims() -> dict[str, str]:
-            # The adviser attribution the commanded triple reads: each
-            # single-writer fleet-loop projection names the unit it claims.
-            # The excess projection composes today; the night-charge
-            # projection joins this map when its surface composes (the
-            # DESIGN_PLANT_HISTORY section 6 archaeology pin).
-            claims: dict[str, str] = {}
-            if excess_controller is not None:
-                state = excess_controller.state()
-                if state.active and state.target_unit_id is not None:
-                    claims[state.target_unit_id] = "excess_adviser"
-            return claims
 
         historian = TelemetryHistorian(
             unit_ids=configured_units,
@@ -3960,6 +3965,11 @@ def _build_runtime(
             tariff=registry_tariff,
             notes=tuple(registry_notes),
         )
+    if night_controller is not None and historian is not None:
+        # The historian's claims read is late-bound: bind the composed night
+        # controller now that both exist (the archaeology pin above).
+        night_claim_source["controller"] = night_controller
+
     # --- the night adviser's morning-credit port (V2 section 2.7) -----------
     # The first forecast-CONSUMING adviser: its evaluation drives the PV
     # fetch through the provider's own cache gate (the 2/day refresh budget
