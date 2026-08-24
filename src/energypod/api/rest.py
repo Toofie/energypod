@@ -35,6 +35,7 @@ from energypod.application.energy import EnergyScorecardRefusal
 from energypod.application.excess_charge import ExcessChargingRefusal
 from energypod.application.history import PlantHistoryRefusal
 from energypod.application.night_charge import NightChargingRefusal
+from energypod.application.parking import ParkingRefusal
 from energypod.application.scheduling import SchedulePublishValidationError, ScheduleRefusal
 
 from .idempotency import IdempotencyConflictError, IdempotencyCoordinator, StoredResult
@@ -76,6 +77,9 @@ class EnergyService(Protocol):
     async def acknowledge_inhibit(self, **kwargs: Any) -> dict[str, Any]: ...
     async def set_excess_charging(self, **kwargs: Any) -> dict[str, Any]: ...
     async def set_night_charging(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def park_unit(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def renew_park_lease(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def resume_unit(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
     async def replace_schedule(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_energy_days(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -233,6 +237,47 @@ class NightChargingRequest(StrictRequest):
     action: Literal["enable", "disable"]
     confirmation: Literal["NIGHT"]
     night_posture: Literal["PARTITION_ACKNOWLEDGED"] | None = None
+
+
+class ParkRequest(StrictRequest):
+    """DESIGN_POD_PARKING §2: the guarded PARK body.
+
+    A typed ``PARK`` confirmation always (the inhibit-acknowledgement
+    pattern on a mode write), a required canonical reason, and an optional
+    lease whose upper bound the facade judges against the commissioned
+    ``max_lease_s``.  The boundary pins the wire SHAPE; the controller owns
+    the guard order and the pinned refusal details.
+    """
+
+    confirmation: Literal["PARK"]
+    reason: str = Field(min_length=1, max_length=500)
+    lease_s: StrictInt | None = Field(default=None, ge=60)
+
+    @field_validator("reason")
+    @classmethod
+    def canonical_reason(cls, value: str) -> str:
+        if not value.strip() or value.strip() != value:
+            raise ValueError("reason must be non-blank and canonical")
+        return value
+
+
+class ParkRenewRequest(StrictRequest):
+    """DESIGN_POD_PARKING §2: the sliding renewal body."""
+
+    confirmation: Literal["RENEW"]
+    lease_s: StrictInt = Field(ge=60)
+
+
+class ResumeRequest(StrictRequest):
+    """DESIGN_POD_PARKING §2: the guarded RESUME body.
+
+    ``takeover`` is the arm-takeover pattern on a mode word: required
+    exactly when the pod holds Standby with no controller lease (the facade
+    and controller judge), never persisted, audited per request.
+    """
+
+    confirmation: Literal["RESUME"]
+    takeover: Literal["FOREIGN"] | None = None
 
 
 class ScheduleEntryRequest(StrictRequest):
@@ -989,6 +1034,140 @@ def create_api_app(
             payload=payload,
             status_code=200,
             invoke=invoke,
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    def _parking_invoke(
+        invoke: Callable[[], Awaitable[dict[str, Any]]]
+    ) -> Callable[[], Awaitable[dict[str, Any]]]:
+        """The shared parking boundary mapping: typed 409s, 422s, and 404s."""
+
+        async def wrapped() -> dict[str, Any]:
+            try:
+                return await invoke()
+            except ParkingRefusal as exc:
+                raise BoundaryError(409, exc.code, exc.message, exc.details) from exc
+            except ValueError as exc:
+                raise BoundaryError(422, "validation_error", str(exc)) from exc
+            except LookupError as exc:
+                raise BoundaryError(
+                    404, "unit_not_found", "The unit identifier is not known"
+                ) from exc
+
+        return wrapped
+
+    @app.post(f"{API_PREFIX}/units/{{unit_id}}/park")
+    async def park_unit(
+        unit_id: str,
+        body: ParkRequest,
+        request: Request,
+        identity: Principal = arm_dependency,
+    ) -> JSONResponse:
+        """Park one pod: the sanctioned vendor Standby mode (operator-only).
+
+        Parking is not electrical isolation — the battery stays connected at
+        full voltage. Never perform physical work on a parked pod; the lease
+        countdown is policy, never safety. Arm scope plus an interactive
+        operator, the literal PARK confirmation, and an Idempotency-Key.
+        """
+        if not _valid_id(unit_id):
+            raise BoundaryError(422, "validation_error", "Invalid unit identifier")
+        if not identity.interactive:
+            raise BoundaryError(
+                403, "interactive_operator_required", "Interactive operator required"
+            )
+        payload = {**body.model_dump(mode="json"), "unit_id": unit_id}
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="park_unit",
+            payload=payload,
+            status_code=200,
+            invoke=_parking_invoke(
+                lambda: service.park_unit(
+                    unit_id=unit_id,
+                    confirmation=payload["confirmation"],
+                    reason=payload["reason"],
+                    lease_s=payload.get("lease_s"),
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
+            ),
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.post(f"{API_PREFIX}/units/{{unit_id}}/park/renew")
+    async def renew_park_lease(
+        unit_id: str,
+        body: ParkRenewRequest,
+        request: Request,
+        identity: Principal = arm_dependency,
+    ) -> JSONResponse:
+        """Renew one pod's parking lease (sliding, anti-rollover-capped)."""
+        if not _valid_id(unit_id):
+            raise BoundaryError(422, "validation_error", "Invalid unit identifier")
+        if not identity.interactive:
+            raise BoundaryError(
+                403, "interactive_operator_required", "Interactive operator required"
+            )
+        payload = {**body.model_dump(mode="json"), "unit_id": unit_id}
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="renew_park_lease",
+            payload=payload,
+            status_code=200,
+            invoke=_parking_invoke(
+                lambda: service.renew_park_lease(
+                    unit_id=unit_id,
+                    confirmation=payload["confirmation"],
+                    lease_s=payload["lease_s"],
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
+            ),
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.post(f"{API_PREFIX}/units/{{unit_id}}/resume")
+    async def resume_unit(
+        unit_id: str,
+        body: ResumeRequest,
+        request: Request,
+        identity: Principal = arm_dependency,
+    ) -> JSONResponse:
+        """Resume one pod: write the vendor Normal mode (operator-only).
+
+        Parking is not electrical isolation — the battery stays connected at
+        full voltage; resume restores the PCS control path, nothing else.
+        Arm scope plus an interactive operator, the literal RESUME
+        confirmation, and an Idempotency-Key.
+        """
+        if not _valid_id(unit_id):
+            raise BoundaryError(422, "validation_error", "Invalid unit identifier")
+        if not identity.interactive:
+            raise BoundaryError(
+                403, "interactive_operator_required", "Interactive operator required"
+            )
+        payload = {**body.model_dump(mode="json"), "unit_id": unit_id}
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="resume_unit",
+            payload=payload,
+            status_code=200,
+            invoke=_parking_invoke(
+                lambda: service.resume_unit(
+                    unit_id=unit_id,
+                    confirmation=payload["confirmation"],
+                    takeover=payload.get("takeover"),
+                    principal=identity,
+                    idempotency_key=cast(str, _single_header(request.scope, b"idempotency-key")),
+                    request_id=request.state.request_id,
+                )
+            ),
         )
         return JSONResponse(status_code=result.status_code, content=dict(result.body))
 

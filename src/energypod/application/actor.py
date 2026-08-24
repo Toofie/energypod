@@ -77,6 +77,25 @@ class ArmRefused(RuntimeError):
         self.reason = reason
 
 
+class DebugModeChangeError(RuntimeError):
+    """One refused debug-mode change carrying its typed reason and details.
+
+    DESIGN_POD_PARKING section 2: the three device-sequence refusals the
+    park/resume controller maps onto its 409 envelopes.  ``reason`` is one of
+    ``mode_out_of_scope`` (prior word in the permanently-unexposed vendor
+    values 2-6 — details carry ``prior_word``/``vendor_name``),
+    ``write_failed`` (transport refused or timed out after one bounded retry
+    — details carry ``error_class``), or ``readback_unverified`` (ACKed but
+    the 0x8100 readback disagrees after ONE retry — details carry
+    ``prior_word``/``written_value``/``readback_word``/``retries``).
+    """
+
+    def __init__(self, reason: str, details: dict[str, Any]) -> None:
+        super().__init__(f"debug-mode change refused: {reason}")
+        self.reason = reason
+        self.details = dict(details)
+
+
 @dataclass(slots=True)
 class _Message:
     operation: str
@@ -110,6 +129,7 @@ class EnergyPodActor:
         blocking_fault_codes: frozenset[str] | None = None,
         mode_refresh_window: tuple[int, int] | None = None,
         autonomous_charge_signature_max_w: int | None = None,
+        debug_mode_readback_address: int | None = None,
         telemetry: Any | None = None,
     ) -> None:
         if stable_observations_required < 1:
@@ -177,6 +197,18 @@ class EnergyPodActor:
         # objective replaces the pod's own (beat-autonomy doctrine).
         # ``None`` keeps today's exact behavior.
         self._autonomous_charge_signature_max_w = autonomous_charge_signature_max_w
+        # DESIGN_POD_PARKING sections 4/5: the debug-mode READBACK address
+        # (0x8100 -- deliberately NOT the 0x8000 write address; the vendor
+        # asymmetry is pinned, never normalized).  The parking controller's
+        # named operation reads prior/readback words through this window; a
+        # transport without the named ``write_debug_mode`` never sees a mode
+        # write at all.  ``None`` keeps today's actor exactly as it is.
+        if debug_mode_readback_address is not None and (
+            type(debug_mode_readback_address) is not int
+            or not 0 <= debug_mode_readback_address <= 0xFFFF
+        ):
+            raise ValueError("debug_mode_readback_address must be an unsigned 16-bit integer")
+        self._debug_readback_address = debug_mode_readback_address
         # The classification the LAST arm preflight reached (read by the
         # facade for the audit trail): "sole_writer", "pod_autonomy",
         # "takeover_acknowledged", "external_writer", or None before any arm.
@@ -336,6 +368,38 @@ class EnergyPodActor:
         """
         words = await self._submit("refresh_mode_words", None, _CONTROL_PRIORITY)
         return (int(words[0]) & 0xFFFF, int(words[1]) & 0xFFFF)
+
+    async def request_debug_mode_change(self, value: int) -> dict[str, Any]:
+        """The ONE actor-mailbox operation of pod parking (DESIGN_POD_PARKING §4).
+
+        The whole transport sequence -- fresh prior read, the named
+        ``write_debug_mode``, the bounded readback -- runs inside a single
+        mailbox dispatch, so a heartbeat PQ write can never interleave
+        between this write and its readback.  Returns the response facts
+        ``{prior_word, written_value, readback_word, verified, retries}``;
+        the three refusal classes raise :class:`DebugModeChangeError` (mode
+        out of scope / write failed after one bounded retry / readback
+        unverified after one retry).  Only a commissioned ``parking:`` block
+        ever reaches this operation.
+        """
+        outcome = await self._submit("debug_mode", int(value), _CONTROL_PRIORITY)
+        return {
+            "prior_word": int(outcome["prior_word"]) & 0xFFFF,
+            "written_value": int(outcome["written_value"]) & 0xFFFF,
+            "readback_word": int(outcome["readback_word"]) & 0xFFFF,
+            "verified": bool(outcome["verified"]),
+            "retries": int(outcome["retries"]),
+        }
+
+    async def read_debug_word(self) -> int:
+        """One bounded fresh read of the debug-mode readback word (0x8100).
+
+        The resume path's pre-write evidence read: whose standby is it, is
+        the pod already Normal, or is it in an unexposed vendor mode.  Same
+        serialization as every other mode read -- inside the mailbox.
+        """
+        word = await self._submit("read_debug_word", None, _CONTROL_PRIORITY)
+        return int(word) & 0xFFFF
 
     async def read_objective_echo(self) -> tuple[str, tuple[int, int]]:
         """One bounded fresh read of the served PQ objective (P1 iii).
@@ -519,6 +583,10 @@ class EnergyPodActor:
             return await self._attempt_zero_owned()
         if operation == "refresh_mode_words":
             return await self._refresh_mode_words_owned()
+        if operation == "debug_mode":
+            return await self._debug_mode_owned(int(argument))
+        if operation == "read_debug_word":
+            return await self._read_debug_word_owned()
         if operation == "read_objective_echo":
             return await self._read_objective_echo_owned()
         if operation == "acknowledge_inhibit":
@@ -658,6 +726,115 @@ class EnergyPodActor:
                 f"{self.unit_id}: the mode-word window did not serve ctrlMode and workMode"
             )
         return (int(words[1]) & 0xFFFF, int(words[2]) & 0xFFFF)
+
+    async def _read_debug_word_owned(self) -> int:
+        """One bounded read of the debug-mode readback word (0x8100)."""
+        try:
+            return int(await self._read_debug_readback())
+        except asyncio.CancelledError:
+            raise
+        except DebugModeChangeError:
+            raise
+        except Exception as error:
+            raise RuntimeError(
+                f"{self.unit_id}: the debug-mode readback read failed"
+            ) from error
+
+    async def _debug_mode_owned(self, value: int) -> dict[str, Any]:
+        """The parking transport sequence: read prior, write, read back, verify.
+
+        DESIGN_POD_PARKING sections 1/5: the write domain is structurally
+        ``{0, 1}`` at the transport layer (the vendor values 2-6 are
+        permanently unexposed); the PRIOR word refuses the change when it
+        already holds a vendor-directed mode we never set; the write earns
+        ONE bounded retry on a transport failure and the readback ONE retry
+        on a mismatch, then the typed refusal carries the facts.  The
+        0x8000-write / 0x8100-readback address asymmetry is vendor truth --
+        nobody normalizes it (design section 5 item 4).
+        """
+        if value not in (0, 1):
+            raise ValueError(
+                f"{self.unit_id}: the debug-mode change accepts only 0 (Normal) or "
+                "1 (Standby): the vendor values 2-6 are permanently unexposed"
+            )
+        prior = await self._read_debug_readback()
+        if prior not in (0, 1):
+            # The vendor's own mode word -- named, never transitioned by us.
+            from energypod.domain.parking import vendor_debug_mode_name
+
+            raise DebugModeChangeError(
+                "mode_out_of_scope",
+                {
+                    "prior_word": prior,
+                    "vendor_name": vendor_debug_mode_name(prior),
+                },
+            )
+        readback: int | None = None
+        retries = 0
+        for attempt in (1, 2):
+            try:
+                async with asyncio.timeout(self._heartbeat_margin or 0.1):
+                    await self._write_debug_mode(value)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if attempt == 2:
+                    raise DebugModeChangeError(
+                        "write_failed", {"error_class": type(error).__name__}
+                    ) from error
+                continue
+            try:
+                readback = int(await self._read_debug_readback())
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if attempt == 2:
+                    raise DebugModeChangeError(
+                        "readback_unverified",
+                        {
+                            "prior_word": prior,
+                            "written_value": value,
+                            "readback_word": None,
+                            "retries": retries,
+                        },
+                    ) from error
+                continue
+            if readback == value:
+                return {
+                    "prior_word": prior,
+                    "written_value": value,
+                    "readback_word": readback,
+                    "verified": True,
+                    "retries": retries,
+                }
+            retries += 1
+        raise DebugModeChangeError(
+            "readback_unverified",
+            {
+                "prior_word": prior,
+                "written_value": value,
+                "readback_word": readback,
+                "retries": retries,
+            },
+        )
+
+    async def _read_debug_readback(self) -> int:
+        """One bounded read of the debug-mode readback (0x8100, one word)."""
+        address = self._debug_readback_address
+        if address is None:
+            raise RuntimeError(f"{self.unit_id}: no debug-mode readback window is wired")
+        async with asyncio.timeout(self._heartbeat_margin or 0.1):
+            words = tuple(await self._transport.read_holding(address, 1))
+        if len(words) < 1:
+            raise ValueError("the debug-mode readback window did not serve its word")
+        return int(words[0]) & 0xFFFF
+
+    async def _write_debug_mode(self, value: int) -> None:
+        """The named transport write -- the only path that can reach 0x8000."""
+        writer = getattr(self._transport, "write_debug_mode", None)
+        if writer is None:
+            raise RuntimeError(f"{self.unit_id}: the transport exposes no write_debug_mode")
+        await writer(value)
 
     async def _read_objective_echo_owned(self) -> tuple[str, tuple[int, int]]:
         """The P1 iii bounded fresh read + classification of the served objective."""

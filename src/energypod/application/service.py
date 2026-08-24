@@ -54,6 +54,12 @@ from .excess_charge import ExcessChargingRefusal
 from .foreign_objective import empty_objective_entry
 from .history import PLANT_HISTORY_NOT_COMMISSIONED, PlantHistoryRefusal
 from .night_charge import NightChargingRefusal
+from .parking import (
+    MIN_LEASE_S,
+    PARK_NOT_COMMISSIONED,
+    ParkCommissioning,
+    ParkingRefusal,
+)
 from .scheduling import (
     SchedulePolicy,
     SchedulePublishValidationError,
@@ -398,6 +404,55 @@ class PlantHistorySurface(Protocol):
         points: int = 600,
         now_utc: datetime | None = None,
     ) -> dict[str, Any]: ...
+
+
+class ParkControl(Protocol):
+    """The composed park controller's facade-facing surface (block presence).
+
+    ``energypod.application.parking.ParkController`` is the composed
+    implementation.  The facade VALIDATES the guarded request (literals,
+    reason, lease bounds, unit known) and delegates the guarded mutation;
+    every refusal the controller raises is the typed ``ParkingRefusal`` the
+    boundary maps verbatim.  Projection reads degrade to absent keys, never
+    fabricating a park state the ledger does not hold.
+    """
+
+    @property
+    def commissioning(self) -> ParkCommissioning: ...
+
+    async def park(
+        self,
+        unit_id: str,
+        *,
+        reason: str,
+        principal_subject: str,
+        request_id: str,
+        lease_s: int | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def renew(
+        self,
+        unit_id: str,
+        *,
+        lease_s: int,
+        principal_subject: str,
+        request_id: str,
+    ) -> dict[str, Any]: ...
+
+    async def resume(
+        self,
+        unit_id: str,
+        *,
+        principal_subject: str,
+        request_id: str,
+        takeover: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def park_states(self) -> Mapping[str, Mapping[str, Any]]: ...
+
+    def parked_unit_ids(self) -> frozenset[str]: ...
+
+    def dispatch_refusal_details(self, unit_id: str) -> dict[str, Any] | None: ...
 
 
 class ActorHandle(Protocol):
@@ -1039,6 +1094,7 @@ class EnergyServiceFacade:
         energy: EnergyScorecardSurface | None = None,
         history: PlantHistorySurface | None = None,
         night: NightChargingControl | None = None,
+        parking: ParkControl | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -1064,6 +1120,7 @@ class EnergyServiceFacade:
         self._energy = energy
         self._history = history
         self._night = night
+        self._parking = parking
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._schedule_correlations = itertools.count(1)
@@ -1083,11 +1140,14 @@ class EnergyServiceFacade:
         latest = await self._observations.all_latest()
         active = await self._intents.active(now_mono)
         recovery_states = await self._recovery_states()
+        park_states = await self._parking_states()
         units: list[dict[str, Any]] = []
         for unit_id, handle in self._actors.items():
             telemetry = latest.get(unit_id) if isinstance(latest, Mapping) else None
             units.append(
-                await self._unit_view(unit_id, handle, telemetry, active, now_mono, recovery_states)
+                await self._unit_view(
+                    unit_id, handle, telemetry, active, now_mono, recovery_states, park_states
+                )
             )
         view: dict[str, Any] = {
             "site_id": self._site_id,
@@ -1156,16 +1216,24 @@ class EnergyServiceFacade:
         Unknown unit ids are refused.  A known unit that has not published an
         observation yet projects nulls for every datum, never zero-filled or
         fabricated values.  This performs no I/O beyond the one repository
-        read and never triggers control.
+        read and never triggers control.  With parking commissioned the unit
+        detail additionally carries ``park_state`` (the lease projection).
         """
         self._admit(principal, "observe")
         canonical_unit = _correlation_key(unit_id, "unit_id")
         if canonical_unit not in self._actors:
             raise LookupError(f"no unit with id {canonical_unit!r}")
         observation = await self._observations.latest(canonical_unit)
-        return _unit_projection(
+        projection = _unit_projection(
             canonical_unit, observation, include_energy=self._energy is not None
         )
+        park_states = await self._parking_states()
+        park_state = park_states.get(canonical_unit)
+        if park_state is not None:
+            # DESIGN_POD_PARKING section 3: absent key when uncommissioned;
+            # present (with honest nulls) whenever the block is composed.
+            projection["park_state"] = dict(park_state)
+        return projection
 
     async def health(self, *, principal: Principal) -> dict[str, Any]:
         """Separate process liveness, dependency readiness, and control readiness."""
@@ -2376,6 +2444,155 @@ class EnergyServiceFacade:
             "degraded": degraded,
         }
 
+    async def park_unit(
+        self,
+        *,
+        unit_id: Any,
+        confirmation: Any,
+        reason: Any,
+        lease_s: Any = None,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """One guarded PARK (DESIGN_POD_PARKING section 2): write 0x8000<-1.
+
+        The arm scope AND an interactive principal, the typed ``PARK``
+        confirmation, a required reason (1..500), an optional lease inside
+        ``[60, max_lease_s]``.  Every refusal is the controller's typed
+        ``ParkingRefusal`` with its pinned details shape; the response is
+        synchronous (write->readback is one serialized actor operation) and
+        carries prior/written/readback/verified plus the new lease.  Parking
+        is NOT electrical isolation -- the battery stays connected at full
+        voltage; the lease countdown is policy, never safety.
+        """
+        self._admit(principal, "arm", interactive=True)
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        canonical_unit = _correlation_key(unit_id, "unit_id")
+        if confirmation != "PARK":
+            raise ValueError("confirmation must be the literal 'PARK'")
+        resolved_reason = _reason_text(reason, required=True)
+        if resolved_reason is None:  # pragma: no cover - guarded by required=True
+            raise ValueError("a reason is required")
+        control = self._parking
+        if control is None:
+            # Block-presence doctrine: an ABSENT ``parking:`` block composes
+            # nothing -- the route answers, it does not silently no-op.
+            raise ParkingRefusal(
+                PARK_NOT_COMMISSIONED,
+                "the parking feature is not composed on this site "
+                "(no parking: block in this controller's configuration)",
+                {"cause": "block_absent"},
+            )
+        if canonical_unit not in self._actors:
+            raise LookupError(f"no unit with id {canonical_unit!r}")
+        max_lease_s = control.commissioning.max_lease_s
+        if lease_s is not None and (
+            isinstance(lease_s, bool)
+            or type(lease_s) is not int
+            or not MIN_LEASE_S <= lease_s <= max_lease_s
+        ):
+            raise ValueError(f"lease_s must be between {MIN_LEASE_S} and {max_lease_s} seconds")
+        return await control.park(
+            canonical_unit,
+            reason=resolved_reason,
+            principal_subject=principal.subject,
+            request_id=request,
+            lease_s=lease_s,
+        )
+
+    async def renew_park_lease(
+        self,
+        *,
+        unit_id: Any,
+        confirmation: Any,
+        lease_s: Any,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """One sliding lease renewal, never past ``parked_at + max_lease_s``.
+
+        Anti-rollover (ISA-TR84): renewal extends within the ORIGINAL lease's
+        cap only; after expiry a NEW park with fresh confirmation is the
+        path, never a renewal.  The ``RENEW`` literal and a required
+        ``lease_s`` travel the wire; the controller owns the guard order and
+        the epoch CAS.
+        """
+        self._admit(principal, "arm", interactive=True)
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        canonical_unit = _correlation_key(unit_id, "unit_id")
+        if confirmation != "RENEW":
+            raise ValueError("confirmation must be the literal 'RENEW'")
+        control = self._parking
+        if control is None:
+            raise ParkingRefusal(
+                PARK_NOT_COMMISSIONED,
+                "the parking feature is not composed on this site",
+                {"cause": "block_absent"},
+            )
+        if canonical_unit not in self._actors:
+            raise LookupError(f"no unit with id {canonical_unit!r}")
+        max_lease_s = control.commissioning.max_lease_s
+        if isinstance(lease_s, bool) or type(lease_s) is not int:
+            raise ValueError("lease_s must be an integer")
+        if not MIN_LEASE_S <= lease_s <= max_lease_s:
+            raise ValueError(f"lease_s must be between {MIN_LEASE_S} and {max_lease_s} seconds")
+        return await control.renew(
+            canonical_unit,
+            lease_s=lease_s,
+            principal_subject=principal.subject,
+            request_id=request,
+        )
+
+    async def resume_unit(
+        self,
+        *,
+        unit_id: Any,
+        confirmation: Any,
+        takeover: Any = None,
+        principal: Principal,
+        idempotency_key: Any,
+        request_id: Any,
+    ) -> dict[str, Any]:
+        """One guarded RESUME: write 0x8000<-0, with consent where required.
+
+        The arm scope AND an interactive principal BOTH DIRECTIONS (flag 10).
+        ``takeover: "FOREIGN"`` is required exactly when the pod holds
+        Standby with no controller lease (the arm takeover pattern:
+        per-request, audited, never persisted).  Resume on a Normal word is a
+        no-op 200 (``origin: "none"``) -- idempotent honesty, no error
+        theater.  The response carries the post-park checklist (comms age,
+        SOC drift vs park time, fault-class audit facts inside the window
+        with a retention note when the trail no longer reaches, latched
+        stops, latched inhibit).
+        """
+        self._admit(principal, "arm", interactive=True)
+        _correlation_key(idempotency_key, "idempotency_key")
+        request = _correlation_key(request_id, "request_id")
+        canonical_unit = _correlation_key(unit_id, "unit_id")
+        if confirmation != "RESUME":
+            raise ValueError("confirmation must be the literal 'RESUME'")
+        if takeover is not None and takeover != "FOREIGN":
+            raise ValueError("takeover acknowledgement must be the literal 'FOREIGN'")
+        control = self._parking
+        if control is None:
+            raise ParkingRefusal(
+                PARK_NOT_COMMISSIONED,
+                "the parking feature is not composed on this site",
+                {"cause": "block_absent"},
+            )
+        if canonical_unit not in self._actors:
+            raise LookupError(f"no unit with id {canonical_unit!r}")
+        return await control.resume(
+            canonical_unit,
+            principal_subject=principal.subject,
+            request_id=request,
+            takeover=takeover,
+        )
+
     async def set_excess_charging(
         self,
         *,
@@ -2914,7 +3131,22 @@ class EnergyServiceFacade:
             ):
                 local.append(unit_id)
         if debugging:
-            raise ValueError(f"device_debug_mode_active: {sorted(debugging)}")
+            # DESIGN_POD_PARKING section 3: the refusal fires exactly as it
+            # always has; when the lease ledger (or the divergence memory)
+            # names a debugging unit, its provenance rides the exception's
+            # structured details -- parked_provenance when the ledger names
+            # it, resume_provenance after an observed foreign resume, and
+            # foreign_mode (never parked) for a word in the unexposed 2-6.
+            error = ValueError(f"device_debug_mode_active: {sorted(debugging)}")
+            details: dict[str, dict[str, Any]] = {}
+            if self._parking is not None:
+                for unit_id in debugging:
+                    provenance = self._parking.dispatch_refusal_details(unit_id)
+                    if provenance:
+                        details[unit_id] = provenance
+            if details:
+                error.details = details  # type: ignore[attr-defined]
+            raise error
         if local:
             raise ValueError(f"device_mode_not_remote: {sorted(local)}")
 
@@ -3009,6 +3241,7 @@ class EnergyServiceFacade:
         active_intents: Sequence[Any],
         now_mono: float,
         recovery_states: Mapping[str, Any] | None = None,
+        park_states: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         age_s: float | None = None
         measured_watts: float | None = None
@@ -3049,6 +3282,14 @@ class EnergyServiceFacade:
             # observed-objectives route).  Null before any recorded sample --
             # never fabricated, never a gate.
             "last_objective_observed": self._last_objective_summary(unit_id),
+            # DESIGN_POD_PARKING section 3: the ``park_state`` projection rides
+            # the per-unit view ONLY when the ``parking:`` block is composed
+            # (absent key when uncommissioned -- the feature-detected pattern).
+            **(
+                {"park_state": dict(park_states[unit_id])}
+                if park_states is not None and unit_id in park_states
+                else {}
+            ),
         }
 
     async def _intent_projection(
@@ -3176,6 +3417,19 @@ class EnergyServiceFacade:
         except Exception:
             return None
 
+    async def _parking_states(self) -> Mapping[str, Mapping[str, Any]]:
+        """The park controller's per-unit projections; empty when absent.
+
+        An uncommissioned or failing projection degrades to no keys, never a
+        fabricated park state: reads never gate on the ledger.
+        """
+        if self._parking is None:
+            return {}
+        try:
+            return await self._parking.park_states()
+        except Exception:
+            return {}
+
     def _last_objective_summary(self, unit_id: str) -> dict[str, Any] | None:
         """The detector's COMPACT five-key per-unit summary, null on absence.
 
@@ -3201,6 +3455,12 @@ class EnergyServiceFacade:
     ) -> list[str]:
         reasons: list[str] = []
         any_armed = False
+        parked_units: frozenset[str] = frozenset()
+        if self._parking is not None:
+            try:
+                parked_units = self._parking.parked_unit_ids()
+            except Exception:
+                parked_units = frozenset()
         for unit_id, handle in self._actors.items():
             lifecycle = _enum_value(getattr(handle, "lifecycle", None))
             # Unknown qualification is a reason, never an assumption.
@@ -3209,6 +3469,10 @@ class EnergyServiceFacade:
                 reasons.append(f"{unit_id}:inhibit_latched")
             if lifecycle == "inhibited":
                 reasons.append(f"{unit_id}:inhibited")
+            # DESIGN_POD_PARKING section 3: a parked unit is not control-ready
+            # whatever its lifecycle says -- the debug word refuses dispatch.
+            if unit_id in parked_units:
+                reasons.append(f"{unit_id}:parked")
             # P1 vi: a unit authorizing without actuating is not ready to
             # act, whatever its lifecycle says.
             view = recovery_states.get(unit_id) if recovery_states is not None else None
@@ -3370,6 +3634,29 @@ class EnergyServiceFacade:
 
     def _is_fleet_wide(self, unit_ids: frozenset[str]) -> bool:
         return set(self._actors).issubset(unit_ids)
+
+    def latched_stop_unit_ids(self) -> frozenset[str]:
+        """Every unit a live latched emergency stop names (park's conflict view).
+
+        Fleet-wide stops name every unit this facade serves; a partial stop
+        names exactly its own selection.  The park controller reads this
+        inside its per-unit critical section.
+        """
+        units: set[str] = set()
+        for stop in self._latched_stops.values():
+            units.update(stop.unit_ids)
+            if self._is_fleet_wide(stop.unit_ids):
+                units.update(self._actors)
+        return frozenset(units)
+
+    def latched_stop_ids_for(self, unit_id: str) -> list[str]:
+        """The exact latched stop ids naming one unit (resume's guard + checklist)."""
+        ids = [
+            stop.stop_id
+            for stop in self._latched_stops.values()
+            if unit_id in stop.unit_ids or self._is_fleet_wide(stop.unit_ids)
+        ]
+        return sorted(ids)
 
     def _mutation_audit(
         self,

@@ -471,6 +471,94 @@ class RecordingEnergyService:
             },
         }
 
+    # The parking surface's scripted answers (DESIGN_POD_PARKING section 2):
+    # a 200 body per action, an optional typed refusal raised to the
+    # boundary, and an optional validation error.
+    park_result: dict[str, Any] = field(
+        default_factory=lambda: {
+            "unit_id": "pod-a",
+            "action": "park",
+            "prior_word": 0,
+            "written_value": 1,
+            "readback_word": 1,
+            "verified": True,
+            "as_of": "2026-08-24T02:00:01+00:00",
+            "lease": {
+                "parked_at": "2026-08-24T02:00:00+00:00",
+                "expires_at": "2026-08-24T06:00:00+00:00",
+                "max_total_s": 14400,
+                "reason": "inverter work",
+                "authorizer": "person:operator",
+                "epoch": 1,
+            },
+            "prior_state": {"lifecycle": "disarmed", "measured_watts": 0.0},
+        }
+    )
+    renew_result: dict[str, Any] = field(
+        default_factory=lambda: {
+            "unit_id": "pod-a",
+            "action": "renew",
+            "as_of": "2026-08-24T03:00:00+00:00",
+            "lease": {
+                "parked_at": "2026-08-24T02:00:00+00:00",
+                "expires_at": "2026-08-24T08:00:00+00:00",
+                "max_total_s": 14400,
+                "reason": "inverter work",
+                "authorizer": "person:operator",
+                "epoch": 1,
+            },
+        }
+    )
+    resume_result: dict[str, Any] = field(
+        default_factory=lambda: {
+            "unit_id": "pod-a",
+            "action": "resume",
+            "prior_word": 1,
+            "written_value": 0,
+            "readback_word": 0,
+            "verified": True,
+            "as_of": "2026-08-24T04:00:00+00:00",
+            "origin": "operator",
+            "checklist": {
+                "comms_age_s": 0.4,
+                "soc_drift_pct": -2.5,
+                "soc_pct_at_park": 48.0,
+                "measured_watts_now": 0.0,
+                "faults_while_parked": [],
+                "faults_retention_note": None,
+                "latched_stops": [],
+                "latched_inhibit": False,
+            },
+            "degraded": [],
+        }
+    )
+    park_refusal: Any = None
+    park_validation_error: Any = None
+
+    async def park_unit(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("park_unit", kwargs))
+        if self.park_refusal is not None:
+            raise self.park_refusal
+        if self.park_validation_error is not None:
+            raise self.park_validation_error
+        return dict(self.park_result)
+
+    async def renew_park_lease(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("renew_park_lease", kwargs))
+        if self.park_refusal is not None:
+            raise self.park_refusal
+        if self.park_validation_error is not None:
+            raise self.park_validation_error
+        return dict(self.renew_result)
+
+    async def resume_unit(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("resume_unit", kwargs))
+        if self.park_refusal is not None:
+            raise self.park_refusal
+        if self.park_validation_error is not None:
+            raise self.park_validation_error
+        return dict(self.resume_result)
+
     async def get_schedule(self, *, principal: Any) -> dict[str, Any]:
         self.calls.append(("get_schedule", {"principal": principal}))
         if self.schedule_refusal is not None:

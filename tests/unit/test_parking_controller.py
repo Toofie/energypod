@@ -1,0 +1,836 @@
+"""The ParkController doctrine contracts (DESIGN_POD_PARKING sections 1-4).
+
+The §12 families this suite owns (the simulator half is B2's, the REST half
+lives in tests/api/test_parking_rest.py):
+
+- T-PARK-HAPPY: the 200 shape, durable-first pending->parked rows, events.
+- T-PARK-REFUSALS: every code with EXACTLY the pinned details shape.
+- T-PARK-IDEMPOTENCY: the post-restart retry resolving park_already_parked.
+- T-PARK-CONCURRENCY: the single-flight critical section (park-vs-park).
+- T-PARK-EXPIRY: alarm-only -- a row, an alert-tier event, NO write, ever.
+- T-PARK-CRASH/RESTART: boot reconstruction (expired-in-downtime alarm,
+  never a write); pending-row adoption.
+- T-PARK-REPLAY: the table truth (renewed rows participate; the closing set
+  includes observed_foreign).
+- T-PARK-FOREIGN: word=1 no lease (unrecorded/foreign + takeover), word 2-6
+  (out of scope + foreign_mode + foreign_rewrite), the observed foreign
+  resume closing the lease with written_value null.
+
+SAFETY: no hardware, no sockets, no live system contact.  Deterministic
+fakes only.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from energypod.adapters.persistence.memory import InMemoryParkLeaseRepository
+from energypod.application.actor import DebugModeChangeError
+from energypod.application.parking import (
+    EXPIRY_HINT,
+    PARK_ALREADY_PARKED,
+    PARK_CONFLICT_REFUSED,
+    PARK_FOREIGN_WORD_ACKNOWLEDGEMENT_REQUIRED,
+    PARK_LEASE_ABSENT,
+    PARK_LEASE_CAP_REACHED,
+    PARK_MODE_OUT_OF_SCOPE,
+    PARK_READBACK_UNVERIFIED,
+    PARK_WRITE_FAILED,
+    ParkCommissioning,
+    ParkController,
+    ParkingRefusal,
+)
+from energypod.domain.audit import AuditEvent
+from energypod.domain.observations import UnitLifecycle
+from energypod.domain.parking import (
+    LEASE_CLOSED_FOREIGN,
+    LEASE_CLOSED_OPERATOR,
+    LEASE_EXPIRED,
+    LEASE_OPEN,
+    ParkLease,
+)
+
+WALL = datetime(2026, 8, 24, 2, 0, 0, tzinfo=UTC)
+UNITS = ("mid", "rhs")
+
+
+class FakeClock:
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+        self.wall = WALL
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def wall_now(self) -> datetime:
+        return self.wall
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+        self.wall += timedelta(seconds=seconds)
+
+
+class FakeActor:
+    """The parking-facing actor surface with a scriptable device word."""
+
+    def __init__(
+        self,
+        unit_id: str,
+        *,
+        word: int = 0,
+        lifecycle: UnitLifecycle = UnitLifecycle.DISARMED,
+        inhibit_latched: bool = False,
+    ) -> None:
+        self.unit_id = unit_id
+        self.word = word
+        self.lifecycle = lifecycle
+        self.inhibit_latched = inhibit_latched
+        self.mode_calls: list[int] = []
+        self.read_calls = 0
+        self.fail_writes = 0        # transport failures left to simulate
+        self.unverify_once = False  # one mismatched readback, then verify
+
+    async def request_debug_mode_change(self, value: int) -> dict[str, Any]:
+        from energypod.domain.parking import vendor_debug_mode_name
+
+        if value not in (0, 1):  # pragma: no cover - the controller never sends these
+            raise ValueError("the write domain is {0, 1}")
+        prior = self.word
+        if prior not in (0, 1):
+            raise DebugModeChangeError(
+                "mode_out_of_scope",
+                {"prior_word": prior, "vendor_name": vendor_debug_mode_name(prior)},
+            )
+        for attempt in (1, 2):
+            self.mode_calls.append(value)  # one entry per transport write attempt
+            if self.fail_writes:
+                self.fail_writes -= 1
+                if attempt == 2:
+                    raise DebugModeChangeError("write_failed", {"error_class": "TransportError"})
+                continue
+            if self.unverify_once and attempt == 1:
+                self.unverify_once = False
+                self.word = value
+                raise DebugModeChangeError(
+                    "readback_unverified",
+                    {
+                        "prior_word": prior,
+                        "written_value": value,
+                        "readback_word": 1 - value,
+                        "retries": 1,
+                    },
+                )
+            self.word = value
+            return {
+                "prior_word": prior,
+                "written_value": value,
+                "readback_word": value,
+                "verified": True,
+                "retries": 0,
+            }
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def read_debug_word(self) -> int:
+        self.read_calls += 1
+        return self.word
+
+
+class FakeObservations:
+    def __init__(self) -> None:
+        self.latest_by_unit: dict[str, SimpleNamespace] = {}
+
+    async def latest(self, unit_id: str) -> SimpleNamespace | None:
+        return self.latest_by_unit.get(unit_id)
+
+    def serve(self, unit_id: str, **facts: Any) -> None:
+        current = self.latest_by_unit.get(unit_id)
+        base = dict(vars(current)) if current is not None else {}
+        base.update(facts)
+        self.latest_by_unit[unit_id] = SimpleNamespace(**base)
+
+
+@dataclass
+class FakeIntent:
+    id: str
+    source: SimpleNamespace
+    selected_unit_ids: frozenset[str]
+
+
+class FakeIntents:
+    def __init__(self) -> None:
+        self.live: list[FakeIntent] = []
+
+    async def active(self, now_mono: float) -> tuple[Any, ...]:
+        return tuple(self.live)
+
+
+class FakeAudit:
+    """The event-only audit port; also the fault-window evidence source."""
+
+    def __init__(self) -> None:
+        self.events: list[AuditEvent] = []
+        self.failing = False
+
+    async def append(self, event: AuditEvent) -> None:
+        if self.failing:
+            raise OSError("audit store unavailable")
+        self.events.append(event)
+
+    async def recent(self, *, limit: int, after_sequence: int | None = None) -> tuple[Any, ...]:
+        return tuple(self.events[-limit:])
+
+    def of_type(self, event_type: str) -> list[AuditEvent]:
+        return [event for event in self.events if event.event_type == event_type]
+
+    @property
+    def types(self) -> list[str]:
+        return [event.event_type for event in self.events]
+
+
+class FakeBus:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def publish(self, body: dict[str, Any]) -> int:
+        self.events.append(body)
+        return len(self.events)
+
+    def of_type(self, event_type: str) -> list[dict[str, Any]]:
+        return [event for event in self.events if event["type"] == event_type]
+
+
+class AsyncLeaseStore:
+    """The async wrapper over the real in-memory twin (the composition's).
+
+    The committed audit rows land in the SHARED audit store exactly as the
+    SQLite path's single transaction leaves them in ``audit_events``: the
+    test rig's audit fake sees pending rows (through the controller's
+    event-only port) and completing rows (through this store) alike.
+    """
+
+    def __init__(self, audit: FakeAudit | None = None) -> None:
+        self.audit = audit
+        self.store = InMemoryParkLeaseRepository(audit_sink=self._sync_sink())
+        self.commit_calls: list[ParkLease] = []
+
+    def _sync_sink(self) -> Any:
+        audit = self.audit
+
+        class _Sink:
+            def append(self, event: AuditEvent) -> None:
+                if audit is not None:
+                    audit.events.append(event)
+
+        return _Sink()
+
+    async def commit(self, event: AuditEvent, lease: ParkLease) -> None:
+        self.store.commit(event, lease)
+        self.commit_calls.append(lease)
+
+    async def replace(self, event: AuditEvent, lease: ParkLease, *, expected_epoch: int) -> None:
+        self.store.replace(event, lease, expected_epoch=expected_epoch)
+        self.commit_calls.append(lease)
+
+    async def lease(self, unit_id: str) -> ParkLease | None:
+        return self.store.lease(unit_id)
+
+    async def all_leases(self) -> dict[str, ParkLease]:
+        return self.store.all_leases()
+
+
+@dataclass
+class StopView:
+    """The facade-side latched-stop view the controller binds."""
+
+    units: frozenset[str] = frozenset()
+    ids_by_unit: dict[str, list[str]] = field(default_factory=dict)
+
+    def unit_ids(self) -> frozenset[str]:
+        return self.units
+
+    def stop_ids_for(self, unit_id: str) -> list[str]:
+        return self.ids_by_unit.get(unit_id, [])
+
+
+class Rig:
+    """One controller with every port faked and scripted."""
+
+    def __init__(self, *, max_lease_s: int = 14400, default_lease_s: int = 14400) -> None:
+        self.clock = FakeClock()
+        self.audit = FakeAudit()
+        self.store = AsyncLeaseStore(audit=self.audit)
+        self.bus = FakeBus()
+        self.actors = {
+            "mid": FakeActor("mid"),
+            "rhs": FakeActor("rhs"),
+        }
+        self.observations = FakeObservations()
+        self.intents = FakeIntents()
+        self.stop_view = StopView()
+        self.controller = ParkController(
+            unit_ids=frozenset(UNITS),
+            commissioning=ParkCommissioning(
+                max_lease_s=max_lease_s,
+                default_lease_s=default_lease_s,
+                mode_write_enabled=True,
+            ),
+            clock=self.clock,
+            store=self.store,
+            audit=self.audit,
+            bus=self.bus,
+            actors=self.actors,
+            observations=self.observations,
+            intents=self.intents,
+            process_instance_id="process-1",
+            process_origin_mono=1000.0,
+            latched_stop_units=self.stop_view,
+        )
+
+    async def park(self, unit_id: str = "mid", **overrides: Any) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "reason": "inverter work",
+            "principal_subject": "person:operator",
+            "request_id": "req-1",
+        }
+        kwargs.update(overrides)
+        return await self.controller.park(unit_id, **kwargs)
+
+    async def renew(self, unit_id: str = "mid", lease_s: int = 3600) -> dict[str, Any]:
+        return await self.controller.renew(
+            unit_id,
+            lease_s=lease_s,
+            principal_subject="person:operator",
+            request_id="req-2",
+        )
+
+    async def resume(self, unit_id: str = "mid", takeover: str | None = None) -> dict[str, Any]:
+        return await self.controller.resume(
+            unit_id,
+            principal_subject="person:operator",
+            request_id="req-3",
+            takeover=takeover,
+        )
+
+
+@pytest.fixture
+def rig() -> Rig:
+    return Rig()
+
+
+async def expect_refusal(coro: Any, code: str) -> ParkingRefusal:
+    with pytest.raises(ParkingRefusal) as caught:
+        await coro
+    assert caught.value.code == code, f"expected {code}, got {caught.value.code}"
+    return caught.value
+
+
+# --- T-PARK-HAPPY -------------------------------------------------------------------
+
+
+async def test_park_happy_path_writes_pending_then_parked_and_mints_the_lease(rig: Rig) -> None:
+    rig.observations.serve("mid", authoritative_soc_pct=48.0, battery_watts=0.0)
+    result = await rig.park(lease_s=7200)
+
+    assert result["unit_id"] == "mid" and result["action"] == "park"
+    assert result["prior_word"] == 0 and result["written_value"] == 1
+    assert result["readback_word"] == 1 and result["verified"] is True
+    assert result["lease"]["max_total_s"] == 14400
+    assert result["lease"]["epoch"] == 1
+    assert result["prior_state"] == {"lifecycle": "disarmed", "measured_watts": 0.0}
+    # Durable-first: the pending row precedes the write; the completing row
+    # and the lease land in ONE store transaction.
+    rows = rig.audit.of_type("unit_parked")
+    assert [row.result for row in rows] == ["pending", "parked"]
+    assert rows[0].reason_codes == ("durable_first",)
+    assert "readback_verified" in rows[1].reason_codes
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.epoch == 1 and lease.soc_pct_at_park == 48.0
+    assert lease.reason == "inverter work" and lease.authorizer == "person:operator"
+    # The bus mirrors the row.
+    (parked_event,) = rig.bus.of_type("unit.parked")
+    assert parked_event["payload"]["origin"] == "operator"
+    assert parked_event["payload"]["epoch"] == 1
+    # The parked mirror drives dispatch refusal and readiness.
+    assert rig.controller.parked_unit_ids() == frozenset({"mid"})
+
+
+async def test_a_park_over_a_foreign_standby_records_the_origin_transition(rig: Rig) -> None:
+    """``adopted_foreign_park``: the ledger never claims we initiated a park
+    we inherited -- parking over an existing word=1 still mints OUR lease with
+    the transition named on the completing row."""
+    rig.actors["mid"].word = 1
+    await rig.park()
+    rows = rig.audit.of_type("unit_parked")
+    assert "adopted_foreign_park" in rows[1].reason_codes
+    assert rows[1].result == "parked"
+
+
+async def test_resume_happy_path_closes_the_lease_and_renders_the_checklist(rig: Rig) -> None:
+    rig.observations.serve(
+        "mid", authoritative_soc_pct=45.5, battery_watts=0.0, captured_at_mono=1002.0
+    )
+    await rig.park()
+    rig.clock.advance(120.0)
+    rig.actors["mid"].word = 1  # still parked
+    result = await rig.resume()
+
+    assert result["origin"] == "operator"
+    assert result["prior_word"] == 1 and result["written_value"] == 0 and result["verified"]
+    checklist = result["checklist"]
+    assert set(checklist) == {
+        "comms_age_s",
+        "soc_drift_pct",
+        "soc_pct_at_park",
+        "measured_watts_now",
+        "faults_while_parked",
+        "faults_retention_note",
+        "latched_stops",
+        "latched_inhibit",
+    }
+    assert checklist["soc_pct_at_park"] == 45.5
+    assert checklist["soc_drift_pct"] == 0.0
+    assert checklist["latched_stops"] == [] and checklist["latched_inhibit"] is False
+    assert result["degraded"] == []
+    # The lease closed as the operator's, in the same transaction as the row.
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.state == LEASE_CLOSED_OPERATOR
+    assert lease.closed_at is not None
+    rows = rig.audit.of_type("unit_resumed")
+    assert [row.result for row in rows] == ["pending", "resumed"]
+    assert "readback_verified" in rows[1].reason_codes
+    assert rig.controller.parked_unit_ids() == frozenset()
+    (event,) = rig.bus.of_type("unit.resumed")
+    assert event["payload"]["origin"] == "operator"
+
+
+async def test_renew_slides_inside_the_cap_and_participates_in_the_table_truth(rig: Rig) -> None:
+    await rig.park(lease_s=3600)
+    rig.clock.advance(600.0)
+    result = await rig.renew(lease_s=3600)
+    assert result["action"] == "renew"
+    lease = await rig.store.lease("mid")
+    assert lease is not None
+    assert lease.expires_at == WALL + timedelta(seconds=600 + 3600)
+    assert lease.epoch == 1, "a renewal keeps the epoch -- same lease, same CAS base"
+    (row,) = rig.audit.of_type("unit_park_renewed")
+    assert row.result == "renewed"
+    (event,) = rig.bus.of_type("unit.park_renewed")
+    assert event["payload"]["epoch"] == 1
+
+
+# --- T-PARK-REFUSALS ------------------------------------------------------------------
+
+
+async def test_park_refuses_while_armed_or_under_intent_or_latched(rig: Rig) -> None:
+    """The arm-outcomes shape, singular unit, cause de-conflated."""
+    rig.actors["mid"].lifecycle = UnitLifecycle.ARMED_IDLE
+    refusal = await expect_refusal(rig.park(), PARK_CONFLICT_REFUSED)
+    assert refusal.details == {"units": [{"unit_id": "mid", "cause": "unit_armed"}]}
+
+    rig.actors["mid"].lifecycle = UnitLifecycle.DISARMED
+    rig.intents.live.append(
+        FakeIntent("intent-1", SimpleNamespace(value="manual"), frozenset({"mid"}))
+    )
+    refusal = await expect_refusal(rig.park(), PARK_CONFLICT_REFUSED)
+    assert refusal.details["units"] == [{"unit_id": "mid", "cause": "under_intent"}]
+
+    rig.intents.live.clear()
+    rig.stop_view.units = frozenset({"mid"})
+    rig.stop_view.ids_by_unit["mid"] = ["stop-9"]
+    refusal = await expect_refusal(rig.park(), PARK_CONFLICT_REFUSED)
+    assert refusal.details["units"] == [{"unit_id": "mid", "cause": "latched_stop"}]
+    # Nothing was written and no lease exists under any conflict.
+    assert rig.actors["mid"].mode_calls == []
+    assert await rig.store.lease("mid") is None
+
+
+async def test_a_second_park_refuses_already_parked_with_the_lease(rig: Rig) -> None:
+    """T-PARK-IDEMPOTENCY's post-restart half: a retried park (a fresh key,
+    or the same body after entry eviction) resolves as ``park_already_parked``
+    -- correct, and stated."""
+    first = await rig.park()
+    refusal = await expect_refusal(rig.park(), PARK_ALREADY_PARKED)
+    assert refusal.details == {"lease": first["lease"]}
+
+
+async def test_a_vendor_mode_word_refuses_out_of_scope_with_its_name(rig: Rig) -> None:
+    rig.actors["mid"].word = 4  # Circulation
+    refusal = await expect_refusal(rig.park(), PARK_MODE_OUT_OF_SCOPE)
+    assert refusal.details == {"prior_word": 4, "vendor_name": "Circulation"}
+    # The refused row lands; no lease is minted.
+    rows = rig.audit.of_type("unit_parked")
+    assert [row.result for row in rows] == ["pending", "refused"]
+    assert rows[1].reason_codes == ("mode_out_of_scope",)
+    assert await rig.store.lease("mid") is None
+
+
+async def test_a_failed_write_refuses_with_the_error_class_after_one_retry(rig: Rig) -> None:
+    rig.actors["mid"].fail_writes = 2  # both attempts fail
+    refusal = await expect_refusal(rig.park(), PARK_WRITE_FAILED)
+    assert refusal.details == {"error_class": "TransportError"}
+    assert rig.actors["mid"].mode_calls == [1, 1], "one bounded retry, then refuse"
+    assert await rig.store.lease("mid") is None, "a failed write mints no lease"
+
+
+async def test_a_transport_blip_retries_once_and_parks(rig: Rig) -> None:
+    rig.actors["mid"].fail_writes = 1  # first attempt fails, retry lands
+    result = await rig.park()
+    assert result["verified"] is True
+    assert rig.actors["mid"].mode_calls == [1, 1]
+
+
+async def test_an_unverified_readback_refuses_with_the_four_facts(rig: Rig) -> None:
+    rig.actors["mid"].unverify_once = True
+    refusal = await expect_refusal(rig.park(), PARK_READBACK_UNVERIFIED)
+    assert refusal.details == {
+        "prior_word": 0,
+        "written_value": 1,
+        "readback_word": 0,
+        "retries": 1,
+    }
+    assert await rig.store.lease("mid") is None, "no lease stands on an unverified write"
+
+
+async def test_renew_refuses_past_the_anti_rollover_cap(rig: Rig) -> None:
+    await rig.park(lease_s=3600)
+    rig.clock.advance(4 * 3600.0 - 60.0)
+    refusal = await expect_refusal(rig.renew(lease_s=3600), PARK_LEASE_CAP_REACHED)
+    assert set(refusal.details) == {"parked_at", "max_total_s", "requested_expires_at"}
+    assert refusal.details["max_total_s"] == 14400
+    assert refusal.details["parked_at"] == WALL.isoformat()
+
+
+async def test_renew_refuses_absent_with_the_closing_row_truth(rig: Rig) -> None:
+    """The pinned details shape (the wave C decoder contract): the closing
+    row's origin string and ISO close time, flat; never-parked is none/null."""
+    refusal = await expect_refusal(rig.renew(), PARK_LEASE_ABSENT)
+    assert refusal.details == {"origin": "none", "closed_at": None}
+
+    await rig.park(lease_s=3600)
+    rig.actors["mid"].word = 1
+    await rig.resume()
+    refusal = await expect_refusal(rig.renew(), PARK_LEASE_ABSENT)
+    assert set(refusal.details) == {"origin", "closed_at"}
+    assert refusal.details["origin"] == "operator"
+    assert refusal.details["closed_at"] is not None
+    assert refusal.details["closed_at"].endswith("+00:00")
+
+    # The foreign close names its own origin.
+    await rig.park(lease_s=3600)
+    rig.actors["mid"].word = 0
+    rig.observations.serve("mid", debug_mode_w=0)
+    await rig.controller.supervise()
+    refusal = await expect_refusal(rig.renew(), PARK_LEASE_ABSENT)
+    assert refusal.details["origin"] == "foreign"
+
+
+async def test_resume_on_a_foreign_standby_requires_the_takeover_acknowledgement(rig: Rig) -> None:
+    rig.actors["mid"].word = 1
+    refusal = await expect_refusal(rig.resume(), PARK_FOREIGN_WORD_ACKNOWLEDGEMENT_REQUIRED)
+    assert refusal.details["acknowledgement"] == "FOREIGN"
+    assert refusal.details["prior_word"] == 1
+    assert rig.actors["mid"].mode_calls == [], "no write without the acknowledgement"
+
+    # The acknowledgement resumes it: audited, origin foreign, no lease minted.
+    result = await rig.resume(takeover="FOREIGN")
+    assert result["origin"] == "foreign"
+    rows = rig.audit.of_type("unit_resumed")
+    assert "foreign_takeover_acknowledged" in rows[1].reason_codes
+    assert await rig.store.lease("mid") is None
+
+
+async def test_resume_on_a_vendor_mode_word_is_its_own_act_never_an_alias(rig: Rig) -> None:
+    rig.actors["mid"].word = 3  # Discharge
+    refusal = await expect_refusal(rig.resume(takeover="FOREIGN"), PARK_MODE_OUT_OF_SCOPE)
+    assert refusal.details == {"prior_word": 3, "vendor_name": "Discharge"}
+    assert rig.actors["mid"].mode_calls == []
+
+
+async def test_resume_refuses_under_a_latched_stop_and_names_the_acknowledgement(rig: Rig) -> None:
+    await rig.park()
+    rig.stop_view.units = frozenset({"mid"})
+    rig.stop_view.ids_by_unit["mid"] = ["stop-7"]
+    refusal = await expect_refusal(rig.resume(), "resume_stop_latched")
+    assert refusal.details == {
+        "stop_ids": ["stop-7"],
+        "acknowledgement_endpoint": "/api/v1/emergency-stop/{stop_id}/acknowledge",
+    }
+    assert 0 not in rig.actors["mid"].mode_calls, "no enabling write under a standing stop"
+
+
+async def test_resume_on_a_normal_word_is_an_honest_no_op(rig: Rig) -> None:
+    result = await rig.resume()
+    assert result["origin"] == "none"
+    assert result["prior_word"] == 0 and result["verified"] is True
+    assert rig.actors["mid"].mode_calls == []
+    # An open lease over a Normal word closes as the observed foreign resume.
+    await rig.park()
+    rig.actors["mid"].word = 0
+    result = await rig.resume()
+    assert result["origin"] == "none"
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.state == LEASE_CLOSED_FOREIGN
+    rows = rig.audit.of_type("unit_resumed")
+    assert rows[-1].result == "observed_foreign"
+
+
+# --- T-PARK-EXPIRY: alarm-only ----------------------------------------------------------
+
+
+async def test_expiry_alarms_without_any_write(rig: Rig) -> None:
+    await rig.park(lease_s=3600)
+    rig.clock.advance(3601.0)
+    await rig.controller.supervise()
+
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.state == LEASE_EXPIRED
+    (row,) = rig.audit.of_type("unit_park_expired")
+    assert row.result == "expired"
+    (event,) = rig.bus.of_type("unit.park_expired")
+    assert event["payload"]["tier"] == "alert"
+    assert EXPIRY_HINT in event["payload"]["hint"]
+    # ALARM-ONLY: the device word was never written by the controller.
+    assert rig.actors["mid"].mode_calls == [1]
+    # Still parked: the projection says expired, and the exit is RESUME.
+    state = (await rig.controller.park_states())["mid"]
+    assert state["parked"] is True and state["expired"] is True
+    assert state["hint"] == EXPIRY_HINT
+    # Expiry is idempotent: a second pass appends nothing.
+    await rig.controller.supervise()
+    assert len(rig.audit.of_type("unit_park_expired")) == 1
+
+
+async def test_an_expired_lease_never_renews_and_a_new_park_mints_a_new_epoch(rig: Rig) -> None:
+    await rig.park(lease_s=3600)
+    rig.clock.advance(3601.0)
+    await rig.controller.supervise()
+    await expect_refusal(rig.renew(), PARK_LEASE_ABSENT)
+
+    rig.actors["mid"].word = 1
+    result = await rig.park(lease_s=3600)
+    assert result["lease"]["epoch"] == 2, "fresh confirmation, new lease, monotonic epoch"
+
+
+# --- T-PARK-CRASH/RESTART ----------------------------------------------------------------
+
+
+async def test_boot_reconstruction_alarms_expired_in_downtime_without_writing(rig: Rig) -> None:
+    await rig.park(lease_s=3600)
+    # The downtime: the lease expires while the controller is down.
+    rig.clock.advance(6 * 3600.0)
+    fresh_audit = FakeAudit()
+    fresh_bus = FakeBus()
+    revived = ParkController(
+        unit_ids=frozenset(UNITS),
+        commissioning=ParkCommissioning(
+            max_lease_s=14400, default_lease_s=14400, mode_write_enabled=True
+        ),
+        clock=rig.clock,
+        store=rig.store,
+        audit=fresh_audit,
+        bus=fresh_bus,
+        actors=rig.actors,
+        observations=rig.observations,
+        intents=rig.intents,
+        process_instance_id="process-2",
+        process_origin_mono=rig.clock.now,
+    )
+    await revived.reconstruct_at_boot()
+    (row,) = rig.audit.of_type("unit_park_expired")
+    assert row.result == "expired" and "expired_in_downtime" in row.reason_codes
+    (event,) = fresh_bus.of_type("unit.park_expired")
+    assert event["payload"]["tier"] == "alert"
+    # Boot NEVER writes the mode register under any path.
+    assert rig.actors["mid"].mode_calls == [1]
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.state == LEASE_EXPIRED
+
+
+async def test_boot_reconstruction_never_parks_or_unparks_a_live_lease(rig: Rig) -> None:
+    await rig.park(lease_s=14400)
+    boot = ParkController(
+        unit_ids=frozenset(UNITS),
+        commissioning=ParkCommissioning(
+            max_lease_s=14400, default_lease_s=14400, mode_write_enabled=True
+        ),
+        clock=rig.clock,
+        store=rig.store,
+        audit=rig.audit,
+        bus=rig.bus,
+        actors=rig.actors,
+        observations=rig.observations,
+        intents=rig.intents,
+        process_instance_id="process-2",
+        process_origin_mono=rig.clock.now,
+    )
+    await boot.reconstruct_at_boot()
+    assert rig.audit.of_type("unit_park_expired") == []
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.state == LEASE_OPEN
+
+
+# --- T-PARK-FOREIGN: divergence is alarmed, never fought ------------------------------------
+
+
+async def test_an_observed_foreign_resume_closes_the_lease_with_no_write(rig: Rig) -> None:
+    await rig.park()
+    # The vendor app (or a foreign writer) resumes the pod out from under us.
+    rig.actors["mid"].word = 0
+    rig.observations.serve("mid", debug_mode_w=0)
+    await rig.controller.supervise()
+
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.state == LEASE_CLOSED_FOREIGN
+    rows = rig.audit.of_type("unit_resumed")
+    assert rows[-1].result == "observed_foreign"
+    assert "observed_foreign" in rows[-1].reason_codes
+    events = rig.bus.of_type("unit.resumed")
+    assert events[-1]["payload"]["origin"] == "foreign"
+    assert events[-1]["payload"]["tier"] == "alert"
+    assert events[-1]["payload"]["written_value"] is None
+    assert rig.actors["mid"].mode_calls == [1], "the controller never re-parks in response"
+
+    # The dispatch provenance window names the foreign resume.
+    details = rig.controller.dispatch_refusal_details("mid")
+    assert details is not None and details["resume_provenance"]["origin"] == "foreign"
+    # The window is bounded: long after, the provenance fades.
+    rig.clock.advance(901.0)
+    assert rig.controller.dispatch_refusal_details("mid") is None
+
+
+async def test_a_word_one_with_no_lease_projects_the_honest_unknown_first(rig: Rig) -> None:
+    """``unrecorded`` -- the word was already 1 at this process's first look
+    (crash-after-write residue); the honest unknown, never a fabricated
+    transition."""
+    rig.observations.serve("mid", debug_mode_w=1)
+    await rig.controller.supervise()
+    state = (await rig.controller.park_states())["mid"]
+    assert state["parked"] is True and state["origin"] == "unrecorded"
+    assert state["lease_expires_at"] is None
+
+
+async def test_an_observed_transition_to_standby_is_the_foreign_class(rig: Rig) -> None:
+    rig.observations.serve("mid", debug_mode_w=0)
+    await rig.controller.supervise()
+    rig.actors["mid"].word = 1
+    rig.observations.serve("mid", debug_mode_w=1)
+    await rig.controller.supervise()
+    state = (await rig.controller.park_states())["mid"]
+    assert state["origin"] == "foreign", "the 0->1 transition was OBSERVED in-run"
+
+
+async def test_a_vendor_word_over_our_lease_sets_foreign_rewrite_and_renders_foreign_mode(
+    rig: Rig,
+) -> None:
+    await rig.park()
+    rig.actors["mid"].word = 5  # Fixing SOC
+    rig.observations.serve("mid", debug_mode_w=5)
+    await rig.controller.supervise()
+
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.foreign_rewrite is True, "named, never fought"
+    state = (await rig.controller.park_states())["mid"]
+    assert state["foreign_mode"]["word"] == 5
+    assert state["foreign_mode"]["name"] == "Fixing SOC"
+    assert state["foreign_mode"]["first_observed_at"] is not None
+    # The lease stays open -- a vendor mode is not a resume; no write, ever.
+    assert lease.state == LEASE_OPEN
+    assert rig.actors["mid"].mode_calls == [1]
+    # The dispatch details render foreign_mode, never parked.
+    details = rig.controller.dispatch_refusal_details("mid")
+    assert details is not None and "foreign_mode" in details
+    assert "parked_provenance" not in details
+
+
+# --- T-PARK-CONCURRENCY: single-flight -------------------------------------------------------
+
+
+async def test_concurrent_parks_serialize_into_one_lease(rig: Rig) -> None:
+    """Two PARKs racing on one unit: the critical section admits exactly one
+    write sequence; the loser resolves ``park_already_parked``."""
+    results = await asyncio.gather(rig.park(), rig.park(), return_exceptions=True)
+    outcomes = sorted(
+        result["action"] if isinstance(result, dict) else result.code for result in results
+    )
+    assert outcomes == ["park", "park_already_parked"]
+    assert rig.actors["mid"].mode_calls == [1]
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.epoch == 1
+
+
+async def test_parked_provenance_rides_the_dispatch_refusal(rig: Rig) -> None:
+    await rig.park()
+    details = rig.controller.dispatch_refusal_details("mid")
+    assert details is not None
+    assert set(details["parked_provenance"]) == {
+        "parked_at",
+        "authorizer",
+        "reason",
+        "lease_expires_at",
+    }
+    assert details["parked_provenance"]["reason"] == "inverter work"
+
+
+# --- the unverified-resume posture --------------------------------------------------------------
+
+
+async def test_an_unverified_resume_leaves_the_lease_in_the_terminal_posture(rig: Rig) -> None:
+    """Our acts stay ours when they fail: an ACKed-but-unverified resume moves
+    the lease to ``write_unverified`` (parked stays true), never foreign."""
+    await rig.park()
+    rig.actors["mid"].word = 1
+    rig.actors["mid"].unverify_once = True
+    await expect_refusal(rig.resume(), PARK_READBACK_UNVERIFIED)
+
+    lease = await rig.store.lease("mid")
+    assert lease is not None
+    assert lease.state == "write_unverified" and lease.write_unverified is True
+    assert rig.controller.parked_unit_ids() == frozenset({"mid"}), "still parked"
+    state = (await rig.controller.park_states())["mid"]
+    assert state["parked"] is True and state["write_unverified"] is True
+    rows = rig.audit.of_type("unit_resumed")
+    assert rows[-1].result == "refused"
+    assert "write_unverified" in rows[-1].reason_codes
+
+
+async def test_a_failed_resume_write_leaves_the_lease_retryable(rig: Rig) -> None:
+    """A transport-refused resume write (never ACKed) changes nothing: the
+    lease stays open, the operator retries."""
+    await rig.park()
+    rig.actors["mid"].word = 1
+    rig.actors["mid"].fail_writes = 2
+    await expect_refusal(rig.resume(), PARK_WRITE_FAILED)
+    lease = await rig.store.lease("mid")
+    assert lease is not None and lease.state == LEASE_OPEN
+
+    rig.actors["mid"].fail_writes = 0
+    result = await rig.resume()
+    assert result["verified"] is True
+    assert (await rig.store.lease("mid")).state == LEASE_CLOSED_OPERATOR  # type: ignore[union-attr]
+
+
+# --- commissioning ------------------------------------------------------------------------------
+
+
+async def test_a_non_write_enabled_composition_refuses_with_its_cause(rig: Rig) -> None:
+    rig.controller._commissioning = ParkCommissioning(  # type: ignore[attr-defined]
+        max_lease_s=14400, default_lease_s=14400, mode_write_enabled=False
+    )
+    refusal = await expect_refusal(rig.park(), "park_not_commissioned")
+    assert refusal.details == {"cause": "mode_not_write_enabled"}
+
+
+async def test_lease_bounds_are_validated(rig: Rig) -> None:
+    with pytest.raises(ValueError, match="lease_s must be between 60 and 14400"):
+        await rig.park(lease_s=59)
+    with pytest.raises(ValueError, match="lease_s must be between 60 and 14400"):
+        await rig.park(lease_s=14401)
+    # The default lease rides the block's default_lease_s.
+    result = await rig.park(lease_s=None)
+    assert result["lease"]["max_total_s"] == 14400

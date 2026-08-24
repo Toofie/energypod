@@ -78,6 +78,7 @@ from energypod.adapters.persistence.memory import (
     InMemoryEnergyLedgerRepository,
     InMemoryIntentRepository,
     InMemoryObservationRepository,
+    InMemoryParkLeaseRepository,
     InMemoryTelemetryHistoryRepository,
 )
 from energypod.adapters.persistence.sqlite import (
@@ -85,6 +86,7 @@ from energypod.adapters.persistence.sqlite import (
     SQLiteAuditRepository,
     SQLiteDatabase,
     SQLiteEnergyLedgerRepository,
+    SQLiteParkLeaseRepository,
     SQLiteScheduleRepository,
     SQLiteTelemetryHistoryRepository,
 )
@@ -128,6 +130,7 @@ from energypod.application.night_charge import (
     NightChargeController,
     NightChargeSettings,
 )
+from energypod.application.parking import ParkCommissioning, ParkController
 from energypod.application.recovery import (
     CONNECT_FAILED,
     ECHO_UNREADABLE,
@@ -693,9 +696,56 @@ class _AuditStore(Protocol):
     def contains_event(self, event_id: str) -> bool: ...
 
 
+class _AsyncParkLeaseRepository:
+    """Awaitable park-lease port; a committed lease rides the bus like any row.
+
+    The underlying store's ``commit``/``replace`` already append the audit row
+    and the lease row in ONE transaction (DESIGN_POD_PARKING section 4); this
+    wrapper only adds the ``audit.appended`` announcement the ordinary audit
+    port makes, so the console stream sees parking rows exactly like every
+    other durable fact.
+    """
+
+    def __init__(self, store: Any, *, bus: EventBus) -> None:
+        self._store = store
+        self._bus = bus
+
+    async def commit(self, event: Any, lease: Any) -> None:
+        self._store.commit(event, lease)
+        await self._announce(event)
+
+    async def replace(self, event: Any, lease: Any, *, expected_epoch: int) -> None:
+        self._store.replace(event, lease, expected_epoch=expected_epoch)
+        await self._announce(event)
+
+    async def lease(self, unit_id: str) -> Any | None:
+        return self._store.lease(unit_id)
+
+    async def all_leases(self) -> Mapping[str, Any]:
+        leases: Mapping[str, Any] = self._store.all_leases()
+        return leases
+
+    async def _announce(self, event: Any) -> None:
+        with contextlib.suppress(Exception):
+            await self._bus.publish(
+                {
+                    "type": "audit.appended",
+                    "payload": {
+                        "event_id": getattr(event, "event_id", None),
+                        "event_type": getattr(event, "event_type", None),
+                        "unit_id": getattr(event, "unit_id", None),
+                        "generation": getattr(event, "generation", None),
+                        "result": getattr(event, "result", None),
+                        "reason_codes": list(getattr(event, "reason_codes", ()) or ()),
+                        "requested_active_w": getattr(event, "requested_active_w", None),
+                        "authorized_active_w": getattr(event, "authorized_active_w", None),
+                    },
+                }
+            )
+
+
 class _AsyncAuditRepository:
     """Awaitable audit port; every durable append is also a bus event."""
-
     def __init__(self, store: _AuditStore, *, bus: EventBus) -> None:
         self._store = store
         self._bus = bus
@@ -1700,6 +1750,14 @@ class _ActorCommandHandle:
         """B5: the actor-owned bounded fresh mode-word read."""
         return await self._actor.refresh_mode_words()
 
+    async def request_debug_mode_change(self, value: int) -> dict[str, Any]:
+        """DESIGN_POD_PARKING §4: the ONE actor-mailbox parking operation."""
+        return await self._actor.request_debug_mode_change(value)
+
+    async def read_debug_word(self) -> int:
+        """The resume path's fresh debug-word read, inside the mailbox."""
+        return await self._actor.read_debug_word()
+
     async def fence(self, reason: str) -> int:
         # The facade's emergency stop fences the actor so an in-flight
         # nonzero heartbeat write is cancelled before the stop returns.
@@ -1914,6 +1972,7 @@ class _Supervision:
         schedule_runner: ScheduleRunner | None = None,
         energy_accountant: EnergyAccountant | None = None,
         historian: TelemetryHistorian | None = None,
+        parking: ParkController | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -1958,6 +2017,10 @@ class _Supervision:
         # passive foreign-objective watch, driven by the same bounded pass
         # shape one step after the recovery pass.
         self._foreign_objective = foreign_objective
+        # Pod parking (DESIGN_POD_PARKING section 4): the lease-expiry alarm
+        # and the word-vs-ledger reconciliation ride THIS existing supervision
+        # pass -- no new task class; the composition contract starts nothing.
+        self._parking = parking
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
@@ -1976,6 +2039,13 @@ class _Supervision:
         self._started = True
         loop = asyncio.get_running_loop()
         self._start_reports = {actor.unit_id: loop.create_future() for actor in self._actors}
+        # DESIGN_POD_PARKING section 4: boot reconstruction from the lease
+        # table -- the expired-in-downtime alarm lands HERE, once, before the
+        # first fleet cycle.  Boot never parks and never un-parks; a failing
+        # reconstruction is suppressed (the per-cycle pass re-derives).
+        if self._parking is not None:
+            with contextlib.suppress(Exception):
+                await self._parking.reconstruct_at_boot()
         self._tasks = [
             asyncio.create_task(
                 self._run_fleet(self._start_reports),
@@ -2117,6 +2187,14 @@ class _Supervision:
                     self._observe_recovery(authorized, tuple(outcomes)),
                     timeout=self._interval_s,
                 )
+            # Pod parking's own bounded pass (DESIGN_POD_PARKING section 4):
+            # the expiry ALARM (a wall-clock check per open lease -- never a
+            # write) and the divergence reconciliation over the freshly polled
+            # debug words.  Same suppression shape as the recovery pass: a
+            # failing lease store never delays control.
+            if self._parking is not None:
+                with contextlib.suppress(Exception, asyncio.TimeoutError):
+                    await asyncio.wait_for(self._parking.supervise(), timeout=self._interval_s)
             # Night-writer detector: one bounded, fully suppressed observation
             # pass after the polls and the recovery pass (API_CONTRACTS
             # "Supervision driving") -- zero extra frames, a failed sample a
@@ -2767,6 +2845,12 @@ class ComposedRuntime:
     # tier's one audit fact and bus event, and the window characterization
     # the facade serves through GET /api/v1/objectives/observed).
     foreign_objective: ForeignObjectiveMonitor | None = None
+    # DESIGN_POD_PARKING: composed only when the ``parking:`` block is
+    # PRESENT -- the park controller (the guarded park/renew/resume
+    # mutations, the durable lease ledger, the expiry alarm, and the
+    # word-vs-ledger divergence reconciliation the fleet loop drives).
+    # None otherwise (block-absent doctrine).
+    parking: ParkController | None = None
     # API_CONTRACTS "Excess-solar accelerated charging (advisory)": composed
     # only when the configuration enables the feature; None otherwise.
     # DESIGN_NIGHT_CHARGE §2/§5: composed only when the ``night_charging``
@@ -3213,6 +3297,12 @@ def _build_runtime(
             # refusal path -- wired wherever a register bank actually serves
             # the system overview (every live and simulated unit does).
             mode_refresh_window=(_SYSTEM_BLOCK_BASE, 3),
+            # DESIGN_POD_PARKING sections 4/5: the debug-mode READBACK window
+            # (0x8100 -- the vendor's own write-at-0x8000 asymmetry, pinned).
+            # A read-only window on every actor; the WRITE itself is reachable
+            # only through the named operation a commissioned parking block's
+            # controller drives.
+            debug_mode_readback_address=_DEBUG_MODE_BLOCK_BASE,
             telemetry=telemetry,
         )
 
@@ -3230,6 +3320,37 @@ def _build_runtime(
         process_origin_mono=process_origin_mono,
         configuration_version=config.revision,
     )
+    # --- pod parking composition (DESIGN_POD_PARKING sections 4/5.1) -----
+    # Built BEFORE the facade (the facade projects and mutates through it)
+    # and composed exactly when the ``parking:`` block is PRESENT -- the
+    # block-presence doctrine.  The lease store rides the existing database
+    # path; simulate mode composes the unbounded in-memory twin (explicitly
+    # non-durable, for scenario tests).  The latched-stop view binds AFTER
+    # the facade exists (the facade owns the latch registry).
+    park_controller: ParkController | None = None
+    if config.parking is not None:
+        lease_store: SQLiteParkLeaseRepository | InMemoryParkLeaseRepository
+        if database is not None and not simulate:
+            lease_store = SQLiteParkLeaseRepository(database)
+        else:
+            lease_store = InMemoryParkLeaseRepository(audit_sink=audit_store)
+        park_controller = ParkController(
+            unit_ids=unit_ids,
+            commissioning=ParkCommissioning(
+                max_lease_s=int(config.parking.max_lease_s),
+                default_lease_s=int(config.parking.default_lease_s),
+                mode_write_enabled=config.mode is ControllerMode.WRITE_ENABLED,
+            ),
+            clock=resolved_clock,
+            store=_AsyncParkLeaseRepository(lease_store, bus=bus),
+            audit=audit_port,
+            bus=bus,
+            actors={unit_id: _ActorCommandHandle(actor) for unit_id, actor in actors.items()},
+            observations=observation_port,
+            intents=intent_port,
+            process_instance_id=process_instance_id,
+            process_origin_mono=process_origin_mono,
+        )
     # --- night-writer detector (API_CONTRACTS "Night-writer detector") ---
     # Composed ALWAYS -- observe-only, write-enabled, and simulate alike: it
     # is read-only evidence machinery over words the read plan already
@@ -3534,7 +3655,12 @@ def _build_runtime(
         night=night_controller,
         energy=energy_surface,
         history=history_surface,
+        parking=park_controller,
     )
+    if park_controller is not None:
+        # The park controller's conflict/resume guards read the facade's own
+        # latched-stop registry (fleet-wide stops name every unit).
+        park_controller.bind_latched_stop_units(facade)
 
     # --- excess-solar advisory composition ---------------------------------
     excess_adviser: ExcessChargeAdviser | None = None
@@ -3760,6 +3886,7 @@ def _build_runtime(
         foreign_objective=foreign_objective_monitor,
         energy_accountant=energy_accountant,
         historian=historian,
+        parking=park_controller,
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision
@@ -3785,6 +3912,7 @@ def _build_runtime(
         simulators=simulators,
         recovery=recovery_monitor,
         foreign_objective=foreign_objective_monitor,
+        parking=park_controller,
         night_adviser=night_adviser,
         night_controller=night_controller,
         excess_adviser=excess_adviser,
