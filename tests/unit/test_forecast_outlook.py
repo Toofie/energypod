@@ -377,21 +377,23 @@ async def test_score_uses_the_real_scorer_over_the_elapsed_window() -> None:
     score = payload["score"]
     assert score is not None
     # Two fully-reported timestamps, each pairing with the first interval's
-    # central 1000 W against the fleet surplus 700 W: bias +300 over 2 samples.
+    # central 1000 W against the PRE-BATTERY fleet surplus (A1): the pods
+    # charge at 100 W each (the historian's charge-negative battery word), so
+    # the recorded export of 700 W reconstructs to 900 W of surplus -- the
+    # scorer's own basis since the night-v2 wave, bias +100 over 2 samples.
     assert score["samples"] == 2
-    assert score["bias_w"] == pytest.approx(300.0)
-    assert score["mae_w"] == pytest.approx(300.0)
-    assert score["rmse_w"] == pytest.approx(300.0)
+    assert score["bias_w"] == pytest.approx(100.0)
+    assert score["mae_w"] == pytest.approx(100.0)
+    assert score["rmse_w"] == pytest.approx(100.0)
     # The surplus sat inside the claimed [400, 1600] band both times.
     assert score["inside_band"] == pytest.approx(1.0)
     assert score["window_from"] == BASE.isoformat()
     assert score["window_to"] == (BASE + timedelta(minutes=15)).isoformat()
-    # The corrected basis's raw inputs (amendment A1): the pods charge at
-    # 100 W each (the historian's charge-negative battery word), so the
-    # recorded export of 700 W is POST-absorption -- the reconstructed
-    # pre-battery surplus is 900 W against the promised 1000 W, while the
-    # scorer's own basis reads the same moment as a 300 W miss.
+    # The basis decomposition beside the scorer's figures (amendment A1): the
+    # scorer itself now rides the pre-battery basis, and the block names it so
+    # the console can never mistake which basis the watt figures carry.
     assert score["basis"] == {
+        "scorer_basis": "pre_battery",
         "paired_samples": 2,
         "mean_forecast_w": pytest.approx(1000.0),
         "mean_export_w": pytest.approx(700.0),
@@ -407,7 +409,7 @@ async def test_score_uses_the_real_scorer_over_the_elapsed_window() -> None:
     assert board is not None
     assert board["records"] == 1
     assert board["total_samples"] == 2
-    assert board["mean_bias_w"] == pytest.approx(300.0)
+    assert board["mean_bias_w"] == pytest.approx(100.0)
     assert board["since"] == BASE.isoformat()
     assert board["durable"] is False
 
@@ -445,17 +447,19 @@ async def test_distinct_fetches_accumulate_one_record_each() -> None:
     control = _control(FakePv([first, second]), history=history)
     first_payload = await control.outlook_payload(now_utc=BASE + timedelta(minutes=10))
     assert first_payload["score"] is not None
-    assert first_payload["score"]["bias_w"] == pytest.approx(300.0)
+    # The pre-battery basis (A1): 1000 promised against 350+350 exported plus
+    # 2 x 100 W absorbed = 900 W reconstructed surplus.
+    assert first_payload["score"]["bias_w"] == pytest.approx(100.0)
     second_payload = await control.outlook_payload(now_utc=BASE + timedelta(minutes=40))
     assert second_payload["score"] is not None
-    assert second_payload["score"]["bias_w"] == pytest.approx(-100.0)
+    assert second_payload["score"]["bias_w"] == pytest.approx(-300.0)
     board = second_payload["scoreboard"]
     assert board is not None
     assert board["records"] == 2
     # One scored timestamp per fetch (the fleet-summed row), two fetches.
     assert board["total_samples"] == 2
-    # The mean over both fetches: (+300 + -100) / 2.
-    assert board["mean_bias_w"] == pytest.approx(100.0)
+    # The mean over both fetches: (+100 + -300) / 2.
+    assert board["mean_bias_w"] == pytest.approx(-100.0)
     assert board["mean_mae_w"] == pytest.approx(200.0)
     # No band was ever claimed: the coverage figure stays null, never 0.
     assert board["mean_inside_band"] is None

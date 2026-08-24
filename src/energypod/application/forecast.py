@@ -24,17 +24,21 @@ pure READ surface the facade serves at ``GET /api/v1/forecast``:
   scored.  A forecast with no elapsed minutes yet scores NULL -- an honest
   empty, never a zero-error verdict.
 - BASIS HONESTY (the night-v2 challenge panel's amendment A1, 2026-08-24):
-  the scorer's recorded basis -- fleet grid export -- is surplus AFTER the
-  batteries absorb it.  When the pods absorb the morning (the desired
-  outcome), recorded export collapses and every sunny interval scores as a
-  forecast miss that is not the forecast's.  This surface therefore carries
-  the CORRECTED BASIS'S RAW INPUTS beside the scorer's figures -- the mean
-  recorded export, the mean fleet charging rate, the mean reconstructed
-  PRE-battery surplus (max(0, export + charging)), and the mean forecast
-  watts over the same paired timestamps -- so the night-v2 round can rebuild
-  the scorer itself without a second console round.  The inputs are means,
-  never integrated kWh: integration owns a cadence assumption this module
-  does not, and night-v2 owns that choice.
+  the scorer's recorded basis is PRE-BATTERY -- the fleet grid export PLUS
+  the fleet battery charge word (charge-negative), floored at zero per
+  timestamp.  The export channel alone is surplus AFTER the batteries absorb
+  it: when the pods absorb the morning (the desired outcome), recorded
+  export collapses and every sunny interval would score as a forecast miss
+  that is not the forecast's.  The night-v2 wave rebuilt the scorer itself
+  on the corrected basis, and this surface carries the basis's DECOMPOSITION
+  beside the scorer's figures -- the mean recorded export, the mean fleet
+  charging rate, the mean reconstructed PRE-battery surplus
+  (max(0, export + charging)), and the mean forecast watts over the same
+  paired timestamps -- plus a ``scorer_basis`` marker so a console can never
+  mistake which basis the watt figures carry.  The inputs are means, never
+  integrated kWh: the per-day kWh integration and its cadence assumption
+  belong to the night-trust ledger (``energypod.application.night_trust``),
+  not to this read surface.
 - Accumulation is PER FETCH and in memory.  Each distinct ``fetched_at``
   contributes one record, re-scored (upserted) as its elapsed window grows;
   a restart starts the evidence over (``durable: false`` says so on every
@@ -481,6 +485,12 @@ def _pre_battery_basis(
         return sum(values) / len(values)
 
     basis: dict[str, Any] = {
+        # The marker names the basis the scorer's own figures ride (A1): a
+        # console reading ``mae_w``/``bias_w`` never has to guess whether the
+        # measured side was export-only or the reconstructed pre-battery
+        # surplus -- and the decomposition below says how much of it the
+        # batteries absorbed.
+        "scorer_basis": "pre_battery",
         "paired_samples": len(exports),
         "mean_forecast_w": mean(forecasts),
         "mean_export_w": mean(exports),

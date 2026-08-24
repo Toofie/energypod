@@ -7,14 +7,23 @@ outcomes.  This module is that comparison's first piece -- a watt forecast
 baseline) scored against the SURPLUS the telemetry historian actually
 recorded.
 
-The measured truth is deliberately specific:
+The measured truth is deliberately specific, and since the night-charge V2
+panel (DESIGN_NIGHT_CHARGE_V2 section 3.2, amendment A1, 2026-08-24) it is
+PRE-BATTERY:
 
-- It is the fleet-summed ``grid_power_w`` with the excess adviser's sign
-  convention (positive = export, negative = import) -- the only measured
-  surplus proxy the historian holds.
+- It is the fleet-summed ``grid_power_w`` (positive = export, the excess
+  adviser's sign convention) PLUS the fleet battery CHARGE word (the
+  historian's ``battery_watts`` is charge-negative, discharge-positive),
+  floored at zero per timestamp.  Surplus that lands on the AC bus splits two
+  ways -- exported, or absorbed by the batteries -- and the export channel
+  alone is a POST-battery proxy that reads LOW on exactly the mornings the
+  forecast was RIGHT: the batteries were taking the surplus, so the meter had
+  nothing to show, and an export-only scorer would call the feature's best
+  hits its worst misses -- suspension by measurement artifact.
 - A timestamp counts only when EVERY configured unit has a row with a
-  non-null grid word (the history surface's fleet doctrine; summing the
-  survivors would understate site surplus).
+  non-null grid word AND a non-null battery word (the history surface's fleet
+  doctrine; summing the survivors would understate site surplus, and an
+  absent battery word cannot honestly reconstruct what was absorbed).
 - Each counted timestamp pairs with the forecast interval that contains it;
   timestamps outside every interval are simply not evidence.
 
@@ -53,10 +62,13 @@ class SurplusSampleRow(Protocol):
     @property
     def grid_power_w(self) -> float | None: ...
 
+    @property
+    def battery_watts(self) -> float | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ForecastScore:
-    """One forecast's agreement with the recorded surplus."""
+    """One forecast's agreement with the recorded pre-battery surplus."""
 
     variable: str
     samples: int
@@ -143,20 +155,39 @@ def _quantile_by_interval(
 def _measured_surplus(
     samples: Sequence[SurplusSampleRow], unit_ids: tuple[str, ...]
 ) -> list[tuple[datetime, float]]:
-    """The fleet-summed grid words, only at fully-reported timestamps."""
+    """The PRE-BATTERY fleet surplus, only at fully-reported timestamps.
+
+    Amendment A1's reconstruction: ``max(0, fleet_export + fleet_charge)``
+    where the charge word is the charge-NEGATIVE half of each unit's
+    ``battery_watts`` (a discharging pod serves the house and adds nothing).
+    A timestamp missing ANY unit's grid or battery word is not evidence.
+    """
     expected = set(unit_ids)
-    by_timestamp: dict[datetime, dict[str, float | None]] = {}
+    by_timestamp: dict[datetime, dict[str, tuple[float | None, float | None]]] = {}
     for row in samples:
         if row.unit_id not in expected:
             continue
-        by_timestamp.setdefault(row.sampled_at, {})[row.unit_id] = row.grid_power_w
+        by_timestamp.setdefault(row.sampled_at, {})[row.unit_id] = (
+            row.grid_power_w,
+            row.battery_watts,
+        )
     measured: list[tuple[datetime, float]] = []
     for moment in sorted(by_timestamp):
         per_unit = by_timestamp[moment]
         if set(per_unit) != expected:
             continue
-        words = [word for word in per_unit.values() if word is not None]
-        if len(words) != len(expected):
+        grids: list[float] = []
+        batteries: list[float] = []
+        complete = True
+        for grid, battery in (per_unit[unit] for unit in expected):
+            if grid is None or battery is None:
+                complete = False
+                break
+            grids.append(float(grid))
+            batteries.append(float(battery))
+        if not complete:
             continue
-        measured.append((moment, sum(float(word) for word in words)))
+        export = sum(grids)
+        charge = sum(max(0.0, -value) for value in batteries)
+        measured.append((moment, max(0.0, export + charge)))
     return measured
