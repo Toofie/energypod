@@ -393,7 +393,9 @@ direction, freshness, and watchdog timing per physical unit.
   remains in the a11y tree and on hover; nothing prints on paper.
   GATES: 961/961 web tests (one unrelated timing flake in the first
   full run — a live/reconnect UI test — clean on two consecutive
-  reruns), tsc + build green; shots regenerating in the background.
+  reruns), tsc + build green; shots regenerated post-commit — 99 PNGs
+  in 26.9 s, all distinct, none blank; the strip shots show bars-only
+  rows (sub-item CLOSED).
   OPEN OBSERVATION offered to the operator, no answer yet: the
   health-flapping itself is REAL DATA (60+ spells, 1–13 min cadence,
   00:32–08:11) and a possible investigation. PVOutput NOTE: the
