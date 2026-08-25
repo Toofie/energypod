@@ -119,6 +119,8 @@ import { formatMillivolts, formatPercent, formatSeconds, formatWatts } from "../
 import { ParkedFleetBanner } from "./ParkedFleetBanner";
 import { NextScheduleCard, toScheduleFacts, type ScheduleFacts } from "./NextScheduleCard";
 import { NightChargeTile } from "./NightChargeTile";
+import { toHealthWatchState, type HealthWatchState } from "../../app/healthWatch";
+import { HealthWatchCard } from "./HealthWatchCard";
 import { PvOutputCard } from "./PvOutputCard";
 import { SolarSurplusTile } from "./SolarSurplusTile";
 import { TodayCard } from "./TodayCard";
@@ -261,6 +263,12 @@ interface SnapshotView {
    * is not composed here, and Home's Today card renders nothing at all.
    */
   energyToday: EnergyToday | null;
+  /**
+   * The snapshot's top-level `health_watch_state` projection, feature-
+   * detected: null when the field is absent — the nightly health watch is
+   * not composed here, and Home's Health Watch card renders nothing at all.
+   */
+  healthWatchState: HealthWatchState | null;
 }
 
 function readPowerFigure(value: unknown): PowerFigureView | null {
@@ -354,6 +362,12 @@ function readSnapshot(value: unknown): SnapshotView | null {
     // the energy scorecard is not composed here, and Home's Today card
     // renders nothing at all.
     energyToday: isRecord(record.energy_today) ? toEnergyToday(record.energy_today) : null,
+    // Feature detection: an absent `health_watch_state` (the block-absent
+    // doctrine) is null — the nightly health watch is not composed here, and
+    // Home's Health Watch card renders nothing at all.
+    healthWatchState: isRecord(record.health_watch_state)
+      ? toHealthWatchState(record.health_watch_state)
+      : null,
   };
 }
 
@@ -1727,6 +1741,13 @@ export function HomeView({ client }: HomeViewProps) {
           );
         }}
       />
+
+      {/* The battery health watch card: the nightly program's one-glance
+          story (the census chips, the probe verdicts with their figures, the
+          recovery word's uncommissioned honesty). Renders nothing at all
+          while the snapshot carries no health_watch_state (the block-presence
+          doctrine — the site has not composed the watch). */}
+      <HealthWatchCard health={snapshot.healthWatchState} />
 
       {/* The PVOutput reporting card: the retiring Docker writer's
           replacement -- the operator's cutover toggle and the reporter's

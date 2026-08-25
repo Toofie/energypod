@@ -917,3 +917,96 @@ pvoutput:
   retry_max: 1
   unit_slots: {lhs: [v7, v8], rhs: [v9, v10], mid: [v11, v12]}
   native_battery_fields: true
+
+# ---------------------------------------------------------------------------
+# BATTERY HEALTH WATCH (DESIGN_BATTERY_HEALTH_WATCH, CONTRACT v1.1) — the
+# nightly readiness/probe/recovery program against the April-onward stuck
+# mode (high reported SoC, no actuation, dead load CT on rhs).
+#
+# COMMISSIONING SEQUENCING (the contract's OWN section 16, unskippable):
+# this wave lands CONFIG REVISION TWO — steps 2 and 3, `stages:
+# ["census", "probe"]` — as ONE entry in this file because this release
+# cut ships both stages' code together (the §16 census-first / probe-second
+# ORDER is preserved by the strict-prefix rule: the next revision may only
+# widen to recovery).  Wave 0 (§3, the deadband and delivery-judged
+# coherence) already shipped as the same-cut prerequisite (A13).  The
+# units must be ARMED at 23:00 for probes to run — the program NEVER arms
+# (a disarmed unit is an honest `unit_disarmed` skip).  Recovery (§7)
+# stays OUT until the §16 steps 4-6 (advise posture, the per-unit
+# supervised live verification receipts, then `auto` + `auto_receipts`).
+#
+# BLOCK PRESENCE: a PRESENT block composes the HealthWatchController (one
+# tick per fleet cycle inside the existing supervision pass — no new task
+# class), the `health_watch_state` snapshot projection, the health.census /
+# health.probe / health.program events, and GET /api/v1/health-watch/status.
+# An ABSENT block composes NOTHING (byte-identical snapshot, 409
+# health_watch_not_commissioned on the route).  There is NO runtime toggle
+# for any stage: the authority ladder is climbed by config revision plus
+# restart only.
+#
+# WHAT THIS WAVE WRITES: the census writes nothing, ever (historian rows
+# and the standing observation stream only).  The probe is ONE bounded
+# 300 W discharge intent per unit per night under `energypod:health-adviser`
+# — ordinary dispatch traffic judged by every standing guard; a guard
+# refusal is a SKIP, never a failure of the battery.  A probe verdict
+# NEVER triggers any write response: Stage R does not exist in this cut,
+# so `fail_no_response` records, alerts, and that is ALL it does.  One
+# honest side effect (A8): on a quiet house the probe's 300 W briefly
+# EXPORTS up to ~300 W for ~50 s — ~4 Wh, named so the export meter is
+# never a surprise.
+#
+# THE WINDOW'S QUIET HOUR: [23:00, 23:45] must stay disjoint from the
+# night_charging window and every schedule allowed window (validated), the
+# whole program fits before the deadline, and the deadline plus the
+# worst-case in-flight act still lands before the night window opens (A1's
+# two arithmetic checks — refusals name their own arithmetic).  At runtime
+# the program verifies the window is genuinely quiet (no live claims) else
+# defers the night with reason `window_not_quiet`.
+#
+# ONCE PER CIVIL NIGHT, CRASH-HONEST: durable audit rows ARE the program's
+# memory — a restart never re-runs a night whose rows show an attempt, and
+# an interrupted census/probe raises the alert naming the state the unit
+# was actually left in (A4).  `stuck.flag_persistence_nights` promotes a
+# stuck flag from notice to alert (one noisy night is evidence, two is a
+# pattern).
+#
+battery_health_watch:
+  timezone: "Australia/Brisbane"   # must equal site.timezone (A9: one truth)
+  window_local: "23:00"            # program start, the idle hour
+  deadline_local: "23:45"          # no-new-ACT boundary (A1); legs finish
+  stages: ["census", "probe"]      # strict prefix of [census, probe, recovery]
+  stuck:
+    evidence_window_h: 6           # historian lookback (>= 1; 6 = min_soc_hours)
+    soc_floor_pct: 95.0
+    soc_hold_frac: 0.9
+    min_soc_hours: 6
+    still_w: 50
+    still_frac: 0.9
+    grid_import_w: 500
+    sibling_flow_w: 500
+    flow_frac: 0.5
+    load_floor_w: 30
+    sibling_load_w: 100
+    load_frac: 0.8
+    flag_persistence_nights: 2     # notice -> alert promotion
+  probe:
+    probe_w: 300                   # [100, 500], <= policy.max_unit_discharge_w
+    settle_s: 20                   # [10, 60]; settle+sustain <= 90
+    sustain_s: 30                  # [20, 60]
+    pass_fraction: 0.5             # (0, 1]; the watchdog's own movement band
+    pass_sample_frac: 0.8          # (0, 1]; a share, never the mean
+    return_band_w: 150             # > stuck.still_w
+    baseline_return_s: 30          # [10, 120]
+    quiet_load_w: 1000             # fleet-mean grid-IMPORT gate (A8)
+    load_move_w: 300               # mid-leg demand move -> inconclusive (A8)
+    inter_unit_gap_s: 30           # >= 0
+  recovery:
+    # RECOGNIZED but NOT commissioned by this wave: `stages` above must
+    # first widen to include recovery (its own later revision, with the
+    # parking block already present), and `auto` additionally requires
+    # auto_receipts naming EVERY fleet unit's supervised-verification
+    # receipt or an explicit `excluded` (A6) — the config file itself
+    # makes the §16 sequencing unskippable in one edit.
+    mode: "advise"
+    hold_s: 90                     # [60, 120]
+    consecutive_fail_limit: 3

@@ -64,6 +64,19 @@ _MAXIMUM_WRITE_ENABLED_CONTROL_PERIOD_S = 1.5
 _LIVE_TRIAL_EVIDENCE_SCHEME = "live-trial://"
 _LIVE_TRIAL_PLACEHOLDER_SEGMENTS = frozenset({"tbd", "todo", "placeholder", "none", "unknown"})
 
+# DESIGN_BATTERY_HEALTH_WATCH §4 (A1): the worst-case stage bounds the
+# program-fit arithmetic budgets.  Census is one bounded pass over historian
+# rows; a probe leg (settle + sustain + echo + cancel + return + gap) sits
+# inside ~2 min per unit; a recovery cycle inside ~5 min per unit (three
+# units worst case ~21 min against a 45-minute budget — the contract's own
+# arithmetic, restated as the constants the validation computes with).
+_CENSUS_WORST_CASE_S: Final[int] = 60
+_PROBE_WORST_CASE_S_PER_UNIT: Final[int] = 120
+_RECOVERY_WORST_CASE_S_PER_UNIT: Final[int] = 300
+# The worst-case SINGLE in-flight act (a recovery cycle, ~5 min): deadline
+# plus this bound must land before the night window opens (A1 check b).
+_WORST_IN_FLIGHT_ACT_S: Final[int] = _RECOVERY_WORST_CASE_S_PER_UNIT
+
 
 def _references_measured_live_trial(evidence: str) -> bool:
     """Whether an expiry-evidence reference names a measured live trial.
@@ -1014,6 +1027,238 @@ class ParkingConfig(_FrozenModel):
         return self
 
 
+class HealthWatchStuckConfig(_FrozenModel):
+    """DESIGN_BATTERY_HEALTH_WATCH §5/§9: the census's stuck-signature knobs.
+
+    Every threshold is its own key so a wrong one is discoverable in the
+    census row's predicate vector, never hidden inside a composite.
+    """
+
+    evidence_window_h: Annotated[StrictInt, Field(ge=1, le=48)] = 6
+    soc_floor_pct: Annotated[StrictFloat, Field(ge=0, le=100)] = 95.0
+    soc_hold_frac: Annotated[StrictFloat, Field(gt=0, le=1)] = 0.9
+    min_soc_hours: Annotated[StrictInt, Field(ge=1, le=48)] = 6
+    still_w: PositiveStrictInt = 50
+    still_frac: Annotated[StrictFloat, Field(gt=0, le=1)] = 0.9
+    grid_import_w: PositiveStrictInt = 500
+    sibling_flow_w: PositiveStrictInt = 500
+    flow_frac: Annotated[StrictFloat, Field(gt=0, le=1)] = 0.5
+    load_floor_w: PositiveStrictInt = 30
+    sibling_load_w: PositiveStrictInt = 100
+    load_frac: Annotated[StrictFloat, Field(gt=0, le=1)] = 0.8
+    # §5/A9: notice -> alert promotion after this many consecutive stuck
+    # nights (one noisy night is evidence, two is a pattern; >= 1).
+    flag_persistence_nights: Annotated[StrictInt, Field(ge=1, le=90)] = 2
+
+    @model_validator(mode="after")
+    def validate_soc_horizon(self) -> Self:
+        # A9: the full-at-top horizon the S1 continuous-hours test needs must
+        # fit inside the evidence window — equality (6 = 6, the defaults) is
+        # INTENDED and allowed; strict < would force a wider window for no
+        # semantic gain.
+        if self.min_soc_hours > self.evidence_window_h:
+            raise ValueError(
+                "battery_health_watch.stuck.min_soc_hours must not exceed "
+                f"evidence_window_h ({self.min_soc_hours} > {self.evidence_window_h}): "
+                "the S1 continuous-hours test cannot demand a longer horizon than "
+                "the historian lookback it is judged over — equality (the 6 = 6 "
+                "defaults) is intended and allowed"
+            )
+        return self
+
+
+class HealthWatchProbeConfig(_FrozenModel):
+    """DESIGN_BATTERY_HEALTH_WATCH §6/§9: the actuation probe's knobs.
+
+    The sustained-delivery judgment these keys shape is DEFINED by the
+    contract (no public standard exists): the delivery band is
+    ``pass_fraction x probe_w`` on >= ``pass_sample_frac`` of core samples,
+    and the fractions share the coherence watchdog's own movement band.
+    """
+
+    probe_w: Annotated[StrictInt, Field(ge=100, le=500)] = 300
+    settle_s: Annotated[StrictInt, Field(ge=10, le=60)] = 20
+    sustain_s: Annotated[StrictInt, Field(ge=20, le=60)] = 30
+    pass_fraction: Annotated[StrictFloat, Field(gt=0, le=1)] = 0.5
+    pass_sample_frac: Annotated[StrictFloat, Field(gt=0, le=1)] = 0.8
+    return_band_w: PositiveStrictInt = 150
+    baseline_return_s: Annotated[StrictInt, Field(ge=10, le=120)] = 30
+    # A8: the quiet-load gate reads the fleet-mean grid-IMPORT magnitude (the
+    # control-grade PCS word), at probe start AND re-checked at cancel.
+    quiet_load_w: PositiveStrictInt = 1000
+    # A8: a mid-leg demand move beyond this bound confounds the baseline
+    # judgment -> inconclusive_baseline_confounded.
+    load_move_w: PositiveStrictInt = 300
+    inter_unit_gap_s: NonNegativeStrictInt = 30
+
+    @model_validator(mode="after")
+    def validate_leg_bound(self) -> Self:
+        # §9: the whole measured leg (settle + sustain) stays at or below 90 s
+        # — the bounded actuation the §4 program-fit arithmetic budgets ~2 min
+        # per unit for.
+        if self.settle_s + self.sustain_s > 90:
+            raise ValueError(
+                "battery_health_watch.probe.settle_s + sustain_s must stay at or "
+                f"below 90 seconds ({self.settle_s} + {self.sustain_s}): the probe "
+                "leg is a bounded actuation, and the program-fit validation "
+                "budgets it inside the window by this bound"
+            )
+        return self
+
+
+class HealthWatchRecoveryConfig(_FrozenModel):
+    """DESIGN_BATTERY_HEALTH_WATCH §7/§9: Stage R's keys — RECOGNIZED here,
+    implemented in a later wave.
+
+    ``mode: advise`` is the standing posture (writes nothing, ever).  ``auto``
+    requires the A6 receipt map; validation enforces the supervised-
+    verification sequencing offline-pure, and boot degrades a missing
+    receipt's unit to advise loudly (never a boot failure).
+    """
+
+    mode: Literal["advise", "auto"] = "advise"
+    hold_s: Annotated[StrictInt, Field(ge=60, le=120)] = 90
+    consecutive_fail_limit: Annotated[StrictInt, Field(ge=1, le=90)] = 3
+    # A6: mode auto requires a supervised-verification receipt (a
+    # docs/evidence/ path, the §16 step-5 file) for EVERY fleet unit, or the
+    # literal "excluded" for a unit that stays advise.  Shape validated here;
+    # existence checked at boot.
+    auto_receipts: dict[NonEmpty, NonEmpty] | None = None
+
+    @field_validator("auto_receipts")
+    @classmethod
+    def validate_receipt_values(
+        cls, values: dict[str, str] | None
+    ) -> dict[str, str] | None:
+        if values is None:
+            return values
+        cleaned: dict[str, str] = {}
+        for unit_raw, path_raw in values.items():
+            unit = _plain(unit_raw, label="auto_receipts key")
+            path = _plain(path_raw, label=f"auto_receipts[{unit!r}]")
+            if path != "excluded" and not path.startswith("docs/evidence/"):
+                raise ValueError(
+                    f"battery_health_watch.recovery.auto_receipts[{unit!r}] must be "
+                    "the literal 'excluded' or a docs/evidence/ path (the §16 "
+                    "step-5 supervised-verification receipt); got "
+                    f"{path!r} — the config file itself enforces the "
+                    "supervised-verification sequencing (A6)"
+                )
+            cleaned[unit] = path
+        return cleaned
+
+
+class BatteryHealthWatchConfig(_FrozenModel):
+    """DESIGN_BATTERY_HEALTH_WATCH §4/§9: the ``battery_health_watch:`` block.
+
+    Block-presence doctrine, the night pattern: a PRESENT block composes the
+    ``HealthWatchController`` (one tick per fleet cycle inside the existing
+    bounded supervision pass), the ``health_watch_state`` snapshot
+    projection, the health events, and the status route; an ABSENT block
+    composes NOTHING (byte-identical snapshot, 409 on the route).  There is
+    deliberately NO ``enabled`` key and NO runtime toggle for any stage or
+    for ``recovery.mode`` — the authority ladder is climbed by config
+    revision plus restart only, so the console can never flip authority into
+    existence.
+    """
+
+    # REQUIRED — the window is a civil-time fact (one truth per site,
+    # cross-checked against ``site.timezone`` on ``ControllerConfig``, A9).
+    timezone: NonEmpty
+    window_local: NonEmpty = "23:00"
+    deadline_local: NonEmpty = "23:45"
+    # A strict prefix of [census, probe, recovery]: no probe without a
+    # census, no recovery without both (§2's progressive-earning posture).
+    stages: tuple[Literal["census", "probe", "recovery"], ...] = ("census",)
+    stuck: HealthWatchStuckConfig = HealthWatchStuckConfig()
+    probe: HealthWatchProbeConfig = HealthWatchProbeConfig()
+    recovery: HealthWatchRecoveryConfig = HealthWatchRecoveryConfig()
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        value = _plain(value, label="timezone")
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone must be a valid IANA timezone") from exc
+        return value
+
+    @field_validator("window_local", "deadline_local")
+    @classmethod
+    def validate_walls(cls, value: str, info: object) -> str:
+        name = getattr(info, "field_name", "wall")
+        return _valid_policy_wall_named(value, label=name)
+
+    @model_validator(mode="after")
+    def validate_window_shape(self) -> Self:
+        window = _wall_minute(self.window_local)
+        deadline = _wall_minute(self.deadline_local)
+        if window >= deadline:
+            raise ValueError(
+                "battery_health_watch.window_local must sit strictly before "
+                f"deadline_local ({self.window_local} >= {self.deadline_local}): the "
+                "deadline is the no-new-ACT boundary and a program with no span "
+                "can never fit inside one (A1)"
+            )
+        if self.probe.return_band_w <= self.stuck.still_w:
+            raise ValueError(
+                "battery_health_watch.probe.return_band_w must exceed "
+                f"stuck.still_w ({self.probe.return_band_w} <= {self.stuck.still_w}): "
+                "a return band inside the still band could never distinguish "
+                "'returned to idle' from 'never moved'"
+            )
+        stage_order: tuple[str, ...] = ("census", "probe", "recovery")
+        if not self.stages:
+            raise ValueError(
+                "battery_health_watch.stages must name at least one stage: an "
+                "empty prefix composes nothing, and a present block that composes "
+                "nothing is the invisible-off class this project refuses"
+            )
+        for position, stage in enumerate(self.stages):
+            expected = stage_order[position] if position < len(stage_order) else None
+            if expected is None or stage != expected:
+                raise ValueError(
+                    "battery_health_watch.stages must be a strict prefix of "
+                    f"[census, probe, recovery] (got {list(self.stages)}): no site "
+                    "ever runs a probe without a census or a recovery without both"
+                )
+        return self
+
+
+def _valid_policy_wall_named(value: str, *, label: str) -> str:
+    """One "HH:MM" wall through the canonical parser, attributed by name."""
+    from energypod.application.scheduling import parse_hhmm
+
+    try:
+        return parse_hhmm(value).strftime("%H:%M")
+    except Exception as exc:
+        raise ValueError(f"{label} must be an HH:MM wall clock ({value!r})") from exc
+
+
+def _wall_minute(value: str) -> int:
+    """The minute-of-day of one canonical "HH:MM" wall."""
+    return int(value[:2]) * 60 + int(value[3:5])
+
+
+def _wrap_minutes_ahead(from_minute: int, to_minute: int) -> int:
+    """Civil minutes from one wall to a later-or-wrapping one, wrap-aware."""
+    return (to_minute - from_minute) % 1440
+
+
+def _wrap_overlaps(window: int, deadline: int, start: int, end: int) -> bool:
+    """Whether the non-wrapping [window, deadline) overlaps one civil pair.
+
+    The pair may wrap midnight (start > end); both sides are half-open, so a
+    pair ending exactly at the window's start (or starting exactly at its
+    deadline) does NOT overlap.
+    """
+    if start < end:
+        return start < deadline and end > window
+    # A wrapping pair covers [start, midnight) + [midnight, end).
+    return start < deadline or end > window
+
+
 #: The PVOutput extended-value slots the custom per-unit fields may own (the
 #: addstatus specification's ``v7``..``v12`` — donation-tier "Extended Value"
 #: parameters, number-typed, user-defined units).
@@ -1187,6 +1432,14 @@ class ControllerConfig(_FrozenModel):
     # and storage blocks the reporter's slot layout, freshness bound, and
     # durable runtime toggle depend on.
     pvoutput: PvOutputConfig | None = None
+    # DESIGN_BATTERY_HEALTH_WATCH §9: the nightly health-watch block, declared
+    # LAST so its commissioning validator sees every block the stages compose
+    # against — the site's timezone, the units the program-fit arithmetic and
+    # the A6 receipt map count, the mode/policy the probe's dispatch needs,
+    # the plant_history block the census's evidence window reads, the parking
+    # block Stage R composes, and the night/schedule windows the program's
+    # quiet hour must be disjoint from.
+    battery_health_watch: BatteryHealthWatchConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -1773,6 +2026,174 @@ class ControllerConfig(_FrozenModel):
                 "operator's choice on every boot"
             )
         return pvoutput
+
+    @field_validator("battery_health_watch")
+    @classmethod
+    def validate_battery_health_watch(
+        cls, watch: BatteryHealthWatchConfig | None, info: ValidationInfo
+    ) -> BatteryHealthWatchConfig | None:
+        """DESIGN_BATTERY_HEALTH_WATCH §9: the commissioning gates for a
+        PRESENT health-watch block (every gate binds to block-PRESENCE, the
+        night pattern; an ABSENT block changes nothing anywhere).
+
+        Each refusal names its own rule — the prefix rule, the quiet-hour
+        disjointness, the TWO deadline-arithmetic checks (A1), the one-zone
+        truth (A9), and each stage's prerequisites.  The program-fit
+        arithmetic uses the contract's own worst-case stage bounds (§4:
+        census one bounded pass, probe <= ~2 min per unit, recovery <= ~5 min
+        per unit — three units worst case ~21 min against a 45-minute
+        budget).
+        """
+        if watch is None:
+            return watch
+        values = info.data
+        site = values.get("site")
+        if site is not None and watch.timezone != site.timezone:
+            raise ValueError(
+                "battery_health_watch.timezone must equal site.timezone "
+                f"({watch.timezone!r} != {site.timezone!r}): the program window is "
+                "a civil-time fact and a site keeps ONE civil-time truth (A9)"
+            )
+        units = tuple(values.get("units", ()) or ())
+        unit_count = max(1, len(units))
+        window = _wall_minute(watch.window_local)
+        deadline = _wall_minute(watch.deadline_local)
+        night = values.get("night_charging")
+        night_starts: list[int] = []
+        if night is not None:
+            for start_wall, _end_wall in night.window_local:
+                night_starts.append(_wall_minute(start_wall))
+            for start_wall, end_wall in night.window_local:
+                pair = (_wall_minute(start_wall), _wall_minute(end_wall))
+                if _wrap_overlaps(window, deadline, *pair):
+                    raise ValueError(
+                        "battery_health_watch's [window_local, deadline_local] "
+                        f"({watch.window_local}-{watch.deadline_local}) overlaps the "
+                        f"night_charging window {start_wall}-{end_wall}: the program "
+                        "lives in the idle hour BEFORE the night charge by "
+                        "construction, never inside it"
+                    )
+        schedule = values.get("schedule")
+        if schedule is not None:
+            for start_wall, end_wall in schedule.allowed_windows_local:
+                pair = (_wall_minute(start_wall), _wall_minute(end_wall))
+                if _wrap_overlaps(window, deadline, *pair):
+                    raise ValueError(
+                        "battery_health_watch's [window_local, deadline_local] "
+                        f"({watch.window_local}-{watch.deadline_local}) overlaps the "
+                        f"schedule allowed window {start_wall}-{end_wall}: the "
+                        "program lives in the quiet hour by construction — widen or "
+                        "move the schedule windows, never the program"
+                    )
+        # --- the TWO deadline-arithmetic checks (A1), each naming its own
+        # arithmetic so a refused revision teaches its own fix.
+        probe_bound_s = (
+            unit_count * (_PROBE_WORST_CASE_S_PER_UNIT + watch.probe.inter_unit_gap_s)
+            if "probe" in watch.stages
+            else 0
+        )
+        recovery_bound_s = (
+            unit_count * _RECOVERY_WORST_CASE_S_PER_UNIT if "recovery" in watch.stages else 0
+        )
+        program_bound_s = _CENSUS_WORST_CASE_S + probe_bound_s + recovery_bound_s
+        span_minutes = deadline - window
+        if program_bound_s > span_minutes * 60:
+            raise ValueError(
+                "battery_health_watch: the whole-program bound does not fit before "
+                f"the deadline — window {watch.window_local} + worst-case program "
+                f"{program_bound_s} s (census {_CENSUS_WORST_CASE_S} s"
+                + (
+                    f" + {unit_count} units x probe "
+                    f"{_PROBE_WORST_CASE_S_PER_UNIT + watch.probe.inter_unit_gap_s} s"
+                    if probe_bound_s
+                    else ""
+                )
+                + (
+                    f" + {unit_count} units x recovery {_RECOVERY_WORST_CASE_S_PER_UNIT} s"
+                    if recovery_bound_s
+                    else ""
+                )
+                + f") exceeds the {watch.deadline_local} deadline by "
+                f"{program_bound_s - span_minutes * 60} s (A1: window start + the "
+                "whole-program bound must land at or before the deadline)"
+            )
+        for night_start in night_starts:
+            clear_minutes = _wrap_minutes_ahead(deadline, night_start)
+            if clear_minutes * 60 < _WORST_IN_FLIGHT_ACT_S:
+                raise ValueError(
+                    "battery_health_watch: the worst-case in-flight act does not "
+                    f"land before the night window opens — deadline {watch.deadline_local}"
+                    f" + worst-case act {_WORST_IN_FLIGHT_ACT_S} s exceeds the night "
+                    f"window open at {night_start // 60:02d}:{night_start % 60:02d} by "
+                    f"{_WORST_IN_FLIGHT_ACT_S - clear_minutes * 60} s (A1: a started "
+                    "act completes inside its own bound and the program can never "
+                    "bleed into the night charge)"
+                )
+        # --- per-stage prerequisites -------------------------------------------
+        if "census" in watch.stages and values.get("plant_history") is None:
+            raise ValueError(
+                "battery_health_watch.stages including census requires the "
+                "plant_history block: the stuck predicates are judged over an "
+                "N-hours evidence window from the historian, and there is "
+                "deliberately NO degrade-to-single-instant path (a one-look stuck "
+                "verdict is the refused direction)"
+            )
+        if "probe" in watch.stages:
+            if values.get("mode") is not ControllerMode.WRITE_ENABLED:
+                raise ValueError(
+                    "battery_health_watch.stages including probe requires mode "
+                    "write_enabled: a probe is dispatch through the ordinary intent "
+                    "path, and an observe-only composition can never actuate"
+                )
+            policy = values.get("policy")
+            if policy is None:
+                raise ValueError(
+                    "battery_health_watch.stages including probe requires a policy "
+                    "block: the probe's discharge sits inside the commissioned "
+                    "static discharge limits and every standing guard judges it"
+                )
+            if watch.probe.probe_w > policy.max_unit_discharge_w:
+                raise ValueError(
+                    "battery_health_watch.probe.probe_w must not exceed the policy "
+                    f"max_unit_discharge_w ({watch.probe.probe_w} > "
+                    f"{policy.max_unit_discharge_w}): the probe is one bounded "
+                    "ordinary intent, never a path around the static limit"
+                )
+        if "recovery" in watch.stages:
+            if values.get("parking") is None:
+                raise ValueError(
+                    "battery_health_watch.stages including recovery requires the "
+                    "parking block: Stage R composes the park/resume primitive "
+                    "(it adds no transport path), and a site without the block is "
+                    "refused at validation, never silently incapable"
+                )
+            if values.get("mode") is not ControllerMode.WRITE_ENABLED:
+                raise ValueError(
+                    "battery_health_watch.stages including recovery requires mode "
+                    "write_enabled: the standby cycle is the one commissioned "
+                    "automation mode write, gated behind the parking block's own "
+                    "write-enabled commissioning"
+                )
+        if watch.recovery.mode == "auto":
+            if "probe" not in watch.stages:
+                raise ValueError(
+                    "battery_health_watch.recovery.mode auto requires probe in "
+                    "stages: there is no auto recovery without the probe that both "
+                    "triggers and verifies it (§9)"
+                )
+            fleet_units = {unit.unit_id for unit in units}
+            receipts = watch.recovery.auto_receipts or {}
+            missing = sorted(fleet_units - set(receipts))
+            if missing:
+                raise ValueError(
+                    "battery_health_watch.recovery.mode auto requires auto_receipts "
+                    f"with a key for EVERY fleet unit (missing: {missing}): each "
+                    "value is a docs/evidence/ supervised-verification receipt or "
+                    "the literal 'excluded' — the config file itself enforces the "
+                    "supervised-verification sequencing, so no operator revision "
+                    "can skip advise and the supervised night in one edit (A6)"
+                )
+        return watch
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:

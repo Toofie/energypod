@@ -1073,3 +1073,111 @@
   background: #f0f6ff;
   color: #2c5282;
 }
+
+/* --- Battery health watch (DESIGN_BATTERY_HEALTH_WATCH section 13) --------- */
+
+.home-health-status {
+  margin: 0 0 0.25rem;
+}
+
+.home-health-stages {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  color: #4a5568;
+}
+
+.home-health-alert {
+  margin: 0.25rem 0;
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid #9b2c2c;
+  background: #fdf0ef;
+  border-radius: 0 0.4rem 0.4rem 0;
+  font-weight: 600;
+}
+
+.home-health-advisory {
+  margin: 0.25rem 0 0.5rem;
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid #b7791f;
+  background: #fffaf0;
+  border-radius: 0 0.4rem 0.4rem 0;
+  font-size: 0.9rem;
+}
+
+.home-health-units {
+  list-style: none;
+  margin: 0.25rem 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.home-health-unit {
+  display: grid;
+  grid-template-columns: 4rem 10rem 1fr;
+  grid-template-areas: "name census probe" "recovery recovery recovery";
+  gap: 0.15rem 0.6rem;
+  align-items: baseline;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.4rem;
+  background: #f7fafc;
+}
+
+.home-health-unit[data-tier="notice"] {
+  background: #fffaf0;
+}
+
+.home-health-unit[data-tier="alert"] {
+  background: #fdf0ef;
+  border-left: 3px solid #9b2c2c;
+}
+
+.home-health-unit-name {
+  grid-area: name;
+  font-weight: 600;
+}
+
+.home-health-census {
+  grid-area: census;
+  font-size: 0.9rem;
+}
+
+.home-health-census[data-tier="alert"] {
+  color: #9b2c2c;
+  font-weight: 600;
+}
+
+.home-health-census[data-tier="notice"] {
+  color: #b7791f;
+}
+
+.home-health-probe {
+  grid-area: probe;
+  font-size: 0.9rem;
+}
+
+.home-health-probe[data-verdict^="fail"] {
+  color: #9b2c2c;
+  font-weight: 600;
+}
+
+.home-health-probe[data-verdict^="skipped"] {
+  color: #4a5568;
+}
+
+.home-health-recovery {
+  grid-area: recovery;
+  font-size: 0.85rem;
+  color: #4a5568;
+}
+
+.home-health-export-note,
+.home-health-parked-note {
+  margin: 0.4rem 0 0;
+  font-size: 0.85rem;
+  color: #4a5568;
+}
+
+.home-health-parked-note {
+  font-weight: 600;
+}

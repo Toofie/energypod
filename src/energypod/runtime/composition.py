@@ -56,6 +56,7 @@ from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from os import environ
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from fastapi import FastAPI
@@ -131,6 +132,12 @@ from energypod.application.foreign_objective import (
     ForeignObjectiveSettings,
 )
 from energypod.application.generation import AuthorityGenerationCoordinator
+from energypod.application.health_watch import (
+    HealthWatchController,
+    HealthWatchSettings,
+    ProbeSettings,
+    StuckSettings,
+)
 from energypod.application.history import PlantHistoryControl, TelemetryHistorian
 from energypod.application.night_charge import (
     NightChargeAdviser,
@@ -311,6 +318,15 @@ _NIGHT_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 # ordinary dispatch needs.
 _SCHEDULE_RUNNER_PRINCIPAL_SUBJECT = "energypod:schedule-runner"
 _SCHEDULE_RUNNER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
+
+# DESIGN_BATTERY_HEALTH_WATCH §2/§6: the composed automation principal the
+# nightly health watch submits its probe intents under — the adviser pattern
+# exactly.  Audit attribution separates the watch's rows by principal plus
+# the ``optimizer`` source tag and the ``health-`` intent prefix;
+# non-interactive, site-bound, and holding nothing beyond what an ordinary
+# dispatch needs (the probe rides the standing guards, never around them).
+_HEALTH_ADVISER_PRINCIPAL_SUBJECT = "energypod:health-adviser"
+_HEALTH_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 # DESIGN_ENERGY_SCORECARD section 7 (E4): the deterministic event id of the
 # operator's P-A1-active pinning fact.  A ``grid_counter_roles`` value other
 # than ``unpinned`` boots only when this fact exists in the durable store --
@@ -1874,6 +1890,26 @@ class _NightAdviserPrincipal:
     site_id: str
 
 
+@dataclass(slots=True)
+class _HealthAdviserPrincipal:
+    """The composed health-watch automation principal (DESIGN_BATTERY_HEALTH_
+    WATCH §2/§6).
+
+    ``energypod:health-adviser``: observe + dispatch only, non-interactive,
+    site-bound — the adviser principal's exact shape, so the nightly watch's
+    probe ``intent_accepted`` rows are attributable distinct from every
+    console, agent, schedule-runner, excess-adviser, and night-adviser
+    writer.  The watch holds NO other authority anywhere: no arm scope, no
+    interactive capability, and (until Stage R is a separately commissioned
+    wave) no mode-write path at all.
+    """
+
+    subject: str
+    scopes: frozenset[str]
+    interactive: bool
+    site_id: str
+
+
 class _RegistryMorningCredit:
     """DESIGN_NIGHT_CHARGE_V2 section 2.7's composed ``morning_credit_kwh``
     port: the registry's PV slice and load baseline netted per section 2.1.
@@ -2184,6 +2220,7 @@ class _Supervision:
         parking: ParkController | None = None,
         delivery_bias: DeliveryBiasEstimator | None = None,
         pvoutput: PvOutputUploader | None = None,
+        health_watch: HealthWatchController | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -2242,6 +2279,10 @@ class _Supervision:
         # cycle, the historian's own envelope -- a failure inside it is a gap
         # on the operator's dashboard, never a delay to control.
         self._pvoutput = pvoutput
+        # DESIGN_BATTERY_HEALTH_WATCH §4: the nightly health watch, ticking
+        # once per fleet cycle inside THIS existing bounded supervision pass
+        # (no new task class), carrying its own per-night phase machine.
+        self._health_watch = health_watch
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
@@ -2531,6 +2572,18 @@ class _Supervision:
                 # never raise into this loop.
                 with contextlib.suppress(Exception, asyncio.TimeoutError):
                     await asyncio.wait_for(self._pvoutput.tick(), timeout=self._interval_s)
+            if self._health_watch is not None:
+                # DESIGN_BATTERY_HEALTH_WATCH §4: the nightly health watch's
+                # own bounded, fully suppressed pass — AFTER every adviser
+                # and the historian (the probe's quiet-window check reads the
+                # whole fleet's claims and the census reads the historian the
+                # same cycle just filled) and BEFORE the kernel tick (a probe
+                # intent submitted here is arbitrated this same cycle).  A
+                # failure inside it is a missed night's evidence, never a
+                # delay to control; the program's own bounds keep any leg
+                # well inside the fleet cycle's supervision budget.
+                with contextlib.suppress(Exception, asyncio.TimeoutError):
+                    await asyncio.wait_for(self._health_watch.tick(), timeout=self._interval_s)
             # A kernel tick that overruns the interval is a component failure,
             # not a survivable per-unit fault. Cancelling it is safe — the
             # kernel's BaseException path revokes authority first (shielded)
@@ -3197,6 +3250,13 @@ class ComposedRuntime:
     # surface then carries the note; the Solcast pattern, never a boot
     # failure).
     pvoutput: PvOutputUploader | None = None
+    # DESIGN_BATTERY_HEALTH_WATCH §4: the nightly health watch, composed only
+    # when the ``battery_health_watch`` block is PRESENT -- the controller
+    # the fleet loop ticks (Stages C and P in this wave; the block's Stage R
+    # keys are recognized but the stage is a later, separately commissioned
+    # wave) and the ``health_watch_state`` projection + status route serve.
+    # None otherwise (block-absent doctrine).
+    health_watch: HealthWatchController | None = None
 
 
 def _simulator_pod(
@@ -4153,6 +4213,131 @@ def _build_runtime(
         except Exception:
             return frozenset()
 
+    # --- the nightly health watch (DESIGN_BATTERY_HEALTH_WATCH §4) ---------
+    health_watch_controller: HealthWatchController | None = None
+    health_config = config.battery_health_watch
+    if health_config is not None and history_store is not None and policy is not None:
+        # Composed exactly when the block is PRESENT and its validated
+        # prerequisites are composed (the census REQUIRES the historian —
+        # §9 refuses the block at validation without it).  The watch's ONE
+        # act is the probe's own intent: it is submitted under the composed
+        # health-adviser principal through the facade's internal twin (never
+        # REST/MCP), judged by every standing guard exactly like every
+        # adviser's intents.  Stage R is NOT composed in this wave — the
+        # block's recovery keys are recognized, the A6 receipt map is
+        # boot-checked, and the projection renders the stage's honesty.
+        health_principal = _HealthAdviserPrincipal(
+            subject=_HEALTH_ADVISER_PRINCIPAL_SUBJECT,
+            scopes=_HEALTH_ADVISER_PRINCIPAL_SCOPES,
+            interactive=False,
+            site_id=config.site.site_id,
+        )
+
+        async def _submit_health_probe(
+            *,
+            unit_ids: Any,
+            direction: Any,
+            watts: Any,
+            ttl_s: Any,
+            watts_by_unit: Any = None,
+        ) -> Any:
+            # The probe is a single-watt dispatch (watts_by_unit stays unused).
+            return await facade.submit_health_intent(
+                unit_ids=unit_ids,
+                direction=direction,
+                watts=watts,
+                ttl_s=ttl_s,
+                principal=health_principal,
+            )
+
+        async def _health_states_view() -> Mapping[str, Any]:
+            assert recovery_monitor is not None  # the guard is the call site's
+            return await recovery_monitor.unit_health_states()
+
+        def _latched_stop_unit_ids() -> frozenset[str]:
+            # The facade owns the latch registry (the parking binding's view).
+            return facade.latched_stop_unit_ids()
+
+        # A6's boot half: verify the named receipt files exist and degrade a
+        # missing receipt's unit to advise loudly (validation stays
+        # offline-pure — this is existence only, never content).
+        receipts_missing: tuple[str, ...] = ()
+        if health_config.recovery.mode == "auto" and health_config.recovery.auto_receipts:
+            receipts_missing = tuple(
+                sorted(
+                    unit_id
+                    for unit_id, receipt in health_config.recovery.auto_receipts.items()
+                    if receipt != "excluded" and not Path(receipt).exists()
+                )
+            )
+
+        from energypod.application.scheduling import parse_hhmm as _parse_health_wall
+
+        health_watch_controller = HealthWatchController(
+            settings=HealthWatchSettings(
+                timezone=health_config.timezone,
+                window_local=_parse_health_wall(health_config.window_local),
+                deadline_local=_parse_health_wall(health_config.deadline_local),
+                stages=tuple(health_config.stages),
+                stuck=StuckSettings(
+                    evidence_window_h=int(health_config.stuck.evidence_window_h),
+                    soc_floor_pct=float(health_config.stuck.soc_floor_pct),
+                    soc_hold_frac=float(health_config.stuck.soc_hold_frac),
+                    min_soc_hours=int(health_config.stuck.min_soc_hours),
+                    still_w=int(health_config.stuck.still_w),
+                    still_frac=float(health_config.stuck.still_frac),
+                    grid_import_w=int(health_config.stuck.grid_import_w),
+                    sibling_flow_w=int(health_config.stuck.sibling_flow_w),
+                    flow_frac=float(health_config.stuck.flow_frac),
+                    load_floor_w=int(health_config.stuck.load_floor_w),
+                    sibling_load_w=int(health_config.stuck.sibling_load_w),
+                    load_frac=float(health_config.stuck.load_frac),
+                    flag_persistence_nights=int(health_config.stuck.flag_persistence_nights),
+                ),
+                probe=ProbeSettings(
+                    probe_w=int(health_config.probe.probe_w),
+                    settle_s=int(health_config.probe.settle_s),
+                    sustain_s=int(health_config.probe.sustain_s),
+                    pass_fraction=float(health_config.probe.pass_fraction),
+                    pass_sample_frac=float(health_config.probe.pass_sample_frac),
+                    return_band_w=int(health_config.probe.return_band_w),
+                    baseline_return_s=int(health_config.probe.baseline_return_s),
+                    quiet_load_w=int(health_config.probe.quiet_load_w),
+                    load_move_w=int(health_config.probe.load_move_w),
+                    inter_unit_gap_s=int(health_config.probe.inter_unit_gap_s),
+                ),
+                recovery_mode=health_config.recovery.mode,
+                unit_ids=tuple(unit.unit_id for unit in config.units),
+                sample_interval_s=float(history_config.sample_interval_s)
+                if history_config is not None
+                else 30.0,
+                # A few fleet cycles of TTL: the probe renews every cycle, a
+                # lapsed process's intent dies by TTL, and the firmware
+                # watchdog hands the pod back (the night adviser's doctrine).
+                intent_ttl_s=max(10.0, 3.0 * policy.heartbeat_interval_s),
+            ),
+            policy=policy,
+            clock=resolved_clock,
+            observations=observation_port,
+            intents=intent_port,
+            submit=_submit_health_probe,
+            history=history_store,
+            audit=audit_port,
+            bus=bus,
+            # The probe's one bounded echo read rides the OWNING actor's
+            # serialized mailbox (the supervision pass's own pattern).
+            actors={unit_id: actor for unit_id, actor in actors.items()},
+            health_states=_health_states_view,
+            parked_units=_parked_units,
+            latched_stop_units=_latched_stop_unit_ids,
+            recovery_receipts_missing=receipts_missing,
+            process_instance_id=process_instance_id,
+        )
+        # The facade's projection binds here (the controller submits through
+        # the facade's own internal twin; either construction order, one
+        # binding, before the first snapshot).
+        facade.bind_health_watch(health_watch_controller)
+
     # --- excess-solar advisory composition ---------------------------------
     excess_adviser: ExcessChargeAdviser | None = None
     if excess_config is not None and excess_controller is not None:
@@ -4422,6 +4607,7 @@ def _build_runtime(
         parking=park_controller,
         delivery_bias=delivery_bias,
         pvoutput=pvoutput_uploader,
+        health_watch=health_watch_controller,
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision
@@ -4462,6 +4648,7 @@ def _build_runtime(
         history_surface=history_surface,
         forecast_providers=forecast_registry,
         pvoutput=pvoutput_uploader,
+        health_watch=health_watch_controller,
     )
 
 

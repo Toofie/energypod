@@ -34,6 +34,7 @@ from starlette.websockets import WebSocketDisconnect
 from energypod.application.energy import EnergyScorecardRefusal
 from energypod.application.excess_charge import ExcessChargingRefusal
 from energypod.application.forecast import ForecastRefusal
+from energypod.application.health_watch import HealthWatchRefusal
 from energypod.application.history import PlantHistoryRefusal
 from energypod.application.night_charge import NightChargingRefusal
 from energypod.application.parking import ParkingRefusal
@@ -87,6 +88,7 @@ class EnergyService(Protocol):
     async def set_excess_charging(self, **kwargs: Any) -> dict[str, Any]: ...
     async def set_night_charging(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_pvoutput_status(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_health_watch_status(self, **kwargs: Any) -> dict[str, Any]: ...
     async def set_pvoutput(self, **kwargs: Any) -> dict[str, Any]: ...
     async def park_unit(self, **kwargs: Any) -> dict[str, Any]: ...
     async def renew_park_lease(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -1091,6 +1093,20 @@ def create_api_app(
             invoke=invoke,
         )
         return JSONResponse(status_code=result.status_code, content=dict(result.body))
+
+    @app.get(f"{API_PREFIX}/health-watch/status")
+    async def get_health_watch_status(identity: Principal = observe_dependency) -> Any:
+        """The nightly health watch's program projection (DESIGN_BATTERY_
+        HEALTH_WATCH §10/§13): the commissioned stages, the window, the
+        per-unit census/probe verdicts with their figures, and the recovery
+        block's uncommissioned honesty.  A deployment without the
+        ``battery_health_watch`` config block refuses with 409
+        ``health_watch_not_commissioned`` -- the watch's honest
+        not-commissioned state, never absence-that-looks-like-health."""
+        try:
+            return await service.get_health_watch_status(principal=identity)
+        except HealthWatchRefusal as exc:
+            raise BoundaryError(409, exc.code, exc.message) from exc
 
     @app.get(f"{API_PREFIX}/pvoutput/status")
     async def get_pvoutput_status(identity: Principal = observe_dependency) -> Any:

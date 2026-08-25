@@ -9,6 +9,7 @@
  */
 import { formatWatts } from "../lib/format";
 import { toEnergyToday, type EnergyToday } from "./energy";
+import { toHealthWatchState, type HealthWatchState } from "./healthWatch";
 import { toNightChargeState, type NightChargeState } from "./nightCharge";
 import { toUnitObjective, type UnitObjective } from "./objectives";
 import { toScheduleState, type ScheduleState } from "./schedule";
@@ -774,6 +775,13 @@ export interface FleetSnapshot {
    */
   nightChargeState: NightChargeState | null;
   /**
+   * The snapshot's top-level `health_watch_state` projection (the nightly
+   * battery health watch, present only when the `battery_health_watch`
+   * config block is composed). Null when absent — the block-absent doctrine
+   * — and that null IS the feature detection: no Health Watch card renders.
+   */
+  healthWatchState: HealthWatchState | null;
+  /**
    * The snapshot's top-level `energy_today` block (PENDING-BACKEND: the
    * energy scorecard's live in-progress day, present only when the
    * `energy_scorecard` config block is composed). Null when absent — today's
@@ -932,6 +940,12 @@ export function normalizeSnapshot(raw: unknown): FleetSnapshot {
     // tile, the toggle, and every night-derived surface stay hidden.
     nightChargeState: isRecord(record.night_charge_state)
       ? toNightChargeState(record.night_charge_state)
+      : null,
+    // Feature detection: an absent `health_watch_state` (the block-absent
+    // doctrine) normalizes to "the health watch is not composed here" — the
+    // Health Watch card stays hidden.
+    healthWatchState: isRecord(record.health_watch_state)
+      ? toHealthWatchState(record.health_watch_state)
       : null,
     // Feature detection: an absent `energy_today` (today's backend) normalizes
     // to "the energy scorecard is not composed here" — the Today card, the

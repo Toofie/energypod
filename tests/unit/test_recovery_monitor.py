@@ -1156,6 +1156,12 @@ def test_no_automated_response_keys_on_actuation_incoherent(api: Any) -> None:
         # The policy block's Wave-0 justification COMMENTS name the incident
         # class (§15 item 6); a comment is documentation, never a consumer.
         Path("runtime") / "config.py",
+        # The nightly health watch's census/probe skip-if set reads the
+        # ladder word as CONTEXT -- an actuation_incoherent unit is skipped
+        # (excluded at the census, never probed), exactly §4's "the health
+        # ladder is context, never a trigger" doctrine.  No health-watch
+        # code path responds to the state with any act at all.
+        Path("application") / "health_watch.py",
     }
     mentioning: set[Path] = set()
     for path in sorted(package_root.rglob("*.py")):

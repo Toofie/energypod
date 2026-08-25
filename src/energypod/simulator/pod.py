@@ -201,6 +201,20 @@ class SimulatedEnergyPod:
         # a FOREIGN served objective -- another writer's words on the detail
         # block, never latched through our own apply path.
         self._scripted_objective: tuple[int, int, bool] | None = None
+        # DESIGN_BATTERY_HEALTH_WATCH section 14 scenario hooks.  The stuck
+        # script pins the spectator signature (SoC >= 95, dead battery watts,
+        # dead load CT, normal mode words) with its ECHO CLASS pinned (A3):
+        # a pending (echo_class, at_s) lands at the next poll that reaches
+        # ``at_s``.  The probe-delivery script pins the delivered share of a
+        # latched objective for a bounded number of polls (the fleet-bias
+        # band, the dead pod, and the spike pattern all compose from it).
+        self._scripted_stuck: tuple[str, float] | None = None
+        self._stuck: tuple[str] | None = None
+        # (fraction, polls remaining); ``_probe_delivery_active`` freezes the
+        # share that governs the CURRENT poll interval, so words served and
+        # post-poll reads agree at the budget boundary.
+        self._probe_delivery: tuple[float, int] | None = None
+        self._probe_delivery_active: tuple[float, int] | None = None
         # Scripted per-pod CT scenario values (PROTOCOL_EVIDENCE 4c words):
         # the deterministic export scenario the excess-solar bound reads.
         self._scripted_grid_power_w = 0
@@ -261,7 +275,21 @@ class SimulatedEnergyPod:
         if now < self._last_poll_mono:
             raise ValueError("injected monotonic time moved backwards")
         self._land_scripted_debug_mode(now)
+        if self._probe_delivery is not None:
+            self._probe_delivery_active = self._probe_delivery
         self._advance_device_state(now)
+        if self._stuck is not None:
+            # The spectator signature's pinned SoC: full at the top, above
+            # the model's own accumulation ceiling, whatever the (dead)
+            # power history says.
+            self._soc_pct = 97.0
+        if self._probe_delivery is not None:
+            fraction, remaining = self._probe_delivery
+            # The budget floors at zero and STAYS: a spent script keeps the
+            # pod quiet until ``clear_scripted_probe_delivery`` (the scripted
+            # transient is a response from an idle pod, not a return to
+            # serving the still-latched command).
+            self._probe_delivery = (fraction, max(0, remaining - 1))
         self._telemetry_sequence += 1
         self._telemetry_captured_at_mono = now
         if now - self._cell_captured_at_mono >= self._cell_poll_interval_s:
@@ -285,14 +313,25 @@ class SimulatedEnergyPod:
         ``script_parked_readback_shows_write`` flip hook is staging the other
         fork side), and the watchdog lease is untouched.  Ignored means
         ignored: mode changes what the PCS serves, never the wire protocol.
+
+        A scripted STUCK pod (DESIGN_BATTERY_HEALTH_WATCH section 14, A3) is
+        the same ACK-then-ignore shape with the mode words NORMAL: the write
+        is ACKed, nothing latches and no lease renews, delivered power stays
+        dead, and the served objective words follow the write or stay put per
+        the pinned ``echo_class`` -- ``matches`` stages the echoed-and-dead
+        leg (probe ``fail_no_response``), ``not_served`` the advisory-only
+        leg (probe ``inconclusive_echo_mismatch``).
         """
         if len(frame) != 3 or type(frame[0]) is not int or frame[0] != _PQ_HEADER_WORD:
             raise ValueError("only the evidenced three-register PQ objective is applicable")
         active_w = protocol_codec.decode_signed16(frame[1])
         reactive_var = protocol_codec.decode_signed16(frame[2])
-        if self._debug_mode != 0:
+        if self._debug_mode != 0 or self._stuck is not None:
             # The ACK: the write is accepted on the wire and changes nothing.
-            if self._parked_readback_shows_write:
+            echo_write = self._parked_readback_shows_write or (
+                self._stuck is not None and self._stuck[0] == "matches"
+            )
+            if echo_write:
                 self._parked_readback_words = (
                     protocol_codec.encode_signed16(active_w),
                     protocol_codec.encode_signed16(reactive_var),
@@ -364,6 +403,77 @@ class SimulatedEnergyPod:
             self._debug_mode = scheduled[0]
             self._scripted_debug_mode = None
             self._parked_readback_words = None
+        scheduled_stuck = self._scripted_stuck
+        if scheduled_stuck is not None and now >= scheduled_stuck[1]:
+            # The spectator signature lands with its echo class pinned (A3):
+            # mode words NORMAL, SoC pinned at the top, dead load CT, and
+            # PQ writes ACKed-but-ignored with the chosen served-word
+            # behavior -- the two legs of the verdict matrix's still rows.
+            echo_class, _at_s = scheduled_stuck
+            self._stuck = (echo_class,)
+            self._scripted_stuck = None
+            self._scripted_debug_mode = None
+            self._debug_mode = 0
+            self._scripted_load_power_w = 0
+            self._soc_pct = 97.0
+            self._rebuild()
+
+    def script_stuck(self, echo_class: str, at_s: float) -> None:
+        """Scenario hook: the spectator signature, echo class PINNED (A3).
+
+        DESIGN_BATTERY_HEALTH_WATCH section 14: SoC pinned >= 95, battery
+        watts dead, load CT dead (~0) while sibling hooks flow, mode words
+        normal, and the echo class the probe's verdict matrix keys on pinned
+        to one of ``matches`` (the echoed-and-dead leg: census flags, probe
+        ``fail_no_response``, Stage R's exact target class) or ``not_served``
+        (the advisory-only leg: probe ``inconclusive_echo_mismatch``, Stage R
+        never eligible).  The transition is pending until the injected clock
+        reaches ``at_s`` and lands at the next :meth:`poll`; a later call
+        replaces the pending transition.
+        """
+        if echo_class not in {"matches", "not_served"}:
+            raise ValueError("echo_class must be 'matches' or 'not_served' (A3's two legs)")
+        if (
+            isinstance(at_s, bool)
+            or not isinstance(at_s, int | float)
+            or not math.isfinite(float(at_s))
+            or float(at_s) < 0.0
+        ):
+            raise ValueError("at_s must be a non-negative finite scripted time")
+        self._scripted_stuck = (echo_class, float(at_s))
+
+    def clear_scripted_stuck(self) -> None:
+        """Scenario hook: the stuck script stands down; the pod serves again."""
+        self._stuck = None
+        self._parked_readback_words = None
+        self._rebuild()
+
+    def script_probe_delivery(self, fraction: float, samples: int) -> None:
+        """Scenario hook: pin the delivered share of a latched objective.
+
+        DESIGN_BATTERY_HEALTH_WATCH section 14's probe legs: while ``samples``
+        polls remain, the pod delivers ``fraction x command`` -- 0.5-1.2 is
+        the fleet's own delivery-spread band (a PASS), 0.0 the dead pod
+        (``fail_no_response`` under a matching echo), 0.3 the degraded pod
+        (``fail_partial``), and a short 2.0 share over a quiet rest composes
+        the spike pattern the 80%-of-samples rule must refuse.  Once the
+        budget expires the pod is back to idle -- a probe target is an idle
+        pod, and a transient response then quiet is exactly the spike shape.
+        """
+        if (
+            isinstance(fraction, bool)
+            or not isinstance(fraction, int | float)
+            or not math.isfinite(float(fraction))
+            or fraction < 0.0
+        ):
+            raise ValueError("fraction must be a non-negative finite share of command")
+        if isinstance(samples, bool) or type(samples) is not int or samples < 0:
+            raise ValueError("samples must be a non-negative poll count")
+        self._probe_delivery = (float(fraction), samples)
+
+    def clear_scripted_probe_delivery(self) -> None:
+        """Scenario hook: the delivery script stands down (full command)."""
+        self._probe_delivery = None
 
     def read(self, address: int, count: int) -> tuple[int, ...]:
         """Serve one register window; reads never advance device state."""
@@ -516,8 +626,26 @@ class SimulatedEnergyPod:
     def _delivered_active_w(self) -> int:
         """The power the PCS actually delivers: the applied objective, or 0
         while parked -- a parked PCS control path moves no power regardless of
-        what any writer keeps writing (the live 2026-08-24 standby cycle)."""
-        return 0 if self._debug_mode != 0 else self._applied_active_w
+        what any writer keeps writing (the live 2026-08-24 standby cycle).
+
+        A scripted STUCK pod delivers nothing whatever the objective says
+        (the spectator signature), and a scripted probe-delivery share serves
+        ``fraction x command`` while its bounded poll budget lasts (the
+        fleet-bias band at 0.5-1.2, the dead pod at 0.0, and the spike
+        pattern composed from a short 2.0 share).
+        """
+        if self._debug_mode != 0 or self._stuck is not None:
+            return 0
+        applied = self._applied_active_w
+        active = self._probe_delivery_active if self._probe_delivery is not None else None
+        if active is not None and applied != 0:
+            fraction, remaining = active
+            # While the bounded budget lasts the pod serves fraction x
+            # command; once it expires the pod is back to idle (a probe
+            # target is an idle pod -- a transient response then quiet is
+            # exactly the spike shape the 80% rule must refuse).
+            return round(fraction * applied) if remaining > 0 else 0
+        return applied
 
     def _accumulate_ct(self, seconds: float) -> None:
         """Accumulate the scripted per-pod CT words into the grid/load pairs.
@@ -642,7 +770,14 @@ class SimulatedEnergyPod:
         # conservative default leaves these words unchanged); otherwise the
         # pod's own.
         scripted = self._scripted_objective
-        parked_echo = self._parked_readback_words if self._debug_mode != 0 else None
+        echo_serves = self._debug_mode != 0 or (
+            # A scripted stuck pod with the ``matches`` echo class serves the
+            # ignored write's pair (A3's echoed-and-dead presentation); the
+            # ``not_served`` class leaves the pod's own words standing.
+            self._stuck is not None
+            and self._stuck[0] == "matches"
+        )
+        parked_echo = self._parked_readback_words if echo_serves else None
         active_word, reactive_word = (
             (scripted[0], scripted[1])
             if scripted is not None
