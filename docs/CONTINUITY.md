@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; health-watch v1.2 live with the fair A16 census for tonight's first run; the load-sharing review's two blockers in fold)
+Last updated: 2026-08-25 (Australia/Brisbane; the load-sharing contract v1.1 committed, its implementation wave launched — advise posture first, act gated on the operator's netting evidence)
 
 ## Purpose
 
@@ -375,6 +375,33 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (load-sharing CONTRACT v1.1 COMMITTED — c81ba98,
+  +297/−46 on top of the swept-in v1; all fourteen amendments placed,
+  95 E-references threaded, §18 log with the three rulings verbatim):
+  TWO AUTHOR JUDGMENTS ACCEPTED — (1) the E6 netting gate is recorded
+  as the contract's ONE conscious departure from the calibration
+  panel's C15 no-receipt ruling: C15 guarded novelty-of-write, E6
+  guards PHYSICS (the ~28.77 c/kWh inversion on a non-netting meter),
+  stated explicitly in §11 with BOOT-DEGRADE rather than boot-refuse
+  keeping validation offline-pure; (2) E4 implemented as
+  MEASURED-DELIVERY latching (below 0.5× share for 3 ticks →
+  not_delivering) rather than kernel-verdict inspection — the adviser
+  cannot see kernel verdicts, and delivery-word latching also catches
+  merely-not-following pods. E8's severity recorded as MAJOR (the
+  label the panel would correct; the substance folded identically).
+  IMPLEMENTATION WAVE LAUNCHED (the last build): the els- adviser per
+  v1.1 — the signed loop, elsewhere_w, the plausibility guards, the
+  debounce, SoC² weighting with the E8 invariant, measured-delivery
+  latches, the ADVISE posture in live config, ACT gated on netting
+  evidence (THE OPERATOR'S BILL INTERVAL DATA REMAINS THE PENDING
+  OPERATOR ACT), the console card, the simulator plants, the full
+  T-ELS. The wave agent also carries the queued SolarOutlook
+  time-bomb fixture fix if trivial. SCHEDULE UNCHANGED: tonight 23:00
+  the first FAIR health-watch run; tomorrow 14:00 the one-shot plan /
+  15:00–22:30 mid's traverse; Thursday graduation. After load-sharing
+  lands: review → commit → restart → it SITS IN ADVISE until the
+  operator provides the netting evidence, then act.
 
 - 2026-08-25 (load-sharing adversarial review — WITH-AMENDMENTS, 14
   items; implementable ONLY after E1+E2 rewrite the §3.3 control
