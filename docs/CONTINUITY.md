@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the PVOutput integration complete — the retiring Docker writer's replacement composed, off by config, the toggle is the operator's)
+Last updated: 2026-08-25 (Australia/Brisbane; the third-writer question closed by differential experiment — two-writer architecture confirmed, the Docker gate satisfied, night-V1 unblocked)
 
 ## Purpose
 
@@ -375,6 +375,42 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (PVOutput "third writer" question CLOSED BY DIFFERENTIAL
+  EXPERIMENT — TWO-WRITER ARCHITECTURE CONFIRMED; no code changed, one
+  var/ observer script used and deleted): CHRONOLOGY — the operator
+  enabled our uploader ~09:11 and questioned a 644 W b1 reading; slot
+  forensics then MISREAD getstatus ext=1's column layout (the extended
+  block begins at v6, NOT v7 — the recurring ~250 value was the
+  FRONIUS's AC voltage riding the operator's own v6 =
+  Voltage_AC_Phase_1 mapping; the battery fields run v7–v12 exactly as
+  our config pins them). That misread produced a FALSE "mystery
+  shifted-layout writer" theory across several turns; the operator
+  challenged it twice AND WAS RIGHT BOTH TIMES. RECONCILIATION: with
+  corrected columns every slot decodes sanely — pre-09:11 slots carry
+  the Docker container's values at its configured slots; post-stop
+  slots carry OURS (09:10: mid −953 W against measured −954 W; 09:30:
+  lhs 99 %/+184, rhs 100 %/+51, mid 100 %/−805 — charging negative per
+  the operator's stated convention). THE EXPERIMENT: the operator stood
+  Docker down (confirmed stopped ≥1 h) and toggled OUR uploader OFF at
+  ~11:52; the 10-minute watch showed slot 11:50 (our last post)
+  carrying our full battery set while 11:55 and 12:00 carry solar +
+  voltage ONLY with every battery field NaN across repeated samples —
+  NO other battery writer exists. Two-writer architecture exactly as
+  designed: Fronius = v1–v6 (solar, consumption, irradiance, AC
+  voltage); pod-manager = v7–v12 (true BMS SoC + measured power,
+  charge-negative) + b1/b2 (fleet aggregates, b1 spec-sign
+  positive-charge). STATE AT CLOSE — live-verified: our uploader
+  DISABLED by the operator (runtime toggle, origin runtime, survives
+  restarts; last_posted_slot 11:50, zero errors) pending their
+  re-enable at will. OPEN COSMETIC QUESTION with the operator: the b1
+  sign — PVOutput spec (positive=charge) vs their custom-field
+  convention (negative=charge); a one-line change if they want it
+  flipped. THE DOCKER STAND-DOWN GATE IS NOW SATISFIED — the night-V1
+  enable is UNBLOCKED whenever the operator asks. LESSONS (also
+  persisted to memory): verify a reader's column model against a KNOWN
+  WRITE before building theories on it; and the operator's direct
+  observation OUTRANKS the agent's inference.
 
 - 2026-08-25 (PVOutput integration COMPLETE — THE RETIRING DOCKER
   WRITER'S REPLACEMENT IS COMPOSED; 482f96e, 38 files +4541): the
