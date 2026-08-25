@@ -1,9 +1,11 @@
 # Battery health watch — the nightly readiness, probe, and recovery program
 
-Design date 2026-08-25. Status: CONTRACT v1.1 — the adversarial panel's
-verdict was IMPLEMENTABLE WITH AMENDMENTS (nothing unsafe found); all
-fifteen amendments (A1–A15) are folded into the sections where they
-landed, and the two panel rulings are recorded verbatim in the amendment
+Design date 2026-08-25. Status: CONTRACT v1.2 — the adversarial panel's
+verdict was IMPLEMENTABLE WITH AMENDMENTS (nothing unsafe found); the
+fifteen panel amendments (A1–A15) and the operator-evidence amendment
+(A16, v1.2: the phase-concentrated-load fact, the phase-relative census,
+and the load-sharer interlock) are folded into the sections where they
+landed, with the two panel rulings recorded verbatim in the amendment
 log (§20). Authored before any implementation per the contract-first
 doctrine.
 Parents: `docs/DESIGN_POD_PARKING.md` (the standby primitive and every guard
@@ -97,7 +99,8 @@ Wave 0 bugs happened.
 | Our write primitives: `actor.request_debug_mode_change` (read-prior → write → readback → verify inside ONE mailbox dispatch; value domain structurally `{0,1}`; refuses any vendor-directed prior mode); the ParkController's lease/epoch/CAS/durable-first machinery; generation fencing; emergency stop | Confirmed by our code | Stage R composes these; it adds no transport path (§17 architecture pin) |
 | Detection exists: the health ladder (`unreachable > not_responding > foreign_writer > inhibited > actuation_incoherent > parked > self_healing > healthy`), the actuation-coherence watchdog, the objective-echo discriminator (`echo_matches_write / objective_not_served / external_writer`), responsiveness classes | Confirmed by our code | Stage C's census rides these words; Stage P's judgment reuses the echo discriminator |
 | TWO MONITOR BUGS: (1) the `autonomous_self_charge` judgment keys on EXACTLY zero watts — at 96–99% SoC pods float across zero and the state flaps (158 transitions on rhs in one night); (2) the coherence baseline re-anchors at whatever the pod is ALREADY delivering across an authorization gap, so steady delivery at 87–96% of command read as "no movement" — BOTH live detections were false positives | Live-observed in our telemetry | Wave 0 (§3) fixes both BEFORE any stage composes; auto-recovery must never trigger on `actuation_incoherent` alone (invariant I10) |
-| The stuck signature in OUR data (rhs the exhibiting pod): SoC 97–100% with battery watts in a narrow ±100 W band while siblings actively flow; rhs's load-CT word averages ~16 W against siblings' ~100/~180 W — the vendor "Electricity meter communication disconnected" warning class (BMS Warning0 bit 13, PROTOCOL_EVIDENCE §9); a full pod with no CT view is a spectator | Live-observed | The Stage C predicate vector (§5) is this signature, formalized |
+| The stuck signature in OUR data (rhs the exhibiting pod): SoC 97–100% with battery watts in a narrow ±100 W band while siblings actively flow; rhs's load-CT word averages ~16 W against siblings' ~100/~180 W | Live-observed | The Stage C predicate vector (§5) formalizes it — PHASE-RELATIVE since A16 (the next row); the cross-pod reading alone is no longer sufficient to flag |
+| **The rhs fingerprint has TWO live hypotheses (A16, operator evidence):** (a) a dead meter link — the vendor "Electricity meter communication disconnected" class (BMS Warning0 bit 13, PROTOCOL_EVIDENCE §9); (b) an IDLE PHASE — the operator states the house load is concentrated on ~1.5 of the 3 phases (kitchen/downstairs heavy, garage near-nothing, upstairs partial) and each pod CT-follows only its own phase, so a pod on the near-empty phase legitimately reads ~0 CT and ~0 flow while siblings serve | Operator evidence + vendor decode | The discriminator is EXTERNAL to this watch: the load-sharing round's phase-map verification (which pod owns which phase) plus whether the CT word EVER moves when that phase's circuits are used — a dead link never moves, an idle phase does. Until it settles, the census treats the difference as UNOBSERVABLE (§5's soft note) and rhs is PARTIALLY REHABILITATED as a stuck-mode suspect; its multi-year SoC pinning (never below 92–97%) stands under either hypothesis and is the parallel calibration program's concern, not this watch's |
 | The nightly quiet window: `active_schedule` empty at ~23:00; night charge opens 00:00; skip conditions available today: armed/intent/inhibited/latched-stop/foreign-writer/parked, plus park's conflict guard | Confirmed by our composition | The program window and its skip-if set (§4, §6, §7) |
 
 ### 1.2 Sourced findings (EFT Systems BYD service guideline V1.5, German/AU
@@ -336,6 +339,20 @@ from that night's charge with the honest `units_disarmed` reason — deliberate
 (§7.4), visible on the night tile, and the operator's morning re-arm is the
 designed human check on a recovered pod.
 
+**Interplay with the evening load-sharing program (A16):** the load-sharer
+under design ends its dispatches at 22:30 — thirty minutes before this
+window opens — and the watch's window remains EXCLUSIVELY its own: no
+shared minutes, no hand-off overlap, no stage of this program borrowing
+the sharer's machinery (the A14 boundary runs both directions). The
+boundary is enforced from the watch's side by the standing runtime quiet
+checks (no live claims, no adviser participation, else `window_not_quiet`
+defers the night), and the sharer's own end is non-renewal hand-back
+(seconds, not minutes) — 22:30 plus hand-back leaves the fleet quiet well
+before 23:00. When that program's block lands, its window end must
+validate at or before this watch's `window_local` minus a hand-back
+margin; the cross-block check joins §9's list under that contract's own
+naming.
+
 ## 5. Stage C — the census (zero writes)
 
 One evaluation per unit per night at window open, over the trailing evidence
@@ -363,17 +380,31 @@ discoverable, not hidden:
 | S1 full | `soc_pct ≥ stuck.soc_floor_pct` on ≥ `stuck.soc_hold_frac` of samples, over ≥ `stuck.min_soc_hours` continuous hours | 95%, 0.9, 6 h | The exhibiting population sat 97–100%; 95 catches it with margin; the 6-h floor excludes a top-of-charge visit from counting |
 | S2 still | `|battery_watts| < stuck.still_w` on ≥ `stuck.still_frac` of samples | 50 W, 0.9 | The observed stuck band is ±100 W at its edge, well inside the siblings' active-flow class (≥500 W); 50/0.9 tolerates float jitter without admitting a flowing pod |
 | S3 the house needed them | fleet mean grid import > `stuck.grid_import_w` OR any sibling `|battery_watts| > stuck.sibling_flow_w`, on ≥ `stuck.flow_frac` of samples | 500 W, 500 W, 0.5 | A full pod is a spectator only when energy was actually moving — import beyond standby or a sibling actively flowing; the corroboration that separates "stuck" from "everything genuinely idle" |
-| S4 no CT view | unit `load_power_w < stuck.load_floor_w` while ≥1 sibling `load_power_w > stuck.sibling_load_w`, on ≥ `stuck.load_frac` of samples | 30 W, 100 W, 0.8 | The vendor "Electricity meter communication disconnected" class: rhs's ~16 W against siblings' ~100/~180 W; 30 splits the populations; the sibling comparison is what makes a dead CT word visible without a fault bit |
+| S4′ in-phase non-following (A16) | unit `load_power_w > stuck.load_floor_w` — load EXISTS on the unit's OWN phase, per its own CT word — while `|battery_watts| < stuck.still_w`, on ≥ `stuck.load_frac` of the SAME samples | 30 W, 0.8 | The pod watches its own phase's load go unserved and does nothing. Self-contained and phase-relative: NO cross-pod comparison. The v1.1 cross-pod form (unit CT ~0 while a sibling reads > `sibling_load_w`) is RETIRED as a flag — with the house load concentrated on ~1.5 of 3 phases, a pod on the near-empty phase legitimately reads ~0 CT and ~0 flow while siblings serve, and that is not the stuck signature |
 | S5 mode corroboration | `debug_mode_w == 0` on all samples | — | Distinguishes the spectator signature from every mode-latch class (parked, vendor 2–6, remote-PQ latch), which the parking/foreign surfaces already own — the census never re-classifies another surface's state |
 
-**Verdicts:** `nominal`; `stuck_suspected` (all five hold — the predicate
-vector rides the row); `degraded_evidence` (historian gaps beyond the
-integration discipline — excluded samples, never interpolated; the night
-renders no verdict rather than a wrong one); `excluded:<class>` (parked /
-vendor-mode / inhibited / unreachable — named, owned elsewhere). The stuck
-flag is a NOTICE-tier fact on first occurrence and promotes to ALERT tier
-when it persists `stuck.flag_persistence_nights` (default 2) consecutive
-nights — one noisy night is evidence, two is a pattern.
+**Verdicts:** `nominal`; `stuck_suspected` (S1 + S2 + S3 + S4′ + S5 — the
+predicate vector rides the row); **`phase_idle_or_ct_silent` (A16 — a SOFT
+informational note, NEVER a flag):** S1 + S2 hold and the unit's own-phase
+load word read ≤ `stuck.load_floor_w` across the window while ≥1 sibling
+carried load above `stuck.sibling_load_w` — the pod is EITHER on an idle
+phase OR its CT link is dead, and the census CANNOT tell which (the only
+per-phase load measurement is the suspect word itself). The note names the
+discriminator — the phase-map verification (§16/§18) and whether the word
+has EVER exceeded `stuck.load_floor_w` in the trailing
+`stuck.phase_live_window_h` (a word that never moves annotates the note
+`ct_link_suspect`; one that moves clears it) — and hands off to Stage P as
+the only test that sees through both hypotheses. `degraded_evidence`
+(historian gaps beyond the integration discipline — excluded samples,
+never interpolated; the night renders no verdict rather than a wrong one);
+`excluded:<class>` (parked / vendor-mode / inhibited / unreachable —
+named, owned elsewhere). The stuck flag is a NOTICE-tier fact on first
+occurrence and promotes to ALERT tier when it persists
+`stuck.flag_persistence_nights` (default 2) consecutive nights — one noisy
+night is evidence, two is a pattern. The soft note NEVER promotes: it is
+informational at every age, because its two hypotheses have different
+owners (an idle phase is nobody's fault; a dead link is the vendor's
+warning class) and the census is not entitled to pick one.
 
 ## 6. Stage P — the actuation probe
 
@@ -488,16 +519,28 @@ restart: no verdict, evidence recorded, next night is another chance);
 
 ### 7.1 Eligibility — the conjunction, deliberately conservative
 
-A unit is R-eligible for a night iff ALL hold:
+A unit is R-eligible for a night iff EITHER route holds:
 
-1. Census verdict `stuck_suspected` that night (the spectator signature), AND
-2. That unit's probe verdict `fail_no_response` that night.
+- **Route A — the conjunction:** census `stuck_suspected` that night AND
+  probe `fail_no_response` that night. The vendor's own two-condition rule
+  made structural: condition 1's display half failed (the census context:
+  full, still, load unserved on its own phase, house needed power) AND
+  condition 2's actuation half failed under direct command.
+- **Route B — the unobservable phase (A16):** census
+  `phase_idle_or_ct_silent` that night AND probe `fail_no_response` on
+  ≥ `recovery.probe_fail_nights` (default 2) CONSECUTIVE nights. For a pod
+  whose phase the census structurally cannot see (idle, or CT-silent —
+  the only per-phase load measurement is the suspect word itself), the
+  commanded probe is the only spectator test that exists, and REPETITION
+  substitutes for the missing census half: two independent nightly
+  failures of a commanded discharge are a second evidence line, not a
+  re-run of the first. Every other guard, bound, and cap applies
+  unchanged — one cycle (I1), the fail cap (I4), all skip-ifs.
 
-The conjunction is the vendor's own two-condition rule made structural:
-condition 1's display half failed (the census context: full, still, no CT
-view, house needed power) AND condition 2's actuation half failed under
-direct command. A probe failure WITHOUT a census flag is one weak night —
-alert, re-probe tomorrow, no write. A census flag WITHOUT a probe failure
+A probe failure on a `nominal` unit is one weak night — alert, re-probe
+tomorrow, no write (route B is deliberately scoped to the soft-note class,
+where the census's blindness is structural, not where it simply did not
+fire). A census flag WITHOUT a probe failure
 (the unit actuates when asked — the CT-dead-but-commandable class) is NOT
 the wedge a standby cycle is proven to fix: it renders the advisory and the
 restart checklist, no cycle. The probe half keys on `fail_no_response`
@@ -710,8 +753,10 @@ battery_health_watch:
     sibling_flow_w: 500
     flow_frac: 0.5
     load_floor_w: 30
-    sibling_load_w: 100
+    sibling_load_w: 100            # the soft note's sibling-load context (A16)
     load_frac: 0.8
+    phase_live_window_h: 168       # has this unit's CT word EVER moved? the
+                                   #   dead-link vs idle-phase annotator (A16)
     flag_persistence_nights: 2     # notice -> alert promotion
   probe:
     probe_w: 300                   # [100, 500] and <= policy.max_unit_discharge_w
@@ -732,6 +777,9 @@ battery_health_watch:
                                    #   and writes nothing, ever)
     hold_s: 90                     # [60, 120]
     consecutive_fail_limit: 3      # >= 1; counts attempted-and-not-recovered
+    probe_fail_nights: 2           # >= 2 (A16 route B): consecutive probe
+                                   #   failures that make an unobservable-
+                                   #   phase unit R-eligible without a flag
     # A6: mode auto requires a supervised-verification receipt (a
     # docs/evidence/ path, the section 16 step-5 file) for EVERY fleet unit,
     # or the literal "excluded" for a unit that stays advise. Validation
@@ -755,7 +803,13 @@ battery_health_watch:
 - `stuck.min_soc_hours ≤ stuck.evidence_window_h` — equality INTENDED and
   allowed (the defaults 6 = 6: the evidence window is exactly the
   full-at-top horizon; strict `<` would force a wider window for no
-  semantic gain); `flag_persistence_nights ≥ 1` (A9).
+  semantic gain); `flag_persistence_nights ≥ 1` (A9);
+  `stuck.phase_live_window_h ≥ stuck.evidence_window_h` and within the
+  historian's full-resolution retention (168 h against the 14-day
+  commissioned default — a liveliness window shorter than the evidence
+  window is nonsense, and one beyond retention is unknowable);
+  `recovery.probe_fail_nights ≥ 2` — a single night NEVER suffices on
+  route B (A16).
 - `stages` includes `census` ⇒ the `plant_history:` block is present (the
   evidence window is historian-backed; there is deliberately NO
   degrade-to-single-instant path — a one-look stuck verdict is the refused
@@ -827,13 +881,16 @@ uncommissioned):
   "as_of": "2026-08-25T23:41:05+10:00",
   "units": [
     {"unit_id": "rhs",
-     "census": {"verdict": "stuck_suspected", "nights": 2,
+     "census": {"verdict": "phase_idle_or_ct_silent", "nights": 4,
+                "note": "ct_link_suspect",
                 "predicates": {"full": true, "still": true, "house_needed": true,
-                                "no_ct_view": true, "modes_normal": true}},
+                                "load_unserved_in_phase": false,
+                                "modes_normal": true}},
      "probe": {"verdict": "fail_no_response", "probe_w": 300,
                "qualifying_samples": 3, "core_samples": 20,
+               "consecutive_fail_nights": 2,
                "echo": "echo_matches_write"},
-     "recovery": {"mode": "advise", "verdict": "advised",
+     "recovery": {"mode": "advise", "verdict": "advised", "route": "b",
                   "attempts_total": 0, "consecutive_fails": 0}},
     {"unit_id": "lhs",
      "census": {"verdict": "nominal", "nights": 0, "predicates": null},
@@ -1117,11 +1174,18 @@ a restart — the authority ladder is climbed one deliberate step at a time.
   values, missing-key refusal, boot's missing-file degradation to advise
   (A6); no runtime toggle exists for stages or mode.
 - **T-BHW-CENSUS** — the predicate vector: each predicate's hold/fail edge;
-  S3's either-corroborator; S4's sibling comparison; S5 excludes parked and
-  vendor-mode units (owned elsewhere); historian gaps render
-  `degraded_evidence` (never interpolated, never a verdict); persistence
-  promotion; zero extra frames (the read-plan pin); audit/event/projection
-  shapes; uncommissioned-stage honesty.
+  S3's either-corroborator; S4′ IN-PHASE non-following (A16) with both
+  named shapes: the GARAGE-PHASE shape — SoC pinned ≥95, own-phase load
+  word ~0, siblings actively flowing — censuses `phase_idle_or_ct_silent`
+  or `nominal`, NEVER `stuck_suspected`; the IN-PHASE shape — own-phase
+  load above `load_floor_w` while the battery stays still — still flags
+  (with S1/S2/S3/S5); the dead-link-vs-idle-phase annotator over
+  `phase_live_window_h` (a word that never moves annotates
+  `ct_link_suspect`; one that moves clears it; the note never promotes);
+  S5 excludes parked and vendor-mode units (owned elsewhere); historian
+  gaps render `degraded_evidence` (never interpolated, never a verdict);
+  persistence promotion; zero extra frames (the read-plan pin);
+  audit/event/projection shapes; uncommissioned-stage honesty.
 - **T-BHW-PROBE** — skip-if set each rendering its skip; the pass math:
   0.5×/0.8× thresholds, the fleet-bias band passes; the FULL verdict matrix
   (A3) — every measured × echo × baseline cell routes to its pinned
@@ -1135,8 +1199,12 @@ a restart — the authority ladder is climbed one deliberate step at a time.
   inter-unit gap; detector-quiet-through-probe (claimed gate); disarmed
   unit → skipped and counted; no probe outside the window; restart
   mid-probe → inconclusive, once per night.
-- **T-BHW-RECOVERY** — eligibility conjunction (flag-without-fail, fail-
-  without-flag, inconclusive-probe all refuse); the §7.2 sequence with
+- **T-BHW-RECOVERY** — eligibility: route A's conjunction (flag-without-
+  fail, fail-without-flag, inconclusive-probe all refuse) AND route B
+  (A16: soft-note unit + `probe_fail_nights` consecutive
+  `fail_no_response` verdicts eligible; ONE failure not; a `nominal`
+  unit's repeated failures NOT — the route is scoped to the
+  structurally-blind class); the §7.2 sequence with
   audit rows under the health principal and origin `automation` (the A10
   derivation, incl. the adopted-row and evicted-window edges); lease
   bounds from the parking block; hold bounds; foreign word=1 → skip+alert;
@@ -1185,11 +1253,18 @@ a restart — the authority ladder is climbed one deliberate step at a time.
 Each one is load-bearing somewhere above; the design's defaults are chosen
 so that any answer changes a THRESHOLD or a POSTURE, never a safety rule.
 
-1. **Always rhs?** Every exhibiting data point is the 50-cell unit. If the
-   class is unit-specific (a hardware story: its CT chain, its firmware),
-   the sibling-comparison predicates stay as they are; if fleet-wide, the
-   per-unit baselines deserve a season's census rows before thresholds
-   tighten. The census rows exist to answer this.
+1. **Always rhs — and is rhs even the suspect it read as?** Every
+   exhibiting data point is the 50-cell unit, but A16's
+   phase-concentration fact PARTIALLY REHABILITATES rhs: if it is the
+   garage-phase pod, its ~16 W CT average and still battery may be an
+   idle phase, not a wedge. Two discriminating facts are pending — the
+   phase-map verification (which pod owns which phase; the load-sharing
+   round's commissioning step) and whether rhs's CT word EVER moves when
+   its phase's circuits are used. Under EITHER hypothesis its multi-year
+   SoC pinning (never below 92–97%) stands, and that is the parallel
+   calibration program's concern. The census rows (with the
+   `ct_link_suspect` annotator) and route B's probe verdicts will answer
+   the rest.
 2. **Did reads stay alive during the historical stucks?** This decides
    Stage R's reach: the standby cycle is only WRITABLE into a pod whose
    comms answer. If the historical class was comms-dead, those units were
@@ -1331,8 +1406,25 @@ is the index.
 - **A15 (NOTE)** — the "advisers are window-gated by their own blocks,
   not the schedule union" distinction is amended into DESIGN_SCHEDULES,
   where a load-bearing rule belongs. §4/§15.
+- **A16 (MAJOR, v1.2 — operator evidence)** — the house load is
+  concentrated on ~1.5 of 3 phases and each pod CT-follows only its own,
+  so the census's cross-pod spectator predicate would FALSE-FLAG the
+  garage-phase pod. S4 is now PHASE-RELATIVE (S4′ in-phase non-following:
+  the unit's OWN CT word shows load while its battery stays still); the
+  cross-pod shape is retired to a soft informational note
+  (`phase_idle_or_ct_silent`, never a flag, never promoting) annotated by
+  a dead-link-vs-idle-phase discriminator (`phase_live_window_h`); rhs's
+  ~16 W CT is recorded under BOTH hypotheses with the phase-map
+  verification as the external discriminator, partially rehabilitating
+  rhs as a stuck-mode suspect (§1/§18) while its SoC pinning stands for
+  the calibration program; route B makes an unobservable-phase unit
+  R-eligible after `probe_fail_nights` (≥2) consecutive probe failures —
+  repetition substituting for the census half; and the evening
+  load-sharer's 22:30 end is pinned as exclusive-before this window, with
+  the cross-block validation joining §9 when that contract lands.
+  §1/§4/§5/§7.1/§9/§17/§18.
 
-**Panel rulings, recorded verbatim:**
+**Panel rulings, recorded verbatim (the v1.1 round):**
 
 1. "RE-ARM AFFIRMED as designed, with A2+A6 as conditions; the in-sequence
    re-arm must be stated in §12 as the ONLY automation arm authority ever
