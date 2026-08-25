@@ -119,12 +119,26 @@ describe("SolarOutlookSection — loading, not-commissioned, and errors", () => 
 
 describe("SolarOutlookSection — the outlook", () => {
   it("renders the curve's text alternative: source, peak, horizon, and the claimed band", async () => {
+    // The fetched-at instant is RELATIVE to the test clock: the component
+    // ticks the age from the wall (a pinned instant was a time bomb — the
+    // age line grew past the fixture's own 900 s the moment real time
+    // passed it). 900 s before now renders "fetched 900 s" forever.
+    const fetchedAt = new Date(Date.now() - 900_000).toISOString();
     const harness = installHarness(
       vi.fn(() =>
         Promise.resolve(
           forecastOutlook({
             pv: forecastPv(),
-            provider: forecastProvider(),
+            provider: forecastProvider({
+              staleness: {
+                fetched_at: fetchedAt,
+                age_s: 900,
+                stale: false,
+                last_error: null,
+                fetch_count: 4,
+                error_count: 0,
+              },
+            }),
           }),
         ),
       ),

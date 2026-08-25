@@ -1355,3 +1355,103 @@
   color: #4a5568;
   font-style: italic;
 }
+
+/* --- Evening load sharing (DESIGN_EVENING_LOAD_SHARING section 9) ---------- */
+
+.home-els-status {
+  margin: 0 0 0.25rem;
+}
+
+.home-els-submits {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  color: #4a5568;
+}
+
+.home-els-alert {
+  margin: 0.25rem 0;
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid #9b2c2c;
+  background: #fdf0ef;
+  border-radius: 0 0.4rem 0.4rem 0;
+  font-weight: 600;
+}
+
+.home-els-live {
+  margin: 0.25rem 0;
+  padding: 0.4rem 0.6rem;
+  border-left: 3px solid var(--active);
+  background: #ebf8ff;
+  border-radius: 0 0.4rem 0.4rem 0;
+  font-weight: 600;
+}
+
+.home-els-live[data-within-tolerance="true"] {
+  border-left-color: var(--ok, #38a169);
+}
+
+.home-els-units {
+  list-style: none;
+  margin: 0.25rem 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.home-els-unit {
+  display: grid;
+  grid-template-columns: 4rem 1fr;
+  grid-template-areas: "name share" "note note";
+  gap: 0.1rem 0.6rem;
+  align-items: baseline;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.4rem;
+  background: #f7fafc;
+}
+
+.home-els-unit[data-tier="notice"] {
+  background: #fffaf0;
+}
+
+.home-els-unit-name {
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.home-els-share {
+  grid-area: share;
+}
+
+.home-els-note {
+  grid-area: note;
+  font-size: 0.9rem;
+  color: #4a5568;
+}
+
+.home-els-residual {
+  margin: 0.25rem 0;
+  font-size: 0.95rem;
+  color: #4a5568;
+}
+
+.home-els-engaged-notes {
+  margin: 0.35rem 0;
+}
+
+.home-els-pinned {
+  margin: 0 0 0.15rem;
+  font-size: 0.9rem;
+  color: #4a5568;
+}
+
+.home-els-stop-route {
+  margin: 0;
+  font-size: 0.9rem;
+  font-style: italic;
+  color: #4a5568;
+}
+
+.home-els-last {
+  margin: 0.25rem 0;
+  font-size: 0.95rem;
+}

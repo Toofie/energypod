@@ -205,6 +205,12 @@ bugs happen (the health-watch §1 doctrine, inherited).
   boundary, honored structurally: this block owns its own window, its own
   vocabulary, its own projection. The one thing it reads from the sibling
   is a durable `health_probe_completed` row — the rhs-class gate (§3.2).
+  (Recorded for a future reader of §7's disjointness checks: the EVENING
+  LOAD-SHARING program (DESIGN_EVENING_LOAD_SHARING §4) deliberately SHARES
+  the traverse's evening hours — the first commissioned window overlap on
+  this controller — with contention settled per-unit at the claim read (the
+  `cal-`/`els-` prefixes' exclusion walk plus the E5 claim-settle debounce),
+  never by a wall. The overlap is commissioned there, not missed here.)
   The two windows are disjoint by validation (§7), the traverse ending
   before the watch opens, so both programs run the same civil night without
   ever meeting on the wire.

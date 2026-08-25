@@ -1169,6 +1169,13 @@ def test_no_automated_response_keys_on_actuation_incoherent(api: Any) -> None:
         # only act is the ordinary discharge intent, gated on its own class
         # gates.
         Path("application") / "calibration.py",
+        # The evening load-sharing program's section 7.1 skip-if set reads
+        # the same ladder word as CONTEXT (DESIGN_EVENING_LOAD_SHARING
+        # section 7.1): an actuation_incoherent unit is EXCLUDED from the
+        # participant set with its flow riding the elsewhere_w term, never
+        # shared and never responded to -- the program's only act is the
+        # ordinary els- discharge intent, gated on its own claim walk.
+        Path("application") / "evening_share.py",
     }
     mentioning: set[Path] = set()
     for path in sorted(package_root.rglob("*.py")):

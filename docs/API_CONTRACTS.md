@@ -1997,6 +1997,42 @@ participate without it; the append is durable-first, and an audit failure refuse
 commissioning gate, promote a tier, or change the mode — and the adviser still yields to every
 higher-priority source, unchanged.
 
+## Evening load sharing (the netted-meter fleet discharge — DESIGN_EVENING_LOAD_SHARING)
+
+Block presence: an `evening_load_sharing:` block composes the `EveningShareAdviser`
+(one tick per fleet cycle inside the existing supervision pass), the snapshot's
+feature-detected `evening_load_share_state` key, the `evening.state_changed` bus
+events, and the status route; an ABSENT block composes NOTHING (byte-identical
+snapshot, and `GET /api/v1/evening-sharing/status` refuses 409
+`evening_share_not_commissioned`). There is no `enabled` key and no runtime toggle
+for `mode` — the authority ladder is climbed by config revision plus restart only,
+and `mode: act` ADDITIONALLY requires the E6 `act_netting_evidence` row (boot
+degrades a missing file to advise loudly).
+
+- **Source pin.** The split submits ONE ordinary short-TTL `OPTIMIZER` DISCHARGE
+  intent with `watts_by_unit` through the composition-internal facade twin
+  `submit_evening_intent` (the `submit_night_intent` pattern exactly: source
+  pinned, intent-id prefix `els-`, native per-unit watts, same
+  audit/publication contract, never routed on REST or MCP) under the principal
+  `energypod:evening-adviser` (observe + dispatch, non-interactive, site-bound).
+  The program holds NO mode-register reach and NO arm scope — values 2-6 of
+  `0x8000` stay permanently prohibited, and dispatch requires arm.
+- **Snapshot key `evening_load_share_state`** (§8.3): `{mode, submits?, window,
+  phase, as_of, engaged, work_w?, net_exchange_w?, elsewhere_w?,
+  within_tolerance, commanded_total_w?, derate, reason_codes[], units[],
+  held_intent_id, pinned_sentence, stop_route, residual_import_w?,
+  degraded_note?, last_close?}` — `mode: advise` renders the whole projection
+  with `submits: "never"` named beside it; skips render their reason verbatim;
+  the pinned §0 sentence and the standing stop route ("to stop tonight's
+  sharing, claim any pod — a manual command preempts instantly") ride the
+  engaged frame.
+- **Bus event `evening.state_changed`** (§8.2): semantic-tuple-triggered with a
+  30 s heartbeat while ENGAGED, nothing while idle-by-window or uncommissioned.
+  No control path subscribes.
+- **Routes.** `GET /api/v1/evening-sharing/status` (observe) serves the
+  projection; no mutation exists on this surface (the stop route is the
+  operator's own claim authority, never a program key).
+
 ## Battery calibration cycling (the periodic anchor traverse — DESIGN_CALIBRATION_CYCLING)
 
 Block presence: a `battery_calibration:` block composes the `CalibrationAdviser` (one

@@ -78,6 +78,7 @@ import {
   toCalibrationState,
   type CalibrationMorningFacts,
 } from "../../app/calibration";
+import { toEveningShareState } from "../../app/eveningShare";
 import {
   formatMillivolts,
   formatPercent,
@@ -162,6 +163,14 @@ export function HistoryView({ client }: HistoryViewProps): JSX.Element {
    * the entry renders nothing at all.
    */
   const [morning, setMorning] = useState<CalibrationMorningFacts | null>(null);
+  /**
+   * The evening load-sharing program's morning-facts entry
+   * (DESIGN_EVENING_LOAD_SHARING §8.1/§9): the window totals, the money
+   * line, the convergence delta, and the honest one-sentence close — read
+   * from the same snapshot the calibration entry rides. Null when the
+   * projection (or its last_close block) is absent.
+   */
+  const [eveningMorning, setEveningMorning] = useState<string | null>(null);
 
   const refresh = useCallback((): void => {
     setReloadNonce((nonce) => nonce + 1);
@@ -193,6 +202,8 @@ export function HistoryView({ client }: HistoryViewProps): JSX.Element {
         setUnitIds(snapshot.units.map((unit) => unit.unit_id));
         const calibration = toCalibrationState(snapshot.calibration_state);
         setMorning(calibration === null ? null : calibration.morning);
+        const evening = toEveningShareState(snapshot.evening_load_share_state);
+        setEveningMorning(evening?.lastClose?.closeSentence ?? null);
       } catch {
         // The history route answers on its own; a failed snapshot read must
         // not kill the charts (the recording note words the absence).
@@ -383,6 +394,16 @@ export function HistoryView({ client }: HistoryViewProps): JSX.Element {
                 } mV`}
             .
           </p>
+        </div>
+      )}
+
+      {/* The evening load-sharing program's morning-facts entry (§9): the
+          window totals with the money line and the convergence delta. Renders
+          nothing at all while the projection carries no close. */}
+      {eveningMorning !== null && (
+        <div role="note" className="history-morning" data-tier="resolved">
+          <h3>Evening sharing morning facts</h3>
+          <p className="history-morning-line">{eveningMorning}.</p>
         </div>
       )}
 

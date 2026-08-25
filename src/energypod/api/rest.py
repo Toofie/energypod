@@ -90,6 +90,7 @@ class EnergyService(Protocol):
     async def get_pvoutput_status(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_health_watch_status(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_calibration_status(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_evening_share_status(self, **kwargs: Any) -> dict[str, Any]: ...
     async def acknowledge_calibration_standdown(self, **kwargs: Any) -> dict[str, Any]: ...
     async def set_pvoutput(self, **kwargs: Any) -> dict[str, Any]: ...
     async def park_unit(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -1124,6 +1125,24 @@ def create_api_app(
         try:
             return await service.get_calibration_status(principal=identity)
         except CalibrationRefusal as exc:
+            raise BoundaryError(409, exc.code, exc.message) from exc
+
+    @app.get(f"{API_PREFIX}/evening-sharing/status")
+    async def get_evening_share_status(identity: Principal = observe_dependency) -> Any:
+        """The evening load-sharing program's projection
+        (DESIGN_EVENING_LOAD_SHARING §8.3): the mode (with ``submits: never``
+        named beside an advise plan), the window, the per-tick control frame
+        (work, the SIGNED netted exchange, elsewhere, the split with weights
+        and SoC), the deadband's ``within_tolerance`` display word, and the
+        last close's morning facts.  A deployment without the
+        ``evening_load_sharing`` config block refuses with 409
+        ``evening_share_not_commissioned`` -- the program's honest
+        not-commissioned state, never absence-that-looks-like-sharing."""
+        from energypod.application.evening_share import EveningShareRefusal
+
+        try:
+            return await service.get_evening_share_status(principal=identity)
+        except EveningShareRefusal as exc:
             raise BoundaryError(409, exc.code, exc.message) from exc
 
     @app.post(f"{API_PREFIX}/units/{{unit_id}}/calibration/standdown/acknowledge")

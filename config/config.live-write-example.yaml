@@ -1102,3 +1102,89 @@ battery_calibration:
   measurement:
     reanchor_delta_pct: 2.0        # (0, 20] — the quality-gated delta step
     floor_epsilon_pct: 2.0         # (0, 5] — the late-step tolerance (C4)
+
+# The evening load-sharing program (DESIGN_EVENING_LOAD_SHARING.md, CONTRACT
+# v1.1) — the netted-meter fleet discharge adviser.  This block lands in the
+# §12 step-2 ADVISE posture: the full loop runs nightly inside 16:00-22:30 —
+# it measures the netted work (the §3.3 conservation identity, both words
+# directly measured), computes the SoC^2-weighted split, writes the
+# opened/revised/close rows, renders the card — and submits NOTHING, ever.
+# `mode: act` is the operator's later revision (config revision + restart;
+# there is no runtime toggle) and it is ADDITIONALLY gated by the E6
+# netting-evidence row: `act` without `act_netting_evidence` is a VALIDATION
+# ERROR, and boot degrades an act block whose recorded evidence file is
+# missing to advise LOUDLY.  The verification itself is the operator's
+# bill-data act (§10/§15-5: the meter's interval data cross-checked against
+# the summed per-pod grid words, the evidence file recorded under
+# docs/evidence/) — it has NOT happened yet, so the key stays documented and
+# ABSENT below.  The sequencing:
+#   step 1  the phase map + the netting evidence (§10, BEFORE any act
+#           evening; `record_phase_map` writes the map row);
+#   step 2  advise (THIS revision) — enough evenings to see the honest edges
+#           (a traverse evening's reduced split, a capability_limited peak,
+#           a grid_evidence withdraw, and an evening where the split
+#           materially re-weights an already-served load);
+#   step 3  act + `act_netting_evidence` naming the recorded cross-check.
+# The spill arithmetic (§3.4): matching, not biasing — a 1 kWh overshoot
+# costs ~6 c, a 1 kWh undershoot ~23 c, the derate at the filed range's SAFE
+# edge (1.16) removes the structural term, and the 150 W spill tolerance is
+# a CEILING on accepted spill, never an allowance the plan aims for.  The
+# window deliberately SHARES the calibration traverse's evening hours (§4's
+# conscious distinction): both are same-direction discharge advisers, unit
+# sets made disjoint at submission time by the claim exclusion (the `els-`
+# prefix never a foreign claim to itself), the E5 claim-settle debounce
+# covering the sibling's renewal seam, and the E2 `elsewhere_w` term
+# subtracting every excluded unit's measured flow so the participants serve
+# the RESIDUAL, never the evening ON TOP of the traverse.  The window's end
+# + ttl lands before the health watch (23:00) and the night charge (00:00),
+# both validated; the capacity map EQUALS night_charging's and the
+# calibration traverse's (one physical fact, three keys); and there is
+# deliberately NO `grid_telemetry_max_age_s` (E10) — the rollup reads the
+# kernel's own `policy.max_telemetry_age_s`, one freshness truth.
+evening_load_sharing:
+  timezone: "Australia/Brisbane"   # must equal site.timezone (A9)
+  mode: "act"                      # §12 step 3 — commissioned 2026-08-25 on
+                                   #   the operator's direct attestation ("I
+                                   #   do have net metering, no need to prove
+                                   #   it, it just is"), recorded as
+                                   #   docs/evidence/netting-attestation-2026-08-25.md
+  act_netting_evidence: docs/evidence/netting-attestation-2026-08-25.md
+                                   # `act` REQUIRES act_netting_evidence
+                                   # (E6) — the key stays absent until the
+                                   # operator's bill-data verification lands
+  window_local: "16:00"            # the not-before bound (after solar has
+                                   #   had the day; after the traverse's
+                                   #   15:00 open, by design)
+  window_end_local: "22:30"        # no-new-renewal; + ttl lands before the
+                                   #   health watch (23:00) and night (00:00)
+  min_share_w: 500                 # [200, cap_w]; the partial-load floor
+                                   #   (63-86% collapse below the rated band)
+  cap_w: 2500                      # <= policy.max_unit_discharge_w
+  participation_floor_pct: 20.0    # [policy.minimum_soc_pct, 50]; drop-out +
+                                   #   redistribute (the old stack threshold)
+  soc_exponent: 2.0                # [1.0, 4.0]; 3.0 restores the old
+                                   #   stack's precedent exactly (§15-1)
+  spill_tolerance_w: 150           # > 0; the bounded accepted spill ceiling
+  import_tolerance_w: 100          # > 0; the deadband's import-side edge
+  assumed_discharge_over_frac: 1.16  # [1.0, 1.5]; the command derate at the
+                                   #   filed +15-16% overshoot's SAFE edge
+  frozen_word_ticks: 8             # >= 2; E3 P1 — a word unchanged this many
+                                   #   ticks while its unit's other word moved
+  frozen_flow_delta_w: 200         # > 0; P1's movement floor
+  delivery_move_floor_w: 400       # > 0; E3 P2 — the fleet battery move that
+                                   #   demands an answer
+  exchange_move_floor_w: 150       # > 0, < delivery_move_floor_w; P2's
+                                   #   absence-of-response floor
+  non_delivery_ticks: 3            # >= 1; E4 — consecutive ticks below 0.5 x
+                                   #   share => not_delivering, share
+                                   #   redistributes
+  intent_ttl_s: 10.0               # (0, 300]; > timing.control_period_s; the
+                                   #   E5 debounce is 2 x this (a stated
+                                   #   constant, never a key)
+  assumed_capacity_wh: {lhs: 5000, mid: 5000, rhs: 4200}
+                                   # MUST equal night_charging's map and the
+                                   #   calibration traverse's (one fact)
+  # act_netting_evidence: "docs/evidence/netting-verification-2026-XX.md"
+                                   # E6's gate — REQUIRED for mode: act; leave
+                                   #   documented and ABSENT until the §10
+                                   #   interval-data cross-check is recorded

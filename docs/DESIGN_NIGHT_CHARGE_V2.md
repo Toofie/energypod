@@ -198,7 +198,12 @@ must land on the incumbent's behavior, not on an empty pack.
   (DESIGN_CALIBRATION_CYCLING §7/§12-2): the calibration traverse's deadline
   rate and its lying-word energy bound both pace from the same map, and that
   contract's config validation refuses a `battery_calibration` map that
-  drifts from this one — one physical fact, enforced at both keys.
+  drifts from this one — one physical fact, enforced at both keys. A THIRD
+  consumer (DESIGN_EVENING_LOAD_SHARING §5.1/§11) leans on it the same way:
+  the evening share weight `SoC^exponent x capacity` paces the percentage
+  space THIS section targets, and that contract's validation refuses an
+  `evening_load_sharing` map that drifts from either sibling's — one
+  physical fact, three keys, all enforced.
 - **ASSUMPTION:** `charge_efficiency: 0.9` (round-trip AC→stored, unlabeled
   vendor figure — the derate's role is directional conservatism, not
   measurement).

@@ -451,6 +451,19 @@ class CalibrationSurface(Protocol):
     def acknowledge_standdown(self, unit_id: str) -> Any: ...
 
 
+class EveningShareSurface(Protocol):
+    """The composed evening adviser's facade-facing half (block presence).
+
+    ``energypod.application.evening_share.EveningShareAdviser`` is the composed
+    implementation.  Pure projection reads: the facade adds the snapshot's
+    ``evening_load_share_state`` key and serves the status route; the
+    program's one dispatch act (the split's own intent) travels the internal
+    submission twin, never this port.
+    """
+
+    def state_payload(self) -> dict[str, Any]: ...
+
+
 class PvOutputSurface(Protocol):
     """The composed pvoutput reporter's facade-facing surface (block presence).
 
@@ -1176,6 +1189,7 @@ class EnergyServiceFacade:
         forecast: ForecastOutlookSurface | None = None,
         health_watch: HealthWatchSurface | None = None,
         calibration: CalibrationSurface | None = None,
+        evening: EveningShareSurface | None = None,
         pvoutput: PvOutputUploader | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
@@ -1207,6 +1221,7 @@ class EnergyServiceFacade:
         self._forecast = forecast
         self._health_watch = health_watch
         self._calibration = calibration
+        self._evening = evening
         self._pvoutput = pvoutput
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
@@ -1214,6 +1229,7 @@ class EnergyServiceFacade:
         self._night_correlations = itertools.count(1)
         self._health_correlations = itertools.count(1)
         self._calibration_correlations = itertools.count(1)
+        self._evening_correlations = itertools.count(1)
         self._latched_stops: dict[str, _LatchedStop] = {}
         self._acknowledged_stops: set[str] = set()
         self._process_instance_id = f"facade-{uuid.uuid4().hex}"
@@ -1242,6 +1258,18 @@ class EnergyServiceFacade:
         if self._calibration is not None:
             raise RuntimeError("the calibration surface is already bound")
         self._calibration = control
+
+    def bind_evening(self, control: EveningShareSurface) -> None:
+        """Bind the composed evening-share surface (composition wiring).
+
+        The adviser submits its split intents through THIS facade's internal
+        twin, so the two are constructed in either order and bound exactly
+        once here — the projection reads see the surface from the first
+        snapshot after composition, never a half-bound state.
+        """
+        if self._evening is not None:
+            raise RuntimeError("the evening share surface is already bound")
+        self._evening = control
 
     # --- read views ---------------------------------------------------------
 
@@ -1320,6 +1348,12 @@ class EnergyServiceFacade:
             # ``battery_calibration`` block is composed, ABSENT when the
             # block is not.
             view["calibration_state"] = self._calibration.state_payload()
+        if self._evening is not None:
+            # DESIGN_EVENING_LOAD_SHARING §8.3: the feature-detected
+            # ``evening_load_share_state`` projection rides TOP LEVEL beside
+            # its siblings, present whenever the ``evening_load_sharing``
+            # block is composed, ABSENT when the block is not.
+            view["evening_load_share_state"] = self._evening.state_payload()
         # Console truth (2026-08-23): a latched emergency stop must be
         # visible in a snapshot taken after the latch event, not only on
         # the event stream.  Only non-acknowledged latches appear -- an
@@ -2071,6 +2105,132 @@ class EnergyServiceFacade:
             "expires_in_s": duration_s,
         }
 
+    async def submit_evening_intent(
+        self,
+        *,
+        unit_ids: Any,
+        direction: Any,
+        watts: Any,
+        ttl_s: Any,
+        reason: Any = None,
+        principal: Principal,
+        idempotency_key: Any = None,
+        request_id: Any = None,
+        watts_by_unit: Any = None,
+    ) -> dict[str, Any]:
+        """Accept one internal evening load-share OPTIMIZER intent.
+
+        DESIGN_EVENING_LOAD_SHARING §6.2 step 11: the exact
+        ``submit_night_intent`` pattern — same validation, audit event type,
+        idempotency/correlation contract, and publication — with the mintage
+        source pinned to ``OPTIMIZER`` (the split is ordinary dispatch
+        traffic judged by everything exactly as a manual request is) and its
+        own intent-id prefix (``els-``), so audit attribution separates the
+        evening adviser's rows from every console, agent, schedule-runner,
+        and adviser writer (the third twin after ``night-`` and ``cal-``).
+        The per-battery watt form is native (the split is per-pod by
+        construction).  Composition-only wiring: never routed on REST or
+        MCP, and only the composed ``energypod:evening-adviser`` principal
+        ever reaches it.
+        """
+        self._admit(principal, "dispatch")
+        units = _validated_units(unit_ids)
+        unknown = [unit_id for unit_id in units if unit_id not in self._actors]
+        if unknown:
+            raise ValueError(f"unknown units requested: {unknown}")
+        await self._refuse_undispatchable_modes(units)
+        resolved_direction = _dispatch_direction(direction)
+        resolved_watts, resolved_per_unit = _dispatch_watts(watts, watts_by_unit, units)
+        duration_s = _positive_duration(ttl_s)
+        _reason_text(reason, required=False)
+        resolved_idempotency = (
+            self._evening_key("idempotency") if idempotency_key is None else idempotency_key
+        )
+        _correlation_key(resolved_idempotency, "idempotency_key")
+        request_source = self._evening_key("request") if request_id is None else request_id
+        request = _correlation_key(request_source, "request_id")
+
+        now_mono = float(self._clock.monotonic())
+        revision = self._next_revision()
+        intent_id = f"els-{revision}-{now_mono:.6f}"
+        intent = PowerIntent(
+            id=intent_id,
+            source=IntentSource.OPTIMIZER,
+            selected_unit_ids=frozenset(units),
+            direction=resolved_direction,
+            watts=resolved_watts,
+            watts_by_unit=resolved_per_unit,
+            duration_s=duration_s,
+            accepted_at_mono=now_mono,
+            acceptance_revision=revision,
+            actor_identity=principal.subject,
+        )
+        await self._intents.add(intent)
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="intent_accepted",
+                    subject=principal.subject,
+                    result="accepted",
+                    request_id=request,
+                    source=IntentSource.OPTIMIZER,
+                    intent_id=intent_id,
+                    reason_codes=("accepted",),
+                    lifecycle=UnitLifecycle.DISARMED,
+                    payload={
+                        "direction": resolved_direction.value,
+                        "unit_ids": sorted(units),
+                        "watts": resolved_watts,
+                        **(
+                            {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                            if resolved_per_unit is not None
+                            else {}
+                        ),
+                    },
+                )
+            )
+            await self._publish(
+                "intent.accepted",
+                {
+                    "principal": principal.subject,
+                    "intent_id": intent_id,
+                    "direction": resolved_direction.value,
+                    "watts": resolved_watts,
+                    **(
+                        {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                        if resolved_per_unit is not None
+                        else {}
+                    ),
+                    "unit_ids": sorted(units),
+                    "expires_in_s": duration_s,
+                },
+            )
+        except Exception:
+            # Atomic with its audit and publication exactly like its twins: a
+            # split drive that failed here must leave nothing stored for the
+            # kernel to arbitrate on.
+            with contextlib.suppress(Exception):
+                await self._intents.remove(intent_id)
+            raise
+        return {
+            "intent_id": intent_id,
+            "acceptance_revision": revision,
+            "accepted_at_monotonic": now_mono,
+            "status": "accepted",
+            "requested": {
+                "direction": resolved_direction.value,
+                "watts": resolved_watts,
+                **(
+                    {"watts_by_unit": dict(sorted(resolved_per_unit.items()))}
+                    if resolved_per_unit is not None
+                    else {}
+                ),
+            },
+            "authorized": None,
+            "measured": None,
+            "expires_in_s": duration_s,
+        }
+
     async def submit_health_intent(
         self,
         *,
@@ -2316,6 +2476,28 @@ class EnergyServiceFacade:
             raise CalibrationRefusal(
                 CALIBRATION_NOT_COMMISSIONED,
                 "the battery calibration program is not composed on this site",
+            )
+        return control.state_payload()
+
+    async def get_evening_share_status(self, *, principal: Principal) -> dict[str, Any]:
+        """The evening load-sharing program's projection (block-presence
+        refusal).
+
+        Answers 409 ``evening_share_not_commissioned`` when the config block
+        is absent — the same honesty every composed surface carries, so a
+        site without the program is told, never left guessing.
+        """
+        self._admit(principal, "observe")
+        control = self._evening
+        if control is None:
+            from energypod.application.evening_share import (
+                EVENING_NOT_COMMISSIONED,
+                EveningShareRefusal,
+            )
+
+            raise EveningShareRefusal(
+                EVENING_NOT_COMMISSIONED,
+                "the evening load-sharing program is not composed on this site",
             )
         return control.state_payload()
 
@@ -3903,6 +4085,10 @@ class EnergyServiceFacade:
     def _health_key(self, prefix: str) -> str:
         """Deterministic facade-owned correlation for an internal health drive."""
         return f"health-{prefix}-{next(self._health_correlations):08d}"
+
+    def _evening_key(self, prefix: str) -> str:
+        """Deterministic facade-owned correlation for an internal evening drive."""
+        return f"evening-{prefix}-{next(self._evening_correlations):08d}"
 
     def _calibration_key(self, prefix: str) -> str:
         """Deterministic facade-owned correlation for an internal calibration drive."""

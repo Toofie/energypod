@@ -199,6 +199,15 @@ the misfire an automated recovery must never stand on. Wave 0 is detection
 work only — no new write of any kind — and lands in the recovery monitor
 (`src/energypod/application/recovery.py`).
 
+> **S4 idle-phase amendment (DESIGN_EVENING_LOAD_SHARING §10, recorded for the
+> watch's own later sweep):** the census's no-CT-view predicate infers "no CT
+> view" from a low load word against loaded siblings; the evening program's
+> phase map gives that class its honest third case — a pod whose CT is low
+> because its PHASE is idle is healthy, and its census context should say
+> `idle_phase` rather than implying a sensing fault. The map row (the
+> `evening_phase_map_recorded` audit row, ranked per-pod evening load figures)
+> is the watch's to consume; no control path in the evening program reads it.
+
 ### 3.1 W0-1 — the self-charge float deadband (health flapping)
 
 The `autonomous_self_charge` healing reason currently requires

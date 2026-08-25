@@ -127,6 +127,10 @@ from energypod.application.energy import (
     EnergyAccountingSettings,
     EnergyScorecardControl,
 )
+from energypod.application.evening_share import (
+    EveningShareAdviser,
+    EveningShareSettings,
+)
 from energypod.application.events import EventBus
 from energypod.application.excess_charge import (
     ExcessAdviserController,
@@ -347,6 +351,12 @@ _HEALTH_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch", "arm"})
 # automation principal; no mode register anywhere on the path).
 _CALIBRATION_ADVISER_PRINCIPAL_SUBJECT = "energypod:calibration-adviser"
 _CALIBRATION_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
+# DESIGN_EVENING_LOAD_SHARING §7: the evening load-sharing adviser's composed
+# principal — the night-charge class (ordinary OPTIMIZER DISCHARGE dispatch
+# under a composed automation principal; no mode register anywhere on the
+# path, no arm scope ever — the program never arms a unit).
+_EVENING_ADVISER_PRINCIPAL_SUBJECT = "energypod:evening-adviser"
+_EVENING_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 # DESIGN_ENERGY_SCORECARD section 7 (E4): the deterministic event id of the
 # operator's P-A1-active pinning fact.  A ``grid_counter_roles`` value other
 # than ``unpinned`` boots only when this fact exists in the durable store --
@@ -1933,6 +1943,25 @@ class _HealthAdviserPrincipal:
 
 
 @dataclass(slots=True)
+class _EveningAdviserPrincipal:
+    """The composed evening load-sharing principal (DESIGN_EVENING_LOAD_
+    SHARING §7).
+
+    ``energypod:evening-adviser``: observe + dispatch, non-interactive,
+    site-bound — the adviser principal's exact shape, so the split's
+    ``intent_accepted`` rows are attributable distinct from every console,
+    agent, schedule-runner, and adviser writer (the third twin after the
+    night and calibration advisers).  No arm scope ever: dispatch requires
+    arm and arm stays the operator's interactive act.
+    """
+
+    subject: str
+    scopes: frozenset[str]
+    interactive: bool
+    site_id: str
+
+
+@dataclass(slots=True)
 class _CalibrationAdviserPrincipal:
     """The composed calibration-adviser principal (DESIGN_CALIBRATION_
     CYCLING §7).
@@ -2264,6 +2293,7 @@ class _Supervision:
         pvoutput: PvOutputUploader | None = None,
         health_watch: HealthWatchController | None = None,
         calibration: CalibrationAdviser | None = None,
+        evening_share: EveningShareAdviser | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -2332,6 +2362,11 @@ class _Supervision:
         # structurally: the two programs share the fleet loop slot and
         # nothing else.
         self._calibration = calibration
+        # DESIGN_EVENING_LOAD_SHARING §7: the evening load-sharing program,
+        # the same bounded suppressed pass shape (no new task class) — its
+        # own window, its own vocabulary, its own durable rows; the A14
+        # sibling line kept structurally beside the calibration twin.
+        self._evening_share = evening_share
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
@@ -2651,6 +2686,18 @@ class _Supervision:
                 # validation so the two programs never meet on the wire.
                 with contextlib.suppress(Exception, asyncio.TimeoutError):
                     await asyncio.wait_for(self._calibration.tick(), timeout=self._interval_s)
+            if self._evening_share is not None:
+                # DESIGN_EVENING_LOAD_SHARING §6.2: the evening program's own
+                # bounded, fully suppressed pass — beside the calibration
+                # twin's slot (the two evening advisers share HOURS by
+                # design, §4, and settle contention per-unit at the claim
+                # read with the E5 debounce covering the renewal seam), after
+                # every adviser and the historian, BEFORE the kernel tick (a
+                # split intent submitted here is arbitrated this same cycle).
+                # A failure inside it is a missed tick, never a delay to
+                # control; withdraw-to-autonomy is the fail-closed direction.
+                with contextlib.suppress(Exception, asyncio.TimeoutError):
+                    await asyncio.wait_for(self._evening_share.tick(), timeout=self._interval_s)
             # A kernel tick that overruns the interval is a component failure,
             # not a survivable per-unit fault. Cancelling it is safe — the
             # kernel's BaseException path revokes authority first (shielded)
@@ -3329,6 +3376,13 @@ class ComposedRuntime:
     # the fleet loop ticks and the ``calibration_state`` projection + status
     # route serve.  None otherwise (block-absent doctrine).
     calibration: CalibrationAdviser | None = None
+    # DESIGN_EVENING_LOAD_SHARING §7: composed only when the
+    # ``evening_load_sharing`` block is PRESENT — the evening load-sharing
+    # adviser the fleet loop ticks beside its siblings (own window, own
+    # vocabulary, own durable rows, ``els-`` intent prefix under the
+    # ``energypod:evening-adviser`` principal).  None otherwise
+    # (block-absent doctrine).
+    evening_share: EveningShareAdviser | None = None
 
 
 def _simulator_pod(
@@ -4269,6 +4323,7 @@ def _build_runtime(
         forecast=forecast_surface,
         pvoutput=pvoutput_uploader,
         calibration=None,
+        evening=None,
     )
     if park_controller is not None:
         # The park controller's conflict/resume guards read the facade's own
@@ -4626,6 +4681,132 @@ def _build_runtime(
         # anchored/stand-down sets load beside it.  Boot never submits — the
         # reconstruction is rows.
 
+    # --- the evening load-sharing program (DESIGN_EVENING_LOAD_SHARING §7) --
+    # Composed exactly when the ``evening_load_sharing`` block is PRESENT (the
+    # block-presence doctrine): the adviser the fleet loop ticks beside its
+    # siblings, the ``evening_load_share_state`` projection, the
+    # ``evening.state_changed`` events, and the status route.  The split's
+    # intent is submitted under the composed evening principal through the
+    # facade's internal twin (never REST/MCP), judged by every standing guard
+    # exactly like every adviser's intents — the night-charge class, no mode
+    # register anywhere on the path, no arm port.
+    evening_share_adviser: EveningShareAdviser | None = None
+    evening_config = config.evening_load_sharing
+    if evening_config is not None and history_store is not None and policy is not None:
+
+        def _evening_latched_stop_unit_ids() -> frozenset[str]:
+            return facade.latched_stop_unit_ids()
+
+        evening_principal = _EveningAdviserPrincipal(
+            subject=_EVENING_ADVISER_PRINCIPAL_SUBJECT,
+            scopes=_EVENING_ADVISER_PRINCIPAL_SCOPES,
+            interactive=False,
+            site_id=config.site.site_id,
+        )
+
+        async def _submit_evening_split(
+            *,
+            unit_ids: Any,
+            direction: Any,
+            watts: Any,
+            ttl_s: Any,
+            watts_by_unit: Any = None,
+        ) -> Any:
+            # The split is per-pod by construction (§6.2 step 11).
+            return await facade.submit_evening_intent(
+                unit_ids=unit_ids,
+                direction=direction,
+                watts=watts,
+                ttl_s=ttl_s,
+                watts_by_unit=watts_by_unit,
+                principal=evening_principal,
+            )
+
+        async def _evening_health_states() -> Mapping[str, Any]:
+            assert recovery_monitor is not None  # the guard is the call site's
+            return await recovery_monitor.unit_health_states()
+
+        def _evening_tariff() -> dict[str, float] | None:
+            # §8.1's money lines need the tariff's general import and feed-in
+            # rates (the evening window sits on the general rate; the refill's
+            # off-peak figure is the night program's own).  Absent tariff
+            # block = kWh-only honesty.
+            declared = None if providers_config is None else providers_config.tariff
+            if declared is None:
+                return None
+            return {
+                "import_cents_per_kwh": float(declared.default_import_cents_per_kwh),
+                "export_cents_per_kwh": float(declared.default_export_cents_per_kwh),
+            }
+
+        # E6's boot half: an act block whose recorded netting evidence file is
+        # MISSING degrades to advise LOUDLY (the A6 receipts shape — validation
+        # stays offline-pure; this is existence only, never content).
+        evening_mode = evening_config.mode
+        evening_degraded_note: str | None = None
+        if (
+            evening_mode == "act"
+            and evening_config.act_netting_evidence is not None
+            and not Path(evening_config.act_netting_evidence).exists()
+        ):
+            evening_mode = "advise"
+            evening_degraded_note = (
+                "mode degraded to advise at boot: the recorded netting evidence "
+                f"({evening_config.act_netting_evidence}) does not exist — record "
+                "the §10 interval-data cross-check and restart before the first "
+                "act evening (E6)"
+            )
+            print(
+                "EVENING LOAD-SHARING DEGRADED TO ADVISE: "
+                f"{evening_config.act_netting_evidence} is missing (E6)",
+                flush=True,
+            )
+
+        evening_share_adviser = EveningShareAdviser(
+            settings=EveningShareSettings(
+                timezone=evening_config.timezone,
+                mode=evening_mode,
+                window_local=parse_hhmm(evening_config.window_local),
+                window_end_local=parse_hhmm(evening_config.window_end_local),
+                min_share_w=int(evening_config.min_share_w),
+                cap_w=int(evening_config.cap_w),
+                participation_floor_pct=float(evening_config.participation_floor_pct),
+                soc_exponent=float(evening_config.soc_exponent),
+                spill_tolerance_w=int(evening_config.spill_tolerance_w),
+                import_tolerance_w=int(evening_config.import_tolerance_w),
+                assumed_discharge_over_frac=float(
+                    evening_config.assumed_discharge_over_frac
+                ),
+                frozen_word_ticks=int(evening_config.frozen_word_ticks),
+                frozen_flow_delta_w=int(evening_config.frozen_flow_delta_w),
+                delivery_move_floor_w=int(evening_config.delivery_move_floor_w),
+                exchange_move_floor_w=int(evening_config.exchange_move_floor_w),
+                non_delivery_ticks=int(evening_config.non_delivery_ticks),
+                intent_ttl_s=float(evening_config.intent_ttl_s),
+                assumed_capacity_wh=dict(evening_config.assumed_capacity_wh or {}),
+                act_netting_evidence=evening_config.act_netting_evidence,
+                unit_ids=tuple(unit.unit_id for unit in config.units),
+                degraded_note=evening_degraded_note,
+            ),
+            policy=policy,
+            clock=resolved_clock,
+            observations=observation_port,
+            intents=intent_port,
+            submit=_submit_evening_split,
+            history=history_store,
+            audit=audit_port,
+            bus=bus,
+            health_states=_evening_health_states,
+            parked_units=_parked_units,
+            latched_stop_units=_evening_latched_stop_unit_ids,
+            tariff=_evening_tariff(),
+            process_instance_id=process_instance_id,
+        )
+        # The facade's projection binds here (the adviser submits through the
+        # facade's own internal twin; either construction order, one binding,
+        # before the first snapshot).
+        facade.bind_evening(evening_share_adviser)
+
     # --- excess-solar advisory composition ---------------------------------
     excess_adviser: ExcessChargeAdviser | None = None
     if excess_config is not None and excess_controller is not None:
@@ -4897,6 +5078,7 @@ def _build_runtime(
         pvoutput=pvoutput_uploader,
         health_watch=health_watch_controller,
         calibration=calibration_adviser,
+        evening_share=evening_share_adviser,
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision
@@ -4939,6 +5121,7 @@ def _build_runtime(
         pvoutput=pvoutput_uploader,
         health_watch=health_watch_controller,
         calibration=calibration_adviser,
+        evening_share=evening_share_adviser,
     )
 
 

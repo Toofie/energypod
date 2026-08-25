@@ -90,6 +90,14 @@ export interface Snapshot {
    * Absent on a program-less deployment.
    */
   calibration_state?: unknown;
+  /**
+   * The evening load-sharing program's feature-detected block
+   * (DESIGN_EVENING_LOAD_SHARING §8.3): present only while the
+   * `evening_load_sharing` config block is composed — the console's Evening
+   * Sharing card and the History view's morning-facts entry key on it.
+   * Absent on a program-less deployment.
+   */
+  evening_load_share_state?: unknown;
 }
 
 /**

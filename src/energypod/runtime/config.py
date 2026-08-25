@@ -1433,6 +1433,112 @@ class BatteryCalibrationConfig(_FrozenModel):
         return self
 
 
+class EveningLoadSharingConfig(_FrozenModel):
+    """DESIGN_EVENING_LOAD_SHARING §11: the ``evening_load_sharing:`` block.
+
+    Block-presence doctrine, the night pattern: a PRESENT block composes the
+    ``EveningShareAdviser`` (one tick per fleet cycle inside the existing
+    bounded supervision pass), the ``evening_load_share_state`` snapshot key,
+    the ``evening.state_changed`` events, and the status route; an ABSENT
+    block composes NOTHING (byte-identical snapshot, 409 on the route).
+    There is deliberately NO ``enabled`` key and NO runtime toggle for
+    ``mode`` — the authority ladder is climbed by config revision plus
+    restart only.  ``mode: advise`` (the default) runs the whole loop —
+    measures the work, computes the split, writes the rows — and submits
+    NOTHING, ever; ``mode: act`` is the operator's later revision AND (E6,
+    the one physics-grounded departure from C15's no-receipt ruling) REQUIRES
+    ``act_netting_evidence`` naming the recorded netting cross-check — on a
+    non-netting meter this program's economics INVERT (shared watts SOLD at
+    the feed-in rate against imports still bought at the general rate), so
+    the verification is unskippable in one edit.  There is deliberately NO
+    ``grid_telemetry_max_age_s`` (E10): the rollup's freshness bound IS
+    ``policy.max_telemetry_age_s`` — one freshness truth, no third key to
+    drift.
+    """
+
+    # REQUIRED; one civil-time truth per site (A9), cross-checked against
+    # ``site.timezone`` on ``ControllerConfig``.
+    timezone: NonEmpty
+    mode: Literal["advise", "act"] = "advise"
+    window_local: NonEmpty = "16:00"
+    window_end_local: NonEmpty = "22:30"
+    min_share_w: Annotated[StrictInt, Field(ge=200)] = 500
+    cap_w: Annotated[StrictInt, Field(ge=200)] = 2500
+    participation_floor_pct: Annotated[StrictFloat, Field(gt=0, le=50)] = 20.0
+    soc_exponent: Annotated[StrictFloat, Field(ge=1.0, le=4.0)] = 2.0
+    spill_tolerance_w: PositiveStrictInt = 150
+    import_tolerance_w: PositiveStrictInt = 100
+    assumed_discharge_over_frac: Annotated[StrictFloat, Field(ge=1.0, le=1.5)] = 1.16
+    frozen_word_ticks: Annotated[StrictInt, Field(ge=2)] = 8
+    frozen_flow_delta_w: PositiveStrictInt = 200
+    delivery_move_floor_w: PositiveStrictInt = 400
+    exchange_move_floor_w: PositiveStrictInt = 150
+    non_delivery_ticks: Annotated[StrictInt, Field(ge=1)] = 3
+    intent_ttl_s: Annotated[StrictFloat, Field(gt=0, le=300)] = 10.0
+    assumed_capacity_wh: dict[NonEmpty, PositiveStrictInt] | None = None
+    # E6's commissioning gate: `mode: act` REQUIRES this key, shaped as a
+    # `docs/evidence/` path whose file names the interval-data cross-check
+    # (§10).  Validation checks the shape offline-pure; boot verifies the
+    # file exists and DEGRADES the missing-file block to advise loudly.
+    act_netting_evidence: NonEmpty | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        value = _plain(value, label="timezone")
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone must be a valid IANA timezone") from exc
+        return value
+
+    @field_validator("window_local", "window_end_local")
+    @classmethod
+    def validate_walls(cls, value: str, info: object) -> str:
+        name = getattr(info, "field_name", "wall")
+        return _valid_policy_wall_named(value, label=f"evening_load_sharing.{name}")
+
+    @field_validator("act_netting_evidence")
+    @classmethod
+    def validate_evidence_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        path = _plain(value, label="act_netting_evidence")
+        if not path.startswith("docs/evidence/") or not path.endswith((".md", ".json")):
+            raise ValueError(
+                "evening_load_sharing.act_netting_evidence must be a docs/evidence/ "
+                "path naming the recorded netting cross-check (a .md or .json file, "
+                f"e.g. docs/evidence/netting-verification-2026-09.md); got {path!r}: "
+                "the evidence gate's shape is what makes §10's verification "
+                "unskippable in one edit (E6)"
+            )
+        return path
+
+    @model_validator(mode="after")
+    def validate_wall_order(self) -> Self:
+        if _wall_minute(self.window_local) >= _wall_minute(self.window_end_local):
+            raise ValueError(
+                "evening_load_sharing.window_local must sit strictly before "
+                f"window_end_local ({self.window_local} >= {self.window_end_local}): "
+                "the evening is one same-day civil span, never a midnight crossing"
+            )
+        if self.min_share_w > self.cap_w:
+            raise ValueError(
+                "evening_load_sharing.min_share_w must sit at or below cap_w "
+                f"({self.min_share_w} > {self.cap_w}): the clamp band [min_share_w, "
+                "cap_w] would be empty"
+            )
+        if self.exchange_move_floor_w >= self.delivery_move_floor_w:
+            raise ValueError(
+                "evening_load_sharing.exchange_move_floor_w must sit strictly below "
+                f"delivery_move_floor_w ({self.exchange_move_floor_w} >= "
+                f"{self.delivery_move_floor_w}): P2's absence-of-response floor must "
+                "sit under the delivery move that demands an answer, or the "
+                "predicate cannot fire (E3)"
+            )
+        return self
+
+
 def _wrap_minutes_ahead(from_minute: int, to_minute: int) -> int:
     """Civil minutes from one wall to a later-or-wrapping one, wrap-aware."""
     return (to_minute - from_minute) % 1440
@@ -1640,6 +1746,15 @@ class ControllerConfig(_FrozenModel):
     # and health-watch windows the traverse must land before, and the night
     # capacity map that must stay ONE physical truth with this block's.
     battery_calibration: BatteryCalibrationConfig | None = None
+    # DESIGN_EVENING_LOAD_SHARING §11: the evening load-sharing block, declared
+    # LAST so its commissioning validator sees every block the program reads
+    # against — the site's timezone, the policy whose kernel bounds order the
+    # participation floor and cap, the timing the TTL bound rides, the fleet
+    # whose capacities the weighting reads, the historian the close row
+    # derives from, the health-watch and night windows the last intent must
+    # die before, and the night capacity map that must stay ONE physical
+    # truth with this block's.
+    evening_load_sharing: EveningLoadSharingConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -2662,6 +2777,187 @@ class ControllerConfig(_FrozenModel):
                 "degrade-to-single-instant path"
             )
         return calibration
+
+    @field_validator("evening_load_sharing")
+    @classmethod
+    def validate_evening_load_sharing(
+        cls, evening: EveningLoadSharingConfig | None, info: ValidationInfo
+    ) -> EveningLoadSharingConfig | None:
+        """DESIGN_EVENING_LOAD_SHARING §11: the commissioning gates for a
+        PRESENT evening load-sharing block (every gate binds to
+        block-PRESENCE, the night pattern; an ABSENT block changes nothing
+        anywhere).
+
+        Each refusal names its own rule — the E6 netting-evidence gate on
+        ``mode: act`` (the one physics-grounded receipt this program carries),
+        the window-end arithmetic against BOTH the watch and night walls, the
+        participation floor's kernel ordering, the capacity-map equality
+        across all three consumers, the E3 floor ordering (carried on the
+        block's own model), and the historian prerequisite.  Deliberately NOT
+        validated: fleet-time disjointness from the calibration traverse (§4's
+        conscious distinction — the two evening advisers share hours by design
+        and settle contention per-unit at the claim read, never by a wall).
+        """
+        if evening is None:
+            return evening
+        values = info.data
+        site = values.get("site")
+        if site is not None and evening.timezone != site.timezone:
+            raise ValueError(
+                "evening_load_sharing.timezone must equal site.timezone "
+                f"({evening.timezone!r} != {site.timezone!r}): the evening window is "
+                "a civil-time fact and a site keeps ONE civil-time truth (A9)"
+            )
+        policy = values.get("policy")
+        if evening.mode == "act":
+            # The act is ordinary OPTIMIZER dispatch (the night-charge class),
+            # so it needs the write-enabled composition and its policy block —
+            # AND (E6, the one departure from C15 the panel instructed) the
+            # recorded netting evidence: on a non-netting meter the economics
+            # INVERT, and the evidence gate is what makes the §10
+            # verification unskippable in one edit.
+            if values.get("mode") is not ControllerMode.WRITE_ENABLED:
+                raise ValueError(
+                    "evening_load_sharing.mode act requires mode write_enabled: the "
+                    "split is ordinary dispatch through the intent path, and an "
+                    "observe-only composition can never actuate (advise — the "
+                    "default — composes as the display-only program)"
+                )
+            if policy is None:
+                raise ValueError(
+                    "evening_load_sharing.mode act requires a policy block: the "
+                    "fleet bound and the participation floor's kernel ordering "
+                    "derive from the commissioned policy"
+                )
+            if evening.act_netting_evidence is None:
+                raise ValueError(
+                    "evening_load_sharing.mode act REQUIRES act_netting_evidence: a "
+                    "docs/evidence/ path naming the recorded interval-data "
+                    "cross-check of §10 (the summed per-pod grid words against the "
+                    "meter's own import/export intervals). On a non-netting meter "
+                    "this program would SELL shared watts at the feed-in rate "
+                    "against imports still bought at the general rate — an "
+                    "automated ~29 c-per-shared-kWh loss — so the physics is "
+                    "verified, never assumed (E6)"
+                )
+        if policy is not None:
+            # §5.2's ordering, a validated config fact: the adviser's
+            # participation stop sits at or above the kernel's
+            # soc_below_discharge_floor backstop.
+            if evening.participation_floor_pct < policy.minimum_soc_pct:
+                raise ValueError(
+                    "evening_load_sharing.participation_floor_pct must sit at or "
+                    "above the policy minimum_soc_pct "
+                    f"({evening.participation_floor_pct} < {policy.minimum_soc_pct}): "
+                    "the adviser's drop-out fires pre-submission so the kernel's "
+                    "soc_below_discharge_floor never sees an at-or-below-floor "
+                    "intent — the ordering-by-construction mirror"
+                )
+            if evening.cap_w > policy.max_unit_discharge_w:
+                raise ValueError(
+                    "evening_load_sharing.cap_w must not exceed the policy "
+                    f"max_unit_discharge_w ({evening.cap_w} > "
+                    f"{policy.max_unit_discharge_w}): the split is bounded ordinary "
+                    "dispatch, never a path around the static limit"
+                )
+        timing = values.get("timing")
+        if timing is not None and evening.intent_ttl_s <= timing.control_period_s:
+            raise ValueError(
+                "evening_load_sharing.intent_ttl_s must exceed "
+                f"timing.control_period_s ({evening.intent_ttl_s} <= "
+                f"{timing.control_period_s}): the adviser renews exactly once per "
+                "fleet cycle, and the E5 claim-settle debounce is 2 x this ttl"
+            )
+        # --- the capacity map: present, exactly the fleet, and ONE physical
+        # truth with the night block's (night-V2 §2.1's ruling, extended to
+        # the third consumer).
+        fleet_units = {unit.unit_id for unit in values.get("units", ()) or ()}
+        capacity = evening.assumed_capacity_wh
+        if capacity is None:
+            raise ValueError(
+                "evening_load_sharing.assumed_capacity_wh is required: the SoC "
+                "weighting operates in the percentage space the night charge "
+                "targets (power ∝ SoC^exponent x capacity), and a unit without "
+                "an estimate has no weighted share to carry"
+            )
+        if set(capacity) != fleet_units:
+            missing = sorted(fleet_units - set(capacity))
+            stray = sorted(set(capacity) - fleet_units)
+            raise ValueError(
+                "evening_load_sharing.assumed_capacity_wh keys must be exactly the "
+                f"fleet units (missing: {missing or []}; names no battery: "
+                f"{stray or []}): every pod the netted meter counts carries a "
+                "weight or sits out with a reason"
+            )
+        night = values.get("night_charging")
+        calibration = values.get("battery_calibration")
+        if (
+            night is not None
+            and night.assumed_capacity_wh is not None
+            and dict(night.assumed_capacity_wh) != dict(capacity)
+        ):
+            raise ValueError(
+                "evening_load_sharing.assumed_capacity_wh must EQUAL "
+                "night_charging.assumed_capacity_wh when that block carries one "
+                f"({dict(sorted(capacity.items()))} != "
+                f"{dict(sorted(night.assumed_capacity_wh.items()))}): one physical "
+                "fact, three keys would drift (night-V2 §2.1's ruling, extended "
+                "to this consumer)"
+            )
+        if (
+            calibration is not None
+            and calibration.traverse.assumed_capacity_wh is not None
+            and dict(calibration.traverse.assumed_capacity_wh) != dict(capacity)
+        ):
+            raise ValueError(
+                "evening_load_sharing.assumed_capacity_wh must EQUAL "
+                "battery_calibration.traverse.assumed_capacity_wh when that block "
+                f"carries one ({dict(sorted(capacity.items()))} != "
+                f"{dict(sorted(calibration.traverse.assumed_capacity_wh.items()))}): "
+                "one physical fact, three keys would drift (night-V2 §2.1's "
+                "ruling, extended to this consumer)"
+            )
+        # --- BOTH window checks (§4): the last intent dies by TTL long before
+        # any sibling window opens.  Deliberately NOT checked here:
+        # disjointness from the calibration traverse's window (§4's conscious
+        # distinction — the contention rule is per-unit at the claim read,
+        # not a wall).
+        end_s = _wall_minute(evening.window_end_local) * 60
+        expiry_s = end_s + evening.intent_ttl_s
+        watch = values.get("battery_health_watch")
+        if watch is not None:
+            watch_open_s = _wall_minute(watch.window_local) * 60
+            boundary = watch_open_s if watch_open_s >= end_s else watch_open_s + 86_400
+            if expiry_s > boundary:
+                raise ValueError(
+                    "evening_load_sharing: window_end_local + intent_ttl_s "
+                    f"({evening.window_end_local} + {evening.intent_ttl_s} s) must "
+                    "land at or before battery_health_watch.window_local "
+                    f"({watch.window_local}): the program may not bleed into the "
+                    "sibling's watch"
+                )
+        if night is not None:
+            for start_wall, _end_wall in night.window_local:
+                night_open_s = _wall_minute(start_wall) * 60
+                boundary = night_open_s if night_open_s >= end_s else night_open_s + 86_400
+                if expiry_s > boundary:
+                    raise ValueError(
+                        "evening_load_sharing: window_end_local + intent_ttl_s "
+                        f"({evening.window_end_local} + {evening.intent_ttl_s} s) "
+                        "must land at or before the night_charging window open "
+                        f"({start_wall}): the program may not bleed into the night "
+                        "charge"
+                    )
+        # The close row and the commissioning map are historian-backed: no
+        # degrade path (the health-watch §9 precedent).
+        if values.get("plant_history") is None:
+            raise ValueError(
+                "evening_load_sharing requires the plant_history block: the §8 "
+                "close row is historian-derived (the loop is stateless by "
+                "construction) and the §10 phase map is historian-backed, and "
+                "there is deliberately NO degrade path"
+            )
+        return evening
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:

@@ -121,8 +121,10 @@ import { NextScheduleCard, toScheduleFacts, type ScheduleFacts } from "./NextSch
 import { NightChargeTile } from "./NightChargeTile";
 import { toHealthWatchState, type HealthWatchState } from "../../app/healthWatch";
 import { toCalibrationState, type CalibrationState } from "../../app/calibration";
+import { toEveningShareState, type EveningShareState } from "../../app/eveningShare";
 import { HealthWatchCard } from "./HealthWatchCard";
 import { CalibrationCard } from "./CalibrationCard";
+import { EveningShareCard } from "./EveningShareCard";
 import { PvOutputCard } from "./PvOutputCard";
 import { SolarSurplusTile } from "./SolarSurplusTile";
 import { TodayCard } from "./TodayCard";
@@ -277,6 +279,13 @@ interface SnapshotView {
    * not composed here, and Home's Calibration card renders nothing at all.
    */
   calibrationState: CalibrationState | null;
+  /**
+   * The snapshot's top-level `evening_load_share_state` projection,
+   * feature-detected: null when the field is absent — the evening
+   * load-sharing program is not composed here, and Home's Evening Sharing
+   * card renders nothing at all.
+   */
+  eveningState: EveningShareState | null;
 }
 
 function readPowerFigure(value: unknown): PowerFigureView | null {
@@ -381,6 +390,12 @@ function readSnapshot(value: unknown): SnapshotView | null {
     // Home's Calibration card renders nothing at all.
     calibrationState: isRecord(record.calibration_state)
       ? toCalibrationState(record.calibration_state)
+      : null,
+    // Feature detection: an absent `evening_load_share_state` (the
+    // block-absent doctrine) is null — the evening load-sharing program is
+    // not composed here, and Home's Evening Sharing card renders nothing.
+    eveningState: isRecord(record.evening_load_share_state)
+      ? toEveningShareState(record.evening_load_share_state)
       : null,
   };
 }
@@ -1769,6 +1784,13 @@ export function HomeView({ client }: HomeViewProps) {
           Renders nothing at all while the snapshot carries no
           calibration_state (the block-presence doctrine). */}
       <CalibrationCard calibration={snapshot.calibrationState} />
+
+      {/* The evening load-sharing card: the netted-meter fleet discharge
+          program's one-glance story, BESIDE the calibration card (own
+          window, own vocabulary, own card — the A14 sibling line again).
+          Renders nothing at all while the snapshot carries no
+          evening_load_share_state (the block-presence doctrine). */}
+      <EveningShareCard evening={snapshot.eveningState} />
 
       {/* The PVOutput reporting card: the retiring Docker writer's
           replacement -- the operator's cutover toggle and the reporter's
