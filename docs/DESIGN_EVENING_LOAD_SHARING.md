@@ -444,10 +444,11 @@ refusal's rule), mirroring the calibration contract's §7:**
   traverse by design (both are evening discharge programs, and on a
   traverse night the fleet runs BOTH — the traversing pod under the
   calibration adviser, the rest under this one). The contention rule is
-  PER-UNIT (§7.3), and the validation that enforces it is the shared
-  claim-exclusion walk both advisers already run — a rule about intents,
+  PER-UNIT (§7.3) — the claim-exclusion walk both advisers already run,
+  with the §7.1 claim-settle debounce covering the renewal seam (E5) —
+  a rule about intents,
   not about walls. The panel should see this stated as a conscious
-  distinction (§14 flag 2): it is the first cross-program window overlap
+  distinction (§14 flag 1): it is the first cross-program window overlap
   this controller commissions, and it is safe precisely because both
   programs are same-direction discharge advisers whose unit sets are
   made disjoint at submission time by the C3 discipline.
@@ -655,17 +656,21 @@ excess adviser owns the export side of the axis (§7.2).
     `net_exchange_w`, `elsewhere_w`, the split, `within_tolerance`, and
     the reason codes.
 
-The loop is STATELESS BY CONSTRUCTION for control: no accumulator, no
-phase memory, no per-window latch participates in the command arithmetic
-— every watt is recomputed from the two measured words each tick. This
+The loop's TOTAL arithmetic is STATELESS BY CONSTRUCTION: no accumulator,
+no phase memory, no per-window latch participates in the commanded-total
+computation — every watt of the total is recomputed from the measured
+words each tick. This
 is deliberate and load-bearing: a restart mid-evening loses NOTHING
-control-side (the next tick re-derives the same plan from the same
-words), which is why §8's bookkeeping reconstructs from historian rows
+of the total arithmetic (the next tick re-derives the same total from
+the same words), which is why §8's bookkeeping reconstructs from
+historian rows
 rather than runtime state, and why this contract needs no
-opened-row/reconstruction machinery of the calibration C2 class. The one
-piece of window-scoped adviser state is the §5.3 join/leave hysteresis
-latch, reset at window boundaries, and its loss on restart costs at most
-one tick of set churn.
+opened-row/reconstruction machinery of the calibration C2 class. Three
+pieces of window-scoped adviser state touch MEMBERSHIP, never the
+total: the §5.3 join/leave hysteresis latch, the §7.1 claim-settle
+debounce, and the E4 non-delivery counter — each reset at window
+boundaries, and their loss on restart costs at most one tick of set
+churn.
 
 ### 6.3 Stop conditions, per pod and per fleet
 
@@ -847,7 +852,7 @@ next tick's plan was always going to be re-derived from the words).
 ### 8.2 Audit rows (advisory class, the accountant pattern)
 
 - `evening_window_opened` — at first engagement each window: the measured
-  `work_w`/`net_import_w`, the participant set with weights, the derate,
+  `work_w`/`net_exchange_w`/`elsewhere_w`, the participant set with weights, the derate,
   the window figures. The reconstruction row.
 - `evening_share_revised` — on each participant-set change (join, leave,
   floor drop, guard skip): the unit, the cause, the before/after split.
@@ -1021,13 +1026,35 @@ evening_load_sharing:
                                     #   +35 W precedent's descendant)
   import_tolerance_w: 100           # > 0; the correction deadband's
                                     #   import-side edge
-  assumed_discharge_over_frac: 1.15 # [1.0, 1.5]; the command derate vs
-                                    #   the filed +15-16% overshoot;
-                                    #   delivery_bias.py graduates it
-  grid_telemetry_max_age_s: 3.0     # > 0; the rollup's freshness bound
-  intent_ttl_s: 10.0                # (0, 300]; > timing.control_period_s
+  assumed_discharge_over_frac: 1.16 # [1.0, 1.5]; the command derate vs
+                                    #   the filed +15-16% overshoot, at
+                                    #   the range's SAFE edge (E1: 1.15
+                                    #   sat one notch under the observed
+                                    #   1.16 — the growth seed); per-pod
+                                    #   graduation is E14's doctrine
+                                    #   change, §16
+  frozen_word_ticks: 8              # >= 2; E3's P1 — a word unchanged
+                                    #   this many ticks while its unit's
+                                    #   other word moved => implausible
+  frozen_flow_delta_w: 200          # > 0; P1's movement floor
+  delivery_move_floor_w: 400        # > 0; E3's P2 — the fleet battery
+                                    #   move that demands an answer
+  exchange_move_floor_w: 150        # > 0, < delivery_move_floor_w; P2's
+                                    #   absence-of-response floor
+  non_delivery_ticks: 3             # >= 1; E4 — consecutive participating
+                                    #   ticks below delivery_pass_fraction
+                                    #   x commanded share => not_delivering
+  intent_ttl_s: 10.0                # (0, 300]; > timing.control_period_s;
+                                    #   the E5 debounce is 2 x this, a
+                                    #   stated constant, never a key
   assumed_capacity_wh: {lhs: 5000, mid: 5000, rhs: 4200}
                                     # MUST equal night_charging's map
+  # E6's commissioning gate: mode: act REQUIRES the recorded netting
+  # evidence (a docs/evidence/ path whose file names the interval-data
+  # cross-check, §10). Validation checks the shape; boot checks the file
+  # exists and DEGRADES the block to advise loudly when it does not (the
+  # A6 receipts shape — validation stays offline-pure).
+  # act_netting_evidence: "docs/evidence/netting-verification-2026-XX.md"
 ```
 
 **Cross-validations (each refusal names its rule):**
@@ -1035,6 +1062,16 @@ evening_load_sharing:
 - `mode ∈ {advise, act}`; `advise` submits no intent on any tick under
   any input (a named test). No runtime toggle for `mode` exists — the
   authority ladder is climbed by config revision plus restart.
+- `mode: act` REQUIRES `act_netting_evidence` present and shaped as a
+  `docs/evidence/` path (E6 — the mechanism's economics invert on a
+  non-netting meter and the evidence gate is what makes the verification
+  unskippable in one edit); boot verifies the file exists and degrades
+  the missing-file block to `mode: advise` with a loud note. This is the
+  ONE place this contract departs from the calibration C15 no-receipt
+  ruling, by the panel's explicit instruction: C15 refused a receipt gate
+  on a NOVEL-WRITE question; this gate stands on a PHYSICS question (the
+  tariff direction), and §15 item 5 names the operator act that satisfies
+  it.
 - `window_local < window_end_local`, both same civil day; timezone equal
   to `site.timezone` (refusal names both values).
 - `window_end_local + intent_ttl_s <= battery_health_watch.window_local`
@@ -1049,7 +1086,13 @@ evening_load_sharing:
   `import_tolerance_w > 0`; `assumed_discharge_over_frac ∈ [1.0, 1.5]`
   (a derate below 1.0 would assume UNDER-delivery — the charge-direction
   bias class, refused here); `0 < intent_ttl_s <= 300` and `>
-  timing.control_period_s`; `grid_telemetry_max_age_s > 0`.
+  timing.control_period_s`; `frozen_word_ticks >= 2`;
+  `frozen_flow_delta_w > 0`; `delivery_move_floor_w > 0`;
+  `0 < exchange_move_floor_w < delivery_move_floor_w` (P2's floors are
+  ordered or the predicate cannot fire); `non_delivery_ticks >= 1`.
+- There is deliberately NO `grid_telemetry_max_age_s` (E10): the rollup's
+  freshness bound IS `policy.max_telemetry_age_s`, read directly — one
+  freshness truth, no third key to drift.
 - `assumed_capacity_wh` present, key set exactly the fleet, every value
   > 0, and EQUAL to `night_charging.assumed_capacity_wh` (and therefore
   the calibration map's — one physical fact, three keys, all enforced).
@@ -1075,14 +1118,18 @@ evening_load_sharing:
    already-served load (the operator's central case, visible in the
    advise rows as commanded shares against the kitchen pod's autonomous
    service).
-3. **ACT** (config revision two): `mode: act`. The units must be ARMED
+3. **ACT** (config revision two): `mode: act` PLUS `act_netting_evidence`
+   naming the §10 evidence file (E6 — the validation refuses the revision
+   without it, which is what makes the netting verification unskippable
+   in one edit; boot degrades a missing file to advise loudly). The units
+   must be ARMED
    for dispatch (the program never arms — the standing doctrine); the
    first evenings are supervised reads of the card, not attended events —
    the act is ordinary dispatch under every standing guard, the
    night-charge and calibration precedent, and the card names the
-   manual-claim stop route throughout. No receipt gate (C15's conscious
-   distinction, inherited: nothing about a discharge share is a novel
-   write class).
+   manual-claim stop route throughout. No OTHER receipt gate (C15's
+   conscious distinction, inherited, with E6's one physics-grounded
+   exception stated in §11).
 4. **STEADY STATE**: the morning line is the operator's daily read; the
    convergence deltas accumulate as the shelved balancer's trigger
    evidence (§0); the §15 thresholds are re-examined after the first
@@ -1095,14 +1142,34 @@ evening_load_sharing:
   window-end arithmetic against BOTH the watch and night walls (refusals
   naming their numbers); the floor-ordering rule (a participation floor
   below the policy floor refused naming both); the capacity-map equality
-  across all three consumers; the historian prerequisite; advise submits
+  across all three consumers; the historian prerequisite; the E6 gate
+  (`mode: act` without `act_netting_evidence` refused naming the rule;
+  boot's missing-file degradation to advise, loudly); the E3/E4 bounds
+  (the P2 ordering `exchange_move_floor_w < delivery_move_floor_w`
+  included); NO `grid_telemetry_max_age_s` key exists anywhere (E10);
+  advise submits
   nothing on any tick; no runtime toggle exists.
-- **T-ELS-LOAD-SOURCE** — the identity: `work = import + fleet
-  discharge` across the three canonical cases (kitchen-served,
-  kitchen-empty, mixed); the rollup's fail-closed words (a single
+- **T-ELS-LOAD-SOURCE** — the identity: `work = served + SIGNED net
+  exchange` across the three canonical cases (kitchen-served,
+  kitchen-empty, mixed); the EXPORT-direction closed loop (E1's named
+  property: with a delivery plant at 1.16 against a 1.16 derate, a
+  seeded export error DECAYS tick over tick — the v1.0 clipped form's
+  every-level-an-equilibrium and geometric-to-cap growth replayed as the
+  regression vector, asserted unreachable under the signed form); the
+  `elsewhere_w` subtraction (E2: a flowing excluded unit — traverse pod,
+  manual claim, guard skip — leaves the participants' commanded total
+  UNCHANGED, the v1.0 on-top ramp replayed as the named vector); the
+  rollup's fail-closed words (a single
   non-good grid or battery word → unjudgeable → withdraw with
   `grid_evidence_<word>`, never a zero-filled basis, never a held
-  discharge); the PV-netting case (surplus collapses `work_w` and the
+  discharge); the E3 plausibility predicates (P1: a grid word frozen
+  across `frozen_word_ticks` while its unit's battery word moves beyond
+  the floor → `grid_evidence_implausible` → withdraw, the identity never
+  converts the frozen word into a command; P2: a fleet battery move ≥
+  `delivery_move_floor_w` answered by < `exchange_move_floor_w` of
+  exchange movement → withdraw; the ONE-SIDED pin — a kettle's
+  exchange-only move NEVER trips either predicate); the PV-netting case
+  (surplus collapses `work_w` and the
   program idles on its own arithmetic); the CT-sum basis is consulted
   NOWHERE on the control path (the named regression vector — a dead CT
   word must not move the split).
@@ -1112,13 +1179,22 @@ evening_load_sharing:
   rule (smallest highest-weight set above `min_share_w`; the 900 W
   one-pod case; the 3 kW three-pod case; the join/leave hysteresis at
   0.8 × floor); the floor clamp with its rendered reason; the
-  redistribution on a mid-evening floor drop; the fleet-limit bound on
+  redistribution on a mid-evening floor drop; the E8 order and invariant
+  (clamp per-pod, renormalize the unclamped, Σ shares = commanded_total
+  EXACTLY — the latched-floor over-command replayed as the named
+  vector); the fleet-limit bound on
   `commanded_total_w`.
-- **T-ELS-LOOP** — the derate (command = desired ÷ 1.15; the structural
+- **T-ELS-LOOP** — the derate (command = desired ÷ 1.16; the structural
   spill without it, the converged spill with it, both asserted); the
-  tolerance band (no correction inside `[−spill, +import]`, correction
-  outside); the transient bound (a scripted full load-drop spills ≤ the
-  tolerance × the settle window); engagement on WORK not import (the
+  tolerance band (HOLD inside `[−spill, +import]` — the total literally
+  unchanged across an in-band oscillation; correction outside, BOTH
+  directions per E1); the transient bound (a scripted full load-drop
+  spills ≤ the tolerance × the settle window); the HANDOVER settle leg
+  (E11: taking over from autonomy, the ~10 s authorization-to-power
+  settle produces an IMPORT-side excursion asserted bounded by the
+  tolerance + settle × commanded rate — the loop's first ticks may
+  under-serve, never over-export past the bound); engagement on WORK not
+  import (the
   already-served load re-split with the meter held); withdrawal paths
   (window end, evidence, preemption, below-floor); the stateless
   restart (a mid-evening restart changes nothing control-side — the next
@@ -1129,7 +1205,16 @@ evening_load_sharing:
   split recomputes, this program never contests); the traverse evening
   (a live `cal-` claim excludes the traversing pod organically, the
   two-pod split renders with its cause, no deferral exists under any
-  input); the own-intent prefix (`els-` never a foreign claim to itself);
+  input); the E5 renewal-seam race (a scripted one-tick cal renewal gap:
+  the unit renders `claim_settling`, does NOT enter the set for
+  2 × ttl, the traverse's next submission finds no `els-` claim and
+  proceeds — the v1.0 seam-aborts-the-traverse interleaving replayed as
+  the named vector and asserted unreachable; the manual-claim release
+  seam covered by the same leg); the E4 kernel-denied leg (a
+  participant whose delivery stays below 0.5 × share for
+  `non_delivery_ticks` drops `not_delivering` and the share
+  redistributes — the phantom-import-forever case replayed and asserted
+  unreachable); the own-intent prefix (`els-` never a foreign claim to itself);
   MANUAL/AGENT/SCHEDULE claims and the e-stop preempting instantly.
 - **T-ELS-BOOKKEEPING** — the close row's figures (per-pod attributed Wh
   with the autonomy/claim attribution rule; import and spill integrals
@@ -1151,8 +1236,14 @@ evening_load_sharing:
 - **T-ELS-SIMULATOR** — the scripted legs: a three-phase site with the
   kitchen/garage/upstairs load split (the phase map's plant); a
   dead-CT pod (the rhs class — must not move the split); a
-  delivery-overshoot plant (1.0x, 1.15x, 1.3x — the derate's
-  regression); a traverse-evening twin (a standing `cal-` claim); a
+  delivery-overshoot plant (1.0x, 1.16x, 1.3x — the derate's
+  regression); the E3 frozen-word plants (a fresh-stamped frozen GRID
+  word with a moving battery word; a frozen BATTERY word with a moving
+  grid word — both must withdraw as implausible, never command); a
+  kernel-denied plant (E4 — a unit whose commands the kernel zeroes for
+  a deny reason outside the skip vocabulary); a renewal-gap harness
+  (E5 — a sibling adviser whose remove-then-submit misses one tick);
+  a traverse-evening twin (a standing `cal-` claim); a
   surplus-evening script (the excess corner); a restart-in-mid-evening
   harness (the stateless property); a `capability_limited` peak script.
 - **T-ELS-CONSOLE** — the card's states × modes (uncommissioned,
@@ -1160,7 +1251,7 @@ evening_load_sharing:
   the morning-after line); the stop-route line wherever the live share
   renders; the pinned sentence; alert tiers; shot matrix.
 
-## 14. For-the-panel flags
+## 14. For-the-panel flags — with the panel's answers folded in
 
 1. **The first commissioned window OVERLAP.** This program shares evening
    hours with the calibration traverse by design (§4), with contention
@@ -1169,7 +1260,11 @@ evening_load_sharing:
    advisers, disjoint unit sets, exclusion at submission), but every
    prior cross-program check on this controller is a WALL — the panel
    should affirm the per-unit rule is sufficient, or name the interleaving
-   it does not cover.
+   it does not cover. **Panel: the per-unit policy is sound but its
+   arithmetic was not — the one interleaving the wall-free rule missed is
+   the sibling's renewal seam, and E5's claim-settle debounce closes it
+   (§7.1); E2's `elsewhere_w` closes the arithmetic the same evening
+   (§3.3). With both folded, the overlap stands as commissioned.**
 2. **The kitchen pod's autonomy is preempted while shared.** Commanding
    the working pod DOWN from its CT-following service to its weighted
    share is the mechanism that makes "all phases contribute" real (§3.3),
@@ -1178,7 +1273,9 @@ evening_load_sharing:
    meter-equivalent by netting, yet it IS a preemption of a working
    autonomous behavior this controller has never displaced before. The
    loop measures the outcome; the panel should confirm 1.5 s renewal is
-   the right bound on that substitution.
+   the right bound on that substitution. **Panel: stood — no amendment;
+   the settle-lag bound is now asserted by test (E11's handover leg,
+   T-ELS-LOOP).**
 3. **Engagement on WORK, not import.** The program will command a
    redistribution of an already-zero-import load (the stranded-energy
    case). No watt is ADDED (the §0 pin), but the fleet's commanded output
@@ -1187,16 +1284,25 @@ evening_load_sharing:
    reads as load support (the operator's ask) and not as the balancer's
    wedge (§0's refusal) — the distinction is that no energy is created,
    moved to storage, or exported beyond tolerance, only the SOURCE of the
-   serving watts is re-weighted.
+   serving watts is re-weighted. **Panel: AFFIRMED as the correct reading
+   of the operator's ask, the transient genuinely cheap (~1–2 Wh ≈ 0.1 c)
+   — but the zero-cost pin was false as written and is re-worded (E7:
+   "no watt is ever EXPORTED for it", §0/§5.1 carry the priced ~3–5%
+   pack-energy premium), and the value case rests on stranded-energy
+   recovery (the 2.8× evening capability), which stands on its own.**
 4. **The stalesess fail-closed is withdraw-to-autonomy, not hold.** Every
    other evidence-failure on this controller holds at a bounded positive
    rate (the night charge's `hold_rate_w`). A discharge program cannot:
    the held watts would free-run into export. The panel should confirm
    withdraw (the status quo ante) is the intended fail-safe rather than a
-   bounded minimum-share hold.
+   bounded minimum-share hold. **Panel: stood — no amendment; and the
+   stale-word case is bounded to one intent's watts by the kernel
+   beneath, with the FROZEN word the real hazard (E3, now guarded).**
 5. **The exponent default deviates from the precedent.** SoC² vs the old
    stack's SoC³ (§5.1) — the panel should confirm the reasoning (the
    nightly convergence reset, the floor clamp's override) or restore 3.
+   **Panel: stood — no amendment; the efficiency-aware set preference
+   (E7) strengthens the same reasoning.**
 
 ## 15. Operator decisions this package needs
 
@@ -1214,10 +1320,15 @@ evening_load_sharing:
 4. **The participation floor:** "Pods drop out at 20% SoC (the old
    system's threshold) and the share redistributes. The night charge
    refills regardless. Confirm 20, or name another."
-5. **The netting evidence:** "Before the first live evening, the meter's
-   interval data is cross-checked against the summed per-pod grid words
-   (§10) — the mechanism is this one fact. The bill data export is the
-   operator's act."
+5. **The netting evidence — GATING since the panel (E6):** "Before the
+   first live evening, the meter's interval data is cross-checked against
+   the summed per-pod grid words (§10) and the evidence file recorded —
+   `mode: act` is refused without it (§11). On a non-netting meter this
+   program would SELL shared watts at 2 c against imports still bought at
+   30.77 c, an automated ~29 c-per-shared-kWh loss; the gate exists so
+   that physics is verified, not assumed. The bill/interval-data export
+   is the operator's act, and it is the checkable evidence the gate
+   names."
 
 ## 16. Future extensions and open questions (documented, deliberately unbuilt)
 
@@ -1236,6 +1347,15 @@ evening_load_sharing:
   (the §14-2 question's config form): the loop makes it unnecessary, but
   a season of close rows would show whether preempting the working pod's
   CT-following ever costs more than the re-weighting gains.
+- **Per-pod delivery derate graduation (E14's doctrine note, named):**
+  `delivery_bias.py`'s own header pins it EVIDENCE-ONLY ("nothing in the
+  kernel, the actor, or any adviser consumes it"), so graduating
+  `assumed_discharge_over_frac` from its per-unit projection is a DOCTRINE
+  CHANGE to that label, not a config flip — this contract consumes the
+  FIGURE via config (the operator's revision, evidence in hand) and
+  leaves the estimator passive; a future round may amend the label so an
+  adviser reads the projection directly, and that round owns the
+  amendment.
 - **The shelved transfer balancer** stays shelved; THIS program's
   convergence deltas are its rebuild trigger's evidence (§0), and the
    trigger's own words are unchanged.
@@ -1259,4 +1379,135 @@ evening_load_sharing:
    coordinator thread at round close (this design does not edit it).
 6. The `config.live-write-example.yaml` block comment for
    `evening_load_sharing:` when the implementation wave lands (the §12
-   sequencing, the advise default, the §3.4 spill arithmetic).
+   sequencing, the advise default, the §3.4 spill arithmetic, the E6
+   act-gate comment).
+
+## 18. Amendment log (v1.1 — the adversarial round)
+
+The panel's verdict: WITH-AMENDMENTS, implementable after the two
+blockers folded — the architecture, the claim discipline, the windows,
+and the validations verified sound; the control law and the
+traverse-night arithmetic did not survive, and both are rewritten in
+place. All fourteen amendments are folded above; this log is the index.
+
+- **E1 (BLOCKER)** — the control law had no corrective feedback in the
+  export direction: `net_import_w = max(0, −Σgrid)` clipped the loop's
+  only self-correcting term, so once exporting, `work_w` re-derived from
+  the fleet's own delivered watts and re-commanded exactly what was
+  delivered — EVERY export level an equilibrium — and with delivery bias
+  1.16 against the assumed 1.15 (the v1.0 default sitting on the filed
+  range's dangerous edge) the error grew geometrically to the 6,000 W
+  fleet cap. Fixed by the §3.3 REWRITE: SIGNED netted exchange
+  (import-positive, export subtracts), zero the loop's sole equilibrium;
+  the deadband's inside/outside behavior defined operationally (§3.4:
+  outside → recompute either direction; inside → HOLD the standing
+  total); the derate default moved to the safe edge 1.16 with the
+  over-vs-under-derate asymmetry named. §3.3/§3.4/§6.2/§6.3/§8.3/§11.
+- **E2 (BLOCKER)** — excluded units' measured discharge was counted in
+  `work_w` and never subtracted: on a traverse night the participants
+  were commanded to serve the whole evening ON TOP of the traverse's
+  800 W — a linear ramp to cap in ~6 ticks and a standing multi-kW
+  export all evening; the same path was operator-reachable via the C16
+  stop route (claim a pod, watch the program fight you). Fixed by the
+  `elsewhere_w` term: `desired_output = work_w − Σ_excluded
+  max(0, battery_watts)`, identically zero when nothing is excluded, one
+  rule for every flavor of non-participant flow. §3.3/§5.1/§6.1/§6.2/
+  §7.3/T-ELS-LOAD-SOURCE.
+- **E3 (MAJOR)** — age-based evidence gates cannot see fresh-stamped
+  FROZEN words, and the identity's Σbattery term converts a stuck word
+  into a commanded ramp. Fixed by the plausibility guard: P1 the frozen
+  word (a grid word unchanged across `frozen_word_ticks` while its
+  unit's battery word moved beyond `frozen_flow_delta_w` — and the
+  mirror), P2 the one-sided reconciliation (a fleet battery move ≥
+  `delivery_move_floor_w` answered by < `exchange_move_floor_w` of
+  exchange movement — absence of response, never excess, so a kettle
+  cannot trip it); both → `grid_evidence_implausible` → withdraw;
+  frozen-word plants added to the simulator. §3.3/§6.2/§11/§13.
+- **E4 (MAJOR)** — a kernel-denied participant (temperature, cells,
+  faults — deny reasons outside this program's skip vocabulary) kept
+  receiving its full share, zeroed every tick, with import standing at
+  that share indefinitely. Fixed by the non-delivery drop: a participant
+  below `delivery_pass_fraction` (0.5) × its commanded share for
+  `non_delivery_ticks` (3) consecutive ticks is excluded
+  `not_delivering`, its measured flow rides `elsewhere_w`, and the share
+  redistributes; re-entry is the §5.3 join rule. §6.2/§6.3/§11/§13.
+- **E5 (MAJOR)** — the per-unit claim exclusion raced at the sibling's
+  renewal seam: one failed calibration tick left the traversing pod
+  legitimately unclaimed at this program's read, this program claimed
+  the gap, and the calibration adviser's next submission ABORTED the
+  traverse for the night (its own skip-if, no retry). Fixed by the
+  claim-settle debounce: a unit enters the participant set only after
+  2 × `intent_ttl_s` (20 s) continuously claim-free; inside the
+  debounce it renders `claim_settling` and its flow rides `elsewhere_w`.
+  The interleaving is named in §14-1's panel answer and pinned by
+  T-ELS-SKIP-IF's scripted renewal-gap leg. §7.1/§6.2/§13/§14.
+- **E6 (MAJOR)** — the netting verification was sequencing discipline
+  only: nothing refused `mode: act` without the evidence, and on a
+  non-netting meter the economics INVERT (shared watts sold at 2.0 c
+  against imports still bought at 30.77 c — an automated ~28.77
+  c-per-shared-kWh loss). Ruled: the phase MAP stays non-control-blocking
+  (correctly), the NETTING cross-check is COMMISSIONING-BLOCKING —
+  `act_netting_evidence` names the evidence path, validation refuses
+  `mode: act` without it, boot degrades a missing file to advise loudly
+  (the A6 receipts shape, offline-pure validation); the one conscious
+  departure from C15's no-receipt ruling, on physics (the tariff
+  direction), not on novelty of write. §10/§11/§12/§15-5. Severity
+  preserved at MAJOR per the coordinator's instruction.
+- **E7 (MAJOR)** — the re-split moves watts to lower per-pod load
+  points, deeper into the 63–86% partial-load collapse: convergence is
+  bought with a ~3–5% pack-energy premium, falsifying v1.0's "no watt is
+  ever spent for it" pin. Fixed: the pin re-worded ("no watt is ever
+  EXPORTED for it", §0), the premium priced in §5.1 where it is paid,
+  and §5.3's participant rule made explicitly EFFICIENCY-AWARE (larger
+  shares on fewer pods — §1.1's own case) as the standing mitigation.
+  §0/§1.1/§2/§5.1/§5.3/§14-3.
+- **E8 (MAJOR)** — clamp/hysteresis renormalization was unspecified: a
+  latched participant clamped UP to the floor could push Σ shares past
+  the commanded total. Fixed by the pinned order: the latch governs
+  MEMBERSHIP only; clamp per-pod, then renormalize the unclamped so
+  Σ = `commanded_total_w` exactly (the `_apply_fleet_limit` shape);
+  arithmetic outranks the latch when clamped floors alone exceed the
+  total. The invariant is a named test. §5.3/§6.2/§13.
+- **E9 (MINOR)** — `within_tolerance` was undefined and self-contradictory
+  (the §8.3 example rendered a 90 W import inside [−150, +100] as
+  false). Fixed: defined as §3.4's deadband state and nothing else —
+  projection-only, never a distinct stop; the example corrected and the
+  definition pinned beside it. §3.4/§6.3/§8.3.
+- **E10 (MINOR)** — `grid_telemetry_max_age_s` was a third freshness key
+  that could drift from the kernel's 3.0 s. Fixed by removal: the rollup
+  reads `policy.max_telemetry_age_s` directly — one freshness truth; the
+  absence of the key is itself a named test. §3.3/§11/§13.
+- **E11 (MINOR)** — the test-matrix gaps, folded with their parents: the
+  frozen-telemetry plants (E3), the excluded-unit double-count leg (E2),
+  the kernel-deny redistribution leg (E4), the renewal-gap race (E5),
+  and — regardless — the HANDOVER settle-lag leg: taking over from
+  autonomy, the ~10 s settle produces an import-side excursion asserted
+  bounded (tolerance + settle × commanded rate). §13.
+- **E12 (NOTE)** — if the traversing pod is the KITCHEN pod, energy
+  (not power) bounds the evening: the reduced fleet's usable figure
+  corrected to ~6.9 kWh (lhs+rhs, 0.75 × 9,200 Wh; ~7.5 kWh when rhs
+  traverses — v1.0's ~7.1 was neither pair), and the sub-floor tail is
+  the pods' OWN autonomy plus import, never import alone. §6.4/§7.3.
+- **E13 (NOTE)** — a dead garage-phase GRID word disables the program
+  every evening (the fail-closed rollup). The consequence is now stated
+  aloud as ACCEPTED in §10, with the nightly alert naming the phase and
+  the commissioning run verifying all three grid words' health before
+  the first act evening. §10.
+- **E14 (NOTE)** — `delivery_bias.py`'s header pins "nothing consumes
+  it": the derate's graduation from its projection is a doctrine change,
+  now named as such in §16 (the figure reaches this program through
+  config, the estimator stays passive). And the structural ~15% delivery
+  overshoot means wire watts exceed every cap (2,500 commanded →
+  ~2,900 W delivered) — stated in §5.2 so nobody is surprised by the CT.
+  §5.2/§16.
+
+**Reviewer rulings, recorded verbatim:**
+
+1. "Control basis NOT sound as written (E1/E3 — stale words bounded to
+   one intent's watts, frozen words the real hazard)."
+2. "Traverse-overlap policy sound but its arithmetic not (E2/E5 before
+   §14-1 can be answered sufficient)."
+3. "Engagement-on-work transient genuinely cheap (~1-2 Wh ≈ 0.1c) and
+   the correct reading of the operator's ask — but the zero-cost pin
+   must be re-worded (E7) and the value case rests on stranded-energy
+   recovery (2.8x evening capability), which stands on its own."
