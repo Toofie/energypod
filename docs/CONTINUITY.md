@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the battery health-watch research phase complete — reset truth pinned, rhs the prime suspect, two Wave-0 monitor bugs found, the ladder designed)
+Last updated: 2026-08-25 (Australia/Brisbane; the health-watch contract v1.1 committed with the panel's fifteen amendments — Wave 0 implementation starting)
 
 ## Purpose
 
@@ -375,6 +375,60 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (health-watch CONTRACT COMMITTED, WAVE 0 STARTING —
+  2f1fd51, docs/DESIGN_BATTERY_HEALTH_WATCH.md, CONTRACT v1.1, 1348
+  lines): the design-contract agent folded the adversarial panel's
+  fifteen amendments; §20 carries the amendment log with both rulings
+  VERBATIM. Four author pushbacks were ACCEPTED by the coordinator:
+  hybrid receipts; failed_write counts toward the cap; no
+  auto-escalation knob; the grid-import quiet gate. NOW STARTING: Wave
+  0 implementation — the two recovery-monitor fixes, each with tests
+  (the ~25 W self-charge deadband per §3.1; coherence-judged-on-delivery
+  per §3.2). Stages C/P/R implementation waves follow after the Wave 0
+  review. The calibration-cycling program design (its own separate
+  contract, per panel A14) queues after the health-watch waves, or in
+  parallel if capacity allows.
+
+- 2026-08-25 (health-watch adversarial panel — CONTRACT v1 VERDICT:
+  IMPLEMENTABLE-WITH-AMENDMENTS, NOTHING UNSAFE): the values {0,1}
+  constraint is structural end-to-end; every identified gap is
+  conservative toward not-writing. FIFTEEN AMENDMENTS (six MAJOR): A1
+  deadline arithmetic; A2 recovered-unproven rungs; A3 the verdict
+  matrix — Stage R's reach pinned (fail_no_response == still +
+  echo_matches_write; the not-served class is the honest limit, open
+  question 7); A4 interrupted-composite restart alert; A5 resume-side
+  lease adoption; A6 config-enforced auto receipts. RULINGS: re-arm
+  AFFIRMED with A2+A6 as conditions — the ONLY automation arm
+  authority ever composed; crash-SAFE at every arrow, crash-HONEST
+  completed by A4/A5.
+
+- 2026-08-25 (cycling research — SHOULD WE CYCLE THE BATTERIES;
+  both agents read-only, no code): LOCAL EVIDENCE — the site's own
+  PVOutput history mined back to 2024 (getextended.jsp era map, 29 API
+  requests): DEEP daily cycles through ~2025 (5–25 % floors, the old
+  one-per-3rd-night 2000 W rotation) with no catastrophe; 2026 went
+  shallow; the pods that STOPPED cycling are exactly the pathological
+  ones — lhs still cycles 67→100 daily and is the healthy one; mid
+  pinned at EXACTLY 100 % since ~May 2026 while still flowing
+  3.3 kWh/day (SoC-ESTIMATE pathology with working control); rhs 100 %
+  of samples ≥97 %. SCIENCE (sourced: Victron BYD page, EFT guideline,
+  the photovoltaikforum 590-post mega-thread, the sarnau BMU decoder,
+  BYD warranty PDFs): the two-anchor model confirmed — top anchor =
+  true full with CCL→0 (the site's daily law provides it;
+  charge-limit-0 W observed live); bottom anchor near 10 % empty is
+  NEVER provided. The April-class symptom is documented in the German
+  thread: cells hit the 3.65 V ceiling, displayed SoC 100 % while
+  blocks are not full, a self-reinforcing loop (reported-full → PCS
+  stops charge → charge never terminates → calibration/balancing never
+  runs). Victron documents a per-module ~1 A/~50 W sensing threshold —
+  rhs hovers in that band. POLICY: one pod at a time, quarterly
+  default, discharge to the 5–10 % ANCHOR at ~0.2 C (~800 W) then a
+  full slow recharge with taper + 30–60 min at full for the balancer;
+  partial cycles anchor NOTHING (a 30–40 % floor is diagnostic-only —
+  corrected); warranty math ~0.4 %/year of the ~3000-EFC budget —
+  free. The calibration program will be a SEPARATE contract beside the
+  health-watch, per panel A14.
 
 - 2026-08-25 (battery health-watch / nightly reset program — RESEARCH
   PHASE COMPLETE; two parallel read-only agents, NO code changed): the
