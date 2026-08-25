@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; health-watch Stage R live in the advise posture — the complete program runs tonight; the calibration implementation wave is the last build)
+Last updated: 2026-08-25 (Australia/Brisbane; both programs commissioned and live — the health-watch's first complete run tonight 23:00, mid's first calibration traverse tomorrow 15:00)
 
 ## Purpose
 
@@ -375,6 +375,50 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (calibration program COMMITTED, COMMISSIONED, AND LIVE —
+  0b02c36, 27 files +6845; controller restarted as harness-managed
+  task bej6q6y8u, boot clean; BOTH programs verified live read-only:
+  health-watch stages [census, probe, recovery] phase await_window
+  (window 23:00 tonight) AND calibration mode act, window
+  15:00–22:30, phase idle, the one-shot STANDING —
+  request_measurement {unit: mid, note: 2026-08-25 operator request,
+  consumed: false}): COMMISSIONING BASIS — the operator's explicit
+  "complete everything — auto-recovery, calibration cycling,
+  everything" directive; §10 step 2 executed (mode act + the C6
+  one-shot for mid — the textbook case). REVIEW — source-scan: ZERO
+  0x8000/debug-mode references in calibration.py; the only dispatch
+  reach is the injected facade twin; three window layers with every
+  stop non-renewing and the no-intent-at-midnight test. GATES: 2989
+  backend (+55), 1049 web (+17), ruff + mypy strict clean, tsc +
+  build green. NOTABLE RESOLUTIONS — the one-shot's once-only property
+  implemented as a DURABLE CONSUMPTION FACT (a restart cannot
+  re-consume); the stand-down acknowledge as an audited interactive
+  REST route; advise composes display-only on observe-only
+  deployments (no runtime toggle exists); the History morning-facts
+  entry rides the projection's morning block; the rest/mcp
+  maintenance-word bans consciously widened by EXACTLY the two status
+  surfaces; the I10 allowlist revision (calibration reads
+  actuation_incoherent as skip-if-context only). THE EVENT SCHEDULE
+  NOW STANDING — TONIGHT 23:00–23:45: the health-watch's FIRST
+  complete run (census always; probe if the operator armed this
+  evening; recovery in advise — zero writes); tomorrow morning:
+  evaluate the first rows. TOMORROW 14:00: the calibration plan
+  consumes mid's one-shot (calibration_trigger_evaluated, due_waived);
+  15:00–22:30: mid's first measurement traverse (800 W discharge,
+  floor 10, energy bound, deadline; the durable traverse-opened row
+  lands before the first intent); the close rides the next refill
+  (night writer absent by config — solar's midday charge to 100 is
+  the expected top anchor, C14's dependency stated on the card);
+  graduation on the measurement record. The coordinator monitors both
+  events and reports. REMAINING (the honest open end) — recovery's
+  AUTO posture awaits a genuinely flagged unit (census
+  stuck_suspected AND probe fail_no_response), armed rows, and the
+  operator's go for the §16 step-5 supervised night (checklist held;
+  evidence files to be pre-created per the A6 chicken-and-egg note);
+  the deferred round-close doc sweep (§15 items 1/2/4); and the three
+  standing operator questions (always-rhs; rhs capacity; Fronius
+  Battery Control).
 
 - 2026-08-25 (health-watch STAGE R COMMITTED AND LIVE — c3532ae, 21
   files +3621/−166; controller restarted as harness-managed task
