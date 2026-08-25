@@ -871,13 +871,24 @@ class CalibrationAdviser:
             plan.klass = self._classify(plan)
             plan.kind = KIND_ROUTINE if plan.anchored else KIND_MEASUREMENT
             plans[unit_id] = plan
-        # Selection (§3.3): the one-shot overrides SELECTION ONLY — every
-        # class gate still applies; the waiver of `due` is recorded.
+        # Selection (§3.3): the one-shot overrides SELECTION ONLY — the
+        # waiver is of the `due` requirement, and `evidence_short` is that
+        # requirement's unjudgeability (§3.1), so the named unit's class is
+        # derived with the waiver in force (§10 step 0: mid-first
+        # commissioning is blocked only until this one-shot exists).  Every
+        # §3.2 class gate still applies on the evidence the window holds —
+        # the lhs-exclusion and the rhs-class probe ladder defer verbatim.
         if request is not None and not consumed_prior:
             named_plan = plans.get(request[0])
-            if named_plan is None or named_plan.vector.evidence_short:
+            if named_plan is not None:
+                named_plan.klass = self._classify(named_plan, due_waived=True)
+            if named_plan is None:
                 reason = "request_unit_not_eligible"
-            elif named_plan.klass in {CLASS_DEFERRED_PROBE, CLASS_NO_CONTROL_EVIDENCE}:
+            elif named_plan.klass in {
+                CLASS_DEFERRED_PROBE,
+                CLASS_NO_CONTROL_EVIDENCE,
+                CLASS_EXCLUDED_CYCLES,
+            }:
                 reason = named_plan.klass
             else:
                 selected = request[0]
@@ -956,15 +967,26 @@ class CalibrationAdviser:
             )
         )
 
-    def _classify(self, plan: _UnitPlan) -> str:
-        """§3.2's class derivation, in evaluation order — from data, not ids."""
+    def _classify(self, plan: _UnitPlan, *, due_waived: bool = False) -> str:
+        """§3.2's class derivation, in evaluation order — from data, not ids.
+
+        ``due_waived`` is the one-shot's lens (§3.3/§10 step 0): the waiver
+        is of the ``due`` requirement, and ``evidence_short`` is §3.1's
+        unjudgeability OF ``due`` — so the waiver subsumes it and the class
+        gates judge on the evidence the window holds.  The lhs-exclusion and
+        the rhs-class probe ladder stand exactly as written either way: a
+        young window is not a refused window (the exclusion sees fewer
+        dates and cannot exclude — the conservative direction; the
+        throughput ladder counts the dates that exist).
+        """
         trigger = self._settings.trigger
         if plan.sub_floor_dates >= trigger.cycles_daily_min_days:
             return CLASS_EXCLUDED_CYCLES
-        if plan.vector.evidence_short:
-            return CLASS_EVIDENCE_SHORT
-        if not plan.vector.due:
-            return CLASS_NOT_DUE
+        if not due_waived:
+            if plan.vector.evidence_short:
+                return CLASS_EVIDENCE_SHORT
+            if not plan.vector.due:
+                return CLASS_NOT_DUE
         if plan.throughput_days >= trigger.throughput_min_days:
             return CLASS_ELIGIBLE
         # Throughput evidence absent: the rhs-class interlock — a passing

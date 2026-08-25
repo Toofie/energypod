@@ -587,7 +587,100 @@ async def test_request_measurement_selects_once_and_waives_due_only() -> None:
     assert row3["due_waived"] is None  # the waiver never applied
 
 
-# --- the traverse ---------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_one_shot_bypasses_the_quiescence_but_keeps_the_hard_gates() -> None:
+    """The §10 step-0 panel ruling, as a test: the one-shot waives the
+    ``due`` requirement — and ``evidence_short`` is that requirement's
+    unjudgeability (§3.1), so the operator-named unit's class derives from
+    the evidence the young window holds (annotated by its ``horizon_days``),
+    KEEPING both hard gates exactly as written.
+
+    (a) a young horizon with throughput evidence on >= 3 dates SELECTS the
+        named unit with the waiver recorded;
+    (b) two throughput dates and no probe row -> ``deferred_probe_required``
+        (the rhs-class gate defers the operator's request verbatim, and the
+        request is NOT consumed — it stands for the night that passes it);
+    (c) the same young window UNLOCKED by a passing probe row (C11);
+    (d) the lhs-exclusion fires on the available evidence alone — a young
+        window is not a refused window, and it refuses the wrong direction.
+    """
+    today = date(2026, 8, 25)
+
+    def young_rollups(days: int, *, watts: float, deep: bool = False) -> tuple[Any, ...]:
+        # Full PRIOR days: the plan tick at 14:00 has not seen today's later
+        # hours, so a "day" of evidence ends at the plan instant.
+        rows: list[Any] = []
+        for offset in range(1, days + 1):
+            day = today - timedelta(days=offset)
+            for hour_of_day in (6, 12, 18):
+                soc = 20.0 if deep else 100.0
+                rows.append(
+                    rollup("mid", hour(day, hour_of_day), soc_min=soc, watts_mean=watts)
+                )
+        return tuple(rows)
+
+    settings = make_settings(request_measurement=("mid", "2026-08-25 operator request"))
+
+    # (a) three throughput dates: the quiescence does not defer the request.
+    adviser, handles = make_adviser(
+        history=FakeHistory(rollups=young_rollups(3, watts=450.0)), settings=settings
+    )
+    await adviser.tick()
+    row = payload_of(events(handles["audit"], "calibration_trigger_evaluated")[0])
+    assert row["selected"] == "mid"
+    assert row["due_waived"] == "request_measurement"
+    units = {entry["unit_id"]: entry for entry in row["units"]}
+    assert units["mid"]["horizon_days"] == 3  # the honest young-window annotation
+    assert units["mid"]["evidence_short"] is True
+
+    # (b) two throughput dates, no probe row: the rhs-class gate defers.
+    adviser2, handles2 = make_adviser(
+        history=FakeHistory(rollups=young_rollups(2, watts=450.0)), settings=settings
+    )
+    await adviser2.tick()
+    row2 = payload_of(events(handles2["audit"], "calibration_trigger_evaluated")[0])
+    assert row2["selected"] is None
+    assert row2["reason"] == cal.CLASS_DEFERRED_PROBE
+    assert row2["request_measurement"]["consumed"] is False  # the request stands
+
+    # (b2) the deferred request is retried (not burned) once evidence lands.
+    adviser2b, handles2b = make_adviser(
+        history=FakeHistory(rollups=young_rollups(2, watts=450.0)),
+        audit=FakeAudit(seeded=list(handles2["audit"].appended)),
+        settings=settings,
+    )
+    await adviser2b.tick()
+    row2b = payload_of(events(handles2b["audit"], "calibration_trigger_evaluated")[0])
+    assert row2b["request_measurement"]["consumed_prior"] is False
+
+    # (c) the same young window, UNLOCKED by a passing probe row (C11).
+    probe_pass = seeded_row(
+        "health_probe_completed",
+        "mid",
+        {"verdict": "pass", "night": (today - timedelta(days=1)).isoformat(), "as_of": "x"},
+    )
+    adviser3, handles3 = make_adviser(
+        history=FakeHistory(rollups=young_rollups(2, watts=0.0)),
+        audit=FakeAudit(seeded=[probe_pass]),
+        settings=settings,
+    )
+    await adviser3.tick()
+    row3 = payload_of(events(handles3["audit"], "calibration_trigger_evaluated")[0])
+    assert row3["selected"] == "mid"
+    assert row3["due_waived"] == "request_measurement"
+
+    # (d) the exclusion fires on the available evidence alone.
+    adviser4, handles4 = make_adviser(
+        history=FakeHistory(rollups=young_rollups(5, watts=450.0, deep=True)),
+        settings=settings,
+    )
+    await adviser4.tick()
+    row4 = payload_of(events(handles4["audit"], "calibration_trigger_evaluated")[0])
+    assert row4["selected"] is None
+    assert row4["reason"] == cal.CLASS_EXCLUDED_CYCLES
+
+
+
 
 
 def traverse_handles(**observation_kwargs: Any) -> tuple[cal.CalibrationAdviser, dict[str, Any]]:

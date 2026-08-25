@@ -167,7 +167,11 @@ def test_absent_block_composes_nothing_and_defaults_commission() -> None:
     assert parsed.battery_calibration.window_local == "15:00"
     assert parsed.battery_calibration.traverse_end_local == "22:30"
     assert parsed.battery_calibration.plan_local == "14:00"
-    # The §10 commissioning file itself: the block present at advise.
+    # The §10 commissioning file itself: the block is present and LAWFUL at
+    # whatever step of the ladder the operator's revision holds — the mode
+    # and the one-shot are the operator's sequencing, not this suite's pin
+    # (step 1 shipped advise; the live revision has since commissioned the
+    # step-2 act posture with mid's one-shot standing).
     from pathlib import Path
 
     import yaml
@@ -177,8 +181,11 @@ def test_absent_block_composes_nothing_and_defaults_commission() -> None:
     )
     parsed_live = _validate(live)
     assert parsed_live.battery_calibration is not None
-    assert parsed_live.battery_calibration.mode == "advise"
-    assert parsed_live.battery_calibration.request_measurement is None
+    assert parsed_live.battery_calibration.mode in {"advise", "act"}
+    if parsed_live.battery_calibration.request_measurement is not None:
+        assert parsed_live.battery_calibration.request_measurement.unit in {
+            unit.unit_id for unit in parsed_live.units
+        }
 
 
 def test_no_runtime_toggle_for_mode_exists() -> None:
