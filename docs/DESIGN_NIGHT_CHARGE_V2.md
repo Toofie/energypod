@@ -194,7 +194,11 @@ must land on the incumbent's behavior, not on an empty pack.
   wrong figure surfaces as early/late completion, and its error direction
   is named: an UNDERSTATED capacity overstates headroom and under-charges
   (the wrong way), so confirming rhs's true Wh matters more than confirming
-  the 60-cell units'.
+  the 60-cell units'. **A second consumer now leans on this assumption**
+  (DESIGN_CALIBRATION_CYCLING §7/§12-2): the calibration traverse's deadline
+  rate and its lying-word energy bound both pace from the same map, and that
+  contract's config validation refuses a `battery_calibration` map that
+  drifts from this one — one physical fact, enforced at both keys.
 - **ASSUMPTION:** `charge_efficiency: 0.9` (round-trip AC→stored, unlabeled
   vendor figure — the derate's role is directional conservatism, not
   measurement).

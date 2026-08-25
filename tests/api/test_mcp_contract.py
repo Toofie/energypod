@@ -41,8 +41,16 @@ async def test_default_mcp_surface_is_read_only_and_has_no_hidden_control_tools(
 
     assert {"get_snapshot", "get_health", "get_recent_audit"} <= names
     assert "dispatch_intent" not in names
-    forbidden = ("arm", "policy", "debug", "maintenance", "register", "modbus", "calibration")
+    # "calibration" stays forbidden as a MAINTENANCE word (no vendor
+    # EE-parameter register surface may ever appear) with one deliberate
+    # exception: the commissioned battery-calibration program's own
+    # READ-ONLY projection tool (DESIGN_CALIBRATION_CYCLING §8 -- MCP
+    # observes; it does not cycle, and the tool's own guidance says so).
+    forbidden = ("arm", "policy", "debug", "maintenance", "register", "modbus")
     assert all(not any(term in name.lower() for term in forbidden) for name in names)
+    assert [name for name in names if "calibration" in name.lower()] == [
+        "get_calibration_status"
+    ]
 
 
 @pytest.mark.asyncio

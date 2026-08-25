@@ -1241,6 +1241,155 @@ def _wall_minute(value: str) -> int:
     return int(value[:2]) * 60 + int(value[3:5])
 
 
+# DESIGN_CALIBRATION_CYCLING §1.1: Victron documents a per-module ~1 A
+# (~50 W) sensing threshold — sub-threshold currents report as 0 W — and the
+# traverse must clear 3 modules' worth with margin (the named floor).
+_CALIBRATION_SENSING_FLOOR_W: Final[int] = 3 * 50
+
+
+class CalibrationRequestMeasurementConfig(_FrozenModel):
+    """C6's guarded one-shot: a config-borne, audited operator request that
+    the named unit's NEXT ``plan_local`` select it as target, waiving the
+    ``due`` requirement ONLY (every class gate still applies).
+
+    Consumed at the plan tick it names; the waiver rides the trigger row.
+    Absent key = no request stands.  This is SELECTION authority only: it
+    never flips mode, never bypasses a guard, never outlives one consumption.
+    """
+
+    unit: NonEmpty
+    note: NonEmpty
+
+    @field_validator("unit", "note")
+    @classmethod
+    def validate_text(cls, value: str, info: object) -> str:
+        name = getattr(info, "field_name", "request_measurement")
+        return _plain(value, label=name)
+
+
+class CalibrationTriggerBlockConfig(_FrozenModel):
+    """DESIGN_CALIBRATION_CYCLING §7: the ``trigger:`` keys (§3's X/N)."""
+
+    trigger_floor_pct: Annotated[StrictFloat, Field(ge=0, le=100)] = 30.0
+    trigger_after_days: Annotated[StrictInt, Field(ge=1, le=3650)] = 60
+    eligibility_window_days: Annotated[StrictInt, Field(ge=1, le=90)] = 14
+    cycles_daily_floor_pct: Annotated[StrictFloat, Field(ge=0, le=100)] = 25.0
+    cycles_daily_min_days: Annotated[StrictInt, Field(ge=1, le=90)] = 5
+    min_daily_throughput_wh: Annotated[StrictFloat, Field(gt=0)] = 1000.0
+    throughput_min_days: Annotated[StrictInt, Field(ge=1, le=90)] = 3
+    probe_pass_window_days: Annotated[StrictInt, Field(ge=1, le=90)] = 7
+
+
+class CalibrationTraverseBlockConfig(_FrozenModel):
+    """DESIGN_CALIBRATION_CYCLING §7: the ``traverse:`` keys (§4's rate and
+    the C8/C9 bounds)."""
+
+    floor_pct: Annotated[StrictFloat, Field(ge=5, le=10)] = 10.0
+    discharge_w: PositiveStrictInt = 800
+    min_discharge_w: PositiveStrictInt = 200
+    intent_ttl_s: Annotated[StrictFloat, Field(gt=0, le=300)] = 10.0
+    assumed_delivery_frac: Annotated[StrictFloat, Field(gt=0, le=1)] = 0.8
+    integration_max_gap_s: Annotated[StrictFloat, Field(gt=0, le=60)] = 10.0
+    energy_margin_wh: Annotated[StrictFloat, Field(gt=0)] = 100.0
+    metering_allowance_wh: Annotated[StrictFloat, Field(ge=0)] = 100.0
+    assumed_capacity_wh: dict[NonEmpty, PositiveStrictInt] | None = None
+
+
+class CalibrationTopAnchorBlockConfig(_FrozenModel):
+    """DESIGN_CALIBRATION_CYCLING §7: the ``top_anchor:`` keys (§5)."""
+
+    taper_deadline_local: NonEmpty = "12:00"
+    taper_soc_pct: Annotated[StrictFloat, Field(ge=50, lt=100)] = 99.0
+    taper_limit_w: NonNegativeStrictInt = 0
+    taper_sustain_s: Annotated[StrictInt, Field(ge=60, le=3600)] = 600
+    hold_min_s: Annotated[StrictInt, Field(ge=1800, le=3600)] = 2700
+    hold_float_w: PositiveStrictInt = 100
+    poor_surplus_kwh: PositiveFiniteFloat = 3.0
+
+    @field_validator("taper_deadline_local")
+    @classmethod
+    def validate_deadline(cls, value: str) -> str:
+        return _valid_policy_wall(value)
+
+
+class CalibrationMeasurementBlockConfig(_FrozenModel):
+    """DESIGN_CALIBRATION_CYCLING §7: the ``measurement:`` keys (§6)."""
+
+    reanchor_delta_pct: Annotated[StrictFloat, Field(gt=0, le=20)] = 2.0
+    floor_epsilon_pct: Annotated[StrictFloat, Field(gt=0, le=5)] = 2.0
+
+
+class BatteryCalibrationConfig(_FrozenModel):
+    """DESIGN_CALIBRATION_CYCLING §7: the ``battery_calibration:`` block.
+
+    Block-presence doctrine, the night pattern: a PRESENT block composes the
+    ``CalibrationAdviser`` (one tick per fleet cycle inside the existing
+    bounded supervision pass), the ``calibration_state`` snapshot key, the
+    ``calibration.cycle`` events, and the status route; an ABSENT block
+    composes NOTHING (byte-identical snapshot, 409 on the route).  There is
+    deliberately NO ``enabled`` key and NO runtime toggle for ``mode`` — the
+    authority ladder is climbed by config revision plus restart only, so the
+    console can never flip a traverse into existence.  ``mode: advise`` (the
+    default) computes and displays the trigger/eligibility and submits
+    NOTHING, ever; ``act`` is the operator's later revision (C15: no receipt
+    gate — the act is ordinary OPTIMIZER dispatch, the night-charge
+    precedent, no mode register, no arm).
+    """
+
+    # REQUIRED; one civil-time truth per site (A9), cross-checked against
+    # ``site.timezone`` on ``ControllerConfig``.
+    timezone: NonEmpty
+    mode: Literal["advise", "act"] = "advise"
+    window_local: NonEmpty = "15:00"
+    traverse_end_local: NonEmpty = "22:30"
+    plan_local: NonEmpty = "14:00"
+    request_measurement: CalibrationRequestMeasurementConfig | None = None
+    trigger: CalibrationTriggerBlockConfig = CalibrationTriggerBlockConfig()
+    traverse: CalibrationTraverseBlockConfig = CalibrationTraverseBlockConfig()
+    top_anchor: CalibrationTopAnchorBlockConfig = CalibrationTopAnchorBlockConfig()
+    measurement: CalibrationMeasurementBlockConfig = CalibrationMeasurementBlockConfig()
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, value: str) -> str:
+        value = _plain(value, label="timezone")
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone must be a valid IANA timezone") from exc
+        return value
+
+    @field_validator("window_local", "traverse_end_local", "plan_local")
+    @classmethod
+    def validate_walls(cls, value: str, info: object) -> str:
+        name = getattr(info, "field_name", "wall")
+        return _valid_policy_wall_named(value, label=f"battery_calibration.{name}")
+
+    @model_validator(mode="after")
+    def validate_wall_order(self) -> Self:
+        plan = _wall_minute(self.plan_local)
+        window = _wall_minute(self.window_local)
+        end = _wall_minute(self.traverse_end_local)
+        if not plan < window:
+            raise ValueError(
+                "battery_calibration.plan_local must sit strictly before window_local "
+                f"({self.plan_local} >= {self.window_local}): the plan resolves the "
+                "morning's taper deadline before the window opens"
+            )
+        if not window < end:
+            raise ValueError(
+                "battery_calibration.window_local must sit strictly before "
+                f"traverse_end_local ({self.window_local} >= {self.traverse_end_local}): "
+                "a window with no span can never fit a traverse"
+            )
+        if end >= plan + 24 * 60:
+            raise ValueError(
+                "battery_calibration.traverse_end_local must land before plan_local + 24h "
+                f"({self.traverse_end_local} does not): the traverse is one civil day's fact"
+            )
+        return self
+
+
 def _wrap_minutes_ahead(from_minute: int, to_minute: int) -> int:
     """Civil minutes from one wall to a later-or-wrapping one, wrap-aware."""
     return (to_minute - from_minute) % 1440
@@ -1440,6 +1589,14 @@ class ControllerConfig(_FrozenModel):
     # block Stage R composes, and the night/schedule windows the program's
     # quiet hour must be disjoint from.
     battery_health_watch: BatteryHealthWatchConfig | None = None
+    # DESIGN_CALIBRATION_CYCLING §7: the calibration-cycling block, declared
+    # LAST so its commissioning validator sees every block the program reads
+    # against — the site's timezone, the policy whose kernel bounds order the
+    # floor, the timing the TTL and integration bounds ride, the fleet whose
+    # capacities the bound sizes, the historian the trigger reads, the night
+    # and health-watch windows the traverse must land before, and the night
+    # capacity map that must stay ONE physical truth with this block's.
+    battery_calibration: BatteryCalibrationConfig | None = None
 
     @field_validator("timing")
     @classmethod
@@ -2194,6 +2351,258 @@ class ControllerConfig(_FrozenModel):
                     "can skip advise and the supervised night in one edit (A6)"
                 )
         return watch
+
+    @field_validator("battery_calibration")
+    @classmethod
+    def validate_battery_calibration(
+        cls, calibration: BatteryCalibrationConfig | None, info: ValidationInfo
+    ) -> BatteryCalibrationConfig | None:
+        """DESIGN_CALIBRATION_CYCLING §7: the commissioning gates for a
+        PRESENT calibration block (every gate binds to block-PRESENCE, the
+        night pattern; an ABSENT block changes nothing anywhere).
+
+        Each refusal names its own rule — the floor-band AND kernel-ordering
+        rule, the C12 set, the C8 SUM sizing, the C13 delivery-floor fit
+        check, and BOTH window checks with their arithmetic.  The rhs-class
+        path's prerequisite (the health watch with probe staged) is
+        deliberately NOT refused here: its absence refuses that PATH only —
+        the affected units defer ``no_control_evidence`` and the projection
+        says so (§3.2).
+        """
+        if calibration is None:
+            return calibration
+        values = info.data
+        fleet_units = {unit.unit_id for unit in values.get("units", ()) or ()}
+        request = calibration.request_measurement
+        if request is not None and request.unit not in fleet_units:
+            # C6's one-shot names a battery that exists: the refusal names
+            # the rule and the fleet (the pair is consumed at the next
+            # plan_local and never outlives one consumption).
+            raise ValueError(
+                "battery_calibration.request_measurement.unit must name a configured "
+                f"unit ({request.unit!r} is not in the fleet {sorted(fleet_units)}): "
+                "the guarded one-shot selects a target, never mints a battery (C6)"
+            )
+        site = values.get("site")
+        if site is not None and calibration.timezone != site.timezone:
+            raise ValueError(
+                "battery_calibration.timezone must equal site.timezone "
+                f"({calibration.timezone!r} != {site.timezone!r}): the traverse window is "
+                "a civil-time fact and a site keeps ONE civil-time truth (A9)"
+            )
+        traverse = calibration.traverse
+        trigger = calibration.trigger
+        policy = values.get("policy")
+        if calibration.mode == "act":
+            # The act is ordinary OPTIMIZER dispatch (C15: no receipt gate),
+            # but it is still DISPATCH — an observe-only composition can never
+            # actuate, and a site without its policy block has no bounds to
+            # traverse inside.
+            if values.get("mode") is not ControllerMode.WRITE_ENABLED:
+                raise ValueError(
+                    "battery_calibration.mode act requires mode write_enabled: the "
+                    "traverse is ordinary dispatch through the intent path, and an "
+                    "observe-only composition can never actuate (advise — the "
+                    "default — composes as the display-only program)"
+                )
+            if policy is None:
+                raise ValueError(
+                    "battery_calibration.mode act requires a policy block: the "
+                    "floor's kernel-ordering rule and the discharge bound derive "
+                    "from the commissioned policy"
+                )
+        if policy is not None:
+            # §4.3's ordering, a validated config fact: the adviser's stop and
+            # the kernel's backstop are ordered by construction — the refusal
+            # names both values and the science band.
+            if traverse.floor_pct < policy.minimum_soc_pct:
+                raise ValueError(
+                    "battery_calibration.traverse.floor_pct must sit at or above the "
+                    f"policy minimum_soc_pct ({traverse.floor_pct} < "
+                    f"{policy.minimum_soc_pct}): the floor fires pre-submission so the "
+                    "kernel's soc_below_discharge_floor never sees an at-or-below-floor "
+                    "intent — at the commissioned policy the only commissionable floor "
+                    "is EXACTLY the policy floor, the sourced band's [5, 10] conservative "
+                    "edge (documented cell-undervoltage risk at reported low SoC argues "
+                    "for keeping it)"
+                )
+            if traverse.discharge_w > policy.max_unit_discharge_w:
+                raise ValueError(
+                    "battery_calibration.traverse.discharge_w must not exceed the policy "
+                    f"max_unit_discharge_w ({traverse.discharge_w} > "
+                    f"{policy.max_unit_discharge_w}): the traverse is one bounded "
+                    "ordinary intent, never a path around the static limit"
+                )
+        # C12: a completed anchor must reset the trigger — the predicate is
+        # ``<=``, so equality still lets a cycle ending AT the floor reset it.
+        if trigger.trigger_floor_pct < traverse.floor_pct:
+            raise ValueError(
+                "battery_calibration.trigger.trigger_floor_pct must sit at or above "
+                f"traverse.floor_pct ({trigger.trigger_floor_pct} < {traverse.floor_pct}): "
+                "the trigger's predicate is <=, so below it a cycle ending AT the "
+                "floor would leave the pod immediately due again (C12)"
+            )
+        if trigger.eligibility_window_days < trigger.cycles_daily_min_days:
+            raise ValueError(
+                "battery_calibration.trigger.eligibility_window_days must sit at or "
+                f"above cycles_daily_min_days ({trigger.eligibility_window_days} < "
+                f"{trigger.cycles_daily_min_days}): the lhs-class exclusion cannot "
+                "demand more distinct dates than its own lookback holds (C12)"
+            )
+        if traverse.min_discharge_w < _CALIBRATION_SENSING_FLOOR_W:
+            raise ValueError(
+                "battery_calibration.traverse.min_discharge_w must sit at or above "
+                f"{_CALIBRATION_SENSING_FLOOR_W} W (got {traverse.min_discharge_w}): "
+                "Victron documents a per-module ~1 A / ~50 W sensing threshold — "
+                "sub-threshold currents report as 0 W — so the commanded rate must "
+                "clear 3 modules' worth with margin (rhs lives in that band)"
+            )
+        if traverse.discharge_w < traverse.min_discharge_w:
+            raise ValueError(
+                "battery_calibration.traverse.discharge_w must sit at or above "
+                f"min_discharge_w ({traverse.discharge_w} < {traverse.min_discharge_w}): "
+                "the rate clamp would be empty"
+            )
+        timing = values.get("timing")
+        if timing is not None:
+            if traverse.intent_ttl_s <= timing.control_period_s:
+                raise ValueError(
+                    "battery_calibration.traverse.intent_ttl_s must exceed "
+                    f"timing.control_period_s ({traverse.intent_ttl_s} <= "
+                    f"{timing.control_period_s}): the adviser renews exactly once per "
+                    "fleet cycle"
+                )
+            if traverse.integration_max_gap_s <= timing.control_period_s:
+                raise ValueError(
+                    "battery_calibration.traverse.integration_max_gap_s must exceed "
+                    f"timing.control_period_s ({traverse.integration_max_gap_s} <= "
+                    f"{timing.control_period_s}): the CT stream samples once per "
+                    "control cycle, so a smaller gap would exclude every interval (C9)"
+                )
+        # --- the capacity map: present, exactly the fleet, and ONE physical
+        # truth with the night block's (night-V2 §2.1's ruling, extended).
+        fleet_units = {unit.unit_id for unit in values.get("units", ()) or ()}
+        capacity = traverse.assumed_capacity_wh
+        if capacity is None:
+            raise ValueError(
+                "battery_calibration.traverse.assumed_capacity_wh is required: the "
+                "deadline rate and the lying-word energy bound both pace from the "
+                "per-unit capacity estimate (the estimate shapes pacing and the "
+                "bound, never safety)"
+            )
+        if set(capacity) != fleet_units:
+            missing = sorted(fleet_units - set(capacity))
+            stray = sorted(set(capacity) - fleet_units)
+            raise ValueError(
+                "battery_calibration.traverse.assumed_capacity_wh keys must be exactly "
+                f"the fleet units (missing: {missing or []}; names no battery: "
+                f"{stray or []}): a unit without an estimate has no traverse to pace"
+            )
+        night = values.get("night_charging")
+        if (
+            night is not None
+            and night.assumed_capacity_wh is not None
+            and dict(night.assumed_capacity_wh) != dict(capacity)
+        ):
+            raise ValueError(
+                    "battery_calibration.traverse.assumed_capacity_wh must EQUAL "
+                    "night_charging.assumed_capacity_wh when that block carries one "
+                    f"({dict(sorted(capacity.items()))} != "
+                    f"{dict(sorted(night.assumed_capacity_wh.items()))}): one physical "
+                    "fact, two keys would drift (night-V2 §2.1's ruling, extended to "
+                    "this consumer)"
+                )
+        # C8's SUM rule: the frozen-word stop must not cross the science
+        # band's 5% edge even behind an undercounting meter — the refusal
+        # names the whole sizing.
+        min_capacity = min(int(value) for value in capacity.values())
+        sum_wh = traverse.energy_margin_wh + traverse.metering_allowance_wh
+        band_edge_wh = (traverse.floor_pct - 5.0) / 100.0 * min_capacity
+        if sum_wh > band_edge_wh:
+            raise ValueError(
+                "battery_calibration.traverse: energy_margin_wh + "
+                f"metering_allowance_wh ({traverse.energy_margin_wh} + "
+                f"{traverse.metering_allowance_wh} = {sum_wh} Wh) must stay at or "
+                f"below (floor_pct - 5)/100 x min(assumed_capacity_wh) "
+                f"({traverse.floor_pct} - 5)/100 x {min_capacity} = "
+                f"{band_edge_wh:.1f} Wh: the frozen-word stop's physical depth is "
+                "floor - (margin + undercount)/capacity x 100, and a 2%-undercounting "
+                "meter's ~94 Wh across a ~4.7 kWh leg must still land inside the "
+                "sourced band's 5% edge (C8)"
+            )
+        # --- the C13 fit check at the DELIVERY floor: commanded watts are
+        # not delivered watts, and the divide names itself (the divide's
+        # natural unit is HOURS — Wh over W — so the window compares in
+        # seconds after the x 3600).
+        window_s = (
+            _wall_minute(calibration.traverse_end_local) - _wall_minute(calibration.window_local)
+        ) * 60
+        worst_case_s = (
+            (100.0 - traverse.floor_pct)
+            / 100.0
+            * min_capacity
+            / (traverse.discharge_w * traverse.assumed_delivery_frac)
+            * 3600.0
+        )
+        if worst_case_s > window_s:
+            raise ValueError(
+                "battery_calibration: the worst-case traverse does not FIT at the "
+                f"delivery floor — (100 - floor)/100 x min(capacity) / (discharge_w x "
+                f"assumed_delivery_frac) = (100 - {traverse.floor_pct})/100 x "
+                f"{min_capacity} / ({traverse.discharge_w} x "
+                f"{traverse.assumed_delivery_frac}) = {worst_case_s / 3600.0:.1f} h "
+                f"against the {window_s / 3600.0:.1f} h window "
+                f"({calibration.window_local}-{calibration.traverse_end_local}): widen "
+                "the window or lower the rate (C13)"
+            )
+        # --- BOTH window checks (§4.1b): the last intent dies by TTL long
+        # before any sibling window opens.
+        end_s = _wall_minute(calibration.traverse_end_local) * 60
+        expiry_s = end_s + traverse.intent_ttl_s
+        watch = values.get("battery_health_watch")
+        if watch is not None:
+            watch_open_s = _wall_minute(watch.window_local) * 60
+            boundary = watch_open_s if watch_open_s >= end_s else watch_open_s + 86_400
+            if expiry_s > boundary:
+                raise ValueError(
+                    "battery_calibration: traverse_end_local + intent_ttl_s "
+                    f"({calibration.traverse_end_local} + {traverse.intent_ttl_s} s) "
+                    f"must land at or before battery_health_watch.window_local "
+                    f"({watch.window_local}): the program may not bleed into the "
+                    "sibling's watch"
+                )
+        if night is not None:
+            for start_wall, _end_wall in night.window_local:
+                night_open_s = _wall_minute(start_wall) * 60
+                boundary = night_open_s if night_open_s >= end_s else night_open_s + 86_400
+                if expiry_s > boundary:
+                    raise ValueError(
+                        "battery_calibration: traverse_end_local + intent_ttl_s "
+                        f"({calibration.traverse_end_local} + {traverse.intent_ttl_s} s) "
+                        f"must land at or before the night_charging window open "
+                        f"({start_wall}): the program may not bleed into the night "
+                        "charge"
+                    )
+                if (
+                    _wall_minute(calibration.top_anchor.taper_deadline_local)
+                    <= _wall_minute(_end_wall)
+                ):
+                    raise ValueError(
+                        "battery_calibration.top_anchor.taper_deadline_local must sit "
+                        f"strictly after the night_charging window end wall "
+                        f"({calibration.top_anchor.taper_deadline_local} <= "
+                        f"{_end_wall}): the taper is a MORNING fact"
+                    )
+        # The trigger and the measurement are historian-backed: no
+        # degrade-to-single-instant path (the health-watch §9 precedent).
+        if values.get("plant_history") is None:
+            raise ValueError(
+                "battery_calibration requires the plant_history block: the trigger "
+                "(days-since-below-X over any horizon) and the measurement record are "
+                "historian-backed, and there is deliberately NO "
+                "degrade-to-single-instant path"
+            )
+        return calibration
 
     @model_validator(mode="after")
     def validate_write_topology(self) -> Self:

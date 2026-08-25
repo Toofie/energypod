@@ -1224,3 +1224,134 @@
 .home-health-parked-note {
   font-weight: 600;
 }
+
+/* --- Battery calibration (DESIGN_CALIBRATION_CYCLING section 9) ------------ */
+
+.home-cal-status {
+  margin: 0 0 0.25rem;
+}
+
+.home-cal-submits {
+  margin: 0 0 0.5rem;
+  font-size: 0.9rem;
+  color: #4a5568;
+}
+
+.home-cal-alert {
+  margin: 0.25rem 0;
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid #9b2c2c;
+  background: #fdf0ef;
+  border-radius: 0 0.4rem 0.4rem 0;
+  font-weight: 600;
+}
+
+.home-cal-units {
+  list-style: none;
+  margin: 0.25rem 0;
+  padding: 0;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.home-cal-unit {
+  display: grid;
+  grid-template-columns: 4rem 1fr;
+  grid-template-areas: "name class" "due due";
+  gap: 0.1rem 0.6rem;
+  align-items: baseline;
+  padding: 0.35rem 0.5rem;
+  border-radius: 0.4rem;
+  background: #f7fafc;
+}
+
+.home-cal-unit[data-tier="notice"] {
+  background: #fffaf0;
+}
+
+.home-cal-unit[data-tier="alert"] {
+  background: #fdf0ef;
+  border-left: 3px solid #9b2c2c;
+}
+
+.home-cal-unit-name {
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+.home-cal-class {
+  grid-area: class;
+}
+
+.home-cal-class[data-class="excluded_cycles_daily"] {
+  color: var(--ink-soft);
+}
+
+.home-cal-class[data-class="deferred_probe_required"],
+.home-cal-class[data-class="no_control_evidence"] {
+  color: #805ad5;
+}
+
+.home-cal-due {
+  grid-area: due;
+  font-size: 0.9rem;
+  color: #4a5568;
+}
+
+.home-cal-traverse {
+  margin: 0.35rem 0;
+  padding: 0.5rem 0.7rem;
+  border-left: 3px solid var(--active);
+  background: #ebf8ff;
+  border-radius: 0 0.4rem 0.4rem 0;
+}
+
+.home-cal-traverse[data-at-risk="true"] {
+  border-left-color: var(--warn);
+}
+
+.home-cal-traverse-line {
+  margin: 0 0 0.25rem;
+  font-weight: 600;
+}
+
+.home-cal-pinned {
+  margin: 0 0 0.15rem;
+  font-size: 0.9rem;
+  color: #4a5568;
+}
+
+.home-cal-stop-route {
+  margin: 0;
+  font-size: 0.9rem;
+  font-style: italic;
+  color: #4a5568;
+}
+
+.home-cal-close {
+  margin: 0.25rem 0;
+  font-size: 0.95rem;
+}
+
+.home-cal-last {
+  margin: 0.25rem 0;
+  font-size: 0.95rem;
+}
+
+.home-cal-last[data-tier="alert"] {
+  color: #9b2c2c;
+  font-weight: 600;
+}
+
+.home-cal-request {
+  margin: 0.25rem 0;
+  font-size: 0.9rem;
+  color: #4a5568;
+}
+
+.home-cal-event-note {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  color: #4a5568;
+  font-style: italic;
+}

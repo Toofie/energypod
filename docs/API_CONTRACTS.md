@@ -1996,3 +1996,42 @@ participate without it; the append is durable-first, and an audit failure refuse
 (3) the toggle flips PARTICIPATION only — it can never change `max_charge_from_export_w`, relax a
 commissioning gate, promote a tier, or change the mode — and the adviser still yields to every
 higher-priority source, unchanged.
+
+## Battery calibration cycling (the periodic anchor traverse — DESIGN_CALIBRATION_CYCLING)
+
+Block presence: a `battery_calibration:` block composes the `CalibrationAdviser` (one
+tick per fleet cycle inside the existing supervision pass), the snapshot's
+feature-detected `calibration_state` key, the `calibration.cycle` bus events, and the
+status route; an ABSENT block composes NOTHING (byte-identical snapshot, and
+`GET /api/v1/calibration/status` refuses 409 `calibration_not_commissioned`). There is
+no `enabled` key and no runtime toggle for `mode` — the authority ladder is climbed by
+config revision plus restart only.
+
+- **Source pin.** The traverse submits ordinary short-TTL `OPTIMIZER` DISCHARGE intents
+  through the composition-internal facade twin `submit_calibration_intent` (the
+  `submit_night_intent` pattern exactly: source pinned, intent-id prefix `cal-`, same
+  audit/publication contract, never routed on REST or MCP) under the principal
+  `energypod:calibration-adviser` (observe + dispatch, non-interactive, site-bound).
+  The program holds NO mode-register reach of any kind — values 2-6 of `0x8000` stay
+  permanently prohibited, and the anchor is provided with ordinary dispatch or it is
+  not provided.
+- **Snapshot key `calibration_state`** (§8): `{mode, submits?, window, phase, target?,
+  reason?, due_waived?, as_of, units[], last_cycle, morning, request_measurement,
+  traverse?, close?}` — `mode: advise` renders the whole projection with
+  `submits: "never"` named beside it; `units[]` carry the class/due/cycle-state vector
+  with `horizon_bounded` on every due figure; `traverse` carries the live line with the
+  pinned §0 sentence and the standing stop route ("to stop tonight's traverse, claim
+  the pod — any manual command preempts instantly").
+- **Bus event `calibration.cycle`** (§8): notice on `floor_reached` and the
+  inconclusive classes, alert on every `floor_miss_*` / `taper_never_observed` /
+  `reanchor_not_observed`, resolved on a routine anchored close. No control path
+  subscribes.
+- **Routes.** `GET /api/v1/calibration/status` (observe) serves the projection;
+  `POST /api/v1/units/{unit_id}/calibration/standdown/acknowledge` (arm, interactive
+  operators only) writes the §6.3 stand-down reset as a durable audit row — the
+  acknowledge-inhibit path, never control. A deployment without the block refuses 409
+  `calibration_not_commissioned` on both.
+- **MCP observes; it does not cycle.** The read-only `get_calibration_status` tool
+  carries the projection only — no mutation tool exists, and the tool's guidance names
+  it: calibration cycling is a commissioned program, not an agent act; recommend the
+  operator surfaces.

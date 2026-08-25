@@ -227,6 +227,16 @@ class SimulatedEnergyPod:
         # the deterministic export scenario the excess-solar bound reads.
         self._scripted_grid_power_w = 0
         self._scripted_load_power_w = 0
+        # Calibration-cycling scenario hooks (DESIGN_CALIBRATION_CYCLING
+        # section 11/T-CAL-SIMULATOR): the SoC-word behavior script, the
+        # sensing-band meter floor, the CCL taper collapse, and the pinned
+        # cell spread.
+        self._soc_word_script: str | None = None
+        self._soc_word_step_at_wh = 0.0
+        self._soc_word_step_to_pct = 0.0
+        self._sensing_floor_w = 0
+        self._ccl_taper_soc_pct: float | None = None
+        self._scripted_cell_spread_mv: int | None = None
         self._fault_words: dict[str, int] = {}
         self._malformed_addresses: set[int] = set()
         # Scripted decode-trust overrides (MUTATION-3/6): field -> quality.
@@ -635,6 +645,74 @@ class SimulatedEnergyPod:
         """Scenario hook: script the per-pod CT load power word (+20)."""
         self._scripted_load_power_w = self._ct_word(watts, "load power")
 
+    # --- calibration-cycling scenario hooks (DESIGN_CALIBRATION_CYCLING
+    # section 11/T-CAL-SIMULATOR): the traverse's scripted legs -- a pinned
+    # SoC pod that traverses and re-anchors, a pod whose SoC word never moves
+    # while watts flow (the measurement-first failure), the late-step twin
+    # (C4), the CCL-taper script (the top anchor lands or refuses), spread
+    # before/after scripting, and the sensing-band meter (a commanded 200 W
+    # reads nonzero, a 100 W reads zero -- the min-rate justification leg).
+
+    def script_soc_word(self, behavior: str, *, at_wh: float = 0.0, to_pct: float = 0.0) -> None:
+        """Scenario hook: pin the SoC word's behavior across a traverse.
+
+        ``"frozen"``: the word never moves while watts flow (the mid
+        pathology -- the floor member never fires and the energy bound must).
+        ``"late_step"``: the word holds frozen until the pod's cumulative
+        discharge reaches ``at_wh`` delivered Wh, then STEPS once to
+        ``to_pct`` (C4's companion leg: the anchor's two-witness proof).
+        ``None`` clears the script and the word follows the pack again.
+        """
+        if behavior is None:
+            self._soc_word_script = None
+            return
+        if behavior not in {"frozen", "late_step"}:
+            raise ValueError("behavior must be 'frozen', 'late_step', or None")
+        if behavior == "late_step" and (not _positive_finite(at_wh) or to_pct < 0.0):
+            raise ValueError("late_step needs a positive at_wh and a non-negative to_pct")
+        self._soc_word_script = behavior
+        self._soc_word_step_at_wh = float(at_wh)
+        self._soc_word_step_to_pct = float(to_pct)
+
+    def clear_scripted_soc_word(self) -> None:
+        """The SoC word follows the pack again."""
+        self._soc_word_script = None
+
+    def script_sensing_floor_w(self, floor_w: int) -> None:
+        """Scenario hook: the vendor-documented per-module sensing threshold.
+
+        A commanded magnitude below ``floor_w`` meters as 0 W (Victron's ~1 A
+        / ~50 W per module: three modules' threshold sits at 150 W, so a
+        commanded 200 W reads nonzero and a 100 W reads zero).
+        """
+        if type(floor_w) is not int or floor_w < 0:
+            raise ValueError("floor_w must be a non-negative integer watt value")
+        self._sensing_floor_w = floor_w
+
+    def script_ccl_taper(self, collapse_at_pct: float | None) -> None:
+        """Scenario hook: the dynamic charge limit's taper collapse.
+
+        ``None`` clears it; otherwise the served charge-limit word collapses
+        to 0 W while the SoC word sits at or above ``collapse_at_pct`` (the
+        true-full signature the §5.2 observation keys on).
+        """
+        if collapse_at_pct is None:
+            self._ccl_taper_soc_pct = None
+            return
+        if not _positive_finite(collapse_at_pct) or collapse_at_pct > 100.0:
+            raise ValueError("collapse_at_pct must be a positive percentage")
+        self._ccl_taper_soc_pct = float(collapse_at_pct)
+
+    def script_cell_spread_mv(self, spread_mv: int | None) -> None:
+        """Scenario hook: pin the cell image's spread (measurement before/
+        after).  ``None`` restores the seeded drift."""
+        if spread_mv is None:
+            self._scripted_cell_spread_mv = None
+            return
+        if type(spread_mv) is not int or not 0 <= spread_mv <= 500:
+            raise ValueError("spread_mv must be an int in [0, 500] millivolts")
+        self._scripted_cell_spread_mv = spread_mv
+
     def script_quality(self, field: str, quality: DataQuality) -> None:
         """Scenario hook: script one quality-map field's decode judgment.
 
@@ -714,6 +792,10 @@ class SimulatedEnergyPod:
             # target is an idle pod -- a transient response then quiet is
             # exactly the spike shape the 80% rule must refuse).
             return round(fraction * applied) if remaining > 0 else 0
+        if self._sensing_floor_w > 0 and 0 < abs(applied) < self._sensing_floor_w:
+            # The vendor-documented sensing threshold: sub-threshold currents
+            # report as 0 W (the calibration min-rate justification leg).
+            return 0
         return applied
 
     def _accumulate_ct(self, seconds: float) -> None:
@@ -744,6 +826,17 @@ class SimulatedEnergyPod:
             self._charge_watt_seconds += -power_w * seconds
         else:
             self._discharge_watt_seconds += power_w * seconds
+        if self._soc_word_script == "frozen":
+            # The pathology leg: the SoC word never moves while watts flow.
+            return
+        if self._soc_word_script == "late_step":
+            # C4's companion leg: the word holds frozen until the cumulative
+            # discharge reaches the scripted bound, then STEPS once.
+            if self._discharge_watt_seconds / 3600.0 >= self._soc_word_step_at_wh:
+                self._soc_pct = min(
+                    _SOC_CEILING_PCT, max(_SOC_FLOOR_PCT, self._soc_word_step_to_pct)
+                )
+            return
         # Charging raises SOC, discharging lowers it.
         drift_pct = -power_w * seconds / (36.0 * _CAPACITY_WH)
         self._soc_pct = min(_SOC_CEILING_PCT, max(_SOC_FLOOR_PCT, self._soc_pct + drift_pct))
@@ -753,10 +846,24 @@ class SimulatedEnergyPod:
         elapsed = int(now - self._origin_mono)
         drift_mv = elapsed % _CELL_DRIFT_PERIOD_S - _CELL_DRIFT_AMPLITUDE_MV
         drift_counts = elapsed % _TEMPERATURE_DRIFT_PERIOD_S
-        self._cell_millivolts = [
-            min(_CELL_MV_CEILING, max(_CELL_MV_FLOOR, base + drift_mv))
-            for base in self._cell_base_millivolts
-        ]
+        if self._scripted_cell_spread_mv is not None:
+            # The measurement script: a monotone ramp whose extrema sit
+            # exactly the scripted spread apart (coherent with the BMS
+            # extrema words the same rebuild serves).
+            spread = self._scripted_cell_spread_mv
+            count = len(self._cell_base_millivolts)
+            self._cell_millivolts = [
+                min(
+                    _CELL_MV_CEILING,
+                    max(_CELL_MV_FLOOR, _CELL_MV_FLOOR + 200 + spread * index // (count - 1)),
+                )
+                for index in range(count)
+            ]
+        else:
+            self._cell_millivolts = [
+                min(_CELL_MV_CEILING, max(_CELL_MV_FLOOR, base + drift_mv))
+                for base in self._cell_base_millivolts
+            ]
         self._cell_temperature_words = [
             max(0, base + drift_counts) for base in self._cell_base_temperature_words
         ]
@@ -917,7 +1024,14 @@ class SimulatedEnergyPod:
         words[10] = self._soh_pct  # SOH, raw percent
         words[11] = _CHARGE_CURRENT_LIMIT_COUNTS
         words[12] = _DISCHARGE_CURRENT_LIMIT_COUNTS
-        words[13] = _CHARGE_POWER_LIMIT_W
+        # The taper script's collapse (DESIGN_CALIBRATION_CYCLING section 11):
+        # at or above the scripted SoC the served charge limit collapses to
+        # 0 W -- the true-full signature the section 5.2 observation keys on.
+        words[13] = (
+            0
+            if self._ccl_taper_soc_pct is not None and self._soc_pct >= self._ccl_taper_soc_pct
+            else _CHARGE_POWER_LIMIT_W
+        )
         words[14] = _DISCHARGE_POWER_LIMIT_W
         words[15], words[16] = self._low_first_words(self._charge_energy_counts())
         words[17], words[18] = self._low_first_words(self._discharge_energy_counts())

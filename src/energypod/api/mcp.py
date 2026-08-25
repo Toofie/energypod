@@ -50,6 +50,7 @@ class EnergyService(Protocol):
     async def get_observed_objectives(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_energy_days(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_plant_history(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_calibration_status(self, **kwargs: Any) -> dict[str, Any]: ...
     async def submit_intent(self, **kwargs: Any) -> dict[str, Any]: ...
 
 
@@ -263,6 +264,27 @@ def create_mcp_server(
             fields=None if fields is None else list(fields),
             points=points,
         )
+
+    @server.tool
+    async def get_calibration_status() -> dict[str, Any]:
+        """Return the battery calibration program's projection (read-only).
+
+        The commissioned mode (an ``advise`` site renders ``submits:
+        "never"`` beside its plan), the traverse window, the per-battery
+        class/due/cycle-state rows, the live traverse line on cycle nights,
+        and the last cycle's record.  Calibration cycling is a commissioned
+        program, not an agent act: there is NO mutation tool for it -- the
+        traverse runs (or does not) on the site's own config, and an agent
+        asked about cycling recommends the operator surfaces (the status
+        route and the console card).  To stop a running traverse, claim the
+        pod -- any manual command preempts instantly.  Answers a
+        refusal-shaped error when the site did not commission the
+        ``battery_calibration`` block.
+        """
+        # API_CONTRACTS "Battery calibration cycling": the observe-scoped
+        # read surface only -- MCP observes; it does not cycle.
+        _require(session_principal, "observe")
+        return await service.get_calibration_status(principal=session_principal)
 
     @server.tool
     async def get_recent_audit(limit: StrictInt = 100) -> dict[str, Any]:

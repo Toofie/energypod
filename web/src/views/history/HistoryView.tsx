@@ -75,6 +75,10 @@ import {
 } from "../../app/fleet";
 import { unitHealthSentence } from "../../app/unitHealth";
 import {
+  toCalibrationState,
+  type CalibrationMorningFacts,
+} from "../../app/calibration";
+import {
   formatMillivolts,
   formatPercent,
   formatTemp,
@@ -150,6 +154,14 @@ export function HistoryView({ client }: HistoryViewProps): JSX.Element {
   const [fetchedAt, setFetchedAt] = useState<number | null>(null);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
   const [reloadNonce, setReloadNonce] = useState(0);
+  /**
+   * The calibration program's morning-facts entry (DESIGN_CALIBRATION_
+   * CYCLING §9): the day-following-a-cycle line — unit, verdict, the delta
+   * pair, the spread change — read from the same snapshot the recording
+   * hint rides. Null when the projection (or its morning block) is absent:
+   * the entry renders nothing at all.
+   */
+  const [morning, setMorning] = useState<CalibrationMorningFacts | null>(null);
 
   const refresh = useCallback((): void => {
     setReloadNonce((nonce) => nonce + 1);
@@ -179,6 +191,8 @@ export function HistoryView({ client }: HistoryViewProps): JSX.Element {
         }
         setRecording(toHistoryRecordingState(snapshot));
         setUnitIds(snapshot.units.map((unit) => unit.unit_id));
+        const calibration = toCalibrationState(snapshot.calibration_state);
+        setMorning(calibration === null ? null : calibration.morning);
       } catch {
         // The history route answers on its own; a failed snapshot read must
         // not kill the charts (the recording note words the absence).
@@ -336,6 +350,41 @@ export function HistoryView({ client }: HistoryViewProps): JSX.Element {
           {recordingNote(recording, nowMs)}
         </p>
       </div>
+
+      {/* The calibration program's morning-facts entry (§9): the honest
+          morning read the day following a cycle — unit, verdict, the delta
+          pair, the spread change. Renders nothing at all while the
+          projection carries no morning block. */}
+      {morning !== null && (
+        <div role="note" className="history-morning" data-tier={morning.tier ?? undefined}>
+          <h3>Calibration morning facts — {morning.night}</h3>
+          <p className="history-morning-line">
+            {morning.unitId}: {morning.verdict.replace(/_/g, " ")}
+            {morning.taperObserved ? " — the top taper landed" : ""}
+            {morning.attribution !== null ? ` (${morning.attribution.replace(/_/g, " ")})` : ""}.
+          </p>
+          <p className="history-morning-figures">
+            system-vs-BMS delta{" "}
+            {morning.deltaBefore === null
+              ? "not available"
+              : `${morning.deltaBefore.toFixed(1)} → ${
+                  morning.deltaAfter === null ? "not available" : morning.deltaAfter.toFixed(1)
+                } pts`}
+            {morning.deltaChange === null
+              ? ""
+              : ` (change ${morning.deltaChange.toFixed(1)} pts)`}
+            {" · cell spread "}
+            {morning.spreadBeforeMv === null
+              ? "not available"
+              : `${Math.round(morning.spreadBeforeMv)} → ${
+                  morning.spreadAfterMv === null
+                    ? "not available"
+                    : Math.round(morning.spreadAfterMv)
+                } mV`}
+            .
+          </p>
+        </div>
+      )}
 
       {/* The window controls — the view's only controls, all read-only. */}
       <div className="history-controls">

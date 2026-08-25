@@ -1162,6 +1162,13 @@ def test_no_automated_response_keys_on_actuation_incoherent(api: Any) -> None:
         # ladder is context, never a trigger" doctrine.  No health-watch
         # code path responds to the state with any act at all.
         Path("application") / "health_watch.py",
+        # The calibration cycling program's section 3.3 skip-if set reads
+        # the same ladder word as CONTEXT (DESIGN_CALIBRATION_CYCLING
+        # section 3.3): an actuation_incoherent unit is deferred from the
+        # traverse, never cycled and never responded to -- the program's
+        # only act is the ordinary discharge intent, gated on its own class
+        # gates.
+        Path("application") / "calibration.py",
     }
     mentioning: set[Path] = set()
     for path in sorted(package_root.rglob("*.py")):

@@ -89,6 +89,8 @@ class EnergyService(Protocol):
     async def set_night_charging(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_pvoutput_status(self, **kwargs: Any) -> dict[str, Any]: ...
     async def get_health_watch_status(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_calibration_status(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def acknowledge_calibration_standdown(self, **kwargs: Any) -> dict[str, Any]: ...
     async def set_pvoutput(self, **kwargs: Any) -> dict[str, Any]: ...
     async def park_unit(self, **kwargs: Any) -> dict[str, Any]: ...
     async def renew_park_lease(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -1107,6 +1109,72 @@ def create_api_app(
             return await service.get_health_watch_status(principal=identity)
         except HealthWatchRefusal as exc:
             raise BoundaryError(409, exc.code, exc.message) from exc
+
+    @app.get(f"{API_PREFIX}/calibration/status")
+    async def get_calibration_status(identity: Principal = observe_dependency) -> Any:
+        """The calibration program's projection (DESIGN_CALIBRATION_CYCLING
+        §8): the mode (with ``submits: never`` named beside an advise plan),
+        the window, the per-unit class/due/cycle-state rows, the live
+        traverse line on cycle nights, and the last cycle's record.  A
+        deployment without the ``battery_calibration`` config block refuses
+        with 409 ``calibration_not_commissioned`` -- the program's honest
+        not-commissioned state, never absence-that-looks-like-rotation."""
+        from energypod.application.calibration import CalibrationRefusal
+
+        try:
+            return await service.get_calibration_status(principal=identity)
+        except CalibrationRefusal as exc:
+            raise BoundaryError(409, exc.code, exc.message) from exc
+
+    @app.post(f"{API_PREFIX}/units/{{unit_id}}/calibration/standdown/acknowledge")
+    async def acknowledge_calibration_standdown(
+        unit_id: str,
+        request: Request,
+        identity: Principal = arm_dependency,
+    ) -> JSONResponse:
+        """The §6.3 stand-down reset: the operator's acknowledge-inhibit act.
+
+        A first cycle whose re-anchor signature was absent stands the pod
+        down from rotation until THIS audited operator act lifts it (the
+        program does not spend a second deep cycle proving the first one's
+        point).  Interactive operators only, exactly like the inhibit
+        acknowledgement it mirrors; the decision tree rides the row.
+        """
+        from energypod.application.calibration import CalibrationRefusal
+
+        if not identity.interactive:
+            raise BoundaryError(
+                403,
+                "interactive_operator_required",
+                "Interactive operator required",
+            )
+        if not _valid_id(unit_id):
+            raise BoundaryError(422, "validation_error", "Invalid unit identifier")
+        payload = {"unit_id": unit_id}
+
+        async def invoke() -> dict[str, Any]:
+            try:
+                return await service.acknowledge_calibration_standdown(
+                    unit_id=unit_id,
+                    principal=identity,
+                    request_id=cast(str, _single_header(request.scope, b"idempotency-key")),
+                )
+            except CalibrationRefusal as exc:
+                raise BoundaryError(409, exc.code, exc.message) from exc
+            except LookupError as exc:
+                raise BoundaryError(
+                    404, "unit_not_found", "The unit identifier is not known"
+                ) from exc
+
+        result = await mutation(
+            request=request,
+            identity=identity,
+            operation_name="acknowledge_calibration_standdown",
+            payload=payload,
+            status_code=200,
+            invoke=invoke,
+        )
+        return JSONResponse(status_code=result.status_code, content=dict(result.body))
 
     @app.get(f"{API_PREFIX}/pvoutput/status")
     async def get_pvoutput_status(identity: Principal = observe_dependency) -> Any:

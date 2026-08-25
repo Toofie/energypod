@@ -1022,7 +1022,12 @@ def test_emergency_stop_requires_auth_but_not_an_arming_confirmation(
 def test_public_route_and_openapi_surfaces_exclude_maintenance_and_debug(
     service: RecordingEnergyService, authenticator: FakeAuthenticator
 ) -> None:
-    forbidden = ("debug", "maintenance", "register", "modbus", "clear-energy", "calibration")
+    # "calibration" stays forbidden as a MAINTENANCE word with one deliberate
+    # exception: the commissioned battery-calibration program's own status
+    # route (DESIGN_CALIBRATION_CYCLING §8 — a projection read in the
+    # health-watch status class, never a vendor EE-parameter register
+    # surface; the 404 candidates below still refuse the bare word).
+    forbidden = ("debug", "maintenance", "register", "modbus", "clear-energy")
     with _client(service, authenticator) as client:
         schema = client.get("/openapi.json").json()
         paths = tuple(schema["paths"])
@@ -1031,6 +1036,7 @@ def test_public_route_and_openapi_surfaces_exclude_maintenance_and_debug(
             f"{API}/maintenance",
             f"{API}/registers/512",
             f"{API}/clear-energy",
+            f"{API}/calibration",
         ):
             assert (
                 client.post(
@@ -1041,6 +1047,10 @@ def test_public_route_and_openapi_surfaces_exclude_maintenance_and_debug(
 
     lowered = " ".join(paths).lower()
     assert all(word not in lowered for word in forbidden)
+    assert sorted(path for path in paths if "calibration" in path.lower()) == [
+        f"{API}/calibration/status",
+        f"{API}/units/{{unit_id}}/calibration/standdown/acknowledge",
+    ]
     # /healthz is the one contracted non-API public surface: unauthenticated
     # liveness for container orchestration (API_CONTRACTS "Operations
     # surface").  Everything else stays behind the versioned, guarded prefix.

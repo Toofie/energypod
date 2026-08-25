@@ -120,7 +120,9 @@ import { ParkedFleetBanner } from "./ParkedFleetBanner";
 import { NextScheduleCard, toScheduleFacts, type ScheduleFacts } from "./NextScheduleCard";
 import { NightChargeTile } from "./NightChargeTile";
 import { toHealthWatchState, type HealthWatchState } from "../../app/healthWatch";
+import { toCalibrationState, type CalibrationState } from "../../app/calibration";
 import { HealthWatchCard } from "./HealthWatchCard";
+import { CalibrationCard } from "./CalibrationCard";
 import { PvOutputCard } from "./PvOutputCard";
 import { SolarSurplusTile } from "./SolarSurplusTile";
 import { TodayCard } from "./TodayCard";
@@ -269,6 +271,12 @@ interface SnapshotView {
    * not composed here, and Home's Health Watch card renders nothing at all.
    */
   healthWatchState: HealthWatchState | null;
+  /**
+   * The snapshot's top-level `calibration_state` projection, feature-
+   * detected: null when the field is absent — the calibration program is
+   * not composed here, and Home's Calibration card renders nothing at all.
+   */
+  calibrationState: CalibrationState | null;
 }
 
 function readPowerFigure(value: unknown): PowerFigureView | null {
@@ -367,6 +375,12 @@ function readSnapshot(value: unknown): SnapshotView | null {
     // Home's Health Watch card renders nothing at all.
     healthWatchState: isRecord(record.health_watch_state)
       ? toHealthWatchState(record.health_watch_state)
+      : null,
+    // Feature detection: an absent `calibration_state` (the block-absent
+    // doctrine) is null — the calibration program is not composed here, and
+    // Home's Calibration card renders nothing at all.
+    calibrationState: isRecord(record.calibration_state)
+      ? toCalibrationState(record.calibration_state)
       : null,
   };
 }
@@ -1748,6 +1762,13 @@ export function HomeView({ client }: HomeViewProps) {
           while the snapshot carries no health_watch_state (the block-presence
           doctrine — the site has not composed the watch). */}
       <HealthWatchCard health={snapshot.healthWatchState} />
+
+      {/* The battery calibration card: the periodic bottom-anchor traverse's
+          one-glance story, BESIDE the health-watch card (A14's sibling line:
+          the two programs share the maintenance row and nothing else).
+          Renders nothing at all while the snapshot carries no
+          calibration_state (the block-presence doctrine). */}
+      <CalibrationCard calibration={snapshot.calibrationState} />
 
       {/* The PVOutput reporting card: the retiring Docker writer's
           replacement -- the operator's cutover toggle and the reporter's

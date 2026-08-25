@@ -435,6 +435,22 @@ class HealthWatchSurface(Protocol):
     def state_payload(self) -> dict[str, Any]: ...
 
 
+class CalibrationSurface(Protocol):
+    """The composed calibration adviser's facade-facing half (block presence).
+
+    ``energypod.application.calibration.CalibrationAdviser`` is the composed
+    implementation.  The facade adds the snapshot's ``calibration_state``
+    key and serves the status route (pure projection reads); the program's
+    one dispatch act (the traverse's own intent) travels the internal
+    submission twin, never this port.  The stand-down acknowledgement is the
+    surface's one audited operator act -- a durable row, never control.
+    """
+
+    def state_payload(self) -> dict[str, Any]: ...
+
+    def acknowledge_standdown(self, unit_id: str) -> Any: ...
+
+
 class PvOutputSurface(Protocol):
     """The composed pvoutput reporter's facade-facing surface (block presence).
 
@@ -1159,6 +1175,7 @@ class EnergyServiceFacade:
         delivery_bias: DeliveryBiasView | None = None,
         forecast: ForecastOutlookSurface | None = None,
         health_watch: HealthWatchSurface | None = None,
+        calibration: CalibrationSurface | None = None,
         pvoutput: PvOutputUploader | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
@@ -1189,12 +1206,14 @@ class EnergyServiceFacade:
         self._delivery_bias = delivery_bias
         self._forecast = forecast
         self._health_watch = health_watch
+        self._calibration = calibration
         self._pvoutput = pvoutput
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._schedule_correlations = itertools.count(1)
         self._night_correlations = itertools.count(1)
         self._health_correlations = itertools.count(1)
+        self._calibration_correlations = itertools.count(1)
         self._latched_stops: dict[str, _LatchedStop] = {}
         self._acknowledged_stops: set[str] = set()
         self._process_instance_id = f"facade-{uuid.uuid4().hex}"
@@ -1211,6 +1230,18 @@ class EnergyServiceFacade:
         if self._health_watch is not None:
             raise RuntimeError("the health watch surface is already bound")
         self._health_watch = control
+
+    def bind_calibration(self, control: CalibrationSurface) -> None:
+        """Bind the composed calibration surface (composition wiring).
+
+        The adviser submits its traverse intents through THIS facade's
+        internal twin, so the two are constructed in either order and bound
+        exactly once here — the projection reads see the surface from the
+        first snapshot after composition, never a half-bound state.
+        """
+        if self._calibration is not None:
+            raise RuntimeError("the calibration surface is already bound")
+        self._calibration = control
 
     # --- read views ---------------------------------------------------------
 
@@ -1281,6 +1312,14 @@ class EnergyServiceFacade:
             # is composed, ABSENT when it is not — the console's Health
             # Watch card keys on exactly this presence.
             view["health_watch_state"] = self._health_watch.state_payload()
+        if self._calibration is not None:
+            # DESIGN_CALIBRATION_CYCLING §8: the feature-detected
+            # ``calibration_state`` projection rides TOP LEVEL beside its
+            # siblings (BESIDE the health watch's own — the A14 sibling line
+            # kept on the surface too), present whenever the
+            # ``battery_calibration`` block is composed, ABSENT when the
+            # block is not.
+            view["calibration_state"] = self._calibration.state_payload()
         # Console truth (2026-08-23): a latched emergency stop must be
         # visible in a snapshot taken after the latch event, not only on
         # the event stream.  Only non-acknowledged latches appear -- an
@@ -2258,6 +2297,199 @@ class EnergyServiceFacade:
                 "the battery health watch is not composed on this site",
             )
         return control.state_payload()
+
+    async def get_calibration_status(self, *, principal: Principal) -> dict[str, Any]:
+        """The calibration program's projection (block-presence refusal).
+
+        Answers 409 ``calibration_not_commissioned`` when the config block is
+        absent — the same honesty every composed surface carries, so a site
+        without the program is told, never left guessing.
+        """
+        self._admit(principal, "observe")
+        control = self._calibration
+        if control is None:
+            from energypod.application.calibration import (
+                CALIBRATION_NOT_COMMISSIONED,
+                CalibrationRefusal,
+            )
+
+            raise CalibrationRefusal(
+                CALIBRATION_NOT_COMMISSIONED,
+                "the battery calibration program is not composed on this site",
+            )
+        return control.state_payload()
+
+    async def acknowledge_calibration_standdown(
+        self, *, unit_id: Any, principal: Principal, request_id: Any = None
+    ) -> dict[str, Any]:
+        """The §6.3 stand-down reset: the operator's acknowledge-inhibit act.
+
+        A durable audit row on the calibration surface and nothing else — the
+        next plan tick re-derives the unit's class from the rows (a restart
+        neither grants nor lifts the stand-down).  Interactive operators
+        only, exactly like the inhibit acknowledgement it mirrors.
+        """
+        self._admit(principal, "arm")
+        control = self._calibration
+        if control is None:
+            from energypod.application.calibration import (
+                CALIBRATION_NOT_COMMISSIONED,
+                CalibrationRefusal,
+            )
+
+            raise CalibrationRefusal(
+                CALIBRATION_NOT_COMMISSIONED,
+                "the battery calibration program is not composed on this site",
+            )
+        canonical = _correlation_key(unit_id, "unit_id")
+        if canonical not in self._actors:
+            raise LookupError(f"no unit with id {canonical!r}")
+        try:
+            outcome = await control.acknowledge_standdown(canonical)
+        except LookupError as exc:
+            raise LookupError(f"no unit with id {canonical!r}") from exc
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="calibration_standdown_acknowledged",
+                    subject=principal.subject,
+                    result="acknowledged",
+                    request_id=request_id
+                    if isinstance(request_id, str)
+                    else f"calibration-standdown:{canonical}",
+                    reason_codes=("standdown_acknowledged",),
+                    unit_id=canonical,
+                    lifecycle=self._handle_lifecycle(canonical),
+                    payload={
+                        "unit_id": canonical,
+                        "decision_tree": (
+                            "re-run the measurement after a physical restart "
+                            "advisory, or escalate to the installer with the record"
+                        ),
+                    },
+                )
+            )
+        except Exception:
+            # The durable-row act stands whatever the facade's own audit
+            # write does; the adviser's row is the derivation's truth.
+            with contextlib.suppress(Exception):
+                pass
+        await self._publish(
+            "calibration.standdown_acknowledged",
+            {"principal": principal.subject, "unit_id": canonical},
+        )
+        return dict(outcome)
+
+    async def submit_calibration_intent(
+        self,
+        *,
+        unit_ids: Any,
+        direction: Any,
+        watts: Any,
+        ttl_s: Any,
+        reason: Any = None,
+        principal: Principal,
+        idempotency_key: Any = None,
+        request_id: Any = None,
+    ) -> dict[str, Any]:
+        """Accept one internal calibration-traverse OPTIMIZER intent.
+
+        DESIGN_CALIBRATION_CYCLING §4: the exact ``submit_advisory_intent`` /
+        ``submit_night_intent`` pattern — same validation, audit event type,
+        idempotency/correlation contract, and publication — with the mintage
+        source pinned to ``OPTIMIZER`` (the traverse is ordinary dispatch
+        traffic judged by everything exactly as a manual request is) and its
+        own intent-id prefix (``cal-``), so audit attribution separates the
+        calibration adviser's rows from every console, agent, schedule-
+        runner, excess-adviser, night-adviser, and health-adviser writer.
+        Composition-only wiring: never routed on REST or MCP, and only the
+        composed ``energypod:calibration-adviser`` principal ever reaches it.
+        """
+        self._admit(principal, "dispatch")
+        units = _validated_units(unit_ids)
+        unknown = [unit_id for unit_id in units if unit_id not in self._actors]
+        if unknown:
+            raise ValueError(f"unknown units requested: {unknown}")
+        await self._refuse_undispatchable_modes(units)
+        resolved_direction = _dispatch_direction(direction)
+        resolved_watts = _positive_watts(watts)
+        duration_s = _positive_duration(ttl_s)
+        _reason_text(reason, required=False)
+        resolved_idempotency = (
+            self._calibration_key("idempotency")
+            if idempotency_key is None
+            else idempotency_key
+        )
+        _correlation_key(resolved_idempotency, "idempotency_key")
+        request_source = (
+            self._calibration_key("request") if request_id is None else request_id
+        )
+        request = _correlation_key(request_source, "request_id")
+
+        now_mono = float(self._clock.monotonic())
+        revision = self._next_revision()
+        intent_id = f"cal-{revision}-{now_mono:.6f}"
+        intent = PowerIntent(
+            id=intent_id,
+            source=IntentSource.OPTIMIZER,
+            selected_unit_ids=frozenset(units),
+            direction=resolved_direction,
+            watts=resolved_watts,
+            duration_s=duration_s,
+            accepted_at_mono=now_mono,
+            acceptance_revision=revision,
+            actor_identity=principal.subject,
+        )
+        await self._intents.add(intent)
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="intent_accepted",
+                    subject=principal.subject,
+                    result="accepted",
+                    request_id=request,
+                    source=IntentSource.OPTIMIZER,
+                    intent_id=intent_id,
+                    reason_codes=("accepted",),
+                    lifecycle=UnitLifecycle.DISARMED,
+                    payload={
+                        "direction": resolved_direction.value,
+                        "unit_ids": sorted(units),
+                        "watts": resolved_watts,
+                    },
+                )
+            )
+            await self._publish(
+                "intent.accepted",
+                {
+                    "principal": principal.subject,
+                    "intent_id": intent_id,
+                    "direction": resolved_direction.value,
+                    "watts": resolved_watts,
+                    "unit_ids": sorted(units),
+                    "expires_in_s": duration_s,
+                },
+            )
+        except Exception:
+            # Atomic with its audit and publication exactly like every twin:
+            # a traverse drive that failed here must leave nothing stored for
+            # the kernel to arbitrate on.
+            with contextlib.suppress(Exception):
+                await self._intents.remove(intent_id)
+            raise
+        return {
+            "intent_id": intent_id,
+            "acceptance_revision": revision,
+            "accepted_at_monotonic": now_mono,
+            "status": "accepted",
+            "requested": {
+                "direction": resolved_direction.value,
+                "watts": resolved_watts,
+            },
+            "authorized": None,
+            "measured": None,
+            "expires_in_s": duration_s,
+        }
 
     async def cancel_intent(
         self,
@@ -3671,6 +3903,10 @@ class EnergyServiceFacade:
     def _health_key(self, prefix: str) -> str:
         """Deterministic facade-owned correlation for an internal health drive."""
         return f"health-{prefix}-{next(self._health_correlations):08d}"
+
+    def _calibration_key(self, prefix: str) -> str:
+        """Deterministic facade-owned correlation for an internal calibration drive."""
+        return f"calibration-{prefix}-{next(self._calibration_correlations):08d}"
 
     async def _unit_view(
         self,

@@ -1024,3 +1024,74 @@ battery_health_watch:
     hold_s: 90                     # [60, 120]; the lease is hold_s + 60 s
     consecutive_fail_limit: 3      # counted: failed_write, write_unverified,
                                    #   failed_no_effect — NOT recovered_unproven
+
+# The battery calibration cycling program (DESIGN_CALIBRATION_CYCLING.md,
+# CONTRACT v1.1) — the periodic bottom-anchor traverse, ONE pod per
+# cycle-night, selected by NEED.  This block lands in the §10 step-1 ADVISE
+# posture: the trigger and eligibility run daily at 14:00, the rows land,
+# the card renders, and NOTHING is submitted — `mode: act` is the operator's
+# later revision (config revision + restart; there is no runtime toggle, and
+# `act` carries no receipt gate by C15's conscious distinction: the act is
+# ordinary OPTIMIZER dispatch, the night-charge precedent, no mode register
+# — the 0x8000 values 2-6 stay permanently unwritten).  The sequencing:
+#   step 1  advise (THIS revision) — days of honest trigger rows;
+#   step 2  `mode: act` + the C6 one-shot naming mid for the supervised
+#           measurement (the `request_measurement` key below, UNCOMMENTED in
+#           that revision — a guarded, audited, once-consumed selection
+#           request that waives `due` ONLY; every class gate still applies);
+#   step 3+ graduation review, rhs probe-gated, then the quarterly rhythm.
+# The historian-block prerequisite is met; the capacity map EQUALS
+# night_charging's (one physical fact, §2.1's ruling extended); and
+# min_discharge_w clears Victron's documented per-module ~50 W sensing
+# threshold three times over (a commanded rate inside that band can meter
+# as 0 W — rhs lives in it).
+battery_calibration:
+  timezone: "Australia/Brisbane"   # must equal site.timezone (A9)
+  mode: "act"                      # §10 step 2 — the operator's "complete
+                                   #   everything" commissioning, 2026-08-25
+  window_local: "15:00"            # traverse open (C13: wide at the 0.8
+                                   #   delivery floor — 7.5 h for ~7.0 h worst)
+  traverse_end_local: "22:30"      # no-new-renewal; + ttl lands before the
+                                   #   health watch (23:00) and night (00:00)
+  plan_local: "14:00"              # the daily trigger/eligibility instant
+  # C6's one-shot — §10 step 2: mid's supervised measurement (the operator's
+  # request; waives `due` ONLY — every class gate still applies, consumed
+  # once at the next plan, a restart cannot re-consume):
+  request_measurement: {unit: mid, note: "2026-08-25 operator request"}
+  trigger:
+    trigger_floor_pct: 30.0        # X — "not below X% in N days"; >= floor_pct
+    trigger_after_days: 60         # N — the quarterly-class cadence
+    eligibility_window_days: 14    # the class-derivation lookback
+    cycles_daily_floor_pct: 25.0   # lhs-class exclusion: below this on...
+    cycles_daily_min_days: 5       #   ...>= this many dates => excluded
+    min_daily_throughput_wh: 1000  # mid-class control-works evidence
+    throughput_min_days: 3
+    probe_pass_window_days: 7      # rhs-class: a passing probe this fresh
+                                   #   unlocks the deferred class
+  traverse:
+    floor_pct: 10.0                # [5, 10] AND >= policy.minimum_soc_pct —
+                                   #   at the commissioned policy exactly 10
+                                   #   (the kernel-ordering rule, §4.3)
+    discharge_w: 800               # [200, policy.max_unit_discharge_w]; the
+                                   #   ~0.2 C warranty-protocol rate class
+    min_discharge_w: 200           # > 3 modules x the ~50 W sensing floor
+    intent_ttl_s: 10.0             # (0, 300]; > timing.control_period_s
+    assumed_delivery_frac: 0.8     # (0, 1] — the fit check's delivery floor
+    integration_max_gap_s: 10.0    # > timing.control_period_s, <= 60 (C9)
+    energy_margin_wh: 100.0        # the lying-word bound's slack
+    metering_allowance_wh: 100.0   # the integrator undercount allowance;
+                                   #   margin + allowance <= the 5% band edge
+                                   #   on the smallest pack (C8: 200 <= 210)
+    assumed_capacity_wh: {lhs: 5000, mid: 5000, rhs: 4200}
+                                   # MUST equal night_charging's map (§2.1)
+  top_anchor:
+    taper_deadline_local: "12:00"  # the operator's midday finish line
+    taper_soc_pct: 99.0            # [50, 100)
+    taper_limit_w: 0               # CCL collapse threshold, >= 0
+    taper_sustain_s: 600           # [60, 3600] — the 10-minute rest class
+    hold_min_s: 2700               # [1800, 3600] = 30-60 min
+    hold_float_w: 100              # > 0, the Wave 0 deadband family
+    poor_surplus_kwh: 3.0          # the solar/pod attribution split
+  measurement:
+    reanchor_delta_pct: 2.0        # (0, 20] — the quality-gated delta step
+    floor_epsilon_pct: 2.0         # (0, 5] — the late-step tolerance (C4)

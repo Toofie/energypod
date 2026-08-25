@@ -112,6 +112,14 @@ from energypod.api.rest import create_api_app
 from energypod.application.actor import EnergyPodActor
 from energypod.application.arbiter import STOP_ACKNOWLEDGE_SCOPE, IntentArbiter
 from energypod.application.audit import AuditEventFactory
+from energypod.application.calibration import (
+    CalibrationAdviser,
+    CalibrationMeasurementSettings,
+    CalibrationSettings,
+    CalibrationTopAnchorSettings,
+    CalibrationTraverseSettings,
+    CalibrationTriggerSettings,
+)
 from energypod.application.control_kernel import ControlKernel
 from energypod.application.delivery_bias import DeliveryBiasEstimator
 from energypod.application.energy import (
@@ -334,6 +342,11 @@ _SCHEDULE_RUNNER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 # only the composed recovery stage ever wires them.
 _HEALTH_ADVISER_PRINCIPAL_SUBJECT = "energypod:health-adviser"
 _HEALTH_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch", "arm"})
+# DESIGN_CALIBRATION_CYCLING §7: the traverse adviser's composed principal —
+# the night-charge class (ordinary OPTIMIZER dispatch under a composed
+# automation principal; no mode register anywhere on the path).
+_CALIBRATION_ADVISER_PRINCIPAL_SUBJECT = "energypod:calibration-adviser"
+_CALIBRATION_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 # DESIGN_ENERGY_SCORECARD section 7 (E4): the deterministic event id of the
 # operator's P-A1-active pinning fact.  A ``grid_counter_roles`` value other
 # than ``unpinned`` boots only when this fact exists in the durable store --
@@ -1919,6 +1932,26 @@ class _HealthAdviserPrincipal:
     site_id: str
 
 
+@dataclass(slots=True)
+class _CalibrationAdviserPrincipal:
+    """The composed calibration-adviser principal (DESIGN_CALIBRATION_
+    CYCLING §7).
+
+    ``energypod:calibration-adviser``: observe + dispatch, non-interactive,
+    site-bound — the adviser principal's exact shape, so the traverse's rows
+    are attributable distinct from every console, agent, schedule-runner,
+    excess-adviser, night-adviser, and health-adviser writer.  No arm scope
+    ever: the traverse is ordinary OPTIMIZER discharge dispatch, and this
+    program holds no mode-write reach of any kind (the 0x8000 register's
+    values 2-6 stay permanently prohibited — the program writes NONE of it).
+    """
+
+    subject: str
+    scopes: frozenset[str]
+    interactive: bool
+    site_id: str
+
+
 class _RegistryMorningCredit:
     """DESIGN_NIGHT_CHARGE_V2 section 2.7's composed ``morning_credit_kwh``
     port: the registry's PV slice and load baseline netted per section 2.1.
@@ -2230,6 +2263,7 @@ class _Supervision:
         delivery_bias: DeliveryBiasEstimator | None = None,
         pvoutput: PvOutputUploader | None = None,
         health_watch: HealthWatchController | None = None,
+        calibration: CalibrationAdviser | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -2292,6 +2326,12 @@ class _Supervision:
         # once per fleet cycle inside THIS existing bounded supervision pass
         # (no new task class), carrying its own per-night phase machine.
         self._health_watch = health_watch
+        # DESIGN_CALIBRATION_CYCLING §7: the calibration program, the same
+        # bounded suppressed pass shape (no new task class) — its own window,
+        # its own vocabulary, its own durable rows; the A14 sibling line kept
+        # structurally: the two programs share the fleet loop slot and
+        # nothing else.
+        self._calibration = calibration
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
@@ -2317,6 +2357,14 @@ class _Supervision:
         if self._parking is not None:
             with contextlib.suppress(Exception):
                 await self._parking.reconstruct_at_boot()
+        # DESIGN_CALIBRATION_CYCLING §4.4 (C2): the boot reconstruction — an
+        # open traverse row retires its night here, once, before the first
+        # fleet cycle, and the durable anchored/stand-down sets load beside
+        # it.  Boot never resumes and never submits.
+        if self._calibration is not None:
+            with contextlib.suppress(Exception):
+                await self._calibration.reconstruct_at_boot()
+                await self._calibration.refresh_durable_facts()
         self._tasks = [
             asyncio.create_task(
                 self._run_fleet(self._start_reports),
@@ -2593,6 +2641,16 @@ class _Supervision:
                 # well inside the fleet cycle's supervision budget.
                 with contextlib.suppress(Exception, asyncio.TimeoutError):
                     await asyncio.wait_for(self._health_watch.tick(), timeout=self._interval_s)
+            if self._calibration is not None:
+                # DESIGN_CALIBRATION_CYCLING §7: the calibration program's own
+                # bounded, fully suppressed pass — beside the health watch's
+                # slot, after every adviser and the historian, BEFORE the
+                # kernel tick (a traverse intent submitted here is arbitrated
+                # this same cycle).  A failure inside it is a missed tick,
+                # never a delay to control; the windows are disjoint by
+                # validation so the two programs never meet on the wire.
+                with contextlib.suppress(Exception, asyncio.TimeoutError):
+                    await asyncio.wait_for(self._calibration.tick(), timeout=self._interval_s)
             # A kernel tick that overruns the interval is a component failure,
             # not a survivable per-unit fault. Cancelling it is safe — the
             # kernel's BaseException path revokes authority first (shielded)
@@ -3266,6 +3324,11 @@ class ComposedRuntime:
     # wave) and the ``health_watch_state`` projection + status route serve.
     # None otherwise (block-absent doctrine).
     health_watch: HealthWatchController | None = None
+    # DESIGN_CALIBRATION_CYCLING §7: the calibration cycling program, composed
+    # only when the ``battery_calibration`` block is PRESENT -- the adviser
+    # the fleet loop ticks and the ``calibration_state`` projection + status
+    # route serve.  None otherwise (block-absent doctrine).
+    calibration: CalibrationAdviser | None = None
 
 
 def _simulator_pod(
@@ -4205,6 +4268,7 @@ def _build_runtime(
         delivery_bias=delivery_bias,
         forecast=forecast_surface,
         pvoutput=pvoutput_uploader,
+        calibration=None,
     )
     if park_controller is not None:
         # The park controller's conflict/resume guards read the facade's own
@@ -4377,6 +4441,188 @@ def _build_runtime(
         # the facade's own internal twin; either construction order, one
         # binding, before the first snapshot).
         facade.bind_health_watch(health_watch_controller)
+
+    # --- the calibration cycling program (DESIGN_CALIBRATION_CYCLING §7) ----
+    # Composed exactly when the ``battery_calibration`` block is PRESENT (the
+    # block-presence doctrine): the adviser the fleet loop ticks, the
+    # ``calibration_state`` projection, and the status route.  The traverse's
+    # intent is submitted under the composed calibration principal through
+    # the facade's internal twin (never REST/MCP), judged by every standing
+    # guard exactly like every adviser's intents — the night-charge class,
+    # no mode register anywhere on the path.
+    calibration_adviser: CalibrationAdviser | None = None
+    calibration_config = config.battery_calibration
+    if calibration_config is not None and history_store is not None and policy is not None:
+        calibration_principal = _CalibrationAdviserPrincipal(
+            subject=_CALIBRATION_ADVISER_PRINCIPAL_SUBJECT,
+            scopes=_CALIBRATION_ADVISER_PRINCIPAL_SCOPES,
+            interactive=False,
+            site_id=config.site.site_id,
+        )
+
+        async def _submit_calibration_drive(
+            *,
+            unit_ids: Any,
+            direction: Any,
+            watts: Any,
+            ttl_s: Any,
+            watts_by_unit: Any = None,
+        ) -> Any:
+            # The traverse is a single-watt dispatch (watts_by_unit unused).
+            return await facade.submit_calibration_intent(
+                unit_ids=unit_ids,
+                direction=direction,
+                watts=watts,
+                ttl_s=ttl_s,
+                principal=calibration_principal,
+            )
+
+        async def _calibration_health_states() -> Mapping[str, Any]:
+            assert recovery_monitor is not None  # the guard is the call site's
+            return await recovery_monitor.unit_health_states()
+
+        def _calibration_watch_stages() -> tuple[str, ...]:
+            # §3.2's rhs-class path: the sibling's own staged vocabulary,
+            # read as a fact (never a stage of this program).
+            return tuple(health_config.stages) if health_config is not None else ()
+
+        def _latched_stop_unit_ids() -> frozenset[str]:
+            return facade.latched_stop_unit_ids()
+
+        def _calibration_tariff() -> dict[str, float] | None:
+            # §5.1's economics need the tariff's three rates: the general
+            # usage figure, the off-peak rate in force over the night window,
+            # and the feed-in rate.  Absent tariff block = kWh-only honesty.
+            declared = None if providers_config is None else providers_config.tariff
+            if declared is None:
+                return None
+            offpeak = float(declared.default_import_cents_per_kwh)
+            if night_config is not None:
+                night_start_minute = parse_hhmm(night_config.window_local[0][0])
+                minute = night_start_minute.hour * 60 + night_start_minute.minute
+                for window in declared.windows:
+                    start = parse_hhmm(window.window_local[0])
+                    end = parse_hhmm(window.window_local[1])
+                    start_minute = start.hour * 60 + start.minute
+                    end_minute = end.hour * 60 + end.minute
+                    if start_minute < end_minute:
+                        covered = start_minute <= minute < end_minute
+                    else:
+                        covered = minute >= start_minute or minute < end_minute
+                    if covered:
+                        offpeak = float(window.import_cents_per_kwh)
+                        break
+            return {
+                "import_cents_per_kwh": float(declared.default_import_cents_per_kwh),
+                "offpeak_cents_per_kwh": offpeak,
+                "export_cents_per_kwh": float(declared.default_export_cents_per_kwh),
+            }
+
+        night_end_local = None
+        if night_config is not None:
+            latest_end = parse_hhmm(night_config.window_local[0][1])
+            for _start_wall, end_wall in night_config.window_local[1:]:
+                candidate = parse_hhmm(end_wall)
+                if candidate > latest_end:
+                    latest_end = candidate
+            night_end_local = latest_end
+
+        calibration_adviser = CalibrationAdviser(
+            settings=CalibrationSettings(
+                timezone=calibration_config.timezone,
+                mode=calibration_config.mode,
+                window_local=parse_hhmm(calibration_config.window_local),
+                traverse_end_local=parse_hhmm(calibration_config.traverse_end_local),
+                plan_local=parse_hhmm(calibration_config.plan_local),
+                request_measurement=(
+                    None
+                    if calibration_config.request_measurement is None
+                    else (
+                        calibration_config.request_measurement.unit,
+                        calibration_config.request_measurement.note,
+                    )
+                ),
+                trigger=CalibrationTriggerSettings(
+                    trigger_floor_pct=float(calibration_config.trigger.trigger_floor_pct),
+                    trigger_after_days=int(calibration_config.trigger.trigger_after_days),
+                    eligibility_window_days=int(
+                        calibration_config.trigger.eligibility_window_days
+                    ),
+                    cycles_daily_floor_pct=float(
+                        calibration_config.trigger.cycles_daily_floor_pct
+                    ),
+                    cycles_daily_min_days=int(calibration_config.trigger.cycles_daily_min_days),
+                    min_daily_throughput_wh=float(
+                        calibration_config.trigger.min_daily_throughput_wh
+                    ),
+                    throughput_min_days=int(calibration_config.trigger.throughput_min_days),
+                    probe_pass_window_days=int(
+                        calibration_config.trigger.probe_pass_window_days
+                    ),
+                ),
+                traverse=CalibrationTraverseSettings(
+                    floor_pct=float(calibration_config.traverse.floor_pct),
+                    discharge_w=int(calibration_config.traverse.discharge_w),
+                    min_discharge_w=int(calibration_config.traverse.min_discharge_w),
+                    intent_ttl_s=float(calibration_config.traverse.intent_ttl_s),
+                    assumed_delivery_frac=float(
+                        calibration_config.traverse.assumed_delivery_frac
+                    ),
+                    integration_max_gap_s=float(
+                        calibration_config.traverse.integration_max_gap_s
+                    ),
+                    energy_margin_wh=float(calibration_config.traverse.energy_margin_wh),
+                    metering_allowance_wh=float(
+                        calibration_config.traverse.metering_allowance_wh
+                    ),
+                    assumed_capacity_wh=dict(calibration_config.traverse.assumed_capacity_wh or {}),
+                ),
+                top_anchor=CalibrationTopAnchorSettings(
+                    taper_deadline_local=parse_hhmm(
+                        calibration_config.top_anchor.taper_deadline_local
+                    ),
+                    taper_soc_pct=float(calibration_config.top_anchor.taper_soc_pct),
+                    taper_limit_w=int(calibration_config.top_anchor.taper_limit_w),
+                    taper_sustain_s=int(calibration_config.top_anchor.taper_sustain_s),
+                    hold_min_s=int(calibration_config.top_anchor.hold_min_s),
+                    hold_float_w=int(calibration_config.top_anchor.hold_float_w),
+                    poor_surplus_kwh=float(calibration_config.top_anchor.poor_surplus_kwh),
+                ),
+                measurement=CalibrationMeasurementSettings(
+                    reanchor_delta_pct=float(
+                        calibration_config.measurement.reanchor_delta_pct
+                    ),
+                    floor_epsilon_pct=float(
+                        calibration_config.measurement.floor_epsilon_pct
+                    ),
+                ),
+                unit_ids=tuple(unit.unit_id for unit in config.units),
+            ),
+            policy=policy,
+            clock=resolved_clock,
+            observations=observation_port,
+            intents=intent_port,
+            submit=_submit_calibration_drive,
+            history=history_store,
+            audit=audit_port,
+            bus=bus,
+            health_states=_calibration_health_states,
+            health_watch_stages=_calibration_watch_stages,
+            parked_units=_parked_units,
+            latched_stop_units=_latched_stop_unit_ids,
+            tariff=_calibration_tariff(),
+            night_window_end_local=night_end_local,
+            process_instance_id=process_instance_id,
+        )
+        # The facade's projection binds here (the adviser submits through the
+        # facade's own internal twin; either construction order, one binding,
+        # before the first snapshot).
+        facade.bind_calibration(calibration_adviser)
+        # C2's boot half rides the supervision start (the parking
+        # reconstruction's own envelope): an open traverse row retires its
+        # night once, before the first fleet cycle, and the durable
+        # anchored/stand-down sets load beside it.  Boot never submits — the
+        # reconstruction is rows.
 
     # --- excess-solar advisory composition ---------------------------------
     excess_adviser: ExcessChargeAdviser | None = None
@@ -4648,6 +4894,7 @@ def _build_runtime(
         delivery_bias=delivery_bias,
         pvoutput=pvoutput_uploader,
         health_watch=health_watch_controller,
+        calibration=calibration_adviser,
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision
@@ -4689,6 +4936,7 @@ def _build_runtime(
         forecast_providers=forecast_registry,
         pvoutput=pvoutput_uploader,
         health_watch=health_watch_controller,
+        calibration=calibration_adviser,
     )
 
 

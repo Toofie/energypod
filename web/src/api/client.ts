@@ -82,6 +82,14 @@ export interface Snapshot {
     retention_full_resolution_days?: number;
     last_sample_at?: Record<string, string | null>;
   };
+  /**
+   * The calibration cycling program's feature-detected block
+   * (DESIGN_CALIBRATION_CYCLING §8): present only while the
+   * `battery_calibration` config block is composed — the console's
+   * Calibration card and the History view's morning-facts entry key on it.
+   * Absent on a program-less deployment.
+   */
+  calibration_state?: unknown;
 }
 
 /**
