@@ -272,6 +272,29 @@ class PolicyConfig(_FrozenModel):
     # consumes these.
     actuation_coherence_cycles: PositiveStrictInt = 4
     actuation_coherence_min_movement_w: PositiveStrictInt = 150
+    # DESIGN_BATTERY_HEALTH_WATCH §3.1 (Wave 0, W0-1): the self-charge float
+    # deadband.  The old exact-zero test on the autonomous_self_charge
+    # classification flapped the health state 158 transitions in one night
+    # at 96-99% SoC, where the pods float ACROSS zero (observed rhs straddle
+    # -16/0/+33 W); |measured| below the deadband renders neither
+    # self-charging nor flap -- floating at the top is the steady state of a
+    # full pack.  25 sits above the metering noise floor (tens of watts) and
+    # an order below the genuine CT-following self-charge class
+    # (-520..-560 W); the ceiling is 100 because beyond it the deadband
+    # would begin to eat the legitimate float class.  Detection only.
+    self_charge_deadband_w: Annotated[StrictFloat, Field(gt=0.0, le=100.0)] = 25.0
+    # §3.2 (Wave 0, W0-2a): the authorization-gap grace the coherence
+    # baseline survives.  An authorization gap shorter than this (intent
+    # renewal lapse, telemetry_stale dip), with delivery continuing at the
+    # commanded level, is the SAME coherence episode: the pre-command
+    # baseline does not move and is never re-anchored onto the watts the pod
+    # was already delivering -- that re-anchoring is exactly the mechanism
+    # behind both live 2026-08-24 actuation_incoherent false positives
+    # (steady 87-96%-of-command delivery read as "no movement").  12 s is
+    # the night-writer detector's handback-grace precedent (bounds mirrored),
+    # covering the observed ~4-8 s watchdog hand-back with margin.  Detection
+    # only: no control path consumes this key.
+    coherence_gap_grace_s: Annotated[StrictFloat, Field(ge=1.0, le=300.0)] = 12.0
     # P1 iii companion (unexpected-autonomy evidence): the commissioned
     # EXPECTED autonomous battery-power envelope -- negative self-charge up to
     # the recalibrated positive evening edge.  Measured power outside this

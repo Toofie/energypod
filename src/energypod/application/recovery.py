@@ -24,6 +24,14 @@ cycle facts and ``unit_health_states`` recomputes the view from them, so
 nothing is remembered beyond the current evidence (boot is
 ``healthy``-by-observation).  The monitor is driven once per fleet cycle by
 the single supervision loop, so it needs no locking.
+
+DESIGN_BATTERY_HEALTH_WATCH §3 (Wave 0) landed here first, before any stage
+of that program composes, because both of its fixes correct the evidence the
+program would act on: the self-charge float deadband (W0-1) and coherence
+judged on delivery with a gap-surviving baseline (W0-2).  Detection work
+only -- Wave 0 adds no write of any kind, and per the contract's invariant
+I10 no automated response anywhere may key on ``actuation_incoherent``
+alone.
 """
 
 from __future__ import annotations
@@ -150,6 +158,27 @@ class RecoverySettings:
 
     actuation_coherence_cycles: int = 4
     actuation_coherence_min_movement_w: int = 150
+    # DESIGN_BATTERY_HEALTH_WATCH §3.1 (Wave 0, W0-1): the self-charge float
+    # deadband.  At 96-99% SoC the pods float ACROSS zero (observed rhs
+    # straddle -16/0/+33 W), so an exact-zero test on the self-charge
+    # classifier flapped the health state 158 transitions in one night.  A
+    # cycle with |measured| below the deadband renders NEITHER self-charging
+    # NOR flap -- floating at the top is the healthy steady state of a full
+    # pack.  25 W sits above the metering noise floor (tens of watts) and an
+    # order below the genuine CT-following self-charge class (-520..-560 W);
+    # the ceiling is 100 because beyond it the deadband would begin to eat
+    # the legitimate float class.
+    self_charge_deadband_w: float = 25.0
+    # §3.2 (Wave 0, W0-2a): the authorization-gap grace the coherence
+    # baseline survives.  An authorization gap (intent renewal lapse,
+    # telemetry_stale dip) shorter than this, with delivery continuing at the
+    # commanded level, is the SAME episode: the pre-command baseline does not
+    # move and is never re-anchored onto the watts the pod was already
+    # delivering.  12 s is the night-writer detector's handback-grace
+    # precedent (bounds mirrored), covering the observed ~4-8 s watchdog
+    # hand-back with margin.  Beyond the grace, or once the measured power
+    # has returned to the idle band, the baseline re-anchors as before.
+    coherence_gap_grace_s: float = 12.0
     # The commissioned EXPECTED autonomy envelope (the live-write example's
     # documented value; live on observe-only deployments, which compose this
     # default verbatim when no policy block is configured).
@@ -166,6 +195,22 @@ class RecoverySettings:
             self.actuation_coherence_min_movement_w < 1
         ):
             raise ValueError("actuation_coherence_min_movement_w must be a positive integer")
+        deadband = self.self_charge_deadband_w
+        if (
+            isinstance(deadband, bool)
+            or not isinstance(deadband, int | float)
+            or not math.isfinite(float(deadband))
+            or not 0.0 < float(deadband) <= 100.0
+        ):
+            raise ValueError("self_charge_deadband_w must be in (0, 100] watts")
+        grace = self.coherence_gap_grace_s
+        if (
+            isinstance(grace, bool)
+            or not isinstance(grace, int | float)
+            or not math.isfinite(float(grace))
+            or not 1.0 <= float(grace) <= 300.0
+        ):
+            raise ValueError("coherence_gap_grace_s must be between 1 and 300 seconds")
         interval = self.unexpected_autonomy_min_interval_s
         if (
             isinstance(interval, bool)
@@ -215,6 +260,14 @@ class _UnitRecord:
     idle_measured_watts: float | None = None
     authorized_watts: int = 0
     authorized_direction: str | None = None
+    # DESIGN_BATTERY_HEALTH_WATCH §3.2 (Wave 0, W0-2a): the episode a
+    # preserved baseline belongs to, and when its authorization gap opened.
+    # ``episode_authorized_watts`` is the last authorized figure the episode
+    # ran under (``authorized_watts`` reads 0 while the gap stands, so the
+    # still-band at gap time needs its own carrier); it is 0 exactly when no
+    # baseline is preserved.
+    episode_authorized_watts: int = 0
+    authorization_gap_open_mono: float | None = None
     # Responsiveness streaks (R4 class discrimination).
     read_failure_streak: int = 0
     connect_failure_streak: int = 0
@@ -355,7 +408,9 @@ class RecoveryMonitor:
         record.park_expired = bool(park_expired)
         record.park_write_unverified = bool(park_write_unverified)
 
-        trigger = self._track_coherence(record, authorized_watts, authorized_direction, measured)
+        trigger = self._track_coherence(
+            record, authorized_watts, authorized_direction, measured, now_mono
+        )
         if trigger:
             # Exactly one detection fact and one detection event per episode
             # (throttled; re-arms only on a coherent cycle or a control-state
@@ -363,6 +418,17 @@ class RecoveryMonitor:
             await self._emit_actuation_incoherent(record)
         autonomy = await self._record_unexpected_autonomy(record, observation, now_mono)
 
+        await self._publish_state_change(record)
+        return CycleFindings(coherence_trigger=trigger, unexpected_autonomy=autonomy)
+
+    async def _publish_state_change(self, record: _UnitRecord) -> None:
+        """Publish ``unit.health_changed`` iff the derived state moved.
+
+        Shared by the cycle pass and the echo pass: the transition to
+        ``actuation_incoherent`` fires at ECHO time (Wave 0 W0-2b -- the
+        state opens on the discriminator's verdict, not the streak), so both
+        passes must publish transitions through one door.
+        """
         state, reasons, _hint = self._derive(record)
         if state is not record.state:
             previous, record.state = record.state, state
@@ -370,14 +436,13 @@ class RecoveryMonitor:
                 {
                     "type": "unit.health_changed",
                     "payload": {
-                        "unit_id": unit_id,
+                        "unit_id": record.unit_id,
                         "from": previous.value,
                         "to": state.value,
                         "reasons": list(reasons),
                     },
                 }
             )
-        return CycleFindings(coherence_trigger=trigger, unexpected_autonomy=autonomy)
 
     async def record_incoherence_echo(
         self,
@@ -395,6 +460,15 @@ class RecoveryMonitor:
         per episode).  Appends the ``objective_echo`` audit fact carrying the
         classification and the read value, and publishes the discriminated
         follow-up to the detection event.
+
+        DESIGN_BATTERY_HEALTH_WATCH §3.2 (Wave 0, W0-2b): this is also where
+        the episode's health STATE is decided.  The state may OPEN -- become
+        ``actuation_incoherent`` -- only when the discriminator classified
+        the episode ``echo_matches_write`` or ``objective_not_served``; an
+        ``echo_unreadable``, unclassified, or ``external_writer`` episode
+        records its evidence and downgrades (the external-writer class
+        belongs to the standing latch path, and an unreadable echo is not
+        pod-side proof).
         """
         record = self._records.get(unit_id)
         if record is None:
@@ -428,6 +502,12 @@ class RecoveryMonitor:
                 },
             }
         )
+        if record.episode_open and classification in {
+            ECHO_MATCHES_WRITE,
+            ECHO_OBJECTIVE_NOT_SERVED,
+        }:
+            record.incoherent_active = True
+            await self._publish_state_change(record)
 
     # --- read views ----------------------------------------------------------------
 
@@ -449,45 +529,52 @@ class RecoveryMonitor:
         authorized_watts: int,
         direction: str | None,
         measured: float | None,
+        now_mono: float,
     ) -> bool:
         """Advance the actuation-coherence watchdog for one cycle.
 
         The judgment bands: with ``required = _MOVEMENT_FRACTION * authorized``
-        and the commissioned absolute floor, a cycle is COHERENT when the
-        measured movement reaches ``max(required, floor)`` (confident
-        actuation -- the episode closes and re-arms), INCOHERENT when it stays
-        below ``min(required, floor)`` (confident stillness -- the wedge
-        signature), and INCONCLUSIVE between the two.  The dead zone keeps
-        tiny setpoints out of court: a healthy 100 W command moves less than
-        the 150 W floor, so it is never declared incoherent OR coherent and
-        no streak accumulates; a fully silent pod (movement ~0) falls below
-        the proportional band and still alarms.
+        and the commissioned absolute floor, a cycle is COHERENT when EITHER
+        the measured movement from the episode baseline OR the delivered
+        power in the commanded direction reaches ``max(required, floor)``
+        (confident actuation -- the episode closes and re-arms), it counts
+        toward the streak only when BOTH stay below ``min(required, floor)``
+        (confident stillness on both axes -- the wedge signature), and
+        anything else is INCONCLUSIVE.  The dead zone keeps tiny setpoints
+        out of court: a healthy 100 W command moves less than the 150 W
+        floor, so it is never declared incoherent OR coherent and no streak
+        accumulates; a fully silent pod (movement ~0) falls below the
+        proportional band and still alarms.
 
-        Movement is judged against the PRE-COMMAND baseline for the whole
-        authorization episode: a steady command holding the measured power at
-        its commanded level reads coherent forever (that IS delivery).  Known
-        limit, deliberately: a mid-flight loss under an UNCHANGED command --
-        the pod pinned at the level it already reached -- is indistinguishable
-        from delivery by movement alone and is not this watchdog's case; the
-        incident class it exists for (22:11Z, the publish-fence wedge) is the
-        command that NEVER lands, and an authorization ending re-arms the
-        detector from whatever level the battery then holds.
+        DESIGN_BATTERY_HEALTH_WATCH §3.2 (Wave 0, W0-2b): incoherence is
+        judged on DELIVERY, not movement alone.  Steady delivery at 87-96%
+        of command (this fleet's known spread) passes the delivery test and
+        is coherent -- it IS delivery; both live 2026-08-24 incoherent
+        detections were the movement-only test reading exactly that delivery
+        as "no movement" after a gap re-anchored the baseline underneath it.
+        Movement from the PRE-COMMAND baseline remains the other axis: a pod
+        that never moved and never delivered is the silent-loss wedge this
+        watchdog exists for.
+
+        The baseline survives short authorization gaps (W0-2a): an
+        authorization ending re-anchors only once the measured power has
+        returned to the idle band (within the still-band of the episode
+        baseline) or the gap exceeded ``coherence_gap_grace_s`` -- see
+        ``_close_authorization_gap``.
+
+        The trigger this method returns records evidence and orders the
+        objective-echo read; the health STATE opens only on the
+        discriminator's verdict (``record_incoherence_echo``) -- an
+        ``echo_unreadable``, unclassified, or ``external_writer`` episode
+        records evidence and downgrades (the external-writer class belongs
+        to the standing latch path).
         """
         if authorized_watts is None or authorized_watts <= 0:
-            # A control-state change ends any episode silently: an uncommanded
-            # pod drifting back to its baseline is autonomy, not a defect.
-            record.authorized_watts = 0
-            record.authorized_direction = None
-            record.streak = 0
-            record.episode_open = False
-            record.incoherent_active = False
-            record.echo_classification = None
-            record.baseline_watts = None
-            if measured is not None:
-                record.idle_measured_watts = measured
+            self._close_authorization_gap(record, measured, now_mono)
             return False
         record.authorized_watts = int(authorized_watts)
         record.authorized_direction = direction
+        record.authorization_gap_open_mono = None
         if record.baseline_watts is None:
             # The pre-command watts the authorization episode started from.
             record.baseline_watts = (
@@ -495,22 +582,99 @@ class RecoveryMonitor:
             )
         if measured is None or record.baseline_watts is None:
             return False  # no usable measurement: neither evidence nor alarm
+        # The episode's live authorization figure (the gap-time still-band's
+        # carrier -- ``authorized_watts`` reads 0 while a gap stands).
+        record.episode_authorized_watts = record.authorized_watts
         movement = abs(measured - record.baseline_watts)
         required = _MOVEMENT_FRACTION * record.authorized_watts
-        floor = self._settings.actuation_coherence_min_movement_w
-        if movement >= max(required, floor):
+        floor = float(self._settings.actuation_coherence_min_movement_w)
+        # Delivered power IN THE COMMANDED DIRECTION (the ``_signed_authorized``
+        # convention: charge signs negative), so a pod serving its command
+        # reads as delivery whatever its distance from the pre-command
+        # baseline.
+        sign = -1.0 if record.authorized_direction == "charge" else 1.0
+        delivery = sign * measured
+        if movement >= max(required, floor) or delivery >= max(required, floor):
             record.streak = 0
             record.episode_open = False
             record.incoherent_active = False
             record.echo_classification = None
             return False
-        if movement < min(required, floor):
+        if movement < min(required, floor) and delivery < min(required, floor):
             record.streak += 1
         if not record.episode_open and record.streak >= self._settings.actuation_coherence_cycles:
+            # Evidence and the echo read only: the state opens (or downgrades)
+            # in ``record_incoherence_echo`` once the discriminator speaks.
             record.episode_open = True
-            record.incoherent_active = True
             return True
         return False
+
+    def _close_authorization_gap(
+        self,
+        record: _UnitRecord,
+        measured: float | None,
+        now_mono: float,
+    ) -> None:
+        """Fold one unauthorized cycle into the coherence episode (W0-2a).
+
+        DESIGN_BATTERY_HEALTH_WATCH §3.2: the baseline re-anchors only when
+        the measured power has returned to the idle band OR the
+        authorization gap exceeded ``coherence_gap_grace_s``.  A shorter gap,
+        with delivery continuing at the commanded level, is the SAME
+        episode: the pre-command baseline does not move, and the watts the
+        pod is ALREADY delivering are NOT adopted as the idle level -- that
+        adoption is exactly the 2026-08-24 false-positive mechanism (an
+        intent-renewal lapse re-anchored the baseline mid-flight, and steady
+        87-96%-of-command delivery then read as "no movement" for four
+        cycles, with a physical-restart hint attached).
+        """
+        record.authorized_watts = 0
+        record.authorized_direction = None
+        if record.baseline_watts is None:
+            # No preserved episode: a control-state change ends any episode
+            # silently -- an uncommanded pod drifting back to its baseline is
+            # autonomy, not a defect.
+            record.streak = 0
+            record.episode_open = False
+            record.incoherent_active = False
+            record.echo_classification = None
+            record.episode_authorized_watts = 0
+            record.authorization_gap_open_mono = None
+            if measured is not None:
+                record.idle_measured_watts = measured
+            return
+        if record.authorization_gap_open_mono is None:
+            record.authorization_gap_open_mono = float(now_mono)
+        # "Returned to the idle band" is the watchdog's own confident-still
+        # band around the episode baseline: a pod back within that band of
+        # its pre-command level is genuinely idle again, whatever the clock
+        # says.
+        still_band = min(
+            _MOVEMENT_FRACTION * record.episode_authorized_watts,
+            float(self._settings.actuation_coherence_min_movement_w),
+        )
+        returned_to_idle = (
+            measured is not None and abs(measured - record.baseline_watts) < still_band
+        )
+        gap_exceeded_grace = (
+            float(now_mono) - record.authorization_gap_open_mono
+        ) > float(self._settings.coherence_gap_grace_s)
+        if returned_to_idle or gap_exceeded_grace:
+            # The episode is genuinely over: re-anchor from the level the
+            # battery now holds (the standing pre-Wave-0 semantics, now
+            # bounded by the grace and the idle-band test).
+            record.streak = 0
+            record.episode_open = False
+            record.incoherent_active = False
+            record.echo_classification = None
+            record.baseline_watts = None
+            record.episode_authorized_watts = 0
+            record.authorization_gap_open_mono = None
+            if measured is not None:
+                record.idle_measured_watts = measured
+        # Else: PRESERVE -- the same episode across the short gap.  The
+        # baseline, the streak, and the episode state all stand; the next
+        # authorized cycle judges against the SAME pre-command baseline.
 
     async def _record_unexpected_autonomy(
         self, record: _UnitRecord, observation: Any, now_mono: float
@@ -596,7 +760,19 @@ class RecoveryMonitor:
         if record.cell_spread_v is not None and record.cell_spread_v > _CELL_BALANCING_SPREAD_V:
             healing.append("cell_balancing")
         measured = record.measured_watts
-        if measured is not None and measured != 0.0 and not record.claimed:
+        # DESIGN_BATTERY_HEALTH_WATCH §3.1 (Wave 0, W0-1): the self-charge
+        # float deadband.  The old exact-zero test flapped 158 transitions a
+        # night at 96-99% SoC, where the pods float ACROSS zero; a cycle with
+        # |measured| below the deadband renders NEITHER self-charging NOR
+        # flap -- floating at the top is the steady state of a full pack.
+        # Beyond the deadband the classification is unchanged: an in-band
+        # float (e.g. +99 W CT-following) still renders self_healing, so the
+        # deadband kills the zero-crossing flap, not the float visibility.
+        if (
+            measured is not None
+            and abs(measured) >= float(settings.self_charge_deadband_w)
+            and not record.claimed
+        ):
             low, high = settings.expected_autonomy_band_w
             if low <= measured <= high:
                 healing.append("autonomous_self_charge")

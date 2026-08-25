@@ -2936,6 +2936,10 @@ def _recovery_settings(config: ControllerConfig) -> RecoverySettings:
     return RecoverySettings(
         actuation_coherence_cycles=configured.actuation_coherence_cycles,
         actuation_coherence_min_movement_w=configured.actuation_coherence_min_movement_w,
+        # DESIGN_BATTERY_HEALTH_WATCH §3 (Wave 0): the float deadband and the
+        # coherence baseline's gap grace ride the same policy block.
+        self_charge_deadband_w=configured.self_charge_deadband_w,
+        coherence_gap_grace_s=configured.coherence_gap_grace_s,
         expected_autonomy_band_w=(band_low, band_high),
     )
 

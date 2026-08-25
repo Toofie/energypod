@@ -106,6 +106,8 @@ def monitor(
     band: tuple[int, int] = (-2600, 300),
     unresponsive_attempts: int = 3,
     autonomy_interval_s: float = 60.0,
+    deadband_w: float = 25.0,
+    gap_grace_s: float = 12.0,
     clock: ManualClock | None = None,
     audit: RecordingAudit | None = None,
     bus: RecordingBus | None = None,
@@ -119,6 +121,8 @@ def monitor(
             expected_autonomy_band_w=band,
             unresponsive_attempts=unresponsive_attempts,
             unexpected_autonomy_min_interval_s=autonomy_interval_s,
+            self_charge_deadband_w=deadband_w,
+            coherence_gap_grace_s=gap_grace_s,
         ),
         clock=resolved_clock,
         audit=audit if audit is not None else RecordingAudit(),
@@ -216,6 +220,16 @@ async def test_authorized_but_still_cycles_trigger_exactly_once(api: Any) -> Non
     assert event.authorized_active_w == 1000
     assert "authorized_not_actuating" in event.reason_codes
     assert len(bus.of_type("actuation.incoherent")) == 1
+
+    # WAVE 0 W0-2b (DESIGN_BATTERY_HEALTH_WATCH §3.2): the trigger records
+    # evidence and orders the echo read; the health STATE opens only on the
+    # discriminator's verdict.  The supervision loop performs the echo read
+    # immediately after the trigger (composition's one-bounded-read-per-
+    # episode budget) -- this call is that step, and for the ACK-then-ignore
+    # wedge the objective word mirrors our write: echo_matches_write.
+    await mon.record_incoherence_echo(
+        "mid", classification=api.ECHO_MATCHES_WRITE, served_active_w=1000, served_reactive_var=0
+    )
     payload = bus.of_type("actuation.incoherent")[0]["payload"]
     assert payload["unit_id"] == "mid"
     assert payload["authorized_watts"] == 1000
@@ -395,17 +409,25 @@ async def test_the_echo_classification_rides_the_episode_evidence(api: Any) -> N
     """On the coherence trigger the caller performs one bounded fresh read of
     the served objective and hands the classification back; the monitor
     records it, audits it as an ``objective_echo`` fact carrying the read
-    value, and includes it on the health reasons and the bus payload."""
+    value, and includes it on the health reasons and the bus payload.
+
+    WAVE 0 W0-2b, honestly: the scenario's baseline moved from the historic
+    -637 W self-charge to a still float.  Under the delivery test a pod
+    already self-charging at -637 W under a 250 W CHARGE command is moving
+    power in the commanded direction (more than commanded, in fact) and is
+    coherent-by-delivery -- movement-only would have called it a wedge; the
+    genuine both-fail wedge here is the still pod that never moved and
+    never delivered."""
     audit, bus = RecordingAudit(), RecordingBus()
     clock = ManualClock()
     mon = monitor(api, audit=audit, bus=bus, clock=clock)
 
-    await idle_cycle(mon, battery_watts=-637.0)
+    await idle_cycle(mon, battery_watts=0.0)
     for _ in range(4):
         clock.now += 1.5
         await idle_cycle(
             mon,
-            battery_watts=-637.0,
+            battery_watts=0.0,
             authorized_watts=250,
             authorized_direction="charge",
             claimed=True,
@@ -452,6 +474,9 @@ async def test_the_unreadable_echo_is_honest_evidence(api: Any) -> None:
     assert (await state_of(mon)).remediation_hint is None, (
         "an unreadable echo is not pod-side proof; no terminal guidance"
     )
+    # WAVE 0 W0-2b: the unreadable episode records evidence and downgrades --
+    # the health state never OPENS on it (see the T-BHW-WAVE0 section).
+    assert (await state_of(mon)).state is not api.HealthState.ACTUATION_INCOHERENT
 
 
 # --- the unresponsiveness classifier (R4) ---------------------------------------
@@ -556,6 +581,8 @@ async def test_classification_precedence_is_pinned(api: Any) -> None:
     assert (await state_of(mon)).state == api.HealthState.SELF_HEALING
 
     # An active wedge while requalifying: the wedge outranks self-healing.
+    # (Wave 0 W0-2b: the state opens on the discriminating echo, not the
+    # streak -- the echo step is driven exactly as supervision drives it.)
     for _ in range(4):
         await idle_cycle(
             mon,
@@ -564,6 +591,12 @@ async def test_classification_precedence_is_pinned(api: Any) -> None:
             claimed=True,
             lifecycle="active",
         )
+    await mon.record_incoherence_echo(
+        "mid",
+        classification=api.ECHO_OBJECTIVE_NOT_SERVED,
+        served_active_w=0,
+        served_reactive_var=0,
+    )
     assert (await state_of(mon)).state == api.HealthState.ACTUATION_INCOHERENT
 
     # An inhibit outranks the wedge verdict.
@@ -791,6 +824,18 @@ async def test_settings_and_units_are_validated(api: Any) -> None:
         api.RecoverySettings(unexpected_autonomy_min_interval_s=0)
     with pytest.raises(ValueError, match="expected_autonomy_band_w"):
         api.RecoverySettings(expected_autonomy_band_w=(300, -2600))
+    # DESIGN_BATTERY_HEALTH_WATCH §3.1/§3.2 (Wave 0): the deadband lives in
+    # (0, 100] -- at 100 it would begin to eat the legitimate float class --
+    # and the gap grace between 1 and 300 s (the handback-grace precedent's
+    # bounds, mirrored at the application layer).
+    with pytest.raises(ValueError, match="self_charge_deadband_w"):
+        api.RecoverySettings(self_charge_deadband_w=0.0)
+    with pytest.raises(ValueError, match="self_charge_deadband_w"):
+        api.RecoverySettings(self_charge_deadband_w=100.5)
+    with pytest.raises(ValueError, match="coherence_gap_grace_s"):
+        api.RecoverySettings(coherence_gap_grace_s=0.5)
+    with pytest.raises(ValueError, match="coherence_gap_grace_s"):
+        api.RecoverySettings(coherence_gap_grace_s=301.0)
     with pytest.raises(ValueError, match="unit_ids"):
         monitor(api, units=())
     unknown = monitor(api)
@@ -808,3 +853,317 @@ async def test_settings_and_units_are_validated(api: Any) -> None:
         )
     with pytest.raises(LookupError):
         unknown.record_read_outcome("ghost", api.READ_OK)
+
+
+# --- DESIGN_BATTERY_HEALTH_WATCH §3: Wave 0 (T-BHW-WAVE0) ------------------------
+#
+# Both fixes below correct live-verified defects in the monitor's own
+# evidence, landed BEFORE any stage of that program composes: W0-1 the
+# self-charge float deadband (the 158-transition night on rhs), W0-2
+# coherence judged on delivery with a gap-surviving baseline (both live
+# 2026-08-24 actuation_incoherent detections were false positives), and the
+# standing invariant I10 pinning that no automated response anywhere keys
+# on actuation_incoherent alone.
+
+
+async def test_the_float_deadband_renders_the_zero_straddle_steady(api: Any) -> None:
+    """W0-1 (§3.1): the 158-transition night replays to ~0 transitions.  rhs
+    at 96-99% SoC floats ACROSS zero (observed straddle -16/0/+33 W) and the
+    exact-zero discriminator flipped healthy <-> self_healing on every zero
+    crossing; inside the deadband the float is the healthy steady state of a
+    full pack, on BOTH sides of zero, and the transition wall is gone."""
+    bus = RecordingBus()
+    clock = ManualClock()
+    mon = monitor(api, bus=bus, clock=clock)
+
+    # The straddle's within-deadband bulk: alternating sign across zero, the
+    # exact shape that flapped per-sample under the exact-zero test.
+    straddle = [-16.0, 0.0, +16.0, 0.0, -8.0, 0.0, +12.0, 0.0] * 20
+    for watts in straddle:
+        clock.now += 96.0  # the cold ring's ~96-108 s serving period
+        await idle_cycle(mon, battery_watts=watts)
+        assert (await state_of(mon)).state == api.HealthState.HEALTHY, watts
+
+    assert bus.of_type("unit.health_changed") == [], (
+        "the zero-straddling float must render steady health, not a wall of "
+        "alternating entries"
+    )
+    assert bus.of_type("unit.unexpected_autonomy") == [], "a float is in-band, never evidence"
+
+
+async def test_beyond_deadband_float_stays_self_healing_on_both_sides(api: Any) -> None:
+    """W0-1 (§3.1): the deadband kills the zero-crossing flap, NOT the float
+    visibility -- the ±33 W observed-straddle extremes on BOTH sides of zero
+    and §3.1's own +99 W CT-following example still render self_healing."""
+    mon = monitor(api, clock=ManualClock())
+    for watts in (-33.0, +33.0, -99.0, +99.0):
+        await idle_cycle(mon, battery_watts=watts)
+        health = await state_of(mon)
+        assert health.state == api.HealthState.SELF_HEALING, watts
+        assert "autonomous_self_charge" in health.reasons
+
+    # The band edge is the deadband itself: below it steady healthy, at it
+    # the float becomes visible again (>= semantics, both signs).
+    await idle_cycle(mon, battery_watts=+24.9)
+    assert (await state_of(mon)).state == api.HealthState.HEALTHY
+    await idle_cycle(mon, battery_watts=-25.0)
+    assert (await state_of(mon)).state == api.HealthState.SELF_HEALING
+
+
+async def test_steady_partial_delivery_never_trips_the_watchdog(api: Any) -> None:
+    """W0-2 (§3.2): the two live false positives as named regression
+    vectors -- mid 2026-08-24 14:11Z (~87% of command) and lhs 15:34Z (~96%):
+    an authorization gap (the telemetry_stale dip ending the intent) while
+    the pod held steady partial delivery must NEVER read as incoherence.
+    The delivery test passes (steady 87-96% of command IS delivery), the
+    baseline survives the short gap instead of re-anchoring onto the watts
+    the pod was already delivering, and no physical-restart hint appears."""
+    for fraction, incident in ((0.87, "mid 14:11Z"), (0.96, "lhs 15:34Z")):
+        audit, bus = RecordingAudit(), RecordingBus()
+        clock = ManualClock()
+        mon = monitor(api, audit=audit, bus=bus, clock=clock, band=(-2600, 1000))
+
+        await idle_cycle(mon, battery_watts=0.0)  # the pre-command float
+        delivery = 1000.0 * fraction
+        for _ in range(4):  # steady partial delivery under the command
+            clock.now += 1.5
+            await idle_cycle(
+                mon,
+                battery_watts=delivery,
+                authorized_watts=1000,
+                authorized_direction="discharge",
+                claimed=True,
+                lifecycle="active",
+            )
+        # THE GAP: the intent lapses for ~3 s (two fleet cycles) while the
+        # pod keeps delivering; renewal then restores the same command.
+        for _ in range(2):
+            clock.now += 1.5
+            await idle_cycle(mon, battery_watts=delivery, authorized_watts=0)
+        for _ in range(8):
+            clock.now += 1.5
+            await idle_cycle(
+                mon,
+                battery_watts=delivery,
+                authorized_watts=1000,
+                authorized_direction="discharge",
+                claimed=True,
+                lifecycle="active",
+            )
+
+        assert [e for e in audit.appended if e.event_type == "actuation_incoherent"] == [], incident
+        assert bus.of_type("actuation.incoherent") == [], incident
+        health = await state_of(mon)
+        assert health.state == api.HealthState.HEALTHY, incident
+        assert health.remediation_hint is None, incident
+
+
+async def test_a_short_authorization_gap_does_not_re_anchor_the_baseline(api: Any) -> None:
+    """W0-2a (§3.2): a gap inside ``coherence_gap_grace_s`` (default 12 s)
+    with delivery continuing is the SAME episode -- the pre-command baseline
+    survives.  Observable through the evidence: when the pod then goes
+    genuinely DEAD (delivers nothing, back at its pre-command float), the
+    alarm still names the ORIGINAL baseline and the dead pod still alarms
+    (movement ~0 AND delivery ~0 against the survived baseline)."""
+    audit, bus = RecordingAudit(), RecordingBus()
+    clock = ManualClock()
+    mon = monitor(api, audit=audit, bus=bus, clock=clock)
+
+    await idle_cycle(mon, battery_watts=0.0)  # baseline 0 W: the pre-command float
+    for _ in range(3):  # steady delivery at 87% of the command
+        clock.now += 1.5
+        await idle_cycle(
+            mon,
+            battery_watts=870.0,
+            authorized_watts=1000,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+    for _ in range(2):  # the 3 s gap, delivery continuing throughout
+        clock.now += 1.5
+        await idle_cycle(mon, battery_watts=870.0, authorized_watts=0)
+    # The command resumes and the pod dies: nothing delivered, no movement.
+    triggered = False
+    for _ in range(4):
+        clock.now += 1.5
+        findings = await idle_cycle(
+            mon,
+            battery_watts=0.0,
+            authorized_watts=1000,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+        triggered = triggered or bool(findings.coherence_trigger)
+    assert triggered, "a dead pod still alarms (W0-2's negative case)"
+
+    await mon.record_incoherence_echo(
+        "mid", classification=api.ECHO_MATCHES_WRITE, served_active_w=1000, served_reactive_var=0
+    )
+    (event,) = [e for e in audit.appended if e.event_type == "actuation_incoherent"]
+    assert event.unit_id == "mid"
+    # The figures ride the bus payload (the audit row keeps fingerprints);
+    # the FIRST incoherent event is the trigger-time one.
+    trigger_payload = bus.of_type("actuation.incoherent")[0]["payload"]
+    assert trigger_payload["baseline_watts"] == 0.0, (
+        "the baseline survived the gap -- the pre-command float, never the "
+        "in-flight delivery watts"
+    )
+    assert (await state_of(mon)).state == api.HealthState.ACTUATION_INCOHERENT
+
+
+async def test_a_gap_beyond_the_grace_re_anchors_the_baseline(api: Any) -> None:
+    """W0-2a (§3.2): past ``coherence_gap_grace_s`` the standing semantics
+    resume -- the baseline re-anchors onto the level the battery then holds.
+    The contrast with the short-gap case is the pin: after a beyond-grace
+    re-anchor at the delivery level, the same subsequent dead-at-float drop
+    reads as MOVEMENT (the pod released its hold), never as stillness from
+    the original baseline, and no incoherence is declared."""
+    audit, bus = RecordingAudit(), RecordingBus()
+    clock = ManualClock()
+    mon = monitor(api, audit=audit, bus=bus, clock=clock)
+
+    await idle_cycle(mon, battery_watts=0.0)
+    for _ in range(3):
+        clock.now += 1.5
+        await idle_cycle(
+            mon,
+            battery_watts=870.0,
+            authorized_watts=1000,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+    # The gap runs past the 12 s grace with delivery continuing: the
+    # baseline re-anchors at 870 W (the standing pre-Wave-0 behavior, now
+    # bounded by the grace).
+    for gap_s in (1.5, 3.0, 14.0):
+        clock.now += gap_s
+        await idle_cycle(mon, battery_watts=870.0, authorized_watts=0)
+    # The command resumes and the pod dies at its float.
+    for _ in range(6):
+        clock.now += 1.5
+        await idle_cycle(
+            mon,
+            battery_watts=0.0,
+            authorized_watts=1000,
+            authorized_direction="discharge",
+            claimed=True,
+            lifecycle="active",
+        )
+    assert [e for e in audit.appended if e.event_type == "actuation_incoherent"] == []
+    assert bus.of_type("actuation.incoherent") == []
+    assert (await state_of(mon)).state == api.HealthState.HEALTHY
+
+
+async def test_only_discriminated_episodes_open_the_state(api: Any) -> None:
+    """W0-2b (§3.2): the episode may OPEN the health state only once the
+    objective-echo discriminator classified it ``echo_matches_write`` or
+    ``objective_not_served``; ``echo_unreadable`` and ``external_writer``
+    episodes record their evidence and downgrade (the external-writer class
+    belongs to the standing latch path), and so does an episode whose echo
+    never arrives (unclassified)."""
+    for classification, served in (
+        (api.ECHO_UNREADABLE, (None, None)),
+        (api.ECHO_EXTERNAL_WRITER, (-900, 0)),
+    ):
+        audit, bus = RecordingAudit(), RecordingBus()
+        clock = ManualClock()
+        mon = monitor(api, audit=audit, bus=bus, clock=clock)
+
+        await idle_cycle(mon, battery_watts=-637.0)
+        for _ in range(4):
+            clock.now += 1.5
+            await idle_cycle(
+                mon,
+                battery_watts=-637.0,
+                authorized_watts=800,
+                authorized_direction="discharge",
+                claimed=True,
+                lifecycle="active",
+            )
+        await mon.record_incoherence_echo(
+            "mid",
+            classification=classification,
+            served_active_w=served[0],
+            served_reactive_var=served[1],
+        )
+
+        # Evidence recorded, state downgraded: never actuation_incoherent.
+        health = await state_of(mon)
+        assert health.state is not api.HealthState.ACTUATION_INCOHERENT, classification
+        assert health.state == api.HealthState.HEALTHY, classification
+        assert health.remediation_hint is None, classification
+        assert [e for e in audit.appended if e.event_type == "actuation_incoherent"], (
+            "the streak evidence is still recorded -- downgraded is not deleted"
+        )
+        assert [e for e in audit.appended if e.event_type == "objective_echo"]
+
+    # The unclassified episode: the trigger fires (evidence + the echo read
+    # ordered) but the read never lands -- the state must not open either.
+    audit = RecordingAudit()
+    mon = monitor(api, audit=audit, clock=ManualClock())
+    await idle_cycle(mon, battery_watts=-637.0)
+    for _ in range(4):
+        await idle_cycle(
+            mon,
+            battery_watts=-637.0,
+            authorized_watts=800,
+            claimed=True,
+            lifecycle="active",
+        )
+    assert [e for e in audit.appended if e.event_type == "actuation_incoherent"]
+    assert (await state_of(mon)).state is not api.HealthState.ACTUATION_INCOHERENT
+
+
+def test_no_automated_response_keys_on_actuation_incoherent(api: Any) -> None:
+    """T-BHW-WAVE0 / DESIGN_BATTERY_HEALTH_WATCH invariant I10 (§3.2, §8,
+    §17): no automated response ANYWHERE keys on ``actuation_incoherent``
+    alone -- Stage R's eligibility is census-flag AND probe-failure, and the
+    health ladder is context, never a trigger.
+
+    The pin is structural: today only the detector itself and PASSIVE
+    surfaces read the vocabulary (projections, advisories, audit-evidence
+    collection, and the one bounded objective-echo READ the trigger orders);
+    any module that starts reading it breaks this allowlist until the pin is
+    consciously revised by a contract that names the response and why it
+    does not stand on the signal Wave 0 exists to make trustworthy."""
+    from pathlib import Path
+
+    package_root = Path(api.__file__).resolve().parents[1]  # src/energypod
+    vocabulary = (
+        "ACTUATION_INCOHERENT",
+        "actuation_incoherent",
+        "actuation.incoherent",
+        "coherence_trigger",
+    )
+    # Every current consumer, with WHY it is passive:
+    allowed = {
+        # The detector itself: audit facts, bus events, the derived view.
+        Path("application") / "recovery.py",
+        # The facade's read surfaces: the unit-detail recovery advisory, the
+        # control-readiness reason strings, the health projection.
+        Path("application") / "service.py",
+        # The resume checklist's faults_while_parked: a bounded read of PAST
+        # audit facts over the park window (DESIGN_POD_PARKING section 4),
+        # never a response to the live state.
+        Path("application") / "parking.py",
+        # The supervision pass's trigger consumer: it performs the ONE
+        # bounded objective-echo READ per episode (P1 iii) -- detection
+        # evidence, not a control act.
+        Path("runtime") / "composition.py",
+        # The policy block's Wave-0 justification COMMENTS name the incident
+        # class (§15 item 6); a comment is documentation, never a consumer.
+        Path("runtime") / "config.py",
+    }
+    mentioning: set[Path] = set()
+    for path in sorted(package_root.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if any(word in text for word in vocabulary):
+            mentioning.add(path.relative_to(package_root))
+    assert mentioning <= allowed, (
+        f"modules beyond the passive-consumer allowlist read the "
+        f"actuation_incoherent vocabulary: {sorted(mentioning - allowed)} -- "
+        f"I10 requires a conscious pin revision, not a silent consumer"
+    )

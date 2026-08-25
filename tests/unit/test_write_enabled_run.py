@@ -1884,16 +1884,25 @@ async def test_a_foreign_objective_echo_resurfaces_the_external_writer(
 ) -> None:
     """The wedge variant where the readback carries somebody else's nonzero
     objective: the classification rides the existing ``external_writer``
-    vocabulary, and the monitor adds no terminal guidance (finding the other
-    writer is the existing latch's remediation, not a pod restart)."""
+    vocabulary, and WAVE 0 W0-2b (DESIGN_BATTERY_HEALTH_WATCH §3.2) makes
+    this episode a DOWNGRADE -- the external-writer class belongs to the
+    standing latch path, so the coherence episode records its evidence
+    (detection fact + classified echo) but the health state never OPENS on
+    it, and no terminal guidance is added (finding the other writer is the
+    existing latch's remediation, not a pod restart)."""
     runtime, journal, _clock = await _drive_wedge(monkeypatch, objective_echo_mode="foreign")
     try:
         (echo,) = _recovery_events(runtime, "objective_echo")
         assert echo.reason_codes == ("external_writer",)
+        assert _recovery_events(runtime, "actuation_incoherent"), (
+            "the streak evidence is still recorded -- downgraded is not deleted"
+        )
         snapshot = await runtime.facade.snapshot(principal=OPERATOR)
         unit = _unit_view(snapshot)
-        assert unit["health_state"] == "actuation_incoherent"
-        assert "external_writer" in unit["health_reasons"]
+        assert unit["health_state"] != "actuation_incoherent", (
+            "an external_writer episode never opens the incoherent state"
+        )
+        assert "external_writer" not in unit["health_reasons"]
         assert unit["remediation_hint"] is None
     finally:
         await _shutdown_actors(runtime)

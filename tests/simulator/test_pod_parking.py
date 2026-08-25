@@ -32,6 +32,7 @@ from typing import Any
 import pytest
 
 from energypod.adapters.modbus import protocol_codec
+from energypod.application.recovery import ECHO_MATCHES_WRITE
 from energypod.simulator.pod import SimulatedEnergyPod
 from energypod.simulator.transport import SimulatorTransport
 
@@ -649,6 +650,20 @@ async def test_a_mid_flight_park_is_the_detected_wedge_signature() -> None:
         assert incoherent.unit_id == "mid"
         assert incoherent.authorized_active_w == -_CHARGE_W
         assert "authorized_not_actuating" in incoherent.reason_codes
+
+        # WAVE 0 W0-2b (DESIGN_BATTERY_HEALTH_WATCH §3.2): the trip records
+        # evidence; the health STATE opens only on the objective-echo
+        # discriminator's verdict.  The parked pod keeps ACKing and its
+        # served-objective word keeps mirroring our write (the pinned
+        # ACK-then-ignore model), so the echo matches -- the state opens as
+        # the live supervision loop (which drives this read itself) would
+        # see it.
+        await runtime.recovery.record_incoherence_echo(
+            "mid",
+            classification=ECHO_MATCHES_WRITE,
+            served_active_w=-_CHARGE_W,
+            served_reactive_var=0,
+        )
 
         # The snapshot renders the wedge signature state.
         snapshot = await runtime.facade.snapshot(principal=OPERATOR)

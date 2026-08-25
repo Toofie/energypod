@@ -263,6 +263,21 @@ async def test_the_incoherent_wedge_outranks_the_park() -> None:
         now_mono=1001.0,
         parked=True,
     )
+    # WAVE 0 W0-2b (DESIGN_BATTERY_HEALTH_WATCH §3.2): the coherence trip
+    # records evidence and orders the objective-echo read; the health STATE
+    # opens only on the discriminator's verdict.  A parked pod keeps ACKing
+    # and its served-objective word keeps mirroring our write (the pinned
+    # ACK-then-ignore model), so the echo matches and the incoherent state
+    # outranks the park -- exactly as the live supervision loop would see.
+    assert (await health_view(mon)).state.value != "actuation_incoherent", (
+        "the streak alone must not open the state"
+    )
+    await mon.record_incoherence_echo(
+        "mid",
+        classification=recovery.ECHO_MATCHES_WRITE,
+        served_active_w=-800,
+        served_reactive_var=0,
+    )
     view = await health_view(mon)
     assert view.state.value == "actuation_incoherent", "the wedge outranks the park"
     assert view.reasons[0] == "authorized_not_actuating"

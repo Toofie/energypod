@@ -665,13 +665,16 @@ def test_excess_charging_intent_ttl_is_bounded() -> None:
 def test_policy_carries_the_recovery_detection_defaults() -> None:
     """The actuation-coherence watchdog and the autonomy band commission with
     pinned defaults, so an unchanged policy keeps today's behavior while the
-    keys stay explicit on the live-write example."""
+    keys stay explicit on the live-write example.  Wave 0's two keys
+    (DESIGN_BATTERY_HEALTH_WATCH §3) carry their defaults the same way."""
     parsed = _validate(_valid_config())
 
     policy = parsed.policy
     assert policy is not None
     assert policy.actuation_coherence_cycles == 4
     assert policy.actuation_coherence_min_movement_w == 150
+    assert policy.self_charge_deadband_w == 25.0
+    assert policy.coherence_gap_grace_s == 12.0
     assert tuple(policy.expected_autonomy_band_w) == (-2600, 1000)
 
 
@@ -736,6 +739,74 @@ def test_actuation_coherence_keys_must_be_positive() -> None:
         payload["policy"][key] = bad
         with pytest.raises(ValidationError, match=key):
             _validate(payload)
+
+
+def test_wave0_monitor_keys_are_commissionable() -> None:
+    """DESIGN_BATTERY_HEALTH_WATCH §3 (Wave 0): the float deadband and the
+    coherence baseline's gap grace override cleanly beside the watchdog's
+    existing knobs, and the application layer composes their defaults
+    verbatim (the recovery-settings twin may never drift from the config
+    default)."""
+    payload = _valid_config()
+    payload["policy"].update({"self_charge_deadband_w": 40.0, "coherence_gap_grace_s": 20.0})
+
+    parsed = _validate(payload)
+
+    assert parsed.policy is not None
+    assert parsed.policy.self_charge_deadband_w == 40.0
+    assert parsed.policy.coherence_gap_grace_s == 20.0
+
+    from energypod.application.recovery import RecoverySettings
+
+    assert RecoverySettings().self_charge_deadband_w == 25.0
+    assert RecoverySettings().coherence_gap_grace_s == 12.0
+
+
+def test_wave0_monitor_keys_are_bounded() -> None:
+    """§3.1 pins the deadband to (0, 100] -- at 100 it would begin to eat the
+    legitimate float class -- and §3.2's gap grace carries the handback-grace
+    precedent's [1, 300] bounds.  Both edges refuse at configuration time,
+    never misbehave at runtime."""
+    for key, bad in (
+        ("self_charge_deadband_w", 0.0),
+        ("self_charge_deadband_w", -25.0),
+        ("self_charge_deadband_w", 100.5),
+        ("coherence_gap_grace_s", 0.5),
+        ("coherence_gap_grace_s", 301.0),
+    ):
+        payload = _valid_config()
+        payload["policy"][key] = bad
+        with pytest.raises(ValidationError, match=key):
+            _validate(payload)
+    # The inclusive ceiling is legal: 100 is the last value that does not
+    # eat the float class.
+    payload = _valid_config()
+    payload["policy"]["self_charge_deadband_w"] = 100.0
+    assert _validate(payload).policy is not None
+
+
+def test_the_live_write_example_documents_the_wave0_monitor_keys() -> None:
+    """§15 item 6: the policy block's recovery-key comments gain Wave 0's
+    two keys with their justification lines, beside the existing watchdog
+    text -- the operator reading their configuration sees the deadband and
+    the gap grace with their defaults."""
+    from pathlib import Path
+
+    text = (
+        Path(__file__)
+        .resolve()
+        .parents[2]
+        .joinpath("config", "config.live-write-example.yaml")
+        .read_text(encoding="utf-8")
+    )
+
+    for key, value in (
+        ("self_charge_deadband_w", "25.0"),
+        ("coherence_gap_grace_s", "12.0"),
+    ):
+        assert re.search(rf"^\s*{key}:\s*{value}\s*$", text, re.MULTILINE), key
+    assert "DESIGN_BATTERY_HEALTH_WATCH §3.1" in text
+    assert "§3.2, Wave 0 W0-2a" in text
 
 
 def test_expected_autonomy_band_must_span_the_self_charge_region() -> None:
