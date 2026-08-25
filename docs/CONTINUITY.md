@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; both programs' contracts committed — health-watch live through C+P with the first census night tonight, calibration at design-only v1.1)
+Last updated: 2026-08-25 (Australia/Brisbane; health-watch Stage R live in the advise posture — the complete program runs tonight; the calibration implementation wave is the last build)
 
 ## Purpose
 
@@ -375,6 +375,52 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (health-watch STAGE R COMMITTED AND LIVE — c3532ae, 21
+  files +3621/−166; controller restarted as harness-managed task
+  be4qkiwzv, boot clean; live status verified read-only: stages
+  [census, probe, recovery], phase await_window — TONIGHT runs the
+  COMPLETE program for the first time, recovery in the ADVISE posture:
+  zero writes, structurally — no arm port wired in that posture):
+  REVIEW — source-scan: ZERO transport writes in health_watch.py;
+  exactly one .park(/.resume( each on the injected port; the
+  disarm/re-arm facade twins confirmed NEVER-ROUTED. WHAT SHIPPED —
+  the §7.2 composite (reverify→disarm→park→hold 90 s→resume→one
+  bounded re-arm→verification re-run→closing disarm; I9
+  authority-never-exceeds); the amended ladder (recovered_unproven
+  excluded from the cap per A2; failed_write/write_unverified/
+  failed_no_effect counted; the derived cap reset — no new API
+  surface); the parking amendments live (A10 derived origin
+  energypod:⇒automation on every lease/event/provenance surface with
+  both-way honesty against operator rows; A5 _adopt_pending_resume —
+  a pending unit_resumed + word=0 inside the anti-rollover window
+  boot-adopts as OURS); DESIGN_POD_PARKING §3/§4/§7 amended; the
+  console recovery surfaces (advise walkthrough vs auto card,
+  attempts_total + the trailing-30 rate per A11, the left-armed
+  alert, the BMU cross-check note); the simulator cycle-wedge +
+  release-on-cycle legs. GATES: 2934 backend (+49), 1032 web (+12),
+  ruff + mypy strict clean. LIVE CONFIG = §16 revision three
+  (recovery-advise) exactly as the contract sequenced it. NOTABLE
+  RESOLUTIONS — the derived cap reset (any non-counted night breaks
+  the streak — flagged in case a privileged acknowledge route is
+  wanted later); A11's rate renders attempted/30 (the
+  needs-the-cycle rate), NOT recovered/attempted (which would read
+  100 % in the chronic case); one recovery row per unit per night
+  (null verdict when not eligible) making I1/A4 well-defined; the A6
+  chicken-and-egg — evidence files must be PRE-CREATED before the
+  supervised auto night (boot degrades to advise LOUDLY if missing);
+  §15 items 1/2/4 (PROTOCOL_EVIDENCE / API_CONTRACTS /
+  CONTROL_SURFACE_GAP amendments naming Stage R) left for the
+  round-close sweep. REMAINING SEQUENCE — the calibration
+  implementation wave is LAUNCHING NOW (the last build); after it:
+  review→commit→restart→commission (advise + the C6 one-shot
+  request_measurement for mid so its first traverse runs at the first
+  eligible evening). The §16 step-5 supervised auto night for
+  recovery waits for a GENUINELY FLAGGED unit (needs tonight's+
+  census/probe rows with the fleet armed — the operator holds the
+  arm flag) and the operator's go; the agent's checklist is held by
+  the coordinator. Three standing operator questions unchanged
+  (always-rhs; rhs capacity; Fronius Battery Control).
 
 - 2026-08-25 (calibration CONTRACT v1.1 COMMITTED — 1fe0c76,
   docs/DESIGN_CALIBRATION_CYCLING.md, 1290 lines, §16 amendment log
