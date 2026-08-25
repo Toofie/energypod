@@ -555,7 +555,12 @@ schedule:
 night_charging:
   timezone: "Australia/Brisbane"   # REQUIRED — the off-peak window is a civil-time fact
   window_local: [["00:00", "06:00"]]   # the commissioned off-peak window
-  enabled: false            # suspended; the toggle starts it (the cutover's step 4)
+  enabled: true             # the DEFAULT (operator direction 2026-08-25: night
+                            #   charging "remains the default setting even
+                            #   after restarts") — the config IS the boot
+                            #   default; the runtime toggle still overrides
+                            #   within a session, and every restart returns
+                            #   to this. Docker stood down 2026-08-25.
   rate_cap_w: 2500          # the per-battery cap (<= policy.max_unit_charge_w)
   demand_threshold_w: 1000  # the operator's own figure
   demand_exit_hysteresis_w: 200   # resume only below 800 W (no flapping)
