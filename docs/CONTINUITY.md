@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; both programs commissioned and live — the health-watch's first complete run tonight 23:00, mid's first calibration traverse tomorrow 15:00)
+Last updated: 2026-08-25 (Australia/Brisbane; the one-shot adjudication lands — the waiver is of due, evidence_short never gated it; tonight's first complete run, tomorrow's first traverse)
 
 ## Purpose
 
@@ -375,6 +375,38 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (calibration ONE-SHOT DEFERRAL ADJUDICATION — c55fff1,
+  3 files +136/−14; controller restarted as harness-managed task
+  bsxx74tkg, boot clean; live status verified read-only: mode act,
+  phase idle, reason now the HONEST deferred_probe_required — was the
+  bogus request_unit_not_eligible — one-shot standing unconsumed):
+  THE RULING — the implementation OVER-DEFERRED: it minted an
+  evidence_short class and let it refuse the operator's request,
+  contra the contract's own §10 step 0 (the panel's ruling there: the
+  one-shot exists precisely so mid-first does NOT wait out the
+  horizon; during the horizon EVERY pod is evidence_short, so
+  deferring under it would have made C6 fix nothing). The waiver is of
+  DUE; evidence_short is the unjudgeability OF due — subsumed. WITH
+  THE FIX — the class derives from available evidence through the
+  unchanged gates (exclusion first; the probe ladder for underived
+  throughput), defers ONLY on deferred_probe_required /
+  no_control_evidence / excluded_cycles_daily, and a deferred request
+  is NEVER consumed — it stands and retries each plan. GATES: 2990
+  backend (4 new legs), ruff + mypy strict clean. The config test that
+  over-pinned the live file's mode was HONESTLY RELAXED (the
+  operator's §10 step-2 commissioning changed the file after the
+  suite's pin). THE SCHEDULE NOW STANDING (FINAL) — TONIGHT 23:00
+  health-watch first complete run (census always; probe if armed — a
+  passing mid probe row unlocks the calibration class REGARDLESS of
+  throughput); TOMORROW 14:00 plan: the third rollup date lands and
+  mid's ~3.3 kWh/day throughput (≥ 3 qualifying dates) unlocks the
+  waiver — one-shot consumed, traverse opens 15:00, closes by 22:30
+  with the stops and the durable opened-row; solar's midday refill
+  Thursday provides the top anchor; graduation on the measurement
+  record. The coordinator monitors and reports each event. Remaining
+  opens unchanged (recovery auto's genuine-flag + supervised night;
+  the §15 doc sweep; the three operator questions).
 
 - 2026-08-25 (calibration program COMMITTED, COMMISSIONED, AND LIVE —
   0b02c36, 27 files +6845; controller restarted as harness-managed
