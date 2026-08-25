@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; health-watch Wave 0 live — the deadband and delivery-judged coherence; Stages C+P launching, recovery still uncommissioned)
+Last updated: 2026-08-25 (Australia/Brisbane; health-watch Stages C+P live — first census+probe night tonight 23:00; the probe needs armed units, the program never arms)
 
 ## Purpose
 
@@ -375,6 +375,40 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (health-watch STAGES C+P COMMITTED AND LIVE — 2a7f6f7, 20
+  files +6181; controller restarted as harness-managed task by7ejlnao,
+  boot clean; the status surface verified live read-only:
+  GET /api/v1/health-watch/status → 200, stages [census, probe], window
+  23:00–23:45, phase await_window, night 2026-08-25 — THE FIRST
+  CENSUS+PROBE NIGHT RUNS TONIGHT 23:00 SITE TIME): WHAT SHIPPED — the
+  program frame (§4 phase machine, once-per-night durable rows, A1
+  deadline arithmetic, A4 interrupted reconstruction, A12 precedence);
+  Stage C census (five stuck predicates, per-unit verdicts, persistence,
+  tiers, ZERO writes); Stage P probe (300 W discharge, the §6.3 verdict
+  matrix verbatim, A8 grid-import quiet gate + cancel re-check,
+  baseline verification); config §9 (strict-prefix stages, A6 receipts —
+  recovery without per-unit evidence is a validation ERROR); the console
+  HealthWatchCard (verdict rows, skip reasons, alert tiers, the
+  defined-restart advisory verbatim); the simulator script_stuck with
+  pinned echo class. REVIEW: footprint verified; source-scan confirmed
+  health_watch.py holds NO write calls — no transport, no
+  arm/park/resume/disarm. GATES: 2885 backend (+107), 1020 web (+30),
+  ruff + mypy strict clean, tsc + build green. Ten §-ambiguities
+  resolved (notably: probe "still" = mean |w| over core; guard-refusal
+  = skip not failure; recovery staged-but-unshipped renders advise with
+  null verdict). LIVE CONFIG lands stages [census, probe]; recovery
+  uncommissioned per §16. OPERATOR NUANCE — the probe requires ARMED
+  units at 23:00: the program NEVER arms (v1 doctrine; only Stage R
+  auto contains the bounded re-arm); a normal disarmed evening renders
+  census + the arm instruction; FULL TEST NIGHTS NEED THE OPERATOR TO
+  ARM IN THE EVENING. NEXT: the calibration-cycling contract design
+  agent is launching NOW (separate contract beside the health-watch per
+  panel A14 — own config block, own window; quarterly, one pod at a
+  time, the 5–10 % bottom anchor at ~0.2 C, taper + 30–60 min
+  balancing hold, trigger-gated on days-since-below-X from the
+  historian, measurement-first); after its review pass: Stage R
+  supervised live verification prep, then the R wave.
 
 - 2026-08-25 (health-watch WAVE 0 COMMITTED AND LIVE — 3f1b27e, 9 files
   +741/−46; controller restarted as harness-managed task bbxaxk1dz,
