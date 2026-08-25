@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the one-shot adjudication lands — the waiver is of due, evidence_short never gated it; tonight's first complete run, tomorrow's first traverse)
+Last updated: 2026-08-25 (Australia/Brisbane; the rebalancing decision — no balancer now, participation first; health-watch first run tonight 23:00, mid's traverse tomorrow)
 
 ## Purpose
 
@@ -375,6 +375,45 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (rebalancing research round — DECISION: DEFER BUILDING,
+  FIRST FIX PARTICIPATION; read-only, nothing committed): FINDINGS OF
+  RECORD — (a) the old stack's two cross-transfer balancers
+  (manager.py balance_battery_soc 448–563: Δ>5, ≤1500 W, +10 %/−15 %
+  factors = a 25 % export bias, NEVER SCHEDULED; byd PhaseBalancer:
+  5/10/20-point tiers to 3 kW, no loss compensation, UI-ONLY) plus the
+  scheduled-then-disabled SoC³-weighted discharge (convergence during
+  useful work, zero double conversion) — NO proven-in-service
+  precedent, correcting an earlier implication that one existed; (b)
+  HTW Berlin Stromspeicher-Inspektion 2025 measured numbers: one-way
+  BAT2AC 95.7 % mean at rated power collapsing to 63–86 % at partial
+  load — battery→AC→battery round trip ≈80–90 %, so the operator's
+  5 % bias is WRONG; the honest starting factor is
+  charge=0.85×discharge, calibratable from fleet telemetry; (c)
+  import/export registers accumulate independently (30 c paid vs 2 c
+  earned — discharge-leads-charge-follows ramping required if
+  zero-import is wanted; meter cross-phase netting is the norm but
+  configurable variance exists — verify from interval data before any
+  commissioning); (d) the German BYD mega-thread: mid-range divergence
+  is partly BMS ARTIFACT reconverging at extremes; the vendor-sanctioned
+  gauge fix is full charges; NO vendor guidance exists for
+  independent-pod balancing; (e) the design shape IF EVER BUILT —
+  trigger range>10 sustained, pairwise extremes 1–1.5 kW, η 0.85,
+  stops (≤5 range, 95 ceiling, floors, 90-min budget, sustained net
+  import), early-afternoon window, never during traverse/night/watch.
+  OPERATOR DECISIONS (asked one at a time per their preference — they
+  find multi-part questions too complex; keep future questions single
+  and simple): GOAL = MORE POWER AVAILABLE IN THE EVENING; unevenness
+  observed = BY LATE AFTERNOON (solar had all day and didn't
+  converge). DIAGNOSIS: the unevenness is the PARTICIPATION pathology,
+  not imbalance dynamics — rhs the spectator + mid pinned while lhs
+  does the work (matches telemetry). DECISION: no balancer now; the
+  already-commissioned health/calibration/recovery programs ARE the
+  fix; monitor one week of evenings after the fleet is healthy; build
+  the transfer balancer only if one pod remains regularly
+  low-by-late-afternoon while others sit full. Standing schedule
+  unchanged: health-watch first run TONIGHT 23:00 (arm for probes),
+  mid's traverse TOMORROW 15:00–22:30, Thursday graduation record.
 
 - 2026-08-25 (calibration ONE-SHOT DEFERRAL ADJUDICATION — c55fff1,
   3 files +136/−14; controller restarted as harness-managed task
