@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; health-watch Stages C+P live — first census+probe night tonight 23:00; the probe needs armed units, the program never arms)
+Last updated: 2026-08-25 (Australia/Brisbane; both programs' contracts committed — health-watch live through C+P with the first census night tonight, calibration at design-only v1.1)
 
 ## Purpose
 
@@ -375,6 +375,54 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (calibration CONTRACT v1.1 COMMITTED — 1fe0c76,
+  docs/DESIGN_CALIBRATION_CYCLING.md, 1290 lines, §16 amendment log
+  with four rulings verbatim): all sixteen review amendments folded
+  in-place; three author liberties ACCEPTED by the coordinator — the
+  stronger C13 branch (window widened to 15:00 + a delivery-floor fit
+  check so mid's first night does not predictably end
+  floor_miss_deadline), key reuse for the interrupt-worry line, and the
+  C8 note that any floor below 10 fails margin validation. WORKSTREAM
+  STATE: both programs' contracts are committed — health-watch live
+  through Wave 0 + Stages C/P (3f1b27e, 2a7f6f7); calibration
+  design-only (1fe0c76). TONIGHT 23:00: the first census night (the
+  probe leg runs only if the operator arms this evening — already
+  flagged). TOMORROW: evaluate the first night's rows, then Stage R
+  supervised live-verification prep, then the R wave and/or the
+  calibration implementation wave. OPERATOR QUESTIONS STANDING: the
+  always-rhs confirmation; rhs capacity (4,200 Wh assumed — now a
+  SECOND consumer of night-V2's assumption); whether they ever use the
+  Fronius app's Battery Control.
+
+- 2026-08-25 (calibration adversarial review — WITH-AMENDMENTS,
+  architecture sound, NO redesign; the adviser shape, ordered stop set,
+  measurement-first, A14 boundary, and night-V2 interaction all
+  verified against code): SIXTEEN AMENDMENTS — C1 BLOCKER: trigger
+  None-if-never made mid permanently ineligible — never-deep pods are
+  now due horizon-bounded once the historian has trigger_after_days of
+  rollups; C2 BLOCKER: restart mid-traverse retired-the-night — now a
+  durable calibration_traverse_opened row + boot reconstruction (resume
+  re-armed the energy bound against a half-emptied pack; no-resume left
+  the morning silent); C3 the excess-adviser OPTIMIZER-claim skip +
+  dawn-corner precedence; C4 graduation accepts EITHER stop member (a
+  frozen word cannot strand mid in stand-down); C5 the forecast_act
+  refill close-dependence stated (solar-attributed miss satisfies,
+  taper_never_observed fails); C6 the ~60-day evidence quiescence
+  stated + the guarded config-borne request_measurement one-shot
+  overriding SELECTION only; C7 the −26 c honest exported-worst-case;
+  C8 the metering allowance with the floor-10 structural reinforcement;
+  C9 integration discipline; C10 the delta instrument quality-gated;
+  C11–C16 minors/notes incl. no-new-kill-switch and the conscious
+  act-without-receipt distinction. RULINGS OF RECORD: the stop set is
+  sound against frozen/blip/gap telemetry (a lying word is caught by
+  the 2.80 V cell floor + dynamic-limit collapse; ~3.3 Wh exposure
+  between 15 s cell refreshes — inherited standing protection); restart
+  was the one defeating interleaving, now closed; the floor is KEPT at
+  10 (the §12-1 answer); mid precedes rhs deterministically on the same
+  horizon-bounded figure (unit-id tiebreak) — the mid-first sequencing
+  needs no override, the one-shot exists only to start before the
+  horizon matures.
 
 - 2026-08-25 (health-watch STAGES C+P COMMITTED AND LIVE — 2a7f6f7, 20
   files +6181; controller restarted as harness-managed task by7ejlnao,
