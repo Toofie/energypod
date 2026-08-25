@@ -1152,9 +1152,11 @@ evening_load_sharing:
                                    # `act` REQUIRES act_netting_evidence
                                    # (E6) — the key stays absent until the
                                    # operator's bill-data verification lands
-  window_local: "16:00"            # the not-before bound (after solar has
-                                   #   had the day; after the traverse's
-                                   #   15:00 open, by design)
+  window_local: "18:00"            # the operator's evening (2026-08-25: the
+                                   #   16:00 default widened down to their
+                                   #   6pm-midnight ask as far as the walls
+                                   #   allow — the 23:00 watch and 00:00
+                                   #   night cap the end at 22:30)
   window_end_local: "22:30"        # no-new-renewal; + ttl lands before the
                                    #   health watch (23:00) and night (00:00)
   min_share_w: 500                 # [200, cap_w]; the partial-load floor
