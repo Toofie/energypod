@@ -234,10 +234,13 @@ async def test_an_operator_park_drives_the_real_actor_mailbox_operation(
         details = getattr(caught.value, "details", {})
         assert set(details["mid"]["parked_provenance"]) == {
             "parked_at",
+            "origin",
             "authorizer",
             "reason",
             "lease_expires_at",
         }
+        # A10: an operator park's provenance derives "operator".
+        assert details["mid"]["parked_provenance"]["origin"] == "operator"
 
         # The durable audit trail: pending then parked.
         rows = [

@@ -323,6 +323,7 @@ async def test_the_debug_mode_refusal_message_is_exact() -> None:
         assert str(caught.value) == "device_debug_mode_active: ['mid']"
         assert set(caught.value.details["mid"]["parked_provenance"]) == {  # type: ignore[attr-defined]
             "parked_at",
+            "origin",
             "authorizer",
             "reason",
             "lease_expires_at",

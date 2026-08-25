@@ -19,6 +19,8 @@ import {
   healthWatchUnitRowText,
   probeSkipText,
   probeVerdictText,
+  recoveryMorningText,
+  recoveryWalkthroughText,
   toHealthWatchState,
 } from "./healthWatch";
 
@@ -299,7 +301,10 @@ describe("the row and the alert story", () => {
       }),
     )!;
     expect(healthWatchAlertText(failed)).toContain("FAILED on rhs");
-    expect(healthWatchAlertText(failed)).toContain("no automated recovery exists");
+    // The Stage-R-era truth: the alert names the site's own recovery posture
+    // (advise writes nothing; auto hands the night to the recovery stage).
+    expect(healthWatchAlertText(failed)).toContain("recovery stage is advise");
+    expect(healthWatchAlertText(failed)).toContain("writes nothing");
     const flagged = toHealthWatchState(
       projection({
         units: [
@@ -325,5 +330,166 @@ describe("the row and the alert story", () => {
       projection({ units: [unit({ census: { verdict: "excluded:parked", nights: 0 } })] }),
     )!;
     expect(anyUnitParked(parked)).toBe(true);
+  });
+});
+
+describe("the recovery surface (§7/§8/§11/§13, the Stage R wave)", () => {
+  const recoveryUnit = (recovery: Record<string, unknown>): Record<string, unknown> =>
+    unit({
+      census: { verdict: "stuck_suspected", nights: 2, tier: "alert" },
+      probe: {
+        verdict: "fail_no_response",
+        probe_w: 300,
+        qualifying_samples: 3,
+        core_samples: 20,
+        echo: "echo_matches_write",
+      },
+      recovery,
+    });
+
+  it("narrows the recovery half with the A11 morning figures", () => {
+    const parsed = toHealthWatchState(
+      projection({
+        stages: ["census", "probe", "recovery"],
+        units: [
+          recoveryUnit({
+            mode: "auto",
+            verdict: "recovered",
+            tier: "resolved",
+            posture: "auto",
+            rung: "verified",
+            reason: null,
+            left_armed: false,
+            attempts_total: 4,
+            consecutive_fails: 0,
+            consecutive_fail_limit: 3,
+            trailing_30_nights: { attempted: 11, recovered: 9, attempt_rate: 0.3667 },
+          }),
+        ],
+      }),
+    );
+    const recovery = parsed!.units[0]!.recovery;
+    expect(recovery.mode).toBe("auto");
+    expect(recovery.verdict).toBe("recovered");
+    expect(recovery.tier).toBe("resolved");
+    expect(recovery.rung).toBe("verified");
+    expect(recovery.leftArmed).toBe(false);
+    expect(recovery.attemptsTotal).toBe(4);
+    expect(recovery.consecutiveFails).toBe(0);
+    expect(recovery.consecutiveFailLimit).toBe(3);
+    expect(recovery.trailing).toEqual({ attempted: 11, recovered: 9, attemptRate: 0.3667 });
+  });
+
+  it("renders each recovery verdict with its figures and cap arithmetic", () => {
+    const at = (recovery: Record<string, unknown>): string =>
+      healthWatchUnitRowText(
+        toHealthWatchState(projection({ units: [recoveryUnit(recovery)] }))!.units[0]!,
+      );
+    expect(
+      at({ mode: "advise", verdict: "advised", tier: "alert", attempts_total: 0 }),
+    ).toContain("advisory rendered");
+    expect(
+      at({
+        mode: "auto",
+        verdict: "recovered",
+        tier: "resolved",
+        attempts_total: 2,
+        consecutive_fails: 0,
+      }),
+    ).toContain("recovered — the standby cycle ran");
+    expect(
+      at({ mode: "auto", verdict: "recovered_unproven", tier: "alert", rung: "rearm_refused" }),
+    ).toContain("proof missing");
+    expect(at({ mode: "auto", verdict: "failed_no_effect", tier: "alert" })).toContain(
+      "still did not follow commands",
+    );
+    expect(at({ mode: "auto", verdict: "write_unverified", tier: "alert" })).toContain(
+      "readback never confirmed",
+    );
+    expect(
+      at({
+        mode: "auto",
+        verdict: "advisory_only",
+        tier: "alert",
+        consecutive_fails: 3,
+        consecutive_fail_limit: 3,
+      }),
+    ).toContain("advisory-only");
+    expect(at({ mode: "auto", verdict: "skipped:foreign_standby", tier: "alert" })).toContain(
+      "Standby and it is not ours",
+    );
+  });
+
+  it("keeps the uncommissioned honesty: no verdict is ever invented", () => {
+    const parsed = toHealthWatchState(projection({ units: [unit()] }));
+    expect(parsed!.units[0]!.recovery.mode).toBe("uncommissioned");
+    expect(parsed!.units[0]!.recovery.verdict).toBeNull();
+    expect(parsed!.units[0]!.recovery.attemptsTotal).toBe(0);
+    expect(healthWatchUnitRowText(parsed!.units[0]!)).toContain(
+      "recovery not commissioned",
+    );
+  });
+
+  it("renders the advise walkthrough and the auto morning re-arm (§13)", () => {
+    const advise = toHealthWatchState(
+      projection({ units: [recoveryUnit({ mode: "advise", verdict: "advised" })] }),
+    )!.units[0]!;
+    expect(recoveryWalkthroughText(advise)).toContain("disarm → park → resume → re-arm → verify");
+    expect(recoveryWalkthroughText(advise)).toContain("writes nothing");
+    const auto = toHealthWatchState(
+      projection({
+        units: [
+          recoveryUnit({
+            mode: "auto",
+            verdict: "recovered",
+            tier: "resolved",
+            attempts_total: 2,
+          }),
+        ],
+      }),
+    )!.units[0]!;
+    expect(recoveryWalkthroughText(auto)).toContain("left the battery disarmed");
+    expect(recoveryWalkthroughText(auto)).toContain("re-arm it this morning");
+    // Not eligible: no advisory card at all.
+    expect(recoveryWalkthroughText(toHealthWatchState(projection())!.units[0]!)).toBeNull();
+  });
+
+  it("renders the recovered morning line with A11's trailing-30 rate", () => {
+    const recovered = toHealthWatchState(
+      projection({
+        units: [
+          recoveryUnit({
+            mode: "auto",
+            verdict: "recovered",
+            tier: "resolved",
+            attempts_total: 7,
+            trailing_30_nights: { attempted: 6, recovered: 5, attempt_rate: 0.2 },
+          }),
+        ],
+      }),
+    )!.units[0]!;
+    const morning = recoveryMorningText(recovered);
+    expect(morning).toContain("Before: stuck signature + a no-response probe");
+    expect(morning).toContain("6 cycle nights in the last 30 (20%)");
+    expect(recoveryMorningText(toHealthWatchState(projection())!.units[0]!)).toBeNull();
+  });
+
+  it("puts a recovery outcome FIRST in the alert story (§11's urgent styling)", () => {
+    const alert = healthWatchAlertText(
+      toHealthWatchState(
+        projection({
+          units: [
+            recoveryUnit({
+              mode: "auto",
+              verdict: "write_unverified",
+              tier: "alert",
+              attempts_total: 1,
+            }),
+          ],
+        }),
+      )!,
+    );
+    expect(alert).toContain("Recovery outcome on rhs");
+    expect(alert).toContain("defined-restart advisory is below");
   });
 });

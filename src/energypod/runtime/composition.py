@@ -138,6 +138,9 @@ from energypod.application.health_watch import (
     ProbeSettings,
     StuckSettings,
 )
+from energypod.application.health_watch import (
+    RecoverySettings as HealthRecoverySettings,
+)
 from energypod.application.history import PlantHistoryControl, TelemetryHistorian
 from energypod.application.night_charge import (
     NightChargeAdviser,
@@ -325,8 +328,12 @@ _SCHEDULE_RUNNER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 # the ``optimizer`` source tag and the ``health-`` intent prefix;
 # non-interactive, site-bound, and holding nothing beyond what an ordinary
 # dispatch needs (the probe rides the standing guards, never around them).
+# Stage R (§7/§12) adds the ONE arm-scope reach the contract's amendment
+# grants: the cycle's disarm (stop-direction) and its single bounded
+# verification re-arm ride the facade's INTERNAL twins — never a route — and
+# only the composed recovery stage ever wires them.
 _HEALTH_ADVISER_PRINCIPAL_SUBJECT = "energypod:health-adviser"
-_HEALTH_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
+_HEALTH_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch", "arm"})
 # DESIGN_ENERGY_SCORECARD section 7 (E4): the deterministic event id of the
 # operator's P-A1-active pinning fact.  A ``grid_counter_roles`` value other
 # than ``unpinned`` boots only when this fact exists in the durable store --
@@ -1893,15 +1900,17 @@ class _NightAdviserPrincipal:
 @dataclass(slots=True)
 class _HealthAdviserPrincipal:
     """The composed health-watch automation principal (DESIGN_BATTERY_HEALTH_
-    WATCH §2/§6).
+    WATCH §2/§6/§7/§12).
 
-    ``energypod:health-adviser``: observe + dispatch only, non-interactive,
+    ``energypod:health-adviser``: observe + dispatch, non-interactive,
     site-bound — the adviser principal's exact shape, so the nightly watch's
-    probe ``intent_accepted`` rows are attributable distinct from every
-    console, agent, schedule-runner, excess-adviser, and night-adviser
-    writer.  The watch holds NO other authority anywhere: no arm scope, no
-    interactive capability, and (until Stage R is a separately commissioned
-    wave) no mode-write path at all.
+    rows are attributable distinct from every console, agent, schedule-runner,
+    excess-adviser, and night-adviser writer.  Stage R's amendment (§12, panel
+    ruling 1) adds the arm scope for exactly TWO internal twins — the cycle's
+    disarm (stop-direction) and its ONE bounded verification re-arm — which
+    only the composed recovery stage ever calls; the public arm/disarm routes
+    stay interactive-principal-only, and no other adviser, stage, timer, or
+    surface gains an arm path from this precedent.
     """
 
     subject: str
@@ -4213,19 +4222,20 @@ def _build_runtime(
         except Exception:
             return frozenset()
 
-    # --- the nightly health watch (DESIGN_BATTERY_HEALTH_WATCH §4) ---------
+    # --- the nightly health watch (DESIGN_BATTERY_HEALTH_WATCH §4/§7) -------
     health_watch_controller: HealthWatchController | None = None
     health_config = config.battery_health_watch
     if health_config is not None and history_store is not None and policy is not None:
         # Composed exactly when the block is PRESENT and its validated
         # prerequisites are composed (the census REQUIRES the historian —
-        # §9 refuses the block at validation without it).  The watch's ONE
-        # act is the probe's own intent: it is submitted under the composed
-        # health-adviser principal through the facade's internal twin (never
-        # REST/MCP), judged by every standing guard exactly like every
-        # adviser's intents.  Stage R is NOT composed in this wave — the
-        # block's recovery keys are recognized, the A6 receipt map is
-        # boot-checked, and the projection renders the stage's honesty.
+        # §9 refuses the block at validation without it).  The probe's intent
+        # is submitted under the composed health-adviser principal through
+        # the facade's internal twin (never REST/MCP), judged by every
+        # standing guard exactly like every adviser's intents.  Stage R
+        # composes with the stage: the recovery cycle's mode writes ride the
+        # ParkController itself (§12's internal composer — REST park/resume
+        # stay interactive routes) and its disarm/re-arm ride two more
+        # internal twins under the same principal.
         health_principal = _HealthAdviserPrincipal(
             subject=_HEALTH_ADVISER_PRINCIPAL_SUBJECT,
             scopes=_HEALTH_ADVISER_PRINCIPAL_SCOPES,
@@ -4257,6 +4267,21 @@ def _build_runtime(
         def _latched_stop_unit_ids() -> frozenset[str]:
             # The facade owns the latch registry (the parking binding's view).
             return facade.latched_stop_unit_ids()
+
+        # §7.2's lifecycle twins: the disarm (stop-direction, step 2) and the
+        # ONE bounded verification re-arm (§7.4, panel ruling 1).  Wired only
+        # when the recovery stage composes; the re-arm only in the auto
+        # posture — in advise no re-arm by the program can ever occur, on any
+        # night, for any unit (there is no port to call).
+        recovery_staged = "recovery" in health_config.stages
+
+        async def _health_disarm(*, unit_id: str) -> Mapping[str, Any]:
+            return await facade.submit_health_disarm(
+                unit_ids=[unit_id], principal=health_principal
+            )
+
+        async def _health_rearm(*, unit_id: str) -> Mapping[str, Any]:
+            return await facade.submit_health_rearm(unit_id=unit_id, principal=health_principal)
 
         # A6's boot half: verify the named receipt files exist and degrade a
         # missing receipt's unit to advise loudly (validation stays
@@ -4307,6 +4332,11 @@ def _build_runtime(
                     inter_unit_gap_s=int(health_config.probe.inter_unit_gap_s),
                 ),
                 recovery_mode=health_config.recovery.mode,
+                recovery=HealthRecoverySettings(
+                    mode=health_config.recovery.mode,
+                    hold_s=int(health_config.recovery.hold_s),
+                    consecutive_fail_limit=int(health_config.recovery.consecutive_fail_limit),
+                ),
                 unit_ids=tuple(unit.unit_id for unit in config.units),
                 sample_interval_s=float(history_config.sample_interval_s)
                 if history_config is not None
@@ -4330,6 +4360,16 @@ def _build_runtime(
             health_states=_health_states_view,
             parked_units=_parked_units,
             latched_stop_units=_latched_stop_unit_ids,
+            # §7.2's composer: the ParkController itself (validation refused
+            # a staged recovery without the parking block, so it is composed
+            # here) — the cycle's mode writes ride its guarded primitive.
+            park_control=park_controller if recovery_staged else None,
+            disarm=_health_disarm if recovery_staged else None,
+            arm=(
+                _health_rearm
+                if recovery_staged and health_config.recovery.mode == "auto"
+                else None
+            ),
             recovery_receipts_missing=receipts_missing,
             process_instance_id=process_instance_id,
         )

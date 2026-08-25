@@ -2,8 +2,8 @@
  * The "Battery health watch" Home card (DESIGN_BATTERY_HEALTH_WATCH §13):
  * the nightly program's whole story in one glance — the program state, one
  * row per battery (census chip / probe verdict with its one-line figures /
- * recovery word), the morning-after alert line, and the honesty the contract
- * pins.
+ * recovery verdict with its figures), the recovery advisory surface, the
+ * morning-after line, and the honesty the contract pins.
  *
  * Feature-detected exactly like the Night tile: it renders ONLY when the
  * snapshot carries a `health_watch_state` projection (the block-presence
@@ -16,13 +16,13 @@
  *   — a site without Stage R never sees "recovery" offered as a suggestion
  *   it cannot execute (§13's uncommissioned honesty).
  * - Skipped units render their skip reason verbatim; a disarmed unit renders
- *   as the arm instruction it is (the program NEVER arms — §6.1).
- * - A probe failure is ALERT-tier styling and says what it did: recorded and
- *   alerted, nothing more — NO automated recovery exists in this deployment,
- *   and no code path responds to a verdict with any write.
- * - The §11 defined-restart advisory rides beside an alert-tier failure so
- *   the escalation ladder's terminal text is on the card, not in a log
- *   directory.
+ *   as the arm instruction it is (the program never arms outside the ONE
+ *   bounded verification re-arm inside an `auto` cycle — §6.1/§7.4).
+ * - The recovery surface names the posture's own truth: `advise` renders the
+ *   operator walkthrough (this posture writes nothing, ever); `auto` renders
+ *   what the program did and the morning re-arm the operator owes.
+ * - The §11 defined-restart advisory rides beside every alert-tier outcome,
+ *   and the BMU cross-check note rides beside any cycle that ran.
  * - The §6.3 export note names the probe's brief feed-in blip so the export
  *   meter is never a surprise.
  * - The not-isolation sentence rides the card's parked-state styling
@@ -32,6 +32,7 @@ import { useId } from "react";
 import type { JSX } from "react";
 import { NOT_ISOLATION_SENTENCE } from "../../app/park";
 import {
+  HEALTH_WATCH_BMU_CROSS_CHECK,
   HEALTH_WATCH_EXPORT_NOTE,
   HEALTH_WATCH_RESTART_ADVISORY,
   anyUnitParked,
@@ -40,6 +41,9 @@ import {
   healthWatchStatusText,
   healthWatchStagesText,
   probeVerdictText,
+  recoveryMorningText,
+  recoveryVerdictText,
+  recoveryWalkthroughText,
   type HealthWatchState,
   type HealthWatchUnitState,
 } from "../../app/healthWatch";
@@ -54,22 +58,26 @@ export interface HealthWatchCardProps {
 }
 
 function unitTier(unit: HealthWatchUnitState): "alert" | "notice" | "quiet" {
-  if (unit.census.tier === "alert" || (unit.probe.verdict ?? "").startsWith("fail")) {
+  if (
+    unit.census.tier === "alert" ||
+    (unit.probe.verdict ?? "").startsWith("fail") ||
+    unit.recovery.tier === "alert"
+  ) {
     return "alert";
   }
-  if (unit.census.verdict === "stuck_suspected") {
+  if (unit.census.verdict === "stuck_suspected" || unit.recovery.verdict === "recovered") {
     return "notice";
   }
   return "quiet";
 }
 
-/** One battery's row: the census chip, the probe line, the recovery word. */
+/** One battery's row: the census chip, the probe line, the recovery verdict. */
 function unitRow(unit: HealthWatchUnitState, keyPrefix: string): JSX.Element {
   const tier = unitTier(unit);
   const recovery =
     unit.recovery.mode === "uncommissioned"
       ? "recovery not commissioned"
-      : `recovery ${unit.recovery.mode}${unit.recovery.note === null ? "" : ` — ${unit.recovery.note}`}`;
+      : recoveryVerdictText(unit);
   return (
     <li
       key={`${keyPrefix}-${unit.unitId}`}
@@ -84,8 +92,47 @@ function unitRow(unit: HealthWatchUnitState, keyPrefix: string): JSX.Element {
       <span className="home-health-probe" data-verdict={unit.probe.verdict ?? undefined}>
         {probeVerdictText(unit)}
       </span>
-      <span className="home-health-recovery">{recovery}</span>
+      <span
+        className="home-health-recovery"
+        data-verdict={unit.recovery.verdict ?? undefined}
+        data-tier={unit.recovery.tier ?? undefined}
+      >
+        {recovery}
+      </span>
     </li>
+  );
+}
+
+/** The per-unit recovery advisory surface (§13): the posture's own truth.
+ * Skipped outcomes render their reason on the row itself — the advisory
+ * card belongs to the outcomes that owe the operator an act. */
+function unitAdvisory(
+  unit: HealthWatchUnitState,
+  keyPrefix: string,
+): JSX.Element | null {
+  if (
+    unit.recovery.mode === "uncommissioned" ||
+    unit.recovery.verdict === null ||
+    unit.recovery.verdict.startsWith("skipped:")
+  ) {
+    return null;
+  }
+  const walkthrough = recoveryWalkthroughText(unit);
+  const morning = recoveryMorningText(unit);
+  return (
+    <div
+      key={`${keyPrefix}-${unit.unitId}-advisory`}
+      className="home-health-recovery-advisory"
+      data-mode={unit.recovery.mode}
+      data-verdict={unit.recovery.verdict}
+    >
+      <p className="home-health-recovery-title">
+        {unit.unitId} — recovery ({unit.recovery.mode})
+        {unit.recovery.leftArmed ? " — LEFT ARMED: the closing disarm refused, disarm it now" : ""}
+      </p>
+      {walkthrough !== null && <p className="home-health-walkthrough">{walkthrough}</p>}
+      {morning !== null && <p className="home-health-morning">{morning}</p>}
+    </div>
   );
 }
 
@@ -99,6 +146,10 @@ export function HealthWatchCard({ health }: HealthWatchCardProps): JSX.Element |
   const alert = healthWatchAlertText(health);
   const probed = health.units.some((unit) => unit.probe.verdict !== null);
   const parked = anyUnitParked(health);
+  const advisories = health.units
+    .map((unit) => unitAdvisory(unit, headingId))
+    .filter((node): node is JSX.Element => node !== null);
+  const cycled = health.units.some((unit) => unit.recovery.attemptsTotal > 0);
   return (
     <section
       className="home-card home-card--health"
@@ -121,6 +172,12 @@ export function HealthWatchCard({ health }: HealthWatchCardProps): JSX.Element |
         <ul className="home-health-units" aria-label="Per-battery health watch rows">
           {health.units.map((unit) => unitRow(unit, headingId))}
         </ul>
+      )}
+      {advisories.length > 0 && advisories}
+      {cycled && (
+        <p role="note" className="home-health-bmu-note">
+          {HEALTH_WATCH_BMU_CROSS_CHECK}
+        </p>
       )}
       {probed && (
         <p role="note" className="home-health-export-note">

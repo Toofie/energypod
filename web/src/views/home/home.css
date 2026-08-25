@@ -1171,6 +1171,49 @@
   color: #4a5568;
 }
 
+.home-health-recovery[data-tier="alert"] {
+  font-weight: 600;
+}
+
+.home-health-recovery[data-verdict="recovered"] {
+  color: #2f855a;
+}
+
+/* §13's recovery advisory surface: the posture's own truth, one block per
+   battery with an outcome that owes the operator an act. */
+.home-health-recovery-advisory {
+  margin: 0.5rem 0 0;
+  padding: 0.45rem 0.6rem;
+  border-left: 3px solid #2b6cb0;
+  background: #f7fafc;
+}
+
+.home-health-recovery-advisory[data-mode="advise"] {
+  border-left-color: #805ad5;
+}
+
+.home-health-recovery-advisory[data-tier="alert"],
+.home-health-recovery-advisory[data-verdict^="failed"],
+.home-health-recovery-advisory[data-verdict="write_unverified"],
+.home-health-recovery-advisory[data-verdict="recovered_unproven"] {
+  border-left-color: #c53030;
+}
+
+.home-health-recovery-title {
+  margin: 0;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #2d3748;
+}
+
+.home-health-walkthrough,
+.home-health-morning,
+.home-health-bmu-note {
+  margin: 0.25rem 0 0;
+  font-size: 0.85rem;
+  color: #4a5568;
+}
+
 .home-health-export-note,
 .home-health-parked-note {
   margin: 0.4rem 0 0;

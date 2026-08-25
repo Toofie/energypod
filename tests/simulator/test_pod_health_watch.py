@@ -157,3 +157,119 @@ def test_the_spike_pattern_composes_from_a_short_double_share() -> None:
         delivered.append(pod._delivered_active_w())
     assert delivered.count(600) == 2
     assert delivered.count(0) == 18
+
+
+# --- Stage R's cycle legs (section 14: the R half) ----------------------------------
+
+
+def test_a_stuck_pod_that_releases_on_the_cycle_serves_again() -> None:
+    """The recovering leg: a completed standby cycle (0 -> 1 -> 0 through
+    ``apply_debug_mode``) releases the spectator signature at the resume
+    edge — command-following returns with the word, the live-proven class
+    behind the ``recovered`` verdict."""
+    pod, clock = build_pod(watchdog_timeout_s=30.0)
+    pod.script_stuck("matches", at_s=0.0)
+    pod.poll()
+    pod.apply_pq_frame(objective_frame(300))
+    clock.advance(1.0)
+    pod.poll()
+    assert pod._delivered_active_w() == 0  # wedged: the write is ignored
+
+    pod.script_stuck_release_on_cycle(True)
+    pod.apply_debug_mode(1)  # the standby leg of the cycle
+    pod.poll()
+    assert pod._debug_mode == 1
+    pod.apply_debug_mode(0)  # the resume edge: the wedge releases
+    assert pod._debug_mode == 0
+    assert pod._stuck is None
+    pod.apply_pq_frame(objective_frame(300))
+    clock.advance(1.0)
+    pod.poll()
+    assert pod._delivered_active_w() == 300  # command-following survived
+
+
+def test_the_default_stuck_wedge_survives_the_cycle() -> None:
+    """The persistent leg (the default): the cycle lands, the wedge does not
+    move — the verification re-run fails ``fail_no_response`` again, the
+    ``failed_no_effect`` rung."""
+    pod, clock = build_pod(watchdog_timeout_s=30.0)
+    pod.script_stuck("matches", at_s=0.0)
+    pod.poll()
+    pod.apply_debug_mode(1)
+    pod.apply_debug_mode(0)
+    assert pod._debug_mode == 0 and pod._stuck is not None
+    pod.apply_pq_frame(objective_frame(300))
+    clock.advance(1.0)
+    pod.poll()
+    assert pod._delivered_active_w() == 0  # still a spectator
+
+
+def test_the_release_needs_the_completed_cycle_not_just_the_word() -> None:
+    """Standby alone must not release the wedge: the release is pinned to
+    the RESUME edge of a completed cycle, never to the standby leg."""
+    pod, clock = build_pod(watchdog_timeout_s=30.0)
+    pod.script_stuck("matches", at_s=0.0)
+    pod.poll()
+    pod.script_stuck_release_on_cycle(True)
+    pod.apply_debug_mode(1)
+    pod.poll()
+    assert pod._stuck is not None  # still wedged while parked
+    pod.apply_debug_mode(0)
+    assert pod._stuck is None  # released at the resume edge only
+
+
+def test_the_release_hook_validates_its_argument() -> None:
+    pod, _clock = build_pod()
+    with pytest.raises(ValueError, match="enabled"):
+        pod.script_stuck_release_on_cycle("yes")  # type: ignore[arg-type]
+
+
+def test_the_cycle_wedge_acks_the_exit_and_keeps_the_word() -> None:
+    """``script_cycle_wedge``: the RESUME write is accepted on the wire (no
+    exception) while the device word stays Standby — the exit readback
+    refusing, the ``write_unverified`` ladder's device half.  The wedge
+    persists until cleared; the PARK direction is untouched."""
+    pod, clock = build_pod()
+    pod.apply_debug_mode(1)
+    assert pod._debug_mode == 1
+    pod.script_cycle_wedge(exit_fails=True)
+    pod.apply_debug_mode(0)  # ACKed...
+    assert pod._debug_mode == 1  # ...and refused: the word never moved
+    pod.poll()
+    clock.advance(1.0)
+    pod.poll()
+    assert pod._debug_mode == 1  # the wedge persists
+    pod.clear_scripted_cycle_wedge()
+    pod.apply_debug_mode(0)
+    assert pod._debug_mode == 0  # cleared: resumes land again
+
+
+def test_the_cycle_wedge_leaves_the_park_direction_alone() -> None:
+    pod, _clock = build_pod()
+    pod.script_cycle_wedge(exit_fails=True)
+    pod.apply_debug_mode(1)
+    assert pod._debug_mode == 1
+
+
+def test_the_cycle_wedge_validates_its_argument() -> None:
+    pod, _clock = build_pod()
+    with pytest.raises(ValueError, match="exit_fails"):
+        pod.script_cycle_wedge(exit_fails=1)  # type: ignore[arg-type]
+
+
+def test_a_wedged_stuck_pod_composes_the_failed_no_effect_shape() -> None:
+    """The two hooks compose: a stuck pod (echo matches) whose exit is
+    wedged — the cycle parks, the exit readback refuses, and the standing
+    ``write_unverified`` posture is the honest terminal."""
+    pod, clock = build_pod(watchdog_timeout_s=30.0)
+    pod.script_stuck("matches", at_s=0.0)
+    pod.poll()
+    pod.script_cycle_wedge(exit_fails=True)
+    pod.apply_debug_mode(1)
+    pod.apply_debug_mode(0)  # ACKed-but-refused: the word stays Standby
+    assert pod._debug_mode == 1
+    assert pod._stuck is not None
+    pod.apply_pq_frame(objective_frame(300))
+    clock.advance(1.0)
+    pod.poll()
+    assert pod._delivered_active_w() == 0

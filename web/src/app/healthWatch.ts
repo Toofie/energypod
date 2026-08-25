@@ -2,19 +2,23 @@
  * The nightly battery health watch's shared wire model
  * (DESIGN_BATTERY_HEALTH_WATCH.md §10/§11/§13, CONTRACT v1.1): the
  * `health_watch_state` snapshot projection plus the plain-word maps the Home
- * Health Watch card renders. The backend family is LIVE for Stages C and P
- * (the census and the actuation probe); Stage R is a later, separately
- * commissioned wave — its stage renders the contract's own uncommissioned
- * honesty (`{"mode": "uncommissioned"}`), never a suggestion the site cannot
+ * Health Watch card renders. Stages C and P are live; Stage R (the recovery
+ * stage) ships with this wave in its standing `advise` posture — writes
+ * nothing, ever — and its verdict vocabulary, the A11 morning figures, and
+ * the §13 advisory surfaces are pinned here. A site without the stage
+ * renders the contract's own uncommissioned honesty
+ * (`{"mode": "uncommissioned"}`), never a suggestion the site cannot
  * execute.
  *
  * Wire truth pinned here (§10's exact shape):
  * - Projection: `{stages, window{opens_local, deadline_local}, phase, night,
  *   reason, as_of, units[{unit_id, census{verdict, nights, predicates,
  *   tier}, probe{verdict, probe_w, qualifying_samples, core_samples, echo},
- *   recovery{mode, verdict?, attempts_total?, consecutive_fails?, note?}}]}`.
- * - `phase`: await_window | census | probe | record | done — the per-night
- *   phase machine; `reason` carries the program-level frame words
+ *   recovery{mode, verdict?, tier?, posture?, rung?, reason?, left_armed?,
+ *   attempts_total?, consecutive_fails?, consecutive_fail_limit?,
+ *   trailing_30_nights{attempted, recovered, attempt_rate}?, note?}}]}`.
+ * - `phase`: await_window | census | probe | recovery | record | done — the
+ *   per-night phase machine; `reason` carries the program-level frame words
  *   (window_not_quiet / outside_window / interrupted).
  * - Census `verdict`: nominal | stuck_suspected | degraded_evidence |
  *   excluded:<class>. The stuck flag is NOTICE tier on first occurrence and
@@ -25,14 +29,20 @@
  *   fail_baseline_not_returned | inconclusive_echo_mismatch |
  *   inconclusive_baseline_confounded | inconclusive_preempted |
  *   inconclusive_aborted | skipped:<reason> — the skip reasons verbatim.
- *   A probe verdict NEVER triggers any write response in this wave: Stage R
- *   does not exist, and the card never offers recovery as if it could run.
+ * - Recovery `verdict` (§7.2 step 7, §8's ladder): recovered |
+ *   recovered_unproven | failed_write | write_unverified | failed_no_effect
+ *   | advised | advisory_only | skipped:<reason> | null (not eligible).
+ *   `recovered` is the resolved tier; every other outcome is alert except
+ *   the notice-tier skips. `recovered_unproven` does NOT count toward
+ *   `consecutive_fails` (A2); `attempts_total` counts every attempted
+ *   cycle, and `trailing_30_nights` carries A11's chronic-case figures.
  * - `echo`: the standing discriminator's words (echo_matches_write |
  *   objective_not_served | external_writer | echo_unreadable).
  *
  * Honesty rules (§13's own): uncommissioned stages render "not commissioned"
  * where their UI would be; skipped units render their skip reason verbatim;
- * a disarmed unit is the arm instruction it is (the program NEVER arms); and
+ * a disarmed unit is the arm instruction it is (the program never arms
+ * outside the ONE bounded verification re-arm inside an `auto` cycle); and
  * the §6.3 export note names the brief feed-in blip so the export meter is
  * never a surprise. The not-isolation sentence rides the card wherever a
  * parked unit's state shows (§13's pinned styling rule).
@@ -42,15 +52,23 @@ import { isRecord } from "./fleet";
 /** The bus vocabulary the watch publishes (§10). */
 export const HEALTH_CENSUS_EVENT = "health.census" as const;
 export const HEALTH_PROBE_EVENT = "health.probe" as const;
+export const HEALTH_RECOVERY_EVENT = "health.recovery" as const;
 export const HEALTH_PROGRAM_EVENT = "health.program" as const;
 
 /** The per-night phase machine's ONE vocabulary (§4). */
-export type HealthWatchPhase = "await_window" | "census" | "probe" | "record" | "done";
+export type HealthWatchPhase =
+  | "await_window"
+  | "census"
+  | "probe"
+  | "recovery"
+  | "record"
+  | "done";
 
 export const HEALTH_WATCH_PHASES: readonly HealthWatchPhase[] = [
   "await_window",
   "census",
   "probe",
+  "recovery",
   "record",
   "done",
 ];
@@ -76,17 +94,32 @@ export interface HealthProbeState {
   echo: string | null;
 }
 
+/** A11's trailing-30-night figures: the chronic case made visible. */
+export interface HealthRecoveryTrailing {
+  attempted: number;
+  recovered: number;
+  attemptRate: number;
+}
+
 /**
- * One unit's recovery half. Stage R is NOT implemented in this wave: the
- * projection renders `{"mode": "uncommissioned"}` when the stage is absent,
- * or the configured posture with a null verdict when the block stages it —
- * never an invented outcome.
+ * One unit's recovery half (§7/§8/§11). `mode` is the unit's EFFECTIVE
+ * posture — `advise`, `auto`, or `uncommissioned` when the stage is absent;
+ * a missing auto receipt degrades the unit to `advise` with the loud
+ * `note` (A6). `verdict` is null before the night's recovery phase and on
+ * not-eligible nights — never an invented outcome.
  */
 export interface HealthRecoveryState {
   mode: string;
   verdict: string | null;
+  tier: HealthTier | "resolved";
+  posture: string | null;
+  rung: string | null;
+  reason: string | null;
+  leftArmed: boolean;
   attemptsTotal: number;
   consecutiveFails: number;
+  consecutiveFailLimit: number;
+  trailing: HealthRecoveryTrailing | null;
   note: string | null;
 }
 
@@ -177,11 +210,33 @@ function toProbe(value: unknown): HealthProbeState {
 
 function toRecovery(value: unknown): HealthRecoveryState {
   const record = isRecord(value) ? value : {};
+  const trailing = isRecord(record.trailing_30_nights)
+    ? {
+        attempted: intOr(record.trailing_30_nights.attempted, 0),
+        recovered: intOr(record.trailing_30_nights.recovered, 0),
+        attemptRate:
+          typeof record.trailing_30_nights.attempt_rate === "number" &&
+          Number.isFinite(record.trailing_30_nights.attempt_rate)
+            ? record.trailing_30_nights.attempt_rate
+            : 0,
+      }
+    : null;
   return {
     mode: text(record.mode, "uncommissioned"),
     verdict: optionalText(record.verdict),
+    tier: oneOf<HealthTier | "resolved">(
+      record.tier,
+      ["notice", "alert", "resolved", null],
+      null,
+    ),
+    posture: optionalText(record.posture),
+    rung: optionalText(record.rung),
+    reason: optionalText(record.reason),
+    leftArmed: record.left_armed === true,
     attemptsTotal: intOr(record.attempts_total, 0),
     consecutiveFails: intOr(record.consecutive_fails, 0),
+    consecutiveFailLimit: intOr(record.consecutive_fail_limit, 0),
+    trailing,
     note: optionalText(record.note),
   };
 }
@@ -254,6 +309,8 @@ export function healthWatchStatusText(state: HealthWatchState): string {
       return "Tonight's health watch is reading the batteries (the census — no writes).";
     case "probe":
       return "Tonight's health watch is running its one-at-a-time actuation probes.";
+    case "recovery":
+      return "Tonight's health watch is running its one-at-a-time recovery cycles (the auto posture) or rendering its advisories (advise).";
     case "record":
       return "Tonight's health watch is recording its results.";
     default:
@@ -362,15 +419,113 @@ export function probeSkipText(reason: string): string {
 }
 
 /**
- * One unit's whole row: the census chip, the probe line, and the recovery
- * word (the uncommissioned honesty included — a site without R never sees
- * "recovery" offered as a suggestion it cannot execute).
+ * One unit's recovery verdict in plain words (§7.2 step 7, §8's ladder,
+ * §11's tiers). The verdicts the operator can distinguish in the morning:
+ * the recovered morning line, the recovered_unproven honest proof-missing
+ * word, the three ladder failures, the advisory postures, and the skips.
  */
+export function recoveryVerdictText(unit: HealthWatchUnitState): string {
+  const recovery = unit.recovery;
+  if (recovery.mode === "uncommissioned") {
+    return "recovery not commissioned";
+  }
+  const verdict = recovery.verdict;
+  if (verdict === null) {
+    return "not eligible tonight";
+  }
+  if (verdict.startsWith("skipped:")) {
+    return recoverySkipText(verdict.slice("skipped:".length));
+  }
+  switch (verdict) {
+    case "recovered":
+      return `recovered — the standby cycle ran and the verification probe PASSED (${recovery.attemptsTotal} attempt${recovery.attemptsTotal === 1 ? "" : "s"} total)`;
+    case "recovered_unproven":
+      return `cycle ran, proof missing — ${recovery.rung === "rearm_refused" ? "the re-arm was refused (a foreign write during the park or a latched stop)" : "the verification could not run"}; verify it yourself this morning (not counted toward the cap)`;
+    case "failed_write":
+      return "failed — the mode write refused twice after resync (counted toward the cap)";
+    case "write_unverified":
+      return "failed — the write was acknowledged but the readback never confirmed it; no further write tonight (counted toward the cap)";
+    case "failed_no_effect":
+      return "failed — the cycle ran and the battery still did not follow commands (counted toward the cap)";
+    case "advised":
+      return "advisory rendered — the operator walkthrough is on the card below (this posture writes nothing, ever)";
+    case "advisory_only":
+      return `advisory-only — ${recovery.consecutiveFails} consecutive failed cycles reached the cap of ${recovery.consecutiveFailLimit}; no more cycles until the pod is fixed and passes a probe`;
+    default:
+      return verdict;
+  }
+}
+
+/** A recovery skip reason in plain words; unknown reasons render verbatim. */
+export function recoverySkipText(reason: string): string {
+  switch (reason) {
+    case "foreign_standby":
+      return "skipped — the battery is in Standby and it is not ours (the takeover resume is the only exit)";
+    case "vendor_mode":
+      return "skipped — the vendor app holds the mode word (it must clear it)";
+    case "open_lease":
+      return "skipped — a parking lease already stands (resume it through the parking surface)";
+    case "latched_stop":
+      return "skipped — an emergency stop holds it; the program writes nothing further tonight";
+    case "disarm_refused":
+      return "skipped — the disarm refused, so the cycle never started";
+    case "deadline_passed":
+      return "skipped — the no-new-act deadline passed first";
+    case "park_conflict":
+      return "skipped — the park conflict guard refused (armed or under a request)";
+    case "resume_refused":
+      return "skipped — the resume refused after the park; the lease follows the standing rules";
+    case "lease_bounds":
+      return "skipped — the hold does not fit the parking block's lease bounds";
+    default:
+      return `skipped — ${reason}`;
+  }
+}
+
+/**
+ * §13's recovery advisory card line: in `advise`, the operator walkthrough
+ * (disarm → park → resume → re-arm → verify); in `auto`, what the program
+ * did and the morning re-arm the operator owes (§4 — the designed human
+ * check on a recovered pod).
+ */
+export function recoveryWalkthroughText(unit: HealthWatchUnitState): string | null {
+  const recovery = unit.recovery;
+  if (recovery.mode === "uncommissioned" || recovery.verdict === null) {
+    return null;
+  }
+  if (recovery.mode === "advise") {
+    return "Operator walkthrough (the advise posture writes nothing, ever — these are your hands): disarm → park → resume → re-arm → verify — through the standing surfaces, with the parking dialog's own confirmations.";
+  }
+  const owes =
+    recovery.verdict === "recovered"
+      ? ` The battery was left DISARMED by design — re-arm it this morning (attempt ${recovery.attemptsTotal}).`
+      : "";
+  return `The program ran its cycle under the auto posture and left the battery disarmed.${owes}`;
+}
+
+/**
+ * The morning-after line for a recovered unit (§13): the before/after
+ * evidence with the honest done-what sentence, beside A11's figures.
+ */
+export function recoveryMorningText(unit: HealthWatchUnitState): string | null {
+  const recovery = unit.recovery;
+  if (recovery.verdict !== "recovered") {
+    return null;
+  }
+  const trailing = recovery.trailing;
+  const rate =
+    trailing === null ? "" : ` · ${trailing.attempted} cycle night${trailing.attempted === 1 ? "" : "s"} in the last 30 (${Math.round(trailing.attemptRate * 100)}%)`;
+  return `Before: stuck signature + a no-response probe. After: one supervised standby cycle, then a passing 300 W verification probe.${rate}`;
+}
+
+/** One unit's whole row: the census chip, the probe line, and the recovery
+ * word (the uncommissioned honesty included — a site without R never sees
+ * "recovery" offered as a suggestion it cannot execute). */
 export function healthWatchUnitRowText(unit: HealthWatchUnitState): string {
   const recovery =
     unit.recovery.mode === "uncommissioned"
       ? "recovery not commissioned"
-      : `recovery ${unit.recovery.mode}`;
+      : `recovery ${unit.recovery.mode}${unit.recovery.note === null ? "" : ` — ${unit.recovery.note}`}: ${recoveryVerdictText(unit)}`;
   return `${unit.unitId} — census ${censusChipText(unit)} · probe ${probeVerdictText(unit)} · ${recovery}`;
 }
 
@@ -382,9 +537,20 @@ export function healthWatchUnitRowText(unit: HealthWatchUnitState): string {
 export function healthWatchAlertText(state: HealthWatchState): string | null {
   const stuck = state.units.filter((unit) => unit.census.tier === "alert");
   const failed = state.units.filter((unit) => (unit.probe.verdict ?? "").startsWith("fail"));
+  const recoveryFailed = state.units.filter(
+    (unit) => unit.recovery.tier === "alert" && unit.recovery.verdict !== null,
+  );
+  if (recoveryFailed.length > 0) {
+    const names = recoveryFailed.map((unit) => unit.unitId).join(", ");
+    const first = recoveryFailed[0]!;
+    return `Recovery outcome on ${names}: ${recoveryVerdictText(first)} — the defined-restart advisory is below.`;
+  }
   if (failed.length > 0) {
     const names = failed.map((unit) => unit.unitId).join(", ");
-    return `Actuation probe FAILED on ${names} — recorded and alerted; no automated recovery exists in this deployment.`;
+    const auto = failed.some((unit) => unit.recovery.mode === "auto");
+    return auto
+      ? `Actuation probe FAILED on ${names} — the recovery stage will take it from here if the census also flagged it.`
+      : `Actuation probe FAILED on ${names} — recorded and alerted; the recovery advisory is below (this site's recovery stage is advise — it writes nothing).`;
   }
   if (stuck.length > 0) {
     const names = stuck.map((unit) => unit.unitId).join(", ");
@@ -408,9 +574,17 @@ export function anyUnitParked(state: HealthWatchState): boolean {
 
 /**
  * The defined-restart advisory (§11's terminal text, pinned verbatim): it
- * rides the card beside an alert-tier probe failure so the operator has the
- * escalation ladder's end without opening a log directory. Stage R's own
- * surfaces carry it too, when that wave ships.
+ * rides the card beside every recovery failure-ladder end and every
+ * alert-tier probe failure so the operator has the escalation ladder's end
+ * without opening a log directory.
  */
 export const HEALTH_WATCH_RESTART_ADVISORY =
   "Remote recovery exhausted. Defined-restart procedure, in this order: battery button OFF for 5 s; DC off; AC off; WAIT 10 MINUTES (the fuse re-engagement lockout — do not shorten it); battery ON FIRST, then AC, then DC. Then verify telemetry resumes, Debug Mode reads Normal Mode and SysControlMode reads Remote in the vendor MiniES app. Take the logs to the installer if the pod does not return.";
+
+/**
+ * The vendor-documented on-device cross-check (§11): force-state
+ * transitions land in the BMU event log — pull it after any cycle to
+ * corroborate (or contradict) the ledger.
+ */
+export const HEALTH_WATCH_BMU_CROSS_CHECK =
+  "Force-state transitions are logged in the BMU event log — pull it after any cycle as the on-device cross-check on ours.";

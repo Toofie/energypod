@@ -123,11 +123,14 @@ describe("the per-battery rows", () => {
 });
 
 describe("the alert styling and the advisories", () => {
-  it("announces an alert-tier probe failure and says no recovery exists", () => {
+  it("announces an alert-tier probe failure with the site's recovery posture", () => {
     renderCard({});
     const alert = screen.getByRole("alert");
     expect(alert).toHaveTextContent(/FAILED on rhs/);
-    expect(alert).toHaveTextContent(/no automated recovery exists/);
+    // The Stage-R-era truth: this fixture's site stages recovery in advise —
+    // the alert says what that posture does (writes nothing), never a
+    // capability the site lacks the wording for.
+    expect(alert).toHaveTextContent(/recovery stage is advise/);
   });
 
   it("carries the defined-restart advisory verbatim beside a failure", () => {
@@ -177,5 +180,112 @@ describe("the alert styling and the advisories", () => {
       ],
     });
     expect(screen.getByText(/not electrical isolation/)).toBeInTheDocument();
+  });
+});
+
+describe("the recovery surface (§13, the Stage R wave)", () => {
+  const stagedRecovery = (recovery: Record<string, unknown>): Partial<Record<string, unknown>> => ({
+    stages: ["census", "probe", "recovery"],
+    units: [
+      {
+        unit_id: "rhs",
+        census: { verdict: "stuck_suspected", nights: 2, predicates: null, tier: "alert" },
+        probe: {
+          verdict: "fail_no_response",
+          probe_w: 300,
+          qualifying_samples: 3,
+          core_samples: 20,
+          echo: "echo_matches_write",
+        },
+        recovery,
+      },
+    ],
+  });
+
+  it("renders the advise advisory card with the operator walkthrough", () => {
+    renderCard(stagedRecovery({ mode: "advise", verdict: "advised", tier: "alert" }));
+    const advisory = screen.getByText(/Operator walkthrough/);
+    expect(advisory).toHaveTextContent("disarm → park → resume → re-arm → verify");
+    expect(advisory).toHaveTextContent("writes nothing, ever");
+    // The row itself carries the advisory verdict.
+    expect(screen.getByLabelText("rhs health watch row")).toHaveTextContent(
+      /advisory rendered/,
+    );
+  });
+
+  it("renders the auto recovery morning: what the program did and the re-arm owed", () => {
+    renderCard(
+      stagedRecovery({
+        mode: "auto",
+        verdict: "recovered",
+        tier: "resolved",
+        posture: "auto",
+        rung: "verified",
+        attempts_total: 3,
+        consecutive_fails: 0,
+        consecutive_fail_limit: 3,
+        trailing_30_nights: { attempted: 6, recovered: 5, attempt_rate: 0.2 },
+      }),
+    );
+    const advisory = screen.getByText(/The program ran its cycle/);
+    expect(advisory).toHaveTextContent("re-arm it this morning");
+    const morning = screen.getByText(/Before: stuck signature/);
+    expect(morning).toHaveTextContent("6 cycle nights in the last 30 (20%)");
+    // The BMU cross-check note rides beside any cycle that ran (§11).
+    expect(screen.getByText(/BMU event log/)).toBeTruthy();
+    // The night's own evidence still speaks: the original probe failure is
+    // its own alert even on the morning the cycle resolved it (§11).
+    expect(screen.getByRole("alert")).toHaveTextContent(/FAILED on rhs/);
+  });
+
+  it("announces a failure-ladder end as the alert and rides the restart advisory", () => {
+    renderCard(
+      stagedRecovery({
+        mode: "auto",
+        verdict: "write_unverified",
+        tier: "alert",
+        rung: "acked_unverified",
+        attempts_total: 1,
+      }),
+    );
+    const alert = screen.getByRole("alert");
+    expect(alert).toHaveTextContent("Recovery outcome on rhs");
+    expect(screen.getByText(/battery button OFF for 5 s/)).toHaveTextContent(
+      "WAIT 10 MINUTES",
+    );
+    expect(screen.getByText(/battery button OFF for 5 s/)).toHaveTextContent(
+      "battery ON FIRST, then AC, then DC",
+    );
+  });
+
+  it("names a unit the closing disarm left ARMED (I9's honest alert)", () => {
+    renderCard(
+      stagedRecovery({
+        mode: "auto",
+        verdict: "recovered",
+        tier: "resolved",
+        left_armed: true,
+        attempts_total: 1,
+      }),
+    );
+    expect(screen.getByText(/LEFT ARMED/)).toHaveTextContent("disarm it now");
+  });
+
+  it("renders a skipped recovery with its reason verbatim and no advisory card", () => {
+    renderCard(stagedRecovery({ mode: "auto", verdict: "skipped:foreign_standby", tier: "alert" }));
+    expect(screen.getByLabelText("rhs health watch row")).toHaveTextContent(
+      "skipped — the battery is in Standby and it is not ours",
+    );
+    expect(screen.queryByText(/Operator walkthrough/)).toBeNull();
+    expect(screen.queryByText(/The program ran its cycle/)).toBeNull();
+  });
+
+  it("keeps the uncommissioned honesty when the stage is absent", () => {
+    renderCard({});
+    expect(screen.getByLabelText("rhs health watch row")).toHaveTextContent(
+      "recovery not commissioned",
+    );
+    expect(screen.queryByText(/Operator walkthrough/)).toBeNull();
+    expect(screen.queryByText(/The program ran its cycle/)).toBeNull();
   });
 });

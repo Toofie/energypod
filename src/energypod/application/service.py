@@ -2139,6 +2139,110 @@ class EnergyServiceFacade:
             "expires_in_s": duration_s,
         }
 
+    async def submit_health_disarm(
+        self, *, unit_ids: Any, principal: Principal, request_id: Any = None
+    ) -> dict[str, Any]:
+        """The health watch's internal disarm twin (DESIGN_BATTERY_HEALTH_WATCH
+        §7.2 step 2).
+
+        The standing facade disarm under the composed ``energypod:health-
+        adviser`` principal, audited and generation-fenced exactly like the
+        operator's own: a STOP-direction act (the emergency-stop family,
+        fail-safe by construction) that exists so PARK'S CONFLICT GUARD NEVER
+        NEEDS WEAKENING — the recovery cycle disarms its target before it
+        parks.  Composition-only wiring: never routed on REST or MCP, and
+        only the composed health principal ever reaches it.
+        """
+        self._admit(principal, "arm")
+        units = _validated_units(unit_ids)
+        request = self._health_key("disarm") if request_id is None else request_id
+        request = _correlation_key(request, "request_id")
+        outcomes: list[dict[str, str]] = []
+        degraded: list[str] = []
+        for unit_id in units:
+            outcome = await self._disarm_one(unit_id)
+            outcomes.append(outcome)
+            try:
+                await self._append_audit(
+                    self._mutation_audit(
+                        event_type="unit_disarmed",
+                        subject=principal.subject,
+                        result=outcome["status"],
+                        request_id=request,
+                        reason_codes=("health_watch_recovery", outcome["reason"]),
+                        unit_id=unit_id,
+                        lifecycle=self._handle_lifecycle(unit_id),
+                        payload={
+                            **dict(outcome),
+                            "reason": "health-watch recovery cycle",
+                        },
+                    )
+                )
+            except Exception:
+                # The safety-positive family: the disarm stands whatever the
+                # record does, named per unit.
+                degraded.append(f"audit_unavailable:{unit_id}")
+        degraded.extend(
+            await self._publish_degraded(
+                "unit.disarmed", {"principal": principal.subject, "units": outcomes}
+            )
+        )
+        return {"units": outcomes, "degraded": degraded}
+
+    async def submit_health_rearm(
+        self, *, unit_id: Any, principal: Principal, request_id: Any = None
+    ) -> dict[str, Any]:
+        """THE one bounded automation arm authority (§7.4, panel ruling 1).
+
+        The recovery cycle's verification re-arm: composed in the ``auto``
+        posture only, never routed on REST or MCP, never the takeover
+        acknowledgement — a foreign objective observed during the park makes
+        the next arm the OPERATOR's acknowledgement (interactive-only,
+        forever), and the refusal lands upstream as A2's ``rearm_refused``
+        rung ending ``recovered_unproven``.  This is the ONLY arm path any
+        adviser, stage, timer, or surface of this controller ever gains; any
+        future automation arm must survive its own panel.
+        """
+        self._admit(principal, "arm")
+        units = _validated_units([unit_id])
+        if len(units) != 1:
+            raise ValueError("the bounded verification re-arm names exactly one unit")
+        request = self._health_key("rearm") if request_id is None else request_id
+        request = _correlation_key(request, "request_id")
+        target = units[0]
+        outcome = await self._arm_one(target, takeover_acknowledged=False)
+        try:
+            await self._append_audit(
+                self._mutation_audit(
+                    event_type="unit_armed",
+                    subject=principal.subject,
+                    result=outcome["status"],
+                    request_id=request,
+                    reason_codes=(
+                        "health_watch_verification_rearm",
+                        outcome["reason"],
+                    ),
+                    unit_id=target,
+                    lifecycle=self._handle_lifecycle(target),
+                    payload={
+                        **dict(outcome),
+                        "reason": "health-watch verification re-arm",
+                        "bounded": True,
+                        "takeover_acknowledged": False,
+                    },
+                )
+            )
+        except Exception:
+            # An unaudited arm cannot stand: disarm compensates (Impl-10),
+            # and the caller reads the refusal as the A2 rung.
+            with contextlib.suppress(Exception):
+                await self._disarm_one(target)
+            raise
+        await self._publish(
+            "unit.armed", {"principal": principal.subject, "units": [dict(outcome)]}
+        )
+        return dict(outcome)
+
     async def get_health_watch_status(self, *, principal: Principal) -> dict[str, Any]:
         """The watch's program projection (block-presence refusal otherwise).
 

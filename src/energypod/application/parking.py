@@ -21,7 +21,16 @@ controller implements, pinned:
   the lease as ``observed_foreign`` (no write) and arms the
   ``resume_provenance`` window; a vendor word 2-6 over our unchanged lease
   sets ``foreign_rewrite`` and renders ``foreign_mode`` -- named, never a
-  write, never a re-park.
+  write, never a re-park.  One extension (DESIGN_BATTERY_HEALTH_WATCH §12,
+  A5): a ``word=0, lease open`` that carries a pending ``unit_resumed`` row
+  with no completing row inside the bounded recency window is OUR
+  crashed-then-verified resume -- adopted as ours, a store write only, never
+  misread as foreign.
+- **The lease origin vocabulary carries ``automation``, DERIVED (A10)**:
+  a row whose principal carries the ``energypod:`` prefix renders
+  ``automation``, anything else ``operator`` (:func:`derive_origin`); the
+  foreign/unrecorded/none semantics are untouched, and a word=1 under an
+  open ``automation`` lease is OURS -- resume needs no takeover.
 - **Single-flight per unit**: one asyncio critical section per unit plus the
   monotonic ``lease_epoch`` CAS in the store; the write->readback->verify
   sequence is ONE actor-mailbox operation, so a heartbeat PQ write can never
@@ -113,6 +122,29 @@ _FAULT_AUDIT_SCAN_LIMIT: Final[int] = 200
 # NOT FOUND -- the adoption degrades to today's ``unrecorded`` path, never a
 # fabricated lease.
 _ADOPTION_AUDIT_SCAN_LIMIT: Final[int] = 200
+
+# The lease origin's ``automation`` word (DESIGN_BATTERY_HEALTH_WATCH §10,
+# A10): DERIVED, never stored -- ``ParkLease`` and the ``park_leases`` table
+# carry no origin column.  A row whose principal carries the ``energypod:``
+# prefix renders ``automation``; anything else renders ``operator``.  The
+# foreign/unrecorded/none semantics are untouched, and a word=1 under an open
+# ``automation`` lease is OURS -- resume by the health watch's own completion
+# or by the operator, never a takeover.
+ORIGIN_AUTOMATION: Final[str] = "automation"
+ORIGIN_OPERATOR: Final[str] = "operator"
+
+
+def derive_origin(principal: str) -> str:
+    """A10's derivation: the acting principal's own class, nothing else.
+
+    The composed automation principals (``energypod:health-adviser`` and the
+    controller's own bookkeeping subjects) render ``automation``; every human
+    principal renders ``operator``.  Pure and total so every row, event, and
+    projection derives the SAME word for the same principal -- the boot-adopted
+    automation park derives ``automation`` from the adopted row's principal,
+    and no surface can ever fabricate an origin in either direction.
+    """
+    return ORIGIN_AUTOMATION if principal.startswith("energypod:") else ORIGIN_OPERATOR
 # The honest reason an adopted lease carries: the operator's own reason text
 # lived in the pending row's payload, which the audit row keeps only as a
 # fingerprint -- unknowable after the crash, never invented.
@@ -404,7 +436,7 @@ class ParkController:
                         "written_value": None,
                         "readback_word": None,
                         "verified": False,
-                        "origin": "operator",
+                        "origin": derive_origin(principal_subject),
                         "authorizer": principal_subject,
                         "reason": reason,
                         "epoch": epoch,
@@ -451,7 +483,7 @@ class ParkController:
                         "written_value": int(outcome["written_value"]),
                         "readback_word": int(outcome["readback_word"]),
                         "verified": bool(outcome["verified"]),
-                        "origin": "operator",
+                        "origin": derive_origin(principal_subject),
                         "authorizer": principal_subject,
                         "reason": reason,
                         **lease.to_payload(),
@@ -467,7 +499,7 @@ class ParkController:
                     "unit_id": unit_id,
                     "principal": principal_subject,
                     "reason": reason,
-                    "origin": "operator",
+                    "origin": derive_origin(principal_subject),
                     **lease.to_payload(),
                     "prior_word": prior_word,
                     "readback_word": int(outcome["readback_word"]),
@@ -532,7 +564,7 @@ class ParkController:
                     lifecycle=self._actor_lifecycle(unit_id),
                     payload={
                         "authorizer": principal_subject,
-                        "origin": "operator",
+                        "origin": derive_origin(principal_subject),
                         **renewed.to_payload(),
                     },
                 ),
@@ -544,7 +576,7 @@ class ParkController:
                 {
                     "unit_id": unit_id,
                     "principal": principal_subject,
-                    "origin": "operator",
+                    "origin": derive_origin(principal_subject),
                     **renewed.to_payload(),
                 },
             )
@@ -615,9 +647,16 @@ class ParkController:
             if prior_word == 0:
                 # Idempotent honesty: the pod is already Normal.  An open
                 # lease over a Normal word is the observed-foreign-resume
-                # divergence (section 1): close it the same way the
-                # supervision pass would, written_value null -- no write.
-                if lease is not None and lease.parked:
+                # divergence (section 1) -- UNLESS our own earlier resume
+                # crashed between its verified write and the lease commit, the
+                # A5 shape a fresh RESUME lands on first: adopt it as ours
+                # (a store write only), else close it the way the supervision
+                # pass would, written_value null -- no write either way.
+                if (
+                    lease is not None
+                    and lease.parked
+                    and not await self._adopt_pending_resume(unit_id, lease, self._wall_now())
+                ):
                     await self._close_observed_foreign(lease, request_id=request_id)
                 return {
                     "unit_id": unit_id,
@@ -632,7 +671,7 @@ class ParkController:
                     "degraded": [],
                 }
             # prior_word == 1: whose standby is it?
-            origin = "operator"
+            origin = derive_origin(principal_subject)
             codes = ["readback_verified"]
             if lease is None or not lease.parked:
                 if takeover != "FOREIGN":
@@ -957,7 +996,7 @@ class ParkController:
                             "written_value": None,
                             "readback_word": 1,
                             "verified": None,
-                            "origin": "operator",
+                            "origin": derive_origin(authorizer),
                             "authorizer": authorizer,
                             "reason": ADOPTED_PENDING_REASON,
                             "adopted": True,
@@ -975,9 +1014,15 @@ class ParkController:
             self._mirror_parked(unit_id, parked=True, lease=adopted)
             return adopted
 
-    async def _latest_uncompleted_pending(self, unit_id: str) -> Any | None:
-        """The unit's most recent pending ``unit_parked`` row no later row
-        completes (``parked`` / ``refused``) -- the crash-after-write shape.
+    async def _latest_uncompleted_pending(
+        self,
+        unit_id: str,
+        *,
+        event_type: str = "unit_parked",
+        completing_results: tuple[str, ...] = ("parked", "refused"),
+    ) -> Any | None:
+        """The unit's most recent pending row of one type no later row
+        completes -- the crash-after-write shape.
 
         Row order never matters: a completing row AT-OR-AFTER the pending's
         instant closes the sequence (the commit lands within the write's own
@@ -992,7 +1037,7 @@ class ParkController:
         for event in events:
             if getattr(event, "unit_id", None) != unit_id:
                 continue
-            if getattr(event, "event_type", None) != "unit_parked":
+            if getattr(event, "event_type", None) != event_type:
                 continue
             occurred = getattr(event, "occurred_at", None)
             if not isinstance(occurred, datetime) or occurred.tzinfo is None:
@@ -1000,7 +1045,7 @@ class ParkController:
             result = getattr(event, "result", None)
             if result == "pending":
                 pending_rows.setdefault(occurred, event)
-            elif result in ("parked", "refused"):
+            elif result in completing_results:
                 completed_at.append(occurred)
         if not pending_rows:
             return None
@@ -1008,6 +1053,118 @@ class ParkController:
         if any(at >= latest for at in completed_at):
             return None
         return pending_rows[latest]
+
+    async def _adopt_pending_resume(
+        self, unit_id: str, lease: ParkLease, now: datetime
+    ) -> bool:
+        """A5 (DESIGN_BATTERY_HEALTH_WATCH §7.2 step 5): adopt a
+        crashed-then-verified RESUME as ours.
+
+        The resume twin of section 4's park-side adoption.  The durable-first
+        resume sequence is pending row -> write 0 -> verifying lease-closing
+        transaction; a crash between the VERIFIED write and that transaction
+        leaves exactly ``word=0, open lease, a pending ``unit_resumed`` row``
+        -- the shape the divergence pass would otherwise close as
+        ``observed_foreign``, reading OUR completed act as somebody else's
+        (and a nightly program multiplies that window).  When the unit's most
+        recent pending resume row has no completing row, sits inside the
+        commissioned anti-rollover horizon, and belongs to THIS lease (its
+        instant at-or-after ``parked_at``), the lost closing row is committed
+        as OURS: origin derived from the pending row's principal (A10), a
+        STORE write only -- the device register is never touched.
+
+        No row, an evicted window, a completing row, a foreign word's lease,
+        or a failing store all return ``False``: the caller keeps the honest
+        ``observed_foreign`` reading with the pending row as the operator's
+        correlation.
+        """
+        pending = await self._latest_uncompleted_pending(
+            unit_id,
+            event_type="unit_resumed",
+            completing_results=("resumed", "refused", "observed_foreign"),
+        )
+        if pending is None:
+            return False
+        occurred = getattr(pending, "occurred_at", None)
+        if not isinstance(occurred, datetime) or occurred.tzinfo is None:
+            return False
+        if (now - occurred).total_seconds() > self._commissioning.max_lease_s:
+            # Outside the bounded recency window: whatever resume happened can
+            # no longer be ours under the anti-rollover cap.
+            return False
+        authorizer = getattr(pending, "principal", None)
+        if not isinstance(authorizer, str) or not authorizer.strip():
+            return False
+        # Deliberately NOT under the unit lock: ``resume()`` itself calls
+        # here from INSIDE its own critical section (the idempotent word=0
+        # path), and asyncio locks are not reentrant.  The single-flight
+        # guarantee is the store's epoch CAS below -- a concurrent mutation
+        # bumps the epoch and this replace fails onto the honest path.
+        current = await self._store.lease(unit_id)
+        if (
+            current is None
+            or current.epoch != lease.epoch
+            or not current.parked
+            or current.state == LEASE_WRITE_UNVERIFIED
+            or occurred < current.parked_at
+        ):
+            return False
+        closed = dataclass_replace(
+            current,
+            state=LEASE_CLOSED_OPERATOR,
+            closed_at=occurred,
+        )
+        origin = derive_origin(authorizer)
+        correlation = getattr(pending, "correlation_id", None)
+        request_id = (
+            correlation.removeprefix("parking:unit_resumed:")
+            if isinstance(correlation, str)
+            and correlation.startswith("parking:unit_resumed:")
+            and len(correlation) > len("parking:unit_resumed:")
+            else f"adoption:{unit_id}"
+        )
+        try:
+            await self._store.replace(
+                self._row(
+                    event_type="unit_resumed",
+                    unit_id=unit_id,
+                    principal="energypod:parking",
+                    request_id=request_id,
+                    result="resumed",
+                    reason_codes=("adopted_pending", "resume_side_adoption"),
+                    lifecycle=self._actor_lifecycle(unit_id),
+                    payload={
+                        "prior_word": 1,
+                        "written_value": None,
+                        "readback_word": 0,
+                        "verified": None,
+                        "origin": origin,
+                        "authorizer": authorizer,
+                        "adopted": True,
+                        "epoch": current.epoch,
+                    },
+                ),
+                closed,
+                expected_epoch=current.epoch,
+            )
+        except Exception:
+            return False
+        self._mirror_parked(unit_id, parked=False)
+        memory = self._divergence.get(unit_id)
+        if memory is not None:
+            # OUR resume, adopted: no foreign-resume provenance window.
+            memory.resume_origin = origin
+            memory.resume_observed_at = closed.closed_at
+        await self._publish(
+            "unit.resumed",
+            {
+                "unit_id": unit_id,
+                "origin": origin,
+                "adopted": True,
+                "epoch": current.epoch,
+            },
+        )
+        return True
 
     async def _expire_lease(
         self, lease: ParkLease, now: datetime, *, reason_codes: tuple[str, ...] = ()
@@ -1026,7 +1183,7 @@ class ParkController:
                     lifecycle=self._actor_lifecycle(lease.unit_id),
                     payload={
                         "written_value": None,
-                        "origin": "operator",
+                        "origin": derive_origin(lease.authorizer),
                         "epoch": lease.epoch,
                         "expires_at": lease.expires_at.astimezone(UTC).isoformat(),
                         "hint": EXPIRY_HINT,
@@ -1081,7 +1238,7 @@ class ParkController:
                                 "written_value": None,
                                 "readback_word": word,
                                 "verified": None,
-                                "origin": "operator",
+                                "origin": derive_origin(lease.authorizer),
                                 "epoch": lease.epoch,
                                 "foreign_mode": {
                                     "word": word,
@@ -1093,10 +1250,16 @@ class ParkController:
                         expected_epoch=lease.epoch,
                     )
             elif word == 0:
+                # A5: before reading OUR completed act as foreign, try the
+                # resume-side adoption (a pending unit_resumed row plus the
+                # already-0 word closes the lease as OURS inside the bounded
+                # recency window -- a store write only).  Only the genuinely-
+                # foreign resume falls through to the alarm.
                 if (
                     lease is not None
                     and lease.parked
                     and lease.state != LEASE_WRITE_UNVERIFIED
+                    and not await self._adopt_pending_resume(unit_id, lease, self._wall_now())
                 ):
                     # The observed foreign resume: close the lease, no write.
                     await self._close_observed_foreign(
@@ -1227,7 +1390,7 @@ class ParkController:
             )
             state: dict[str, Any] = {
                 "parked": True,
-                "origin": "operator",
+                "origin": derive_origin(lease.authorizer),
                 "parked_at": lease.parked_at.astimezone(UTC).isoformat(),
                 "lease_expires_at": lease.expires_at.astimezone(UTC).isoformat(),
                 "max_total_s": lease.max_total_s,
@@ -1319,6 +1482,7 @@ class ParkController:
         if lease is not None and lease.parked:
             details["parked_provenance"] = {
                 "parked_at": lease.parked_at.astimezone(UTC).isoformat(),
+                "origin": derive_origin(lease.authorizer),
                 "authorizer": lease.authorizer,
                 "reason": lease.reason,
                 "lease_expires_at": lease.expires_at.astimezone(UTC).isoformat(),
@@ -1447,13 +1611,13 @@ class ParkController:
         """
         if lease is None:
             return {"origin": "none", "closed_at": None}
-        origin = {
-            LEASE_CLOSED_OPERATOR: "operator",
-            LEASE_CLOSED_FOREIGN: "foreign",
-            LEASE_WRITE_UNVERIFIED: "operator",
-            LEASE_EXPIRED: "operator",
-            LEASE_OPEN: "operator",
-        }.get(lease.state, lease.state)
+        if lease.state == LEASE_CLOSED_FOREIGN:
+            origin = "foreign"
+        else:
+            # A10: the lease's own origin derives from the principal that
+            # took the park -- an automation park closes ``automation`` every
+            # way it can end except a foreign resume.
+            origin = derive_origin(lease.authorizer)
         return {
             "origin": origin,
             "closed_at": (
@@ -1654,6 +1818,8 @@ __all__ = [
     "ADOPTED_PENDING_REASON",
     "EXPIRY_HINT",
     "MIN_LEASE_S",
+    "ORIGIN_AUTOMATION",
+    "ORIGIN_OPERATOR",
     "PARK_ALREADY_PARKED",
     "PARK_CONFLICT_REFUSED",
     "PARK_FOREIGN_WORD_ACKNOWLEDGEMENT_REQUIRED",
@@ -1668,4 +1834,5 @@ __all__ = [
     "ParkCommissioning",
     "ParkController",
     "ParkingRefusal",
+    "derive_origin",
 ]

@@ -18,8 +18,10 @@ against ``energypod.application.health_watch``:
   gate on the grid-IMPORT words including the stale-evidence skip, the
   explicit cancel, sequential ordering with the inter-unit gap, and no
   probe outside the window;
-- the structural pin: NO code path responds to a probe verdict with any
-  write — Stage R does not exist in this wave.
+- the structural pin, restated for the Stage-R era: a probe verdict ALONE
+  still triggers nothing (only the §7.1 conjunction composes a cycle, and
+  that lives in test_health_watch_recovery); the module's write reach is
+  exactly the injected composer ports.
 """
 
 from __future__ import annotations
@@ -1370,24 +1372,28 @@ def test_a_failed_health_watch_refusal_is_well_formed() -> None:
 
 
 def test_no_code_path_responds_to_a_probe_verdict_with_any_write() -> None:
-    """The I10-adjacent rule for this wave: probe verdicts never trigger ANY
-    write response.  The module's source holds no transport, park, resume,
-    disarm, or arm call — the ONE submission it can make is the probe's own
-    intent, and nothing consumes a verdict for actuation."""
+    """The I10-adjacent rule, restated for the Stage-R era: a probe verdict
+    ALONE still triggers nothing — only the §7.1 conjunction (census flag AND
+    ``fail_no_response``) composes a cycle, and the module's write reach is
+    exactly the injected composer ports.  The source holds no transport and
+    no actor-lifecycle method; the ONE park and ONE resume call ride the
+    injected ``_park_control`` port (the ParkController's own guarded
+    primitive), the disarm/re-arm ride the injected lifecycle ports."""
     from pathlib import Path
 
     source = Path(hw.__file__).read_text(encoding="utf-8")
     for forbidden in (
         "write_debug_mode",
         "request_debug_mode_change(",
-        ".park(",
-        ".resume(",
-        ".disarm(",
-        ".arm(",
         "request_bounded_zero(",
         "emergency_stop(",
     ):
         assert forbidden not in source, forbidden
+    # The recovery composer's mode writes reach ONLY the injected port.
+    assert source.count(".park(") == 1 and "control.park(" in source
+    assert source.count(".resume(") == 1 and "control.resume(" in source
+    # And the lifecycle reach is the two injected ports, never an actor.
+    assert ".disarm(" not in source and ".arm(" not in source
 
 
 def test_the_application_module_imports_no_adapters() -> None:

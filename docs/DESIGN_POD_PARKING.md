@@ -170,13 +170,20 @@ the stop first): `{"stop_ids": [...],
 ## 3. State, projections, and vocabulary
 
 - `park_state` per unit (snapshot + unit detail): `{parked: bool, origin:
-  "operator" | "foreign" | "unrecorded" | "none", parked_at,
+  "operator" | "automation" | "foreign" | "unrecorded" | "none", parked_at,
   lease_expires_at, max_total_s, remaining_cap_s, expired: bool, reason,
   authorizer, foreign_rewrite: bool?, write_unverified: bool?,
   foreign_mode: {word, name, first_observed_at}?}` — absent key when
   uncommissioned. `unrecorded` covers word=1 with no lease AND no foreign
   evidence (crash-after-write residue); `foreign` is reserved for the
-  vendor-app/foreign-flip class.
+  vendor-app/foreign-flip class. **The `automation` word is DERIVED, never
+  stored (DESIGN_BATTERY_HEALTH_WATCH §10, A10): `ParkLease` and the
+  `park_leases` table carry no origin column — a row (and the lease's own
+  projection) renders `automation` when its principal carries the
+  `energypod:` prefix, `operator` otherwise; the foreign/unrecorded/none
+  semantics are untouched, and a word=1 under an open `automation` lease is
+  OURS — resume by the health watch's own completion or by the operator,
+  no takeover.**
 - A lease ends only by (a) verified resume write, (b) observed foreign
   resume, or (c) expiry (alarm-only). Under any OTHER ending the lease
   persists in the terminal sub-state `write_unverified`: `parked: true,
@@ -263,8 +270,16 @@ the stop first): `{"stop_ids": [...],
 - **Boot:** reconstruct from the lease table + the device word. Expired-
   during-downtime → raise the expiry alarm (no write — ever). Pending row +
   word=1 → the durable-first park completed; adopt it as ours. Open lease +
-  word=0 → the foreign-resume reconciliation of §1. Boot never writes the
-  mode register under any path.
+  word=0 → the foreign-resume reconciliation of §1, **with the resume-side
+  twin of the park adoption (DESIGN_BATTERY_HEALTH_WATCH §12, A5): a
+  pending `unit_resumed` row plus an already-0 word inside the bounded
+  recency window (the commissioned anti-rollover horizon of the pending
+  row) closes the lease as OURS — origin derived from the pending row's
+  principal, a store write only — so a crash between the VERIFIED resume
+  write and the lease commit never reads our completed act as a foreign
+  resume; outside that window the honest `observed_foreign` reading stands
+  with the pending row as the operator's correlation.** Boot never writes
+  the mode register under any path.
 - Expiry timing rides the existing bounded supervision pass (a per-unit
   wall-clock check per fleet cycle — no new task class; the composition
   contract starts nothing).
@@ -341,7 +356,12 @@ write.
   acknowledgement." Advisory-only; abort-to-human unchanged. One honesty
   sentence owned: **the wedge recovery tool requires the `parking:` block
   commissioned** — the advisory renders as unavailable otherwise, never as
-  a suggestion the site cannot execute.
+  a suggestion the site cannot execute. **Commissioning honesty, extended
+  (DESIGN_BATTERY_HEALTH_WATCH §12): the nightly program can execute this
+  walkthrough itself when `battery_health_watch.recovery.mode: auto` is
+  commissioned — until then the advisory names the operator's own hands as
+  the only actor, and a site without that commissioning never renders the
+  cycle as a capability it has.**
 - `delivery_bias` on unit detail + MCP (pinned shape:
   `{"mean_bias_pct", "max_bias_pct", "sample_count", "window_s"}`,
   evidence-only): bounded per-unit deque of

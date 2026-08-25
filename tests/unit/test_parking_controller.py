@@ -960,10 +960,13 @@ async def test_parked_provenance_rides_the_dispatch_refusal(rig: Rig) -> None:
     assert details is not None
     assert set(details["parked_provenance"]) == {
         "parked_at",
+        "origin",
         "authorizer",
         "reason",
         "lease_expires_at",
     }
+    # A10: the derived origin — an operator park renders "operator" everywhere.
+    assert details["parked_provenance"]["origin"] == "operator"
     assert details["parked_provenance"]["reason"] == "inverter work"
 
 

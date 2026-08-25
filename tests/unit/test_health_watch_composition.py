@@ -236,3 +236,96 @@ async def test_an_auto_receipt_that_does_not_exist_degrades_to_advise(tmp_path) 
     (unit,) = status["units"]
     assert unit["recovery"]["mode"] == "advise"
     assert "receipt missing" in unit["recovery"]["note"]
+
+
+# --- Stage R's composed surfaces (DESIGN_BATTERY_HEALTH_WATCH §7/§12/§17) ----------
+
+
+async def test_a_staged_recovery_composes_the_park_composer(tmp_path) -> None:
+    """The recovery stage composes the ParkController as its ONE mode-write
+    reach (§12: an internal composer, never an API) plus the facade's disarm
+    twin; the advise posture wires no re-arm port at all — structurally,
+    no re-arm by the program can ever occur."""
+    from energypod.application.health_watch import HEALTH_ADVISER_PRINCIPAL
+
+    runtime = _compose(
+        _watch_payload(stages=["census", "probe", "recovery"]), ManualClock(), tmp_path
+    )
+    assert runtime.health_watch is not None
+    assert runtime.health_watch._park_control is not None
+    assert runtime.health_watch._disarm_port is not None
+    assert runtime.health_watch._arm_port is None  # advise: no arm path exists
+
+    principal = type("HealthPrincipal", (), {})()
+    principal.subject = HEALTH_ADVISER_PRINCIPAL
+    principal.scopes = frozenset({"observe", "dispatch", "arm"})
+    principal.interactive = False
+    principal.site_id = "home"
+    disarmed = await runtime.facade.submit_health_disarm(
+        unit_ids=["mid"], principal=principal
+    )
+    # The simulate rig never starts the fleet task, so the actor's own
+    # answer is environment-dependent; the pin is the ATTRIBUTION — the
+    # row lands under the health principal with the watch's reason code.
+    assert disarmed["units"][0]["status"] in {"disarmed", "refused"}
+    rows = [
+        event
+        for event in runtime.audit.recent(limit=32)
+        if event.event_type == "unit_disarmed"
+    ]
+    assert rows and rows[-1].principal == HEALTH_ADVISER_PRINCIPAL
+    assert "health_watch_recovery" in rows[-1].reason_codes
+
+
+async def test_the_auto_posture_wires_the_one_bounded_rearm_twin(tmp_path) -> None:
+    """Auto (with the A6 receipts) composes the re-arm port — the ONLY
+    automation arm authority — and it lands an audited unit_armed row with
+    the bounded marker and no takeover acknowledgement, ever."""
+    from energypod.application.health_watch import HEALTH_ADVISER_PRINCIPAL
+
+    runtime = _compose(
+        _watch_payload(
+            stages=["census", "probe", "recovery"],
+            recovery={
+                "mode": "auto",
+                "auto_receipts": {"mid": "excluded"},
+            },
+        ),
+        ManualClock(),
+        tmp_path,
+    )
+    assert runtime.health_watch is not None
+    assert runtime.health_watch._arm_port is not None
+    principal = type("HealthPrincipal", (), {})()
+    principal.subject = HEALTH_ADVISER_PRINCIPAL
+    principal.scopes = frozenset({"observe", "dispatch", "arm"})
+    principal.interactive = False
+    principal.site_id = "home"
+    outcome = await runtime.facade.submit_health_rearm(unit_id="mid", principal=principal)
+    assert outcome["status"] in {"armed", "refused"}
+    rows = [
+        event for event in runtime.audit.recent(limit=32) if event.event_type == "unit_armed"
+    ]
+    assert rows and rows[-1].principal == HEALTH_ADVISER_PRINCIPAL
+    assert "health_watch_verification_rearm" in rows[-1].reason_codes
+
+
+def test_the_health_lifecycle_twins_are_never_routed() -> None:
+    """§12: the amendment adds an INTERNAL composer, it opens no API — the
+    REST surface exposes no health disarm/re-arm route."""
+    from pathlib import Path
+
+    from energypod.runtime.composition import build_runtime
+
+    rest = Path(build_runtime.__code__.co_filename).parent.joinpath("..", "api", "rest.py")
+    source = rest.resolve().read_text(encoding="utf-8")
+    assert "submit_health_disarm" not in source
+    assert "submit_health_rearm" not in source
+
+
+def test_no_control_path_subscribes_to_the_recovery_event() -> None:
+    """T-BHW-ARCHITECTURE: the health.recovery event is observability only."""
+    from pathlib import Path
+
+    composition = Path(build_runtime.__code__.co_filename).read_text(encoding="utf-8")
+    assert "health.recovery" not in composition

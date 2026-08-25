@@ -1,18 +1,20 @@
-"""The nightly battery health watch — Stages C (census) and P (probe).
+"""The nightly battery health watch — Stages C (census), P (probe), R (recovery).
 
-DESIGN_BATTERY_HEALTH_WATCH (CONTRACT v1.1) §4/§5/§6.  A ``HealthWatchController``
+DESIGN_BATTERY_HEALTH_WATCH (CONTRACT v1.1) §4/§5/§6/§7.  A ``HealthWatchController``
 composed exactly when the ``battery_health_watch:`` block is PRESENT, ticking
 once per fleet cycle inside the existing bounded supervision pass (no new task
 class), carrying a small per-night phase machine::
 
     await_window -> census -> probe (lhs -> mid -> rhs, strictly sequential,
-    one unit at a time) -> recovery -> record -> done
+    one unit at a time) -> recovery (eligible units, strictly sequential) ->
+    record -> done
 
 Its durable facts are AUDIT ROWS, so a restart reconstructs conservatively: a
-night whose rows show an attempt never re-runs, an interrupted census or probe
-raises the alert naming the state the unit was actually left in (A4's C/P
-shape), and "an attempt" — for every once-per-night budget in the contract —
-is ANY health-watch audit row for that unit that civil night.
+night whose rows show an attempt never re-runs, an interrupted census, probe,
+or recovery composite raises the alert naming the state the unit was actually
+left in (A4 — including the crash-after-re-arm state: armed, normal,
+lease-less), and "an attempt" — for every once-per-night budget in the
+contract — is ANY health-watch audit row for that unit that civil night.
 
 What this module is, pinned:
 
@@ -27,11 +29,18 @@ What this module is, pinned:
   facade twin — judged by the arbiter, allocator, SafetyKernel and actor
   exactly like every adviser's intents.  A guard refusal is a SKIP with that
   guard's reason, never a failure of the battery.
-- **A probe verdict NEVER triggers any write response.**  Stage R does not
-  exist in this wave: ``fail_no_response`` records, alerts, and that is ALL
-  it does.  There is no code path from a verdict to any act — the module
-  holds no transport, no park, no disarm, no arm, nothing but the intent
-  submission that IS the probe.
+- **Stage R (§7) composes; it never forks.**  The recovery cycle's ONLY mode
+  writes ride the injected ``ParkController`` (the existing ``{0, 1}``-bound
+  primitive — this module holds no transport and no arm/park/resume reach of
+  its own), the disarm and the ONE bounded verification re-arm ride the
+  facade's internal twins under the health principal, and in the ``advise``
+  posture NONE of it runs: no disarm, no park, no re-arm, ever, on any night.
+  Eligibility is the §7.1 conjunction — census ``stuck_suspected`` AND probe
+  ``fail_no_response`` — and NO ladder state (``actuation_incoherent``
+  included, I10) is ever a trigger.  One cycle per unit per civil night;
+  never a second attempt after any terminal outcome (I1); no write after an
+  ACKed-but-unverified one (I3); the unit ends disarmed-and-Normal or the
+  program alerts that it could not (I9).
 - **Once per civil night, crash-safe and crash-honest at every arrow** (§4).
 
 The export honesty note (§6.3): on a quiet house the probe's 300 W discharge
@@ -55,6 +64,17 @@ from zoneinfo import ZoneInfo
 from energypod.domain.audit import AuditEvent
 from energypod.domain.intents import Direction
 from energypod.domain.observations import UnitLifecycle
+
+from .parking import (
+    PARK_ALREADY_PARKED,
+    PARK_CONFLICT_REFUSED,
+    PARK_FOREIGN_WORD_ACKNOWLEDGEMENT_REQUIRED,
+    PARK_MODE_OUT_OF_SCOPE,
+    PARK_READBACK_UNVERIFIED,
+    PARK_WRITE_FAILED,
+    RESUME_STOP_LATCHED,
+    ParkingRefusal,
+)
 
 # The composed automation principal (composition supplies the real principal
 # for the facade twin; audit rows under this subject are the health
@@ -90,6 +110,84 @@ PROBE_INCONCLUSIVE_ABORTED: Final[str] = "inconclusive_aborted"
 # §11's severity tiers (the operator's four distinguishable mornings).
 TIER_NOTICE: Final[str] = "notice"
 TIER_ALERT: Final[str] = "alert"
+# §10/§11: ``health.recovery`` is alert tier on every outcome except
+# ``recovered``, which is the resolved tier.
+TIER_RESOLVED: Final[str] = "resolved"
+
+# Stage R's verdict vocabulary (§7.2 step 7, §8's ladder):
+#   recovered            -- cycle verified AND the verification probe passed
+#   recovered_unproven   -- A2: the verification re-run was inconclusive, or
+#                           the re-arm was refused; NOT counted to the cap
+#   failed_write         -- rung 2: transport resync + ONE re-issue exhausted
+#   write_unverified     -- rung 3: ACKed-but-unverified, no further write
+#   failed_no_effect     -- rung 4: verified cycle, verification probe FAILED
+#   advised              -- the advise posture's ALERT-tier advisory (§7.2)
+#   advisory_only        -- the cap's stand-down (§7.3): no cycle until the
+#                           operator acknowledgement resets it
+RECOVERY_RECOVERED: Final[str] = "recovered"
+RECOVERY_RECOVERED_UNPROVEN: Final[str] = "recovered_unproven"
+RECOVERY_FAILED_WRITE: Final[str] = "failed_write"
+RECOVERY_WRITE_UNVERIFIED: Final[str] = "write_unverified"
+RECOVERY_FAILED_NO_EFFECT: Final[str] = "failed_no_effect"
+RECOVERY_ADVISED: Final[str] = "advised"
+RECOVERY_ADVISORY_ONLY: Final[str] = "advisory_only"
+
+# §8 rung 6 / A2 from the positive side: the counted failures are exactly the
+# outcomes where a cycle was ATTEMPTED and the unit was NOT recovered —
+# ``recovered_unproven`` proofs that went missing do NOT count.
+_RECOVERY_COUNTED_FAILS: Final[frozenset[str]] = frozenset(
+    {RECOVERY_FAILED_WRITE, RECOVERY_WRITE_UNVERIFIED, RECOVERY_FAILED_NO_EFFECT}
+)
+# A11's ``attempts_total``: every outcome where a cycle actually ran,
+# recovered and recovered_unproven included (the cap bounds failures, not
+# successes — the trailing rate makes the chronic case visible instead).
+_RECOVERY_ATTEMPTED: Final[frozenset[str]] = frozenset(
+    {*_RECOVERY_COUNTED_FAILS, RECOVERY_RECOVERED, RECOVERY_RECOVERED_UNPROVEN}
+)
+# The trailing window A11 pins on the morning facts.
+_RECOVERY_TRAILING_NIGHTS: Final[int] = 30
+
+# The ladder rung that ended each outcome (§10: the health_recovery_outcome
+# row carries it when any did).
+RUNG_RESYNC_EXHAUSTED: Final[str] = "transport_resync_exhausted"
+RUNG_ACKED_UNVERIFIED: Final[str] = "acked_unverified"
+RUNG_VERIFICATION_FAILED: Final[str] = "verification_failed"
+RUNG_VERIFICATION_INCONCLUSIVE: Final[str] = "verification_inconclusive"
+RUNG_REARM_REFUSED: Final[str] = "rearm_refused"
+RUNG_VERIFIED: Final[str] = "verified"
+
+# §7.2's step-1 re-verify skip words, and the R-specific reasons.
+SKIP_OPEN_LEASE: Final[str] = "open_lease"
+SKIP_FOREIGN_STANDBY: Final[str] = "foreign_standby"
+SKIP_DISARM_REFUSED: Final[str] = "disarm_refused"
+SKIP_REARM_REFUSED: Final[str] = "rearm_refused"
+SKIP_LEASE_BOUNDS: Final[str] = "lease_bounds"
+SKIP_PARK_CONFLICT: Final[str] = "park_conflict"
+SKIP_RESUME_REFUSED: Final[str] = "resume_refused"
+REASON_DEADLINE_PASSED_VERIFICATION: Final[str] = "deadline_passed_before_verification"
+REASON_VERIFICATION_INCONCLUSIVE: Final[str] = "verification_inconclusive"
+
+# §11's defined-restart advisory, pinned VERBATIM (the EFT Systems BYD
+# service guideline V1.5 procedure; it extends, and where R has run
+# supersedes the wording of, the standing PHYSICAL_RESTART_HINT).  The
+# 10-minute wait and the battery-first ordering are load-bearing text: they
+# ride the alert row, the event, and the console card identically.
+RESTART_ADVISORY: Final[str] = (
+    "Remote recovery exhausted. Defined-restart procedure, in this order: "
+    "battery button OFF for 5 s; DC off; AC off; WAIT 10 MINUTES (the "
+    "fuse re-engagement lockout — do not shorten it); battery ON FIRST, "
+    "then AC, then DC. Then verify telemetry resumes, Debug Mode reads "
+    "Normal Mode and SysControlMode reads Remote in the vendor MiniES app. "
+    "Take the logs to the installer if the pod does not return."
+)
+# The vendor-documented on-device cross-check named beside every cycle
+# (§11): force-state transitions land in the BMU event log.
+BMU_CROSS_CHECK_NOTE: Final[str] = (
+    "force-state transitions are logged in the BMU event log — pull it "
+    "afterward as the on-device cross-check on every cycle"
+)
+# §7.2's advise posture: the exact operator sequence the alert names.
+ADVISE_WALKTHROUGH: Final[str] = "disarm → park → resume → re-arm → verify"
 
 # The audit scan bound for the durable-row derivations (once-per-night,
 # persistence streaks, the interrupted-program reconstruction): the parking
@@ -112,7 +210,7 @@ EXPORT_HONESTY_NOTE: Final[str] = (
     "the export meter is never a surprise"
 )
 
-Phase = str  # await_window | census | probe | record | done
+Phase = str  # await_window | census | probe | recovery | record | done
 
 # The skip-if vocabulary (§4/§6.1): every skip is a recorded verdict with its
 # reason — never silence, never a failure.
@@ -204,6 +302,15 @@ class ProbeSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class RecoverySettings:
+    """§7/§9's recovery keys (the ``recovery:`` block)."""
+
+    mode: str = "advise"  # advise | auto
+    hold_s: int = 90
+    consecutive_fail_limit: int = 3
+
+
+@dataclass(frozen=True, slots=True)
 class HealthWatchSettings:
     """Every behavioural key of the ``battery_health_watch:`` block."""
 
@@ -215,6 +322,7 @@ class HealthWatchSettings:
     probe: ProbeSettings
     recovery_mode: str
     unit_ids: tuple[str, ...]
+    recovery: RecoverySettings = RecoverySettings()
     # The historian's sampling cadence: the census's degraded-evidence
     # coverage floor and the expected-sample count derive from it.
     sample_interval_s: float = 30.0
@@ -278,6 +386,40 @@ class _ActorEchoPort(Protocol):
     """The one actor surface the probe reads: the objective-echo read-back."""
 
     async def read_objective_echo(self) -> tuple[str, tuple[int | None, int | None]]: ...
+
+
+class _ParkControlPort(Protocol):
+    """The Stage R composer's ONE mode-write reach: the ParkController itself.
+
+    §12: the amendment adds an INTERNAL composer, it opens no API — R drives
+    the existing ``park``/``resume`` mutations under the health principal, so
+    every parking guard (conflict, vendor word, lease epochs, durable-first
+    rows, the ``{0, 1}`` transport bound) judges the recovery cycle exactly
+    as it judges an operator's act.  No other method of the controller is
+    reachable from here, and this module holds no transport of its own.
+    """
+
+    async def park(
+        self,
+        unit_id: str,
+        *,
+        reason: str,
+        principal_subject: str,
+        request_id: str,
+        lease_s: int | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def resume(
+        self, unit_id: str, *, principal_subject: str, request_id: str
+    ) -> dict[str, Any]: ...
+
+
+class _LifecyclePort(Protocol):
+    """One facade internal twin: the disarm (stop-direction, §7.2 step 2) or
+    the ONE bounded verification re-arm (§7.4, panel ruling 1).  Composition
+    wires these; they are never routed on REST or MCP."""
+
+    async def __call__(self, *, unit_id: str) -> Mapping[str, Any]: ...
 
 
 def _fingerprint(facts: Mapping[str, Any]) -> str:
@@ -434,6 +576,27 @@ def probe_tier(verdict: str) -> str:
     return TIER_NOTICE
 
 
+# The skip words §7.2 pins at ALERT tier (foreign standby, vendor mode) plus
+# the exits a landed cycle owes the operator's morning (a latched stop, a
+# refused resume); every other skip is the notice tier.
+_RECOVERY_ALERT_SKIPS: Final[frozenset[str]] = frozenset(
+    {SKIP_FOREIGN_STANDBY, SKIP_VENDOR_MODE, SKIP_LATCHED_STOP, SKIP_RESUME_REFUSED}
+)
+
+
+def recovery_tier(verdict: str | None) -> str:
+    """§11's recovery tier: ``recovered`` is resolved; every outcome is alert
+    except the notice-tier skips and the null (not-eligible) verdict."""
+    if verdict == RECOVERY_RECOVERED:
+        return TIER_RESOLVED
+    if verdict is None:
+        return TIER_NOTICE
+    if verdict.startswith("skipped:"):
+        reason = verdict[len("skipped:") :]
+        return TIER_ALERT if reason in _RECOVERY_ALERT_SKIPS else TIER_NOTICE
+    return TIER_ALERT
+
+
 def census_tier(stuck_nights: int, persistence_nights: int) -> str:
     """§5/§11's census tier: notice on first occurrence, alert on persistence."""
     return TIER_ALERT if stuck_nights >= persistence_nights else TIER_NOTICE
@@ -468,7 +631,13 @@ class _ProbeOutcome:
 
 @dataclass(slots=True)
 class _ProbeLeg:
-    """One in-flight probe leg (§6.2's seven steps, one tick at a time)."""
+    """One in-flight probe leg (§6.2's seven steps, one tick at a time).
+
+    ``verification`` marks the §7.2 step-6 re-run: identical steps and
+    figures, but its verdict routes to the recovery outcome (never a second
+    ``health_probe_completed`` row — that row is per unit per night) and its
+    skip/preemption classes end at ``recovered_unproven`` (A2).
+    """
 
     unit_id: str
     step: str = "baseline"  # baseline|settle|sustain|echo|cancel|return
@@ -483,8 +652,66 @@ class _ProbeLeg:
     final_w: float | None = None
     returned: bool = False
     intent_id: str | None = None
+    verification: bool = False
 
     def reset_steps(self, step: str, now_mono: float) -> None:
+        self.step = step
+        self.step_started_mono = now_mono
+
+
+@dataclass(slots=True)
+class _RecoveryFacts:
+    """A11's morning figures, derived from the durable outcome rows."""
+
+    attempts_total: int = 0
+    consecutive_fails: int = 0
+    trailing_attempted: int = 0
+    trailing_recovered: int = 0
+
+
+@dataclass(slots=True)
+class _RecoveryOutcome:
+    verdict: str | None
+    tier: str = TIER_NOTICE
+    posture: str = "advise"
+    reason: str | None = None
+    rung: str | None = None
+    codes: tuple[str, ...] = ()
+    cycle: dict[str, Any] | None = None
+    verification: dict[str, Any] | None = None
+    left_armed: bool = False
+    attempts_total: int = 0
+    consecutive_fails: int = 0
+    note: str | None = None
+
+
+@dataclass(slots=True)
+class _RecoveryLeg:
+    """One in-flight §7.2 composite (the auto posture), one tick at a time.
+
+    The step order is the contract's own and never loops backward — I1's
+    structural shape: there is no step that can revisit a mode write, and
+    once ``write_attempted`` is set the leg can only END (skip, ladder rung,
+    or verdict), never restart.  ``reissued`` is rung 2's ONE re-issue.
+    """
+
+    unit_id: str
+    step: str = "reverify"  # reverify|disarm|park|hold|resume|rearm|verify|disarm_after
+    step_started_mono: float = 0.0
+    reissued: bool = False
+    write_attempted: bool = False
+    park_result: dict[str, Any] | None = None
+    resume_result: dict[str, Any] | None = None
+    rearm_reason: str | None = None
+    verify: _ProbeLeg | None = None
+    verify_outcome: _ProbeOutcome | None = None
+    verify_reason_codes: tuple[str, ...] = ()
+    final_verdict: str | None = None
+    final_reason: str | None = None
+    final_rung: str | None = None
+    final_tier: str = TIER_ALERT
+
+    def advance(self, step: str, now_mono: float) -> None:
         self.step = step
         self.step_started_mono = now_mono
 
@@ -493,13 +720,15 @@ class _ProbeLeg:
 
 
 class HealthWatchController:
-    """The nightly program frame plus Stages C and P (§4/§5/§6).
+    """The nightly program frame plus Stages C, P, and R (§4/§5/§6/§7).
 
     Ticks once per fleet cycle, fully suppressed by the supervision pass: an
     observability failure is a missed night's evidence, never a delay to
-    control.  Holds no transport, no park primitive, no disarm/arm — the ONE
-    act it can perform is the probe's own intent submission, and NO code path
-    responds to a verdict with anything at all (Stage R is a later wave).
+    control.  Holds no transport of its own — the probe's intent submission
+    is the one dispatch act, and Stage R's mode writes ride the injected
+    ``ParkController`` (the disarm/re-arm ride the facade's internal twins).
+    In the ``advise`` posture the recovery stage renders its advisory and
+    records: no disarm, no park, no re-arm, ever, on any night, for any unit.
     """
 
     def __init__(
@@ -518,12 +747,30 @@ class HealthWatchController:
         health_states: Callable[[], Awaitable[Mapping[str, Any]]],
         parked_units: Callable[[], frozenset[str]],
         latched_stop_units: Callable[[], frozenset[str]],
+        park_control: _ParkControlPort | None = None,
+        disarm: _LifecyclePort | None = None,
+        arm: _LifecyclePort | None = None,
         recovery_receipts_missing: tuple[str, ...] = (),
         process_instance_id: str = "",
     ) -> None:
         units = tuple(settings.unit_ids)
         if not units:
             raise ValueError("unit_ids must not be empty")
+        if "recovery" in settings.stages and park_control is None:
+            # §9 composes the parking primitive with the stage; a staged
+            # recovery without its composer is a composition bug, refused
+            # loudly here rather than silently incapable.
+            raise ValueError("a staged recovery requires its park_control port")
+        if (
+            "recovery" in settings.stages
+            and settings.recovery_mode == "auto"
+            and (disarm is None or arm is None)
+        ):
+            # §7.2's composite needs both facade twins; the ``advise``
+            # posture contains none of the sequence, so its ports may stay
+            # unwired (structurally: the sequence is the auto path's own
+            # code, never entered).
+            raise ValueError("the auto recovery posture requires its disarm and arm ports")
         self._settings = settings
         self._policy = policy
         self._clock = clock
@@ -537,6 +784,9 @@ class HealthWatchController:
         self._health_states = health_states
         self._parked_units = parked_units
         self._latched_stop_units = latched_stop_units
+        self._park_control = park_control
+        self._disarm_port = disarm
+        self._arm_port = arm
         self._receipts_missing = tuple(recovery_receipts_missing)
         self._process_instance_id = process_instance_id
         self._zone = ZoneInfo(settings.timezone)
@@ -551,6 +801,11 @@ class HealthWatchController:
         self._leg: _ProbeLeg | None = None
         self._gap_until_mono: float | None = None
         self._rows_checked = False
+        self._recovery: dict[str, _RecoveryOutcome] = {}
+        self._recovery_order: tuple[str, ...] = ()
+        self._recovery_index = 0
+        self._recovery_leg: _RecoveryLeg | None = None
+        self._recovery_facts: dict[str, _RecoveryFacts] = {}
 
     # --- the fleet-loop tick ---------------------------------------------------
 
@@ -575,9 +830,11 @@ class HealthWatchController:
         if self._phase == "probe":
             await self._advance_probe(wall)
             return
-        # record/recovery/done: the rows already landed as each verdict
-        # resolved; recovery is a later wave (rendered honestly on the
-        # projection), and the program ends done.
+        if self._phase == "recovery":
+            await self._advance_recovery(wall)
+            return
+        # record/done: the rows already landed as each verdict resolved, and
+        # the program ends done.
         self._phase = "done"
 
     def _roll_night(self, local: datetime) -> None:
@@ -595,6 +852,11 @@ class HealthWatchController:
         self._leg = None
         self._gap_until_mono = None
         self._rows_checked = False
+        self._recovery = {}
+        self._recovery_order = ()
+        self._recovery_index = 0
+        self._recovery_leg = None
+        self._recovery_facts = {}
 
     def _second_of_day(self, value: time) -> int:
         return value.hour * 3600 + value.minute * 60 + value.second
@@ -670,6 +932,11 @@ class HealthWatchController:
         stopped = self._latched_view()
         socs = self._fleet_socs(latest)
         streaks = await self._stuck_streaks(self._night or wall.date())
+        if "recovery" in settings.stages:
+            # A11's morning figures derive from the durable outcome rows;
+            # computed here so the projection carries them from the window's
+            # first rendering, refreshed as tonight's outcomes land.
+            self._recovery_facts = await self._derive_recovery_facts(self._night or wall.date())
         for unit_id in settings.unit_ids:
             outcome = self._census_unit(
                 unit_id,
@@ -693,6 +960,11 @@ class HealthWatchController:
             )
             self._probe_index = 0
             self._phase = "probe"
+        elif "recovery" in settings.stages:
+            # Unreachable under the strict-prefix rule (recovery stages probe)
+            # but honest if the vocabulary ever widens: the recovery phase
+            # runs its own eligibility gate, which will find no probe rows.
+            self._phase = "recovery"
         else:
             self._phase = "done"
 
@@ -919,7 +1191,9 @@ class HealthWatchController:
         self._gap_until_mono = None
         if self._leg is None:
             if self._probe_index >= len(self._probe_order):
-                self._phase = "done"
+                # The probes are done; the recovery stage (when commissioned)
+                # takes the night from here over the SAME rows.
+                self._phase = "recovery" if "recovery" in settings.stages else "done"
                 return
             unit_id = self._probe_order[self._probe_index]
             if self._past_deadline(local):
@@ -1255,6 +1529,12 @@ class HealthWatchController:
         reason_codes: tuple[str, ...],
     ) -> None:
         """Record the verdict row/event, then the inter-unit gap (§6.1)."""
+        if leg.verification:
+            # §7.2 step 6: the re-run's verdict is the recovery outcome's own
+            # verification half — never a second ``health_probe_completed``
+            # row (that row is per unit per night), never a probe-order step.
+            await self._complete_verification(wall, leg, outcome, reason_codes=reason_codes)
+            return
         self._probe[leg.unit_id] = outcome
         codes: tuple[str, ...] = (
             reason_codes if reason_codes else (outcome.verdict or "recorded",)
@@ -1264,6 +1544,715 @@ class HealthWatchController:
         self._leg = None
         gap_s = self._settings.probe.inter_unit_gap_s
         self._gap_until_mono = float(self._clock.monotonic()) + gap_s
+
+    async def _complete_verification(
+        self,
+        wall: datetime,
+        leg: _ProbeLeg,
+        outcome: _ProbeOutcome,
+        *,
+        reason_codes: tuple[str, ...],
+    ) -> None:
+        """Route one finished verification re-run to its recovery verdict.
+
+        §8 rungs 4/5 (A2): a FAILING re-run is ``failed_no_effect`` (counted
+        to the cap); an INCONCLUSIVE re-run — preemption, guard refusal,
+        telemetry loss, a skipped leg — is ``recovered_unproven`` (NOT
+        counted: the cycle plausibly worked, the proof is missing).  The
+        composite then runs its final disarm step whatever the verdict: the
+        sequence is authority-net-zero (I9).
+        """
+        recovery = self._recovery_leg
+        if recovery is None or recovery.unit_id != leg.unit_id:
+            return  # pragma: no cover - a verification leg without its composite
+        self._leg = None  # the verification leg is finished; the composite continues
+        recovery.verify_outcome = outcome
+        if outcome.verdict == PROBE_PASS:
+            recovery.final_verdict = RECOVERY_RECOVERED
+            recovery.final_rung = RUNG_VERIFIED
+            recovery.final_tier = TIER_RESOLVED
+        elif (outcome.verdict or "").startswith("fail"):
+            recovery.final_verdict = RECOVERY_FAILED_NO_EFFECT
+            recovery.final_rung = RUNG_VERIFICATION_FAILED
+            recovery.final_tier = TIER_ALERT
+        else:
+            recovery.final_verdict = RECOVERY_RECOVERED_UNPROVEN
+            recovery.final_rung = RUNG_VERIFICATION_INCONCLUSIVE
+            recovery.final_tier = TIER_ALERT
+            recovery.final_reason = outcome.verdict or REASON_VERIFICATION_INCONCLUSIVE
+        recovery.verify_reason_codes = reason_codes
+        recovery.advance("disarm_after", float(self._clock.monotonic()))
+
+    # --- Stage R: recovery (§7) ----------------------------------------------------
+
+    def _recovery_posture(self, unit_id: str) -> str:
+        """The unit's EFFECTIVE posture: advise, or auto minus A6's degrade."""
+        if (
+            self._settings.recovery_mode == "auto"
+            and unit_id not in self._receipts_missing
+        ):
+            return "auto"
+        return "advise"
+
+    def _recovery_eligible(self, unit_id: str) -> bool:
+        """§7.1's conjunction, deliberately conservative.
+
+        Census ``stuck_suspected`` AND that unit's probe ``fail_no_response``
+        — the vendor's own two-condition rule made structural.  A probe
+        failure without a census flag, a census flag without the probe
+        failure, a skipped or inconclusive probe: all NOT eligible (the
+        evidence is incomplete, and an incomplete case never mints a mode
+        write).  Per I10, no ladder state is consulted at all.
+        """
+        census = self._census.get(unit_id)
+        probe = self._probe.get(unit_id)
+        return (
+            census is not None
+            and census.verdict == CENSUS_STUCK
+            and probe is not None
+            and probe.verdict == PROBE_FAIL_NO_RESPONSE
+        )
+
+    async def _advance_recovery(self, wall: datetime) -> None:
+        """The recovery phase: record every unit's honest outcome, cycle the
+        eligible ones strictly sequentially (§7.2)."""
+        settings = self._settings
+        now_mono = float(self._clock.monotonic())
+        for unit_id in sorted(settings.unit_ids):
+            if unit_id in self._recovery:
+                continue
+            census = self._census.get(unit_id)
+            probe = self._probe.get(unit_id)
+            if census is None or probe is None:
+                continue
+            eligible = self._recovery_eligible(unit_id)
+            posture = self._recovery_posture(unit_id)
+            if not eligible:
+                # I11: never silence — the basis rides the row, verdict null
+                # (the §10 projection's own "not eligible" shape).
+                await self._record_recovery_outcome(
+                    wall,
+                    unit_id,
+                    _RecoveryOutcome(verdict=None, posture=posture),
+                )
+            elif posture == "advise":
+                # §7.2's advise posture: a REAL posture, not a stub — the
+                # ALERT-tier advisory naming the exact operator sequence, and
+                # what the operator does through the standing surfaces is the
+                # night's recovery evidence.  Steps 2-6 do not run.
+                await self._record_recovery_outcome(
+                    wall,
+                    unit_id,
+                    _RecoveryOutcome(
+                        verdict=RECOVERY_ADVISED,
+                        tier=TIER_ALERT,
+                        posture=posture,
+                        reason=ADVISE_WALKTHROUGH,
+                    ),
+                )
+            elif (
+                self._recovery_facts.get(unit_id, _RecoveryFacts()).consecutive_fails
+                >= settings.recovery.consecutive_fail_limit
+            ):
+                # §7.3: the cap's stand-down — advisory-only for this unit
+                # until the operator acknowledgement resets it (the streak
+                # resets when the unit's own evidence clears: a night whose
+                # outcome row is not a counted failure, the probe-pass morning
+                # included).
+                await self._record_recovery_outcome(
+                    wall,
+                    unit_id,
+                    _RecoveryOutcome(
+                        verdict=RECOVERY_ADVISORY_ONLY,
+                        tier=TIER_ALERT,
+                        posture=posture,
+                        reason="consecutive_fail_limit reached — advisory-only until acknowledged",
+                    ),
+                )
+            else:
+                # I1's structural shape: a unit joins the night's cycle order
+                # exactly once — while its composite is in flight (and after
+                # it ends) the guard above plus this membership check keep a
+                # second leg from ever being queued.
+                if unit_id not in self._recovery_order:
+                    self._recovery_order += (unit_id,)
+        if self._recovery_leg is None:
+            if self._recovery_index >= len(self._recovery_order):
+                self._phase = "done"
+                return
+            unit_id = self._recovery_order[self._recovery_index]
+            leg = _RecoveryLeg(unit_id=unit_id)
+            leg.step_started_mono = now_mono
+            self._recovery_leg = leg
+            return
+        local = wall.astimezone(self._zone)
+        await self._advance_recovery_leg(wall, self._recovery_leg, now_mono, local)
+
+    async def _advance_recovery_leg(
+        self, wall: datetime, leg: _RecoveryLeg, now_mono: float, local: datetime
+    ) -> None:
+        """One bounded step of the §7.2 composite (the auto posture)."""
+        unit_id = leg.unit_id
+        # I7: the emergency stop is supreme over the program — a latched stop
+        # naming the unit ends the sequence with NO further write, whatever
+        # the step; an in-flight lease follows the standing expiry rules.
+        if unit_id in self._latched_view():
+            await self._finish_recovery(
+                wall,
+                leg,
+                verdict=f"skipped:{SKIP_LATCHED_STOP}",
+                tier=TIER_ALERT,
+                reason_codes=("emergency_stop", "no_further_program_write"),
+                rung=None,
+            )
+            return
+        if leg.step == "reverify":
+            reason = await self._recovery_skip_reason(unit_id, now_mono)
+            if reason is not None:
+                alert = reason in {SKIP_FOREIGN_STANDBY, SKIP_VENDOR_MODE}
+                await self._finish_recovery(
+                    wall,
+                    leg,
+                    verdict=f"skipped:{reason}",
+                    tier=TIER_ALERT if alert else TIER_NOTICE,
+                    reason_codes=(reason,),
+                )
+                return
+            if self._past_deadline(local):
+                await self._finish_recovery(
+                    wall,
+                    leg,
+                    verdict=f"skipped:{SKIP_DEADLINE_PASSED}",
+                    tier=TIER_NOTICE,
+                    reason_codes=(SKIP_DEADLINE_PASSED,),
+                )
+                return
+            leg.advance("disarm", now_mono)
+            return
+        if leg.step == "disarm":
+            # §7.2 step 2: the standing facade disarm under the health
+            # principal — a stop-direction act (the emergency-stop family,
+            # fail-safe by construction) so PARK'S CONFLICT GUARD NEVER NEEDS
+            # WEAKENING.
+            outcome = await self._disarm_unit(unit_id=unit_id)
+            if outcome.get("status") != "disarmed":
+                # No cycle was attempted (the park never ran) — a guard-class
+                # skip, never a battery failure and never a counted outcome.
+                await self._finish_recovery(
+                    wall,
+                    leg,
+                    verdict=f"skipped:{SKIP_DISARM_REFUSED}",
+                    tier=TIER_NOTICE,
+                    reason_codes=(SKIP_DISARM_REFUSED, str(outcome.get("reason", ""))),
+                )
+                return
+            leg.advance("park", now_mono)
+            return
+        if leg.step == "park":
+            leg.write_attempted = True
+            control = self._park_control
+            assert control is not None  # the construction guard is the call site's
+            try:
+                result = await control.park(
+                    unit_id,
+                    reason=(
+                        "nightly health-watch recovery (census flag + probe no-response)"
+                    ),
+                    principal_subject=HEALTH_ADVISER_PRINCIPAL,
+                    request_id=f"health-recovery:{unit_id}:{self._night}",
+                    lease_s=self._settings.recovery.hold_s + 60,
+                )
+            except ParkingRefusal as refusal:
+                handled = await self._recovery_park_refusal(wall, leg, refusal)
+                if handled:
+                    return
+                leg.advance("park", now_mono)  # rung 2's ONE re-issue
+                return
+            except ValueError:
+                # lease_s outside the parking block's commissioned bounds.
+                await self._finish_recovery(
+                    wall,
+                    leg,
+                    verdict=f"skipped:{SKIP_LEASE_BOUNDS}",
+                    tier=TIER_NOTICE,
+                    reason_codes=(SKIP_LEASE_BOUNDS,),
+                )
+                return
+            leg.park_result = self._cycle_excerpt(result)
+            leg.advance("hold", now_mono)
+            return
+        if leg.step == "hold":
+            # §7.2 step 4: the hold is bounded policy, NEVER safety — comms,
+            # telemetry and SoC stay alive (live-proven), and if comms die the
+            # STANDING rules own it (the lease expires alarm-only, no write).
+            if now_mono - leg.step_started_mono >= float(self._settings.recovery.hold_s):
+                leg.advance("resume", now_mono)
+            return
+        if leg.step == "resume":
+            control = self._park_control
+            assert control is not None  # the construction guard is the call site's
+            try:
+                result = await control.resume(
+                    unit_id,
+                    principal_subject=HEALTH_ADVISER_PRINCIPAL,
+                    request_id=f"health-recovery:{unit_id}:{self._night}",
+                )
+            except ParkingRefusal as refusal:
+                handled = await self._recovery_resume_refusal(wall, leg, refusal)
+                if handled:
+                    return
+                leg.advance("resume", now_mono)  # rung 2's ONE re-issue
+                return
+            leg.resume_result = self._cycle_excerpt(result)
+            leg.advance("rearm", now_mono)
+            return
+        if leg.step == "rearm":
+            # §7.2 step 6 / §7.4: the ONE bounded verification re-arm — the
+            # only automation arm authority this controller ever composes
+            # (panel ruling 1).  The verification act must START before the
+            # deadline (A1); a refused re-arm (a foreign objective during the
+            # park makes the next arm the operator's takeover acknowledgement,
+            # a latched stop names the unit) is A2's honest terminal.
+            if self._past_deadline(local):
+                await self._finish_recovery(
+                    wall,
+                    leg,
+                    verdict=RECOVERY_RECOVERED_UNPROVEN,
+                    tier=TIER_ALERT,
+                    reason_codes=(REASON_DEADLINE_PASSED_VERIFICATION,),
+                    rung=RUNG_VERIFICATION_INCONCLUSIVE,
+                    reason=REASON_DEADLINE_PASSED_VERIFICATION,
+                )
+                return
+            outcome = await self._arm_unit(unit_id=unit_id)
+            if outcome.get("status") != "armed":
+                leg.rearm_reason = str(outcome.get("reason", "refused"))
+                await self._finish_recovery(
+                    wall,
+                    leg,
+                    verdict=RECOVERY_RECOVERED_UNPROVEN,
+                    tier=TIER_ALERT,
+                    reason_codes=(SKIP_REARM_REFUSED, leg.rearm_reason),
+                    rung=RUNG_REARM_REFUSED,
+                    reason=leg.rearm_reason,
+                )
+                return
+            leg.advance("verify", now_mono)
+            return
+        if leg.step == "verify":
+            await self._advance_verify(wall, leg, now_mono)
+            return
+        if leg.step == "disarm_after":
+            # The composite's last step whatever the verdict: authority-net-
+            # zero (I9) — the unit ends disarmed-and-Normal, or the program
+            # alerts that it could not (a refusal never re-attempts).
+            outcome = await self._disarm_unit(unit_id=unit_id)
+            left_armed = outcome.get("status") != "disarmed"
+            await self._finish_recovery(
+                wall,
+                leg,
+                verdict=leg.final_verdict or RECOVERY_RECOVERED_UNPROVEN,
+                tier=leg.final_tier,
+                reason_codes=tuple(leg.verify_reason_codes or ()),
+                rung=leg.final_rung,
+                reason=leg.final_reason,
+                left_armed=left_armed,
+            )
+            return
+
+    async def _advance_verify(self, wall: datetime, leg: _RecoveryLeg, now_mono: float) -> None:
+        """§7.2 step 6: the §6 leg re-run, unchanged, on the same unit.
+
+        The re-run rides the SAME leg machinery (``_advance_leg`` and its
+        seven steps, its renew/cancel discipline, its preemption classes) with
+        the ``verification`` flag set: identical judgment, a different
+        destination for the verdict (``_finish_leg`` routes it to the
+        recovery outcome instead of a second ``health_probe_completed`` row).
+        """
+        if leg.verify is None:
+            # The §6.1 gate walk for the re-run: a guard refusal is an
+            # inconclusive VERIFICATION (A2 — the cycle plausibly worked, the
+            # proof is missing), never a failure of the battery.
+            reason = await self._probe_gate_skip(leg.unit_id, now_mono)
+            if reason is not None:
+                leg.final_verdict = RECOVERY_RECOVERED_UNPROVEN
+                leg.final_rung = RUNG_VERIFICATION_INCONCLUSIVE
+                leg.final_tier = TIER_ALERT
+                leg.final_reason = reason
+                leg.verify_reason_codes = (reason,)
+                leg.advance("disarm_after", now_mono)
+                return
+            verify = _ProbeLeg(unit_id=leg.unit_id, verification=True)
+            verify.started_mono = now_mono
+            verify.step_started_mono = now_mono
+            latest = await self._observations.all_latest()
+            quiet, import_w = self._quiet_gate(latest)
+            verify.start_import_w = import_w if quiet else None
+            leg.verify = verify
+            # The probe machinery advances ``self._leg``; the recovery leg
+            # holds its own reference and the phase machine never touches
+            # ``self._probe_order`` from here (a verification leg finishes
+            # into the recovery outcome, not the probe sequence).
+            self._leg = verify
+            return
+        await self._advance_leg(wall, now_mono)
+
+    async def _recovery_park_refusal(
+        self, wall: datetime, leg: _RecoveryLeg, refusal: ParkingRefusal
+    ) -> bool:
+        """Map one refused PARK onto §8's ladder; True when the leg ended."""
+        if refusal.code == PARK_WRITE_FAILED:
+            if not leg.reissued:
+                # Rung 2: on a clean transport refusal the actor has already
+                # reconnected (its own automatic resync); ONE re-issue of the
+                # write.  A second refusal ends the night's attempt below.
+                leg.reissued = True
+                return False
+            await self._finish_recovery(
+                wall,
+                leg,
+                verdict=RECOVERY_FAILED_WRITE,
+                tier=TIER_ALERT,
+                reason_codes=("write_failed", "transport_resync_reissued_once"),
+                rung=RUNG_RESYNC_EXHAUSTED,
+                reason=refusal.message,
+            )
+            return True
+        if refusal.code == PARK_READBACK_UNVERIFIED:
+            # Rung 3: ACKed-but-unverified — no re-issue, no second attempt
+            # (I3): the word state is unknown and the program writes nothing
+            # further that night.
+            await self._finish_recovery(
+                wall,
+                leg,
+                verdict=RECOVERY_WRITE_UNVERIFIED,
+                tier=TIER_ALERT,
+                reason_codes=("readback_unverified", "no_further_write_tonight"),
+                rung=RUNG_ACKED_UNVERIFIED,
+                reason=refusal.message,
+            )
+            return True
+        skip = {
+            PARK_CONFLICT_REFUSED: SKIP_PARK_CONFLICT,
+            PARK_ALREADY_PARKED: SKIP_OPEN_LEASE,
+            PARK_MODE_OUT_OF_SCOPE: SKIP_VENDOR_MODE,
+            PARK_FOREIGN_WORD_ACKNOWLEDGEMENT_REQUIRED: SKIP_FOREIGN_STANDBY,
+        }.get(refusal.code, "park_refused")
+        await self._finish_recovery(
+            wall,
+            leg,
+            verdict=f"skipped:{skip}",
+            tier=TIER_ALERT if skip in {SKIP_VENDOR_MODE, SKIP_FOREIGN_STANDBY} else TIER_NOTICE,
+            reason_codes=(skip,),
+        )
+        return True
+
+    async def _recovery_resume_refusal(
+        self, wall: datetime, leg: _RecoveryLeg, refusal: ParkingRefusal
+    ) -> bool:
+        """Map one refused RESUME onto §8's ladder; True when the leg ended."""
+        if refusal.code == PARK_WRITE_FAILED:
+            if not leg.reissued:
+                leg.reissued = True
+                return False
+            await self._finish_recovery(
+                wall,
+                leg,
+                verdict=RECOVERY_FAILED_WRITE,
+                tier=TIER_ALERT,
+                reason_codes=("write_failed", "transport_resync_reissued_once"),
+                rung=RUNG_RESYNC_EXHAUSTED,
+                reason=refusal.message,
+            )
+            return True
+        if refusal.code == PARK_READBACK_UNVERIFIED:
+            # Rung 3 on the exit write: parking itself holds the lease in the
+            # terminal write_unverified posture (parked stays true, ours stays
+            # ours); the program writes nothing further that night.
+            await self._finish_recovery(
+                wall,
+                leg,
+                verdict=RECOVERY_WRITE_UNVERIFIED,
+                tier=TIER_ALERT,
+                reason_codes=("readback_unverified", "no_further_write_tonight"),
+                rung=RUNG_ACKED_UNVERIFIED,
+                reason=refusal.message,
+            )
+            return True
+        if refusal.code == RESUME_STOP_LATCHED:
+            # A latched stop landed mid-cycle: no further write (I7); the
+            # open lease follows the standing expiry rules and the operator's
+            # resume-with-acknowledgement is the named exit.
+            await self._finish_recovery(
+                wall,
+                leg,
+                verdict=f"skipped:{SKIP_LATCHED_STOP}",
+                tier=TIER_ALERT,
+                reason_codes=("emergency_stop", "lease_follows_standing_rules"),
+            )
+            return True
+        skip = {
+            PARK_MODE_OUT_OF_SCOPE: SKIP_VENDOR_MODE,
+            PARK_FOREIGN_WORD_ACKNOWLEDGEMENT_REQUIRED: SKIP_FOREIGN_STANDBY,
+        }.get(refusal.code, SKIP_RESUME_REFUSED)
+        # A cycle already ran (the park write landed): every exit here is the
+        # operator's morning, so every one carries the alert tier.
+        await self._finish_recovery(
+            wall,
+            leg,
+            verdict=f"skipped:{skip}",
+            tier=TIER_ALERT,
+            reason_codes=(skip,),
+        )
+        return True
+
+    async def _recovery_skip_reason(self, unit_id: str, now_mono: float) -> str | None:
+        """§7.2 step 1's re-verify walk — every guard re-checked inside the
+        standing locks, one honest reason per unit."""
+        latest = await self._observations.all_latest()
+        observation = latest.get(unit_id)
+        health = await self._health_states()
+        parked = self._parked_view()
+        active = await self._intents.active(now_mono)
+        word = _word(getattr(observation, "debug_mode_w", None))
+        if parked or word == 1:
+            if word == 1 and unit_id not in parked:
+                # A standby word of 1 that is not ours: the operator's
+                # takeover resume is the only exit, forever (§7.2 step 1).
+                return SKIP_FOREIGN_STANDBY
+            return SKIP_OPEN_LEASE
+        if word is not None and word in {2, 3, 4, 5, 6}:
+            return SKIP_VENDOR_MODE
+        state = getattr(health.get(unit_id), "state", None)
+        state_word = _enum_text(state) if state is not None else ""
+        if state_word == "unreachable":
+            return SKIP_UNREACHABLE
+        if state_word == "not_responding":
+            return SKIP_NOT_RESPONDING
+        if state_word == "foreign_writer":
+            return SKIP_FOREIGN_WRITER
+        if state_word in {"inhibited", "actuation_incoherent"}:
+            return SKIP_INHIBITED
+        captured = _finite(getattr(observation, "captured_at_mono", None))
+        if observation is None or captured is None or (
+            now_mono - captured > float(self._policy.max_telemetry_age_s)
+        ):
+            return SKIP_TELEMETRY_STALE
+        if unit_id in self._claiming_units(active, exclude_prefix=_OWN_INTENT_PREFIX):
+            return SKIP_UNDER_INTENT
+        return None
+
+    async def _probe_gate_skip(self, unit_id: str, now_mono: float) -> str | None:
+        """The §6.1 gate walk (the verification re-run's own start gate)."""
+        latest = await self._observations.all_latest()
+        active = await self._intents.active(now_mono)
+        health = await self._health_states()
+        parked = self._parked_view()
+        stopped = self._latched_view()
+        quiet, _ = self._quiet_gate(latest)
+        return self._probe_skip_reason(
+            unit_id,
+            latest.get(unit_id),
+            active=active,
+            health_view=health.get(unit_id),
+            parked=unit_id in parked,
+            stopped=unit_id in stopped,
+            quiet_ok=quiet is True,
+            quiet_stale=quiet is None,
+            now_mono=now_mono,
+        )
+
+    def _cycle_excerpt(self, result: Mapping[str, Any]) -> dict[str, Any]:
+        """The row's cycle evidence: the write/readback words and times (the
+        Be-Connect pattern — the operator acts without opening a log)."""
+        raw_lease = result.get("lease")
+        lease: Mapping[str, Any] = raw_lease if isinstance(raw_lease, Mapping) else {}
+        return {
+            "prior_word": result.get("prior_word"),
+            "written_value": result.get("written_value"),
+            "readback_word": result.get("readback_word"),
+            "verified": result.get("verified"),
+            "origin": result.get("origin"),
+            "lease_epoch": lease.get("epoch"),
+            "lease_s": lease.get("max_total_s"),
+            "checklist": result.get("checklist"),
+        }
+
+    async def _disarm_unit(self, *, unit_id: str) -> Mapping[str, Any]:
+        port = self._disarm_port
+        assert port is not None  # the construction guard is the call site's
+        with contextlib.suppress(Exception):
+            return await port(unit_id=unit_id)
+        return {"status": "refused", "reason": "disarm_port_unavailable"}
+
+    async def _arm_unit(self, *, unit_id: str) -> Mapping[str, Any]:
+        port = self._arm_port
+        assert port is not None  # the construction guard is the call site's
+        with contextlib.suppress(Exception):
+            return await port(unit_id=unit_id)
+        return {"status": "refused", "reason": "arm_port_unavailable"}
+
+    async def _finish_recovery(
+        self,
+        wall: datetime,
+        leg: _RecoveryLeg,
+        *,
+        verdict: str,
+        tier: str,
+        reason_codes: tuple[str, ...],
+        rung: str | None = None,
+        reason: str | None = None,
+        left_armed: bool = False,
+    ) -> None:
+        """Record the §10 outcome row/event and retire the unit's night (I1:
+        this is the ONLY exit — no step of the composite ever loops back)."""
+        posture = self._recovery_posture(leg.unit_id)
+        facts = self._recovery_facts.get(leg.unit_id, _RecoveryFacts())
+        counted = verdict in _RECOVERY_COUNTED_FAILS
+        outcome = _RecoveryOutcome(
+            verdict=verdict,
+            tier=tier,
+            posture=posture,
+            reason=reason,
+            rung=rung,
+            codes=tuple(reason_codes) or (verdict or "not_eligible",),
+            cycle={
+                "hold_s": self._settings.recovery.hold_s,
+                "reissued": leg.reissued,
+                "park": leg.park_result,
+                "resume": leg.resume_result,
+            },
+            verification=self._verification_payload(leg.verify_outcome),
+            left_armed=left_armed,
+            attempts_total=facts.attempts_total + (1 if verdict in _RECOVERY_ATTEMPTED else 0),
+            consecutive_fails=facts.consecutive_fails + (1 if counted else 0),
+        )
+        await self._record_recovery_outcome(wall, leg.unit_id, outcome)
+        self._recovery_index += 1
+        self._recovery_leg = None
+
+    @staticmethod
+    def _verification_payload(outcome: _ProbeOutcome | None) -> dict[str, Any] | None:
+        if outcome is None:
+            return None
+        return {
+            "verdict": outcome.verdict,
+            "probe_w": outcome.probe_w,
+            "core_samples": outcome.core_samples,
+            "qualifying_samples": outcome.qualifying_samples,
+            "echo": outcome.echo,
+            "returned_to_baseline": outcome.returned_to_baseline,
+            "final_w": outcome.final_w,
+        }
+
+    async def _record_recovery_outcome(
+        self, wall: datetime, unit_id: str, outcome: _RecoveryOutcome
+    ) -> None:
+        """§10's ``health_recovery_outcome`` row + §11's ``health.recovery``
+        event (alert tier on every outcome except ``recovered``, which is the
+        resolved tier)."""
+        self._recovery[unit_id] = outcome
+        night = (self._night or wall.date()).isoformat()
+        census = self._census.get(unit_id)
+        probe = self._probe.get(unit_id)
+        payload: dict[str, Any] = {
+            "night": night,
+            "verdict": outcome.verdict,
+            "tier": outcome.tier,
+            "posture": outcome.posture,
+            "eligibility": {
+                "census": None if census is None else census.verdict,
+                "probe": None if probe is None else probe.verdict,
+                "eligible": self._recovery_eligible(unit_id),
+            },
+            "reason": outcome.reason,
+            "rung": outcome.rung,
+            "cycle": outcome.cycle,
+            "verification": outcome.verification,
+            "left_armed": outcome.left_armed,
+            "attempts_total": outcome.attempts_total,
+            "consecutive_fails": outcome.consecutive_fails,
+            "consecutive_fail_limit": self._settings.recovery.consecutive_fail_limit,
+            "hold_s": self._settings.recovery.hold_s,
+            "bmu_cross_check": BMU_CROSS_CHECK_NOTE,
+            "as_of": wall.astimezone(UTC).isoformat(),
+        }
+        if outcome.tier == TIER_ALERT:
+            # §11: the advisory rides the alert row verbatim, and the advise
+            # posture names the exact operator sequence.
+            payload["advisory"] = RESTART_ADVISORY
+            if outcome.verdict == RECOVERY_ADVISED:
+                payload["walkthrough"] = ADVISE_WALKTHROUGH
+        await self._append_row(
+            self._health_row(
+                event_type="health_recovery_outcome",
+                unit_id=unit_id,
+                reason_codes=outcome.codes,
+                result="recorded",
+                payload=payload,
+            )
+        )
+        await self._publish("health.recovery", payload | {"unit_id": unit_id})
+        # A11's figures refresh as the night's outcomes land.
+        with contextlib.suppress(Exception):
+            self._recovery_facts = await self._derive_recovery_facts(self._night or wall.date())
+
+    async def _derive_recovery_facts(self, night: date) -> dict[str, _RecoveryFacts]:
+        """A11's morning figures per unit, from the durable outcome rows.
+
+        ``attempts_total`` counts every attempted cycle (bounded by the audit
+        window — an evicted window undercounts, the honest direction).  The
+        consecutive-fail streak walks the outcome rows newest-first and stops
+        at the first night whose outcome is NOT a counted failure — so a
+        probe-pass morning (verdict null: not eligible) breaks the streak,
+        which is the operator's evidence-driven reset of §7.3's stand-down.
+        Two verdict classes are TRANSPARENT (they neither extend nor reset):
+        nights with no row at all (a deferred or interrupted night), and the
+        ``advised``/``advisory_only`` rows — the cap's own stand-down and the
+        advise posture's advisory are not cycles and must never erode the
+        streak they guard, or the cap could never bind across them.
+        """
+        rows = await self._recent_health_rows()
+        outcomes: dict[str, dict[date, str]] = {}
+        for row in rows:
+            if getattr(row, "event_type", "") != "health_recovery_outcome":
+                continue
+            payload = getattr(row, "payload", None)
+            if not isinstance(payload, Mapping):
+                continue
+            row_night = payload.get("night")
+            unit_id = getattr(row, "unit_id", None)
+            verdict = payload.get("verdict")
+            if not isinstance(row_night, str) or not isinstance(unit_id, str):
+                continue
+            if isinstance(verdict, str) and verdict in {RECOVERY_ADVISED, RECOVERY_ADVISORY_ONLY}:
+                continue  # transparent: not a cycle, never a reset
+            if not isinstance(verdict, str):
+                verdict = ""
+            try:
+                night_date = date.fromisoformat(row_night)
+            except ValueError:
+                continue
+            # A null-verdict row participates as "" — a night the program ran
+            # and the unit was NOT eligible (healthy): it breaks the streak.
+            outcomes.setdefault(unit_id, {})[night_date] = verdict
+        trailing_from = night - timedelta(days=_RECOVERY_TRAILING_NIGHTS - 1)
+        facts: dict[str, _RecoveryFacts] = {}
+        for unit_id, by_night in outcomes.items():
+            streak = 0
+            for night_date in sorted(by_night, reverse=True):
+                if by_night[night_date] in _RECOVERY_COUNTED_FAILS:
+                    streak += 1
+                else:
+                    break
+            window = [by_night[d] for d in sorted(by_night) if d >= trailing_from]
+            facts[unit_id] = _RecoveryFacts(
+                attempts_total=sum(1 for v in by_night.values() if v in _RECOVERY_ATTEMPTED),
+                consecutive_fails=streak,
+                trailing_attempted=sum(1 for v in window if v in _RECOVERY_ATTEMPTED),
+                trailing_recovered=sum(1 for v in window if v == RECOVERY_RECOVERED),
+            )
+        return facts
 
     # --- durable-row derivations (§4/A4/I8) --------------------------------------
 
@@ -1280,8 +2269,16 @@ class HealthWatchController:
         units: set[str] = set()
         censored: set[str] = set()
         last_stage_rows: set[str] = set()
-        last_stage = "probe" if "probe" in self._settings.stages else "census"
-        last_event = "health_probe_completed" if last_stage == "probe" else "health_census_recorded"
+        last_stage = next(
+            stage
+            for stage in ("recovery", "probe", "census")
+            if stage in self._settings.stages
+        )
+        last_event = {
+            "recovery": "health_recovery_outcome",
+            "probe": "health_probe_completed",
+            "census": "health_census_recorded",
+        }[last_stage]
         for row in rows:
             payload = getattr(row, "payload", None)
             if not isinstance(payload, Mapping):
@@ -1351,12 +2348,13 @@ class HealthWatchController:
         return ()
 
     async def _record_interrupted(self, wall: datetime, units: Sequence[str]) -> None:
-        """A4's C/P shape: the interrupted program alert, naming unit states.
+        """A4's shape: the interrupted program alert, naming unit states.
 
         The night is retired (rows exist); the alert names the state each
-        interrupted unit was actually left in — for Stages C/P that is the
-        honest telemetry state (arm, mode word, parked), because this wave
-        writes no mode register and never disarms.
+        interrupted unit was actually left in — the honest telemetry state
+        (arm, mode word, parked), which for an interrupted Stage R composite
+        is exactly the crash-after-re-arm shape A4 names: armed, normal, no
+        lease, silently night-charging without this alert.
         """
         latest = await self._observations.all_latest()
         parked = self._parked_view()
@@ -1592,26 +2590,39 @@ class HealthWatchController:
             # The uncommissioned honesty (§10): a site without R never sees
             # "recovery" offered as if it could run.
             return {"mode": "uncommissioned"}
-        mode = self._settings.recovery_mode
-        if mode == "auto" and unit_id in self._receipts_missing:
+        effective_mode = self._recovery_posture(unit_id)
+        facts = self._recovery_facts.get(unit_id, _RecoveryFacts())
+        outcome = self._recovery.get(unit_id)
+        payload: dict[str, Any] = {
+            "mode": effective_mode,
+            "verdict": None if outcome is None else outcome.verdict,
+            "tier": None if outcome is None else outcome.tier,
+            "posture": None if outcome is None else outcome.posture,
+            "rung": None if outcome is None else outcome.rung,
+            "reason": None if outcome is None else outcome.reason,
+            "left_armed": bool(outcome is not None and outcome.left_armed),
+            "attempts_total": facts.attempts_total,
+            "consecutive_fails": facts.consecutive_fails,
+            "consecutive_fail_limit": self._settings.recovery.consecutive_fail_limit,
+            # A11: the trailing-30-night figures so the chronic case (a unit
+            # that NEEDS the cycle most nights) is visible in the daily read.
+            "trailing_30_nights": {
+                "attempted": facts.trailing_attempted,
+                "recovered": facts.trailing_recovered,
+                "attempt_rate": round(facts.trailing_attempted / _RECOVERY_TRAILING_NIGHTS, 4),
+            },
+        }
+        if self._settings.recovery_mode == "auto" and unit_id in self._receipts_missing:
             # A6's boot degradation, loud: the receipt file is gone, so the
             # unit runs advise until the operator restores it.
-            return {
-                "mode": "advise",
-                "verdict": None,
-                "attempts_total": 0,
-                "consecutive_fails": 0,
-                "note": "auto receipt missing at boot — degraded to advise",
-            }
-        return {
-            "mode": mode,
-            "verdict": None,
-            "attempts_total": 0,
-            "consecutive_fails": 0,
-        }
+            payload["configured_mode"] = "auto"
+            payload["note"] = "auto receipt missing at boot — degraded to advise"
+        return payload
 
 
 __all__ = [
+    "ADVISE_WALKTHROUGH",
+    "BMU_CROSS_CHECK_NOTE",
     "CENSUS_DEGRADED",
     "CENSUS_NOMINAL",
     "CENSUS_STUCK",
@@ -1630,17 +2641,35 @@ __all__ = [
     "PROBE_INCONCLUSIVE_ECHO",
     "PROBE_INCONCLUSIVE_PREEMPTED",
     "PROBE_PASS",
+    "RECOVERY_ADVISED",
+    "RECOVERY_ADVISORY_ONLY",
+    "RECOVERY_FAILED_NO_EFFECT",
+    "RECOVERY_FAILED_WRITE",
+    "RECOVERY_RECOVERED",
+    "RECOVERY_RECOVERED_UNPROVEN",
+    "RECOVERY_WRITE_UNVERIFIED",
+    "RESTART_ADVISORY",
+    "RUNG_ACKED_UNVERIFIED",
+    "RUNG_REARM_REFUSED",
+    "RUNG_RESYNC_EXHAUSTED",
+    "RUNG_VERIFICATION_FAILED",
+    "RUNG_VERIFICATION_INCONCLUSIVE",
+    "RUNG_VERIFIED",
+    "SKIP_FOREIGN_STANDBY",
     "TIER_ALERT",
     "TIER_NOTICE",
+    "TIER_RESOLVED",
     "HealthWatchController",
     "HealthWatchRefusal",
     "HealthWatchSettings",
     "ProbeSettings",
+    "RecoverySettings",
     "StuckSettings",
     "census_tier",
     "census_verdict",
     "measured_class",
     "probe_tier",
     "probe_verdict",
+    "recovery_tier",
     "stuck_predicates",
 ]

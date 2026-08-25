@@ -924,16 +924,24 @@ pvoutput:
 # mode (high reported SoC, no actuation, dead load CT on rhs).
 #
 # COMMISSIONING SEQUENCING (the contract's OWN section 16, unskippable):
-# this wave lands CONFIG REVISION TWO — steps 2 and 3, `stages:
-# ["census", "probe"]` — as ONE entry in this file because this release
-# cut ships both stages' code together (the §16 census-first / probe-second
-# ORDER is preserved by the strict-prefix rule: the next revision may only
-# widen to recovery).  Wave 0 (§3, the deadband and delivery-judged
-# coherence) already shipped as the same-cut prerequisite (A13).  The
-# units must be ARMED at 23:00 for probes to run — the program NEVER arms
-# (a disarmed unit is an honest `unit_disarmed` skip).  Recovery (§7)
-# stays OUT until the §16 steps 4-6 (advise posture, the per-unit
-# supervised live verification receipts, then `auto` + `auto_receipts`).
+# revisions one and two (census, then probe) are behind us.  This wave —
+# the recovery CODE — lands CONFIG REVISION THREE, §16 step 4
+# (RECOVERY-ADVISE): `stages: ["census", "probe", "recovery"]` with
+# `recovery.mode: advise`, "the standing posture".  Advise writes NOTHING,
+# ever: on a flagged night the program renders the ALERT-tier advisory
+# naming the exact operator sequence (disarm -> park -> resume -> re-arm ->
+# verify) through the standing surfaces, records what the operator did as
+# the night's recovery evidence, and that is ALL it does — this step is
+# where the operator calibrates their own trust in the census/probe
+# conjunction.  `auto` stays two deliberate steps away: the per-unit
+# supervised live verification (§16 step 5, whose evidence file becomes the
+# `auto_receipts` receipt) and then config revision four with
+# `mode: auto` + the receipts map (A6 — validation refuses the revision
+# without it, which is what makes the sequence unskippable in one edit).
+# Wave 0 (§3, the deadband and delivery-judged coherence) shipped as the
+# same-cut prerequisite (A13).  The units must be ARMED at 23:00 for probes
+# to run — the program never arms outside the ONE bounded verification
+# re-arm inside an `auto` cycle (§7.4).
 #
 # BLOCK PRESENCE: a PRESENT block composes the HealthWatchController (one
 # tick per fleet cycle inside the existing supervision pass — no new task
@@ -948,12 +956,14 @@ pvoutput:
 # and the standing observation stream only).  The probe is ONE bounded
 # 300 W discharge intent per unit per night under `energypod:health-adviser`
 # — ordinary dispatch traffic judged by every standing guard; a guard
-# refusal is a SKIP, never a failure of the battery.  A probe verdict
-# NEVER triggers any write response: Stage R does not exist in this cut,
-# so `fail_no_response` records, alerts, and that is ALL it does.  One
-# honest side effect (A8): on a quiet house the probe's 300 W briefly
-# EXPORTS up to ~300 W for ~50 s — ~4 Wh, named so the export meter is
-# never a surprise.
+# refusal is a SKIP, never a failure of the battery.  The recovery stage in
+# the `advise` posture writes NOTHING either — its product is the advisory
+# and the record.  In a later `auto` revision (never this one) the cycle's
+# mode writes ride the ParkController's own {0, 1}-bound primitive under the
+# same health principal, one cycle per unit per civil night, ending
+# disarmed-and-Normal or alerting that it could not (I9).  One honest side
+# effect (A8): on a quiet house the probe's 300 W briefly EXPORTS up to
+# ~300 W for ~50 s — ~4 Wh, named so the export meter is never a surprise.
 #
 # THE WINDOW'S QUIET HOUR: [23:00, 23:45] must stay disjoint from the
 # night_charging window and every schedule allowed window (validated), the
@@ -974,7 +984,9 @@ battery_health_watch:
   timezone: "Australia/Brisbane"   # must equal site.timezone (A9: one truth)
   window_local: "23:00"            # program start, the idle hour
   deadline_local: "23:45"          # no-new-ACT boundary (A1); legs finish
-  stages: ["census", "probe"]      # strict prefix of [census, probe, recovery]
+  stages: ["census", "probe", "recovery"]  # strict prefix; §16 revision three
+                                   # (RECOVERY-ADVISE) — recovery staged in its
+                                   # standing advise posture, which writes nothing
   stuck:
     evidence_window_h: 6           # historian lookback (>= 1; 6 = min_soc_hours)
     soc_floor_pct: 95.0
@@ -1001,12 +1013,14 @@ battery_health_watch:
     load_move_w: 300               # mid-leg demand move -> inconclusive (A8)
     inter_unit_gap_s: 30           # >= 0
   recovery:
-    # RECOGNIZED but NOT commissioned by this wave: `stages` above must
-    # first widen to include recovery (its own later revision, with the
-    # parking block already present), and `auto` additionally requires
+    # STAGED in its standing advise posture (§16 revision three): writes
+    # nothing, ever — the advisory and the record are the whole stage until
+    # the §16 steps 5-6 (the per-unit supervised live verification, then
+    # `auto` + the receipts map).  `auto` additionally requires
     # auto_receipts naming EVERY fleet unit's supervised-verification
     # receipt or an explicit `excluded` (A6) — the config file itself
     # makes the §16 sequencing unskippable in one edit.
     mode: "advise"
-    hold_s: 90                     # [60, 120]
-    consecutive_fail_limit: 3
+    hold_s: 90                     # [60, 120]; the lease is hold_s + 60 s
+    consecutive_fail_limit: 3      # counted: failed_write, write_unverified,
+                                   #   failed_no_effect — NOT recovered_unproven

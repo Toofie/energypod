@@ -447,8 +447,13 @@ def test_there_is_no_enabled_key_and_no_runtime_toggle() -> None:
 
 
 def test_the_live_write_example_carries_the_commissioned_wave_two_block() -> None:
-    """§16 steps 2-3: the example file commissions ``[census, probe]`` — the
-    C/P wave's own end state, recovery deliberately OUT."""
+    """§16 revision three (RECOVERY-ADVISE): the example file commissions
+    ``[census, probe, recovery]`` with ``recovery.mode: advise`` — the
+    standing posture that writes nothing, ever.  ``auto`` stays two
+    deliberate steps away (the §16 step-5 supervised live verification,
+    then revision four with the A6 receipts map), so ``auto_receipts`` is
+    deliberately ABSENT: its presence would let one edit skip the
+    sequencing the config file itself enforces."""
     from pathlib import Path
 
     import yaml
@@ -459,9 +464,10 @@ def test_the_live_write_example_carries_the_commissioned_wave_two_block() -> Non
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     watch = payload.get("battery_health_watch")
     assert isinstance(watch, dict)
-    assert watch["stages"] == ["census", "probe"]
+    assert watch["stages"] == ["census", "probe", "recovery"]
     assert watch["recovery"]["mode"] == "advise"
     assert "auto_receipts" not in watch["recovery"]
+    assert "RECOVERY-ADVISE" in path.read_text(encoding="utf-8")
 
 
 def test_the_block_is_frozen() -> None:

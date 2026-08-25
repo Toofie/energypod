@@ -210,6 +210,14 @@ class SimulatedEnergyPod:
         # band, the dead pod, and the spike pattern all compose from it).
         self._scripted_stuck: tuple[str, float] | None = None
         self._stuck: tuple[str] | None = None
+        # Stage R's cycle legs (DESIGN_BATTERY_HEALTH_WATCH section 14): the
+        # release hook stages the wedge that a completed standby cycle heals
+        # (the ``recovered`` leg; the default keeps it wedged for
+        # ``failed_no_effect``), and the exit-wedge hook makes the resume
+        # readback refuse (the ``write_unverified`` ladder).
+        self._stuck_release_on_cycle = False
+        self._stuck_saw_standby = False
+        self._cycle_wedge = False
         # (fraction, polls remaining); ``_probe_delivery_active`` freezes the
         # share that governs the CURRENT poll interval, so words served and
         # post-poll reads agree at the budget boundary.
@@ -352,8 +360,30 @@ class SimulatedEnergyPod:
         section 0 -- vendor values 2-6 are permanently unexposed).  A direct
         application supersedes any pending scheduled transition and retires
         the parked-echo words: the device word is what was just written.
+
+        Two scenario-fork behaviors stage DESIGN_BATTERY_HEALTH_WATCH
+        section 14's cycle legs: the ``script_cycle_wedge`` hook makes a
+        RESUME write ACK while the word stays Standby (the exit readback
+        refusing -- the ``write_unverified`` ladder), and the
+        ``script_stuck_release_on_cycle`` hook releases the stuck signature
+        at the completed cycle's resume edge (the ``recovered`` leg; the
+        default keeps the wedge through the cycle for ``failed_no_effect``).
         """
-        self._debug_mode = _validated_debug_mode(value)
+        mode = _validated_debug_mode(value)
+        if self._cycle_wedge and mode == 0 and self._debug_mode == 1:
+            # ACK-then-refuse: the write is accepted on the wire and the
+            # device word stays Standby.  Nothing else moves.
+            return
+        if self._stuck is not None and self._stuck_release_on_cycle:
+            if mode == 1:
+                self._stuck_saw_standby = True
+            elif mode == 0 and self._stuck_saw_standby:
+                # The completed standby cycle released the wedge (the
+                # live-proven class): command-following returns with the word.
+                self._stuck = None
+                self._stuck_saw_standby = False
+                self._parked_readback_words = None
+        self._debug_mode = mode
         self._scripted_debug_mode = None
         self._parked_readback_words = None
         self._rebuild()
@@ -445,8 +475,47 @@ class SimulatedEnergyPod:
     def clear_scripted_stuck(self) -> None:
         """Scenario hook: the stuck script stands down; the pod serves again."""
         self._stuck = None
+        self._stuck_saw_standby = False
         self._parked_readback_words = None
         self._rebuild()
+
+    def script_stuck_release_on_cycle(self, enabled: bool = True) -> None:
+        """Scenario hook: Stage R's two cycle legs (section 14, the R half).
+
+        Armed (the recovering leg): a stuck pod that completes one standby
+        cycle -- debug word 0 -> 1 -> 0 through :meth:`apply_debug_mode` --
+        RELEASES the spectator signature at the resume edge and serves
+        command again, the live-proven ``command-following survives the
+        cycle`` class turned into the program's ``recovered`` verdict.  Dis-
+        armed (the default, the persistent leg): the wedge survives the cycle
+        -- the verification re-run fails ``fail_no_response`` again, the
+        ``failed_no_effect`` rung.  The stuck signature's own landing rules
+        are untouched; only its SURVIVAL past a completed cycle is staged.
+        """
+        if type(enabled) is not bool:
+            raise ValueError("enabled must be a boolean")
+        self._stuck_release_on_cycle = enabled
+        if not enabled:
+            self._stuck_saw_standby = False
+
+    def script_cycle_wedge(self, exit_fails: bool = True) -> None:
+        """Scenario hook: the exit readback refusing (section 14's cycle legs).
+
+        DESIGN_BATTERY_HEALTH_WATCH section 14: while wedged, a RESUME write
+        (value 0) is ACKed on the wire but the device word STAYS Standby --
+        the exit readback refuses -- so the actor's write->readback->verify
+        sequence exhausts its one retry and the ladder ends at
+        ``write_unverified`` end to end.  The wedge persists until cleared
+        (a real stuck word does not heal itself); the PARK direction (value
+        1) is untouched, and direct PQ writes keep their standing behavior.
+        """
+        if type(exit_fails) is not bool:
+            raise ValueError("exit_fails must be a boolean")
+        self._cycle_wedge = exit_fails
+
+    def clear_scripted_cycle_wedge(self) -> None:
+        """Scenario hook: the exit wedge stands down; resumes land again."""
+        self._cycle_wedge = False
 
     def script_probe_delivery(self, fraction: float, samples: int) -> None:
         """Scenario hook: pin the delivered share of a latched objective.
