@@ -20,6 +20,7 @@ import {
   probeSkipText,
   probeVerdictText,
   recoveryMorningText,
+  recoveryRouteText,
   recoveryWalkthroughText,
   toHealthWatchState,
 } from "./healthWatch";
@@ -27,13 +28,14 @@ import {
 function unit(spec: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     unit_id: "rhs",
-    census: { verdict: "nominal", nights: 0, predicates: null, tier: null },
+    census: { verdict: "nominal", nights: 0, predicates: null, tier: null, note: null },
     probe: {
       verdict: null,
       probe_w: null,
       qualifying_samples: null,
       core_samples: null,
       echo: null,
+      consecutive_fail_nights: null,
     },
     recovery: { mode: "uncommissioned" },
     ...spec,
@@ -66,10 +68,11 @@ describe("toHealthWatchState", () => {
                 full: true,
                 still: true,
                 house_needed: true,
-                no_ct_view: true,
+                load_unserved_in_phase: true,
                 modes_normal: true,
               },
               tier: "alert",
+              note: null,
             },
             probe: {
               verdict: "fail_no_response",
@@ -77,6 +80,7 @@ describe("toHealthWatchState", () => {
               qualifying_samples: 3,
               core_samples: 20,
               echo: "echo_matches_write",
+              consecutive_fail_nights: 1,
             },
             recovery: { mode: "uncommissioned" },
           }),
@@ -97,15 +101,70 @@ describe("toHealthWatchState", () => {
       full: true,
       still: true,
       house_needed: true,
-      no_ct_view: true,
+      load_unserved_in_phase: true,
       modes_normal: true,
     });
+    expect(only.census.note).toBeNull();
     expect(only.probe.verdict).toBe("fail_no_response");
     expect(only.probe.probeW).toBe(300);
     expect(only.probe.qualifyingSamples).toBe(3);
     expect(only.probe.coreSamples).toBe(20);
     expect(only.probe.echo).toBe("echo_matches_write");
+    expect(only.probe.consecutiveFailNights).toBe(1);
     expect(only.recovery.mode).toBe("uncommissioned");
+  });
+
+  it("narrows A16's soft note, its annotator, and route B's figures", () => {
+    const parsed = toHealthWatchState(
+      projection({
+        units: [
+          unit({
+            census: {
+              verdict: "phase_idle_or_ct_silent",
+              nights: 4,
+              predicates: {
+                full: true,
+                still: true,
+                house_needed: true,
+                load_unserved_in_phase: false,
+                modes_normal: true,
+              },
+              tier: "notice",
+              note: "ct_link_suspect",
+            },
+            probe: {
+              verdict: "fail_no_response",
+              probe_w: 300,
+              qualifying_samples: 3,
+              core_samples: 20,
+              echo: "echo_matches_write",
+              consecutive_fail_nights: 2,
+            },
+            recovery: {
+              mode: "advise",
+              verdict: "advised",
+              tier: "alert",
+              posture: "advise",
+              route: "b",
+              attempts_total: 0,
+              consecutive_fails: 0,
+            },
+          }),
+        ],
+      }),
+    );
+    const only = parsed!.units[0]!;
+    expect(only.census.verdict).toBe("phase_idle_or_ct_silent");
+    expect(only.census.note).toBe("ct_link_suspect");
+    expect(only.census.tier).toBe("notice");
+    expect(only.census.predicates!.load_unserved_in_phase).toBe(false);
+    expect(only.probe.consecutiveFailNights).toBe(2);
+    expect(only.recovery.route).toBe("b");
+    // An unknown route word narrows to null, never a half-adopted string.
+    const odd = toHealthWatchState(
+      projection({ units: [unit({ recovery: { mode: "advise", route: "c" } })] }),
+    )!;
+    expect(odd.units[0]!.recovery.route).toBeNull();
   });
 
   it("never half-adopts a garbage frame", () => {
@@ -203,6 +262,41 @@ describe("censusChipText", () => {
     )!.units[0]!;
     expect(censusChipText(unread)).toBe("not yet read");
   });
+
+  it("renders A16's soft note as the note it is, with its annotator", () => {
+    const noted = toHealthWatchState(
+      projection({
+        units: [
+          unit({
+            census: {
+              verdict: "phase_idle_or_ct_silent",
+              nights: 4,
+              predicates: null,
+              tier: "notice",
+              note: "ct_link_suspect",
+            },
+          }),
+        ],
+      }),
+    )!.units[0]!;
+    expect(censusChipText(noted)).toBe("idle phase or CT silent 4 nights · CT link suspect");
+    const cleared = toHealthWatchState(
+      projection({
+        units: [
+          unit({
+            census: {
+              verdict: "phase_idle_or_ct_silent",
+              nights: 1,
+              predicates: null,
+              tier: "notice",
+              note: null,
+            },
+          }),
+        ],
+      }),
+    )!.units[0]!;
+    expect(censusChipText(cleared)).toBe("idle phase or CT silent");
+  });
 });
 
 describe("probeVerdictText", () => {
@@ -217,6 +311,7 @@ describe("probeVerdictText", () => {
               qualifying_samples: 3,
               core_samples: 20,
               echo: "echo_matches_write",
+              consecutive_fail_nights: 1,
             },
           }),
         ],
@@ -224,6 +319,26 @@ describe("probeVerdictText", () => {
     )!.units[0]!;
     expect(probeVerdictText(failing)).toBe(
       "fail — no response — 3/20 samples moved · echo followed the write, the battery stayed still",
+    );
+    // Route B's repetition evidence rides the same line once it is a streak.
+    const repeated = toHealthWatchState(
+      projection({
+        units: [
+          unit({
+            probe: {
+              verdict: "fail_no_response",
+              probe_w: 300,
+              qualifying_samples: 3,
+              core_samples: 20,
+              echo: "echo_matches_write",
+              consecutive_fail_nights: 2,
+            },
+          }),
+        ],
+      }),
+    )!.units[0]!;
+    expect(probeVerdictText(repeated)).toBe(
+      "fail — no response — 3/20 samples moved · echo followed the write, the battery stayed still · 2 nights in a row",
     );
     const passing = toHealthWatchState(
       projection({
@@ -472,6 +587,35 @@ describe("the recovery surface (§7/§8/§11/§13, the Stage R wave)", () => {
     expect(morning).toContain("Before: stuck signature + a no-response probe");
     expect(morning).toContain("6 cycle nights in the last 30 (20%)");
     expect(recoveryMorningText(toHealthWatchState(projection())!.units[0]!)).toBeNull();
+  });
+
+  it("names route B's own eligibility story where route A stays quiet (A16)", () => {
+    const byRoute = (route: string | null): Record<string, unknown> =>
+      recoveryUnit({ mode: "advise", verdict: "advised", tier: "alert", route });
+    const routeB = toHealthWatchState(projection({ units: [byRoute("b")] }))!.units[0]!;
+    expect(recoveryRouteText(routeB)).toContain("route B");
+    expect(recoveryRouteText(routeB)).toContain("cannot see this pod's phase");
+    expect(recoveryRouteText(routeB)).toContain("two consecutive nightly probe failures");
+    const routeA = toHealthWatchState(projection({ units: [byRoute("a")] }))!.units[0]!;
+    expect(recoveryRouteText(routeA)).toBeNull();
+    expect(recoveryRouteText(toHealthWatchState(projection())!.units[0]!)).toBeNull();
+    // The recovered morning line carries the route's own "before" story.
+    const recoveredB = toHealthWatchState(
+      projection({
+        units: [
+          recoveryUnit({
+            mode: "auto",
+            verdict: "recovered",
+            tier: "resolved",
+            route: "b",
+            attempts_total: 1,
+          }),
+        ],
+      }),
+    )!.units[0]!;
+    expect(recoveryMorningText(recoveredB)).toContain(
+      "Before: a phase the census cannot see + repeated no-response probes",
+    );
   });
 
   it("puts a recovery outcome FIRST in the alert story (§11's urgent styling)", () => {

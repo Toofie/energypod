@@ -15,6 +15,9 @@
  * - Uncommissioned stages render "not commissioned" where their UI would be
  *   — a site without Stage R never sees "recovery" offered as a suggestion
  *   it cannot execute (§13's uncommissioned honesty).
+ * - A16's soft note (`phase_idle_or_ct_silent`) renders as the
+ *   informational note it is — its age and the `ct_link_suspect` annotator
+ *   on the chip, notice styling, never a flag, never promoting (§5).
  * - Skipped units render their skip reason verbatim; a disarmed unit renders
  *   as the arm instruction it is (the program never arms outside the ONE
  *   bounded verification re-arm inside an `auto` cycle — §6.1/§7.4).
@@ -42,6 +45,7 @@ import {
   healthWatchStagesText,
   probeVerdictText,
   recoveryMorningText,
+  recoveryRouteText,
   recoveryVerdictText,
   recoveryWalkthroughText,
   type HealthWatchState,
@@ -65,7 +69,13 @@ function unitTier(unit: HealthWatchUnitState): "alert" | "notice" | "quiet" {
   ) {
     return "alert";
   }
-  if (unit.census.verdict === "stuck_suspected" || unit.recovery.verdict === "recovered") {
+  if (
+    unit.census.verdict === "stuck_suspected" ||
+    // A16's soft note: informational, so it carries the notice styling —
+    // never the alert styling, at any age.
+    unit.census.verdict === "phase_idle_or_ct_silent" ||
+    unit.recovery.verdict === "recovered"
+  ) {
     return "notice";
   }
   return "quiet";
@@ -119,17 +129,20 @@ function unitAdvisory(
   }
   const walkthrough = recoveryWalkthroughText(unit);
   const morning = recoveryMorningText(unit);
+  const route = recoveryRouteText(unit);
   return (
     <div
       key={`${keyPrefix}-${unit.unitId}-advisory`}
       className="home-health-recovery-advisory"
       data-mode={unit.recovery.mode}
       data-verdict={unit.recovery.verdict}
+      data-route={unit.recovery.route ?? undefined}
     >
       <p className="home-health-recovery-title">
         {unit.unitId} — recovery ({unit.recovery.mode})
         {unit.recovery.leftArmed ? " — LEFT ARMED: the closing disarm refused, disarm it now" : ""}
       </p>
+      {route !== null && <p className="home-health-route">{route}</p>}
       {walkthrough !== null && <p className="home-health-walkthrough">{walkthrough}</p>}
       {morning !== null && <p className="home-health-morning">{morning}</p>}
     </div>

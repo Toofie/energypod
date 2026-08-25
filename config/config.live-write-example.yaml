@@ -997,9 +997,13 @@ battery_health_watch:
     grid_import_w: 500
     sibling_flow_w: 500
     flow_frac: 0.5
-    load_floor_w: 30
-    sibling_load_w: 100
+    load_floor_w: 30               # S4' own-phase floor (A16): the unit's OWN
+                                   #   CT word above this while still = the flag
+    sibling_load_w: 100            # the soft note's sibling-load context (A16)
     load_frac: 0.8
+    phase_live_window_h: 168       # has this unit's CT word EVER moved? the
+                                   #   dead-link vs idle-phase annotator (A16);
+                                   #   >= evidence_window_h, within retention
     flag_persistence_nights: 2     # notice -> alert promotion
   probe:
     probe_w: 300                   # [100, 500], <= policy.max_unit_discharge_w
@@ -1024,6 +1028,9 @@ battery_health_watch:
     hold_s: 90                     # [60, 120]; the lease is hold_s + 60 s
     consecutive_fail_limit: 3      # counted: failed_write, write_unverified,
                                    #   failed_no_effect — NOT recovered_unproven
+    probe_fail_nights: 2           # >= 2 (A16 route B): consecutive probe
+                                   #   failures that make an unobservable-
+                                   #   phase unit R-eligible without a flag
 
 # The battery calibration cycling program (DESIGN_CALIBRATION_CYCLING.md,
 # CONTRACT v1.1) — the periodic bottom-anchor traverse, ONE pod per

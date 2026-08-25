@@ -1,16 +1,23 @@
 """T-BHW-CENSUS + T-BHW-PROBE + the shared program frame (the C/P wave).
 
-DESIGN_BATTERY_HEALTH_WATCH (CONTRACT v1.1) §4/§5/§6/§8/§10/§11, tested
+DESIGN_BATTERY_HEALTH_WATCH (CONTRACT v1.2) §4/§5/§6/§8/§10/§11, tested
 against ``energypod.application.health_watch``:
 
 - the frame: the once-per-civil-night semantics derived from durable rows,
   the no-new-ACT deadline (A1), the quiet-window verification, and the
   interrupted-program reconstruction (A4's C/P shape — an interrupted
   census/probe leaves the alert naming the unit state);
-- the census: the five stuck-signature predicates with their hold/fail
-  edges, S3's either-corroborator, S4's sibling comparison, S5's mode
-  exclusion, ``degraded_evidence`` on historian gaps, persistence
-  promotion, ZERO writes, and the row/event/projection shapes;
+- the census (v1.2/A16): the five stuck-signature predicates with their
+  hold/fail edges, S3's either-corroborator, S4' IN-PHASE non-following
+  with BOTH named shapes — the GARAGE-PHASE shape (own-phase load ~0,
+  siblings flowing) renders the soft note or nominal, NEVER
+  ``stuck_suspected``; the IN-PHASE shape (own-phase load above the floor
+  while the battery stays still) still flags — the
+  dead-link-vs-idle-phase annotator over ``phase_live_window_h`` (a word
+  that never moves annotates ``ct_link_suspect``; one that moves clears
+  it; the note never promotes), S5's mode exclusion,
+  ``degraded_evidence`` on historian gaps, persistence promotion, ZERO
+  writes, and the row/event/projection shapes;
 - the probe: the skip-if set each rendering its skip, the pass math, the
   FULL §6.3 verdict matrix (A3), spike patterns never passing, preemption
   (A12: MANUAL/AGENT/e-stop preempt, a schedule claim does not),
@@ -19,8 +26,8 @@ against ``energypod.application.health_watch``:
   explicit cancel, sequential ordering with the inter-unit gap, and no
   probe outside the window;
 - the structural pin, restated for the Stage-R era: a probe verdict ALONE
-  still triggers nothing (only the §7.1 conjunction composes a cycle, and
-  that lives in test_health_watch_recovery); the module's write reach is
+  still triggers nothing (only §7.1's routes compose a cycle, and that
+  lives in test_health_watch_recovery); the module's write reach is
   exactly the injected composer ports.
 """
 
@@ -156,10 +163,15 @@ class FakeHistory:
     def samples(
         self, unit_ids: Any, from_at: datetime, to_at: datetime
     ) -> tuple[Any, ...]:
+        # The real historian port filters by unit_ids (the A16 annotator
+        # queries ONE unit's trailing phase-live window) — the fake honors
+        # the same contract.
+        wanted = {str(unit) for unit in unit_ids} if unit_ids else None
         return tuple(
             row
             for row in self.rows
-            if from_at <= getattr(row, "sampled_at", from_at) <= to_at
+            if (wanted is None or str(getattr(row, "unit_id", "")) in wanted)
+            and from_at <= getattr(row, "sampled_at", from_at) <= to_at
         )
 
 
@@ -348,12 +360,14 @@ def evidence_rows(
     watts: dict[str, float] | None = None,
     loads: dict[str, float] | None = None,
     modes: dict[str, int] | None = None,
+    grids: dict[str, float] | None = None,
 ) -> tuple[Any, ...]:
     """A full-coverage evidence window for the fleet (default: healthy)."""
     socs = socs or {"lhs": 80.0, "mid": 80.0, "rhs": 80.0}
     watts = watts or {"lhs": 0.0, "mid": 0.0, "rhs": 0.0}
     loads = loads or {"lhs": 120.0, "mid": 120.0, "rhs": 120.0}
     modes = modes or {"lhs": 0, "mid": 0, "rhs": 0}
+    grids = grids or {"lhs": -100.0, "mid": -100.0, "rhs": -100.0}
     rows = []
     for offset in range(0, hours * 3600, step_s):
         at = (end - timedelta(seconds=hours * 3600) + timedelta(seconds=offset)).astimezone(UTC)
@@ -364,11 +378,39 @@ def evidence_rows(
                     at,
                     soc=socs.get(unit, 80.0),
                     watts=watts.get(unit, 0.0),
+                    grid=grids.get(unit, -100.0),
                     load=loads.get(unit, 120.0),
                     mode=modes.get(unit, 0),
                 )
             )
     return tuple(rows)
+
+
+def in_phase_rows(**overrides: Any) -> tuple[Any, ...]:
+    """The v1.2 IN-PHASE exhibiting shape (A16's S4' flag shape): rhs full,
+    still, and its OWN phase's load word above the floor while siblings
+    actively flow — all five predicates hold."""
+    shape: dict[str, Any] = dict(
+        socs={"lhs": 80.0, "mid": 80.0, "rhs": 97.0},
+        watts={"lhs": 600.0, "mid": 600.0, "rhs": 20.0},
+        loads={"lhs": 150.0, "mid": 150.0, "rhs": 140.0},
+    )
+    shape.update(overrides)
+    return evidence_rows(**shape)
+
+
+def garage_rows(**overrides: Any) -> tuple[Any, ...]:
+    """The v1.2 GARAGE-PHASE shape (A16's named test shape): rhs SoC pinned,
+    its own-phase load word ~0 while siblings actively flow — the pod on the
+    near-empty phase legitimately reads ~0 CT, and that is NOT the stuck
+    signature under any predicate combination."""
+    shape: dict[str, Any] = dict(
+        socs={"lhs": 80.0, "mid": 80.0, "rhs": 97.0},
+        watts={"lhs": 600.0, "mid": 600.0, "rhs": 20.0},
+        loads={"lhs": 150.0, "mid": 150.0, "rhs": 16.0},
+    )
+    shape.update(overrides)
+    return evidence_rows(**shape)
 
 
 def bind_state(controller: hw.HealthWatchController, handles: dict[str, Any]) -> None:
@@ -532,19 +574,15 @@ def test_the_tiers_follow_section_11() -> None:
     assert hw.census_tier(3, 2) == hw.TIER_ALERT
 
 
-# --- Stage C: the census (§5) --------------------------------------------------------
+# --- Stage C: the census (§5, v1.2/A16) ------------------------------------------------
 
 
-async def test_the_exhibiting_signature_flags_stuck_suspected() -> None:
-    """rhs's own fingerprint: SoC pinned 97, still, dead load CT, siblings
-    flowing — all five predicates hold and the first night is a notice."""
-    rows = evidence_rows(
-        socs={"lhs": 80.0, "mid": 80.0, "rhs": 97.0},
-        watts={"lhs": 600.0, "mid": 600.0, "rhs": 20.0},
-        loads={"lhs": 150.0, "mid": 150.0, "rhs": 16.0},
-    )
+async def test_the_in_phase_signature_flags_stuck_suspected() -> None:
+    """The v1.2 flag shape (A16's S4'): rhs SoC pinned 97, still, its OWN
+    phase's load word above the floor while siblings flow — all five
+    predicates hold and the first night is a notice."""
     controller, handles = make_controller(
-        history=FakeHistory(rows=rows),
+        history=FakeHistory(rows=in_phase_rows()),
         # Census-only staging for the zero-writes pin: the program's whole
         # surface is the read-only evaluation.
         settings=make_settings(stages=("census",)),
@@ -562,7 +600,7 @@ async def test_the_exhibiting_signature_flags_stuck_suspected() -> None:
         "full": True,
         "still": True,
         "house_needed": True,
-        "no_ct_view": True,
+        "load_unserved_in_phase": True,
         "modes_normal": True,
     }
     assert census["lhs"]["verdict"] == hw.CENSUS_NOMINAL
@@ -576,7 +614,7 @@ async def test_the_exhibiting_signature_flags_stuck_suspected() -> None:
     assert len(rows_written) == 3
     rhs_row = next(e for e in rows_written if e.unit_id == "rhs")
     assert rhs_row.payload["verdict"] == hw.CENSUS_STUCK
-    assert rhs_row.payload["predicates"]["no_ct_view"] is True
+    assert rhs_row.payload["predicates"]["load_unserved_in_phase"] is True
     assert rhs_row.payload["evidence_window_h"] == 6
     assert rhs_row.payload["night"] == "2026-08-25"
     # The event rides the bus at the notice tier.
@@ -584,25 +622,161 @@ async def test_the_exhibiting_signature_flags_stuck_suspected() -> None:
     assert any(e["payload"]["unit_id"] == "rhs" for e in events)
 
 
-async def test_each_predicates_fail_edge_renders_nominal() -> None:
-    """One predicate failing is enough: the stuck flag needs ALL five."""
-    base = dict(
-        socs={"lhs": 80.0, "mid": 80.0, "rhs": 97.0},
-        watts={"lhs": 600.0, "mid": 600.0, "rhs": 20.0},
-        loads={"lhs": 150.0, "mid": 150.0, "rhs": 16.0},
+async def test_the_garage_phase_shape_never_flags_under_any_combination() -> None:
+    """A16's named T-BHW-CENSUS shape: SoC pinned >= 95, own-phase load ~0,
+    siblings actively flowing — the pod on the near-empty phase legitimately
+    reads ~0 CT while siblings serve, and NO predicate combination can render
+    it ``stuck_suspected``.  The cross-pod comparison is RETIRED as a flag:
+    the shape renders the SOFT note (its own word never moved in the
+    phase-live window -> ``ct_link_suspect``), never a flag, never alert.
+    """
+    controller, handles = make_controller(
+        history=FakeHistory(rows=garage_rows()),
+        settings=make_settings(stages=("census",)),
     )
+    handles["controller"] = controller
+    handles["state"] = lambda: controller.state_payload()["phase"]
+    handles["observations"].latest = fleet_observations(rhs__soc_pct=97.0)
+    await run_program(handles, seconds=30)
+    payload = controller.state_payload()
+    census = {unit["unit_id"]: unit["census"] for unit in payload["units"]}
+    assert census["rhs"]["verdict"] == hw.CENSUS_PHASE_IDLE_OR_CT_SILENT
+    assert census["rhs"]["verdict"] != hw.CENSUS_STUCK
+    assert census["rhs"]["tier"] == hw.TIER_NOTICE
+    assert census["rhs"]["nights"] == 1
+    assert census["rhs"]["note"] == hw.CENSUS_NOTE_CT_LINK_SUSPECT
+    # The predicate vector rides the soft note's row too (§10): S4' is False
+    # — the unit's OWN word never read above the floor, so the flag is
+    # structurally impossible whatever the siblings did.
+    assert census["rhs"]["predicates"] == {
+        "full": True,
+        "still": True,
+        "house_needed": True,
+        "load_unserved_in_phase": False,
+        "modes_normal": True,
+    }
+    assert census["lhs"]["verdict"] == hw.CENSUS_NOMINAL
+    # And the pure arithmetic pin behind it: an own-phase-idle figure fails
+    # S4' at ANY load_frac the §9 bounds admit — the garage guarantee holds
+    # per predicate, not per end-to-end accident.
+    garage_figures = hw.CensusFigures(
+        samples=720,
+        soc_full_frac=1.0,
+        soc_full_longest_run_s=6 * 3600.0,
+        still_frac=1.0,
+        house_needed_frac=1.0,
+        load_unserved_frac=0.0,
+        phase_idle_frac=1.0,
+        modes_normal=True,
+    )
+    for load_frac in (0.1, 0.5, 0.8, 1.0):
+        settings = hw.StuckSettings(load_frac=load_frac)
+        predicates = hw.stuck_predicates(garage_figures, settings)
+        assert predicates["load_unserved_in_phase"] is False, load_frac
+        assert not all(predicates.values()), load_frac
+        assert hw.census_verdict(
+            predicates, degraded=False, phase_idle=True
+        ) == hw.CENSUS_PHASE_IDLE_OR_CT_SILENT
+
+
+async def test_the_annotator_clears_when_the_ct_word_has_moved() -> None:
+    """A16's dead-link-vs-idle-phase discriminator: a CT word that HAS
+    exceeded the load floor somewhere in the trailing ``phase_live_window_h``
+    (here: the phase was used days ago, idle tonight) clears the
+    ``ct_link_suspect`` annotation — the note stays, unannotated."""
+    used_days_ago = evidence_rows(
+        hours=1,
+        end=NIGHT - timedelta(days=5),
+        loads={"lhs": 150.0, "mid": 150.0, "rhs": 200.0},
+    )
+    controller, handles = make_controller(
+        history=FakeHistory(rows=garage_rows() + used_days_ago),
+        settings=make_settings(stages=("census",)),
+    )
+    handles["controller"] = controller
+    handles["state"] = lambda: controller.state_payload()["phase"]
+    handles["observations"].latest = fleet_observations(rhs__soc_pct=97.0)
+    await run_program(handles, seconds=30)
+    payload = controller.state_payload()
+    census = {unit["unit_id"]: unit["census"] for unit in payload["units"]}
+    assert census["rhs"]["verdict"] == hw.CENSUS_PHASE_IDLE_OR_CT_SILENT
+    assert census["rhs"]["note"] is None
+    # The row carries the note and the phase-live provenance either way.
+    rhs_row = next(
+        e
+        for e in handles["audit"].appended
+        if e.event_type == "health_census_recorded" and e.unit_id == "rhs"
+    )
+    assert rhs_row.payload["note"] is None
+    assert rhs_row.payload["phase_live_window_h"] == 168
+
+
+async def test_the_soft_note_never_promotes_at_any_age() -> None:
+    """§5/A16: the note is informational at EVERY age — its two hypotheses
+    have different owners and the census is not entitled to pick one, so
+    four prior soft-note nights still render notice, never alert."""
+    seeded = []
+    for nights_ago in range(1, 5):
+        seeded.append(
+            SimpleNamespace(
+                event_type="health_census_recorded",
+                unit_id="rhs",
+                payload={
+                    "night": (NIGHT.date() - timedelta(days=nights_ago)).isoformat(),
+                    "verdict": hw.CENSUS_PHASE_IDLE_OR_CT_SILENT,
+                },
+            )
+        )
+    controller, handles = make_controller(
+        history=FakeHistory(rows=garage_rows()),
+        audit=FakeAudit(seeded=seeded),
+        settings=make_settings(stages=("census",)),
+    )
+    handles["controller"] = controller
+    handles["state"] = lambda: controller.state_payload()["phase"]
+    handles["observations"].latest = fleet_observations(rhs__soc_pct=97.0)
+    await run_program(handles, seconds=30)
+    payload = controller.state_payload()
+    census = {unit["unit_id"]: unit["census"] for unit in payload["units"]}
+    assert census["rhs"]["verdict"] == hw.CENSUS_PHASE_IDLE_OR_CT_SILENT
+    assert census["rhs"]["nights"] == 5
+    assert census["rhs"]["tier"] == hw.TIER_NOTICE
+
+
+async def test_the_soft_note_hands_off_to_the_probe() -> None:
+    """§5/A16: the note names the probe as the only test that sees through
+    both hypotheses — a soft-note unit is PROBED, never skipped as if the
+    census had excluded it, and route B's repetition figure rides its row."""
+    controller, handles = make_controller(history=FakeHistory(rows=garage_rows()))
+    handles["controller"] = controller
+    handles["state"] = lambda: controller.state_payload()["phase"]
+    handles["observations"].latest = fleet_observations(rhs__soc_pct=97.0)
+    await run_program(handles, seconds=600)
+    payload = controller.state_payload()
+    probes = {unit["unit_id"]: unit["probe"] for unit in payload["units"]}
+    assert probes["rhs"]["verdict"] is not None
+    assert not (probes["rhs"]["verdict"] or "").startswith("skipped:census")
+    assert "consecutive_fail_nights" in probes["rhs"]
+
+
+async def test_each_predicates_fail_edge_renders_nominal() -> None:
+    """One predicate failing is enough: the stuck flag needs ALL five.  The
+    S4' fail edge is the garage shape's own (own-phase load below the floor),
+    rendered here against QUIET siblings so the soft note's sibling context
+    does not fire — the soft-note rendering of the same edge is the garage
+    test above."""
     variants = {
         "S1 soc": dict(socs={"lhs": 80.0, "mid": 80.0, "rhs": 90.0}),
         "S2 still": dict(watts={"lhs": 600.0, "mid": 600.0, "rhs": 400.0}),
         "S3 house needed": dict(
             watts={"lhs": 0.0, "mid": 0.0, "rhs": 20.0},
-            loads={"lhs": 150.0, "mid": 150.0, "rhs": 16.0},
+            loads={"lhs": 50.0, "mid": 50.0, "rhs": 16.0},
         ),
-        "S4 ct view": dict(loads={"lhs": 150.0, "mid": 150.0, "rhs": 140.0}),
+        "S4' own-phase load idle": dict(loads={"lhs": 50.0, "mid": 50.0, "rhs": 16.0}),
         "S5 modes": dict(modes={"lhs": 0, "mid": 0, "rhs": 3}),
     }
     for name, override in variants.items():
-        rows = evidence_rows(**{**base, **override})
+        rows = in_phase_rows(**override)
         controller, handles = make_controller(
             history=FakeHistory(rows=rows), settings=make_settings(stages=("census",))
         )
@@ -616,23 +790,26 @@ async def test_each_predicates_fail_edge_renders_nominal() -> None:
 
 async def test_s3s_either_corroborator_suffices() -> None:
     """Import beyond standby OR any sibling actively flowing — each alone
-    corroborates that the house needed them."""
-    stuck_kwargs = dict(
-        socs={"lhs": 80.0, "mid": 80.0, "rhs": 97.0},
-        watts={"lhs": 600.0, "mid": 0.0, "rhs": 20.0},
-        loads={"lhs": 150.0, "mid": 150.0, "rhs": 16.0},
-    )
-    controller, handles = make_controller(
-        history=FakeHistory(rows=evidence_rows(**stuck_kwargs)),
-        settings=make_settings(stages=("census",)),
-    )
-    handles["controller"] = controller
-    handles["state"] = lambda: controller.state_payload()["phase"]
-    handles["observations"].latest = fleet_observations()
-    await run_program(handles, seconds=30)
-    payload = controller.state_payload()
-    census = {unit["unit_id"]: unit["census"] for unit in payload["units"]}
-    assert census["rhs"]["verdict"] == hw.CENSUS_STUCK
+    corroborates that the house needed them (the in-phase flag shape)."""
+    for corroborator in (
+        # any sibling actively flowing (import at standby)
+        dict(watts={"lhs": 600.0, "mid": 0.0, "rhs": 20.0}),
+        # import beyond standby (no sibling flowing)
+        dict(
+            watts={"lhs": 0.0, "mid": 0.0, "rhs": 20.0},
+            grids={"lhs": -800.0, "mid": -800.0, "rhs": -800.0},
+        ),
+    ):
+        controller, handles = make_controller(
+            history=FakeHistory(rows=in_phase_rows(**corroborator)),
+            settings=make_settings(stages=("census",)),
+        )
+        bind_state(controller, handles)
+        handles["observations"].latest = fleet_observations()
+        await run_program(handles, seconds=30)
+        payload = controller.state_payload()
+        census = {unit["unit_id"]: unit["census"] for unit in payload["units"]}
+        assert census["rhs"]["verdict"] == hw.CENSUS_STUCK, corroborator
 
 
 async def test_historian_gaps_render_degraded_evidence() -> None:
@@ -702,11 +879,7 @@ async def test_persistence_promotes_the_flag_to_alert() -> None:
                 payload={"night": night, "verdict": hw.CENSUS_STUCK},
             )
         )
-    rows = evidence_rows(
-        socs={"lhs": 80.0, "mid": 80.0, "rhs": 97.0},
-        watts={"lhs": 600.0, "mid": 600.0, "rhs": 20.0},
-        loads={"lhs": 150.0, "mid": 150.0, "rhs": 16.0},
-    )
+    rows = in_phase_rows()
     audit = FakeAudit(seeded=seeded)
     controller, handles = make_controller(
         history=FakeHistory(rows=rows), audit=audit, settings=make_settings(stages=("census",))
@@ -737,11 +910,7 @@ async def test_a_nominal_night_between_stucks_caps_the_streak() -> None:
             payload={"night": "2026-08-23", "verdict": hw.CENSUS_NOMINAL},
         ),
     ]
-    rows = evidence_rows(
-        socs={"lhs": 80.0, "mid": 80.0, "rhs": 97.0},
-        watts={"lhs": 600.0, "mid": 600.0, "rhs": 20.0},
-        loads={"lhs": 150.0, "mid": 150.0, "rhs": 16.0},
-    )
+    rows = in_phase_rows()
     audit = FakeAudit(seeded=seeded)
     controller, handles = make_controller(
         history=FakeHistory(rows=rows), audit=audit, settings=make_settings(stages=("census",))
@@ -1351,13 +1520,14 @@ async def test_the_projection_renders_the_honest_shapes() -> None:
         # Uncommissioned stages render their honesty, never absence-that-
         # looks-like-health.
         assert unit["recovery"] == {"mode": "uncommissioned"}
-        assert set(unit["census"]) == {"verdict", "nights", "predicates", "tier"}
+        assert set(unit["census"]) == {"verdict", "nights", "predicates", "tier", "note"}
         assert set(unit["probe"]) == {
             "verdict",
             "probe_w",
             "qualifying_samples",
             "core_samples",
             "echo",
+            "consecutive_fail_nights",
         }
 
 

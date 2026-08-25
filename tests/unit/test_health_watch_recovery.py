@@ -1,16 +1,21 @@
 """T-BHW-RECOVERY + the recovery-half of T-BHW-RESTART / NEVER-THRASH /
-EMERGENCY (DESIGN_BATTERY_HEALTH_WATCH §7/§8/§17).
+EMERGENCY (DESIGN_BATTERY_HEALTH_WATCH §7/§8/§17, CONTRACT v1.2).
 
 Against ``energypod.application.health_watch``, with the C/P wave's own
 fakes (``test_health_watch``):
 
-- §7.1's eligibility conjunction: flag-without-fail, fail-without-flag, and
-  an inconclusive probe all refuse — and NO ladder state (I10:
+- §7.1's eligibility: route A's conjunction (flag-without-fail,
+  fail-without-flag, and an inconclusive probe all refuse) AND route B
+  (A16: a soft-note ``phase_idle_or_ct_silent`` unit +
+  ``probe_fail_nights`` consecutive ``fail_no_response`` verdicts eligible;
+  ONE failure not; a ``nominal`` unit's repeated failures NOT — the route
+  is scoped to the structurally-blind class) — and NO ladder state (I10:
   ``actuation_incoherent`` included) is ever a trigger.
 - §7.2's composite in ``auto``, step by step: re-verify, disarm, park (the
   lease bound ``hold_s + 60``, the health principal, the reason naming the
-  watch), hold, resume, the ONE bounded re-arm, the §6 re-run, the closing
-  disarm — and the audit/event/projection shapes under the health principal.
+  watch and its own route), hold, resume, the ONE bounded re-arm, the §6
+  re-run, the closing disarm — and the audit/event/projection shapes under
+  the health principal.
 - §8's ladder: resync-then-ONE-reissue -> ``failed_write``;
   ACKed-but-unverified -> ``write_unverified`` with NO further write (I3);
   verification FAIL -> ``failed_no_effect`` (counted); verification
@@ -60,20 +65,25 @@ from .test_health_watch import (
     FakeSubmit,
     evidence_rows,
     fleet_observations,
+    garage_rows,
+    in_phase_rows,
 )
 
 HOLD_S = 60  # the bounded floor keeps the composite inside the test budget
 
 
 def stuck_history() -> FakeHistory:
-    """The exhibiting fingerprint: rhs the spectator, siblings flowing."""
-    return FakeHistory(
-        rows=evidence_rows(
-            socs={"lhs": 80.0, "mid": 80.0, "rhs": 97.0},
-            watts={"lhs": 600.0, "mid": 600.0, "rhs": 20.0},
-            loads={"lhs": 150.0, "mid": 150.0, "rhs": 16.0},
-        )
-    )
+    """The v1.2 IN-PHASE exhibiting fingerprint (route A's census half): rhs
+    full, still, its OWN phase's load word above the floor, siblings
+    flowing."""
+    return FakeHistory(rows=in_phase_rows())
+
+
+def garage_history() -> FakeHistory:
+    """The v1.2 GARAGE-PHASE fingerprint (route B's census half): rhs full,
+    still, its own-phase load word ~0 while siblings flow — the soft note,
+    never a flag."""
+    return FakeHistory(rows=garage_rows())
 
 
 def recovery_settings(**overrides: Any) -> hw.HealthWatchSettings:
@@ -352,6 +362,7 @@ async def test_a_probe_failure_without_a_census_flag_never_cycles() -> None:
         "census": hw.CENSUS_NOMINAL,
         "probe": hw.PROBE_FAIL_NO_RESPONSE,
         "eligible": False,
+        "route": None,
     }
 
 
@@ -393,6 +404,146 @@ async def test_no_ladder_state_is_ever_a_trigger_i10() -> None:
     assert rig.outcome_row("rhs").payload["verdict"] is None
 
 
+# --- §7.1 route B (A16): the unobservable-phase repetition ----------------------------
+
+
+async def test_route_b_its_threshold_makes_the_soft_note_unit_eligible() -> None:
+    """A16's route B at the threshold: a ``phase_idle_or_ct_silent`` unit
+    whose probe failed no-response TONIGHT and the night before (2 =
+    ``probe_fail_nights`` consecutive) is R-eligible without a flag — the
+    repetition substitutes for the census half the census structurally
+    cannot see, and the cycle's park reason names its own basis."""
+    audit = FakeAudit(
+        seeded=[probe_row_for("rhs", (NIGHT - timedelta(days=1)).date(),
+                              hw.PROBE_FAIL_NO_RESPONSE)]
+    )
+    rig = Rig(history=garage_history(), audit=audit)
+
+    def rhs_stays_dead() -> None:
+        rig.observations.latest["rhs"].battery_watts = 20.0
+
+    await rig.run(each_tick=rhs_stays_dead)
+    assert [call["unit_id"] for call in rig.park.park_calls] == ["rhs"]
+    assert rig.park.park_calls[0]["reason"] == hw.PARK_REASON_ROUTE_B
+    row = rig.outcome_row("rhs")
+    assert row.payload["route"] == "b"
+    assert row.payload["eligibility"] == {
+        "census": hw.CENSUS_PHASE_IDLE_OR_CT_SILENT,
+        "probe": hw.PROBE_FAIL_NO_RESPONSE,
+        "eligible": True,
+        "route": "b",
+    }
+    payload = rig.recovery_payload("rhs")
+    assert payload["route"] == "b"
+    # Route B's live repetition figure rode tonight's probe row too.
+    probe_row = next(
+        e
+        for e in rig.audit.appended
+        if e.event_type == "health_probe_completed" and e.unit_id == "rhs"
+    )
+    assert probe_row.payload["consecutive_fail_nights"] == 2
+
+
+async def test_route_b_one_failure_alone_is_not_enough() -> None:
+    """A single no-response night on a soft-note unit: one weak night — the
+    route needs ``probe_fail_nights`` CONSECUTIVE failures, and a single
+    night NEVER suffices (the A16 bound the config itself enforces)."""
+    rig = Rig(history=garage_history())
+
+    def rhs_stays_dead() -> None:
+        rig.observations.latest["rhs"].battery_watts = 20.0
+
+    await rig.run(each_tick=rhs_stays_dead)
+    assert rig.park.park_calls == []
+    row = rig.outcome_row("rhs")
+    assert row.payload["verdict"] is None
+    assert row.payload["eligibility"] == {
+        "census": hw.CENSUS_PHASE_IDLE_OR_CT_SILENT,
+        "probe": hw.PROBE_FAIL_NO_RESPONSE,
+        "eligible": False,
+        "route": None,
+    }
+    probe_row = next(
+        e
+        for e in rig.audit.appended
+        if e.event_type == "health_probe_completed" and e.unit_id == "rhs"
+    )
+    assert probe_row.payload["consecutive_fail_nights"] == 1
+
+
+async def test_route_b_never_applies_to_a_nominal_unit_however_it_repeats() -> None:
+    """The route is scoped to the structurally-blind class: a ``nominal``
+    unit failing no-response every night for a week is one weak unit, not an
+    unobservable phase — no count of failures mints a mode write (§7.1's
+    'route B is deliberately scoped to the soft-note class')."""
+    audit = FakeAudit()
+    for nights_ago in range(1, 7):
+        audit.seeded.append(
+            probe_row_for("rhs", (NIGHT - timedelta(days=nights_ago)).date(),
+                          hw.PROBE_FAIL_NO_RESPONSE)
+        )
+    rig = Rig(history=FakeHistory(rows=evidence_rows()), audit=audit)
+
+    def rhs_stays_dead() -> None:
+        rig.observations.latest["rhs"].battery_watts = 20.0
+
+    await rig.run(each_tick=rhs_stays_dead)
+    assert rig.park.park_calls == []
+    row = rig.outcome_row("rhs")
+    assert row.payload["verdict"] is None
+    assert row.payload["eligibility"]["census"] == hw.CENSUS_NOMINAL
+    assert row.payload["eligibility"]["eligible"] is False
+    assert row.payload["eligibility"]["route"] is None
+    probe_row = next(
+        e
+        for e in rig.audit.appended
+        if e.event_type == "health_probe_completed" and e.unit_id == "rhs"
+    )
+    assert probe_row.payload["consecutive_fail_nights"] == 7
+
+
+async def test_route_b_a_pass_breaks_the_streak() -> None:
+    """Consecutive means night after night: a passing night between the
+    failures resets the repetition count, and eligibility waits for the full
+    run again."""
+    audit = FakeAudit(
+        seeded=[
+            probe_row_for("rhs", (NIGHT - timedelta(days=2)).date(),
+                          hw.PROBE_FAIL_NO_RESPONSE),
+            probe_row_for("rhs", (NIGHT - timedelta(days=1)).date(), hw.PROBE_PASS),
+        ]
+    )
+    rig = Rig(history=garage_history(), audit=audit)
+
+    def rhs_stays_dead() -> None:
+        rig.observations.latest["rhs"].battery_watts = 20.0
+
+    await rig.run(each_tick=rhs_stays_dead)
+    assert rig.park.park_calls == []
+    assert rig.outcome_row("rhs").payload["eligibility"]["route"] is None
+
+
+async def test_route_b_renders_its_advisory_in_the_advise_posture() -> None:
+    """Advise composes route B honestly too: the eligibility basis and the
+    route ride the ALERT-tier advisory row, and still nothing is written."""
+    audit = FakeAudit(
+        seeded=[probe_row_for("rhs", (NIGHT - timedelta(days=1)).date(),
+                              hw.PROBE_FAIL_NO_RESPONSE)]
+    )
+    rig = Rig(history=garage_history(), audit=audit, mode="advise")
+
+    def rhs_stays_dead() -> None:
+        rig.observations.latest["rhs"].battery_watts = 20.0
+
+    await rig.run(each_tick=rhs_stays_dead)
+    assert rig.park.park_calls == []
+    row = rig.outcome_row("rhs")
+    assert row.payload["verdict"] == hw.RECOVERY_ADVISED
+    assert row.payload["route"] == "b"
+    assert row.payload["posture"] == "advise"
+    assert rig.recovery_payload("rhs")["route"] == "b"
+
+
 # --- §7.2: the composite in the auto posture ----------------------------------------
 
 
@@ -416,9 +567,7 @@ async def test_the_full_auto_cycle_recovers_and_ends_disarmed_and_normal() -> No
     park_call = rig.park.park_calls[0]
     assert park_call["principal_subject"] == hw.HEALTH_ADVISER_PRINCIPAL
     assert park_call["lease_s"] == HOLD_S + 60
-    assert park_call["reason"] == (
-        "nightly health-watch recovery (census flag + probe no-response)"
-    )
+    assert park_call["reason"] == hw.PARK_REASON_ROUTE_A
     assert rig.park.resume_calls[0]["principal_subject"] == hw.HEALTH_ADVISER_PRINCIPAL
     # The verdict, its tier, and the honest figures.
     row = rig.outcome_row("rhs")
@@ -427,6 +576,8 @@ async def test_the_full_auto_cycle_recovers_and_ends_disarmed_and_normal() -> No
     assert row.payload["tier"] == hw.TIER_RESOLVED
     assert row.payload["rung"] == hw.RUNG_VERIFIED
     assert row.payload["posture"] == "auto"
+    assert row.payload["route"] == "a"
+    assert row.payload["eligibility"]["route"] == "a"
     assert row.payload["cycle"]["park"]["written_value"] == 1
     assert row.payload["cycle"]["resume"]["readback_word"] == 0
     assert row.payload["verification"]["verdict"] == hw.PROBE_PASS
@@ -799,8 +950,10 @@ async def test_the_advise_posture_renders_the_advisory_and_writes_nothing() -> N
     assert row.payload["walkthrough"] == hw.ADVISE_WALKTHROUGH
     assert row.payload["advisory"] == hw.RESTART_ADVISORY
     assert row.payload["eligibility"]["eligible"] is True
+    assert row.payload["eligibility"]["route"] == "a"
     payload = rig.recovery_payload("rhs")
     assert payload["mode"] == "advise"
+    assert payload["route"] == "a"
     assert payload["verdict"] == hw.RECOVERY_ADVISED
     # The not-eligible units still carry their honest null rows.
     assert rig.outcome_row("lhs").payload["verdict"] is None

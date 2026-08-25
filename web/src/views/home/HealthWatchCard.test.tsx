@@ -120,6 +120,33 @@ describe("the per-battery rows", () => {
     });
     expect(screen.getByText(/the program never arms/)).toBeInTheDocument();
   });
+
+  it("renders A16's soft note as the informational note it is", () => {
+    // The garage-phase shape: full, still, own-phase load ~0 while siblings
+    // flow — a NOTE (with its ct_link_suspect annotator and its age), never
+    // a flag chip, never alert styling, at any age.
+    renderCard({
+      units: [
+        {
+          unit_id: "rhs",
+          census: {
+            verdict: "phase_idle_or_ct_silent",
+            nights: 4,
+            predicates: null,
+            tier: "notice",
+            note: "ct_link_suspect",
+          },
+          probe: { verdict: "pass", probe_w: 300, qualifying_samples: 20, core_samples: 20 },
+          recovery: { mode: "uncommissioned" },
+        },
+      ],
+    });
+    const row = screen.getByLabelText("rhs health watch row");
+    expect(row).toHaveTextContent("idle phase or CT silent 4 nights · CT link suspect");
+    expect(row).toHaveAttribute("data-tier", "notice");
+    // A passing probe on a soft-note unit is a quiet night: no alert story.
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
 });
 
 describe("the alert styling and the advisories", () => {
@@ -211,6 +238,23 @@ describe("the recovery surface (§13, the Stage R wave)", () => {
     expect(screen.getByLabelText("rhs health watch row")).toHaveTextContent(
       /advisory rendered/,
     );
+  });
+
+  it("names route B's eligibility story on the advisory card (A16)", () => {
+    // The soft-note class made eligible by repetition: the advisory card
+    // says WHY the census's blindness stood aside for two probe failures.
+    renderCard(
+      stagedRecovery({ mode: "advise", verdict: "advised", tier: "alert", route: "b" }),
+    );
+    expect(screen.getByText(/eligible by route B/)).toHaveTextContent(
+      "cannot see this pod's phase",
+    );
+    // Route A (the standing conjunction) needs no extra line.
+    cleanup();
+    renderCard(
+      stagedRecovery({ mode: "advise", verdict: "advised", tier: "alert", route: "a" }),
+    );
+    expect(screen.queryByText(/eligible by route B/)).toBeNull();
   });
 
   it("renders the auto recovery morning: what the program did and the re-arm owed", () => {

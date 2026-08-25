@@ -1028,10 +1028,15 @@ class ParkingConfig(_FrozenModel):
 
 
 class HealthWatchStuckConfig(_FrozenModel):
-    """DESIGN_BATTERY_HEALTH_WATCH §5/§9: the census's stuck-signature knobs.
+    """DESIGN_BATTERY_HEALTH_WATCH §5/§9 (CONTRACT v1.2): the census's
+    stuck-signature knobs.
 
     Every threshold is its own key so a wrong one is discoverable in the
-    census row's predicate vector, never hidden inside a composite.
+    census row's predicate vector, never hidden inside a composite.  Since
+    A16 (v1.2) ``sibling_load_w`` is the SOFT note's sibling-load context
+    (``phase_idle_or_ct_silent``) — the flagging predicate S4' is
+    phase-relative, and no cross-pod comparison can render
+    ``stuck_suspected``.
     """
 
     evidence_window_h: Annotated[StrictInt, Field(ge=1, le=48)] = 6
@@ -1044,8 +1049,17 @@ class HealthWatchStuckConfig(_FrozenModel):
     sibling_flow_w: PositiveStrictInt = 500
     flow_frac: Annotated[StrictFloat, Field(gt=0, le=1)] = 0.5
     load_floor_w: PositiveStrictInt = 30
+    # A16: the load above which a sibling counts as carrying while the unit's
+    # own word reads idle — the soft note's context, never a flag's input.
     sibling_load_w: PositiveStrictInt = 100
     load_frac: Annotated[StrictFloat, Field(gt=0, le=1)] = 0.8
+    # A16: has this unit's CT word EVER moved in the trailing window?  The
+    # dead-link-vs-idle-phase annotator behind the soft note's
+    # ``ct_link_suspect``; >= evidence_window_h (a liveliness window shorter
+    # than the evidence window is nonsense) and within the historian's
+    # full-resolution retention (one beyond retention is unknowable — the
+    # cross-check lives on ControllerConfig beside the block it reads).
+    phase_live_window_h: Annotated[StrictInt, Field(ge=1, le=8760)] = 168
     # §5/A9: notice -> alert promotion after this many consecutive stuck
     # nights (one noisy night is evidence, two is a pattern; >= 1).
     flag_persistence_nights: Annotated[StrictInt, Field(ge=1, le=90)] = 2
@@ -1063,6 +1077,18 @@ class HealthWatchStuckConfig(_FrozenModel):
                 "the S1 continuous-hours test cannot demand a longer horizon than "
                 "the historian lookback it is judged over — equality (the 6 = 6 "
                 "defaults) is intended and allowed"
+            )
+        # A16: the annotator's trailing window must cover the evidence window
+        # it annotates — a liveliness window shorter than the evidence window
+        # would judge "has this word EVER moved" over LESS history than the
+        # census already read.
+        if self.phase_live_window_h < self.evidence_window_h:
+            raise ValueError(
+                "battery_health_watch.stuck.phase_live_window_h must be at least "
+                f"evidence_window_h ({self.phase_live_window_h} < {self.evidence_window_h})"
+                ": the ct_link_suspect annotator's trailing liveliness window cannot "
+                "be shorter than the evidence window it annotates (A16) — widen it to "
+                "the span the dead-link-vs-idle-phase discriminator needs"
             )
         return self
 
@@ -1119,6 +1145,23 @@ class HealthWatchRecoveryConfig(_FrozenModel):
     mode: Literal["advise", "auto"] = "advise"
     hold_s: Annotated[StrictInt, Field(ge=60, le=120)] = 90
     consecutive_fail_limit: Annotated[StrictInt, Field(ge=1, le=90)] = 3
+    # A16 route B: consecutive ``fail_no_response`` probe nights that make a
+    # ``phase_idle_or_ct_silent`` unit R-eligible WITHOUT a census flag.
+    probe_fail_nights: Annotated[StrictInt, Field(ge=1, le=90)] = 2
+
+    @model_validator(mode="after")
+    def validate_route_b_nights(self) -> Self:
+        # A16: a single night NEVER suffices on route B — repetition is the
+        # substitute for the census half the census structurally cannot see,
+        # and one night is a re-run of the same line, not a second one.
+        if self.probe_fail_nights < 2:
+            raise ValueError(
+                "battery_health_watch.recovery.probe_fail_nights must be at least "
+                f"2 (got {self.probe_fail_nights}): route B's consecutive probe "
+                "failures substitute for the missing census half, and a single "
+                "night NEVER suffices (A16)"
+            )
+        return self
     # A6: mode auto requires a supervised-verification receipt (a
     # docs/evidence/ path, the §16 step-5 file) for EVERY fleet unit, or the
     # literal "excluded" for a unit that stays advise.  Shape validated here;
@@ -2295,6 +2338,22 @@ class ControllerConfig(_FrozenModel):
                 "deliberately NO degrade-to-single-instant path (a one-look stuck "
                 "verdict is the refused direction)"
             )
+        history = values.get("plant_history")
+        if history is not None:
+            retention_h = history.retention_full_resolution_days * 24
+            if watch.stuck.phase_live_window_h > retention_h:
+                # A16: a liveliness window beyond the historian's
+                # full-resolution retention is unknowable — the annotator
+                # would read evicted rows as a never-moving word and mint a
+                # false ``ct_link_suspect`` against a blank.
+                raise ValueError(
+                    "battery_health_watch.stuck.phase_live_window_h must stay "
+                    "within the plant_history full-resolution retention "
+                    f"({watch.stuck.phase_live_window_h} h > {retention_h} h = "
+                    f"{history.retention_full_resolution_days} days): the "
+                    "ct_link_suspect annotator would read already-rolled-up "
+                    "history as a CT word that never moved (A16)"
+                )
         if "probe" in watch.stages:
             if values.get("mode") is not ControllerMode.WRITE_ENABLED:
                 raise ValueError(

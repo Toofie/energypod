@@ -1,6 +1,6 @@
 """The nightly battery health watch — Stages C (census), P (probe), R (recovery).
 
-DESIGN_BATTERY_HEALTH_WATCH (CONTRACT v1.1) §4/§5/§6/§7.  A ``HealthWatchController``
+DESIGN_BATTERY_HEALTH_WATCH (CONTRACT v1.2) §4/§5/§6/§7.  A ``HealthWatchController``
 composed exactly when the ``battery_health_watch:`` block is PRESENT, ticking
 once per fleet cycle inside the existing bounded supervision pass (no new task
 class), carrying a small per-night phase machine::
@@ -22,7 +22,15 @@ What this module is, pinned:
   writes, ever: every word it judges (mode words, CT words, SoC, battery
   watts) comes from the standing observation stream or the telemetry
   historian through injected ports (the load-baseline pattern — no
-  application import of adapters).
+  application import of adapters).  Since A16 (v1.2) the S4 predicate is
+  PHASE-RELATIVE — S4' in-phase non-following: the unit's OWN CT word shows
+  load above the floor while its battery stays still; NO cross-pod
+  comparison flags a unit (the house load concentrates on ~1.5 of 3 phases,
+  and a pod on the idle phase legitimately reads ~0 CT while siblings
+  serve).  The retired cross-pod shape renders as the SOFT note
+  ``phase_idle_or_ct_silent`` — informational at every age, never a flag,
+  never promoting — annotated ``ct_link_suspect`` when the unit's CT word
+  has never moved in the trailing ``phase_live_window_h``.
 - **Stage P (§6) is ordinary dispatch traffic, not a new write path.**  The
   probe submits short-TTL ``OPTIMIZER`` discharge intents under the composed
   automation principal ``energypod:health-adviser`` through the internal
@@ -35,12 +43,15 @@ What this module is, pinned:
   its own), the disarm and the ONE bounded verification re-arm ride the
   facade's internal twins under the health principal, and in the ``advise``
   posture NONE of it runs: no disarm, no park, no re-arm, ever, on any night.
-  Eligibility is the §7.1 conjunction — census ``stuck_suspected`` AND probe
-  ``fail_no_response`` — and NO ladder state (``actuation_incoherent``
-  included, I10) is ever a trigger.  One cycle per unit per civil night;
-  never a second attempt after any terminal outcome (I1); no write after an
-  ACKed-but-unverified one (I3); the unit ends disarmed-and-Normal or the
-  program alerts that it could not (I9).
+  Eligibility is §7.1's two routes — route A, the conjunction (census
+  ``stuck_suspected`` AND probe ``fail_no_response``), or route B (A16: the
+  soft note ``phase_idle_or_ct_silent`` AND ``probe_fail_nights`` consecutive
+  ``fail_no_response`` nights, repetition substituting for the census half the
+  census structurally cannot see) — and NO ladder state
+  (``actuation_incoherent`` included, I10) is ever a trigger.  One cycle per
+  unit per civil night; never a second attempt after any terminal outcome
+  (I1); no write after an ACKed-but-unverified one (I3); the unit ends
+  disarmed-and-Normal or the program alerts that it could not (I9).
 - **Once per civil night, crash-safe and crash-honest at every arrow** (§4).
 
 The export honesty note (§6.3): on a quiet house the probe's 300 W discharge
@@ -90,13 +101,22 @@ ECHO_OBJECTIVE_NOT_SERVED: Final[str] = "objective_not_served"
 ECHO_UNREADABLE: Final[str] = "echo_unreadable"
 
 # The verdict vocabulary (§5/§6.3).  Census: nominal | stuck_suspected |
-# degraded_evidence | excluded:<class>.  Probe: pass | fail_no_response |
-# fail_partial | fail_baseline_not_returned | inconclusive_echo_mismatch |
-# inconclusive_baseline_confounded | inconclusive_preempted |
-# inconclusive_aborted | skipped:<reason>.
+# phase_idle_or_ct_silent | degraded_evidence | excluded:<class>.  Probe:
+# pass | fail_no_response | fail_partial | fail_baseline_not_returned |
+# inconclusive_echo_mismatch | inconclusive_baseline_confounded |
+# inconclusive_preempted | inconclusive_aborted | skipped:<reason>.
 CENSUS_NOMINAL: Final[str] = "nominal"
 CENSUS_STUCK: Final[str] = "stuck_suspected"
+# A16's SOFT informational note — NEVER a flag, never promoting: the retired
+# cross-pod shape (own CT word at/below the floor across the window while a
+# sibling carries load), which the census CANNOT tell apart from an idle
+# phase (the only per-phase load measurement is the suspect word itself).
+CENSUS_PHASE_IDLE_OR_CT_SILENT: Final[str] = "phase_idle_or_ct_silent"
 CENSUS_DEGRADED: Final[str] = "degraded_evidence"
+# The note's dead-link-vs-idle-phase annotator (A16): a word that has NEVER
+# exceeded the load floor in the trailing phase-live window annotates the
+# note; one that moves clears it.
+CENSUS_NOTE_CT_LINK_SUSPECT: Final[str] = "ct_link_suspect"
 
 PROBE_PASS: Final[str] = "pass"  # noqa: S105 -- a verdict word, not a secret
 PROBE_FAIL_NO_RESPONSE: Final[str] = "fail_no_response"
@@ -188,6 +208,14 @@ BMU_CROSS_CHECK_NOTE: Final[str] = (
 )
 # §7.2's advise posture: the exact operator sequence the alert names.
 ADVISE_WALKTHROUGH: Final[str] = "disarm → park → resume → re-arm → verify"
+# §7.2 step 3's park reason names its OWN eligibility basis: route A's
+# conjunction (the pinned v1.1 text) or route B's repetition (A16).
+PARK_REASON_ROUTE_A: Final[str] = (
+    "nightly health-watch recovery (census flag + probe no-response)"
+)
+PARK_REASON_ROUTE_B: Final[str] = (
+    "nightly health-watch recovery (phase-idle note + repeated probe no-response)"
+)
 
 # The audit scan bound for the durable-row derivations (once-per-night,
 # persistence streaks, the interrupted-program reconstruction): the parking
@@ -268,7 +296,14 @@ HEALTH_WATCH_NOT_COMMISSIONED: Final[str] = "health_watch_not_commissioned"
 
 @dataclass(frozen=True, slots=True)
 class StuckSettings:
-    """§5's stuck-signature thresholds (the ``stuck:`` block)."""
+    """§5's stuck-signature thresholds (the ``stuck:`` block).
+
+    Since A16 (v1.2) ``sibling_load_w`` is the SOFT note's sibling-load
+    context — the load above which a sibling counts as carrying while the
+    unit's own word reads idle — never a flagging input: the flagging
+    predicate S4' is phase-relative (the unit's OWN CT word), and no
+    cross-pod comparison can render ``stuck_suspected``.
+    """
 
     evidence_window_h: int = 6
     soc_floor_pct: float = 95.0
@@ -282,6 +317,11 @@ class StuckSettings:
     load_floor_w: int = 30
     sibling_load_w: int = 100
     load_frac: float = 0.8
+    # A16: the trailing window the ct_link_suspect annotator reads — has the
+    # unit's CT word EVER exceeded the load floor?  A dead link never moves,
+    # an idle phase does; >= evidence_window_h (validated), within the
+    # historian's full-resolution retention.
+    phase_live_window_h: int = 168
     flag_persistence_nights: int = 2
 
 
@@ -303,11 +343,19 @@ class ProbeSettings:
 
 @dataclass(frozen=True, slots=True)
 class RecoverySettings:
-    """§7/§9's recovery keys (the ``recovery:`` block)."""
+    """§7/§9's recovery keys (the ``recovery:`` block).
+
+    ``probe_fail_nights`` (A16, route B): the number of CONSECUTIVE
+    ``fail_no_response`` probe nights that make a soft-note unit R-eligible
+    WITHOUT a census flag — >= 2 always (a single night never suffices;
+    repetition substitutes for the census half the census structurally
+    cannot see).
+    """
 
     mode: str = "advise"  # advise | auto
     hold_s: int = 90
     consecutive_fail_limit: int = 3
+    probe_fail_nights: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,6 +507,13 @@ class CensusFigures:
     window of exactly that length can never span more than the window
     (samples are instants inside it) — equality (the 6 = 6 defaults) must
     be reachable, and §9 pins that it is intended.
+
+    ``load_unserved_frac`` is S4' (A16): the share of the unit's own
+    load-bearing samples where its OWN CT word reads above the load floor
+    while its battery stays still — phase-relative, no cross-pod term.
+    ``phase_idle_frac`` is the RETIRED cross-pod shape's own share (the
+    unit's word at/below the floor while a sibling carries load) — the
+    soft note's input, never a flag's.
     """
 
     samples: int = 0
@@ -467,7 +522,8 @@ class CensusFigures:
     soc_full_longest_run_s: float = 0.0
     still_frac: float = 0.0
     house_needed_frac: float = 0.0
-    no_ct_view_frac: float = 0.0
+    load_unserved_frac: float = 0.0
+    phase_idle_frac: float = 0.0
     modes_normal: bool = True
 
 
@@ -475,7 +531,10 @@ def stuck_predicates(figures: CensusFigures, settings: StuckSettings) -> dict[st
     """§5's five predicates over one unit's evidence-window figures.
 
     ALL must hold for ``stuck_suspected``; the row records the full vector so
-    a wrong threshold is discoverable, not hidden.
+    a wrong threshold is discoverable, not hidden.  S4' is A16's in-phase
+    non-following — self-contained and phase-relative: a unit whose OWN CT
+    word never exceeds the load floor can never satisfy it, whatever its
+    siblings do (the garage-phase pin).
     """
     horizon_s = settings.min_soc_hours * 3600.0
     return {
@@ -483,17 +542,37 @@ def stuck_predicates(figures: CensusFigures, settings: StuckSettings) -> dict[st
         and figures.soc_full_longest_run_s + figures.sample_interval_s >= horizon_s,
         "still": figures.still_frac >= settings.still_frac,
         "house_needed": figures.house_needed_frac >= settings.flow_frac,
-        "no_ct_view": figures.no_ct_view_frac >= settings.load_frac,
+        "load_unserved_in_phase": figures.load_unserved_frac >= settings.load_frac,
         "modes_normal": figures.modes_normal,
     }
 
 
-def census_verdict(predicates: Mapping[str, bool], *, degraded: bool) -> str:
-    """nominal | stuck_suspected | degraded_evidence (excluded is decided upstream)."""
+def census_verdict(
+    predicates: Mapping[str, bool], *, degraded: bool, phase_idle: bool = False
+) -> str:
+    """nominal | stuck_suspected | phase_idle_or_ct_silent | degraded_evidence.
+
+    ``excluded:<class>`` is decided upstream.  The soft note (A16) is NOT a
+    flag: it renders only where the stuck conjunction failed, S1 + S2 hold
+    (with S5 — a window that carries a nonzero mode word is another surface's
+    state, and the census never re-classifies another surface's state), and
+    the retired cross-pod shape's own share held — the unit's word
+    at/below the floor across the window while a sibling carried load.  The
+    census cannot tell an idle phase from a dead CT link (the only
+    per-phase load measurement is the suspect word itself), so it says
+    exactly that, at the notice tier, at every age.
+    """
     if degraded:
         return CENSUS_DEGRADED
     if all(predicates.values()):
         return CENSUS_STUCK
+    if (
+        phase_idle
+        and predicates.get("full", False)
+        and predicates.get("still", False)
+        and predicates.get("modes_normal", False)
+    ):
+        return CENSUS_PHASE_IDLE_OR_CT_SILENT
     return CENSUS_NOMINAL
 
 
@@ -614,6 +693,10 @@ class _CensusOutcome:
     excluded_class: str | None = None
     soc_flagged: bool = False
     samples: int = 0
+    # The soft note's ct_link_suspect annotator (A16): set only on a
+    # phase_idle_or_ct_silent verdict — a CT word that has NEVER moved in
+    # the trailing phase-live window; a word that moved clears it.
+    note: str | None = None
 
 
 @dataclass(slots=True)
@@ -627,6 +710,9 @@ class _ProbeOutcome:
     returned_to_baseline: bool | None = None
     final_w: float | None = None
     demand_move_w: float | None = None
+    # A16 route B's repetition evidence, tonight included: consecutive
+    # fail_no_response nights for this unit (0 on any other verdict).
+    consecutive_fail_nights: int = 0
 
 
 @dataclass(slots=True)
@@ -674,6 +760,9 @@ class _RecoveryOutcome:
     verdict: str | None
     tier: str = TIER_NOTICE
     posture: str = "advise"
+    # §7.1's route when eligible: "a" (the conjunction) or "b" (A16's
+    # unobservable-phase repetition); None on not-eligible nights.
+    route: str | None = None
     reason: str | None = None
     rung: str | None = None
     codes: tuple[str, ...] = ()
@@ -697,6 +786,9 @@ class _RecoveryLeg:
 
     unit_id: str
     step: str = "reverify"  # reverify|disarm|park|hold|resume|rearm|verify|disarm_after
+    # The §7.1 route that made the unit eligible ("a" | "b") — the park
+    # reason names its own basis.
+    route: str | None = None
     step_started_mono: float = 0.0
     reissued: bool = False
     write_attempted: bool = False
@@ -796,6 +888,10 @@ class HealthWatchController:
         self._program_reason: str | None = None
         self._census: dict[str, _CensusOutcome] = {}
         self._probe: dict[str, _ProbeOutcome] = {}
+        # Route B's prior-night repetition evidence (A16): consecutive
+        # fail_no_response probe nights BEFORE tonight, per unit, from the
+        # durable rows — refreshed at census time, read at recovery time.
+        self._prior_probe_fails: dict[str, int] = {}
         self._probe_order: tuple[str, ...] = ()
         self._probe_index = 0
         self._leg: _ProbeLeg | None = None
@@ -847,6 +943,7 @@ class HealthWatchController:
         self._program_reason = None
         self._census = {}
         self._probe = {}
+        self._prior_probe_fails = {}
         self._probe_order = ()
         self._probe_index = 0
         self._leg = None
@@ -931,7 +1028,11 @@ class HealthWatchController:
         parked = self._parked_view()
         stopped = self._latched_view()
         socs = self._fleet_socs(latest)
-        streaks = await self._stuck_streaks(self._night or wall.date())
+        streaks = await self._census_streaks(self._night or wall.date())
+        if "probe" in settings.stages:
+            # Route B's repetition half (A16) derives from the durable rows
+            # once per night, before tonight's own verdicts land.
+            self._prior_probe_fails = await self._probe_fail_streaks(self._night or wall.date())
         if "recovery" in settings.stages:
             # A11's morning figures derive from the durable outcome rows;
             # computed here so the projection carries them from the window's
@@ -946,17 +1047,24 @@ class HealthWatchController:
                 parked=unit_id in parked,
                 stopped=unit_id in stopped,
                 fleet_socs=socs,
-                streak=streaks.get(unit_id, 0),
+                streaks=streaks,
                 now_mono=float(self._clock.monotonic()),
             )
+            if outcome.verdict == CENSUS_PHASE_IDLE_OR_CT_SILENT:
+                # A16's dead-link-vs-idle-phase annotator reads the trailing
+                # phase-live window (one historian query, the note's own).
+                outcome.note = self._ct_link_note(unit_id, wall)
             self._census[unit_id] = outcome
             await self._record_census_row(wall, unit_id, outcome)
         if "probe" in settings.stages:
-            # §6.1: fixed sorted order, strictly one at a time.
+            # §6.1: fixed sorted order, strictly one at a time.  The soft
+            # note hands off to Stage P — the commanded probe is the only
+            # test that sees through BOTH of the note's hypotheses (§5).
             self._probe_order = tuple(
                 unit_id
                 for unit_id in sorted(settings.unit_ids)
-                if self._census[unit_id].verdict in {CENSUS_NOMINAL, CENSUS_STUCK}
+                if self._census[unit_id].verdict
+                in {CENSUS_NOMINAL, CENSUS_STUCK, CENSUS_PHASE_IDLE_OR_CT_SILENT}
             )
             self._probe_index = 0
             self._phase = "probe"
@@ -978,7 +1086,7 @@ class HealthWatchController:
         parked: bool,
         stopped: bool,
         fleet_socs: Mapping[str, float],
-        streak: int,
+        streaks: Mapping[str, Mapping[str, int]],
         now_mono: float,
     ) -> _CensusOutcome:
         stuck = self._settings.stuck
@@ -994,7 +1102,11 @@ class HealthWatchController:
             return _CensusOutcome(verdict=f"excluded:{excluded}", excluded_class=excluded)
         figures, degraded = self._evidence_figures(unit_id, rows)
         predicates = stuck_predicates(figures, stuck)
-        verdict = census_verdict(predicates, degraded=degraded)
+        verdict = census_verdict(
+            predicates,
+            degraded=degraded,
+            phase_idle=figures.phase_idle_frac >= stuck.load_frac,
+        )
         soc = _finite(getattr(latest, "authoritative_soc_pct", None))
         flagged = False
         if soc is not None:
@@ -1003,12 +1115,22 @@ class HealthWatchController:
                 self._policy.max_soc_disagreement_pct
             ):
                 flagged = True
-        nights = streak + 1 if verdict == CENSUS_STUCK else 0
+        # The tracked streaks: the flag's promotion arithmetic and the note's
+        # own age (informational at every age — the note NEVER promotes).
+        nights = 0
+        if verdict in {CENSUS_STUCK, CENSUS_PHASE_IDLE_OR_CT_SILENT}:
+            nights = streaks.get(verdict, {}).get(unit_id, 0) + 1
         return _CensusOutcome(
             verdict=verdict,
-            tier=census_tier(nights, stuck.flag_persistence_nights),
+            tier=(
+                census_tier(nights, stuck.flag_persistence_nights)
+                if verdict == CENSUS_STUCK
+                else TIER_NOTICE
+            ),
             nights=nights,
-            predicates=None if verdict != CENSUS_STUCK else dict(predicates),
+            predicates=None
+            if verdict not in {CENSUS_STUCK, CENSUS_PHASE_IDLE_OR_CT_SILENT}
+            else dict(predicates),
             soc_flagged=flagged,
             samples=figures.samples,
         )
@@ -1057,9 +1179,15 @@ class HealthWatchController:
     def _evidence_figures(self, unit_id: str, rows: Sequence[Any]) -> tuple[CensusFigures, bool]:
         """§5's predicate figures over the historian rows (S1-S5).
 
-        The fleet predicates (S3/S4) join per timestamp: a sample where the
-        unit or every sibling lacks a row is EXCLUDED from that predicate's
-        own denominator — never interpolated, never zero-filled.
+        The fleet predicates join per timestamp: a sample where the unit or
+        every sibling lacks a row is EXCLUDED from that predicate's own
+        denominator — never interpolated, never zero-filled.  Since A16 the
+        two load-word shapes are judged on the unit's OWN word: S4' counts a
+        sample only when that word reads ABOVE the floor while the battery
+        stays still (in-phase non-following), and the retired cross-pod
+        shape's share (own word at/below the floor while a sibling carries)
+        feeds the soft note alone — neither can flag a pod whose own phase
+        is legitimately idle.
         """
         stuck = self._settings.stuck
         fleet_ids = frozenset(self._settings.unit_ids)
@@ -1082,8 +1210,9 @@ class HealthWatchController:
         run_start: Any = None
         house_needed = 0
         flow_denom = 0
-        no_ct_view = 0
-        ct_denom = 0
+        load_unserved = 0
+        phase_idle = 0
+        load_denom = 0
         for row in unit_rows:
             soc = _finite(getattr(row, "bms_soc_pct", None))
             if soc is None:
@@ -1138,9 +1267,15 @@ class HealthWatchController:
                     (_finite(getattr(other, "load_power_w", None)) or 0.0) > stuck.sibling_load_w
                     for other in siblings
                 )
-                ct_denom += 1
-                if sibling_load and unit_load < stuck.load_floor_w:
-                    no_ct_view += 1
+                load_denom += 1
+                if unit_load > stuck.load_floor_w and abs(watts) < stuck.still_w:
+                    # S4' (A16): load EXISTS on the unit's OWN phase while
+                    # its battery stays still — in-phase non-following.
+                    load_unserved += 1
+                if sibling_load and unit_load <= stuck.load_floor_w:
+                    # The retired cross-pod shape: the soft note's own input,
+                    # never a flag's.
+                    phase_idle += 1
         degraded = usable < _EVIDENCE_COVERAGE_FLOOR * expected
         figures = CensusFigures(
             samples=usable,
@@ -1149,7 +1284,8 @@ class HealthWatchController:
             soc_full_longest_run_s=longest_run_s,
             still_frac=still / usable if usable else 0.0,
             house_needed_frac=house_needed / flow_denom if flow_denom else 0.0,
-            no_ct_view_frac=no_ct_view / ct_denom if ct_denom else 0.0,
+            load_unserved_frac=load_unserved / load_denom if load_denom else 0.0,
+            phase_idle_frac=phase_idle / load_denom if load_denom else 0.0,
             modes_normal=modes_normal,
         )
         return figures, degraded
@@ -1177,7 +1313,11 @@ class HealthWatchController:
             census = self._census.get(unit_id)
             if census is None:
                 continue
-            if census.verdict not in {CENSUS_NOMINAL, CENSUS_STUCK}:
+            if census.verdict not in {
+                CENSUS_NOMINAL,
+                CENSUS_STUCK,
+                CENSUS_PHASE_IDLE_OR_CT_SILENT,
+            }:
                 reason = (
                     SKIP_CENSUS_DEGRADED
                     if census.verdict == CENSUS_DEGRADED
@@ -1536,6 +1676,10 @@ class HealthWatchController:
             await self._complete_verification(wall, leg, outcome, reason_codes=reason_codes)
             return
         self._probe[leg.unit_id] = outcome
+        if outcome.verdict == PROBE_FAIL_NO_RESPONSE:
+            # A16 route B's live figure: the durable prior streak plus
+            # tonight (any other verdict renders an honest 0).
+            outcome.consecutive_fail_nights = self._prior_probe_fails.get(leg.unit_id, 0) + 1
         codes: tuple[str, ...] = (
             reason_codes if reason_codes else (outcome.verdict or "recorded",)
         )
@@ -1594,24 +1738,41 @@ class HealthWatchController:
             return "auto"
         return "advise"
 
-    def _recovery_eligible(self, unit_id: str) -> bool:
-        """§7.1's conjunction, deliberately conservative.
+    def _recovery_route(self, unit_id: str) -> str | None:
+        """§7.1's two eligibility routes, deliberately conservative.
 
-        Census ``stuck_suspected`` AND that unit's probe ``fail_no_response``
-        — the vendor's own two-condition rule made structural.  A probe
-        failure without a census flag, a census flag without the probe
-        failure, a skipped or inconclusive probe: all NOT eligible (the
+        Route A — the conjunction: census ``stuck_suspected`` that night AND
+        probe ``fail_no_response`` that night (the vendor's own two-condition
+        rule made structural).  Route B — A16's unobservable phase: census
+        ``phase_idle_or_ct_silent`` AND ``fail_no_response`` on >=
+        ``probe_fail_nights`` CONSECUTIVE nights — for a pod whose phase the
+        census structurally cannot see, the commanded probe is the only
+        spectator test that exists, and REPETITION substitutes for the
+        missing census half.  A probe failure on a ``nominal`` unit is one
+        weak night — never eligible on ANY count: the route is scoped to the
+        structurally-blind class, not to wherever the census simply did not
+        fire.  A skipped or inconclusive probe, a census flag without the
+        probe failure, a degraded or excluded census: all NOT eligible (the
         evidence is incomplete, and an incomplete case never mints a mode
         write).  Per I10, no ladder state is consulted at all.
         """
         census = self._census.get(unit_id)
         probe = self._probe.get(unit_id)
-        return (
-            census is not None
-            and census.verdict == CENSUS_STUCK
-            and probe is not None
-            and probe.verdict == PROBE_FAIL_NO_RESPONSE
-        )
+        if probe is None or probe.verdict != PROBE_FAIL_NO_RESPONSE:
+            return None
+        if census is None:
+            return None
+        if census.verdict == CENSUS_STUCK:
+            return "a"
+        if census.verdict == CENSUS_PHASE_IDLE_OR_CT_SILENT:
+            prior = self._prior_probe_fails.get(unit_id, 0)
+            if prior + 1 >= self._settings.recovery.probe_fail_nights:
+                return "b"
+        return None
+
+    def _recovery_eligible(self, unit_id: str) -> bool:
+        """Whether either §7.1 route holds for this unit tonight."""
+        return self._recovery_route(unit_id) is not None
 
     async def _advance_recovery(self, wall: datetime) -> None:
         """The recovery phase: record every unit's honest outcome, cycle the
@@ -1626,6 +1787,7 @@ class HealthWatchController:
             if census is None or probe is None:
                 continue
             eligible = self._recovery_eligible(unit_id)
+            route = self._recovery_route(unit_id)
             posture = self._recovery_posture(unit_id)
             if not eligible:
                 # I11: never silence — the basis rides the row, verdict null
@@ -1633,7 +1795,7 @@ class HealthWatchController:
                 await self._record_recovery_outcome(
                     wall,
                     unit_id,
-                    _RecoveryOutcome(verdict=None, posture=posture),
+                    _RecoveryOutcome(verdict=None, posture=posture, route=route),
                 )
             elif posture == "advise":
                 # §7.2's advise posture: a REAL posture, not a stub — the
@@ -1647,6 +1809,7 @@ class HealthWatchController:
                         verdict=RECOVERY_ADVISED,
                         tier=TIER_ALERT,
                         posture=posture,
+                        route=route,
                         reason=ADVISE_WALKTHROUGH,
                     ),
                 )
@@ -1666,6 +1829,7 @@ class HealthWatchController:
                         verdict=RECOVERY_ADVISORY_ONLY,
                         tier=TIER_ALERT,
                         posture=posture,
+                        route=route,
                         reason="consecutive_fail_limit reached — advisory-only until acknowledged",
                     ),
                 )
@@ -1681,7 +1845,7 @@ class HealthWatchController:
                 self._phase = "done"
                 return
             unit_id = self._recovery_order[self._recovery_index]
-            leg = _RecoveryLeg(unit_id=unit_id)
+            leg = _RecoveryLeg(unit_id=unit_id, route=self._recovery_route(unit_id))
             leg.step_started_mono = now_mono
             self._recovery_leg = leg
             return
@@ -1756,7 +1920,9 @@ class HealthWatchController:
                 result = await control.park(
                     unit_id,
                     reason=(
-                        "nightly health-watch recovery (census flag + probe no-response)"
+                        PARK_REASON_ROUTE_A
+                        if leg.route != "b"
+                        else PARK_REASON_ROUTE_B
                     ),
                     principal_subject=HEALTH_ADVISER_PRINCIPAL,
                     request_id=f"health-recovery:{unit_id}:{self._night}",
@@ -2113,6 +2279,7 @@ class HealthWatchController:
             verdict=verdict,
             tier=tier,
             posture=posture,
+            route=leg.route,
             reason=reason,
             rung=rung,
             codes=tuple(reason_codes) or (verdict or "not_eligible",),
@@ -2160,10 +2327,12 @@ class HealthWatchController:
             "verdict": outcome.verdict,
             "tier": outcome.tier,
             "posture": outcome.posture,
+            "route": outcome.route,
             "eligibility": {
                 "census": None if census is None else census.verdict,
                 "probe": None if probe is None else probe.verdict,
                 "eligible": self._recovery_eligible(unit_id),
+                "route": self._recovery_route(unit_id),
             },
             "reason": outcome.reason,
             "rung": outcome.rung,
@@ -2300,17 +2469,20 @@ class HealthWatchController:
         complete = bool(attempt_units) and set(self._settings.unit_ids) <= last_stage_rows
         return attempt_units, complete
 
-    async def _stuck_streaks(self, night: date) -> dict[str, int]:
-        """Consecutive prior stuck nights per unit, from durable rows (§5).
+    async def _census_streaks(self, night: date) -> dict[str, dict[str, int]]:
+        """Consecutive prior nights per unit for each tracked census verdict
+        (§5), from durable rows: the ``stuck_suspected`` flag's promotion
+        arithmetic and the soft note's own age (informational at every age,
+        never promoting — carried so the operator sees the pattern forming).
 
         Tonight's own rows are excluded (the streak counts the nights BEFORE
         this one); an evicted window undercounts — the honest, conservative
         direction (notice where alert cannot be proven).
         """
-        rows = await self._recent_health_rows()
-        stuck_nights: dict[str, set[date]] = {}
+        tracked = (CENSUS_STUCK, CENSUS_PHASE_IDLE_OR_CT_SILENT)
+        held: dict[str, dict[str, set[date]]] = {word: {} for word in tracked}
         census_nights: set[date] = set()
-        for row in rows:
+        for row in await self._recent_health_rows():
             payload = getattr(row, "payload", None)
             if not isinstance(payload, Mapping):
                 continue
@@ -2323,21 +2495,93 @@ class HealthWatchController:
                 continue
             if night_date >= night:
                 continue
-            if row.event_type == "health_census_recorded":
-                census_nights.add(night_date)
-                if payload.get("verdict") == CENSUS_STUCK:
-                    unit_id = getattr(row, "unit_id", None)
-                    if isinstance(unit_id, str):
-                        stuck_nights.setdefault(unit_id, set()).add(night_date)
+            if getattr(row, "event_type", "") != "health_census_recorded":
+                continue
+            census_nights.add(night_date)
+            verdict = payload.get("verdict")
+            if verdict in held:
+                unit_id = getattr(row, "unit_id", None)
+                if isinstance(unit_id, str):
+                    held[verdict].setdefault(unit_id, set()).add(night_date)
+        streaks: dict[str, dict[str, int]] = {word: {} for word in tracked}
+        for verdict, by_unit in held.items():
+            for unit_id, nights_held in by_unit.items():
+                streak = 0
+                cursor = night - timedelta(days=1)
+                while cursor in nights_held and cursor in census_nights:
+                    streak += 1
+                    cursor -= timedelta(days=1)
+                streaks[verdict][unit_id] = streak
+        return streaks
+
+    async def _probe_fail_streaks(self, night: date) -> dict[str, int]:
+        """Route B's repetition evidence (§7.1/A16): consecutive PRIOR nights
+        whose probe verdict was ``fail_no_response``, per unit.
+
+        A night with any other probe verdict breaks the streak (the evidence
+        changed), and so does a night with no probe row at all — consecutive
+        means night after night, and route B substitutes repetition for the
+        census half, so a gap is a missing second line, never an assumed one.
+        """
+        failed: dict[str, set[date]] = {}
+        for row in await self._recent_health_rows():
+            payload = getattr(row, "payload", None)
+            if not isinstance(payload, Mapping):
+                continue
+            if getattr(row, "event_type", "") != "health_probe_completed":
+                continue
+            if payload.get("verdict") != PROBE_FAIL_NO_RESPONSE:
+                continue
+            row_night = payload.get("night")
+            if not isinstance(row_night, str):
+                continue
+            try:
+                night_date = date.fromisoformat(row_night)
+            except ValueError:
+                continue
+            if night_date >= night:
+                continue
+            unit_id = getattr(row, "unit_id", None)
+            if isinstance(unit_id, str):
+                failed.setdefault(unit_id, set()).add(night_date)
         streaks: dict[str, int] = {}
-        for unit_id, nights_stuck in stuck_nights.items():
+        for unit_id, nights_failed in failed.items():
             streak = 0
             cursor = night - timedelta(days=1)
-            while cursor in nights_stuck and cursor in census_nights:
+            while cursor in nights_failed:
                 streak += 1
                 cursor -= timedelta(days=1)
             streaks[unit_id] = streak
         return streaks
+
+    def _ct_link_note(self, unit_id: str, wall: datetime) -> str | None:
+        """A16's dead-link-vs-idle-phase annotator, for one soft-note unit.
+
+        Has the unit's CT word EVER exceeded the load floor in the trailing
+        ``phase_live_window_h``?  A word that never moved annotates the note
+        ``ct_link_suspect`` (a dead link — the vendor's meter-comms warning
+        class); a word that moved clears it (an idle phase, used when its
+        circuits are).  No rows at all is UNJUDGEABLE, not suspect — an
+        honest blank, never a fabricated annotation in either direction.
+        One historian query, only for a unit the census just soft-noted.
+        """
+        stuck = self._settings.stuck
+        window_s = stuck.phase_live_window_h * 3600.0
+        to_at = wall.astimezone(UTC)
+        rows: tuple[Any, ...] = ()
+        with contextlib.suppress(Exception):
+            rows = tuple(
+                self._history.samples((unit_id,), to_at - timedelta(seconds=window_s), to_at)
+            )
+        seen = False
+        for row in rows:
+            load = _finite(getattr(row, "load_power_w", None))
+            if load is None:
+                continue
+            seen = True
+            if load > stuck.load_floor_w:
+                return None  # the word HAS moved: an idle phase, not a dead link
+        return CENSUS_NOTE_CT_LINK_SUSPECT if seen else None
 
     async def _recent_health_rows(self) -> tuple[Any, ...]:
         with contextlib.suppress(Exception):
@@ -2434,7 +2678,9 @@ class HealthWatchController:
             "excluded_class": outcome.excluded_class,
             "soc_flagged": outcome.soc_flagged,
             "samples": outcome.samples,
+            "note": outcome.note,
             "evidence_window_h": self._settings.stuck.evidence_window_h,
+            "phase_live_window_h": self._settings.stuck.phase_live_window_h,
             "as_of": wall.astimezone(UTC).isoformat(),
         }
         await self._append_row(
@@ -2469,6 +2715,7 @@ class HealthWatchController:
             "returned_to_baseline": outcome.returned_to_baseline,
             "final_w": outcome.final_w,
             "demand_move_w": outcome.demand_move_w,
+            "consecutive_fail_nights": outcome.consecutive_fail_nights,
             "export_note": EXPORT_HONESTY_NOTE,
             "as_of": wall.astimezone(UTC).isoformat(),
         }
@@ -2559,12 +2806,13 @@ class HealthWatchController:
     @staticmethod
     def _census_payload(census: _CensusOutcome | None) -> dict[str, Any]:
         if census is None:
-            return {"verdict": None, "nights": 0, "predicates": None, "tier": None}
+            return {"verdict": None, "nights": 0, "predicates": None, "tier": None, "note": None}
         return {
             "verdict": census.verdict,
             "nights": census.nights,
             "predicates": census.predicates,
             "tier": census.tier,
+            "note": census.note,
         }
 
     @staticmethod
@@ -2576,6 +2824,7 @@ class HealthWatchController:
                 "qualifying_samples": None,
                 "core_samples": None,
                 "echo": None,
+                "consecutive_fail_nights": None,
             }
         return {
             "verdict": probe.verdict,
@@ -2583,6 +2832,7 @@ class HealthWatchController:
             "qualifying_samples": probe.qualifying_samples,
             "core_samples": probe.core_samples,
             "echo": probe.echo,
+            "consecutive_fail_nights": probe.consecutive_fail_nights,
         }
 
     def _recovery_payload(self, unit_id: str) -> dict[str, Any]:
@@ -2598,6 +2848,9 @@ class HealthWatchController:
             "verdict": None if outcome is None else outcome.verdict,
             "tier": None if outcome is None else outcome.tier,
             "posture": None if outcome is None else outcome.posture,
+            # §7.1's route when tonight was eligible: "a" (the conjunction)
+            # or "b" (A16's repetition on the soft-note class).
+            "route": None if outcome is None else outcome.route,
             "rung": None if outcome is None else outcome.rung,
             "reason": None if outcome is None else outcome.reason,
             "left_armed": bool(outcome is not None and outcome.left_armed),
@@ -2625,6 +2878,8 @@ __all__ = [
     "BMU_CROSS_CHECK_NOTE",
     "CENSUS_DEGRADED",
     "CENSUS_NOMINAL",
+    "CENSUS_NOTE_CT_LINK_SUSPECT",
+    "CENSUS_PHASE_IDLE_OR_CT_SILENT",
     "CENSUS_STUCK",
     "ECHO_EXTERNAL_WRITER",
     "ECHO_MATCHES_WRITE",
@@ -2633,6 +2888,8 @@ __all__ = [
     "EXPORT_HONESTY_NOTE",
     "HEALTH_ADVISER_PRINCIPAL",
     "HEALTH_WATCH_NOT_COMMISSIONED",
+    "PARK_REASON_ROUTE_A",
+    "PARK_REASON_ROUTE_B",
     "PROBE_FAIL_BASELINE",
     "PROBE_FAIL_NO_RESPONSE",
     "PROBE_FAIL_PARTIAL",

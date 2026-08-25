@@ -4381,6 +4381,7 @@ def _build_runtime(
                     load_floor_w=int(health_config.stuck.load_floor_w),
                     sibling_load_w=int(health_config.stuck.sibling_load_w),
                     load_frac=float(health_config.stuck.load_frac),
+                    phase_live_window_h=int(health_config.stuck.phase_live_window_h),
                     flag_persistence_nights=int(health_config.stuck.flag_persistence_nights),
                 ),
                 probe=ProbeSettings(
@@ -4400,6 +4401,7 @@ def _build_runtime(
                     mode=health_config.recovery.mode,
                     hold_s=int(health_config.recovery.hold_s),
                     consecutive_fail_limit=int(health_config.recovery.consecutive_fail_limit),
+                    probe_fail_nights=int(health_config.recovery.probe_fail_nights),
                 ),
                 unit_ids=tuple(unit.unit_id for unit in config.units),
                 sample_interval_s=float(history_config.sample_interval_s)

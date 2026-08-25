@@ -147,6 +147,7 @@ def test_present_block_defaults_match_the_contract_section_9() -> None:
     assert watch.stuck.grid_import_w == 500
     assert watch.stuck.load_floor_w == 30
     assert watch.stuck.sibling_load_w == 100
+    assert watch.stuck.phase_live_window_h == 168
     assert watch.stuck.flag_persistence_nights == 2
     assert watch.probe.probe_w == 300
     assert watch.probe.settle_s == 20
@@ -161,6 +162,7 @@ def test_present_block_defaults_match_the_contract_section_9() -> None:
     assert watch.recovery.mode == "advise"
     assert watch.recovery.hold_s == 90
     assert watch.recovery.consecutive_fail_limit == 3
+    assert watch.recovery.probe_fail_nights == 2
 
 
 # --- the strict-prefix rule -------------------------------------------------------
@@ -214,6 +216,52 @@ def test_min_soc_hours_equality_is_intended_and_allowed() -> None:
     assert config.battery_health_watch is not None
     with pytest.raises(ValidationError, match="min_soc_hours must not exceed"):
         _validate(payload | {"battery_health_watch": _watch(stuck={"min_soc_hours": 7})})
+
+
+def test_phase_live_window_h_must_cover_the_evidence_window() -> None:
+    """A16: a liveliness window shorter than the evidence window it
+    annotates is nonsense — the refusal names the rule; equality and the 168
+    default validate (6 = 6 covers it, 168 = one week comfortably)."""
+    payload = _base()
+    config = _validate(
+        payload | {"battery_health_watch": _watch(stuck={"phase_live_window_h": 6})}
+    )
+    assert config.battery_health_watch is not None
+    assert config.battery_health_watch.stuck.phase_live_window_h == 6
+    with pytest.raises(ValidationError, match="phase_live_window_h must be at least"):
+        _validate(payload | {"battery_health_watch": _watch(stuck={"phase_live_window_h": 5})})
+
+
+def test_phase_live_window_h_must_stay_within_the_historian_retention() -> None:
+    """A16: a liveliness window beyond the historian's full-resolution
+    retention is unknowable — the annotator would read already-rolled-up
+    history as a CT word that never moved, so the revision is refused naming
+    the retention arithmetic."""
+    payload = _base()
+    payload["plant_history"]["retention_full_resolution_days"] = 3  # 72 h
+    with pytest.raises(ValidationError, match="full-resolution retention"):
+        _validate(
+            payload | {"battery_health_watch": _watch(stuck={"phase_live_window_h": 168})}
+        )
+    # The commissioned default (168 h against 14 days) validates.
+    payload["plant_history"]["retention_full_resolution_days"] = 14
+    config = _validate(payload | {"battery_health_watch": _watch()})
+    assert config.battery_health_watch is not None
+
+
+def test_probe_fail_nights_is_at_least_two() -> None:
+    """A16 route B: a single night NEVER suffices — the named refusal; the
+    default 2 and any higher count validate."""
+    payload = _base()
+    with pytest.raises(ValidationError, match="probe_fail_nights must be at least 2"):
+        _validate(
+            payload | {"battery_health_watch": _watch(recovery={"probe_fail_nights": 1})}
+        )
+    config = _validate(
+        payload | {"battery_health_watch": _watch(recovery={"probe_fail_nights": 3})}
+    )
+    assert config.battery_health_watch is not None
+    assert config.battery_health_watch.recovery.probe_fail_nights == 3
 
 
 def test_return_band_must_exceed_the_still_band() -> None:
@@ -467,6 +515,10 @@ def test_the_live_write_example_carries_the_commissioned_wave_two_block() -> Non
     assert watch["stages"] == ["census", "probe", "recovery"]
     assert watch["recovery"]["mode"] == "advise"
     assert "auto_receipts" not in watch["recovery"]
+    # A16's documented keys at their defaults: the annotator window and
+    # route B's repetition bound.
+    assert watch["stuck"]["phase_live_window_h"] == 168
+    assert watch["recovery"]["probe_fail_nights"] == 2
     assert "RECOVERY-ADVISE" in path.read_text(encoding="utf-8")
 
 

@@ -1,51 +1,62 @@
 /**
  * The nightly battery health watch's shared wire model
- * (DESIGN_BATTERY_HEALTH_WATCH.md §10/§11/§13, CONTRACT v1.1): the
+ * (DESIGN_BATTERY_HEALTH_WATCH.md §10/§11/§13, CONTRACT v1.2): the
  * `health_watch_state` snapshot projection plus the plain-word maps the Home
  * Health Watch card renders. Stages C and P are live; Stage R (the recovery
- * stage) ships with this wave in its standing `advise` posture — writes
- * nothing, ever — and its verdict vocabulary, the A11 morning figures, and
- * the §13 advisory surfaces are pinned here. A site without the stage
- * renders the contract's own uncommissioned honesty
- * (`{"mode": "uncommissioned"}`), never a suggestion the site cannot
- * execute.
+ * stage) ships in its standing `advise` posture — writes nothing, ever — and
+ * its verdict vocabulary, the A11 morning figures, and the §13 advisory
+ * surfaces are pinned here. A site without the stage renders the contract's
+ * own uncommissioned honesty (`{"mode": "uncommissioned"}`), never a
+ * suggestion the site cannot execute.
  *
  * Wire truth pinned here (§10's exact shape):
  * - Projection: `{stages, window{opens_local, deadline_local}, phase, night,
  *   reason, as_of, units[{unit_id, census{verdict, nights, predicates,
- *   tier}, probe{verdict, probe_w, qualifying_samples, core_samples, echo},
- *   recovery{mode, verdict?, tier?, posture?, rung?, reason?, left_armed?,
- *   attempts_total?, consecutive_fails?, consecutive_fail_limit?,
+ *   tier, note}, probe{verdict, probe_w, qualifying_samples, core_samples,
+ *   echo, consecutive_fail_nights}, recovery{mode, verdict?, tier?,
+ *   posture?, route?, rung?, reason?, left_armed?, attempts_total?,
+ *   consecutive_fails?, consecutive_fail_limit?,
  *   trailing_30_nights{attempted, recovered, attempt_rate}?, note?}}]}`.
  * - `phase`: await_window | census | probe | recovery | record | done — the
  *   per-night phase machine; `reason` carries the program-level frame words
  *   (window_not_quiet / outside_window / interrupted).
- * - Census `verdict`: nominal | stuck_suspected | degraded_evidence |
- *   excluded:<class>. The stuck flag is NOTICE tier on first occurrence and
- *   promotes to ALERT after `flag_persistence_nights` consecutive nights;
- *   `nights` carries the streak and `predicates` rides it (the full vector,
- *   one tap away).
+ * - Census `verdict`: nominal | stuck_suspected | phase_idle_or_ct_silent |
+ *   degraded_evidence | excluded:<class>. The stuck flag is NOTICE tier on
+ *   first occurrence and promotes to ALERT after `flag_persistence_nights`
+ *   consecutive nights; `nights` carries the streak and `predicates` rides
+ *   it (the full vector, one tap away — since A16 the load predicate key is
+ *   `load_unserved_in_phase`, the unit's OWN CT word). The A16 soft note
+ *   `phase_idle_or_ct_silent` is informational at EVERY age — never a flag,
+ *   never promoting — and carries `note: "ct_link_suspect"` when the unit's
+ *   CT word has never moved in the trailing phase-live window.
  * - Probe `verdict`: pass | fail_no_response | fail_partial |
  *   fail_baseline_not_returned | inconclusive_echo_mismatch |
  *   inconclusive_baseline_confounded | inconclusive_preempted |
  *   inconclusive_aborted | skipped:<reason> — the skip reasons verbatim.
+ *   `consecutive_fail_nights` carries the fail_no_response streak, tonight
+ *   included (route B's repetition evidence).
  * - Recovery `verdict` (§7.2 step 7, §8's ladder): recovered |
  *   recovered_unproven | failed_write | write_unverified | failed_no_effect
  *   | advised | advisory_only | skipped:<reason> | null (not eligible).
- *   `recovered` is the resolved tier; every other outcome is alert except
- *   the notice-tier skips. `recovered_unproven` does NOT count toward
- *   `consecutive_fails` (A2); `attempts_total` counts every attempted
- *   cycle, and `trailing_30_nights` carries A11's chronic-case figures.
+ *   `route` names §7.1's eligibility basis on eligible nights: "a" (census
+ *   flag AND probe no-response) or "b" (A16: the soft-note class AND
+ *   `probe_fail_nights` consecutive no-response nights). `recovered` is the
+ *   resolved tier; every other outcome is alert except the notice-tier
+ *   skips. `recovered_unproven` does NOT count toward `consecutive_fails`
+ *   (A2); `attempts_total` counts every attempted cycle, and
+ *   `trailing_30_nights` carries A11's chronic-case figures.
  * - `echo`: the standing discriminator's words (echo_matches_write |
  *   objective_not_served | external_writer | echo_unreadable).
  *
  * Honesty rules (§13's own): uncommissioned stages render "not commissioned"
  * where their UI would be; skipped units render their skip reason verbatim;
  * a disarmed unit is the arm instruction it is (the program never arms
- * outside the ONE bounded verification re-arm inside an `auto` cycle); and
- * the §6.3 export note names the brief feed-in blip so the export meter is
- * never a surprise. The not-isolation sentence rides the card wherever a
- * parked unit's state shows (§13's pinned styling rule).
+ * outside the ONE bounded verification re-arm inside an `auto` cycle); the
+ * A16 soft note renders as the informational note it is (never a flag chip,
+ * never alert styling); and the §6.3 export note names the brief feed-in
+ * blip so the export meter is never a surprise. The not-isolation sentence
+ * rides the card wherever a parked unit's state shows (§13's pinned styling
+ * rule).
  */
 import { isRecord } from "./fleet";
 
@@ -77,21 +88,26 @@ export const HEALTH_WATCH_PHASES: readonly HealthWatchPhase[] = [
 export type HealthTierWord = "notice" | "alert";
 export type HealthTier = HealthTierWord | null;
 
-/** One unit's census half: the verdict, the persistence streak, the vector. */
+/** One unit's census half: the verdict, the persistence streak, the vector,
+ * and the A16 soft note's `ct_link_suspect` annotator (null everywhere
+ * else). */
 export interface HealthCensusState {
   verdict: string | null;
   nights: number;
   predicates: Record<string, boolean> | null;
   tier: HealthTier;
+  note: string | null;
 }
 
-/** One unit's probe half: the verdict with its one-line figures (§13). */
+/** One unit's probe half: the verdict with its one-line figures (§13) and
+ * the fail_no_response streak tonight included (route B's evidence). */
 export interface HealthProbeState {
   verdict: string | null;
   probeW: number | null;
   qualifyingSamples: number | null;
   coreSamples: number | null;
   echo: string | null;
+  consecutiveFailNights: number | null;
 }
 
 /** A11's trailing-30-night figures: the chronic case made visible. */
@@ -113,6 +129,9 @@ export interface HealthRecoveryState {
   verdict: string | null;
   tier: HealthTier | "resolved";
   posture: string | null;
+  /** §7.1's eligibility route on eligible nights: "a" (the conjunction) or
+   * "b" (A16's repetition on the soft-note class); null otherwise. */
+  route: "a" | "b" | null;
   rung: string | null;
   reason: string | null;
   leftArmed: boolean;
@@ -194,6 +213,7 @@ function toCensus(value: unknown): HealthCensusState {
     nights: intOr(record.nights, 0),
     predicates: toPredicates(record.predicates),
     tier: oneOf<HealthTierWord | null>(record.tier, ["notice", "alert", null], null),
+    note: optionalText(record.note),
   };
 }
 
@@ -205,6 +225,7 @@ function toProbe(value: unknown): HealthProbeState {
     qualifyingSamples: optionalInt(record.qualifying_samples),
     coreSamples: optionalInt(record.core_samples),
     echo: optionalText(record.echo),
+    consecutiveFailNights: optionalInt(record.consecutive_fail_nights),
   };
 }
 
@@ -230,6 +251,7 @@ function toRecovery(value: unknown): HealthRecoveryState {
       null,
     ),
     posture: optionalText(record.posture),
+    route: oneOf<"a" | "b" | null>(record.route, ["a", "b", null], null),
     rung: optionalText(record.rung),
     reason: optionalText(record.reason),
     leftArmed: record.left_armed === true,
@@ -327,8 +349,10 @@ export function healthWatchStagesText(state: HealthWatchState): string {
 
 /**
  * One unit's census chip: nominal reads nominal, a stuck flag names its
- * nights and tier, an excluded class renders its class, degraded evidence
- * says so (never a wrong verdict).
+ * nights and tier, the A16 soft note renders as the informational note it is
+ * (its age and the ct_link_suspect annotator included — never a flag chip,
+ * never alert styling), an excluded class renders its class, degraded
+ * evidence says so (never a wrong verdict).
  */
 export function censusChipText(unit: HealthWatchUnitState): string {
   const verdict = unit.census.verdict;
@@ -338,6 +362,14 @@ export function censusChipText(unit: HealthWatchUnitState): string {
   if (verdict === "stuck_suspected") {
     const nights = unit.census.nights > 1 ? ` ${unit.census.nights} nights` : "";
     return `flagged${nights}`;
+  }
+  if (verdict === "phase_idle_or_ct_silent") {
+    // A16: the pod is EITHER on an idle phase OR its CT link is dead, and
+    // the census cannot tell which — a note, at the notice tier, at every
+    // age.
+    const nights = unit.census.nights > 1 ? ` ${unit.census.nights} nights` : "";
+    const note = unit.census.note === "ct_link_suspect" ? " · CT link suspect" : "";
+    return `idle phase or CT silent${nights}${note}`;
   }
   if (verdict === "degraded_evidence") {
     return "evidence degraded";
@@ -366,11 +398,17 @@ export function probeVerdictText(unit: HealthWatchUnitState): string {
     probe.coreSamples === null
       ? ""
       : ` — ${probe.qualifyingSamples ?? 0}/${probe.coreSamples} samples moved`;
+  const streak =
+    verdict === "fail_no_response" &&
+    probe.consecutiveFailNights !== null &&
+    probe.consecutiveFailNights > 1
+      ? ` · ${probe.consecutiveFailNights} nights in a row`
+      : "";
   switch (verdict) {
     case "pass":
       return `pass${figures === "" ? "" : ` — ${probe.qualifyingSamples ?? 0}/${probe.coreSamples} samples delivered`}`;
     case "fail_no_response":
-      return `fail — no response${figures} · echo followed the write, the battery stayed still`;
+      return `fail — no response${figures} · echo followed the write, the battery stayed still${streak}`;
     case "fail_partial":
       return `fail — partial${figures}`;
     case "fail_baseline_not_returned":
@@ -456,10 +494,23 @@ export function recoveryVerdictText(unit: HealthWatchUnitState): string {
   }
 }
 
+/**
+ * §7.1's eligibility route in plain words, when tonight was eligible by the
+ * route the operator cannot see otherwise. Route A is the standing
+ * conjunction (named by the verdict line already); route B is A16's
+ * repetition on the soft-note class — the census cannot see this pod's
+ * phase, so the consecutive nightly probe failures stood in for the flag.
+ */
+export function recoveryRouteText(unit: HealthWatchUnitState): string | null {
+  if (unit.recovery.route !== "b") {
+    return null;
+  }
+  return "eligible by route B — the census cannot see this pod's phase (idle, or CT-silent), so two consecutive nightly probe failures stood in for the flag";
+}
+
 /** A recovery skip reason in plain words; unknown reasons render verbatim. */
 export function recoverySkipText(reason: string): string {
-  switch (reason) {
-    case "foreign_standby":
+  switch (reason) {    case "foreign_standby":
       return "skipped — the battery is in Standby and it is not ours (the takeover resume is the only exit)";
     case "vendor_mode":
       return "skipped — the vendor app holds the mode word (it must clear it)";
@@ -515,7 +566,11 @@ export function recoveryMorningText(unit: HealthWatchUnitState): string | null {
   const trailing = recovery.trailing;
   const rate =
     trailing === null ? "" : ` · ${trailing.attempted} cycle night${trailing.attempted === 1 ? "" : "s"} in the last 30 (${Math.round(trailing.attemptRate * 100)}%)`;
-  return `Before: stuck signature + a no-response probe. After: one supervised standby cycle, then a passing 300 W verification probe.${rate}`;
+  const before =
+    recovery.route === "b"
+      ? "a phase the census cannot see + repeated no-response probes"
+      : "stuck signature + a no-response probe";
+  return `Before: ${before}. After: one supervised standby cycle, then a passing 300 W verification probe.${rate}`;
 }
 
 /** One unit's whole row: the census chip, the probe line, and the recovery
