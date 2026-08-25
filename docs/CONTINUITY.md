@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the third-writer question closed by differential experiment — two-writer architecture confirmed, the Docker gate satisfied, night-V1 unblocked)
+Last updated: 2026-08-25 (Australia/Brisbane; the battery health-watch research phase complete — reset truth pinned, rhs the prime suspect, two Wave-0 monitor bugs found, the ladder designed)
 
 ## Purpose
 
@@ -375,6 +375,62 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (battery health-watch / nightly reset program — RESEARCH
+  PHASE COMPLETE; two parallel read-only agents, NO code changed): the
+  operator authorized the program after describing the April-onward
+  STUCK MODE — high reported SoC, no response to solar/load/commands,
+  historically fixed by physically power-cycling the pod. FINDINGS OF
+  RECORD: (1) RESET TRUTH — the vendor app (EnergyPod_RE, exhaustively
+  inventoried) has NO reset/reboot command anywhere; 0x8000
+  standby/normal with write→readback→verify (0x8100) is the ONLY
+  soft-recovery register; the old Docker "force state" was enable-word
+  maintenance @0x0200 word 0 (NOT 0x8000) — its nightly rhythm
+  re-asserted the go-word for years without harm; the live R3 rhs
+  evidence (docs/evidence/standby-cycle-2026-08-24.md) remains the
+  decisive proof the standby cycle is benign, reversible, and
+  command-following survives it. (2) PRIME SUSPECT — rhs shows the
+  stuck fingerprint in our own telemetry: SoC 97–100 % with near-zero
+  autonomous flow while siblings flow, AND rhs's load-CT word ~16 W
+  avg vs siblings ~100/~180 W (the vendor "Electricity meter
+  communication disconnected" class: a full pod with no CT view is a
+  spectator); the operator was asked to confirm it is always rhs.
+  (3) TWO RECOVERY-MONITOR BUGS — must be fixed BEFORE any automation
+  keys off them (Wave 0): (a) health flapping keys on EXACTLY-zero
+  watts (158 rhs transitions one night) — needs a ~25 W hysteresis
+  band; this CLOSES the earlier open flapping observation (88c0db9's
+  60+ spells); (b) both actuation_incoherent detections were FALSE
+  POSITIVES from a baseline re-anchor across an authorization gap (pods
+  were at 87–96 % of command) — auto-recovery must never trigger on
+  that signal alone. (4) THE LADDER — S0 nightly census (zero writes)
+  → S1 bounded actuation probe (200–500 W, 60–90 s, coherence+echo
+  verification) → S2 standby cycle for flagged units only (THE doctrine
+  revision: revises alarm-only-0x8000 and interactive-park; own config
+  block, default off) → S3 full-fleet only if multi-pod sticking.
+  Never-candidates: gateway reboot, undocumented words; Values 2–6
+  permanently prohibited as always. (5) ONLINE SOURCES (EFT Systems
+  BYD service guideline V1.5, photovoltaikforum, Whirlpool, Fronius
+  register docs) — vendor pass/fail = TWO conditions (SoC displays AND
+  charges/discharges); verify-before-write; small-power probes (20–300
+  W) are established practice; escalation ends in the DEFINED-RESTART
+  ADVISORY (battery-first sequencing, 10-min fuse lockout, wait
+  10 min); SoC drifts at persistently high SoC (our
+  night-charge-to-100 % law is itself protective — noted); Fronius
+  Solar.web Battery Control is a competing writer with documented
+  stuck cases; NO public endorsement of nightly cycling as prevention —
+  the contract must say so honestly. STATUS: the design-contract agent
+  is writing docs/DESIGN_BATTERY_HEALTH_WATCH.md (house style of
+  DESIGN_POD_PARKING; Wave 0 fixes; stages C/P/R separately
+  commissible; the doctrine-amendment section; §12-style test matrix);
+  next: coordinator review, adversarial panel on the doctrine revision,
+  then implementation waves. OPEN OPERATOR QUESTIONS: always-rhs?; did
+  reads stay alive during the historical stucks (picks Stage R vs
+  advisory-only) — the operator's mid-flight answer suggested YES
+  (live data kept flowing: comms alive, control dead), which SUPPORTS
+  Stage R's standby cycle as the plausible fix; historical fix =
+  physical power cycle (the R5 terminal); the vendor-app
+  charge/discharge test as their own verification mirrors our S1 probe
+  exactly.
 
 - 2026-08-25 (PVOutput "third writer" question CLOSED BY DIFFERENTIAL
   EXPERIMENT — TWO-WRITER ARCHITECTURE CONFIRMED; no code changed, one
