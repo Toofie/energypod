@@ -332,7 +332,7 @@ def targets(decision: Any) -> dict[str, int]:
     return {
         plan.unit_id: plan.target_w
         for plan in decision.unit_plans
-        if plan.phase in ("pacing", "holding_on_demand")
+        if plan.phase in ("pacing", "holding_on_demand", "standing_by_on_demand")
     }
 
 
@@ -866,6 +866,7 @@ def _controller(night: Any, **overrides: Any) -> Any:
         "hold_rate_w": 100,
         "demand_scope": "fleet",
         "demand_threshold_w": 1_000,
+        "demand_exit_hysteresis_w": 200,
         "windows": WINDOW,
         "timezone": "Australia/Brisbane",
         "posture": "partition",

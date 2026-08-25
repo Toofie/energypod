@@ -506,21 +506,26 @@ schedule:
 # grid words: the grid word includes the adviser's OWN charging draw, so a
 # demand rule on it would read a 3 x 2500 W charge as 7.5 kW of "demand" and
 # hold forever. While MEASURED demand exceeds demand_threshold_w every
-# participating battery STANDS DOWN entirely (the operator's directive, the
-# one behavior — no selector): zero-watt non-participation, excluded from
-# the submission, the TTL lapse plus the ~3.5-4.0 s watchdog handing each
-# pod back to its own autonomy. Charging resumes when demand falls below
-# threshold - hysteresis OR the window ends. Honest trade, stated as such:
-# during the stand-down the pods' own load-matching autonomy serves part of
-# the house demand, so a battery may discharge into the spike — the
-# operator's chosen behavior.
+# eligible battery STANDS DOWN INTO ITS HOLD (the operator's directive,
+# 2026-08-26: on a big night load the batteries stand down and the cheap
+# off-peak grid serves the house, preserving stored solar for the expensive
+# evening): each held battery STAYS IN the submission at hold_rate_w — an
+# ordinary positive charge objective renewed every tick, whose live presence
+# overrides the pod's own CT-following autonomy (which would otherwise
+# DISCHARGE into the house). Never park, never a stop triple, never a
+# zero-watt intent — the kernel never mints authority for zero watts, so a
+# literal 0 W command would hand the pod straight back to autonomy. The hold
+# releases when demand falls below threshold - hysteresis (normal capped
+# charging resumes) OR at window end (withdrawn like any held intent).
 # FAIL-CLOSED IS THE SAFETY DOCTRINE, not a posture: bad evidence (a
 # missing/bad/stale load word) HOLDS at hold_rate_w — the EVIDENCE-FAILURE
-# fallback rate alone, never a demand behavior — because a stand-down
-# answers MEASURED demand, never missing data, and must never silently
-# free-run a fleet into autonomy drain during an EV night. The
-# hold-on-bad-evidence state is loud (demand_evidence_stale etc.), never a
-# silent never-charges.
+# fallback alone, named `holding_on_demand` — because a stand-down answers
+# MEASURED demand, never missing data, and must never silently free-run a
+# fleet into autonomy drain during an EV night. Both arms land on the same
+# positive rate; they are named apart by phase and reason code
+# (`holding_on_demand`/`demand_evidence_*` vs
+# `standing_by_on_demand`/`demand_above_threshold`), and the hold state is
+# loud either way, never a silent never-charges.
 #
 # PRECEDENCE: manual/agent requests outrank it per battery (and their units
 # are excluded from the submission until the claim lapses); it ALWAYS yields
@@ -564,8 +569,10 @@ night_charging:
   rate_cap_w: 2500          # the per-battery cap (<= policy.max_unit_charge_w)
   demand_threshold_w: 1000  # the operator's own figure
   demand_exit_hysteresis_w: 200   # resume only below 800 W (no flapping)
-  hold_rate_w: 100          # the EVIDENCE-FAILURE fallback alone (bad demand
-                            # evidence holds at 100 W, never free-runs)
+  hold_rate_w: 100          # the stand-down/evidence-failure rate: a held
+                            # battery stays IN the submission at this trickle
+                            # charge (zero discharge, autonomy overridden) —
+                            # bad demand evidence holds here too, never free-runs
   demand_scope: "fleet"     # fleet | per_phase (the graduation)
   pacing: "cap_first"       # Docker parity; `even` is deadline-paced (needs the map)
   demand_telemetry_max_age_s: 3.0

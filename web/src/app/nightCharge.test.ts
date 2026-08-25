@@ -78,6 +78,13 @@ describe("nightCharge — the projection parse", () => {
     expect(state!.holdRateW).toBe(100);
     expect(state!.demandScope).toBe("fleet");
     expect(state!.demandThresholdW).toBe(1000);
+    // ADDITIVE (2026-08-26): the resume gap rides the projection; an absent
+    // key (an older frame) parses as 0 = "unknown" and the words fall back.
+    expect(state!.demandExitHysteresisW).toBe(0);
+    expect(
+      toNightChargeState(nightChargeState({ demand_exit_hysteresis_w: 200 }))!
+        .demandExitHysteresisW,
+    ).toBe(200);
     expect(state!.demandW).toBe(412);
     expect(state!.demandEvidence).toBe("good");
     expect(state!.heldIntentId).toBe("night-881-77123.445101");
@@ -117,6 +124,7 @@ describe("nightCharge — the projection parse", () => {
     expect(state!.windowEndsAt).toBeNull();
     expect(state!.windowEndsInS).toBeNull();
     expect(state!.nextWindowAt).toBeNull();
+    expect(state!.demandExitHysteresisW).toBe(0);
     expect(state!.demandW).toBeNull();
     expect(state!.demandEvidence).toBe("missing");
     expect(state!.heldIntentId).toBeNull();
@@ -226,22 +234,39 @@ describe("nightCharge — the plain-word maps", () => {
     );
   });
 
-  it("words the stand-by story: measured demand stands the batteries down, the honest trade named", () => {
+  it("words the stand-by story: the grid serves the heavy load, the resume bound named in watts", () => {
     const standing = toNightChargeState(
       nightChargeState({
         phase: "standing_by_on_demand",
         demand_w: 2340,
+        demand_exit_hysteresis_w: 200,
         reason_codes: ["demand_above_threshold"],
-        units: [nightUnitState({ phase: "standing_by_on_demand", soc_pct: 88, target_w: 0, reason: "demand_above_threshold" })],
+        units: [nightUnitState({ phase: "standing_by_on_demand", soc_pct: 88, target_w: 100, reason: "demand_above_threshold" })],
       }),
     )!;
     expect(nightPhaseText(standing)).toBe(
-      "Standing by — house demand 2,340 W: the batteries stand down at zero watts and the pods answer the house on their own until demand falls back.",
+      "Standing by — house demand 2,340 W: the grid serves the heavy load and charging resumes below 800 W.",
     );
-    // The per-unit row words the stand-down as what it is — never the old
-    // "sitting out (demand hold)" fallback spelling.
+    // The per-unit row words the stand-down hold at its own rate — zero
+    // discharge, never a zero-watt sit-out spelling.
     expect(nightUnitRowText(standing.units[0]!)).toBe(
-      "lhs — 88% charged · lhs standing by (house demand high)",
+      "lhs — 88% charged · lhs standing by at 100 W (house demand high)",
+    );
+    // The resume bound is stated in watts ONLY from wire figures: a frame
+    // without the hysteresis key falls back to words, never a guessed number.
+    expect(
+      nightPhaseText(
+        toNightChargeState(
+          nightChargeState({
+            phase: "standing_by_on_demand",
+            demand_w: null,
+            demand_evidence: "good",
+            reason_codes: ["demand_above_threshold"],
+          }),
+        )!,
+      ),
+    ).toBe(
+      "Standing by — the demand reading is good: the grid serves the heavy load and charging resumes once it falls back.",
     );
   });
 
@@ -450,7 +475,7 @@ describe("nightCharge — the plain-word maps", () => {
       "Night charging resumed — pacing toward full.",
     );
     expect(nightPhaseAnnouncement("pacing", "standing_by_on_demand")).toBe(
-      "Night charging is standing by — house demand is high; the batteries stand down until it passes.",
+      "Night charging is standing by — house demand is high; the grid serves the heavy load while the batteries stand down.",
     );
     expect(nightPhaseAnnouncement("standing_by_on_demand", "pacing")).toBe(
       "Night charging resumed — pacing toward full.",

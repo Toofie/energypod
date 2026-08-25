@@ -13,9 +13,10 @@
  * - ACTIVE phases name their facts in plain words: pacing names the window's
  *   end and every battery's own target ("Charging toward full by 06:00: mid
  *   1,900 W · lhs 1,200 W · rhs full, sitting out"); standing by names the
- *   measured-demand stand-down with its honest trade ("the batteries stand
- *   down at zero watts and the pods answer the house on their own until
- *   demand falls back"); holding names the fail-closed guarantee ("batteries
+ *   measured-demand ACTIVE STAND-DOWN with its truth ("the grid serves the
+ *   heavy load and charging resumes below 800 W" — the resume bound computed
+ *   from the wire's own threshold − hysteresis figures, never hardcoded);
+ *   holding names the fail-closed guarantee ("batteries
  *   neither drain nor cycle while the grid meets the spike" — the missing-
  *   evidence fallback at `hold_rate_w`, never a response to measured demand);
  *   complete names the moment ("Batteries full — window complete at 04:12");
@@ -299,7 +300,7 @@ function NightToggleDialog({
       </h2>
       <p>
         {action === "enable"
-          ? `Enabling charges the batteries to full inside the off-peak window (${windowText}), standing them down entirely whenever house demand is high — each pod answers the house on its own until demand falls back. Night charging stops by itself at the window's end.`
+          ? `Enabling charges the batteries to full inside the off-peak window (${windowText}); whenever house demand runs high the grid serves the heavy load instead — the batteries stand down (zero discharge) and charging resumes once demand falls back. Night charging stops by itself at the window's end.`
           : "Disabling stops night charging now; a controller restart re-reads the config's own setting either way."}
       </p>
       {showAcknowledgement && (

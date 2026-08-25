@@ -1478,22 +1478,25 @@ non-participants. Full design and rationale: `docs/DESIGN_NIGHT_CHARGE.md`.
   beats the opportunist — the schedules-stay-day recommendation, which this feature is the
   night half of).
 - **The demand rule — LOAD words, never grid words (the pinned correctness catch).** While
-  `demand_w` exceeds `demand_threshold_w` (default 1000 W), every participating unit STANDS
-  DOWN (the operator's directive — the one behavior, no selector): zero-watt
-  non-participation, the unit excluded from the submission (the facade refuses zero-watt
-  per-unit targets), the TTL lapse plus watchdog handing the pod back to its own autonomy
-  — resuming below `threshold − hysteresis` or at window end (fleet/unit phase
-  `standing_by_on_demand`). Honest trade, stated as such: during a stand-down the pod's own
-  matching autonomy may serve part of the load. The measurement is the per-pod CT
+  `demand_w` exceeds `demand_threshold_w` (default 1000 W), every eligible unit STANDS DOWN
+  INTO ITS HOLD (the operator's directive, 2026-08-26: on a big night load the batteries
+  stand down and the cheap off-peak grid serves the house): the unit STAYS IN the submission
+  at `hold_rate_w` — an ordinary positive charge objective renewed each tick whose live
+  presence overrides the pod's own CT-following autonomy (which would otherwise discharge
+  into the house; the kernel never mints authority for zero watts, so a literal 0 W command
+  would hand the pod straight back to autonomy) — resuming below
+  `threshold − hysteresis` or withdrawn at window end like any held intent (fleet/unit phase
+  `standing_by_on_demand`). The measurement is the per-pod CT
   `load_power_w` (`demand_scope: fleet` default = max(0, Σ); `per_phase` the option) — the
   grid word includes the adviser's OWN charging draw and would self-hold forever at cap
   rates. Evidence quality is the scorecard's family (per-field quality, worst-word-wins
   `demand_evidence` `good|missing|bad|stale`, freshness `demand_telemetry_max_age_s`); a
-  non-good word FAILS CLOSED TO HOLD at `hold_rate_w` (default 100 W — the EVIDENCE-FAILURE
-  fallback rate alone, never a demand behavior; config refuses zero) — the stand-down
-  answers measured demand, never missing data — loudly visible. Resume pacing only below
-  `demand_threshold_w − demand_exit_hysteresis_w` (default 200); the hold latch resets at
-  window boundaries.
+  non-good word FAILS CLOSED TO HOLD at `hold_rate_w` (default 100 W — config refuses zero)
+  — the stand-down answers measured demand, never missing data — loudly visible. Both arms
+  land on the same positive rate, named apart by phase and code (`holding_on_demand` /
+  `demand_evidence_*` vs `standing_by_on_demand` / `demand_above_threshold`). Resume pacing
+  only below `demand_threshold_w − demand_exit_hysteresis_w` (default 200); the hold latch
+  resets at window boundaries.
 - **Composition (block-presence doctrine).** A PRESENT `night_charging:` block composes the
   adviser, the `night_charge_state` projection, the `night_charge.state_changed` events, the
   guarded toggle route, and the PCS live-block promotion (the promotion predicate widens to
@@ -1548,10 +1551,13 @@ non-participants. Full design and rationale: `docs/DESIGN_NIGHT_CHARGE.md`.
   from `held_intent_id`): `{enabled, enabled_origin, acknowledged_partition, posture, active,
   phase, window{start_local,end_local,timezone}, window_ends_at, window_ends_in_s,
   next_window_at, pacing, rate_cap_w, hold_rate_w, demand_scope, demand_threshold_w,
-  demand_w, demand_evidence, held_intent_id, units[{unit_id, soc_pct, phase, target_w,
-  reason}], last_action, last_tick_at, reason_codes}`. Fleet `phase`: `idle | pacing |
+  demand_exit_hysteresis_w, demand_w, demand_evidence, held_intent_id,
+  units[{unit_id, soc_pct, phase, target_w, reason}], last_action, last_tick_at,
+  reason_codes}` (`demand_exit_hysteresis_w` — 2026-08-26 — rides the wire so the console
+  states the resume bound in watts instead of fabricating it). Fleet `phase`: `idle | pacing |
   holding_on_demand | standing_by_on_demand | complete | skipped_full` (`holding_on_demand`
-  is the fail-closed evidence hold alone); per-unit adds `sitting_out`. Reason
+  is the fail-closed evidence hold alone; `standing_by_on_demand` is the measured-demand
+  active stand-down into the hold); per-unit adds `sitting_out`. Reason
   vocabulary (ONE): `outside_window, window_open, on_plan, deadline_at_risk,
   demand_above_threshold, demand_below_exit, demand_evidence_missing, demand_evidence_bad,
   demand_evidence_stale, at_ceiling, no_charge_headroom, target_reached,

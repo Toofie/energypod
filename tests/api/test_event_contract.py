@@ -1429,6 +1429,7 @@ def _night_rig(api_domain: Any, loads: Any, *, config_enabled: bool = True) -> A
         hold_rate_w=100,
         demand_scope="fleet",
         demand_threshold_w=1_000,
+        demand_exit_hysteresis_w=200,
         windows=NIGHT_WINDOW,
         timezone="Australia/Brisbane",
         posture="partition",
@@ -1482,6 +1483,7 @@ async def test_night_first_tick_publishes_the_contract_payload(api_domain: Any) 
         "hold_rate_w",
         "demand_scope",
         "demand_threshold_w",
+        "demand_exit_hysteresis_w",
         "demand_w",
         "demand_evidence",
         "held_intent_id",
@@ -1549,7 +1551,7 @@ async def test_a_night_semantic_change_publishes_and_carries_the_new_figures(
 ) -> None:
     """Demand crossing the threshold mid-window is the semantic change the
     console announces: pacing -> standing_by_on_demand, one event, the
-    stood-down rows carried at zero watts."""
+    stood-down rows carried at the hold rate (zero discharge)."""
     from tests.unit.test_night_charge import NOW as NIGHT_NOW
 
     rig = _night_rig(api_domain, {"lhs": 100.0, "mid": 100.0, "rhs": 100.0})
@@ -1571,8 +1573,8 @@ async def test_a_night_semantic_change_publishes_and_carries_the_new_figures(
     assert payload["reason_codes"] == ["window_open", "demand_above_threshold"]
     assert payload["demand_w"] == 1_500
     assert {unit["unit_id"]: (unit["phase"], unit["target_w"]) for unit in payload["units"]} == {
-        "lhs": ("standing_by_on_demand", 0),
-        "mid": ("standing_by_on_demand", 0),
+        "lhs": ("standing_by_on_demand", 100),
+        "mid": ("standing_by_on_demand", 100),
         "rhs": ("skipped_full", 0),
     }
     await close_subscription(subscription)

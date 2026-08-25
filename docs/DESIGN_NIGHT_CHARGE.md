@@ -183,23 +183,27 @@ control-rate under the PCS-block promotion, gaps/failures never interpolated.
   is the exact outcome the operator refused). The hold-on-bad-evidence state
   is loudly visible (`demand_evidence_stale` etc. on the tile), so it can
   never be a silent never-charges.
-- **Threshold and the ONE response.** Engage when `demand_w >
-  demand_threshold_w` (default 1000, the operator's own figure; the ~109 W
-  fleet standby floor is far below it — no false engages on an idle night).
-  The response to a MEASURED engage is the STAND-DOWN (the operator's
-  directive 2026-08-24, the one behavior — there is deliberately NO
-  posture selector): zero-watt non-participation — the unit is EXCLUDED
-  from the submission (the 6abd869/d2163a5 doctrine; the facade refuses a
-  zero-watt per-unit target, so exclusion is the only honest spelling),
-  the remove-then-submit renewal drops it, and the TTL lapse plus the
-  ~3.5-4.0 s watchdog hand the pod back to its own autonomy until demand
-  falls below the exit bound OR the window ends (non-renewal, exactly the
-  window-end hand-back). The stand-down state is its own phase word
-  (`standing_by_on_demand`, fleet and unit) with the `demand_above_threshold`
-  code. HONEST TRADE, stated as such: during a stand-down the pod's own
-  load-matching autonomy serves part of the house demand, so a battery MAY
-  discharge into the spike — the operator's chosen behavior, replacing the
-  original design's positive-charge hold.
+- **Threshold and the ONE response: the ACTIVE STAND-DOWN.** Engage when
+  `demand_w > demand_threshold_w` (default 1000, the operator's own figure;
+  the ~109 W fleet standby floor is far below it — no false engages on an
+  idle night). The response to a MEASURED engage is the ACTIVE STAND-DOWN
+  (the operator's directive 2026-08-26, revising the 2026-08-24 exclusion:
+  on a big night load the batteries stand down and the CHEAP OFF-PEAK GRID
+  serves the house, preserving stored solar for the expensive evening):
+  each held unit STAYS IN the submission at `hold_rate_w` — an ordinary
+  positive charge objective renewed every tick whose live presence replaces
+  the pod's CT-following autonomy (beat-autonomy doctrine), so the battery
+  cannot discharge into the spike. Zero-watt non-participation was tried
+  and REVERSED: exclusion lets the intent lapse, the watchdog hands the pod
+  back to its own autonomy, and the pod then DISCHARGES into the load — the
+  exact outcome the operator refused (and a literal 0 W command is
+  impossible anyway: the kernel never mints authority for zero watts, so
+  the hold must be a positive objective to have any effect at all). The
+  hold releases when demand falls below the exit bound (capped charging
+  resumes) OR at window end (withdrawn like any held intent). The stand-down
+  state is its own phase word (`standing_by_on_demand`, fleet and unit) with
+  the `demand_above_threshold` code; both arms land on `hold_rate_w` and are
+  named apart by phase and code.
 - **Hysteresis (no flapping).** Resume pacing only when
   `demand_w < demand_threshold_w − demand_exit_hysteresis_w` (default 200;
   validated `0 < hysteresis < threshold`). A load oscillating around 1000 W
@@ -210,16 +214,18 @@ control-rate under the PCS-block promotion, gaps/failures never interpolated.
   exit bound, the tick recomputes the paced rate and the unit rejoins the
   submission (under `even` pacing the pause has already raised
   `required_w` — self-correcting).
-- **`hold_rate_w` — the EVIDENCE-FAILURE fallback alone, never a demand
-  behavior.** The fail-closed arm above (missing/bad/stale ⇒ HOLD at
-  `hold_rate_w`) is the one behavior that still charges at a held rate:
-  a small POSITIVE charge (default 100 W; never zero, never a discharge —
-  zero-watt/idle submissions are refused by the standing doctrine and
-  would hand the pod back to matching autonomy on exactly the evidence it
-  cannot see). This is the SAFETY DOCTRINE, not backward compatibility:
-  the stand-down answers MEASURED demand, never missing data, so a stale
-  word must never silently free-run a fleet into autonomy drain during an
-  EV night — it holds, loudly, until a GOOD word returns.
+- **`hold_rate_w` — the stand-down's rate AND the EVIDENCE-FAILURE fallback.**
+  The fail-closed arm above (missing/bad/stale ⇒ HOLD at `hold_rate_w`) and
+  the measured stand-down share the same positive rate (default 100 W; never
+  zero, never a discharge — zero-watt/idle submissions are refused by the
+  standing doctrine and would hand the pod back to matching autonomy on
+  exactly the evidence it cannot see). This is the SAFETY DOCTRINE, not
+  backward compatibility: the stand-down answers MEASURED demand, never
+  missing data, so a stale word must never silently free-run a fleet into
+  autonomy drain during an EV night — it holds, loudly, until a GOOD word
+  returns; the arms are named apart by phase (`holding_on_demand` vs
+  `standing_by_on_demand`) and code (`demand_evidence_*` vs
+  `demand_above_threshold`).
 
 ### 2.5 The tick
 
@@ -538,7 +544,8 @@ mirror); `active` derives from `held_intent_id`, never a lifecycle guess:
   suspended/disabled), `holding_on_demand` (the FAIL-CLOSED evidence hold:
   a missing/bad/stale word holding units at `hold_rate_w`),
   `standing_by_on_demand` (measured demand has stood at least one unit down
-  to zero-watt non-participation), `pacing` (at least
+  into its hold_rate_w hold — the active stand-down, grid serves the load),
+  `pacing` (at least
   one unit charging at a planned rate), `complete` (window open; every
   participating target reached; nothing charging), `skipped_full` (window
   open; every unit sat out from the start). Precedence in that order except

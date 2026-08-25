@@ -1669,11 +1669,13 @@ def test_unknown_night_keys_are_refused() -> None:
 
 
 def test_the_live_write_examples_night_block_validates_as_documented() -> None:
-    """B6: the example's `night_charging:` block — present but `enabled:
-    false`, the grant widened beside it in the same revision, and (since
+    """B6: the example's `night_charging:` block — the boot DEFAULT since
+    the operator's 2026-08-25 direction (`enabled: true`: night charging
+    remains the default across restarts; the runtime toggle still
+    overrides within a session), the grant widened beside it, and (since
     night-V2) the SUGGEST posture with its whole advisory stack — parses
     cleanly, so what the operator reads on the example is what the
-    controller composes (the projection visible, participation off)."""
+    controller composes (the projection visible, charging on)."""
     from pathlib import Path
 
     import yaml
@@ -1681,8 +1683,8 @@ def test_the_live_write_examples_night_block_validates_as_documented() -> None:
     example = Path(__file__).resolve().parents[2] / "config" / "config.live-write-example.yaml"
     document = yaml.safe_load(example.read_text(encoding="utf-8"))
     assert isinstance(document, dict), "the example must stay one YAML document"
-    assert "night_charging" in document, "the night block is present-but-suspended"
-    assert document["night_charging"]["enabled"] is False
+    assert "night_charging" in document, "the night block is the boot default"
+    assert document["night_charging"]["enabled"] is True
     assert document["night_charging"]["target_policy"] == "forecast_suggest", (
         "the V2 shipping posture: computed, displayed, and byte-identical v1 charging"
     )
@@ -1697,7 +1699,7 @@ def test_the_live_write_examples_night_block_validates_as_documented() -> None:
     payload["night_charging"] = document["night_charging"]
     parsed = ControllerConfig.model_validate(payload)
     assert parsed.night_charging is not None
-    assert parsed.night_charging.enabled is False
+    assert parsed.night_charging.enabled is True
     assert parsed.night_charging.pacing == "cap_first"
     assert parsed.night_charging.assumed_capacity_wh == {"lhs": 5000, "mid": 5000, "rhs": 4200}
     assert parsed.schedule is not None

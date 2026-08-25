@@ -25,21 +25,25 @@
  * - Projection: `{enabled, enabled_origin, acknowledged_partition, posture,
  *   active, phase, window{start_local,end_local,timezone}, window_ends_at,
  *   window_ends_in_s, next_window_at, pacing, rate_cap_w, hold_rate_w,
- *   demand_scope, demand_threshold_w, demand_w, demand_evidence,
- *   held_intent_id, units[{unit_id, soc_pct, phase, target_w, reason,
- *   target_soc_pct | suggested_target_soc_pct}], last_action, last_tick_at,
- *   reason_codes, target_policy?, trust?, forecast?, explanation?,
+ *   demand_scope, demand_threshold_w, demand_exit_hysteresis_w, demand_w,
+ *   demand_evidence, held_intent_id, units[{unit_id, soc_pct, phase, target_w,
+ *   reason, target_soc_pct | suggested_target_soc_pct}], last_action,
+ *   last_tick_at, reason_codes, target_policy?, trust?, forecast?, explanation?,
  *   morning_notice?}` — `active` derives from `held_intent_id`, never a
  *   lifecycle guess.
  * - Fleet `phase`: idle | pacing | holding_on_demand | standing_by_on_demand |
  *   complete | skipped_full; per-unit adds `sitting_out` (claimed, disarmed, or
- *   no headroom this tick). `standing_by_on_demand` is THE demand response: a
- *   MEASURED demand above the threshold stands the unit down entirely (zero-
- *   watt non-participation — excluded from the submission, the pod back on its
- *   own autonomy until demand falls back or the window ends). `holding_on_demand`
+ *   no headroom this tick). `standing_by_on_demand` is THE demand response, the
+ *   ACTIVE STAND-DOWN (2026-08-26): a MEASURED demand above the threshold holds
+ *   each battery IN the submission at `hold_rate_w` — a renewed positive charge
+ *   objective that overrides the pod's own CT-following autonomy — so the cheap
+ *   off-peak grid serves the heavy load instead of stored solar discharging
+ *   into it. The hold lifts below `threshold − hysteresis` and is withdrawn at
+ *   window end like any held intent. `holding_on_demand`
  *   is the fail-closed FALLBACK ONLY: missing/bad/stale evidence holds at
- *   `hold_rate_w` (the no-cycling guarantee — standby answers measured demand,
- *   never missing data). There is no `demand_response` selector on the wire.
+ *   `hold_rate_w` too (the no-cycling guarantee — standby answers measured demand,
+ *   never missing data); the arms are named apart by phase and code. There is
+ *   no `demand_response` selector on the wire.
  * - `demand_evidence`: good | missing | bad | stale, worst-word-wins; a
  *   non-good rollup FAILS CLOSED TO HOLD (the no-cycling guarantee) and is
  *   loudly visible — never a silent never-charges.
@@ -87,9 +91,10 @@ export const NIGHT_PHASES: readonly NightPhase[] = [
 
 /**
  * The per-unit phase vocabulary: the fleet list plus `sitting_out`.
- * `standing_by_on_demand` is the MEASURED-demand stand-down (zero-watt
- * non-participation); `holding_on_demand` is the fail-closed hold at
- * `hold_rate_w` when the evidence word did not hold.
+ * `standing_by_on_demand` is the MEASURED-demand active stand-down (the unit
+ * stays in the submission at its hold-rate target); `holding_on_demand` is the
+ * fail-closed hold at `hold_rate_w` when the evidence word did not hold — same
+ * positive rate, named apart by phase and code.
  */
 export type NightUnitPhase =
   | "pacing"
@@ -458,6 +463,14 @@ export interface NightChargeState {
   holdRateW: number;
   demandScope: NightDemandScope;
   demandThresholdW: number;
+  /**
+   * The engage→resume gap in watts (ADDITIVE, 2026-08-26): charging resumes
+   * below `demandThresholdW − demandExitHysteresisW`. The figure rides the wire
+   * so the tile can state the resume bound in watts instead of fabricating it;
+   * 0 (an absent key from an older frame) means "unknown" and the words fall
+   * back to "below the hold line".
+   */
+  demandExitHysteresisW: number;
   /** The measured site demand (the LOAD words, never the grid words); null under failed evidence. */
   demandW: number | null;
   demandEvidence: NightDemandEvidence;
@@ -531,6 +544,7 @@ export function toNightChargeState(
     holdRateW: finite(value.hold_rate_w, base?.holdRateW ?? 0),
     demandScope: oneOf(value.demand_scope, DEMAND_SCOPES, base?.demandScope ?? "fleet"),
     demandThresholdW: finite(value.demand_threshold_w, base?.demandThresholdW ?? 0),
+    demandExitHysteresisW: finite(value.demand_exit_hysteresis_w, base?.demandExitHysteresisW ?? 0),
     demandW: nullableFinite(value.demand_w, base?.demandW ?? null),
     demandEvidence: oneOf(value.demand_evidence, DEMAND_EVIDENCES, base?.demandEvidence ?? "missing"),
     heldIntentId: optionalText(value.held_intent_id) ?? (value.held_intent_id === null ? null : base?.heldIntentId ?? null),
@@ -644,7 +658,7 @@ export function nextWindowInText(state: NightChargeState, nowMs: number): string
  * One unit's row in the pacing sentence and the per-battery list: its target
  * in plain words keyed on its own phase. A skipped-full battery says "full,
  * sitting out" — the design's own wording — a measured-demand stand-down says
- * "standing by" (the zero-watt non-participation named as what it is), and a
+ * "standing by at N W" (its zero-discharge hold named at its own rate), and a
  * claimed/disarmed/headroom sit-out says "sitting out" with its reason named
  * in the row.
  */
@@ -655,7 +669,7 @@ export function nightUnitPhrase(unit: NightUnitState): string {
     case "holding_on_demand":
       return `${unit.unitId} held at ${formatWatts(unit.targetW)}`;
     case "standing_by_on_demand":
-      return `${unit.unitId} standing by`;
+      return `${unit.unitId} standing by at ${formatWatts(unit.targetW)}`;
     case "skipped_full":
       return `${unit.unitId} full, sitting out`;
     case "complete":
@@ -687,11 +701,11 @@ export function nightUnitReasonText(reason: string): string {
 
 /**
  * One unit's reason in plain words, phase-aware where the wire shares ONE code
- * across behaviors: `demand_above_threshold` rides BOTH demand arms — a
- * stand-by answers MEASURED demand ("house demand high"), while the hold at
- * `hold_rate_w` is the fail-closed fallback a failed evidence word triggered
- * ("the demand reading did not hold" — never a demand figure the wire does
- * not have).
+ * across behaviors: `demand_above_threshold` rides BOTH demand arms — the
+ * active stand-down answers MEASURED demand ("house demand high"), while the
+ * hold at `hold_rate_w` is the fail-closed fallback a failed evidence word
+ * triggered ("the demand reading did not hold" — never a demand figure the
+ * wire does not have).
  */
 function unitReasonText(unit: NightUnitState): string {
   if (unit.reason === "demand_above_threshold") {
@@ -741,10 +755,10 @@ export function nightDemandText(state: NightChargeState): string {
 /**
  * The tile's one-line phase story for an ACTIVE window (the design §7 W2's own
  * wording): pacing names the per-battery targets toward the window's end,
- * standing by names the measured-demand stand-down with its honest trade (the
- * pods answer the house on their own), holding names the fail-closed
- * guarantee, complete names the moment, and skipped_full states the window had
- * nothing to charge.
+ * standing by names the measured-demand active stand-down with its truth (the
+ * grid serves the heavy load, charging resumes below threshold − hysteresis),
+ * holding names the fail-closed guarantee, complete names the moment, and
+ * skipped_full states the window had nothing to charge.
  */
 export function nightPhaseText(state: NightChargeState): string {
   const endLocal = state.window.endLocal;
@@ -768,7 +782,13 @@ export function nightPhaseText(state: NightChargeState): string {
         state.demandW === null
           ? `the demand reading is ${state.demandEvidence}`
           : `house demand ${formatWatts(state.demandW)}`;
-      return `Standing by — ${demand}: the batteries stand down at zero watts and the pods answer the house on their own until demand falls back.`;
+      // The resume bound is stated in watts ONLY from wire figures — the
+      // hysteresis rides the projection, never a client-side guess.
+      const bound =
+        state.demandExitHysteresisW > 0 && state.demandThresholdW > state.demandExitHysteresisW
+          ? `below ${formatWatts(state.demandThresholdW - state.demandExitHysteresisW)}`
+          : "once it falls back";
+      return `Standing by — ${demand}: the grid serves the heavy load and charging resumes ${bound}.`;
     }
     case "holding_on_demand": {
       const demand =
@@ -814,7 +834,7 @@ export function nightReasonText(state: NightChargeState): string {
     case "deadline_at_risk":
       return "Behind the plan — charging at the cap to reach full by the window's end.";
     case "demand_above_threshold":
-      return "House demand is above the hold line — batteries stood down until it falls back.";
+      return "House demand is above the hold line — the grid serves the heavy load while the batteries stand down.";
     case "demand_below_exit":
       return "House demand has fallen back below the hold line — charging resumes.";
     case "demand_evidence_missing":
@@ -930,7 +950,7 @@ export function nightPhaseAnnouncement(
         ? "Night charging started — pacing toward full."
         : "Night charging resumed — pacing toward full.";
     case "standing_by_on_demand":
-      return "Night charging is standing by — house demand is high; the batteries stand down until it passes.";
+      return "Night charging is standing by — house demand is high; the grid serves the heavy load while the batteries stand down.";
     case "holding_on_demand":
       // The fail-closed fallback: the evidence word did not hold, so the
       // announcement never claims a demand figure it does not have.

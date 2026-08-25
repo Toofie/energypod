@@ -3954,6 +3954,7 @@ def _build_runtime(
             hold_rate_w=int(night_config.hold_rate_w),
             demand_scope=night_config.demand_scope,
             demand_threshold_w=int(night_config.demand_threshold_w),
+            demand_exit_hysteresis_w=int(night_config.demand_exit_hysteresis_w),
             windows=tuple(
                 (parse_hhmm(start), parse_hhmm(end)) for start, end in night_config.window_local
             ),

@@ -2036,6 +2036,7 @@ export interface WireNightChargeState {
   readonly hold_rate_w: number;
   readonly demand_scope: "fleet" | "per_phase";
   readonly demand_threshold_w: number;
+  readonly demand_exit_hysteresis_w?: number;
   readonly demand_w: number | null;
   readonly demand_evidence: "good" | "missing" | "bad" | "stale";
   readonly held_intent_id: string | null;
@@ -2079,6 +2080,12 @@ export function nightChargeState(spec: Partial<WireNightChargeState> = {}): Wire
     hold_rate_w: spec.hold_rate_w ?? 100,
     demand_scope: spec.demand_scope ?? "fleet",
     demand_threshold_w: spec.demand_threshold_w ?? 1000,
+    // ADDITIVE (2026-08-26): rides only when the fixture asks — an older
+    // fixture shape (no key) must keep parsing exactly as before, and the
+    // console's words fall back to "below the hold line".
+    ...(spec.demand_exit_hysteresis_w === undefined
+      ? {}
+      : { demand_exit_hysteresis_w: spec.demand_exit_hysteresis_w }),
     demand_w: spec.demand_w === undefined ? 412 : spec.demand_w,
     demand_evidence: spec.demand_evidence ?? "good",
     held_intent_id:
@@ -2153,6 +2160,9 @@ export function nightChargeStateChanged(
       hold_rate_w: base.hold_rate_w,
       demand_scope: base.demand_scope,
       demand_threshold_w: base.demand_threshold_w,
+      ...(base.demand_exit_hysteresis_w === undefined
+        ? {}
+        : { demand_exit_hysteresis_w: base.demand_exit_hysteresis_w }),
       demand_w: base.demand_w,
       demand_evidence: base.demand_evidence,
       held_intent_id: base.held_intent_id,

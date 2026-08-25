@@ -1031,7 +1031,7 @@ def _targets(state: dict[str, Any]) -> dict[str, int]:
     return {
         unit["unit_id"]: unit["target_w"]
         for unit in state["units"]
-        if unit["phase"] in ("pacing", "holding_on_demand")
+        if unit["phase"] in ("pacing", "holding_on_demand", "standing_by_on_demand")
     }
 
 
@@ -1113,8 +1113,9 @@ async def test_the_scripted_night_runs_the_full_strategy(tmp_path: Any) -> None:
         assert _targets(pacing) == {"mid": 2_500, "lhs": 2_500}, "cap_first Docker parity"
 
         # The EV arrives: 500 + 500 + 300 = 1300 W of house load, and every
-        # participating battery STANDS DOWN (zero-watt non-participation —
-        # the operator's directive, the one demand behavior).
+        # participating battery STANDS DOWN INTO ITS HOLD — the operator's
+        # directive: the grid serves the heavy load while the hold pins each
+        # battery at hold_rate_w (zero discharge, autonomy overridden).
         _script_load(runtime, {"mid": 500, "rhs": 300, "lhs": 500})
         await session.pump_until(
             lambda: _state(runtime)["phase"] == "standing_by_on_demand",
@@ -1123,7 +1124,9 @@ async def test_the_scripted_night_runs_the_full_strategy(tmp_path: Any) -> None:
         stood_down = _state(runtime)
         assert stood_down["demand_w"] == 1_300
         assert "demand_above_threshold" in stood_down["reason_codes"]
-        assert _targets(stood_down) == {}, "stood down: nothing charges"
+        assert _targets(stood_down) == {"mid": 100, "lhs": 100}, (
+            "stood down at the hold rate: zero discharge, not zero charge"
+        )
 
         # Into the hysteresis band (900 W: above the 800 W exit bound): the
         # stand-down must NOT release.
@@ -1133,6 +1136,7 @@ async def test_the_scripted_night_runs_the_full_strategy(tmp_path: Any) -> None:
         band = _state(runtime)
         assert band["phase"] == "standing_by_on_demand", "the band never flaps"
         assert band["demand_w"] == 900
+        assert _targets(band) == {"mid": 100, "lhs": 100}, "the band keeps the holds"
 
         # Demand falls below the exit bound: pacing resumes.
         _script_load(runtime, {"mid": 300, "rhs": 100, "lhs": 300})
