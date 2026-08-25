@@ -275,6 +275,16 @@ referenced from CONTINUITY.md.)
    Status: OPEN (filed 2026-08-24; promoted if a charge leg shows the same
    bias at the policy cap).
 
+## Queue: web fixture hygiene (2026-08-25)
+
+1. SolarOutlook test fixture is a time bomb — it pinned an absolute
+   instant (2026-08-25T06:00Z) and aged out of range, failing the
+   suite on a clean tree (the single 1053/1054 web failure verified
+   pre-existing at e82bb26). Improvement: compute RELATIVE instants
+   from the test clock in that fixture, and sweep other fixtures for
+   absolute-date pins while there. Status: OPEN (queued for the next
+   web wave).
+
 ## Queue: night-V2 console wire gaps (2026-08-24, flagged by the console wave)
 
 1. Fallback forecast frames carry no age figure — the console cannot say

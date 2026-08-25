@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the rebalancing decision — no balancer now, participation first; health-watch first run tonight 23:00, mid's traverse tomorrow)
+Last updated: 2026-08-25 (Australia/Brisbane; health-watch v1.2 live with the fair A16 census for tonight's first run; the load-sharing review's two blockers in fold)
 
 ## Purpose
 
@@ -375,6 +375,50 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (load-sharing adversarial review — WITH-AMENDMENTS, 14
+  items; implementable ONLY after E1+E2 rewrite the §3.3 control
+  subsection): E1 BLOCKER — the clipped net term made EVERY export
+  level an equilibrium (geometric ramp risk at delivery bias 1.16 vs
+  the assumed 1.15); rewrite as a TRUE CLOSED LOOP on the SIGNED
+  netted exchange, derating at the safe edge. E2 BLOCKER — excluded
+  units' output DOUBLE-COUNTED (traverse nights ramp to cap in ~6
+  ticks, multi-kW standing export); subtract excluded output. E3 the
+  frozen-word plausibility guard; E4 kernel-denied participant
+  exclusion; E5 the claim-settle debounce (one failed cal tick could
+  destroy an anchor night via the renewal seam); E6 NETTING
+  VERIFICATION COMMISSIONING-BLOCKING for mode: act — the operator's
+  bill interval data is the evidence; on a NON-netting meter the
+  economics invert (2 c sold vs 30.77 c displaced); E7 the zero-cost
+  pin re-worded (partial-load efficiency penalty ~3–5 % — "no watt is
+  ever EXPORTED for it"); E8 the clamp renormalization; E9–E14
+  minors/notes. The v1.1 fold is IN FLIGHT (its working file rides the
+  tree; never swept). RULINGS RECORDED: the engagement-on-work
+  transient is genuinely cheap (~0.1 c) and the correct reading of the
+  operator's ask; the value case = STRANDED-ENERGY RECOVERY (2.8×
+  evening capability). OPERATOR-FACING: load-sharing activation will
+  need the operator's bill interval data (or an equivalent read-only
+  verification) before mode: act per E6 — flag when relevant.
+
+- 2026-08-25 (health-watch v1.2 + THE A16 CENSUS FIX, COMMITTED AND
+  LIVE — contract 180a3c8; code e82bb26, 12 files +2398 — NOTE: the
+  code commit also swept in the untracked
+  DESIGN_EVENING_LOAD_SHARING.md v1; the v1.1 fold in flight lands on
+  top; controller restarted as harness-managed task buj01g26s, boot
+  clean — TONIGHT'S 23:00 FIRST RUN USES THE FAIR PREDICATES): the
+  §1.1 two-hypotheses rhs re-read; S4' in-phase non-following; the
+  phase_idle_or_ct_silent soft note + ct_link_suspect; ROUTE B
+  ACCEPTED with the agent's flagged-judgment rationale — without it a
+  genuinely stuck garage pod could never reach recovery. GATES: 3002
+  backend (+12 — the garage shape NEVER flags under any load_frac,
+  pinned per-predicate; Route B never applies to nominal units, pinned
+  at 7 seeded nights), ruff + mypy strict clean, web 1053/1054 — the
+  one failure PRE-EXISTING (the SolarOutlook fixture pinned to
+  2026-08-25T06:00Z had aged out; verified failing on the clean tree;
+  QUEUED in DEFERRED_FINDINGS as the time-bomb-fixture fix — fixtures
+  must compute relative instants). Operator-facing state: tonight's
+  first health-check run is now FAIR to the garage battery; mid's
+  traverse tomorrow 15:00 unchanged.
 
 - 2026-08-25 (rebalancing research round — DECISION: DEFER BUILDING,
   FIRST FIX PARTICIPATION; read-only, nothing committed): FINDINGS OF
