@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the health-watch contract v1.1 committed with the panel's fifteen amendments — Wave 0 implementation starting)
+Last updated: 2026-08-25 (Australia/Brisbane; health-watch Wave 0 live — the deadband and delivery-judged coherence; Stages C+P launching, recovery still uncommissioned)
 
 ## Purpose
 
@@ -375,6 +375,36 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (health-watch WAVE 0 COMMITTED AND LIVE — 3f1b27e, 9 files
+  +741/−46; controller restarted as harness-managed task bbxaxk1dz,
+  boot clean, console polling, both env files sourced per the runbook;
+  /healthz re-verified ok after restart): W0-1 THE SELF-CHARGE DEADBAND
+  — policy.self_charge_deadband_w (default 25 W, validated (0,100]):
+  in-band floats render NEITHER self-charging NOR flapping; outside the
+  band the rendering is byte-identical. W0-2 COHERENCE JUDGED ON
+  DELIVERY — episodes count only when BOTH movement AND signed delivery
+  fail; baselines survive authorization gaps up to
+  policy.coherence_gap_grace_s (default 12 s) unless power returned to
+  idle; the health state opens ONLY on a classifying echo
+  (echo_matches_write or objective_not_served; unreadable/external →
+  record-and-downgrade). THE I10 STRUCTURAL PIN: a source-scan test
+  asserts NOTHING in src/energypod responds automatically on
+  actuation_incoherent (allowlist: recovery.py itself, service.py read
+  surfaces, parking's audit-window read, composition's one bounded echo
+  READ, config comments). GATES: 2778 backend tests (10 new incl. the
+  87 %/96 % regression vectors and the zero-straddle replay), ruff
+  clean, mypy strict clean. Five §3 ambiguities resolved by the author
+  and accepted (the idle-band definition; symmetric close bounds; grace
+  bounds [1,300]; signed projection semantics incl. the honest
+  charge-onto-self-charge corner; the ±33 W class both-sides
+  rendering). The flapping observation that started this (the
+  operator's History wall of 60+ entries) is now STRUCTURALLY
+  IMPOSSIBLE at default policy — live tonight. NOW LAUNCHING: Stages
+  C+P implementation (census + probe; contract §4–§6, §9–§11, §13–§14,
+  §17 — NOT Stage R). RECOVERY STAYS UNCOMMISSIONED pending the
+  supervised live verification + A6 receipts. The calibration contract
+  remains queued behind it.
 
 - 2026-08-25 (health-watch CONTRACT COMMITTED, WAVE 0 STARTING —
   2f1fd51, docs/DESIGN_BATTERY_HEALTH_WATCH.md, CONTRACT v1.1, 1348
