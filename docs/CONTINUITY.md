@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; the load-sharing contract v1.1 committed, its implementation wave launched — advise posture first, act gated on the operator's netting evidence)
+Last updated: 2026-08-25 (Australia/Brisbane; every commissioned surface live — load-sharing act on the operator's attestation, the fair census tonight, mid's traverse tomorrow, sharing's first window tomorrow 16:00)
 
 ## Purpose
 
@@ -375,6 +375,46 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-08-25 (evening load-sharing COMMITTED, COMMISSIONED ACT, LIVE —
+  830d137, 25 files +5852; PRECEDED BY THE ATTESTATION 8dd229b — the
+  operator's direct statement "I do have net metering, no need to
+  prove it, it just is" recorded as
+  docs/evidence/netting-attestation-2026-08-25.md with the
+  bill-structure and NET_BILLED corroborations, RELEASING THE E6 GATE;
+  §12 steps 2–3 compressed to one revision at the operator's
+  direction; controller restarted as harness-managed task bah336tk9,
+  boot clean; ALL THREE programs verified live read-only —
+  evening-sharing mode ACT phase idle (first window tomorrow
+  16:00–22:30), health-watch await_window (23:00 tonight),
+  calibration act/idle with mid's one-shot standing (fires 14:00
+  tomorrow)): GATES — 3077 backend (+87) / 1074 web (+20), ruff +
+  mypy strict + tsc + build green; the SolarOutlook TIME-BOMB FIXTURE
+  FIXED (relative to the test clock; the DEFERRED_FINDINGS item
+  closed). THREE SAFETY PROOFS PINNED BY NAMED TESTS — the signed
+  loop's ONLY equilibrium is zero netted exchange (the v1.0 clipped
+  counterfactual grows past cap — the regression pin); elsewhere_w
+  leaves the participants' total UNCHANGED (the excluded-output ramp
+  unreachable); NO dispatch outside the window (cold/wall/morning
+  ticks all zero). SIX AMBIGUITY RESOLUTIONS recorded (§5.3's
+  both-bounds set rule as the E7 efficiency-aware reading;
+  elsewhere_w over the post-skip candidate set; the E8 invariant's
+  all-caps case; baseline_context riding the close row; the close
+  row's open/close pair; capability_limited including the fleet
+  bound). THE FULL PROGRAM STATE — every commissioned surface is now
+  live: the honest recovery monitor (W0); health-watch
+  census+probe+recovery-advise (the FAIR A16 predicates run tonight);
+  calibration act with mid's measurement one-shot standing;
+  evening-sharing act from tomorrow 16:00; PVOutput (the operator's
+  toggle); night-V2 suggest. THE OPERATOR'S COMPLETE-EVERYTHING
+  DIRECTIVE IS DELIVERED END-TO-END. REMAINING HONEST OPENS —
+  recovery AUTO (needs a genuinely flagged unit + the supervised
+  night); the first-evening and first-traverse observations (tomorrow
+  is BOTH: mid traverses 15:00–22:30 exempt from sharing while
+  lhs/rhs share reduced — by design the two programs' first live
+  cooperation); Thursday's graduation record; and the three standing
+  operator questions (always-rhs; rhs capacity; Fronius Battery
+  Control).
 
 - 2026-08-25 (load-sharing CONTRACT v1.1 COMMITTED — c81ba98,
   +297/−46 on top of the swept-in v1; all fourteen amendments placed,

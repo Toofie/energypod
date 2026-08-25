@@ -282,8 +282,9 @@ referenced from CONTINUITY.md.)
    suite on a clean tree (the single 1053/1054 web failure verified
    pre-existing at e82bb26). Improvement: compute RELATIVE instants
    from the test clock in that fixture, and sweep other fixtures for
-   absolute-date pins while there. Status: OPEN (queued for the next
-   web wave).
+   absolute-date pins while there. Status: FIXED 830d137 (fixture now
+   relative to the test clock, riding the evening-share wave; the
+   sweep-for-other-pins follow-up may still be worth a pass).
 
 ## Queue: night-V2 console wire gaps (2026-08-24, flagged by the console wave)
 
