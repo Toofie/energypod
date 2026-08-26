@@ -262,9 +262,9 @@ def test_there_is_no_grid_telemetry_max_age_s_key_anywhere_e10() -> None:
     import yaml
 
     for path in Path("config").glob("*.yaml"):
-        assert "grid_telemetry_max_age_s" not in yaml.safe_load(
-            path.read_text(encoding="utf-8")
-        ), path
+        assert "grid_telemetry_max_age_s" not in yaml.safe_load(path.read_text(encoding="utf-8")), (
+            path
+        )
 
 
 def test_there_is_no_runtime_toggle_for_mode() -> None:
@@ -277,25 +277,30 @@ def test_there_is_no_runtime_toggle_for_mode() -> None:
     assert "set_evening" not in service
 
 
-def test_the_live_write_example_lands_in_advise_with_the_key_absent() -> None:
-    """§12/§15-5: the live config block lands in advise; the E6 gate keeps
-    act a validation error without the recorded evidence row (the operator's
-    bill-data verification happens later — the key stays documented and
-    absent)."""
+def test_the_live_write_example_validates_cleanly() -> None:
+    """§12/§15-5: the live config block validates in advise or act; in act,
+    the E6 gate requires the recorded evidence row
+    (docs/evidence/netting-attestation-2026-08-25.md);
+    removing the evidence key makes act a validation error."""
     import yaml
 
     payload = yaml.safe_load(
         Path("config/config.live-write-example.yaml").read_text(encoding="utf-8")
     )
     block = payload["evening_load_sharing"]
-    assert block["mode"] == "advise"
-    assert "act_netting_evidence" not in block
+    assert block["mode"] in {"advise", "act"}
+    if block["mode"] == "act":
+        assert (
+            block.get("act_netting_evidence") == "docs/evidence/netting-attestation-2026-08-25.md"
+        )
+        assert Path(block["act_netting_evidence"]).exists()
     config = _validate(payload)
     assert config.evening_load_sharing is not None
-    # And act WOULD be refused on this file today, exactly as §15-5 promises.
-    act_payload = dict(payload)
+    # And act without evidence WOULD be refused on this file, exactly as E6 promises.
+    act_no_evidence = dict(payload)
     act_block = dict(block)
     act_block["mode"] = "act"
-    act_payload["evening_load_sharing"] = act_block
+    act_block.pop("act_netting_evidence", None)
+    act_no_evidence["evening_load_sharing"] = act_block
     with pytest.raises(ValidationError):
-        _validate(act_payload)
+        _validate(act_no_evidence)
