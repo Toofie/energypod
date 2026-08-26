@@ -28,12 +28,20 @@
  * - FEATURE-ABSENT HONESTY: absent telemetry words "not available" (never
  *   zero-filled); absent adviser projections claim nothing; the solar
  *   footnote states the site fact.
+ * - NODE INSTRUMENTS (round 3b): every card carries one instrument slot; the
+ *   battery's molten cell meters the REAL SoC (an empty vessel worded "not
+ *   available" when unknown, meniscus shimmer gated to live charging — never
+ *   while discharging or down); grid feed ports rotate with import/export
+ *   and stand their tick down on the fleet's split; home hearths breathe
+ *   with measured load and stay dark at idle. All decorative layers are
+ *   aria-hidden.
  */
 import { render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient } from "../../api/client";
 import { FlowView } from "./FlowView";
+import { CONDUIT_START_Y, STUB_BOTTOM } from "./flowGeometry";
 
 const api = vi.hoisted(() => {
   const client = {
@@ -468,6 +476,8 @@ describe("FlowView — honesty", () => {
         active: true,
         phase: "standing_by_on_demand",
         demand_w: 1900,
+        demand_threshold_w: 1000,
+        demand_exit_hysteresis_w: 200,
       },
       units: [
         unit("mid", { grid_power_w: -1900, load_power_w: 950, battery_watts: 0 }),
@@ -479,7 +489,39 @@ describe("FlowView — honesty", () => {
 
     expect(
       await screen.findByText(
-        "Night charging is standing by — house demand is 1,900 W, so the batteries stand down at zero watts and the pods answer the house on their own until demand falls back.",
+        "Night charging is standing by — house demand is 1,900 W, so the grid serves the heavy load and charging resumes below 800 W.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("names the parked battery in the night story while the window keeps running around it", async () => {
+    // The per-phase park (2026-08-26): mid's own circuit ran heavy, so its row
+    // left the submission entirely — the fleet phase never changes, and the
+    // story names the silence beside itself.
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue({
+      site_id: "site-1",
+      snapshot_sequence: 41,
+      captured_at: "2026-08-22T12:00:00+10:00",
+      night_charge_state: {
+        enabled: true,
+        active: true,
+        phase: "pacing",
+        units: [
+          { unit_id: "mid", soc_pct: 88, phase: "standing_by_parked", target_w: 0, reason: "night_standby_parked" },
+        ],
+      },
+      units: [
+        unit("mid", { grid_power_w: -1900, load_power_w: 1500, battery_watts: 0 }),
+        unit("rhs", { grid_power_w: -2000, load_power_w: 270, battery_watts: -1900 }),
+      ],
+    } as unknown as SnapshotEnvelope);
+
+    renderFlow();
+
+    expect(
+      await screen.findByText(
+        "Night charging is running — rhs is charging 1,900 W in total, the house using 1,770 W. mid is parked in standby — answers neither charge nor discharge until house demand falls.",
       ),
     ).toBeVisible();
   });
@@ -610,7 +652,11 @@ describe("FlowView — the pinned diagram structure", () => {
     await screen.findByRole("group", { name: /power flow by phase/i });
     const diagram = document.body.querySelector(".flow-diagram");
     expect(diagram).not.toBeNull();
-    const columns = diagram?.querySelectorAll(":scope > .flow-phase") ?? [];
+    // Round 1 of the design loop wrapped every column in the bay's own
+    // presentational viewport (.flow-stage) inside the diagram group — the
+    // pin follows it one level so it still asserts the DIRECT column set and
+    // their exact order (fleet first, then phases).
+    const columns = diagram?.querySelectorAll(":scope > .flow-stage > .flow-phase") ?? [];
     expect(columns.length).toBe(3);
     // The glance path is story → whole site → phase detail; the fleet column
     // leads the DOM (and so the screen reader's speech) before any phase.
@@ -632,9 +678,9 @@ describe("FlowView — the pinned diagram structure", () => {
 
     await screen.findByText(/Nothing is flowing/i);
     // 3 columns × 3 idle slots (grid, battery, and a measured 0 W house) = 9
-    // rings, and no ribbon or dotted stub anywhere.
+    // rings, and no live conduit or dotted stub anywhere.
     expect(document.body.querySelectorAll(".flow-idle-ring").length).toBe(9);
-    expect(document.body.querySelectorAll(".flow-stub-track").length).toBe(0);
+    expect(document.body.querySelectorAll(".flow-conduit").length).toBe(0);
     expect(document.body.querySelectorAll(".flow-stub-unknown").length).toBe(0);
   });
 
@@ -647,14 +693,14 @@ describe("FlowView — the pinned diagram structure", () => {
     renderFlow();
 
     expect((await screen.findAllByText(composedLine("Importing 412 W"))).length).toBe(2); // mid + the fleet
-    // mid's column: one ribbon (the grid import) and two dotted unknowns
-    // (battery, house); the fleet column mirrors the same split.
+    // mid's column: one live conduit (the grid import) and two dotted
+    // unknowns (battery, house); the fleet column mirrors the same split.
     const columns = document.body.querySelectorAll(".flow-phase");
     expect(columns.length).toBe(2);
-    expect(columns[1]?.querySelectorAll(".flow-stub-track").length).toBe(1);
+    expect(columns[1]?.querySelectorAll(".flow-conduit").length).toBe(1);
     expect(columns[1]?.querySelectorAll(".flow-stub-unknown").length).toBe(2);
     expect(columns[0]?.querySelectorAll(".flow-stub-unknown").length).toBe(2);
-    expect(columns[0]?.querySelectorAll(".flow-stub-track").length).toBe(1);
+    expect(columns[0]?.querySelectorAll(".flow-conduit").length).toBe(1);
   });
 
   it("splits the fleet's both-directions slots into two half-slot stubs", async () => {
@@ -671,11 +717,11 @@ describe("FlowView — the pinned diagram structure", () => {
     await screen.findByText(/discharging 800 W while mid is charging 1,900 W/i);
     // The fleet column: the grid slot AND the battery slot both split (import
     // beside export, discharge beside charge), the house slot does not — five
-    // ribbons where a single column would draw three, and each side carries
-    // its own width instead of one max-width both-headed lie.
+    // conduits where a single column would draw three, each side its own
+    // stream instead of one max-width both-headed lie.
     const fleet = document.body.querySelector(".flow-phase--fleet");
     expect(fleet).not.toBeNull();
-    expect(fleet?.querySelectorAll(".flow-stub-track").length).toBe(5);
+    expect(fleet?.querySelectorAll(".flow-conduit").length).toBe(5);
   });
 
   it("dims a disconnected phase, dots its stubs, and keeps its last-known words", async () => {
@@ -699,7 +745,15 @@ describe("FlowView — the pinned diagram structure", () => {
     expectVisibleText(down, /Charging 600 W/);
     // The arrows stop claiming a live flow they cannot vouch for; the words stay.
     expect(down.querySelectorAll(".flow-stub-unknown").length).toBe(3);
-    expect(down.querySelectorAll(".flow-stub-track").length).toBe(0);
+    expect(down.querySelectorAll(".flow-conduit").length).toBe(0);
+    // The downed battery keeps its LAST-KNOWN fill (emptied would be a lie
+    // about what was measured) but never shimmers it, and its port dims to
+    // unknown — chrome goes quiet, words stay word-perfect.
+    const downCell = down.querySelector<HTMLElement>(".flow-soc-cell");
+    expect(downCell).not.toBeNull();
+    expect(downCell?.style.getPropertyValue("--cell-level")).toBe("45%");
+    expect(downCell?.classList.contains("flow-soc-cell--charging")).toBe(false);
+    expect(down.querySelector(".flow-port")?.getAttribute("data-flow")).toBe("unknown");
     // The note anchors the column's FOOT — under the figures it vouches for —
     // so a phase that needs a word never shifts any other column's rows.
     const note = down.querySelector(".flow-phase-note");
@@ -723,26 +777,33 @@ describe("FlowView — the pinned diagram structure", () => {
     await screen.findByText(/while rhs is charging 700 W/i);
     const columns = document.body.querySelectorAll(".flow-phase");
     expect(columns.length).toBe(3);
-    const stubsOf = (column: Element, tone: string): string[] =>
-      [...column.querySelectorAll(`.flow-stub--${tone} .flow-stub-track`)].map(
-        (line) => `${line.getAttribute("y1")}->${line.getAttribute("y2")}`,
-      );
-    // A stub drawn bottom→top (78→14) carries its head INTO the rail; one
-    // drawn top→bottom (14→78) carries its head down to the node. Import and
-    // discharge feed the phase; export, charge, and the house's draw leave it.
-    expect(stubsOf(columns[1]!, "grid")).toEqual(["78->14"]); // lhs importing
-    expect(stubsOf(columns[1]!, "battery")).toEqual(["78->14"]); // lhs discharging
-    expect(stubsOf(columns[1]!, "home")).toEqual(["14->78"]);
-    expect(stubsOf(columns[2]!, "grid")).toEqual(["14->78"]); // rhs exporting
-    expect(stubsOf(columns[2]!, "battery")).toEqual(["14->78"]); // rhs charging
-    // Every active track wears exactly one head (markerEnd), on its drawn end.
-    for (const line of document.body.querySelectorAll(".flow-stub-track")) {
-      expect(line.getAttribute("marker-end")).toMatch(/^url\(#flow-head-(sm|lg)-/);
-      expect(line.getAttribute("marker-start")).toBeNull();
+    // A curved conduit is read from its own path endpoints: it STARTS at one
+    // anchor and ENDS at the other, with markerEnd docked on the drawn end.
+    // into-bus runs card → rail (ends at CONDUIT_START_Y, by the rail);
+    // to-node runs rail → card (ends at STUB_BOTTOM, by the node).
+    const endsOf = (column: Element, tone: string): string[] =>
+      [...column.querySelectorAll(`.flow-stub--${tone} .flow-conduit`)].map((path) => {
+        const pairs = [...(path.getAttribute("d") ?? "").matchAll(/(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)/g)];
+        const first = pairs[0];
+        const last = pairs[pairs.length - 1];
+        return `${first?.[2]}->${last?.[2]}`; // y of start -> y of end
+      });
+    // Import and discharge FEED the phase (heads dock at the rail); export,
+    // charge, and the house's draw LEAVE it (heads dock at the node).
+    expect(endsOf(columns[1]!, "grid")).toEqual([`${STUB_BOTTOM}->${CONDUIT_START_Y}`]); // lhs importing
+    expect(endsOf(columns[1]!, "battery")).toEqual([`${STUB_BOTTOM}->${CONDUIT_START_Y}`]); // lhs discharging
+    expect(endsOf(columns[1]!, "home")).toEqual([`${CONDUIT_START_Y}->${STUB_BOTTOM}`]);
+    expect(endsOf(columns[2]!, "grid")).toEqual([`${CONDUIT_START_Y}->${STUB_BOTTOM}`]); // rhs exporting
+    expect(endsOf(columns[2]!, "battery")).toEqual([`${CONDUIT_START_Y}->${STUB_BOTTOM}`]); // rhs charging
+    // Every active conduit wears exactly one head (markerEnd), on its drawn
+    // end — never a tail head (markerStart).
+    for (const path of document.body.querySelectorAll(".flow-conduit")) {
+      expect(path.getAttribute("marker-end")).toMatch(/^url\(#flow-head-(sm|lg)-/);
+      expect(path.getAttribute("marker-start")).toBeNull();
     }
   });
 
-  it("edges every ribbon with its family's own deepened hue (the gold stays gold)", async () => {
+  it("retires the ribbon grammar and mounts the light engine under every bus", async () => {
     liveChannel([]);
     api.client.getSnapshot.mockResolvedValue(
       snapshotEnvelope([
@@ -753,21 +814,27 @@ describe("FlowView — the pinned diagram structure", () => {
     renderFlow();
 
     await screen.findByText(/All the batteries are charging 1,900 W/i);
-    // Every track carries a rim beneath it: the same hue deepened, full
-    // opacity, 2.6 units wider — the darker edge that keeps a thin battery
-    // ribbon reading gold on white instead of beige (round 2's finding 1).
-    const tracks = document.body.querySelectorAll(".flow-stub-track");
-    expect(tracks.length).toBeGreaterThan(0);
-    for (const track of tracks) {
-      const rim = track.previousElementSibling;
-      expect(rim?.classList.contains("flow-stub-rim")).toBe(true);
-      const trackWidth = Number((track as SVGElement).style.strokeWidth);
-      const rimWidth = Number((rim as SVGElement).style.strokeWidth);
-      expect(rimWidth).toBeCloseTo(trackWidth + 2.6, 5);
+    // THE GRAMMAR SWAP, pinned negatively: not one element of the retired
+    // thickness-ribbon trio (rim / track / march line) survives anywhere —
+    // magnitude lives in the streams, the words, and two discrete heads now.
+    expect(document.body.querySelectorAll(".flow-stub-rim").length).toBe(0);
+    expect(document.body.querySelectorAll(".flow-stub-track").length).toBe(0);
+    expect(document.body.querySelectorAll(".flow-stub-march").length).toBe(0);
+    // …and positively: every column's bus wrap stacks the light-engine canvas
+    // (decorative light only, aria-hidden) UNDER the structural SVG — canvas
+    // first in DOM so the svg paints its rail/collars/heads above the glow.
+    const wraps = document.body.querySelectorAll(".flow-bus-wrap");
+    expect(wraps.length).toBe(2); // fleet + the one live unit's phase
+    for (const wrap of wraps) {
+      const canvas = wrap.querySelector(":scope > canvas.flow-bus-glow");
+      expect(canvas).not.toBeNull();
+      expect(canvas?.getAttribute("aria-hidden")).toBe("true");
+      expect(wrap.querySelector(":scope > svg.flow-bus")).not.toBeNull();
+      expect(canvas === wrap.firstElementChild).toBe(true);
     }
   });
 
-  it("reserves the SoC band in every node card and meters the battery's reading", async () => {
+  it("equips every node card with an instrument slot and pours the molten cell", async () => {
     liveChannel([]);
     api.client.getSnapshot.mockResolvedValue(
       snapshotEnvelope([
@@ -778,24 +845,167 @@ describe("FlowView — the pinned diagram structure", () => {
     renderFlow();
 
     await screen.findByText(/All the batteries are charging 1,900 W/i);
-    // Every card — Grid and Home included — carries exactly one SoC band, so
-    // the same rows land at the same y across all four columns; only the
-    // battery's carries the reading, worded and metered.
+    // Every card — all six — carries exactly one instrument slot, so the same
+    // rows land at the same y across all columns (the aligned visual grid).
     const nodes = document.body.querySelectorAll(".flow-node");
     expect(nodes.length).toBe(6); // the fleet's three + the phase's three
     for (const node of nodes) {
-      const bands = node.querySelectorAll(":scope > .flow-node-extra");
-      expect(bands.length).toBe(1);
+      const slots = node.querySelectorAll(":scope > .flow-node-extra");
+      expect(slots.length).toBe(1);
+    }
+    // ROUND-3B INSTRUMENTS: both grid cards dock a feed port (importing), the
+    // phase battery's cell meters the real reading, and both homes breathe a
+    // hearth. Reserved-empty remain only the slots with nothing honest to
+    // show: the fleet battery (no summed SoC exists) and both homes' rows.
+    const ports = document.body.querySelectorAll(".flow-port");
+    expect(ports.length).toBe(2);
+    for (const port of ports) {
+      expect(port.getAttribute("data-flow")).toBe("import"); // lhs imports 2,000 W
+      expect(port.getAttribute("aria-hidden")).toBe("true"); // decorative tick
     }
     const reserved = document.body.querySelectorAll(".flow-node-extra--reserved");
-    // Grid + Home in both columns (the fleet's battery has no summed SoC, so
-    // its band is reserved too): 5 reserved, 1 worded.
-    expect(reserved.length).toBe(5);
+    expect(reserved.length).toBe(3); // fleet battery + both homes
+    const cells = document.body.querySelectorAll<HTMLElement>(".flow-soc-cell");
+    expect(cells.length).toBe(1); // only lhs's battery has a SoC to pour
     const socBand = document.body.querySelector(".flow-node-extra--soc");
-    expect(socBand).not.toBeNull();
-    expect(socBand?.textContent).toBe("40% charged");
-    const fill = socBand?.querySelector<HTMLElement>(".flow-soc-fill");
-    expect(fill?.style.width).toBe("40%");
+    expect(socBand?.textContent).toBe("40% charged"); // the pinned wording, verbatim
+    expect(socBand?.getAttribute("aria-hidden")).toBeNull(); // the words are real text
+    const cell = cells[0]!;
+    expect(cell.getAttribute("aria-hidden")).toBe("true"); // the vessel is decoration
+    expect(cell.style.getPropertyValue("--cell-level")).toBe("40%");
+    // The end-glow rides the reading's ramp (0.18 + 0.5·SoC/100).
+    expect(cell.style.getPropertyValue("--cell-glow")).toBe("0.380");
+    expect(cell.classList.contains("flow-soc-cell--charging")).toBe(true); // −1,900 W charging
+    const hearths = document.body.querySelectorAll<HTMLElement>(".flow-node-hearth");
+    expect(hearths.length).toBe(2); // the phase's home + the fleet's home
+    for (const hearth of hearths) {
+      expect(Number.parseFloat(hearth.style.getPropertyValue("--hearth-i"))).toBeGreaterThan(0);
+      expect(hearth.getAttribute("aria-hidden")).toBe("true");
+    }
+  });
+
+  it("pours an EMPTY vessel and words not available when the SoC itself is unknown", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([unit("mid", { battery_watts: -600 })]), // soc_pct stays null
+    );
+
+    renderFlow();
+
+    expect((await screen.findAllByText(composedLine("Charging 600 W"))).length).toBeGreaterThanOrEqual(1);
+    const band = document.body.querySelector(".flow-node-extra--soc-unknown");
+    expect(band).not.toBeNull();
+    expect(band?.textContent).toBe("not available"); // worded, never zero-filled
+    const cell = band?.querySelector(".flow-soc-cell");
+    expect(cell).not.toBeNull();
+    // NEVER a zero-fill lie: the unknown vessel has no fill layer at all.
+    expect(cell?.querySelector(".flow-soc-cell-fill")).toBeNull();
+    expect(cell?.getAttribute("aria-hidden")).toBe("true");
+    expect(document.body.querySelector(".flow-soc-pct")).toBeNull(); // no percentage to show
+  });
+
+  it("rotates the grid port's tick with the flow and stands it down on the fleet's split", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("lhs", { grid_power_w: -800, load_power_w: 100 }),
+        unit("rhs", { grid_power_w: 500, load_power_w: 100 }),
+      ]),
+    );
+
+    renderFlow();
+
+    await screen.findByText(/pulling different ways/i);
+    const portDirection = (phaseLabel: RegExp): string | null => {
+      const column = [...document.body.querySelectorAll(".flow-phase")].find((el) =>
+        phaseLabel.test(el.getAttribute("aria-label") ?? ""),
+      );
+      return column?.querySelector(".flow-port")?.getAttribute("data-flow") ?? null;
+    };
+    // One port per grid card: import rotates up, export rotates down.
+    expect(portDirection(/Phase lhs/)).toBe("import");
+    expect(portDirection(/Phase rhs/)).toBe("export");
+    // The fleet is legally both-at-once: its tick STANDS DOWN ("split") — a
+    // single rotated pointer cannot own two directions; the two-sided words do.
+    expect(portDirection(/Whole site/)).toBe("split");
+  });
+
+  it("breathes the hearth with measured load and leaves it dark when idle", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("mid", { load_power_w: 950 }),
+        unit("rhs", { load_power_w: 0 }), // measured zero — the honest dark hearth
+      ]),
+    );
+
+    renderFlow();
+
+    await screen.findByRole("group", { name: /power flow by phase/i });
+    const homes = [...document.body.querySelectorAll(".flow-node--home")];
+    expect(homes.length).toBe(3); // mid, rhs, and the fleet's home
+    const lit = homes.filter((home) => home.querySelector(".flow-node-hearth") !== null);
+    expect(lit.length).toBe(2); // mid's home and the fleet sum; rhs idles DARK
+    for (const home of lit) {
+      const hearth = home.querySelector<HTMLElement>(".flow-node-hearth")!;
+      const level = Number.parseFloat(hearth.style.getPropertyValue("--hearth-i"));
+      expect(level).toBeGreaterThan(0);
+      expect(level).toBeLessThanOrEqual(1);
+    }
+  });
+
+  it("shimmers the meniscus only while charging — never while discharging or down", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([
+        unit("mid", { soc_pct: 30, battery_watts: -1500 }), // charging
+        unit("lhs", { soc_pct: 70, battery_watts: 800 }), // discharging
+        unit("rhs", { soc_pct: 50, battery_watts: -400 }, { lifecycle: "disconnected" }),
+      ]),
+    );
+
+    renderFlow();
+
+    await screen.findByRole("group", { name: /power flow by phase/i });
+    const cellOf = (phaseLabel: RegExp): HTMLElement | null => {
+      const column = [...document.body.querySelectorAll(".flow-phase")].find((el) =>
+        phaseLabel.test(el.getAttribute("aria-label") ?? ""),
+      );
+      return column?.querySelector<HTMLElement>(".flow-soc-cell") ?? null;
+    };
+    expect(document.body.querySelectorAll(".flow-soc-cell").length).toBe(3); // phases only
+    expect(cellOf(/Phase mid/)?.classList.contains("flow-soc-cell--charging")).toBe(true);
+    // THE DISCHARGE SHIMMER IS FORBIDDEN: motion may shimmer in place, never
+    // fake a drain — the fill only ever reflects the real SoC figure.
+    expect(cellOf(/Phase lhs/)?.classList.contains("flow-soc-cell--charging")).toBe(false);
+    // A downed cell keeps its last-known fill but loses the glint — shimmer
+    // would claim a liveness the wire no longer carries.
+    expect(cellOf(/Phase rhs/)?.classList.contains("flow-soc-cell--charging")).toBe(false);
+  });
+
+  it("keeps a measured-zero vessel dark: no glow, no fill, no fake surface", async () => {
+    liveChannel([]);
+    api.client.getSnapshot.mockResolvedValue(
+      snapshotEnvelope([unit("mid", { soc_pct: 0, grid_power_w: -200, load_power_w: 100, battery_watts: 0 })]),
+    );
+
+    renderFlow();
+
+    await screen.findByRole("group", { name: /power flow by phase/i });
+    // The percentage is still real text — a measured zero is spoken honestly.
+    const socLine = (_: string, element: Element | null): boolean =>
+      (element?.textContent ?? "") === "0% charged";
+    expect(screen.getAllByText(socLine).length).toBeGreaterThan(0);
+    const cell = document.body.querySelector<HTMLElement>(".flow-soc-cell");
+    expect(cell).not.toBeNull();
+    // THE GLOW FLOOR: the ramp (0.18 + 0.5·SoC/100) floors at exactly 0 —
+    // a measured-zero vessel earns no end-glow halo.
+    expect(cell?.style.getPropertyValue("--cell-level")).toBe("0%");
+    expect(cell?.style.getPropertyValue("--cell-glow")).toBe("0");
+    // And no fill layer at all — the same rule the unknown vessel follows —
+    // so nothing anchors a glowing "surface" at the vessel floor either.
+    expect(cell?.querySelector(".flow-soc-cell-fill")).toBeNull();
+    expect(cell?.querySelector(".flow-soc-cell-meniscus")).toBeNull();
   });
 
   it("pulses the battery ring of a phase commanded but not yet moving", async () => {

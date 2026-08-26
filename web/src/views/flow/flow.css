@@ -1,323 +1,588 @@
 /*
- * Energy Flow view styling — the console's most legible view, per the
- * accepted design brief (docs/FLOW_DESIGN_BRIEF.md) and the round-2 polish.
- * The diagram is the centerpiece: the Whole-site fleet column FIRST and
- * unmistakably the lead, then one column per phase, each a rail (the phase
- * conductor) with three stub slots dropping to docked node cards.
+ * Energy Flow view styling — ROUND 2 of the "Dark Glass Bay" direction:
+ * the living streams. Round 1 built the recessed dark-glass bay; round 2
+ * RETIRES the thickness-ribbon grammar (the operator's verdict: no more bars
+ * of like thickness) and hands magnitude to a Canvas2D light engine
+ * (web/src/views/flow/glow.ts) — particle streams whose density, speed, and
+ * glow are proportional to watts, terminal bloom pools, and rail
+ * energization on through-flow, painted additively under the structural SVG.
  *
- * DIRECTION IS NEVER COLOR-ALONE: the word + the arrowhead + the proportional
- * width carry it on three redundant channels (the colorblind-safe
- * construction); color only names the NODE FAMILY — grid --active, battery
- * --armed, home --ink-soft — and every arrowhead is one neutral --ink.
+ * ARCHITECTURE: everything around the bay keeps its cream light chrome
+ * (heading row, connection pill, story line, footnote, loading/error/empty —
+ * deliberately untouched; they frame the instrument). Inside .flow-diagram,
+ * all four columns collapse into ONE recessed dark-glass viewport
+ * (.flow-stage): machined bezel, inset vignette, glass sheen. The old light
+ * cards are gone — columns are transparent ZONES separated by hairlines, the
+ * fleet zone lifts in family blue, node tiles are etched dark glass, and the
+ * SVG bus keeps the STRUCTURE (rail, channel, collars, idle rings, unknown
+ * dashes, neutral heads on curved conduits) while the canvas paints LIFE.
  *
- * THE RIBBON (round 2's fix for the muted gold): the round-1 track rendered
- * the family color at 0.45 alpha over a white card, which bleached the
- * battery's #8a6d1a into a muted beige (0.45 × #8a6d1a + 0.55 × #fff ≈
- * #c0b299 — barely a hue at all). The ribbon is now three layers, all inside
- * the validated family:
- *   1. the RIM — a same-hue deepened edge variant (≈ base × 0.78), full
- *      opacity, width + 2.6 units, drawn first and shortened at both ends —
- *      the "subtle darker edge / stronger stroke weight" the brief's doctrine
- *      allows ("color only names the family; tune the ribbon rendering");
- *   2. the TRACK — the family's validated token at FULL opacity, so the
- *      categorical identity is exactly the color that passed the six-checks
- *      gates (re-run for round 2: worst CVD ΔE 21.5 protan, normal 23.4 —
- *      unchanged, because the identity colors are unchanged);
- *   3. the MARCH — light dashes (white at 0.55 alpha) running along the
- *      saturated ribbon, so the aliveness cue is contrast ON the family color
- *      instead of a paler copy of it.
- * The rim variants are edge shading, not series slots: they darken every
- * family by the same factor, keep ≥3:1 against the card, and stay mutually
- * ≥8 ΔE apart, so the categorical reading still rides on the validated pair.
+ * FAMILY TINTS (validated, not eyeballed: dataviz validate_palette.js
+ * --mode dark --surface #11161e — L band, chroma floor, CVD ΔE, contrast vs
+ * surface ALL PASS for #4595ec/#c78202/#476aa4):
+ *   grid    body #4595ec   text/name #85c2ff   deep rim #1d5fa0   core #bfdcff
+ *   battery body #c78202   text/name #ffc246   deep rim #a16207   core #ffdf9e
+ *   home    body #476aa4   text/name #c2ccdc   deep rim #31517f   core #dfe6ee
+ * Body tints draw the marks (conduits, collars, rings, tile accents); the
+ * lighter tints carry TEXT on the dark tiles (contrast is law) and the
+ * sprite CORES in the engine (all pre-existing validated colors — round 2
+ * introduces no new tint). Direction is NEVER color-alone: word +
+ * arrowhead + stream travel carry it on redundant channels, and every
+ * arrowhead is neutral near-white #e8eef6.
  *
- * THE ALIGNED GRID: every column and every node card reserves the same rows
- * (name band, two-line figure band, SoC band; the lifecycle note anchors the
- * card's foot), so the same rows land at the same y across all four columns —
- * figure baselines and SoC lines align whether or not a column carries a
- * note, a SoC, or a wrapped figure. The fleet card's second frame pixel is an
- * inset shadow, not a border, precisely so its 1px of layout stays identical
- * to the phase cards' and the rows cannot drift by the border difference.
+ * ROUND 2 lost-stack floor: [data-connection="lost"] fades .flow-diagram as a
+ * GROUP (opacity .75), compositing bay AND text toward the light page
+ * (#f7f8fa) beneath. Grid text/name lifted #6cb2ff → #85c2ff, neutral
+ * nameplate #9aa8bd → #a6b3c6, fig-sep alpha .70 → .78; the old values
+ * measured 4.14–4.38:1 against that composited backdrop, the new ones clear
+ * 4.5:1 (per-token math at each rule). Computed, not eyeballed.
  *
- * MOTION: exactly four things move (the march, the stroke-width transition,
- * the number tick's 300 ms tween, the commanded-not-moving pulse), each
- * duration pinned by the brief; everything else that changes renders as a
- * fresh stub with a 150 ms fade-in. styles.css globally kills animation and
- * transition under prefers-reduced-motion, and the march overlay is
- * additionally HIDDEN there (frozen dashes would read as a broken line).
+ * ROUND 3B — THE NODE INSTRUMENTS: nodes become physical. The battery tile's
+ * thin SoC meter is REPLACED by a vertical molten CELL (the validated gold
+ * ramp stood upright, meniscus, ticks, glass gloss, end-glow ∝ the reading;
+ * charging shimmers the meniscus IN PLACE — never a level change); the grid
+ * tile docks a machined FEED PORT (family-blue ring on dark hardware, an
+ * inner tick rotating with import/export — never direction alone); the home
+ * tile breathes a warm HEARTH behind its figure (∝ load watts via a custom
+ * property, zero when idle/unknown). ZERO NEW MARK TINTS: every mark hex
+ * below is a previously validated family color (see round-1 table above) —
+ * an audit pass replaced a first-draft unvalidated amber cell ramp with the
+ * validated battery quartet (see .flow-soc-cell-fill); the only new surfaces
+ * are the vessel's near-black trough shades, container chrome with the same
+ * standing as the round-1 tile gradients. Layout reclaims the page: the bus
+ * box grew (`0 -8 240 128`, landings y=96 in flowGeometry.ts), node tiles
+ * run taller, the fleet zone is strengthened as the hero band, and the stage
+ * gains a desktop min-height so the bay fills the viewport band at 1440
+ * without stretching the phone.
  */
+
+/* --- Container & Layout ----------------------------------------------------- */
 
 .flow-view {
   display: grid;
-  gap: 0.9rem;
+  /* Round 3b: one breathing step wider between the bay and its frame — the
+     story, the stage, and the footnote each get air without new content. */
+  gap: 1.25rem;
   max-width: 68rem;
   margin: 0 auto;
+  position: relative;
 }
 
 .flow-heading-row {
   display: flex;
   flex-wrap: wrap;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
-  gap: 0.35rem 1rem;
+  gap: 0.5rem 1rem;
+  padding: 0.2rem 0.2rem 0;
 }
 
+/* Light chrome above the bay stays exactly that — cream console framing. */
 .flow-view h2 {
   margin: 0;
-  font-size: 1.2rem;
-  line-height: 1.3;
+  font-size: 1.35rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--ink);
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
 }
 
 .flow-connection {
   margin: 0;
-  font-size: 0.9rem;
+  font-size: 0.88rem;
   color: var(--ink-soft);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.35rem 0.75rem;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), inset 0 1px 0 rgba(255, 255, 255, 0.8);
 }
 
 .flow-connection--live {
-  color: var(--yes);
+  color: #0d6b38;
+  border-color: rgba(13, 107, 56, 0.25);
+  background: linear-gradient(180deg, #f2fbf6 0%, #e6f7ef 100%);
+}
+
+.flow-connection--live::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #10b981;
+  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2), 0 0 8px #10b981;
+  animation: flow-beacon-pulse 2400ms ease-in-out infinite;
 }
 
 .flow-connection--lost {
   color: var(--no);
+  border-color: rgba(185, 28, 28, 0.25);
+  background: linear-gradient(180deg, #fdf2f2 0%, #fde8e8 100%);
 }
 
-/* The status word carries the state ("Live", "Connection lost") — same color
-   as its sentence, set forward in weight so the glance lands on it first. */
+.flow-connection--lost::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--no);
+  box-shadow: 0 0 0 2px rgba(185, 28, 28, 0.2), 0 0 8px var(--no);
+}
+
+@keyframes flow-beacon-pulse {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.2);
+    opacity: 0.75;
+    box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.3), 0 0 12px #10b981;
+  }
+}
+
 .flow-connection-word {
   font-weight: 700;
 }
 
-/* THE STORY LINE — the one sentence an operator reads aloud. A full card:
-   --active's 4 px left border is the view's accent (the same accent that
-   frames the Whole-site lead below), the other three edges the quiet --line. */
+/* --- The Story Line (light chrome, frames the bay) -------------------------- */
+
 .flow-story {
   margin: 0;
-  padding: 0.7rem 1rem;
-  border: 1px solid var(--line);
+  padding: 0.95rem 1.25rem;
+  border: 1px solid rgba(23, 74, 125, 0.18);
   border-left: 4px solid var(--active);
-  background: var(--card);
-  border-radius: 0 12px 12px 0;
-  font-size: 1.05rem;
-  line-height: 1.45;
+  background: linear-gradient(175deg, #ffffff 0%, #f4f8fe 100%);
+  border-radius: 0 14px 14px 0;
+  font-size: 1.02rem;
+  font-weight: 500;
+  line-height: 1.5;
+  color: var(--ink);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.95),
+    0 2px 8px -2px rgba(23, 74, 125, 0.08),
+    0 1px 2px rgba(0, 0, 0, 0.04);
+  position: relative;
+  overflow: hidden;
 }
 
-/* --- the diagram ------------------------------------------------------------ */
-/*
- * THE FIT LADDER (round 3): the worded figure's longest single word is
- * "Discharging" (82 px at 0.95 rem) — a card narrower than that cannot hold
- * its own words, and at round 2's widths the figures rendered wider than
- * their cards, the glyphs stamping over the card borders into the gutters
- * (measured: 21 px past the edge on the lead's Grid card at 1440). The
- * ladder's every rung guarantees the cards' content box ≥ the longest word:
- *
- * - <45 rem — one column: the phone stack, the full bus metaphor (approved).
- * - 45–70 rem — the lead spans the first row as a band, the phases pair
- *   beneath it, and the LAST phase completes the page as a band of its own
- *   (its dock capped to the lead's 24 rem so every bus on screen draws at
- *   the same scale); three columns here would be 60 px cards — too narrow
- *   for the words.
- * - 70–81 rem — the lead band with the three phases in one row.
- * - ≥81 rem — all four in ONE row, equal tracks (the round-2 law: the bus is
- *   aspect-locked, so unequal tracks would drop the rows out of alignment),
- *   the view borrowing 11 rem of the shell's side margins so the columns are
- *   wide enough for the two-register figure (the word a label line, the
- *   figure the larger datum — see .flow-fig-* below).
- */
+.flow-story::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 4px;
+  height: 100%;
+  background: var(--active);
+  box-shadow: 0 0 12px var(--active), 0 0 24px rgba(23, 74, 125, 0.6);
+}
+
+/* --- THE BAY: one recessed dark-glass viewport -------------------------------
+ * .flow-diagram keeps its role as the diagram's semantic group; the responsive
+ * column grid lives on its styled child .flow-stage so every breakpoint below
+ * lays out the ZONES exactly as the old card grid did. */
+
 .flow-diagram {
+  min-width: 0;
+}
+
+.flow-stage {
+  /* The bay IS the grid the diagram used to be (gap 0: zones carry their own
+     padding, and the hairline dividers sit symmetrically between them). */
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 0.75rem;
+  gap: 0;
   align-items: stretch;
+  min-width: 0;
+  position: relative;
+  padding: 20px;
+  border-radius: 20px;
+  background: linear-gradient(180deg, #10151d 0%, #0b1017 55%, #080c12 100%);
+  border: 1px solid rgba(217, 222, 231, 0.5);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    inset 0 0 48px rgba(0, 0, 0, 0.55),
+    0 12px 32px -16px rgba(15, 23, 42, 0.5),
+    0 2px 6px rgba(15, 23, 42, 0.18);
+}
+
+/* Inner machined hairline frame — the bezel's second step. */
+.flow-stage::before {
+  content: "";
+  position: absolute;
+  inset: 8px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  pointer-events: none;
+}
+
+/* A single faint glass sheen across the top of the bay (never animated,
+   never above texture-opacity discipline). */
+.flow-stage::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(120% 60% at 50% -10%, rgba(255, 255, 255, 0.045), transparent 60%);
+  pointer-events: none;
+}
+
+@media (max-width: 44.99rem) {
+  .flow-stage {
+    padding: 14px;
+  }
 }
 
 @media (min-width: 45rem) {
-  .flow-diagram {
+  .flow-stage {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    /* Round-3b layout reclaim: the bay holds a graceful floor through the
+       tablet band so a sparse fleet never leaves the page half-empty —
+       zones stretch, notes stay anchored to their feet. Never applied on a
+       phone (390 stays content-height). */
+    min-height: 30rem;
   }
 
-  /* The lead band: full-width framing above the phases, its content centered
-     and capped at a comfortable bus width (a stretched bus would balloon its
-     240×84 geometry — the ribbon scale must stay comparable across columns). */
-  .flow-phase--fleet {
+  .flow-stage > .flow-phase--fleet {
     grid-column: 1 / -1;
     justify-items: center;
   }
 
-  .flow-phase--fleet .flow-dock {
+  /* THE HERO BAND: the whole-site dock runs wider than before (26 → 30 rem)
+     so its taller bus, bigger figures, and instruments read first. */
+  .flow-stage > .flow-phase--fleet .flow-dock {
     width: 100%;
-    max-width: 24rem;
+    max-width: 30rem;
   }
 
-  /* The odd phase out completes the page as a band of its own — the same
-     centered 24 rem dock as the lead's, never a half-width orphan beside a
-     hole. (A two-pod site simply never leaves the pair.) */
-  .flow-diagram > .flow-phase:last-child {
+  /* An odd phase out lands alone on a full row — no divider when nothing
+     sits beside it. */
+  .flow-stage > .flow-phase:last-child {
     grid-column: 1 / -1;
     justify-items: center;
+    border-left: none;
   }
 
-  .flow-diagram > .flow-phase:last-child .flow-dock {
+  .flow-stage > .flow-phase:last-child .flow-dock {
     width: 100%;
-    max-width: 24rem;
+    max-width: 26rem;
   }
 }
 
 @media (min-width: 70rem) {
-  .flow-diagram {
+  .flow-stage {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+    /* Desktop band (the 1440 console): the bay fills the viewport band
+       gracefully even when only one or two phases report. */
+    min-height: 33rem;
   }
 
-  .flow-diagram > .flow-phase:last-child {
+  .flow-stage > .flow-phase:last-child {
     grid-column: auto;
     justify-items: stretch;
+    border-left: 1px solid rgba(255, 255, 255, 0.06);
   }
 
-  .flow-diagram > .flow-phase:last-child .flow-dock {
+  .flow-stage > .flow-phase:last-child .flow-dock {
     max-width: none;
   }
 }
 
 @media (min-width: 81rem) {
-  /* The four-column row: the lead is the framed first column again. Equal
-     tracks, deliberately (the round-2 law above); auto-fit so a two-pod site
-     collapses to three honest columns instead of leaving a hole — the 18rem
-     floor is measured so FOUR tracks fit the borrowed width (a 19rem floor
-     leaves room for three and wraps the fourth to a lonely second row). */
-  .flow-diagram {
-    grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr));
+  .flow-stage {
+    grid-template-columns: repeat(auto-fit, minmax(18.5rem, 1fr));
   }
 
-  .flow-phase--fleet {
+  .flow-stage > .flow-phase--fleet {
     grid-column: auto;
     justify-items: stretch;
   }
 
-  .flow-phase--fleet .flow-dock {
+  .flow-stage > .flow-phase--fleet .flow-dock {
     max-width: none;
   }
 
-  /* The flow view is the console's wide stage: at four-across it steps past
-     the shell's 72rem column into its side margins (78rem, symmetrically —
-     the breakout margin goes negative by exactly the overhang, so the view
-     stays centered and never past the viewport at this band's 81rem floor)
-     so the columns are wide enough for their words; the story and the
-     commands widen with it, one measure for the whole page. */
   .flow-view {
     max-width: none;
-    width: 78rem;
-    margin-inline: calc((100% - 78rem) / 2);
+    width: 79rem;
+    margin-inline: calc((100% - 79rem) / 2);
   }
 }
 
-.flow-phase {
+/* --- Column Zones -------------------------------------------------------------
+ * No more card boxes inside the bay: each column is a transparent zone, and
+ * neighbors are separated by one hairline (vertical at ≥45rem, horizontal
+ * when stacked on a phone). min-width guards keep long figure words inside
+ * their tracks instead of widening them. */
+
+.flow-stage > .flow-phase {
   display: grid;
   grid-template-rows: auto auto 1fr;
-  gap: 0.5rem;
-  padding: 0.9rem 0.95rem 0.85rem;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--card);
+  gap: 0.65rem;
+  padding: 0.85rem 0.9rem;
   min-width: 0;
-}
-
-/* THE WHOLE-SITE LEAD — first, framed, and set in a larger voice: --active's
-   2 px frame (1 px border + 1 px inset ring, so the layout border matches the
-   phases' exactly), the brief's #f4f8ff tint, the accent's top strip (the
-   same accent that frames the story card — absolutely positioned so it never
-   shifts the rows), a larger name and larger figures. The phases stay
-   recessive: 1 px --line on white. */
-.flow-phase--fleet {
   position: relative;
-  border-color: var(--active);
-  box-shadow: inset 0 0 0 1px var(--active);
-  background: #f4f8ff;
+  background: transparent;
+  border: 0;
 }
 
-.flow-phase--fleet::before {
-  content: "";
-  position: absolute;
-  inset: 0 0 auto 0;
-  height: 3px;
-  border-radius: 11px 11px 0 0;
-  background: var(--active);
+/* Phone: stacked zones divide with a horizontal hairline. */
+.flow-stage > .flow-phase + .flow-phase {
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-/* A phase with no contact: the whole column dims — the last-known figures
-   stay, dimmed, never gone (the shell's standing rule). */
-.flow-phase--down {
-  opacity: 0.6;
+/* …except against the fleet frame itself: its rounded bottom edge is already
+   the divider, and a second line flush under it reads as a doubled seam. */
+@media (max-width: 44.99rem) {
+  .flow-stage > .flow-phase--fleet + .flow-phase {
+    border-top: none;
+  }
 }
 
-/* The name band is RESERVED at one height in every column and bottom-aligned,
-   so the bus below starts at the same y whether the name is the fleet's
-   larger lead or a phase's smaller one (the pinned line-height keeps both
-   inside the band; without it the lead's taller line box shoved its dock
-   down by the difference). */
+@media (min-width: 45rem) {
+  .flow-stage > .flow-phase + .flow-phase {
+    border-top: none;
+    border-left: 1px solid rgba(255, 255, 255, 0.06);
+  }
+
+  /* Row-start seam: at 45–81rem the zone right after the fleet frame opens
+     the next row — a left hairline there hangs ORPHANED off the row's edge
+     with nothing on its other side. At ≥81rem that same zone sits flush
+     against the fleet frame's own right border instead — two 1px lines
+     back-to-back, a DOUBLED seam. Both bands suppress it; the fleet frame
+     already draws that separation. */
+  .flow-stage > .flow-phase--fleet + .flow-phase {
+    border-left: none;
+  }
+
+  .flow-stage > .flow-phase {
+    padding-block: 1rem; /* round 3b: the zones breathe with their taller tiles */
+  }
+}
+
+/* THE WHOLE-SITE LEAD — the fleet zone lifts one step out of the bay in the
+ * family blue (frame + wash), replacing the old top-band and screws.
+ * ROUND 3B hero pass: the frame strengthens — a brighter border step, a two-
+ * stop wash instead of a flat one, and a faint family-blue ambient shadow so
+ * the hub reads as the bay's centerpiece without stealing light from it. */
+.flow-stage > .flow-phase--fleet {
+  border: 1px solid rgba(108, 178, 255, 0.3);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(108, 178, 255, 0.07) 0%, rgba(108, 178, 255, 0.03) 100%);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 0 28px -14px rgba(69, 149, 236, 0.5);
+}
+
+/* Offline / disconnected: dim CHROME, never WORDS. The round-1 whole-zone
+   opacity took the words down with the decoration (name/figure/note fell
+   below 4.5:1 once the connection-lost factor stacked on top). Now only the
+   non-text layers take the drain — the zone's SVG bus, the engine canvas,
+   the round-3b instruments (molten cell, feed port, hearth ambience), and
+   the tile boxes' surfaces/borders/accents — while .flow-node-name,
+   .flow-node-figure (+parts), .flow-phase-note, .flow-soc and the phase
+   nameplate stay at FULL opacity, so a downed zone still reads word-perfect;
+   it just goes visually quiet. A downed cell keeps its last-known FILL,
+   dimmed (never emptied), and its meniscus never shimmers (the view gates
+   the charging class off while a phase is down). */
+.flow-stage > .flow-phase--down .flow-bus,
+.flow-stage > .flow-phase--down .flow-bus-glow,
+.flow-stage > .flow-phase--down .flow-soc-cell,
+.flow-stage > .flow-phase--down .flow-port,
+.flow-stage > .flow-phase--down .flow-node-hearth {
+  opacity: 0.45;
+  filter: saturate(0.6);
+}
+
+.flow-stage > .flow-phase--down .flow-node {
+  border-color: rgba(255, 255, 255, 0.04);
+  background: linear-gradient(180deg, #131a24, #10151d);
+  box-shadow: none;
+}
+
+/* Family accents drain to one quiet neutral — the accent is chrome. */
+.flow-stage > .flow-phase--down .flow-node--grid,
+.flow-stage > .flow-phase--down .flow-node--battery,
+.flow-stage > .flow-phase--down .flow-node--home {
+  border-top-color: rgba(154, 168, 189, 0.3);
+}
+
+/* A downed fleet frame drains the same way (frame + wash are chrome too). */
+.flow-stage > .flow-phase--down.flow-phase--fleet {
+  border-color: rgba(154, 168, 189, 0.14);
+  background: rgba(154, 168, 189, 0.03);
+  box-shadow: none;
+}
+
+/* Zone nameplate */
 .flow-phase-name {
   margin: 0;
-  min-height: 1.3rem;
+  min-height: 1.4rem;
   display: flex;
-  align-items: flex-end;
+  align-items: center;
+  gap: 0.4rem;
   line-height: 1.2;
-  font-size: 0.8rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--ink-soft);
-}
-
-.flow-phase--fleet .flow-phase-name {
-  font-size: 0.95rem;
+  font-size: 0.82rem;
   font-weight: 800;
-  color: var(--active);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  /* #a6b3c6, not #9aa8bd (and before that #93a1b5): this nameplate must
+     survive the connection-lost GROUP dim at ≥4.5:1. The lost state fades the
+     whole bay as one group (opacity .75 on .flow-diagram), so ink AND its
+     stage backdrop both composite toward the light page #f7f8fa:
+       effective ink = 0.75·ink + 0.25·#f7f8fa
+       effective backdrop = 0.75·#10151d + 0.25·#f7f8fa ≈ rgb(74,78,84)
+     #9aa8bd → effective rgb(177,188,204), L=0.497 vs backdrop L=0.0755
+     = 4.38:1 — FAILS. #a6b3c6 → L=0.546 = 4.75:1. Computed, not eyeballed. */
+  color: #a6b3c6;
 }
 
-/* The lifecycle note anchors the column's foot — under the figures it vouches
-   for, never between the name and the bus (where it would shove every other
-   row out of alignment). */
+.flow-phase-name::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(147, 161, 181, 0.65);
+}
+
+.flow-stage > .flow-phase--fleet .flow-phase-name {
+  font-size: 0.96rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  /* Lifted from #6cb2ff for the lost-stack floor (round 2): the group dim
+     composites this zone toward #f7f8fa — backdrop 0.75·(stage+wash) +
+     0.25·#f7f8fa ≈ rgb(77,82,92), where #6cb2ff fell to 4.26:1 and
+     #85c2ff computes 4.86:1. Same hue family, one step lighter. The ::before
+     dot below stays #6cb2ff — it is chrome, not text. */
+  color: #85c2ff;
+}
+
+.flow-stage > .flow-phase--fleet .flow-phase-name::before {
+  background: #6cb2ff;
+  box-shadow: 0 0 6px rgba(108, 178, 255, 0.6);
+}
+
+/* Lifecycle note — retinted for the dark zone it anchors (contrast law). */
 .flow-phase-note {
   margin: 0;
   align-self: end;
   font-size: 0.8rem;
+  font-weight: 600;
   line-height: 1.35;
-  color: var(--warn);
+  color: #ffd489;
+  padding: 0.3rem 0.5rem;
+  background: rgba(255, 194, 70, 0.08);
+  border: 1px solid rgba(255, 194, 70, 0.28);
+  border-radius: 6px;
 }
 
-/* The bus docks to its node cards — no gap beyond 0.25 rem, so each arrowhead
-   visually reaches its node. */
 .flow-dock {
   display: grid;
-  gap: 0.25rem;
+  gap: 0.35rem;
+  min-width: 0;
 }
 
-/* The bus is decorative duplication (aria-hidden): the worded figures below
-   each stub carry the same facts as text. */
+/* --- The Bus & Conduits (SVG) ------------------------------------------------- */
+
 .flow-bus {
   width: 100%;
   height: auto;
   display: block;
+  overflow: visible;
 }
 
+/* The recessed conduit chassis track */
+.flow-bus-channel {
+  fill: #1a212c;
+  stroke: rgba(255, 255, 255, 0.05);
+  stroke-width: 1;
+}
+
+/* The conductor rail: structural dark on a phase, family-blue lift on the
+   fleet hub (the one place the bus itself carries family identity). Round 2
+   removed the fleet rail's blue drop-shadow GLOW — through-flow energization
+   is painted by the light engine now (glow.ts), additively under this SVG. */
 .flow-bus-rail {
-  stroke: var(--line);
-  stroke-width: 3;
+  stroke: #232c39;
+  stroke-width: 3.5;
   stroke-linecap: round;
 }
 
-/* The site's own conductor carries a whisper of the view's accent — the one
-   rail in the picture that is the whole site, not one phase. */
-.flow-phase--fleet .flow-bus-rail {
-  stroke: var(--active);
-  opacity: 0.28;
+.flow-stage > .flow-phase--fleet .flow-bus-rail {
+  stroke: #3b6ea5;
+  stroke-width: 4;
 }
 
-/* --- the stubs (the three-channel direction discipline) ---------------------- */
+/* Terminal collars: dark hardware lugs ringed in the family body tint. */
+.flow-bus-collar {
+  fill: #10151d;
+  stroke-width: 1.5;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.35));
+}
 
-/* Every stub rests at 0.92 and enters with a 150 ms fade — a fresh stub on a
-   geometry change (an aim flip, a fleet slot splitting); a magnitude change
-   keeps the element so the stroke-width transition breathes it instead. */
-.flow-stub {
-  opacity: 0.92;
+.flow-bus-collar--grid {
+  stroke: #4595ec;
+}
+
+.flow-bus-collar--battery {
+  stroke: #c78202;
+}
+
+.flow-bus-collar--home {
+  stroke: #476aa4;
+}
+
+/* --- The Light-Engine Stack -----------------------------------------------------
+ * Round 2's grammar swap: the wrap stacks the engine's canvas UNDER the
+ * structural SVG. The canvas (.flow-bus-glow) paints the living streams —
+ * pooled particles with motion-blur streaks and lateral wander, terminal
+ * bloom pools, rail energization — blitted additively ("lighter") in
+ * viewBox units; it is pointer-transparent chrome that never takes focus.
+ * The SVG keeps the structure AND rides above the canvas so rail, collars,
+ * rings, unknown dashes, and every arrowhead stay crisp over the light.
+ * (The canvas is absolutely positioned — which would normally paint it over
+ * an in-flow sibling — so the SVG gets `position: relative` and later DOM
+ * order wins the stack.) */
+
+.flow-bus-wrap {
+  position: relative;
+}
+
+.flow-bus-glow {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.flow-bus-wrap > .flow-bus {
+  position: relative;
+}
+
+/* --- The Conduits (the static half of the stream grammar) -----------------------
+ * Each active slot draws ONE curved path (geometry from flowGeometry.ts).
+ * ROUND 3A (dial 6): the stroke stepped up from the deep rim tones to the
+ * VALIDATED BODY tints at 0.55 alpha, width 2.4 → 2.8 — round 2's verdict
+ * was that the wire was near-invisible, and light needs a visible road. No
+ * second rim path underneath: a duplicate element would double every
+ * structure pin for marginal depth, and the engine's additive glow already
+ * wraps this road in the same family tint. Direction rides the neutral
+ * arrowhead docked at the path's flow end, oriented along the curve tangent
+ * by the marker. Idle/unknown slots draw no conduit at all. */
+
+.flow-conduit {
+  fill: none;
+  stroke-linecap: round;
+  stroke-width: 2.8;
   animation: flow-stub-in 150ms ease-out;
 }
 
@@ -327,227 +592,191 @@
   }
 }
 
-/* The ribbon's three layers (see the header note): the same-hue rim first —
-   full opacity, width + 2.6 units, drawn a few units short of either end so
-   its caps tuck under the ink head and stop shy of the rail — then the
-   saturated track, then the light march on top. All width-bearing layers
-   share the 400 ms stroke-width breath (motion #2). */
-.flow-stub-rim {
-  transition: stroke-width 400ms cubic-bezier(0.2, 0, 0, 1);
+.flow-conduit--grid {
+  stroke: rgba(69, 149, 236, 0.55); /* body #4595ec */
 }
 
-.flow-stub-track {
-  transition: stroke-width 400ms cubic-bezier(0.2, 0, 0, 1);
+.flow-conduit--battery {
+  stroke: rgba(199, 130, 2, 0.55); /* body #c78202 */
 }
 
-/* MOTION #1 — the march (the aliveness cue). Each stub's own draw direction
-   runs source → target, so one negative-offset keyframe marches every stub in
-   its arrowhead's direction; the inline animation-duration maps speed to
-   magnitude (3200 − 1600 × share ms: the largest flow on screen cycles in
-   1.6 s, the smallest in 3.2 s). Light dashes on the saturated ribbon: the
-   cue is contrast along the family's color, never a paler copy of it. */
-.flow-stub-march {
-  stroke: #fff;
-  opacity: 0.55;
-  stroke-dasharray: 8 12;
-  stroke-linecap: round;
-  transition: stroke-width 400ms cubic-bezier(0.2, 0, 0, 1);
-  animation: flow-march 3200ms linear infinite;
+.flow-conduit--home {
+  stroke: rgba(71, 106, 164, 0.55); /* body #476aa4 */
 }
 
-@keyframes flow-march {
-  to {
-    stroke-dashoffset: -40;
-  }
+/* The stub group wraps each slot's mark; the hover/focus choreography and
+   the fresh-mark fade ride the group exactly as before. */
+.flow-stub {
+  opacity: 0.95;
 }
 
-/* Color names the node family — never the direction. The track wears the
-   validated token at full strength; the rim is its same-hue deepened edge;
-   the march is one light dash color for every family (contrast ON the family
-   color, never a paler copy of it). */
-.flow-stub--grid .flow-stub-rim {
-  stroke: #174a7d;
-}
-
-.flow-stub--grid .flow-stub-track {
-  stroke: var(--active);
-}
-
-.flow-stub--battery .flow-stub-rim {
-  stroke: #6c5514;
-}
-
-.flow-stub--battery .flow-stub-track {
-  stroke: var(--armed);
-}
-
-.flow-stub--home .flow-stub-rim {
-  stroke: #434d5f;
-}
-
-.flow-stub--home .flow-stub-track {
-  stroke: var(--ink-soft);
-}
-
-/* Idle (measured 0 W): a hollow 7 px ring in the node family's color —
-   connected, nothing moving. Never a dashed line (that reads "a weak flow"). */
+/* Idle ring: connected, nothing moving — the family body at rest alpha. */
 .flow-idle-ring {
-  fill: none;
-  stroke-width: 2;
+  fill: #10151d;
+  stroke-width: 2.2;
 }
 
 .flow-stub--grid .flow-idle-ring {
-  stroke: var(--active);
+  stroke: rgba(69, 149, 236, 0.55);
 }
 
 .flow-stub--battery .flow-idle-ring {
-  stroke: var(--armed);
+  stroke: rgba(199, 130, 2, 0.55);
 }
 
 .flow-stub--home .flow-idle-ring {
-  stroke: var(--ink-soft);
+  stroke: rgba(71, 106, 164, 0.55);
 }
 
-/* MOTION #4 — the commanded-not-moving pulse: the one honest way to say "we
-   asked; nothing has happened yet" without drawing a fake flow. */
+/* Commanded-not-moving pulse: the battery ring asks for attention in the
+   battery family's bright gold. The keyframes scale the element — and on an
+   SVG <circle> a CSS transform defaults to the viewport origin, so without
+   `transform-box: fill-box` the ring would LEAP across the diagram every
+   beat instead of breathing in place. Anchor the scale to the circle's own
+   geometry box. */
 .flow-idle-ring--pulse {
+  transform-box: fill-box;
+  transform-origin: center;
   animation: flow-pulse 1600ms ease-in-out infinite;
 }
 
 @keyframes flow-pulse {
-  0%,
-  100% {
+  0%, 100% {
     opacity: 1;
+    transform: scale(1);
+    filter: drop-shadow(0 0 2px rgba(255, 194, 70, 0.4));
   }
   50% {
-    opacity: 0.5;
+    opacity: 0.45;
+    transform: scale(1.25);
+    filter: drop-shadow(0 0 8px rgba(255, 194, 70, 0.8));
   }
 }
 
-/* Unknown ("not available"): a 1.5 px dotted stub — presence without a claim. */
+/* Unknown / absent telemetry: presence without a claim. */
 .flow-stub-unknown {
-  stroke: var(--ink-soft);
-  stroke-width: 1.5;
-  stroke-dasharray: 1 7;
+  stroke: rgba(255, 255, 255, 0.28);
+  stroke-width: 1.8;
+  stroke-dasharray: 2 6;
   stroke-linecap: round;
 }
 
-/* Reduced motion: the overlay is HIDDEN, never frozen mid-march (static dashes
-   read as a broken line). styles.css already killed the animation globally. */
-@media (prefers-reduced-motion: reduce) {
-  .flow-stub-march {
-    opacity: 0;
-  }
-}
+/* Reduced motion + connection-lost are honored INSIDE the engine now
+   (glow.ts): reduced motion paints exactly one static frame and never starts
+   its ticker; anything less than "live" full-stops to an empty canvas. The
+   retired march's CSS media guards died with the march. */
 
-/* While disconnected, the march stops everywhere — a moving diagram claiming
-   liveness while disconnected is dishonest. */
-.flow-view[data-connection="lost"] .flow-stub-march {
-  opacity: 0;
-  animation: none;
-}
-
-/* --- the node cards ---------------------------------------------------------- */
+/* --- Node Tiles: etched dark glass --------------------------------------------- */
 
 .flow-nodes {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 0.4rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* ROUND 3A contract (the arrowhead-landing fix): the gap is a PERCENTAGE,
+     not rem, so it resolves against this grid's width — the very width the
+     bus SVG's viewBox maps to — and is therefore a CONSTANT 4.8 viewBox
+     units at every viewport. flowGeometry.ts derives the card centers from
+     exactly this number (`NODES_GAP_UNITS`, `cardCenterX`): outer cards sit
+     g/3 = 1.6 units outside their third-points, conduit landings correct for
+     it, and arrowheads meet card centers by construction instead of by
+     eyeball. Changing this percentage means changing NODES_GAP_UNITS with it.
+     Row gap is irrelevant (one row); the old per-breakpoint rem overrides
+     died — they were the source of the drift. */
+  column-gap: 2%;
 }
 
-/* The one-column band trims its insets a shade (0.75 rem column padding,
-   0.3 rem card gutters) so even the vocabulary's widest word — "Discharging",
-   82 px at 0.95 rem — clears its card's content box at a 390 px phone; and
-   the lead's figure matches the phases' size there (still the heavier weight,
-   still the framed first card): a 94 px card cannot hold a 99 px word at the
-   lead's 1.1 rem, and the lead's presence at this width is its frame, its
-   tint and its name — never an overflowing glyph. */
 @media (max-width: 44.99rem) {
-  .flow-phase {
+  .flow-stage > .flow-phase {
     padding-inline: 0.75rem;
   }
 
-  .flow-nodes {
-    gap: 0.3rem;
-  }
-
-  .flow-phase.flow-phase--fleet .flow-node-figure {
+  .flow-stage > .flow-phase--fleet .flow-node-figure {
     font-size: 0.95rem;
   }
 }
 
-/*
- * Every card reserves the same three bands — name, a two-line figure zone,
- * the SoC zone — so the figure's first line and the SoC line land at the same
- * y in every column, present or absent. The figure zone is top-aligned (a
- * one-line figure keeps its baseline where a two-line figure's first line
- * sits); the SoC zone is reserved even for Grid and Home, whose figures have
- * no second datum (the alignment is the point, not an accident of content).
- */
 .flow-node {
   display: grid;
-  gap: 0.2rem;
-  /* Rows pack from the TOP: the cards share one height (the nodes grid
-     stretches them), and default stretch would redistribute a shorter card's
-     slack into its rows — shoving its figure down the moment a sibling card
-     (the fleet Home's scoped figure) needed more lines. Top-packed, every
-     row starts at the same y in every card. */
+  gap: 0.25rem;
   align-content: start;
   justify-items: center;
   text-align: center;
-  padding: 0.5rem 0.35rem 0.55rem;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface);
+  padding: 0.55rem 0.35rem 0.6rem;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 10px;
+  background: linear-gradient(180deg, #161d27, #11161e);
   min-width: 0;
+  position: relative;
+  overflow: hidden;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  transition: transform 180ms cubic-bezier(0.2, 0, 0, 1), box-shadow 180ms cubic-bezier(0.2, 0, 0, 1), border-color 180ms ease;
+  outline: none;
+}
+
+/* Family accents: the etched tile wears its family body on the top edge. */
+.flow-node--grid {
+  border-top: 2px solid #4595ec;
 }
 
 .flow-node--battery {
-  background: #fffaf0;
+  border-top: 2px solid #c78202;
 }
 
-/* The lead's instruments sit on white — they pop off the fleet card's tint
-   the way the phases' quiet --surface cards recede on theirs. */
-.flow-phase--fleet .flow-node {
-  background: var(--card);
+.flow-node--home {
+  border-top: 2px solid #476aa4;
 }
 
+/* Node nameplate — family text tints on dark (all ≥4.5:1 on #161d27). */
 .flow-node-name {
   font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+  font-weight: 800;
+  letter-spacing: 0.09em;
   text-transform: uppercase;
-  color: var(--ink-soft);
+  color: #c2ccdc;
   line-height: 1.25;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  max-width: 100%;
 }
 
 .flow-node--grid .flow-node-name {
-  color: var(--active);
+  /* Lifted from #6cb2ff for the lost-stack floor (round 2): under the
+     connection-lost group dim the tile composites to 0.75·#161d27 +
+     0.25·#f7f8fa ≈ rgb(78,84,92), where #6cb2ff measured 4.18:1; #85c2ff
+     computes 4.73:1 there (9.0:1 at full opacity on #161d27). */
+  color: #85c2ff;
 }
 
 .flow-node--battery .flow-node-name {
-  color: var(--armed);
+  color: #ffc246;
 }
 
+.flow-node--home .flow-node-name {
+  color: #c2ccdc;
+}
+
+/* The figure: near-white datum text, tabular numerals. min-width/max-width
+   guards make the tile's measure authoritative — a word that would not fit
+   must shrink (the compact register) and be caught by the probe, never
+   silently widen the track or clip mid-letter. */
 .flow-node-figure {
-  font-size: 0.95rem;
-  font-weight: 600;
+  font-size: 0.96rem;
+  font-weight: 700;
   line-height: 1.3;
   min-height: 2.75rem;
   font-variant-numeric: tabular-nums;
-  overflow-wrap: break-word;
-  /* The card's own measure, taken: an auto-width span sizes to its longest
-     unbreakable string and stamps over the card's borders (the round-2
-     defect). At 100% the phrase wraps at its spaces INSIDE the card; only a
-     single word wider than the card could leave it, and the fit ladder
-     guarantees the cards are always wider than the longest word. */
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  color: #f2f6fb;
+  letter-spacing: -0.01em;
 }
 
-/* The figure's parts: the direction word and its magnitude render as sibling
-   spans (the pinned reading unchanged — "Importing 412 W"). Below the
-   four-across breakpoint they run inline exactly as one phrase; at ≥77 rem
-   they promote to two typographic registers. */
+.flow-fig-part {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .flow-fig-word,
 .flow-fig-num,
 .flow-fig-sep,
@@ -555,29 +784,64 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* The lead's figures are a step up in size and weight — the whole-site
- * picture is what the homeowner scans first (still two lines to the reserved
- * zone at 1.1rem × 1.3 line-height). */
-.flow-phase--fleet .flow-node-figure {
-  font-size: 1.1rem;
-  font-weight: 700;
+/* The muted figure tokens wear their mute as intrinsic alpha. The downed-zone
+   chrome drain never touches words, but the connection-lost GROUP dim does:
+   opacity .75 on .flow-diagram composites the whole bay (tiles included)
+   toward the light page #f7f8fa, so effective ink is
+     0.75·(α-blend over #161d27) + 0.25·#f7f8fa
+   against backdrop 0.75·#161d27 + 0.25·#f7f8fa ≈ rgb(78,84,92). Alphas are
+   pinned so that worst case clears 4.5:1: word/scope/soc-word at 0.76 →
+   4.55; separator RAISED 0.70 → 0.78 (the old 0.70 measured 4.14 under this
+   corrected model) → 4.69. Computed, not eyeballed. */
+.flow-fig-word {
+  color: rgba(226, 233, 243, 0.76);
 }
 
-/* THE TWO-REGISTER FIGURE (≥81 rem only): the word steps down to a label
-   line and the figure steps forward as the datum — the number is what the
-   homeowner scans; the word names it. The lead's datum stays a full step
-   larger than the phases' (1.1 vs 0.95 rem, both 700), so the lead's figures
-   still read bigger at a glance. The separator hides (each part carries its
-   own lines) and the fleet Home's scope suffix becomes a small third line. */
+.flow-fig-sep {
+  color: rgba(226, 233, 243, 0.78);
+}
+
+/* The compact label register: any word whose widest unbreakable token is ≥8
+   characters ("Discharging", "Exporting", "available") steps down one size so
+   the longest real string fits its tile at every breakpoint. This is the
+   truncation fix — no mid-word breaks, ever. */
+.flow-fig-word--compact {
+  font-size: 0.7rem;
+  letter-spacing: 0.01em;
+}
+
+.flow-stage > .flow-phase--fleet .flow-node-figure {
+  font-size: 1.12rem;
+  font-weight: 800;
+}
+
+/* The scope suffix ("— across the 2 of 3 phases reporting") is meta-
+   information: it reads as a small footnote line UNDER its figure at every
+   width, not inline beside it — the hierarchy is better everywhere, and on a
+   390px phone it is the difference between fitting and spilling out of the
+   tile (probe finding, round 1). */
+.flow-fig-scope {
+  display: block;
+  margin-top: 0.1rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.35;
+  color: rgba(226, 233, 243, 0.76);
+}
+
+/* Two-register typography (≥81rem): the word becomes a small label line, the
+   number the larger datum line. Kept verbatim from the layout round; colors
+   retinted for the dark tile. */
 @media (min-width: 81rem) {
   .flow-node-figure {
     display: grid;
-    gap: 0.08rem;
+    gap: 0.1rem;
   }
 
   .flow-fig-part {
     display: grid;
     gap: 0.08rem;
+    justify-items: center;
   }
 
   .flow-fig-sep {
@@ -586,38 +850,133 @@
 
   .flow-fig-word {
     font-size: 0.75rem;
-    font-weight: 600;
+    font-weight: 700;
     line-height: 1.35;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: rgba(226, 233, 243, 0.76);
+  }
+
+  .flow-fig-word--compact {
+    font-size: 0.63rem;
+    letter-spacing: 0.03em;
   }
 
   .flow-fig-num {
-    font-size: 0.95rem;
-    font-weight: 700;
+    font-size: 0.98rem;
+    font-weight: 800;
     line-height: 1.3;
+    color: #f2f6fb;
   }
 
-  .flow-phase--fleet .flow-fig-num {
-    font-size: 1.1rem;
-  }
-
-  .flow-fig-scope {
-    display: block;
-    margin-top: 0.1rem;
-    font-size: 0.72rem;
-    font-weight: 500;
-    line-height: 1.35;
+  .flow-stage > .flow-phase--fleet .flow-fig-num {
+    font-size: 1.14rem;
   }
 }
 
-/* The SoC zone: a real hierarchy for the figure the homeowner actually scans
-   — the percentage large and weight-forward in the battery family's gold, the
-   "charged" word small and quiet beneath it, a slim honest meter underneath
-   (the same SOC datum, drawn once, no animation). The phrase STACKS (the
-   percentage over the word) and the meter spans the card's own content box:
-   at round 2 the one-line "100% charged" (96 px) rode nowrap on 60–70 px
-   cards and its gold meter crossed the card's border into the neighbour's
-   zone — the widest the band can ever be is now the card itself. Grid and
-   Home reserve the band empty. Never italic. */
+/* --- THE FLEET HERO BAND (round 3c owner pass) ----------------------------------
+ * The phases grew tall instruments; the fleet column's RESERVED ROWS stayed
+ * empty dark boxes and the hero band read as a hole. Recomposed honestly —
+ * NO invented data (the fleet still carries no summed SoC, so no vessel, no
+ * aggregate anything): the reserved instrument rows DISSOLVE for the fleet
+ * column only (the elements stay in the DOM — the census and the phase
+ * columns' aligned instrument rows are untouched), and the three figure
+ * tiles become vertically centered typographic heroes — bigger figures,
+ * generous internal padding, content packed to each tile's middle, and the
+ * whole dock centered in its frame so the band fills with typography and
+ * light, not emptiness.
+ *
+ * Sizing is computed against the probe's tightest band: below 81rem the
+ * figure is an inline paragraph whose every space is a wrap point (only the
+ * direction words are unbreakable, and they wear the fixed 0.7 rem compact
+ * register), so the large figure register is safe from 45 rem up; at ≥81 rem
+ * the two-register layout puts each NUMBER alone on its line, where the
+ * widest real datum bounds the size — see the measured slack note in that
+ * block below. The phone keeps its 0.95 rem figures and simply loses the
+ * dead rows. */
+.flow-stage > .flow-phase--fleet .flow-node-extra--reserved {
+  display: none;
+}
+
+@media (min-width: 45rem) {
+  /* The frame's slack flows into the dock's row instead of pooling under it… */
+  .flow-stage > .flow-phase--fleet {
+    grid-template-rows: auto 1fr;
+    padding-inline: 0.5rem; /* the heroes breathe wider inside the frame */
+  }
+
+  /* …and the dock centers as ONE composition (bus + tiles) in that row. */
+  .flow-stage > .flow-phase--fleet .flow-dock {
+    align-content: center;
+    gap: 0.6rem;
+  }
+
+  /* Each tile: a centered hero. Generous block padding, modest inline
+     padding (the measure is the binding constraint at ≥81 rem — see above),
+     and content packed to the vertical middle now that the reserved rows
+     beneath it are gone. */
+  .flow-stage > .flow-phase--fleet .flow-node {
+    align-content: center;
+    gap: 0.45rem;
+    padding: 1.15rem 0.4rem 1.25rem;
+  }
+
+  .flow-stage > .flow-phase--fleet .flow-node-figure {
+    font-size: 1.3rem;
+    line-height: 1.25;
+  }
+}
+
+@media (min-width: 81rem) {
+  /* Two-register band: the number stands alone on its line. Measured, not
+     eyeballed (Segoe UI, tabular): the widest real datum "7,755 W" renders
+     79.0px at 1.22rem, and the 4-across fleet tile yields an 84.4px text
+     track with the inline padding relaxed to 0.2rem here (the figures are
+     centered, so side padding guards nothing at this width) — one-line
+     numbers with ~5px of slack. */
+  .flow-stage > .flow-phase--fleet .flow-node {
+    padding-inline: 0.2rem;
+  }
+
+  .flow-stage > .flow-phase--fleet .flow-fig-num {
+    font-size: 1.22rem;
+  }
+}
+
+/* --- THE NODE INSTRUMENTS (round 3b) --------------------------------------------
+ * Three physical instruments, one per family tile — all aria-hidden
+ * duplication of text that already exists, all built from previously
+ * validated hexes (zero new tints):
+ *
+ *   BATTERY — THE MOLTEN CELL: a vertical glass vessel (~38×72 desktop,
+ *   ~30×54 phone) whose fill level IS the SoC figure (--cell-level, set
+ *   inline from the real datum). The validated gold ramp stands upright so
+ *   light pools at the surface; a meniscus line marks it; faint segment
+ *   ticks, a specular strip, and an end-glow ∝ the reading finish the glass.
+ *   CHARGING shimmers the meniscus IN PLACE (a surface glint — the fill
+ *   itself only ever moves to the real reading, via one height transition).
+ *   A DISCHARGE SHIMMER IS FORBIDDEN: motion may never fake a level change.
+ *   Unknown SoC renders the vessel EMPTY plus the worded "not available" —
+ *   never a zero fill.
+ *
+ *   GRID — THE FEED PORT: a machined socket ringed in family blue on dark
+ *   hardware. Its twin-chevron terminal mark rotates to the flow's heading
+ *   (up = import, down = export); split/idle stand the mark down entirely;
+ *   absent telemetry dims the socket. The port NEVER carries direction alone.
+ *
+ *   HOME — THE HEARTH: a warm radial ambience behind the figure whose
+ *   opacity is calc(--hearth-i × cap), the property set inline from load
+ *   watts against the view's shared scale. Exactly zero when idle or
+ *   unknown. Cozy, not christmassy: one warm hue at whisper alpha.
+ *
+ * Reduced motion: styles.css kills every animation/transition globally, so
+ * each instrument's static frame is its base style — the shimmer layer sits
+ * at opacity 0 when not animating, the hearth holds its computed intensity,
+ * the fill snaps to its true level. Full premium stillness, nothing frozen
+ * mid-glide. */
+
+/* The instrument slot every card reserves (rows stay aligned across all
+   columns); content stacks above the home hearth's ambience layer. */
 .flow-node-extra {
   min-height: 2.2rem;
   display: grid;
@@ -626,7 +985,146 @@
   justify-items: center;
   font-style: normal;
   width: 100%;
+  min-width: 0;
 }
+
+/* Lift card content above the absolutely-positioned hearth (position only —
+   layout is untouched). */
+.flow-node-name,
+.flow-node-figure,
+.flow-node-extra {
+  position: relative;
+  z-index: 1;
+}
+
+/* — HOME: the hearth ---------------------------------------------------------- */
+
+.flow-node-hearth {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  /* Intensity arrives inline from the measured watts (0 when idle/unknown);
+     the .9 cap keeps even a full-share hearth a whisper above the ink. */
+  opacity: calc(var(--hearth-i, 0) * 0.9);
+  background: radial-gradient(
+    60% 48% at 50% 64%,
+    rgba(255, 223, 158, 0.17) 0%, /* battery core #ffdf9e */
+    rgba(199, 130, 2, 0.09) 46%, /* battery body #c78202 */
+    transparent 74%
+  );
+  animation: flow-hearth-breath 4600ms ease-in-out infinite;
+}
+
+@keyframes flow-hearth-breath {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.045);
+  }
+}
+
+/* — GRID: the feed port -------------------------------------------------------- */
+
+.flow-node-extra--port {
+  padding-block: 0.2rem;
+}
+
+.flow-port {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 2px solid rgba(69, 149, 236, 0.7); /* grid body #4595ec */
+  background: radial-gradient(circle at 50% 40%, #1a212c 0%, #10151d 72%);
+  box-shadow:
+    inset 0 2px 4px rgba(0, 0, 0, 0.7),
+    0 1px 0 rgba(255, 255, 255, 0.05);
+  transition: border-color 180ms ease;
+}
+
+/* Machined face: a recessed inner ring with faint radial tooling. */
+.flow-port-recess {
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.055);
+  background: repeating-conic-gradient(
+    rgba(255, 255, 255, 0.045) 0deg 7deg,
+    transparent 7deg 30deg
+  );
+}
+
+/* THE TERMINAL MARK (round-3c owner pass): twin machined chevrons in the grid
+   core tint, stenciled like gauge-face tooling — deliberately NOT a lone bar,
+   which read as an info glyph. The pair rests pointing UP (= import); the
+   whole mark rotates 180° for export. Rotation is the ONLY direction channel
+   here, redundant with the figure word, the arrowhead, and the stream travel.
+   Split/idle stand it down entirely; unknown dims the whole socket below. */
+.flow-port-tick {
+  position: absolute;
+  left: calc(50% - 7px);
+  top: calc(50% - 9px);
+  width: 14px;
+  height: 18px;
+  opacity: 0;
+  transform: rotate(0deg);
+  transform-origin: center;
+  filter: drop-shadow(0 0 4px rgba(191, 220, 255, 0.55));
+  transition:
+    transform 300ms cubic-bezier(0.2, 0, 0, 1),
+    opacity 200ms ease;
+}
+
+.flow-port-tick::before,
+.flow-port-tick::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 8px;
+  height: 8px;
+  /* A corner-stroke square rotated −45° is a crisp up-chevron ("^"); stacked
+     twice it reads as machined terminal tooling, not UI iconography. */
+  border-top: 2px solid #bfdcff; /* grid core */
+  border-right: 2px solid #bfdcff;
+  border-radius: 1px;
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
+
+.flow-port-tick::before {
+  top: 25%;
+}
+
+.flow-port-tick::after {
+  top: 75%;
+}
+
+.flow-port[data-flow="import"] .flow-port-tick {
+  opacity: 0.95;
+  transform: rotate(0deg);
+}
+
+.flow-port[data-flow="export"] .flow-port-tick {
+  opacity: 0.95;
+  transform: rotate(180deg);
+}
+
+.flow-port[data-flow="unknown"] {
+  opacity: 0.4; /* presence without a claim */
+}
+
+/* Phone: the socket scales with its tile. */
+@media (max-width: 44.99rem) {
+  .flow-port {
+    width: 30px;
+    height: 30px;
+  }
+}
+
+/* — BATTERY: the molten cell ---------------------------------------------------- */
 
 .flow-soc {
   display: grid;
@@ -635,53 +1133,249 @@
 }
 
 .flow-soc-pct {
-  font-size: 1.02rem;
-  font-weight: 700;
-  color: var(--armed);
+  font-size: 1.05rem;
+  font-weight: 800;
+  color: #ffc246;
   font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
 }
 
 .flow-soc-word {
-  font-size: 0.78rem;
-  font-weight: 500;
-  color: var(--ink-soft);
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: rgba(226, 233, 243, 0.76);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
 }
 
-.flow-soc-meter {
-  width: 100%;
-  height: 5px;
-  border-radius: 999px;
-  background: rgba(138, 109, 26, 0.16);
+.flow-soc-cell {
+  --cell-w: 38px;
+  --cell-h: 72px;
+  position: relative;
+  width: var(--cell-w);
+  height: var(--cell-h);
+  border-radius: 9px;
+  overflow: hidden;
+  margin-top: 0.15rem;
+  background: linear-gradient(180deg, #17140d 0%, #211c12 100%);
+  border: 1px solid rgba(255, 194, 70, 0.28);
+  box-shadow:
+    inset 0 1px 2px rgba(0, 0, 0, 0.65),
+    inset 0 -8px 14px rgba(0, 0, 0, 0.35);
+}
+
+/* Glass crown: a faint light catch along the vessel's top lip. */
+.flow-soc-cell::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 26%;
+  border-radius: 9px 9px 0 0;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), transparent);
+  pointer-events: none;
+  z-index: 3;
+}
+
+/* The end-glow ∝ SoC: alpha rides in inline as --cell-glow. Tint is the
+   validated battery NAME gold #ffc246 (round-1 table) — the round-3b audit
+   found the first draft's rgba(245,158,11,…) was an unvalidated Tailwind
+   amber and replaced it; every tint in this vessel is now a previously
+   validated family hex. */
+.flow-soc-cell-glow {
+  position: absolute;
+  inset: 0;
+  opacity: var(--cell-glow, 0);
+  background: radial-gradient(80% 42% at 50% 100%, rgba(255, 194, 70, 0.45), transparent 70%);
+  pointer-events: none;
+  transition: opacity 450ms ease;
+}
+
+/* THE FILL IS THE DATUM: height = --cell-level (%), set inline from the
+   real SoC. One honest transition — the surface glides to the reading and
+   stops. It never animates anywhere else. */
+.flow-soc-cell-fill {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--cell-level, 0%);
+  /* THE VALIDATED GOLD RAMP (top→bottom: core → name → body → deep rim).
+     The first draft poured an unvalidated Tailwind amber ramp (#fbbf24…);
+     the round-3b palette gate failed it and swapped in the round-1 battery
+     family — the same four hexes everywhere else on this view. Computed vs
+     the vessel's own backdrops (WCAG): worst stop #a16207 = 3.44:1 on the
+     trough's lightest point #211c12 (5.34 for body, 10.53 name, 13.15 core),
+     so every stop clears the ≥3:1 mark floor and lightness falls strictly
+     top→bottom (sequential-ramp law). Computed, not eyeballed. */
+  background: linear-gradient(
+    180deg,
+    #ffdf9e 0%,
+    #ffc246 28%,
+    #c78202 62%,
+    #a16207 100%
+  );
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  transition: height 450ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* The meniscus: the bright boundary line at the fill's surface, glowing in
+   the validated core tint. While CHARGING only, a glint sweeps ALONG the
+   line — in place, never vertical, so motion can never read as level. */
+.flow-soc-cell-meniscus {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    rgba(255, 223, 158, 0.55),
+    #ffdf9e 30%,
+    #ffdf9e 70%,
+    rgba(255, 223, 158, 0.55)
+  );
+  box-shadow: 0 0 7px rgba(255, 223, 158, 0.75);
   overflow: hidden;
 }
 
-.flow-soc-fill {
-  display: block;
-  height: 100%;
-  border-radius: 999px;
-  background: var(--armed);
+/* The glint layer. Round-3c BLOCKER fix at the cause: the base rule used to
+   carry the animation itself with a play-state "gate" (a no-op — running is
+   the default), so the cell shimmered in EVERY state, implying charging while
+   discharging/idle. Now the base state carries NO animation at all: the
+   static frame is the calm glowing boundary line, and the glint exists only
+   under the charging gate below. Reduced motion still kills animation
+   globally (styles.css), so reduced-motion users see this calm base. */
+.flow-soc-cell-meniscus::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 45%;
+  opacity: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.95), transparent);
 }
 
-/* The cards are the hit surfaces: hovering or keyboard-focusing one raises its
-   stub to full opacity, tints the card's border with the node family's color,
-   and lifts the card a shade — the one linkage cue between card and stroke.
-   No tooltips: every number is already on screen as text. */
+/* THE GATE: only a CHARGING cell shimmers (the view withholds the charging
+   class while a phase is down, and never sets it for discharge or idle —
+   pinned by FlowView.test.tsx). A surface glint IN PLACE; never a level
+   change. */
+.flow-soc-cell--charging .flow-soc-cell-meniscus::after {
+  animation: flow-meniscus-shimmer 1700ms ease-in-out infinite;
+}
+
+@keyframes flow-meniscus-shimmer {
+  0% {
+    transform: translateX(-110%);
+    opacity: 0;
+  }
+  30% {
+    opacity: 0.9;
+  }
+  100% {
+    transform: translateX(330%);
+    opacity: 0;
+  }
+}
+
+/* Segment ticks: faint horizontal hairlines every tenth of the vessel. */
+.flow-soc-cell-ticks {
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    180deg,
+    transparent 0px,
+    transparent 9px,
+    rgba(0, 0, 0, 0.38) 9px,
+    rgba(0, 0, 0, 0.38) 10px
+  );
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Glass specular strip: one diagonal light band over everything. */
+.flow-soc-cell-gloss {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 18%,
+    rgba(255, 255, 255, 0.09) 30%,
+    rgba(255, 255, 255, 0.035) 42%,
+    transparent 58%
+  );
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Phone: the vessel scales down, the wording untouched. */
+@media (max-width: 44.99rem) {
+  .flow-soc-cell {
+    --cell-w: 30px;
+    --cell-h: 54px;
+  }
+}
+
+@media (min-width: 81rem) {
+  .flow-soc-cell {
+    --cell-w: 34px;
+    --cell-h: 64px;
+  }
+}
+
+/* Unknown SoC: the empty-vessel variant reads quieter than a measurement. */
+.flow-node-extra--soc-unknown .flow-soc-word {
+  text-transform: none;
+  letter-spacing: 0.01em;
+  font-size: 0.78rem;
+}
+
+.flow-node-extra--soc-unknown .flow-soc-cell {
+  border-color: rgba(255, 194, 70, 0.16);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.65);
+}
+
+/* --- Interactive Hover / Focus (dark) -------------------------------------------- */
+
+/* Focus rings are safety chrome: the 2px spread must hold ≥3:1 against BOTH
+   surfaces it can land on — the tile (#11161e) and the bay (#0b1017). The
+   round-1 alphas (0.40–0.45) blended to 2.7–3.2; these are pinned by
+   computation (blended ring color vs each surface):
+     grid    rgba(125,180,255,.62) → 4.01 / 4.08
+     battery rgba(255,194,70,.60)  → 4.74 / 4.83
+     home    rgba(160,185,220,.62) → 4.21 / 4.28
+   (forced-colors restores a system outline further below.) */
 .flow-node--grid:hover,
 .flow-node--grid:focus-visible {
-  border-color: var(--active);
-  background: var(--card);
+  border-color: rgba(125, 180, 255, 0.8);
+  background: linear-gradient(180deg, #182231, #131a25);
+  transform: translateY(-2px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 8px 20px -8px rgba(0, 0, 0, 0.8),
+    0 0 0 2px rgba(125, 180, 255, 0.62);
 }
 
 .flow-node--battery:hover,
 .flow-node--battery:focus-visible {
-  border-color: var(--armed);
-  background: #fffdf7;
+  border-color: rgba(255, 203, 107, 0.85);
+  background: linear-gradient(180deg, #221d11, #17130c);
+  transform: translateY(-2px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 8px 20px -8px rgba(0, 0, 0, 0.8),
+    0 0 0 2px rgba(255, 194, 70, 0.6);
 }
 
 .flow-node--home:hover,
 .flow-node--home:focus-visible {
-  border-color: var(--ink-soft);
-  background: var(--card);
+  border-color: rgba(160, 185, 220, 0.8);
+  background: linear-gradient(180deg, #19202c, #12161f);
+  transform: translateY(-2px);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.08),
+    0 8px 20px -8px rgba(0, 0, 0, 0.8),
+    0 0 0 2px rgba(160, 185, 220, 0.62);
 }
 
 .flow-phase:has(.flow-node--grid:hover, .flow-node--grid:focus-visible) .flow-stub--grid,
@@ -690,18 +1384,41 @@
   opacity: 1;
 }
 
-/* --- the command overlay ------------------------------------------------------ */
+/* --- Command Overlay (unified with the bay's material) ----------------------------
+ * Same dark glass as the stage, one system: hairline border, blue accent
+ * heading, quiet rows. */
 
 .flow-commands {
-  padding: 0.75rem 1rem;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  background: var(--card);
+  padding: 0.9rem 1.25rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: linear-gradient(175deg, #131a24, #0f141c);
+  color: #cbd5e1;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 12px 32px -16px rgba(15, 23, 42, 0.5);
 }
 
 .flow-commands h3 {
-  margin: 0 0 0.4rem;
+  margin: 0 0 0.5rem;
   font-size: 0.95rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #6cb2ff;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.flow-commands h3::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #6cb2ff;
+  box-shadow: 0 0 8px rgba(108, 178, 255, 0.7);
 }
 
 .flow-commands ul {
@@ -709,58 +1426,346 @@
   padding: 0;
   list-style: none;
   display: grid;
-  gap: 0.25rem 1rem;
-  /* One row per phase up to three across (the diagram's own rhythm); the
-     rows are short sentences, and a full-width stack of three would read as
-     scattered lines of air on the wide band. */
+  gap: 0.4rem 1.25rem;
   grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
 }
 
 .flow-commands li {
-  font-size: 0.95rem;
+  font-size: 0.92rem;
+  color: #cbd5e1;
+  background: rgba(255, 255, 255, 0.04);
+  padding: 0.45rem 0.75rem;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-/* The row's unit id — the anchor that names which phase the sentence is
-   about, matching the scan the diagram's columns train. */
 .flow-cmd-unit {
-  font-weight: 700;
+  font-weight: 800;
+  color: #f2f6fb;
+  text-transform: uppercase;
 }
 
-/* --- the footnote and the quiet states ----------------------------------------- */
+/* --- Footnotes & Status Messages (light chrome, untouched) ----------------------- */
 
 .flow-footnote {
   margin: 0;
   font-size: 0.85rem;
   color: var(--ink-soft);
+  line-height: 1.4;
+  /* Round-3b breathing: the footnote gets air under the taller bay instead
+     of hugging it (no filler content — just spacing that lets the page sit). */
+  padding: 0.45rem 0.4rem 0.2rem;
 }
 
 .flow-loading,
 .flow-empty {
   margin: 0;
-  padding: 0.75rem 0.9rem;
-  border: 1px dashed var(--line);
-  border-radius: 12px;
+  padding: 1.2rem 1.5rem;
+  border: 1px dashed rgba(0, 0, 0, 0.15);
+  border-radius: 14px;
   color: var(--ink-soft);
   background: var(--card);
+  font-size: 0.95rem;
+  text-align: center;
 }
 
 .flow-error {
   display: grid;
-  gap: 0.4rem;
+  gap: 0.5rem;
   justify-items: start;
-  padding: 0.75rem 1rem;
+  padding: 1rem 1.25rem;
   border-left: 4px solid var(--no);
-  background: #fdf3f2;
-  border-radius: 0 10px 10px 0;
+  background: linear-gradient(180deg, #fff5f5 0%, #fee2e2 100%);
+  border-radius: 0 12px 12px 0;
+  box-shadow: 0 2px 8px rgba(185, 28, 28, 0.08);
 }
 
 .flow-error code {
   font-size: 0.85rem;
+  background: rgba(0, 0, 0, 0.06);
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
 }
 
-/* While disconnected, the last known picture stays — dimmed, never gone (the
-   shell's own rule; the connection line names why). */
+/* Connection lost: the last known picture dims — the bay included.
+   THE CAP: exactly ONE 0.75 may ever multiply the words. Two legitimate dim
+   sources exist — this one and the shell's `main.dimmed` (styles.css, same
+   0.75) — and stacked they land at 0.5625, dragging every figure below its
+   floor. When the bay carries the lost state itself, the shell's factor is
+   neutralized; the bay's own 0.75 is THE dim (this also keeps bare-mounted
+   harness shots faithful, since the shell is absent there). */
 .flow-view[data-connection="lost"] .flow-diagram,
 .flow-view[data-connection="lost"] .flow-story {
   opacity: 0.75;
+}
+
+/* Round-3c: the INSTRUMENTS join the frozen last-known world. The group dim
+   above already stills the light engine (glow.ts full-stops off "live"), but
+   the CSS instruments kept their own life — a hearth breathing, a charging
+   meniscus glinting, a tick or fill mid-glide would claim a liveness the
+   wire no longer carries. Each now holds its LAST POSE under the same lost
+   floor: the hearth pauses mid-breath, the gated shimmer freezes, and the
+   tick/fill/end-glow lose their glide (nothing arrives to glide TO while the
+   stream is down; on resume the transitions return with live data). */
+.flow-view[data-connection="lost"] .flow-node-hearth,
+.flow-view[data-connection="lost"] .flow-soc-cell--charging .flow-soc-cell-meniscus::after {
+  animation-play-state: paused;
+}
+
+.flow-view[data-connection="lost"] .flow-port-tick,
+.flow-view[data-connection="lost"] .flow-soc-cell-fill,
+.flow-view[data-connection="lost"] .flow-soc-cell-glow {
+  transition: none;
+}
+
+main.dimmed:has(.flow-view[data-connection="lost"]) {
+  opacity: 1;
+}
+
+/* --- PRINT ----------------------------------------------------------------------
+ * Paper gets the bay as ink, not light: a white surface with dark family inks
+ * inside .flow-stage, glows/shadows/bezel off, the light-engine canvas hidden
+ * (streams are screen material; the static conduit strokes carry the picture),
+ * arrowheads retipped from near-white to ink so direction survives on white.
+ * The light chrome outside the bay is already print-shaped. */
+@media print {
+  .flow-stage {
+    background: #ffffff;
+    border-color: #c7cedb;
+    box-shadow: none;
+  }
+
+  .flow-stage::before,
+  .flow-stage::after {
+    display: none; /* bezel step + glass sheen are screen material */
+  }
+
+  .flow-node,
+  /* Specificity parity (round-2 fix): print media does not silence screen
+     rules, and the disconnected-phase tile rule on screen —
+     .flow-stage > .flow-phase--down .flow-node, (0,3,0) — outranked the bare
+     .flow-node rule above, (0,1,0), so a downed phase PRINTED its dark glass
+     gradient (#131a24→#10151d) with near-invisible ink. Re-assert white at
+     (0,3,0) here: equal specificity plus later source order wins the cascade
+     for BOTH normal phases (.flow-stage > .flow-phase .flow-node beats the
+     base tile gradient at (0,1,0)) and --down phases (ties (0,3,0), prints
+     after it). Also covers hover/focus variants ((0,2,0)/(0,2,1)). */
+  .flow-stage > .flow-phase .flow-node,
+  .flow-stage > .flow-phase--down .flow-node {
+    background: #ffffff;
+    border-color: #c7cedb;
+    box-shadow: none;
+  }
+
+  /* Dark ink for every dark-surface token inside the stage. The command
+     panel below the bay keeps its own treatment (out of this block's scope). */
+  .flow-stage {
+    --stage-ink-strong: #10151d;
+    --stage-ink-muted: #3c4657;
+    color: var(--stage-ink-strong);
+  }
+
+  .flow-phase-name,
+  /* Same parity hole, found verifying FIX B: the fleet nameplate's screen
+     rule (.flow-stage > .flow-phase--fleet .flow-phase-name, (0,3,0)) beat
+     the bare print rule (0,1,0) and would print family blue on white paper
+     (~2.2:1). Re-assert at (0,3,0) — ties the screen rule, later in source. */
+  .flow-stage > .flow-phase .flow-phase-name,
+  .flow-stage > .flow-phase--fleet .flow-phase-name {
+    color: #4a5568;
+  }
+
+  .flow-node-figure,
+  .flow-fig-num {
+    color: var(--stage-ink-strong);
+  }
+
+  .flow-fig-word,
+  .flow-fig-sep,
+  .flow-fig-scope,
+  .flow-soc-word {
+    color: var(--stage-ink-muted);
+  }
+
+  .flow-node--grid .flow-node-name {
+    color: #1d5fa0;
+  }
+
+  .flow-node--battery .flow-node-name {
+    color: #8a5a06;
+  }
+
+  .flow-node--home .flow-node-name {
+    color: var(--stage-ink-muted);
+  }
+
+  .flow-soc-pct {
+    color: #8a5a06;
+  }
+
+  /* Round-3b instruments on paper: the molten cell prints as a light trough
+     with a solid dark-gold fill (the level survives as ink), every screen
+     material layer (meniscus glow, ticks, gloss, end-glow) off, and the
+     hearth/port ambience hidden entirely — the port carries no unique fact
+     (words do) and the tick's rotation means nothing frozen. */
+  .flow-soc-cell {
+    background: #eceff4;
+    border-color: #c7cedb;
+    box-shadow: none;
+  }
+
+  .flow-soc-cell::before,
+  .flow-soc-cell-meniscus,
+  .flow-soc-cell-ticks,
+  .flow-soc-cell-gloss,
+  .flow-soc-cell-glow,
+  .flow-node-hearth,
+  .flow-port-recess {
+    display: none;
+  }
+
+  .flow-soc-cell-fill {
+    background: #8a5a06;
+    box-shadow: none;
+    transition: none;
+  }
+
+  .flow-port {
+    border-color: #1d5fa0;
+    background: #ffffff;
+    box-shadow: none;
+  }
+
+  .flow-port-tick {
+    background: none;
+    box-shadow: none;
+    filter: none;
+  }
+
+  .flow-port-tick::before,
+  .flow-port-tick::after {
+    border-color: #1d5fa0;
+  }
+
+  .flow-phase-note {
+    color: #7a5205;
+    background: #fdf6e7;
+    border-color: #e3ce9e;
+  }
+
+  /* Glows off; structural SVG strokes are dark enough to read on white. */
+  .flow-conduit,
+  .flow-bus-rail,
+  .flow-bus-collar,
+  .flow-idle-ring {
+    filter: none;
+  }
+
+  /* Round-3a parity fix: on screen conduits wear their body tints at 0.55
+     alpha (a dark-bay material), but paper hides the light engine and these
+     strokes ARE the picture there — translucent blue at 55% on white washes
+     out. Re-assert the solid deep rim inks at print. */
+  .flow-conduit--grid {
+    stroke: #1d5fa0;
+  }
+
+  .flow-conduit--battery {
+    stroke: #a16207;
+  }
+
+  .flow-conduit--home {
+    stroke: #31517f;
+  }
+
+  .flow-bus-collar,
+  .flow-idle-ring {
+    fill: #ffffff;
+  }
+
+  /* Canvas light is screen material — paper gets the ink conduits only
+     (the retired march's frozen-dash ban died with the march). */
+  .flow-bus-glow {
+    display: none;
+  }
+
+  /* Arrowheads are near-white for the dark bay — retip them for paper. */
+  .flow-bus marker path {
+    fill: var(--stage-ink-strong);
+  }
+}
+
+/* --- FORCED COLORS --------------------------------------------------------------
+ * With a Windows High Contrast / forced-colors theme the system owns color:
+ * hand-tuned fills step aside for Canvas/CanvasText, glow filters drop, and
+ * the tile focus indicator comes back as a real system outline (the base
+ * `.flow-node` sets `outline: none`). */
+@media (forced-colors: active) {
+  .flow-stage {
+    background: Canvas;
+    border-color: CanvasText;
+    box-shadow: none;
+  }
+
+  .flow-stage::before,
+  .flow-stage::after {
+    display: none;
+  }
+
+  .flow-node,
+  .flow-commands {
+    background: Canvas;
+    border-color: CanvasText;
+    box-shadow: none;
+  }
+
+  /* …and the panel's light-on-dark text reverts to system ink. */
+  .flow-commands,
+  .flow-commands li {
+    color: CanvasText;
+  }
+
+  .flow-node:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+
+  /* Round-3b instruments under forced colors: the ambience and the port step
+     aside (no unique facts — words carry everything); the cell reduces to a
+     Canvas trough with a solid CanvasText level. */
+  .flow-node-hearth,
+  .flow-port {
+    display: none;
+  }
+
+  .flow-soc-cell {
+    background: Canvas;
+    border-color: CanvasText;
+    box-shadow: none;
+  }
+
+  .flow-soc-cell::before,
+  .flow-soc-cell-meniscus,
+  .flow-soc-cell-ticks,
+  .flow-soc-cell-gloss,
+  .flow-soc-cell-glow {
+    display: none;
+  }
+
+  .flow-soc-cell-fill {
+    background: CanvasText;
+  }
+
+  .flow-conduit,
+  .flow-bus-rail,
+  .flow-stub-unknown {
+    stroke: CanvasText;
+    filter: none;
+  }
+
+  .flow-bus-collar,
+  .flow-idle-ring {
+    fill: Canvas;
+    stroke: CanvasText;
+    filter: none;
+  }
 }

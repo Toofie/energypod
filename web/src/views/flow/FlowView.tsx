@@ -9,15 +9,17 @@
  * story, whole site, phase detail), then one column per phase (a unit is a
  * phase on this three-phase site). Each column is three nodes — GRID,
  * BATTERY, HOME — docked under one phase bus: a horizontal rail (the phase
- * conductor) with three stub slots. Every active stub is a ribbon whose
- * thickness is proportional to watts, whose arrowhead gives the direction,
- * and whose dashes march in the arrowhead's direction at a speed set by the
- * magnitude; color only names the node family. The worded figure sits beside
- * every node ("Importing 412 W", never a raw signed number). Idle states are
+ * conductor) with three stub slots. Every active stub is a LIVING STREAM:
+ * a curved conduit carries particles whose density, speed, and glow are
+ * proportional to watts (the Canvas2D light engine in glow.ts), traveling
+ * in the arrowhead's direction; magnitude lives in motion and in the words,
+ * never again in a ribbon's thickness (that grammar retired in round 2).
+ * Color only names the node family. The worded figure sits beside every
+ * node ("Importing 412 W", never a raw signed number). Idle states are
  * honest ("Idle" and a hollow ring); absent data says "not available" and is
- * never zero-filled. The SVG is decorative duplication: every fact it draws
- * also exists as text, and each column carries its whole state as an
- * accessible label.
+ * never zero-filled. The SVG+canvas pair is decorative duplication: every
+ * fact it draws also exists as text, and each column carries its whole state
+ * as an accessible label.
  *
  * THE STORY LINE: one plain sentence composing the measured state, with the
  * strategy advisers' stories riding on top when their projections are present
@@ -33,6 +35,19 @@
  * node exists anywhere on this view; export is labeled "exporting" (surplus
  * leaving the site) and the one footnote states the fact.
  *
+ * THE NODE INSTRUMENTS (round 3b): every node tile carries a physical
+ * instrument, each an aria-hidden duplicate of text that already exists —
+ * the battery tile grows a vertical MOLTEN CELL whose fill level IS the SoC
+ * figure (charging shimmers the meniscus IN PLACE; a discharge shimmer is
+ * forbidden as a fake level change; unknown SoC renders an empty vessel and
+ * words "not available", never a zero fill), the grid tile a machined FEED
+ * PORT whose inner tick rotates with import/export (the port itself never
+ * claims direction — words and arrowheads own that), and the home tile a
+ * warm HEARTH ambience breathing with the load watts (zero when idle or
+ * unknown). Geometry moved with the instruments: the bus box grew to
+ * `0 -8 240 128` and the landings to y=96 (flowGeometry.ts), lengthening
+ * every conduit into the reclaimed page.
+ *
  * LIVE DATA: the view rides the session's existing cadence — the shell's
  * SharedDataPlane republishes every REST snapshot read (its ~2.5 s measured-
  * data heartbeat included) to this view's stream subscription, and the event
@@ -41,7 +56,7 @@
  * never invents a figure the wire did not carry.
  */
 import { Fragment, useCallback, useEffect, useId, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient, StreamEvent } from "../../api/client";
 import { formatPercent, formatWatts } from "../../lib/format";
@@ -50,7 +65,6 @@ import { usePrefersReducedMotion } from "../../app/usePrefersReducedMotion";
 import { useUnitIntentFigures } from "../../app/useUnitIntentFigures";
 import {
   arrowScaleW,
-  arrowWidthPx,
   batteryFigureParts,
   batteryFlowDirection,
   batteryFlowText,
@@ -79,6 +93,8 @@ import {
   type FlowSnapshot,
   type FlowUnit,
 } from "./flow";
+import { FlowBus, IDLE_STUB, UNKNOWN_STUB, activeStub, single } from "./FlowBus";
+import type { SlotSpec } from "./FlowBus";
 import "./flow.css";
 
 /** The one prop the shell hands every mounted view (views.ts ShellViewProps). */
@@ -107,260 +123,6 @@ const REFETCH_FRAME_TYPES: readonly string[] = [
   "schedule.replaced",
   "energy.day_rolled",
 ];
-
-// ---------------------------------------------------------------------------
-// the decorative bus (pure SVG; every fact it draws also exists as text)
-// ---------------------------------------------------------------------------
-//
-// Geometry (the design brief's pins, round 2's flatter aspect): one horizontal
-// rail — the phase conductor, 3 px, --line, rounded caps — across the top of a
-// `0 0 240 84` viewBox at y = 12; three stub slots dropping to the node cards
-// at the viewBox's thirds (x = 40 / 120 / 200), each landing on the center of
-// the node card docked immediately beneath the SVG. Direction is carried by
-// THREE redundant channels — the word beside the node, the arrowhead, and the
-// proportional width — while color only ever names the NODE FAMILY (grid
-// --active, battery --armed, home --ink-soft; heads all --ink).
-
-/** The bus geometry, in viewBox units (the brief's pinned numbers). */
-const RAIL_Y = 12;
-const STUB_TOP = 14;
-const STUB_BOTTOM = 78;
-/** The idle ring's center — just below the rail, centered in the slot. */
-const RING_Y = 21;
-/** The rim stops this far short of either end, so its caps tuck under the ink
- *  head and stop shy of the rail (the edge shades the ribbon, never the tips). */
-const RIM_INSET = 4;
-/** The fleet's two-sided slots render two half-slot stubs, offset ±14 px. */
-const SPLIT_OFFSET = 14;
-/** Strokes at 4 px and above wear the large head; thinner wear the small. */
-const LARGE_HEAD_AT_PX = 4;
-/** The stub slots, pinned to the thirds so each lands on its card's center. */
-const SLOT_X = { grid: 40, battery: 120, home: 200 } as const;
-/** The march's speed band: the largest flow on screen cycles in 1.6 s, the smallest in 3.2 s. */
-const MARCH_SLOW_MS = 3200;
-const MARCH_FAST_MS = 1600;
-
-/** Which way one stub's arrow points — the arrowhead IS the direction. */
-type StubAim = "into-bus" | "to-node" | "idle" | "unknown";
-
-/** One stub: its aim, its proportional width, and its share of the scale. */
-interface Stub {
-  aim: StubAim;
-  /** Solid stroke width in viewBox units (ARROW_MIN_PX..ARROW_MAX_PX); 0 when no ribbon draws. */
-  widthPx: number;
-  /** |watts| / scaleMax (0..1) — sets the march speed; 1 = the fastest. */
-  share: number;
-}
-
-/** One slot's content: a single stub, or the fleet's two-sided split. */
-type SlotSpec =
-  | { kind: "single"; stub: Stub }
-  | { kind: "split"; intoBus: Stub; toNode: Stub };
-
-const IDLE_STUB: Stub = { aim: "idle", widthPx: 0, share: 0 };
-const UNKNOWN_STUB: Stub = { aim: "unknown", widthPx: 0, share: 0 };
-
-function single(stub: Stub): SlotSpec {
-  return { kind: "single", stub };
-}
-
-/** An active stub: width proportional to watts, march speed proportional to share. */
-function activeStub(aim: "into-bus" | "to-node", watts: number, scaleMaxW: number): Stub {
-  return {
-    aim,
-    widthPx: arrowWidthPx(watts, scaleMaxW),
-    share: scaleMaxW > 0 ? Math.min(1, Math.abs(watts) / scaleMaxW) : 0,
-  };
-}
-
-/**
- * One stub mark. The line's own draw direction carries both the arrowhead and
- * the march (the invariant that makes one keyframe serve every stub): an
- * into-bus stub is drawn bottom→top so its head lands on the rail and its
- * dashes march upward; a to-node stub is drawn top→bottom so both point down
- * at the node. Idle draws a hollow ring (connected, nothing moving); unknown
- * draws a 1.5 px dotted line (presence without a claim).
- */
-function StubMark({
-  cx,
-  spec,
-  tone,
-  smallHead,
-  largeHead,
-  pulse = false,
-}: {
-  cx: number;
-  spec: Stub;
-  tone: "grid" | "battery" | "home";
-  smallHead: string;
-  largeHead: string;
-  pulse?: boolean;
-}): ReactNode {
-  if (spec.aim === "idle") {
-    return (
-      <g className={`flow-stub flow-stub--${tone}`} key="idle">
-        <circle
-          className={pulse ? "flow-idle-ring flow-idle-ring--pulse" : "flow-idle-ring"}
-          cx={cx}
-          cy={RING_Y}
-          r={3.5}
-        />
-      </g>
-    );
-  }
-  if (spec.aim === "unknown") {
-    return (
-      <g className="flow-stub" key="unknown">
-        <line className="flow-stub-unknown" x1={cx} y1={STUB_TOP} x2={cx} y2={STUB_BOTTOM} />
-      </g>
-    );
-  }
-  const intoBus = spec.aim === "into-bus";
-  const y1 = intoBus ? STUB_BOTTOM : STUB_TOP;
-  const y2 = intoBus ? STUB_TOP : STUB_BOTTOM;
-  const head = spec.widthPx >= LARGE_HEAD_AT_PX ? largeHead : smallHead;
-  return (
-    // The key is the aim: a flip remounts the group (the 150 ms fade-in of a
-    // fresh stub) while a magnitude change keeps it (the 400 ms stroke-width
-    // transition breathes the new width instead).
-    <g className={`flow-stub flow-stub--${tone}`} key={spec.aim}>
-      {/* The rim: the family's own hue, deepened, full opacity, 2.6 units
-          wider than the ribbon and drawn a few units short of either end —
-          the darker edge that keeps a thin gold ribbon reading GOLD at a
-          glance instead of beige-on-white (the track alone at partial alpha
-          was the round-1 failure the review caught). */}
-      <line
-        className="flow-stub-rim"
-        x1={cx}
-        y1={intoBus ? STUB_BOTTOM - RIM_INSET : STUB_TOP + RIM_INSET}
-        x2={cx}
-        y2={intoBus ? STUB_TOP + RIM_INSET : STUB_BOTTOM - RIM_INSET}
-        strokeLinecap="round"
-        style={{ strokeWidth: spec.widthPx + 2.6 }}
-      />
-      <line
-        className="flow-stub-track"
-        x1={cx}
-        y1={y1}
-        x2={cx}
-        y2={y2}
-        strokeLinecap="round"
-        markerEnd={`url(#${head})`}
-        style={{ strokeWidth: spec.widthPx }}
-      />
-      <line
-        className="flow-stub-march"
-        x1={cx}
-        y1={y1}
-        x2={cx}
-        y2={y2}
-        strokeLinecap="round"
-        style={{
-          strokeWidth: spec.widthPx * 0.55,
-          animationDuration: `${MARCH_SLOW_MS - MARCH_FAST_MS * spec.share}ms`,
-        }}
-      />
-    </g>
-  );
-}
-
-/** One node slot: a single stub, or the fleet's two-sided split (±14 px). */
-function BusSlot({
-  x,
-  tone,
-  spec,
-  smallHead,
-  largeHead,
-  pulse = false,
-}: {
-  x: number;
-  tone: "grid" | "battery" | "home";
-  spec: SlotSpec;
-  smallHead: string;
-  largeHead: string;
-  pulse?: boolean;
-}): ReactNode {
-  if (spec.kind === "split") {
-    return (
-      <g key="split">
-        <StubMark cx={x - SPLIT_OFFSET} spec={spec.intoBus} tone={tone} smallHead={smallHead} largeHead={largeHead} />
-        <StubMark cx={x + SPLIT_OFFSET} spec={spec.toNode} tone={tone} smallHead={smallHead} largeHead={largeHead} />
-      </g>
-    );
-  }
-  return <StubMark cx={x} spec={spec.stub} tone={tone} smallHead={smallHead} largeHead={largeHead} pulse={pulse} />;
-}
-
-/**
- * One column's phase bus: the rail (the phase itself) with three stub slots —
- * grid, battery, home — each a ribbon whose width is proportional to watts
- * and whose head gives the direction. aria-hidden by design: the worded
- * figures carry the same facts as text right below.
- */
-function FlowBus({
-  grid,
-  battery,
-  house,
-  batteryPulse = false,
-}: {
-  grid: SlotSpec;
-  battery: SlotSpec;
-  house: SlotSpec;
-  batteryPulse?: boolean;
-}): ReactNode {
-  const uid = useId().replace(/[^a-zA-Z0-9-]/g, "");
-  const smallHead = `flow-head-sm-${uid}`;
-  const largeHead = `flow-head-lg-${uid}`;
-  return (
-    <svg className="flow-bus" viewBox="0 0 240 84" aria-hidden="true" focusable="false">
-      <defs>
-        {/* Two heads, one shape: small (8×7) under 4 px of stroke, large
-            (12×10) at 4 px and above — a constant single size would put a
-            cartoon head on a 2 px trickle. markerUnits="userSpaceOnUse" keeps
-            both constant while the stroke width carries the magnitude;
-            orient="auto-start-reverse" lets one def serve either aim. One
-            neutral ink for every head: the stroke names the node family, the
-            head names the direction. */}
-        <marker
-          id={smallHead}
-          viewBox="0 0 8 7"
-          refX={7}
-          refY={3.5}
-          markerWidth={8}
-          markerHeight={7}
-          markerUnits="userSpaceOnUse"
-          orient="auto-start-reverse"
-        >
-          <path d="M 1 1 L 7 3.5 L 1 6 z" fill="var(--ink)" />
-        </marker>
-        <marker
-          id={largeHead}
-          viewBox="0 0 12 10"
-          refX={10.5}
-          refY={5}
-          markerWidth={12}
-          markerHeight={10}
-          markerUnits="userSpaceOnUse"
-          orient="auto-start-reverse"
-        >
-          <path d="M 1 1.5 L 11 5 L 1 8.5 z" fill="var(--ink)" />
-        </marker>
-      </defs>
-      <line className="flow-bus-rail" x1={16} y1={RAIL_Y} x2={224} y2={RAIL_Y} />
-      <BusSlot key="grid" x={SLOT_X.grid} tone="grid" spec={grid} smallHead={smallHead} largeHead={largeHead} />
-      <BusSlot
-        key="battery"
-        x={SLOT_X.battery}
-        tone="battery"
-        spec={battery}
-        smallHead={smallHead}
-        largeHead={largeHead}
-        pulse={batteryPulse}
-      />
-      <BusSlot key="home" x={SLOT_X.home} tone="home" spec={house} smallHead={smallHead} largeHead={largeHead} />
-    </svg>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // the number tick (§c motion #3): the watt figure tweens 300 ms, ease-out, and
@@ -447,6 +209,24 @@ function useTickedWatts(parts: readonly FlowFigurePart[], animate: boolean): num
 }
 
 /**
+ * THE TRUNCATION FIX AT THE CAUSE: a figure word whose widest UNBREAKABLE
+ * token reaches this many characters ("Discharging" → 11, "Exporting" → 9,
+ * the "available" inside "not available" → 9) wears the `--compact` label
+ * register — one deliberate size step-down (flow.css) that lets the longest
+ * real string fit its tile's measure at every breakpoint. A single word can
+ * never be wrapped (`overflow-wrap` mid-word breaks are banned for these),
+ * so fitting is done by typography, and the overflow probe
+ * (scripts/check-flow-overflow.mjs) fails the round if any string still
+ * escapes its tile.
+ */
+const COMPACT_WORD_TOKEN_MIN = 8;
+
+/** The longest single unbreakable token of one figure word ("not available" → 9). */
+function widestToken(word: string): number {
+  return Math.max(...word.split(" ").map((token) => token.length));
+}
+
+/**
  * One worded figure line, its magnitudes ticking between snapshots.
  *
  * Rendered as PARTS — the direction word and its magnitude in sibling spans —
@@ -455,7 +235,7 @@ function useTickedWatts(parts: readonly FlowFigurePart[], animate: boolean): num
  * figures stay exactly the pinned `figurePartsText` reading ("Importing 412
  * W", "Charging 3,800 W · Discharging 800 W" — the separator rides between the
  * parts). The desktop's four-across band promotes the two into typographic
- * registers (flow.css ≥77rem): the word a small label line, the figure the
+ * registers (flow.css ≥81rem): the word a small label line, the figure the
  * larger datum line — the number is what the homeowner scans, the word names
  * it, and neither ever reaches past its card's edge again.
  */
@@ -476,7 +256,13 @@ function FlowFigure({
           <Fragment key={`${index}-${part.word}`}>
             {index === 0 ? null : <span className="flow-fig-sep"> · </span>}
             <span className="flow-fig-part">
-              <span className="flow-fig-word">{part.word}</span>
+              <span
+                className={`flow-fig-word${
+                  widestToken(part.word) >= COMPACT_WORD_TOKEN_MIN ? " flow-fig-word--compact" : ""
+                }`}
+              >
+                {part.word}
+              </span>
               {watts === null ? null : (
                 <>
                   {" "}
@@ -495,47 +281,169 @@ function FlowFigure({
 /**
  * The battery card's SoC band — real hierarchy for the one per-phase figure
  * the homeowner scans: the percentage large and weight-forward in the battery
- * family's gold, the "charged" word quiet beside it, and a slim honest meter
- * of the same datum beneath (drawn once, never animated). The wording is the
- * pinned "…% charged" string, verbatim.
+ * family's gold, the "charged" word quiet beside it, and beneath them THE
+ * MOLTEN CELL (round 3b): a vertical glass vessel whose fill level IS the
+ * SoC figure — the validated gold ramp stood upright so the light pools at
+ * the surface, a bright meniscus line on that boundary, faint segment ticks,
+ * a glass specular strip, and a soft end-glow ∝ the reading. While the cell
+ * CHARGES, its meniscus shimmers IN PLACE (a surface glint; the fill level
+ * itself only ever moves to the real SoC datum — a discharge shimmer is
+ * forbidden as a faked level change). The end-glow rides the same reading and
+ * floors at exactly 0: a measured-zero vessel renders dark — no halo, no
+ * fill layer, no fake surface at the floor. The vessel is decorative
+ * aria-hidden duplication; the worded figure above is the primary carrier.
  */
-function SocBand({ socPct }: { socPct: number }): ReactNode {
+function SocBand({ socPct, charging = false }: { socPct: number; charging?: boolean }): ReactNode {
+  const level = Math.min(100, Math.max(0, socPct));
+  // Round-3c honesty floor: a MEASURED zero is a dark, empty vessel. The old
+  // formula (0.18 + 0.5·level/100) paid an end-glow even at 0% — a faint halo
+  // implying charge that was never measured — so the ramp now floors at
+  // exactly 0, and the fill layer (with its meniscus line, which would
+  // otherwise anchor a glowing "surface" at the vessel floor) does not render
+  // at all — the same no-fill-layer rule the unknown-SoC vessel follows.
   return (
     <span className="flow-node-extra flow-node-extra--soc">
       <span className="flow-soc">
         <b className="flow-soc-pct">{formatPercent(socPct)}</b>{" "}
         <span className="flow-soc-word">charged</span>
       </span>
-      <span className="flow-soc-meter" aria-hidden="true">
-        <span className="flow-soc-fill" style={{ width: `${socPct}%` }} />
+      {/* The level and the end-glow ride in as custom properties from the
+          REAL reading; every layer inside is inert glass over that datum. */}
+      <span
+        className={`flow-soc-cell${charging ? " flow-soc-cell--charging" : ""}`}
+        aria-hidden="true"
+        style={
+          {
+            "--cell-level": `${level}%`,
+            "--cell-glow": level <= 0 ? "0" : (0.18 + 0.5 * (level / 100)).toFixed(3),
+          } as CSSProperties
+        }
+      >
+        <span className="flow-soc-cell-glow" />
+        {level > 0 ? (
+          <span className="flow-soc-cell-fill">
+            <span className="flow-soc-cell-meniscus" />
+          </span>
+        ) : null}
+        <span className="flow-soc-cell-ticks" />
+        <span className="flow-soc-cell-gloss" />
       </span>
     </span>
   );
 }
 
-/** One node card: the node's name, its worded figure, and the reserved SoC band. */
+/**
+ * The battery card's extra when the SoC ITSELF is absent telemetry: the same
+ * slot holds an EMPTY vessel — no fill, never a zero-fill lie — and the
+ * worded "not available" where the percentage would sit. An unmeasured cell
+ * shows nothing it cannot vouch for.
+ */
+function SocBandUnavailable(): ReactNode {
+  return (
+    <span className="flow-node-extra flow-node-extra--soc flow-node-extra--soc-unknown">
+      <span className="flow-soc">
+        <span className="flow-soc-word">not available</span>
+      </span>
+      <span className="flow-soc-cell" aria-hidden="true" />
+    </span>
+  );
+}
+
+/** Every state the feed port can name. Each one is ALSO a word beside the
+ *  node ("Importing", "Exporting", "Idle", "not available") and an arrowhead
+ *  on the conduit — the port never carries direction alone. */
+type PortDirection = "import" | "export" | "split" | "idle" | "unknown";
+
+/**
+ * The grid card's FEED PORT (round 3b): a machined socket ringed in the grid
+ * family's blue, docked in the reserved extra slot. When power moves, a twin-
+ * chevron terminal mark inside rotates to the flow's heading (up = import,
+ * down = export) — restyled in round 3c from a lone bar, which read as an
+ * info icon, into gauge-face tooling that cannot be misread as a UI glyph;
+ * the fleet's legal both-ways split and idle show no mark at all, and absent
+ * telemetry dims the whole socket to presence-without-a-claim. Purely
+ * decorative (aria-hidden): the words own every fact.
+ */
+function FeedPort({ direction }: { direction: PortDirection }): ReactNode {
+  return (
+    <span className="flow-node-extra flow-node-extra--port">
+      <span className="flow-port" aria-hidden="true" data-flow={direction}>
+        <span className="flow-port-recess" />
+        <span className="flow-port-tick" />
+      </span>
+    </span>
+  );
+}
+
+/** The fleet port's direction from the SUMMED picture: importing and
+ *  exporting at once is legal there, so the tick stands down ("split") and
+ *  the two-sided words carry the exact picture. */
+function fleetGridPortDirection(fleet: ReturnType<typeof fleetFlow>): PortDirection {
+  if (fleet.gridReporting === 0) {
+    return "unknown";
+  }
+  const importing = (fleet.importW ?? 0) > 0;
+  const exporting = (fleet.exportW ?? 0) > 0;
+  if (importing && exporting) {
+    return "split";
+  }
+  if (importing) {
+    return "import";
+  }
+  return exporting ? "export" : "idle";
+}
+
+/**
+ * The home card's HEARTH level (round 3b): load watts against the view's
+ * shared scale — exactly 0 when idle or unknown (a dark hearth is the honest
+ * hearth), approaching 1 as the house draws its largest measured share.
+ * Drives only the ambience's opacity via CSS; the figure stays the carrier.
+ */
+function hearthLevel(loadW: number | null, scaleMaxW: number): number {
+  if (loadW === null || loadW <= 0 || !(scaleMaxW > 0)) {
+    return 0;
+  }
+  return Math.min(1, loadW / scaleMaxW);
+}
+
+/**
+ * One node card: the node's name, its worded figure, its INSTRUMENT (the
+ * round-3b physical layer — battery molten cell / grid feed port), and the
+ * home hearth's ambience behind everything.
+ */
 function FlowNode({
   name,
   parts,
   suffix = "",
   extra = null,
+  ambience = 0,
   tone,
 }: {
   name: string;
   parts: readonly FlowFigurePart[];
   suffix?: string;
   extra?: ReactNode;
+  /** Hearth intensity 0..1 (∝ load watts); >0 renders the ambience layer. */
+  ambience?: number;
   tone: "grid" | "battery" | "home";
 }): ReactNode {
   return (
     <div className={`flow-node flow-node--${tone}`} data-tone={tone} tabIndex={0}>
+      {ambience > 0 ? (
+        <span
+          className="flow-node-hearth"
+          aria-hidden="true"
+          style={{ "--hearth-i": ambience.toFixed(3) } as CSSProperties}
+        />
+      ) : null}
       <span className="flow-node-name">{name}</span>
       <span className="flow-node-figure">
         <FlowFigure parts={parts} suffix={suffix} />
       </span>
-      {/* The SoC band is RESERVED in every card — empty for Grid and Home —
-          so the same rows land at the same y across all four columns whether
-          or not a card carries a second datum (the aligned visual grid). */}
+      {/* The instrument slot is RESERVED in every card — empty for Home and
+          for any battery without a reading — so the same rows land at the
+          same y across all columns whether or not a card carries a second
+          datum or an instrument (the aligned visual grid). */}
       {extra ?? <span className="flow-node-extra flow-node-extra--reserved" aria-hidden="true" />}
     </div>
   );
@@ -931,6 +839,12 @@ export function FlowView({ client }: FlowViewProps) {
         </p>
       ) : (
         <div className="flow-diagram" role="group" aria-label="Power flow by phase">
+          {/* THE BAY — every column lives inside one recessed dark-glass
+              viewport (.flow-stage): machined bezel, inset vignette, hairline-
+              divided zones. Purely presentational (role="presentation"): it
+              adds no semantics, so reading order and each column's own
+              accessible label are untouched. */}
+          <div className="flow-stage" role="presentation">
           {/* THE FLEET COLUMN — FIRST in DOM and reading order: the glance
               path is story → whole site → phase detail, which is also the
               order a screen reader speaks, and the only sane order when the
@@ -938,15 +852,28 @@ export function FlowView({ client }: FlowViewProps) {
           <section className="flow-phase flow-phase--fleet" aria-label="Whole site">
             <h3 className="flow-phase-name">Whole site</h3>
             <div className="flow-dock">
-              <FlowBus grid={fleetGridSlot} battery={fleetBatterySlot} house={fleetHouseSlot} />
+              <FlowBus
+                grid={fleetGridSlot}
+                battery={fleetBatterySlot}
+                house={fleetHouseSlot}
+                connection={connection}
+              />
               <div className="flow-nodes">
-                <FlowNode name="Grid" parts={fleetGridFigureParts(fleet)} tone="grid" />
+                <FlowNode
+                  name="Grid"
+                  parts={fleetGridFigureParts(fleet)}
+                  tone="grid"
+                  extra={<FeedPort direction={fleetGridPortDirection(fleet)} />}
+                />
+                {/* The fleet battery carries no summed SoC — its slot stays
+                    reserved (an honest absence, never a guessed vessel). */}
                 <FlowNode name="Battery" parts={fleetBatteryFigureParts(fleet)} tone="battery" />
                 <FlowNode
                   name="Home"
                   parts={fleetHouseFigureParts(fleet)}
                   suffix={fleetHouseScope(fleet)}
                   tone="home"
+                  ambience={hearthLevel(fleet.houseW, scale)}
                 />
               </div>
             </div>
@@ -958,8 +885,10 @@ export function FlowView({ client }: FlowViewProps) {
               unit={unit}
               scale={scale}
               batteryPulse={commandedNotMoving.has(unit.unitId)}
+              connection={connection}
             />
           ))}
+          </div>
         </div>
       )}
 
@@ -994,10 +923,13 @@ function PhaseColumn({
   unit,
   scale,
   batteryPulse,
+  connection,
 }: {
   unit: FlowUnit;
   scale: number;
   batteryPulse: boolean;
+  /** The view's live-connection state — the light engine full-stops off "live". */
+  connection: "connecting" | "live" | "lost";
 }): ReactNode {
   const gridW = unit.gridPowerW;
   const batteryW = unit.batteryWatts;
@@ -1035,6 +967,11 @@ function PhaseColumn({
   const gridText = gridFlowText(gridW);
   const batteryText = batteryFlowText(batteryW);
   const houseText = houseFlowText(loadW);
+  // The port dims to "unknown" whenever the phase is down or the grid datum
+  // is absent — a disconnected socket never rotates a tick it cannot vouch
+  // for (the words keep their last-known values, dimmed, per the down rules).
+  const gridPortDirection: PortDirection =
+    down || gridDirection === "unknown" ? "unknown" : gridDirection;
   return (
     <section
       className={`flow-phase${down ? " flow-phase--down" : ""}`}
@@ -1044,16 +981,41 @@ function PhaseColumn({
     >
       <h3 className="flow-phase-name">{unit.unitId}</h3>
       <div className="flow-dock">
-        <FlowBus grid={gridSlot} battery={batterySlot} house={houseSlot} batteryPulse={batteryPulse} />
+        <FlowBus
+          grid={gridSlot}
+          battery={batterySlot}
+          house={houseSlot}
+          batteryPulse={batteryPulse}
+          connection={connection}
+        />
         <div className="flow-nodes">
-          <FlowNode name="Grid" parts={gridFigureParts(gridW)} tone="grid" />
+          <FlowNode
+            name="Grid"
+            parts={gridFigureParts(gridW)}
+            tone="grid"
+            extra={<FeedPort direction={gridPortDirection} />}
+          />
           <FlowNode
             name="Battery"
             parts={batteryFigureParts(batteryW)}
-            extra={unit.socPct === null ? null : <SocBand socPct={unit.socPct} />}
+            extra={
+              unit.socPct === null ? (
+                <SocBandUnavailable />
+              ) : (
+                // The meniscus may shimmer only while the phase is BOTH
+                // charging AND in contact — a downed cell's glint would claim
+                // a liveness the wire no longer carries.
+                <SocBand socPct={unit.socPct} charging={batteryDirection === "charge" && !down} />
+              )
+            }
             tone="battery"
           />
-          <FlowNode name="Home" parts={houseFigureParts(loadW)} tone="home" />
+          <FlowNode
+            name="Home"
+            parts={houseFigureParts(loadW)}
+            tone="home"
+            ambience={hearthLevel(loadW, scale)}
+          />
         </div>
       </div>
       {/* The lifecycle note anchors the column's foot — under the figures it

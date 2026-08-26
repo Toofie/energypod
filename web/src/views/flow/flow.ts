@@ -522,33 +522,48 @@ function gridIdleText(fleet: FleetFlow): string {
 /**
  * The night strategy's story when its projection says a window is running
  * (feature-detected: null projection, an idle phase, or a disabled adviser
- * never claims the story). The stand-by story names the honest trade (the
- * pods answer the house on their own); the fail-closed hold's guarantee is
+ * never claims the story). The stand-by story names the active stand-down's
+ * truth (the grid serves the heavy load; charging resumes below
+ * threshold − hysteresis); the fail-closed hold's guarantee is
  * the design's own wording: batteries neither drain nor cycle while the grid
- * meets the spike.
+ * meets the spike. A unit parked in true standby rides no submission and its
+ * silence is named beside every running story — the fleet sums cannot speak
+ * for a battery that takes no writes.
  */
 export function nightStory(night: NightChargeState, fleet: FleetFlow): string | null {
   if (!night.enabled || night.phase === "idle") {
     return null;
   }
+  // The true standby's clause (2026-08-26): any row parked by the per-phase
+  // demand rule is named in the operator's own list shape, whatever the fleet
+  // phase is doing around it.
+  const parked = night.units
+    .filter((unit) => unit.phase === "standing_by_parked")
+    .map((unit) => unit.unitId);
+  const parkedText = parked.length === 0 ? "" : ` ${parkedStoryClause(parked)}`;
   switch (night.phase) {
     case "pacing": {
       const charging = chargingClause(fleet, coversAllReporting(fleet, fleet.chargingPhases));
-      return `Night charging is running${charging === "" ? "" : ` — ${charging}`}${houseClause(fleet)}.`;
+      return `Night charging is running${charging === "" ? "" : ` — ${charging}`}${houseClause(fleet)}.${parkedText}`;
     }
     case "standing_by_on_demand": {
       const demand =
         night.demandW === null
           ? "the demand reading is not available"
           : `house demand is ${formatWatts(night.demandW)}`;
-      return `Night charging is standing by — ${demand}, so the batteries stand down at zero watts and the pods answer the house on their own until demand falls back.`;
+      // Same wire-figure rule as the tile: watts only from the projection.
+      const bound =
+        night.demandExitHysteresisW > 0 && night.demandThresholdW > night.demandExitHysteresisW
+          ? `below ${formatWatts(night.demandThresholdW - night.demandExitHysteresisW)}`
+          : "once demand falls back";
+      return `Night charging is standing by — ${demand}, so the grid serves the heavy load and charging resumes ${bound}.${parkedText}`;
     }
     case "holding_on_demand": {
       const demand =
         night.demandW === null
           ? "the demand reading is not available"
           : `house demand is ${formatWatts(night.demandW)}`;
-      return `Night charging is holding — ${demand}, so the batteries neither drain nor cycle while the grid meets the house.`;
+      return `Night charging is holding — ${demand}, so the batteries neither drain nor cycle while the grid meets the house.${parkedText}`;
     }
     case "complete":
       return "Night charging is complete — the batteries are full.";
@@ -557,6 +572,19 @@ export function nightStory(night: NightChargeState, fleet: FleetFlow): string | 
     default:
       return null;
   }
+}
+
+/**
+ * The parked batteries' own clause: who, and the exact silence they are in —
+ * neither charge nor discharge until their own good word falls back below the
+ * line. The verb agrees with the count; the names render the operator's way
+ * ("mid", "mid and rhs").
+ */
+function parkedStoryClause(unitIds: string[]): string {
+  const who = phaseListText(unitIds);
+  const is = unitIds.length === 1 ? "is" : "are";
+  const answers = unitIds.length === 1 ? "answers" : "answer";
+  return `${who} ${is} parked in standby — ${answers} neither charge nor discharge until house demand falls.`;
 }
 
 /**

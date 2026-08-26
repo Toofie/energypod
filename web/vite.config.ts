@@ -23,5 +23,19 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     css: false,
+    // The design loop's round backups (web/.design-shots/_backups/*/) hold
+    // frozen copies of earlier rounds' *.test.* files — loop backups are not
+    // suite members, and vitest otherwise collects them (stale-collection
+    // failures on a plain run). Setting `exclude` REPLACES vitest's defaults,
+    // so the defaults (vitest 3.2.4 defaultExclude) are mirrored verbatim
+    // below with the backup vault appended.
+    exclude: [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/cypress/**",
+      "**/.{idea,git,cache,output,temp}/**",
+      "**/{karma,rollup,webpack,vite,vitest,jest,ava,babel,nyc,cypress,tsup,build,eslint,prettier}.config.*",
+      "**/.design-shots/**",
+    ],
   },
 });

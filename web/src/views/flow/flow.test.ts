@@ -105,6 +105,7 @@ const night = (over: Partial<NightChargeState> = {}): NightChargeState => ({
   holdRateW: 0,
   demandScope: "fleet",
   demandThresholdW: 0,
+  demandExitHysteresisW: 0,
   demandW: null,
   demandEvidence: "good",
   heldIntentId: null,
@@ -389,12 +390,81 @@ describe("flow model — adviser stories", () => {
     );
   });
 
-  it("composes the night stand-by story: measured demand stands the batteries down", () => {
+  it("composes the night stand-by story: the grid serves the heavy load", () => {
     const fleet = fleetFlow(chargingUnits);
     expect(
-      nightStory(night({ active: true, phase: "standing_by_on_demand", demandW: 1900 }), fleet),
+      nightStory(
+        night({
+          active: true,
+          phase: "standing_by_on_demand",
+          demandW: 1900,
+          demandThresholdW: 1000,
+          demandExitHysteresisW: 200,
+        }),
+        fleet,
+      ),
     ).toBe(
-      "Night charging is standing by — house demand is 1,900 W, so the batteries stand down at zero watts and the pods answer the house on their own until demand falls back.",
+      "Night charging is standing by — house demand is 1,900 W, so the grid serves the heavy load and charging resumes below 800 W.",
+    );
+    // Without the wire's hysteresis figure the words fall back — never a
+    // client-side guessed resume number.
+    expect(
+      nightStory(night({ active: true, phase: "standing_by_on_demand", demandW: null }), fleet),
+    ).toBe(
+      "Night charging is standing by — the demand reading is not available, so the grid serves the heavy load and charging resumes once demand falls back.",
+    );
+  });
+
+  it("names a parked battery beside every running night story", () => {
+    const fleet = fleetFlow(chargingUnits);
+    // A parked unit rides no submission: whatever the fleet phase is doing
+    // around it, the story names the silence beside itself.
+    const parked = {
+      unitId: "mid",
+      socPct: 88,
+      phase: "standing_by_parked",
+      targetW: 0,
+      reason: "night_standby_parked",
+      targetSocPct: null,
+    } as const;
+    expect(nightStory(night({ active: true, phase: "pacing", units: [parked] }), fleet)).toBe(
+      "Night charging is running — All the batteries are charging 5,700 W in total, the house using 800 W. mid is parked in standby — answers neither charge nor discharge until house demand falls.",
+    );
+    expect(
+      nightStory(
+        night({
+          active: true,
+          phase: "standing_by_on_demand",
+          demandW: 1900,
+          demandThresholdW: 1000,
+          demandExitHysteresisW: 200,
+          units: [parked],
+        }),
+        fleet,
+      ),
+    ).toBe(
+      "Night charging is standing by — house demand is 1,900 W, so the grid serves the heavy load and charging resumes below 800 W. mid is parked in standby — answers neither charge nor discharge until house demand falls.",
+    );
+    expect(
+      nightStory(
+        night({ active: true, phase: "holding_on_demand", demandW: null, units: [parked] }),
+        fleet,
+      ),
+    ).toBe(
+      "Night charging is holding — the demand reading is not available, so the batteries neither drain nor cycle while the grid meets the house. mid is parked in standby — answers neither charge nor discharge until house demand falls.",
+    );
+    // Two batteries park together: one clause, plural verbs.
+    expect(
+      nightStory(
+        night({
+          active: true,
+          phase: "pacing",
+          units: [parked, { ...parked, unitId: "rhs" }],
+        }),
+        fleet,
+      ),
+    ).toBe(
+      "Night charging is running — All the batteries are charging 5,700 W in total, the house using 800 W. mid and rhs are parked in standby — answer neither charge nor discharge until house demand falls.",
     );
   });
 
