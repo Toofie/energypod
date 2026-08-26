@@ -376,6 +376,16 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-27 ~09:05 (EXCESS CHARGING GRADUATED — config revision 9, LIVE):
+  THE OPERATOR'S DIRECTIVE ("consume almost as much as possible"): the
+  trial cap `max_charge_from_export_w` 500→2500. The bound is
+  min(cap, export − export_headroom_margin_w=200), targeting the neediest
+  unit, so surplus flows to a battery up to the headroom itself with the
+  anti-import margin unchanged (live-proven within minutes of restart:
+  export 1729 W → commanded 1529 W on mid). Restore ritual after the
+  restart per the runbook: arm ×3, pvoutput enable (creds verified pre-
+  launch), excess enable. Commit: the yaml revision itself.
+
 - 2026-08-27 ~08:20 (PVOUTPUT POST HOLE — ROOT CAUSE MINE, FIXED AND
   VERIFIED): the operator noticed battery add-on feeds (their PVOutput view
   "B1/B2", our unit_slots lhs/rhs/mid → v7..v12) stopped publishing while

@@ -60,7 +60,7 @@
 #     `energypod db backup`/`restore` see one durable store, and is distinct
 #     from the observe-only deployment's database.
 schema_version: 1
-revision: 8
+revision: 9
 mode: write_enabled
 
 site:
@@ -401,7 +401,11 @@ storage:
 excess_charging:
   enabled: false            # suspended at boot; the trial STARTS at the toggle
   export_headroom_margin_w: 200
-  max_charge_from_export_w: 500   # the trial cap (graduation restores 2500)
+  max_charge_from_export_w: 2500  # THE GRADUATION (operator directive 2026-08-27:
+                            # "consume almost as much as possible"). The bound is
+                            # min(this cap, export − 200 W margin), so surplus flows
+                            # to the neediest battery up to the headroom itself; the
+                            # 200 W anti-import margin and hysteresis are unchanged
   export_telemetry_max_age_s: 3.0
   assumed_autonomous_charge_w: 300  # trial value: entry threshold 400 W < 500 W cap
   min_acceleration_w: 100
