@@ -3242,12 +3242,15 @@ def _night_surface_payload(
     night: dict[str, Any] | None = None,
     excess: dict[str, Any] | None = None,
     windows: list[list[str]] | None = None,
+    parking: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = _write_enabled_payload(database)
     payload["schedule"] = {"allowed_windows_local": windows or [["00:00", "20:00"]]}
     payload["night_charging"] = dict(night or {"timezone": "Australia/Brisbane"})
     if excess is not None:
         payload["excess_charging"] = excess
+    if parking is not None:
+        payload["parking"] = parking
     return payload
 
 
@@ -3259,9 +3262,12 @@ def compose_night(
     night: dict[str, Any] | None = None,
     excess: dict[str, Any] | None = None,
     windows: list[list[str]] | None = None,
+    parking: dict[str, Any] | None = None,
 ) -> Any:
     config = _validate(
-        _night_surface_payload(database, night=night, excess=excess, windows=windows)
+        _night_surface_payload(
+            database, night=night, excess=excess, windows=windows, parking=parking
+        )
     )
     return _compose_with(config, simulate=True, clock=clock, announce=announce)
 
@@ -3573,3 +3579,83 @@ async def test_supervision_drives_the_night_projection_and_publishes_state_event
     state = seen[0]["payload"]
     assert state["enabled"] is True
     assert state["enabled_origin"] == "config"
+
+
+# --- park_standby composition (operator directive 2026-08-26) ---------------------
+
+
+def _standby_night() -> dict[str, Any]:
+    """The commissioned TRUE STANDBY posture block."""
+    return {
+        "timezone": "Australia/Brisbane",
+        "enabled": True,
+        "demand_scope": "per_phase",
+        "demand_response": "park_standby",
+    }
+
+
+async def test_the_hold_posture_composes_no_park_ports_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """The default posture adds NOTHING: no ParkController port, no lifecycle
+    twins, no lease view — an isolated composition stays byte-identical to
+    v1, and no arm authority exists to grant."""
+    runtime = compose_night(tmp_path / "hold.sqlite3", clock=ScriptedClock())
+
+    adviser = runtime.night_adviser
+    assert adviser is not None
+    assert adviser._park_control is None
+    assert adviser._disarm_port is None
+    assert adviser._arm_port is None
+    assert adviser._standby_leases is None
+    await _shutdown_actors(runtime)
+
+
+async def test_park_standby_composes_the_park_ports_and_grants_the_arm_scope(
+    tmp_path: Path,
+) -> None:
+    """The SECOND composer exception (after Stage R §12/A10), fenced exactly
+    the same way: ONLY when ``demand_response == "park_standby"`` does the
+    night adviser gain the ParkController port, its stop-direction/re-arm
+    twins, and the lease view — with the arm scope its twins admit on.  No
+    other adviser gains anything from this precedent."""
+    runtime = compose_night(
+        tmp_path / "standby.sqlite3",
+        clock=ScriptedClock(),
+        night=_standby_night(),
+        parking={"max_lease_s": 25_200},
+    )
+
+    adviser = runtime.night_adviser
+    assert adviser is not None
+    assert adviser._park_control is not None
+    assert adviser._disarm_port is not None
+    assert adviser._arm_port is not None
+    assert adviser._standby_leases is not None
+
+    # Behavioral grant proof: the composed twin carries the granted principal
+    # — the act lands audited UNDER the adviser's identity with the night
+    # family's reason code riding the row.  (The simulate rig never starts
+    # the fleet task, so the actor's own answer is environment-dependent;
+    # the pin is the ATTRIBUTION.)
+    outcome = await adviser._disarm_port(unit_id="mid")
+    assert outcome["status"] in {"disarmed", "refused"}
+    rows = [
+        event for event in runtime.audit.recent(limit=32) if event.event_type == "unit_disarmed"
+    ]
+    assert rows and rows[-1].principal == "energypod:night-adviser"
+    assert "night_demand_standby" in rows[-1].reason_codes
+    await _shutdown_actors(runtime)
+
+
+def test_the_night_lifecycle_twins_are_never_routed() -> None:
+    """§12's fence holds for the second exception too: the twins are INTERNAL
+    composers — the REST surface exposes no night disarm/re-arm route."""
+    from pathlib import Path
+
+    from energypod.runtime.composition import build_runtime
+
+    rest = Path(build_runtime.__code__.co_filename).parent.joinpath("..", "api", "rest.py")
+    source = rest.resolve().read_text(encoding="utf-8")
+    assert "submit_night_disarm" not in source
+    assert "submit_night_rearm" not in source

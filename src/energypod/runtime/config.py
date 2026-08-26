@@ -699,6 +699,14 @@ class NightChargingConfig(_FrozenModel):
     # never silently free-run the fleet into autonomy drain.
     hold_rate_w: PositiveStrictInt = 100
     demand_scope: Literal["fleet", "per_phase"] = "fleet"
+    # The TRUE STANDBY posture selector (operator directive 2026-08-26):
+    # ``hold`` — the DEFAULT and exact v1 identity — answers measured demand
+    # with the active stand-down INTO THE HOLD and parks nothing; the ONE
+    # sanctioned exception, ``park_standby``, parks a heavy phase's OWN
+    # battery via the ParkController lease.  Its commissioning gates live on
+    # ``ControllerConfig`` (the scope gate here, the parking-block and
+    # lease-cap gates where the blocks they relate to live).
+    demand_response: Literal["hold", "park_standby"] = "hold"
     pacing: Literal["cap_first", "even"] = "cap_first"
     # REQUIRED iff ``pacing: even`` OR ``target_policy != full`` (key set
     # exactly the fleet units, validated on ControllerConfig); a stray map
@@ -960,9 +968,7 @@ class ForecastProvidersConfig(_FrozenModel):
         # (the shared default, or a family override above it) sets the floor.
         budgets: list[tuple[str, float]] = [("refresh_interval_s", self.refresh_interval_s)]
         if self.open_meteo is not None and self.open_meteo.refresh_interval_s is not None:
-            budgets.append(
-                ("open_meteo.refresh_interval_s", self.open_meteo.refresh_interval_s)
-            )
+            budgets.append(("open_meteo.refresh_interval_s", self.open_meteo.refresh_interval_s))
         if self.solcast is not None and self.solcast.refresh_interval_s is not None:
             budgets.append(("solcast.refresh_interval_s", self.solcast.refresh_interval_s))
         for budget_name, refresh_s in budgets:
@@ -1162,6 +1168,7 @@ class HealthWatchRecoveryConfig(_FrozenModel):
                 "night NEVER suffices (A16)"
             )
         return self
+
     # A6: mode auto requires a supervised-verification receipt (a
     # docs/evidence/ path, the §16 step-5 file) for EVERY fleet unit, or the
     # literal "excluded" for a unit that stays advise.  Shape validated here;
@@ -1170,9 +1177,7 @@ class HealthWatchRecoveryConfig(_FrozenModel):
 
     @field_validator("auto_receipts")
     @classmethod
-    def validate_receipt_values(
-        cls, values: dict[str, str] | None
-    ) -> dict[str, str] | None:
+    def validate_receipt_values(cls, values: dict[str, str] | None) -> dict[str, str] | None:
         if values is None:
             return values
         cleaned: dict[str, str] = {}
@@ -1655,9 +1660,7 @@ class PvOutputConfig(_FrozenModel):
 
     @field_validator("unit_slots")
     @classmethod
-    def validate_unit_slots(
-        cls, values: dict[str, tuple[str, str]]
-    ) -> dict[str, tuple[str, str]]:
+    def validate_unit_slots(cls, values: dict[str, tuple[str, str]]) -> dict[str, tuple[str, str]]:
         if not values:
             raise ValueError(
                 "pvoutput.unit_slots must name at least one unit (each commissioned unit "
@@ -1715,16 +1718,19 @@ class ControllerConfig(_FrozenModel):
     # declared last beside its siblings so its cross-block validator sees
     # the already-validated plant_history block the load baseline reads.
     forecast_providers: ForecastProvidersConfig | None = None
+    # DESIGN_POD_PARKING section 5.1: the parking commissioning block,
+    # declared beside its siblings so its commissioning validator sees the
+    # already-validated mode and policy the sanctioned write depends on —
+    # and declared BEFORE ``night_charging`` so the TRUE STANDBY posture's
+    # lease-cap gate (the night validator's cross-block arithmetic) reads it
+    # through ``info.data``.
+    parking: ParkingConfig | None = None
     # DESIGN_NIGHT_CHARGE §3.1 (B1) + DESIGN_NIGHT_CHARGE_V2 §6: declared
     # AFTER forecast_providers (V2) so its commissioning validator sees the
     # advisory stack a forecast posture requires, beside the already-
     # validated policy, timing, units, and the schedule block the PARTITION
     # grant is judged against.
     night_charging: NightChargingConfig | None = None
-    # DESIGN_POD_PARKING section 5.1: the parking commissioning block,
-    # declared last beside its siblings so its commissioning validator sees
-    # the already-validated mode and policy the sanctioned write depends on.
-    parking: ParkingConfig | None = None
     # The pvoutput.org reporting block, declared last beside its siblings so
     # its commissioning validator sees the already-validated units, timing,
     # and storage blocks the reporter's slot layout, freshness bound, and
@@ -2012,6 +2018,57 @@ class ControllerConfig(_FrozenModel):
                 "what keeps a load oscillating around the threshold from toggling "
                 "the rate every tick"
             )
+        # --- the TRUE STANDBY posture's own commissioning gates (operator
+        # directive 2026-08-26): per-phase independence IS the feature, and
+        # the posture composes the SANCTIONED standby write, so both facts
+        # are file-level refusals — never silent incapability.  All three
+        # gates live HERE because ``parking`` is declared before
+        # ``night_charging`` — the cross-block arithmetic reads it through
+        # ``info.data``.
+        if night.demand_response == "park_standby":
+            if night.demand_scope != "per_phase":
+                raise ValueError(
+                    "night_charging.demand_response 'park_standby' requires "
+                    "demand_scope 'per_phase': per-phase independence is the "
+                    "feature (only the heavy one parks) — a fleet-scope "
+                    "stand-down would park EVERY battery for one phase's spike.  "
+                    "Set night_charging.demand_scope: per_phase (one deliberate "
+                    "config revision, then restart)"
+                )
+            parking_block = values.get("parking")
+            if parking_block is None:
+                raise ValueError(
+                    "night_charging.demand_response 'park_standby' requires the "
+                    "parking block: the posture composes the ParkController's "
+                    "sanctioned standby write (vendor Standby 0x8000<-1 under a "
+                    "lease) and adds no transport path of its own — a site "
+                    "without the block is refused at boot, never silently "
+                    "incapable"
+                )
+            # The third gate, the lease cap: the engage lease spans the OPEN
+            # window plus 120 s of margin capped by ``max_lease_s``, so a cap
+            # under that arithmetic cannot carry a heavy phase through even
+            # one window without mid-window re-parks.  Cross-midnight aware:
+            # a window pair is ONE continuous span (22:00-04:00 is six hours,
+            # never two), so the bound is the LONGEST configured span.
+            longest_span_s = 0
+            for start, end in night.window_local:
+                start_s = int(start[:2]) * 3600 + int(start[3:5]) * 60
+                end_s = int(end[:2]) * 3600 + int(end[3:5]) * 60
+                longest_span_s = max(longest_span_s, (end_s - start_s) % 86400)
+            required_s = longest_span_s + 120
+            if parking_block.max_lease_s < required_s:
+                raise ValueError(
+                    "parking.max_lease_s must cover the longest night_charging "
+                    f"window plus the 120 s engage margin (longest span "
+                    f"{longest_span_s}s + 120 = {required_s}s, found "
+                    f"{parking_block.max_lease_s}): the standby engage lease spans the "
+                    "open window plus margin capped by this bound — raise "
+                    "parking.max_lease_s past the longest window span (one "
+                    "deliberate config revision, then restart): a cap under the "
+                    "arithmetic forces mid-window re-parks exactly when the "
+                    "heavy load least tolerates them"
+                )
         timing = values.get("timing")
         if timing is not None:
             poll_bound = timing.control_period_s + timing.essential_read_timeout_s
@@ -2146,10 +2203,7 @@ class ControllerConfig(_FrozenModel):
                     )
                     for window in tariff.windows
                 ],
-                [
-                    (_minute(end), _minute(night.midday_local))
-                    for _start, end in night.window_local
-                ],
+                [(_minute(end), _minute(night.midday_local)) for _start, end in night.window_local],
             )
             if not night_imports or not morning_exports:
                 raise ValueError(  # pragma: no cover - minute spans are non-empty
@@ -2288,6 +2342,12 @@ class ControllerConfig(_FrozenModel):
                 "parking requires a policy block: the park surface composes against the "
                 "commissioned control policy (armed/latched refusal checks and audit)"
             )
+        # The TRUE STANDBY posture's third commissioning gate — the
+        # ``max_lease_s``-vs-longest-night-window arithmetic — lives on
+        # ``validate_night_charging``: that validator runs AFTER this one only
+        # because the ``parking`` field is declared BEFORE ``night_charging``,
+        # which is exactly what lets its cross-block arithmetic read this
+        # block through ``info.data``.
         return parking
 
     @field_validator("pvoutput")
@@ -2679,13 +2739,13 @@ class ControllerConfig(_FrozenModel):
             and dict(night.assumed_capacity_wh) != dict(capacity)
         ):
             raise ValueError(
-                    "battery_calibration.traverse.assumed_capacity_wh must EQUAL "
-                    "night_charging.assumed_capacity_wh when that block carries one "
-                    f"({dict(sorted(capacity.items()))} != "
-                    f"{dict(sorted(night.assumed_capacity_wh.items()))}): one physical "
-                    "fact, two keys would drift (night-V2 §2.1's ruling, extended to "
-                    "this consumer)"
-                )
+                "battery_calibration.traverse.assumed_capacity_wh must EQUAL "
+                "night_charging.assumed_capacity_wh when that block carries one "
+                f"({dict(sorted(capacity.items()))} != "
+                f"{dict(sorted(night.assumed_capacity_wh.items()))}): one physical "
+                "fact, two keys would drift (night-V2 §2.1's ruling, extended to "
+                "this consumer)"
+            )
         # C8's SUM rule: the frozen-word stop must not cross the science
         # band's 5% edge even behind an undercounting meter — the refusal
         # names the whole sizing.
@@ -2757,9 +2817,8 @@ class ControllerConfig(_FrozenModel):
                         f"({start_wall}): the program may not bleed into the night "
                         "charge"
                     )
-                if (
-                    _wall_minute(calibration.top_anchor.taper_deadline_local)
-                    <= _wall_minute(_end_wall)
+                if _wall_minute(calibration.top_anchor.taper_deadline_local) <= _wall_minute(
+                    _end_wall
                 ):
                     raise ValueError(
                         "battery_calibration.top_anchor.taper_deadline_local must sit "

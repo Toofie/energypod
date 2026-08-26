@@ -1639,3 +1639,154 @@ async def test_the_disable_carrying_tick_is_the_last_night_event(api_domain: Any
     await rig.controller.observe_tick(await rig.adviser.tick())
     assert (await drain(subscription, 2)) == [], "nothing while disabled"
     await close_subscription(subscription)
+
+
+def _standby_rig(api_domain: Any, loads: Any) -> Any:
+    """The park_standby posture's real adviser + controller over the real
+    bus: per_phase scope, the selector on, and every park port faked — the
+    engagement publishes through the SAME single-writer projection."""
+    from tests.unit.test_health_watch_recovery import (
+        FakeArm as StandbyFakeArm,
+    )
+    from tests.unit.test_health_watch_recovery import (
+        FakeDisarm as StandbyFakeDisarm,
+    )
+    from tests.unit.test_health_watch_recovery import (
+        FakeParkControl as StandbyFakeParkControl,
+    )
+    from tests.unit.test_night_charge import (
+        DEFAULT_WINDOW as NIGHT_WINDOW,
+    )
+    from tests.unit.test_night_charge import (
+        FakeClock as NightClock,
+    )
+    from tests.unit.test_night_charge import (
+        FakeIntents as NightIntents,
+    )
+    from tests.unit.test_night_charge import (
+        FakeObservations as NightObservations,
+    )
+    from tests.unit.test_night_charge import (
+        FakeSubmit as NightSubmit,
+    )
+    from tests.unit.test_night_charge import (
+        make_fleet as make_night_fleet,
+    )
+    from tests.unit.test_night_charge import (
+        make_policy as make_night_policy,
+    )
+    from tests.unit.test_night_charge import (
+        make_settings as make_night_settings,
+    )
+
+    modules = _night_modules()
+    clock = NightClock()
+    bus = modules.events.EventBus(retention=64, queue_capacity=64, clock=clock)
+    controller = modules.night.NightChargeController(
+        pacing="cap_first",
+        rate_cap_w=2_500,
+        hold_rate_w=100,
+        demand_scope="per_phase",
+        demand_threshold_w=1_000,
+        demand_exit_hysteresis_w=200,
+        windows=NIGHT_WINDOW,
+        timezone="Australia/Brisbane",
+        posture="partition",
+        clock=clock,
+        acknowledged_partition=True,
+        config_enabled=True,
+        bus=bus,
+    )
+    observations = NightObservations(latest=make_night_fleet(api_domain, loads))
+    adviser = modules.night.NightChargeAdviser(
+        settings=make_night_settings(
+            modules.night,
+            demand_scope="per_phase",
+            demand_response="park_standby",
+            max_lease_s=25_200,
+        ),
+        policy=make_night_policy(api_domain),
+        clock=clock,
+        observations=observations,
+        intents=NightIntents(),
+        submit=NightSubmit(),
+        participation=controller.participation_verdict,
+        park_control=StandbyFakeParkControl(),
+        disarm=StandbyFakeDisarm(),
+        arm=StandbyFakeArm(),
+    )
+    controller.bind_adviser(adviser)
+    return SimpleNamespace(
+        controller=controller,
+        adviser=adviser,
+        observations=observations,
+        clock=clock,
+        bus=bus,
+    )
+
+
+async def test_a_park_engagement_publishes_through_reason_codes_with_zero_new_payload_keys(
+    api_domain: Any,
+) -> None:
+    """The engagement is a semantic change (active_unit_ids narrows and the
+    additive reason code lands), so it publishes — through the UNCHANGED
+    payload shape: zero new keys at the top level, zero new keys on the unit
+    rows.  The new vocabulary rides reason_codes alone."""
+    from tests.unit.test_night_charge import NOW as NIGHT_NOW
+
+    rig = _standby_rig(api_domain, {"lhs": 1_500.0, "mid": 100.0, "rhs": 100.0})
+    subscription = rig.bus.subscribe(after_sequence=None)
+
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    first = await drain(subscription, 4)
+    assert len(first) == 1
+    baseline = first[0]["payload"]
+    assert set(baseline) == {
+        "enabled",
+        "enabled_origin",
+        "acknowledged_partition",
+        "posture",
+        "active",
+        "phase",
+        "window",
+        "window_ends_at",
+        "window_ends_in_s",
+        "next_window_at",
+        "pacing",
+        "rate_cap_w",
+        "hold_rate_w",
+        "demand_scope",
+        "demand_threshold_w",
+        "demand_exit_hysteresis_w",
+        "demand_w",
+        "demand_evidence",
+        "held_intent_id",
+        "units",
+        "reason_codes",
+        "heartbeat",
+    }
+    row_keys = {key for unit in baseline["units"] for key in unit}
+
+    rig.clock.now = NIGHT_NOW + 1.5
+    for unit in rig.observations.latest.values():
+        object.__setattr__(unit, "captured_at_mono", rig.clock.now)
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    engaged = await drain(subscription, 4)
+
+    assert len(engaged) == 1, "the engagement is exactly one publication"
+    payload = engaged[0]["payload"]
+    assert set(payload) == set(baseline), "ZERO new payload keys"
+    assert "night_standby_parked" in payload["reason_codes"]
+    assert all(set(unit) == row_keys for unit in payload["units"]), "no new unit-row keys"
+
+    # The steady parked frame renders the truth without inventing vocabulary:
+    # the fleet phase stays v1 while the unit row names the stand-by.
+    rig.clock.now = NIGHT_NOW + 3.0
+    for unit in rig.observations.latest.values():
+        object.__setattr__(unit, "captured_at_mono", rig.clock.now)
+    await rig.controller.observe_tick(await rig.adviser.tick())
+    steady = rig.controller.state()
+    steady_rows = {unit["unit_id"]: (unit["phase"], unit["target_w"]) for unit in steady["units"]}
+    assert steady_rows["lhs"] == ("standing_by_parked", 0)
+    assert steady["phase"] == "pacing"
+    await close_subscription(subscription)

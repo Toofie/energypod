@@ -145,6 +145,8 @@ def derive_origin(principal: str) -> str:
     and no surface can ever fabricate an origin in either direction.
     """
     return ORIGIN_AUTOMATION if principal.startswith("energypod:") else ORIGIN_OPERATOR
+
+
 # The honest reason an adopted lease carries: the operator's own reason text
 # lived in the pending row's payload, which the audit row keeps only as a
 # fingerprint -- unknowable after the crash, never invented.
@@ -197,9 +199,7 @@ class ParkAuditPort(Protocol):
 
     async def append(self, event: AuditEvent) -> None: ...
 
-    async def recent(
-        self, *, limit: int, after_sequence: int | None = None
-    ) -> tuple[Any, ...]: ...
+    async def recent(self, *, limit: int, after_sequence: int | None = None) -> tuple[Any, ...]: ...
 
 
 class ParkEventBus(Protocol):
@@ -1054,9 +1054,7 @@ class ParkController:
             return None
         return pending_rows[latest]
 
-    async def _adopt_pending_resume(
-        self, unit_id: str, lease: ParkLease, now: datetime
-    ) -> bool:
+    async def _adopt_pending_resume(self, unit_id: str, lease: ParkLease, now: datetime) -> bool:
         """A5 (DESIGN_BATTERY_HEALTH_WATCH §7.2 step 5): adopt a
         crashed-then-verified RESUME as ours.
 
@@ -1217,11 +1215,7 @@ class ParkController:
                 if memory.foreign_mode_word != word:
                     memory.foreign_mode_word = word
                     memory.foreign_mode_first_seen = self._wall_now()
-                if (
-                    lease is not None
-                    and lease.parked
-                    and not lease.foreign_rewrite
-                ):
+                if lease is not None and lease.parked and not lease.foreign_rewrite:
                     # A foreign park OVER our unchanged lease: named, no write.
                     flagged = dataclass_replace(lease, foreign_rewrite=True)
                     await self._store.replace(
@@ -1293,9 +1287,7 @@ class ParkController:
 
     async def _close_observed_foreign(self, lease: ParkLease, *, request_id: str) -> None:
         """Close a parked lease on the observed word=0 -- no write, one alarm."""
-        closed = dataclass_replace(
-            lease, state=LEASE_CLOSED_FOREIGN, closed_at=self._wall_now()
-        )
+        closed = dataclass_replace(lease, state=LEASE_CLOSED_FOREIGN, closed_at=self._wall_now())
         await self._store.replace(
             self._row(
                 event_type="unit_resumed",
@@ -1385,9 +1377,7 @@ class ParkController:
                 ),
             }
         if lease is not None and lease.parked:
-            remaining_cap_s = max(
-                0, int((lease.rollover_cap_at() - now).total_seconds())
-            )
+            remaining_cap_s = max(0, int((lease.rollover_cap_at() - now).total_seconds()))
             state: dict[str, Any] = {
                 "parked": True,
                 "origin": derive_origin(lease.authorizer),
@@ -1448,6 +1438,23 @@ class ParkController:
     def parked_unit_ids(self) -> frozenset[str]:
         """The sync parked view advisers and readiness reasons read."""
         return frozenset(self._parked_mirror)
+
+    def parked_lease_views(self) -> dict[str, dict[str, Any]]:
+        """The sync lease-payload view beside ``parked_unit_ids`` (the night
+        TRUE STANDBY posture's read half, operator directive 2026-08-26).
+
+        ``{unit: ParkLease.to_payload()}`` for every still-parked lease in
+        the mirror — COPIES, one fresh dict per call, so a reader can never
+        mutate the ledger's rows.  The standby adviser reads THIS (adoption,
+        the never-fight reconciliation, the renewal sweep) and nothing else:
+        authorizer and reason ride the payload exactly as the durable row
+        carries them.
+        """
+        views: dict[str, dict[str, Any]] = {}
+        for unit_id, lease in self._lease_mirror.items():
+            if lease.parked:
+                views[unit_id] = dict(lease.to_payload())
+        return views
 
     def parked_facts(self, unit_id: str) -> dict[str, bool]:
         """The health classifier's parked inputs, from the lease mirror.
@@ -1533,18 +1540,14 @@ class ParkController:
         if isinstance(lease_s, bool) or type(lease_s) is not int:
             raise ValueError("lease_s must be an integer")
         if not MIN_LEASE_S <= lease_s <= max_lease_s:
-            raise ValueError(
-                f"lease_s must be between {MIN_LEASE_S} and {max_lease_s} seconds"
-            )
+            raise ValueError(f"lease_s must be between {MIN_LEASE_S} and {max_lease_s} seconds")
         return lease_s
 
     async def _unit_conflicts(self, unit_id: str) -> list[dict[str, str]]:
         """The arm-outcomes-shaped conflict causes, judged inside the lock."""
         causes: list[dict[str, str]] = []
         handle = self._actors.get(unit_id)
-        lifecycle = (
-            _enum_text(getattr(handle, "lifecycle", None)) if handle is not None else None
-        )
+        lifecycle = _enum_text(getattr(handle, "lifecycle", None)) if handle is not None else None
         if lifecycle in ("armed_idle", "active"):
             causes.append({"unit_id": unit_id, "cause": "unit_armed"})
         try:
@@ -1561,16 +1564,12 @@ class ParkController:
                 causes.append(
                     {
                         "unit_id": unit_id,
-                        "cause": (
-                            "latched_stop" if source == "emergency_stop" else "under_intent"
-                        ),
+                        "cause": ("latched_stop" if source == "emergency_stop" else "under_intent"),
                     }
                 )
                 break
         stop_units = self._latched_stop_unit_ids()
-        if unit_id in stop_units and not any(
-            item["cause"] == "latched_stop" for item in causes
-        ):
+        if unit_id in stop_units and not any(item["cause"] == "latched_stop" for item in causes):
             causes.append({"unit_id": unit_id, "cause": "latched_stop"})
         return causes
 
@@ -1621,9 +1620,7 @@ class ParkController:
         return {
             "origin": origin,
             "closed_at": (
-                None
-                if lease.closed_at is None
-                else lease.closed_at.astimezone(UTC).isoformat()
+                None if lease.closed_at is None else lease.closed_at.astimezone(UTC).isoformat()
             ),
         }
 

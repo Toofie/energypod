@@ -60,7 +60,7 @@
 #     `energypod db backup`/`restore` see one durable store, and is distinct
 #     from the observe-only deployment's database.
 schema_version: 1
-revision: 7
+revision: 8
 mode: write_enabled
 
 site:
@@ -573,7 +573,21 @@ night_charging:
                             # battery stays IN the submission at this trickle
                             # charge (zero discharge, autonomy overridden) —
                             # bad demand evidence holds here too, never free-runs
-  demand_scope: "fleet"     # fleet | per_phase (the graduation)
+  demand_scope: "per_phase" # fleet | per_phase — LIVE per the further operator
+                            # directive 2026-08-26 ("Only the heavy one"): each
+                            # battery judges ONLY its own LOAD CT
+  # THE COMMISSIONED DEMAND RESPONSE is `park_standby` (the FURTHER operator
+  # directive the same day): a MEASURED engage on ONE unit's own phase — its
+  # LOAD word > demand_threshold_w — disarms and PARKS THAT UNIT ALONE into
+  # vendor Standby via the ParkController lease (true standby: answers
+  # neither charge nor discharge; the grid serves the heavy load), and it
+  # resumes + re-arms when its word is GOOD below threshold - hysteresis.
+  # Bad evidence keeps today's trickle-hold arm below unchanged, and bad
+  # evidence DURING a standby KEEPS the park.  Validation refuses this value
+  # without per_phase scope and a parking.max_lease_s covering the longest
+  # window span + 120 s.  `hold` remains the default posture everywhere else.
+  demand_response: "park_standby"
+
   pacing: "cap_first"       # Docker parity; `even` is deadline-paced (needs the map)
   demand_telemetry_max_age_s: 3.0
   intent_ttl_s: 10.0
@@ -627,8 +641,10 @@ night_charging:
 # directions; parking is NOT electrical isolation (the pack stays connected
 # at full voltage).
 parking:
-  max_lease_s: 14400        # 4 h cap; lease_s ∈ [60, max_lease_s]
-  default_lease_s: 14400
+  max_lease_s: 25200        # 7 h — covers the 6 h night window + margin (the
+                            # night-standby wave's lease-cap gate; expiry stays
+                            # ALARM-ONLY for operator parks too, Resume anytime)
+  default_lease_s: 25200
 
 # ---------------------------------------------------------------------------
 # THE DAILY ENERGY SCORECARD (DESIGN_ENERGY_SCORECARD; advisory-only).

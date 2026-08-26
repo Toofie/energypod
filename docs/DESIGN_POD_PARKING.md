@@ -447,3 +447,41 @@ fork sides via hook; wedge end-to-end; `_WRITE_BLOCKS`; PQ gate
 byte-identical; architecture-fitness: generic path can never reach 0x8000) ·
 T-PARK-MCP (read fields; NO mutation tool; contract text) · T-PARK-CONSOLE
 (chip/countdown/banner/checklist/409-detail rendering; shots).
+
+## 13. Amendment 2026-08-26 — the SECOND composer exception (the night standby parks)
+
+Health-watch Stage R (`DESIGN_BATTERY_HEALTH_WATCH` §12) composed the FIRST
+exception to interactive-only parking: one automation principal driving
+park/resume through a bounded nightly recovery sequence. Operator directive
+2026-08-26 composes the SECOND: while `night_charging.demand_response:
+park_standby` is commissioned (validation requires `demand_scope:
+"per_phase"`, this block present, and `max_lease_s` covering the longest
+window span + 120 s), the principal `energypod:night-adviser` may drive park
+AND resume through an injected narrow port (park/resume only — the Stage R
+port shape verbatim) during the night window: a unit whose OWN load word
+exceeds the demand threshold is disarmed then parked on a window-sized lease
+inside the adviser's remove→submit gap (the disarm-first choreography exists
+precisely so PARK'S CONFLICT GUARD NEVER NEEDS WEAKENING), and resumed +
+re-armed when its word reads GOOD below threshold − hysteresis; every adviser
+exit path releases, and boot adoption touches only leases carrying OUR
+authorizer AND our lease reason (`night_demand_standby`).
+
+The fence wording is Stage R's grant, restated: the revision is scoped to
+EXACTLY that composition — one principal, one lease reason, values {0, 1},
+every parking guard intact (durable-first rows, single-flight epochs,
+synchronous write→readback→verify, alarm-only expiry). No other adviser,
+stage, timer, or surface gains ANYTHING from this precedent — parks remain
+interactive operator acts EVERYWHERE ELSE; REST park/resume stay `arm`-scope
+interactive routes; the amendment adds an INTERNAL composer, it opens no API;
+boot still never writes; lease expiry still never writes. Any future
+automation composer must survive its own panel.
+
+With that commissioning the LIVE block's caps rise: `max_lease_s` 14400 →
+25200, `default_lease_s` with it (7 h ≥ the 6 h window + margin). The raise
+is window coverage, not appetite: a lease sized to the whole window avoids
+mid-window resume/re-park blips (each a needless Normal-word exposure);
+renewal exists but should be vestigial at these sizes. The operator-visible
+consequence is honest and bounded — an OPERATOR park's expiry ALARM now
+sounds at 7 h instead of 4 h; expiry stays alarm-only (§1: no autonomous
+write, ever, including boot), Resume is always available, and anti-rollover
+(`parked_at + max_lease_s`) is untouched.

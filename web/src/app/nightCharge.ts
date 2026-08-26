@@ -33,14 +33,22 @@
  *   lifecycle guess.
  * - Fleet `phase`: idle | pacing | holding_on_demand | standing_by_on_demand |
  *   complete | skipped_full; per-unit adds `sitting_out` (claimed, disarmed, or
- *   no headroom this tick). `standing_by_on_demand` is THE demand response, the
- *   ACTIVE STAND-DOWN (2026-08-26): a MEASURED demand above the threshold holds
- *   each battery IN the submission at `hold_rate_w` — a renewed positive charge
- *   objective that overrides the pod's own CT-following autonomy — so the cheap
- *   off-peak grid serves the heavy load instead of stored solar discharging
- *   into it. The hold lifts below `threshold − hysteresis` and is withdrawn at
- *   window end like any held intent. `holding_on_demand`
- *   is the fail-closed FALLBACK ONLY: missing/bad/stale evidence holds at
+ *   no headroom this tick) and `standing_by_parked` (the TRUE STANDBY,
+ *   2026-08-26: under the per-phase park posture a unit whose OWN measured load
+ *   word exceeds the threshold is disarmed and PARKED through the ParkController
+ *   lease — vendor Standby 0x8000 — so it answers NEITHER charge NOR discharge,
+ *   and its row leaves the fleet submission entirely; the fleet vocabulary
+ *   itself never changes for a park). `standing_by_on_demand` is THE demand
+ *   response, the ACTIVE STAND-DOWN (2026-08-26): a MEASURED demand above the
+ *   threshold holds each battery IN the submission at `hold_rate_w` — a renewed
+ *   positive charge objective that overrides the pod's own CT-following
+ *   autonomy — so the cheap off-peak grid serves the heavy load instead of
+ *   stored solar discharging into it. The hold lifts below
+ *   `threshold − hysteresis` and is withdrawn at window end like any held
+ *   intent; a parked unit releases on the same good-word-below-exit arithmetic
+ *   and re-arms, and EVERY exit path (window close, disable) releases.
+ *   `holding_on_demand`
+ *   is the fail-closed FALLBACK ONLY, kept byte-for-byte from v1: missing/bad/stale evidence holds at
  *   `hold_rate_w` too (the no-cycling guarantee — standby answers measured demand,
  *   never missing data); the arms are named apart by phase and code. There is
  *   no `demand_response` selector on the wire.
@@ -54,7 +62,10 @@
  *   units_disarmed, yielding_to_higher_priority, disabled_by_config,
  *   disabled_by_runtime, night_acknowledgement_required, forecast_missing,
  *   forecast_stale, forecast_no_load_baseline, forecast_below_trust,
- *   window_closed_below_target.
+ *   window_closed_below_target, night_standby_parked,
+ *   night_standby_park_refused, night_standby_release_failed,
+ *   night_standby_release_unverified, night_standby_rearm_failed,
+ *   night_standby_adopted.
  * - Event `night_charge.state_changed`: published when the semantic tuple
  *   `(enabled, enabled_origin, acknowledged_partition, active, phase,
  *   active_unit_ids, demand_evidence, reason_codes, target_policy,
@@ -90,16 +101,22 @@ export const NIGHT_PHASES: readonly NightPhase[] = [
 ];
 
 /**
- * The per-unit phase vocabulary: the fleet list plus `sitting_out`.
- * `standing_by_on_demand` is the MEASURED-demand active stand-down (the unit
- * stays in the submission at its hold-rate target); `holding_on_demand` is the
- * fail-closed hold at `hold_rate_w` when the evidence word did not hold — same
- * positive rate, named apart by phase and code.
+ * The per-unit phase vocabulary: the fleet list plus `sitting_out` and
+ * `standing_by_parked`. `standing_by_on_demand` is the MEASURED-demand active
+ * stand-down (the unit stays in the submission at its hold-rate target);
+ * `holding_on_demand` is the fail-closed hold at `hold_rate_w` when the
+ * evidence word did not hold — same positive rate, named apart by phase and
+ * code. `standing_by_parked` is the TRUE STANDBY (2026-08-26): the unit's own
+ * circuit ran heavy, so it was disarmed and PARKED (vendor Standby via the
+ * ParkController lease) and rides NO submission — it answers nothing until its
+ * own good word falls below threshold − hysteresis; operator-parked units keep
+ * `sitting_out`, never this row.
  */
 export type NightUnitPhase =
   | "pacing"
   | "holding_on_demand"
   | "standing_by_on_demand"
+  | "standing_by_parked"
   | "skipped_full"
   | "complete"
   | "sitting_out";
@@ -109,6 +126,7 @@ export const NIGHT_UNIT_PHASES: readonly NightUnitPhase[] = [
   "pacing",
   "holding_on_demand",
   "standing_by_on_demand",
+  "standing_by_parked",
   "skipped_full",
   "complete",
   "sitting_out",
@@ -198,6 +216,17 @@ export const NIGHT_REASON_CODES: readonly string[] = [
   "forecast_no_load_baseline",
   "forecast_below_trust",
   "window_closed_below_target",
+  // The true standby's lifecycle (2026-08-26), additive: the per-phase park
+  // names every arm of its story loudly — the parked fact itself, the
+  // refused-park fallback, the release that would not land or would not
+  // verify, the re-arm the operator must finish by hand, and the boot-time
+  // adoption of our own pre-restart leases.
+  "night_standby_parked",
+  "night_standby_park_refused",
+  "night_standby_release_failed",
+  "night_standby_release_unverified",
+  "night_standby_rearm_failed",
+  "night_standby_adopted",
 ];
 
 // --- parsing -------------------------------------------------------------------
@@ -658,9 +687,11 @@ export function nextWindowInText(state: NightChargeState, nowMs: number): string
  * One unit's row in the pacing sentence and the per-battery list: its target
  * in plain words keyed on its own phase. A skipped-full battery says "full,
  * sitting out" — the design's own wording — a measured-demand stand-down says
- * "standing by at N W" (its zero-discharge hold named at its own rate), and a
- * claimed/disarmed/headroom sit-out says "sitting out" with its reason named
- * in the row.
+ * "standing by at N W" (its zero-discharge hold named at its own rate), a
+ * parked battery says "standing by (parked) — answers nothing" (the true
+ * standby names its own silence: it rides no submission and takes no writes),
+ * and a claimed/disarmed/headroom sit-out says "sitting out" with its reason
+ * named in the row.
  */
 export function nightUnitPhrase(unit: NightUnitState): string {
   switch (unit.phase) {
@@ -670,6 +701,8 @@ export function nightUnitPhrase(unit: NightUnitState): string {
       return `${unit.unitId} held at ${formatWatts(unit.targetW)}`;
     case "standing_by_on_demand":
       return `${unit.unitId} standing by at ${formatWatts(unit.targetW)}`;
+    case "standing_by_parked":
+      return `${unit.unitId} standing by (parked) — answers nothing`;
     case "skipped_full":
       return `${unit.unitId} full, sitting out`;
     case "complete":
@@ -694,6 +727,10 @@ export function nightUnitReasonText(reason: string): string {
       return "another request has this battery";
     case "target_reached":
       return "target reached";
+    case "night_standby_parked":
+      // The parked row's own cause: its OWN measured load word crossed the
+      // threshold (the fleet reading never parks a single battery).
+      return "its own circuit ran heavy";
     default:
       return reason;
   }
@@ -879,6 +916,20 @@ export function nightReasonText(state: NightChargeState): string {
       // §5.4/A5's honest close: lost window time is unrecoverable; the morning
       // notice on the tile carries the landing story until midday.
       return "The window closed below target — solar is finishing what it can.";
+    // --- The true standby's lifecycle (2026-08-26): each code names its own
+    // consequence and, where one exists, the operator's part in it. ---
+    case "night_standby_parked":
+      return "A battery whose own circuit ran heavy is parked in standby — it answers neither charge nor discharge until its load falls back.";
+    case "night_standby_park_refused":
+      return "The park was refused — the battery keeps charging at the trickle hold instead of standing by; repeated refusals hold it there for the window.";
+    case "night_standby_release_failed":
+      return "Releasing a parked battery failed — it stays parked while the controller retries; the grid still serves its load.";
+    case "night_standby_release_unverified":
+      return "The release could not be verified on the battery — it stays treated as parked for the rest of the window, and no further writes are attempted.";
+    case "night_standby_rearm_failed":
+      return "The battery left standby but could not be re-armed — arm it by hand; while disarmed it can neither charge nor discharge.";
+    case "night_standby_adopted":
+      return "The controller found a standby park it placed before the restart and owns it again — the battery stays parked until its load falls back.";
     default:
       return `Night charging is standing down (${code}).`;
   }
@@ -936,12 +987,34 @@ export function nightToggleStateText(state: NightChargeState): string {
  * active-flip pattern): phase changes announce, heartbeats never do. Null when
  * the transition is not worth the operator's ear (no change, or the first
  * frame of a session).
+ *
+ * The true standby's park rides NO fleet phase (the vocabulary is unchanged —
+ * a parked unit simply leaves the submission), so its transitions are carried
+ * by the UNIT rows: when the caller passes the previous and next projections'
+ * unit lists, a same-phase frame whose parked set moved announces too — the
+ * park landing ("...parked in standby — answers neither charge nor discharge
+ * until house demand falls") and the release ("left standby — charging
+ * resumes and the battery re-arms"). Without the rows the function stays
+ * exactly the fleet-phase announcer it always was.
  */
 export function nightPhaseAnnouncement(
   previous: NightPhase,
   next: NightPhase,
+  previousUnits: readonly NightUnitState[] = [],
+  nextUnits: readonly NightUnitState[] = [],
 ): string | null {
   if (previous === next) {
+    // The fleet phase held: only a moved parked set can be worth saying.
+    const before = parkedUnitIds(previousUnits);
+    const after = parkedUnitIds(nextUnits);
+    const gained = after.filter((id) => !before.includes(id));
+    if (gained.length > 0) {
+      return parkedAnnouncement(gained, true);
+    }
+    const lost = before.filter((id) => !after.includes(id));
+    if (lost.length > 0) {
+      return parkedAnnouncement(lost, false);
+    }
     return null;
   }
   switch (next) {
@@ -964,6 +1037,37 @@ export function nightPhaseAnnouncement(
       // are back on their own autonomy either way (non-renewal hand-back).
       return "Night charging stood down — the batteries are back on their own.";
   }
+}
+
+/** The parked rows' unit ids, in the frame's own order. */
+function parkedUnitIds(units: readonly NightUnitState[]): string[] {
+  return units.filter((unit) => unit.phase === "standing_by_parked").map((unit) => unit.unitId);
+}
+
+/**
+ * The park transition's sentence, named per battery the operator's way
+ * ("lhs", "lhs and rhs", "lhs, rhs and mid") with the verb agreeing: a park
+ * landing names the silence it buys (the grid serves the load, the battery
+ * answers neither direction); a release names the resume and the re-arm (the
+ * exit is not real until BOTH land).
+ */
+function parkedAnnouncement(ids: string[], parked: boolean): string {
+  const who = listNames(ids);
+  const is = ids.length === 1 ? "is" : "are";
+  const answers = ids.length === 1 ? "answers" : "answer";
+  if (parked) {
+    return `${who} ${is} parked in standby — ${answers} neither charge nor discharge until house demand falls.`;
+  }
+  const reArms = ids.length === 1 ? "re-arms" : "re-arm";
+  return `${who} left standby — charging resumes and the batter${ids.length === 1 ? "y" : "ies"} ${reArms}.`;
+}
+
+/** A name list in the operator's own spoken shape (never ["a","b"].join). */
+function listNames(ids: readonly string[]): string {
+  if (ids.length <= 1) {
+    return ids[0] ?? "";
+  }
+  return `${ids.slice(0, -1).join(", ")} and ${ids[ids.length - 1]!}`;
 }
 
 // --- V2 plain-language maps (the forecast-aware target's own tile lines) ------

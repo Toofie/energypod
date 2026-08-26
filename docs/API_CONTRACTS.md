@@ -1473,10 +1473,24 @@ non-participants. Full design and rationale: `docs/DESIGN_NIGHT_CHARGE.md`.
   class), submitted through the composition-internal facade twin `submit_night_intent` (the
   `submit_advisory_intent` pattern: source pinned, intent-id prefix `night-`, same
   audit/publication contract, never routed on REST or MCP) under the principal
-  `energypod:night-adviser` (observe + dispatch, non-interactive, site-bound). The night
+  `energypod:night-adviser` (observe + dispatch, non-interactive, site-bound;
+  under `demand_response: park_standby` — the operator directive 2026-08-26 —
+  the principal carries `arm` as well, and ONLY under that posture: the SECOND
+  composer exception after health-watch Stage R, fenced identically —
+  DESIGN_POD_PARKING's amendment block). The night
   adviser ALWAYS yields per unit to a live SCHEDULE claim (no opt-out flag; the published fact
   beats the opportunist — the schedules-stay-day recommendation, which this feature is the
   night half of).
+- **The standby twins (composition-only internals — operator directive
+  2026-08-26).** Under `park_standby` the adviser drives its disarm/re-arm
+  acts through TWO more internal twins, `submit_night_disarm(unit_ids, ...)`
+  and `submit_night_rearm(unit_id, ...)` — the health-watch facade-twin
+  pattern: `_admit(principal, "arm")`, audited with the night reasons, the
+  unaudited-arm compensation disarm kept, NEVER routed on REST or MCP. The
+  foreign-objective takeover rule rides VERBATIM: a foreign objective seen
+  during our park makes the next arm OPERATOR-only, surfacing loudly as
+  `night_standby_rearm_failed` — the unit stays DISARMED (cannot discharge:
+  safe) until a human arms it.
 - **The demand rule — LOAD words, never grid words (the pinned correctness catch).** While
   `demand_w` exceeds `demand_threshold_w` (default 1000 W), every eligible unit STANDS DOWN
   INTO ITS HOLD (the operator's directive, 2026-08-26: on a big night load the batteries
@@ -1557,18 +1571,40 @@ non-participants. Full design and rationale: `docs/DESIGN_NIGHT_CHARGE.md`.
   states the resume bound in watts instead of fabricating it). Fleet `phase`: `idle | pacing |
   holding_on_demand | standing_by_on_demand | complete | skipped_full` (`holding_on_demand`
   is the fail-closed evidence hold alone; `standing_by_on_demand` is the measured-demand
-  active stand-down into the hold); per-unit adds `sitting_out`. Reason
+  active stand-down into the hold); per-unit adds `sitting_out` and — operator directive
+  2026-08-26, `demand_response: park_standby` only (DESIGN_NIGHT_CHARGE §2.4) —
+  `standing_by_parked`: the unit whose OWN load word engaged
+  (> `demand_threshold_w`), disarmed then ACTIVE-PARKED through the ParkController lease
+  inside the tick's remove→submit gap (ordering pinned: submission LAST; every unit always
+  exactly one of held-in-submission / parked), rendered
+  `{unit_id, soc_pct, phase: "standing_by_parked", target_w: 0, reason: "night_standby_parked"}`
+  and absent from the submission; released — resumed, re-armed, rejoined at full rate — when
+  its own word reads GOOD below `demand_threshold_w − demand_exit_hysteresis_w`; bad evidence
+  DURING standby keeps the park. Reason
   vocabulary (ONE): `outside_window, window_open, on_plan, deadline_at_risk,
   demand_above_threshold, demand_below_exit, demand_evidence_missing, demand_evidence_bad,
   demand_evidence_stale, at_ceiling, no_charge_headroom, target_reached,
   no_eligible_units, units_disarmed, unit_parked, yielding_to_higher_priority,
   disabled_by_config, disabled_by_runtime, night_acknowledgement_required`
   (`unit_parked` — 2026-08-24, DESIGN_POD_PARKING §3 — joins additively and outranks
-  `units_disarmed` for a parked unit: resume, not arm, is the true next step). Bus
+  `units_disarmed` for a parked unit: resume, not arm, is the true next step), joined by
+  SIX additive codes — operator directive 2026-08-26, `park_standby` only:
+  `night_standby_parked` (the engage landed; unit excluded from the submission),
+  `night_standby_park_refused` (conflict/write refusal — the unit re-includes at
+  `hold_rate_w` this tick; ≥ 3 consecutive latch the window's trickle-hold),
+  `night_standby_release_failed` (release write failing — retried idempotently, loud each
+  failing tick), `night_standby_release_unverified` (terminal for the window),
+  `night_standby_rearm_failed` (the takeover rule's loud surface — the operator arms
+  manually), `night_standby_adopted` (boot adoption of OUR authorizer+reason leases). Bus
   `night_charge.state_changed`: published on the semantic tuple `(enabled, enabled_origin,
   acknowledged_partition, active, phase, active_unit_ids, demand_evidence, reason_codes)`
   — watts/SOC ride but never trigger — with the 30 s heartbeat while enabled and NOTHING
-  while disabled (the excess `excess_adviser.state_changed` mechanics verbatim).
+  while disabled (the excess `excess_adviser.state_changed` mechanics verbatim). The
+  projection and event PAYLOAD KEY SETS are UNCHANGED by the operator directive
+  2026-08-26: `units[]` rows keep `{unit_id, soc_pct, phase, target_w, reason}` and the
+  envelope keeps every key pinned above — the amendment is ADDITIVE VOCABULARY ONLY (one
+  unit phase + six reason words inside the existing keys), and the event-contract key-set
+  equality test passes untouched.
 - **Honesty pins.** Charge-only window — the strategy never discharges, and the no-cycling
   guarantee is bounded by the TTL/watchdog hand-back gap, stated as such. The off-peak
   import cost is the operator's tariff question (`energy_scorecard.tariff`); the scorecard

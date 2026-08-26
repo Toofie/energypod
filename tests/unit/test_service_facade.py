@@ -4354,6 +4354,144 @@ async def test_submit_night_intent_pins_source_prefix_and_per_unit_watts(api: An
     assert published[0]["payload"]["watts_by_unit"] == {"pod-a": 2_500, "pod-b": 100}
 
 
+# --- park_standby §3: the night lifecycle twins ----------------------------------
+#
+# The engage choreography needs a STOP-direction twin and the release needs
+# its ONE bounded re-arm — the health-watch pattern (§7.2/§7.4) cloned under
+# the night adviser's own principal: composition-only wiring, `_admit` on
+# "arm", audited like the operator's own acts, the unaudited-arm compensation
+# disarm kept verbatim, and the foreign-objective takeover rule untouched (a
+# foreign objective seen during our park makes the next arm OPERATOR-only and
+# surfaces loud upstream as `night_standby_rearm_failed`; the unit stays
+# disarmed = cannot discharge = safe).
+
+
+def night_principal() -> Any:
+    """The composed adviser principal: non-interactive, arm-granted."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        subject="energypod:night-adviser",
+        scopes=frozenset({"observe", "dispatch", "arm"}),
+        interactive=False,
+        site_id=SITE_ID,
+    )
+
+
+async def test_submit_night_disarm_audits_under_the_night_principal_and_publishes(
+    api: Any,
+) -> None:
+    """The stop-direction half of the choreography: an ordinary audited
+    disarm under the composed principal — so PARK'S CONFLICT GUARD NEVER
+    NEEDS WEAKENING — with the same publication contract as the operator's."""
+    rig = make_rig(api)
+
+    result = await rig.facade.submit_night_disarm(
+        unit_ids=["pod-a"],
+        principal=night_principal(),
+        request_id="night-standby:pod-a:2026-08-27",
+    )
+
+    assert result["units"] == [{"unit_id": "pod-a", "status": "disarmed", "reason": "disarmed"}]
+    assert result["degraded"] == []
+    rows = [event for event in rig.audit.appended if event.event_type == "unit_disarmed"]
+    assert len(rows) == 1
+    assert rows[0].principal == "energypod:night-adviser"
+    assert rows[0].result == "disarmed"
+    assert rows[0].reason_codes == ("night_demand_standby", "disarmed")
+    assert rows[0].unit_id == "pod-a"
+    published = [body for body in rig.bus.published if body["type"] == "unit.disarmed"]
+    assert len(published) == 1
+    assert published[0]["payload"]["principal"] == "energypod:night-adviser"
+    assert published[0]["payload"]["units"][0]["status"] == "disarmed"
+
+
+async def test_the_night_twins_admit_on_arm_scope_not_interactivity(api: Any) -> None:
+    """The caller is AUTOMATION: the twins gate on the arm scope alone — an
+    unprivileged principal refuses, the non-interactive adviser passes."""
+    rig = make_rig(api)
+
+    with pytest.raises(PermissionError, match="arm"):
+        await rig.facade.submit_night_disarm(unit_ids=["pod-a"], principal=VIEWER)
+    with pytest.raises(PermissionError, match="arm"):
+        await rig.facade.submit_night_rearm(unit_id="pod-a", principal=VIEWER)
+
+    await rig.facade.submit_night_disarm(unit_ids=["pod-a"], principal=night_principal())
+    assert "disarm:pod-a" in rig.history
+
+
+async def test_submit_night_rearm_is_one_unit_never_takeover(api: Any) -> None:
+    """The bounded verification re-arm: exactly one unit, NEVER the takeover
+    acknowledgement — a foreign objective makes the next arm the operator's,
+    forever — audited with the bounded facts riding the payload."""
+    rig = make_rig(api)
+
+    # A multi-unit ask can never pass the bounded twin.  Under the verbatim
+    # health clone the canonical-unit gate refuses the non-string names
+    # FIRST (the count guard behind it stays defense-in-depth, unreachable
+    # through a singular ``unit_id``); either way no actor is touched.
+    with pytest.raises(ValueError):
+        await rig.facade.submit_night_rearm(unit_id=["pod-a", "pod-b"], principal=night_principal())
+    assert "arm:pod-a" not in rig.history and "arm:pod-b" not in rig.history, (
+        "a two-unit ask never reaches an actor"
+    )
+
+    result = await rig.facade.submit_night_rearm(
+        unit_id="pod-a",
+        principal=night_principal(),
+        request_id="night-standby:pod-a:2026-08-27",
+    )
+    assert result == {"unit_id": "pod-a", "status": "armed", "reason": "armed"}
+    assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.ARMED_IDLE
+    rows = [event for event in rig.audit.appended if event.event_type == "unit_armed"]
+    assert len(rows) == 1
+    assert rows[0].principal == "energypod:night-adviser"
+    assert rows[0].reason_codes == ("night_standby_verification_rearm", "armed")
+    assert rows[0].payload["bounded"] is True
+    assert rows[0].payload["takeover_acknowledged"] is False
+    published = [body for body in rig.bus.published if body["type"] == "unit.armed"]
+    assert len(published) == 1
+
+
+async def test_an_unaudited_night_arm_compensates_with_a_disarm(api: Any) -> None:
+    """Impl-10 verbatim: an arm whose durable row cannot land cannot stand —
+    the compensation disarm returns the pod to the safe side before the
+    error reaches the adviser (which reads it as the loud rung)."""
+    rig = make_rig(api)
+    rig.audit.failing = True
+
+    with pytest.raises(OSError, match="audit store unavailable"):
+        await rig.facade.submit_night_rearm(unit_id="pod-a", principal=night_principal())
+
+    assert rig.history.index("arm:pod-a") < rig.history.index("disarm:pod-a"), (
+        "armed, then stood back down"
+    )
+    assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.DISARMED
+
+
+async def test_a_foreign_objective_refuses_the_night_rearm_operators_only(
+    api: Any,
+) -> None:
+    """The takeover rule preserved through the night twin: a foreign writer
+    latched during OUR park means this surface answers the pinned latched
+    refusal — the unit stays disarmed and the adviser names the rung loudly
+    (`night_standby_rearm_failed`); only the operator's acknowledged arm
+    clears it."""
+    rig = make_rig(
+        api,
+        units={"pod-a": {"inhibit_latched": True, "inhibit_reason": "external_writer"}},
+    )
+
+    result = await rig.facade.submit_night_rearm(unit_id="pod-a", principal=night_principal())
+
+    assert result["status"] == "refused"
+    assert result["reason"] == "inhibit_latched"
+    assert result["inhibit_reason"] == "external_writer"
+    assert rig.handles["pod-a"].lifecycle is api.UnitLifecycle.DISARMED, "never armed past a latch"
+    rows = [event for event in rig.audit.appended if event.event_type == "unit_armed"]
+    assert rows[0].result == "refused"
+
+
 # --- DESIGN_SCHEDULES §5 B3: the schedule facade surface ------------------------
 
 

@@ -1773,14 +1773,24 @@ export const NIGHT_PHASE_VALUES: readonly string[] = [
   "idle",
   "pacing",
   "holding_on_demand",
+  // The active stand-down (2026-08-26) rides the FLEET phase too; the list
+  // below it was missing this word since the stand-down landed — completed.
+  "standing_by_on_demand",
   "complete",
   "skipped_full",
 ];
 
-/** The per-unit phase vocabulary: the fleet list plus `sitting_out`. */
+/**
+ * The per-unit phase vocabulary: the fleet list plus `sitting_out` and the
+ * true standby's own row (`standing_by_parked`, 2026-08-26 — a heavy OWN
+ * circuit parks that battery through the ParkController lease and it rides no
+ * submission at all).
+ */
 export const NIGHT_UNIT_PHASE_VALUES: readonly string[] = [
   "pacing",
   "holding_on_demand",
+  "standing_by_on_demand",
+  "standing_by_parked",
   "skipped_full",
   "complete",
   "sitting_out",
@@ -1821,6 +1831,16 @@ export const NIGHT_REASON_CODE_VALUES: readonly string[] = [
   "forecast_no_load_baseline",
   "forecast_below_trust",
   "window_closed_below_target",
+  // The true standby's lifecycle (2026-08-26), additive, in the backend's own
+  // declaration order: the parked fact, the refused park, the release that
+  // would not land or verify, the re-arm only an operator can finish, and the
+  // boot-time adoption of our own pre-restart leases.
+  "night_standby_parked",
+  "night_standby_park_refused",
+  "night_standby_release_failed",
+  "night_standby_release_unverified",
+  "night_standby_rearm_failed",
+  "night_standby_adopted",
 ];
 
 /** V2 §3.1's three-state `target_policy` key (absent = `full` = v1 identity). */

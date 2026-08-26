@@ -1323,19 +1323,127 @@ def test_night_hold_rate_must_be_a_positive_charge_below_the_cap() -> None:
     _assert_night_rule(_night_config(hold_rate_w=2500), message_contains="hold_rate_w")
 
 
-def test_the_night_block_has_no_demand_posture_selector() -> None:
-    """The operator's no-compatibility directive: the measured stand-down is
-    THE demand behavior.  A `demand_response` key is refused as an UNKNOWN
-    key — no selector, no default, no deprecated alias."""
+def _standby_config(*, parking: bool | dict[str, Any] = True, **overrides: Any) -> dict[str, Any]:
+    """The commissioned TRUE STANDBY posture (operator directive 2026-08-26)
+    against the partition-granted schedule; ``parking`` toggles the sibling
+    block whose lease budget the posture spends — ``False`` removes it, a
+    dict shapes its lease budget."""
+    night_overrides: dict[str, Any] = {
+        "demand_scope": "per_phase",
+        "demand_response": "park_standby",
+    }
+    night_overrides.update(overrides)
+    payload = _night_config(**night_overrides)
+    if isinstance(parking, dict):
+        payload["parking"] = dict(parking)
+    elif parking:
+        payload["parking"] = {"max_lease_s": 25_200}
+    return payload
+
+
+def _assert_standby_rule(payload: dict[str, Any], *, message_contains: str) -> ValidationError:
+    """Refuse the posture by its OWN commissioning rule, never by key
+    ignorance.  Tolerant of WHERE the refusal lives: ControllerConfig
+    validates ``night_charging`` BEFORE ``parking``, so a cross-block rule
+    (the lease-cap arithmetic) may surface under either location."""
     with pytest.raises(ValidationError) as caught:
-        _validate(_night_config(demand_response="hold"))
+        _validate(payload)
+    error = caught.value
+    relevant = [
+        item
+        for item in error.errors()
+        if item["loc"] and item["loc"][0] in ("night_charging", "parking")
+    ]
+    assert relevant, f"expected a night/parking commissioning error, got {error.errors()!r}"
+    assert all(item["type"] != "extra_forbidden" for item in relevant), (
+        "demand_response is a known key refused by its commissioning rule, "
+        "not rejected as an unknown key"
+    )
+    assert message_contains.lower() in str(error).lower()
+    return error
+
+
+def test_the_demand_posture_defaults_to_the_hold_identity() -> None:
+    """V1 identity is preserved by default: an unconfigured selector means
+    the measured stand-down stays THE demand behavior and nothing can ever
+    be parked by the night layer."""
+    parsed = _validate(_night_config())
+    assert parsed.night_charging is not None
+    assert parsed.night_charging.demand_response == "hold"
+
+
+def test_park_standby_requires_per_phase_scope() -> None:
+    """Per-phase independence IS the feature ("Only the heavy one"): a
+    fleet-scope stand-down parks EVERY battery for one phase's spike — the
+    posture refuses to commission without its own scope."""
+    payload = _standby_config(parking=False)
+    del payload["night_charging"]["demand_scope"]  # the fleet default applies
+    _assert_standby_rule(payload, message_contains="per_phase")
+
+
+def test_park_standby_requires_a_parking_block() -> None:
+    """The posture composes the SANCTIONED standby write; without a parking
+    block there is nothing to compose — refuse at boot, never run silently
+    incapable."""
+    _assert_standby_rule(_standby_config(parking=False), message_contains="parking")
+
+
+def test_park_standby_requires_a_lease_cap_past_the_longest_window() -> None:
+    """The engage lease spans the open window plus 120 s of margin, capped
+    by ``max_lease_s`` — a cap under that arithmetic cannot carry the
+    posture through even one window without mid-window re-parks."""
+    _assert_standby_rule(
+        _standby_config(parking={"max_lease_s": 14_400}),  # < 21_600 + 120
+        message_contains="max_lease_s",
+    )
+
+    parsed = _validate(_standby_config())
+    assert parsed.night_charging.demand_response == "park_standby"
+    assert parsed.parking is not None
+    assert parsed.parking.max_lease_s == 25_200, "the live shape commissions"
+
+
+@pytest.mark.parametrize(
+    ("window_local", "schedule"),
+    [
+        ([["00:00", "06:00"]], [["00:00", "20:00"]]),
+        ([["22:00", "04:00"]], [["20:00", "06:00"]]),
+    ],
+)
+def test_the_lease_cap_arithmetic_is_cross_midnight_aware(
+    window_local: list[list[str]], schedule: list[list[str]]
+) -> None:
+    """Both spellings are ONE continuous six-hour window (never two), so
+    both need ≥ 21_600 + 120 — missing by one watt-second refuses, seven
+    hours commissions."""
+
+    def config(max_lease_s: int) -> dict[str, Any]:
+        payload = _standby_config(parking={"max_lease_s": max_lease_s})
+        payload["night_charging"]["window_local"] = window_local
+        payload["schedule"] = {"allowed_windows_local": schedule}
+        return payload
+
+    _assert_standby_rule(config(21_719), message_contains="max_lease_s")
+
+    parsed = _validate(config(25_200))
+    assert parsed.parking is not None
+    assert parsed.parking.max_lease_s == 25_200
+
+
+def test_no_third_demand_posture_exists() -> None:
+    """Exactly two postures exist: hold and park_standby.  Anything else is
+    a literal-value refusal — a KNOWN key carrying an UNKNOWN value — never
+    a silently-held third behavior."""
+    with pytest.raises(ValidationError) as caught:
+        _validate(_standby_config(demand_response="coast"))
     night_errors = [
         item for item in caught.value.errors() if item["loc"] and item["loc"][0] == "night_charging"
     ]
     assert night_errors, f"expected a night_charging error, got {caught.value.errors()!r}"
-    assert all(item["type"] == "extra_forbidden" for item in night_errors), (
-        "the selector is gone entirely: an unknown key, never a known-but-refused one"
+    assert all(item["type"] == "literal_error" for item in night_errors), (
+        f"a known key with an unknown value, got {caught.value.errors()!r}"
     )
+    assert "coast" in str(caught.value)
 
 
 def test_night_hysteresis_must_sit_strictly_inside_the_threshold() -> None:
@@ -1489,9 +1597,7 @@ def test_a_forecast_posture_requires_the_declared_advisory_stack() -> None:
     """Section 6: the PV source, the enabled provider block, and the load
     baseline are prerequisites of any forecast posture — each refusal names
     the missing block by path."""
-    _assert_night_rule(
-        _night_v2_config(without=("solcast",)), message_contains="PV forecast"
-    )
+    _assert_night_rule(_night_v2_config(without=("solcast",)), message_contains="PV forecast")
     _assert_night_rule(
         _night_v2_config(without=("load_baseline",)), message_contains="load_baseline"
     )
@@ -1539,9 +1645,7 @@ def test_the_trust_block_bounds_refuse_symmetric_or_non_positive_bias() -> None:
         "max_underforecast_bias_pct": 15.0,
         "min_regime_days": 3,
     }
-    _assert_night_rule(
-        _night_v2_config(trust=symmetric), message_contains="overforecast"
-    )
+    _assert_night_rule(_night_v2_config(trust=symmetric), message_contains="overforecast")
     inverted = {**symmetric, "max_overforecast_bias_pct": 25.0}
     _assert_night_rule(_night_v2_config(trust=inverted), message_contains="overforecast")
     zero_tolerance = {**symmetric, "tolerance_pct": 0.0, "max_overforecast_bias_pct": 10.0}
@@ -1555,9 +1659,7 @@ def test_forecast_act_is_gated_on_tariff_keys_and_the_export_spread() -> None:
     the export FIT STRICTLY below the off-peak import — the legacy 44-52 c
     QLD FiT against ~12 c off-peak loses ~35 c per stored kWh and the file
     refuses to automate a loss."""
-    no_tariff = _assert_night_rule(
-        _night_v2_config("forecast_act"), message_contains="tariff"
-    )
+    no_tariff = _assert_night_rule(_night_v2_config("forecast_act"), message_contains="tariff")
     assert "forecast_providers.tariff" in str(no_tariff), "the refusal names the block by path"
 
     legacy_fit = _night_v2_config(

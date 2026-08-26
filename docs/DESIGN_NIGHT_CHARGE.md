@@ -11,6 +11,16 @@ floor), the night-writer detector contract (API_CONTRACTS "Night-writer
 detector" — the known −2500 W × 3 nightly Docker writer), and
 `docs/DESIGN_ENERGY_SCORECARD.md` (the evidence family the demand rule reads).
 
+AMENDED 2026-08-26, same day (operator directive 2026-08-26): the demand rule
+gains a SECOND commissioned response — `demand_response: park_standby` (§2.4)
+— superseding the trickle-only posture for MEASURED engages: a unit whose OWN
+load word exceeds 1,000 W inside the window is DISARMED then ACTIVE-PARKED
+(vendor Standby `0x8000 ← 1` via the ParkController lease — mid's manual park
+proved the act live), and released + re-armed when its word reads GOOD below
+800 W. `hold` remains the DEFAULT posture, and the fail-closed evidence arm
+is unchanged byte-for-byte. The matching amendments: API_CONTRACTS
+"Off-peak night charge" and `docs/DESIGN_POD_PARKING.md` §13.
+
 This document is DESIGN ONLY. It touches no `src/`, `tests/`, `config/`, or
 `web/` file. The backend agent follows §7's ordered plan (a second backend
 agent is finishing the night-writer detector in `src/` — B1 does not start
@@ -50,7 +60,7 @@ The operator's words, and the mechanism each becomes:
 |---|---|
 | "force-charges the batteries at 2.5 kW all the way up to full each night between midnight and 6 a.m." | Per-battery CHARGE intents in a commissioned civil-time window (`window_local`, default `00:00–06:00` site time), each unit's rate ≤ `rate_cap_w` (default 2500, the per-battery static cap — the ask sits exactly at it). "Full" is the SOC charge ceiling `policy.max_soc_pct` (95%), not 100%. |
 | "If demand goes high, like over 1,000 W, it drops to a very low charge rate" | The DEMAND RULE (§2.4): while measured site demand exceeds `demand_threshold_w` (default 1000), every participating battery STANDS DOWN — zero-watt non-participation, back on its own autonomy. |
-| "I prefer it to move into standby mode, then return to an active or enabled state after the night charging period or when demand subsides" (the operator's ruling, 2026-08-24 — this is THE behavior, no selector) | The MEASURED demand stand-down (§2.4): excluded from the submission; the TTL lapse plus watchdog hand the pod back to its own autonomy; charging resumes when demand falls below threshold − hysteresis OR the window ends. Fail-closed is the safety doctrine, not a posture: bad evidence HOLDS at `hold_rate_w` (the evidence-failure fallback alone) — the stand-down answers measured demand, never missing data. |
+| "I prefer it to move into standby mode, then return to an active or enabled state after the night charging period or when demand subsides" (the operator's ruling, 2026-08-24 — this is THE behavior, no selector) | The MEASURED demand stand-down (§2.4): excluded from the submission; the TTL lapse plus watchdog hand the pod back to its own autonomy; charging resumes when demand falls below threshold − hysteresis OR the window ends. Fail-closed is the safety doctrine, not a posture: bad evidence HOLDS at `hold_rate_w` (the evidence-failure fallback alone) — the stand-down answers measured demand, never missing data. Amended by the operator's directives of 2026-08-26: the first replaced the exclusion with the trickle-hold stand-down (the cheap off-peak grid serves the load), and the further directive the same day supersedes the trickle-only posture where commissioned — under `demand_response: "park_standby"` the MEASURED engage becomes an ACTIVE PARK of the heavy unit alone (§2.4): TRUE standby, answering neither charge nor discharge. This trickle-hold remains the default posture (`hold`) and the entire fail-closed arm. |
 | "so the battery doesn't drain during that time — I don't want energy going in and out of the battery while the EV is charging" | The point of a held objective is not the watts — it is the OBJECTIVE. While any intent is renewed, the PQ objective REPLACES the pod's own CT-following autonomy (the beat-autonomy doctrine, inverted for night use). The pods autonomously load-match in the evening and WILL discharge into house/EV load unless held (NIGHT_LOAD_INVESTIGATION §1.1: 0–536 W per pod, uncommanded). Under the stand-down directive this guarantee is DELIBERATELY suspended for MEASURED demand events (the row above) and preserved everywhere else — above all in the fail-closed hold, where a held `hold_rate_w` objective means: not discharging blind, not cycling, still inching up while the evidence is missing. |
 | "we pay off-peak rates then" | The window is a civil-time fact in config; the import cost itself is the operator's tariff question (§6 — the scorecard prices it when the tariff keys exist). |
 
@@ -183,14 +193,15 @@ control-rate under the PCS-block promotion, gaps/failures never interpolated.
   is the exact outcome the operator refused). The hold-on-bad-evidence state
   is loudly visible (`demand_evidence_stale` etc. on the tile), so it can
   never be a silent never-charges.
-- **Threshold and the ONE response: the ACTIVE STAND-DOWN.** Engage when
+- **Threshold and the responses: the ACTIVE STAND-DOWN (posture `hold`, the
+  default) and TRUE STANDBY (posture `park_standby`, below).** Engage when
   `demand_w > demand_threshold_w` (default 1000, the operator's own figure;
   the ~109 W fleet standby floor is far below it — no false engages on an
-  idle night). The response to a MEASURED engage is the ACTIVE STAND-DOWN
-  (the operator's directive 2026-08-26, revising the 2026-08-24 exclusion:
-  on a big night load the batteries stand down and the CHEAP OFF-PEAK GRID
-  serves the house, preserving stored solar for the expensive evening):
-  each held unit STAYS IN the submission at `hold_rate_w` — an ordinary
+  idle night). The `hold` response to a MEASURED engage is the ACTIVE
+  STAND-DOWN (the operator's directive 2026-08-26, revising the 2026-08-24
+  exclusion: on a big night load the batteries stand down and the CHEAP
+  OFF-PEAK GRID serves the house, preserving stored solar for the expensive
+  evening): each held unit STAYS IN the submission at `hold_rate_w` — an ordinary
   positive charge objective renewed every tick whose live presence replaces
   the pod's CT-following autonomy (beat-autonomy doctrine), so the battery
   cannot discharge into the spike. Zero-watt non-participation was tried
@@ -204,6 +215,37 @@ control-rate under the PCS-block promotion, gaps/failures never interpolated.
   state is its own phase word (`standing_by_on_demand`, fleet and unit) with
   the `demand_above_threshold` code; both arms land on `hold_rate_w` and are
   named apart by phase and code.
+- **TRUE STANDBY — the `park_standby` response (a FURTHER operator directive
+  the same day, 2026-08-26, superseding the trickle-only posture above where
+  commissioned).** With `demand_response: "park_standby"` (validation
+  refuses it without `demand_scope: "per_phase"`, without a present
+  `parking:` block, and without `max_lease_s` covering the longest window
+  span + 120 s — §7's step 1), the measured engage is judged PER PHASE and
+  its response is an ACTIVE PARK: the ONE unit whose OWN load word exceeds
+  `demand_threshold_w` (> 1000 W on the defaults) is DISARMED then PARKED —
+  vendor Standby `0x8000 ← 1` through the `ParkController` lease, mid's
+  manual park proving the act live — while its siblings keep pacing. The
+  choreography rides INSIDE the tick's remove→submit gap, because park
+  refuses armed/under-intent units: the previous fleet intent is removed
+  first (the pod still executes its last objective; the ~3.5–4.0 s watchdog
+  has not fired), then the disarm twin lands (an audited stop-direction act),
+  then the park lease — Standby settles inside the watchdog window, so
+  discharge exposure ≈ zero, on a lease sized to the window's remainder and
+  bounded by the commissioned `parking.max_lease_s` (raised live to 25200 s,
+  `docs/DESIGN_POD_PARKING.md` §13) — and ONLY THEN does the fresh submission
+  go out WITHOUT the parked unit. **Ordering pinned: SUBMISSION HAPPENS LAST,
+  and every unit is always EXACTLY ONE OF {held-in-submission, parked}** —
+  the gap manufactures the conflict-guard clearance instead of weakening the
+  guard. The unit renders `standing_by_parked` (§5) and stays out of the
+  submission until its OWN word reads GOOD below the exit bound (< 800 W on
+  the defaults), whereupon the tick RESUMES it (`0x8000 ← 0`) and RE-ARMS it
+  before it rejoins at full rate. Evidence going bad DURING standby KEEPS the
+  park — the safe direction: a parked unit answers neither charge nor
+  discharge. The trickle-hold remains BOTH the default posture
+  (`demand_response: "hold"` preserves v1 identity) AND the entire
+  fail-closed arm, unchanged: missing/bad/stale words before any engage hold
+  at `hold_rate_w` exactly as written above. Act budget, exit paths, boot
+  adoption, and the refusal ladder: §2.5.
 - **Hysteresis (no flapping).** Resume pacing only when
   `demand_w < demand_threshold_w − demand_exit_hysteresis_w` (default 200;
   validated `0 < hysteresis < threshold`). A load oscillating around 1000 W
@@ -271,6 +313,41 @@ Per tick:
    remove, then the TTL lapse and the ~3.5–4.0 s watchdog return each pod to
    its own autonomy (daytime PV self-charge). No stop triple, no idle intent,
    ever.
+
+**The `park_standby` tick notes (pinned under the operator directive
+2026-08-26; posture `hold` runs EXACTLY the five steps above and composes
+none of this):**
+
+- **Act budget:** AT MOST ONE engage AND AT MOST ONE release per tick — the
+  largest-W candidate engages; releases run before the engage (resume → drop
+  from the map → re-arm; a re-arm refusal ≠ release failure — the unit sits
+  disarmed, loudly coded, the operator arms it). The budget bounds every
+  tick's worst case and keeps a multi-unit spike from churning the mode
+  register.
+- **Every exit path releases ALL:** window close, entry disable, and
+  participation loss each run the release-all pass BEFORE returning idle —
+  a window boundary must never leave pods parked past it, and expiry stays
+  alarm-only (a timer is not a principal), so the adviser itself must be the
+  releaser. The EMERGENCY STOP path does NOT release (resume refuses
+  stop-latched units anyway, and a parked unit answers nothing — consistent
+  with the stop owning the site).
+- **Boot adoption, one-shot per window:** the first in-window tick adopts
+  boot-reconstructed leases into its map ONLY when authorizer ==
+  `energypod:night-adviser` AND lease reason == the night standby reason
+  (`night_demand_standby`; code `night_standby_adopted`). Operator and
+  foreign leases are never touched: adopt if ours, drop if not — the
+  controller never fights a park it did not mint.
+- **Refusal ladder (Stage R discipline):** a conflict or write refusal
+  re-includes the unit at `hold_rate_w` THIS tick (≥ 3 consecutive latch the
+  window's trickle-hold — never churn into a standing refusal); a write
+  failure gets ONE re-issue next tick, then latches loud; readback-unverified
+  engage or release is TERMINAL for the window (no further writes); an
+  already-parked corner adopts if ours and drops if operator/foreign;
+  cap-reached on renewal is loud watching (no resume/re-park cycling); a
+  release-write failure retries idempotently while the condition persists,
+  loud each failing tick; a refused re-arm surfaces
+  `night_standby_rearm_failed` and the unit STAYS disarmed (= cannot
+  discharge = safe).
 
 ## 3. Config, the PARTITION grant, and the cutover
 
@@ -716,6 +793,46 @@ case, feature detection), `web/src/views/activity/ActivityView.test.tsx`.
 - The console can never widen the partition or touch the window/caps; the
   ungranted or unacknowledged states render their config paths, never a
   toggle that pretends.
+
+**Amended 2026-08-26 (the further operator directive of 2026-08-26): the
+`park_standby` wave — ordered steps landing on the plan above (contract-first:
+this amendment sweep lands BEFORE the red tests).**
+
+1. **Config** — `NightChargingConfig` gains `demand_response:
+   Literal["hold","park_standby"] = "hold"` (default preserves v1 identity);
+   validation REFUSES `park_standby` without `demand_scope: "per_phase"`,
+   without a present `parking:` block, and with
+   `parking.max_lease_s < longest_window_span_s + 120` (cross-midnight
+   aware; the error names the widening path, partition-grant style). **The
+   anti-selector pin is replaced HONESTLY:** `tests/unit/test_config.py`'s
+   `test_the_night_block_has_no_demand_posture_selector` asserted the block
+   had NO demand-posture selector — the operator's directive supersedes it;
+   the replacement family pins default-is-`hold`, the three refusals above,
+   and the unknown-value refusal (exactly two postures, never a third).
+2. **Adviser state machine** — the Stage R port clones verbatim (the
+   park/resume port, the lifecycle closures for disarm/re-arm, the lease
+   view; all optional and None-defaulted, so every `hold` composition stays
+   byte-identical); window-scoped standby state reset at the boundaries; the
+   standby advance step BETWEEN `_remove_held()` and `_submit()` — §2.4's
+   choreography under §2.5's budget, exits, and ladder.
+3. **Facade twins + the arm grant** — `submit_night_disarm` /
+   `submit_night_rearm`, composition-only, never routed REST or MCP,
+   audited, the foreign-objective takeover rule verbatim;
+   `energypod:night-adviser` gains the `arm` scope ONLY while `park_standby`
+   is commissioned — the SECOND composer exception after health-watch Stage
+   R, fenced like the first (`docs/DESIGN_POD_PARKING.md` §13).
+4. **Refusal ladder** — as pinned in §2.5; the red-first matrix in
+   `tests/unit/test_night_charge.py` names each rung (engage-one-heavy-unit,
+   refusal-never-uncovered, hysteresis no-flap, bad-evidence-during-standby
+   keeps the park, release-resumes-rearms, act budget, window-close and
+   participation-loss release ALL, e-stop releases nothing, boot adopts only
+   own leases, cap renewal loud, unverified terminal, re-arm failure loud).
+5. **Projection/web** — unit-phase `standing_by_parked`; the SIX additive
+   reason codes; ZERO new payload keys (the event-contract key-set equality
+   test passes untouched).
+6. **Integration gates + deploy** — full backend suite, ruff, mypy strict,
+   web tsc + build green; live yaml flip, restart, re-arm WELL BEFORE the
+   00:00 window.
 
 ## 8. Operator decisions this package needs (verbatim-ready)
 

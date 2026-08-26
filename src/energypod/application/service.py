@@ -55,7 +55,7 @@ from .forecast import FORECAST_PROVIDERS_NOT_COMMISSIONED, ForecastRefusal
 from .foreign_objective import empty_objective_entry
 from .health_watch import HEALTH_WATCH_NOT_COMMISSIONED, HealthWatchRefusal
 from .history import PLANT_HISTORY_NOT_COMMISSIONED, PlantHistoryRefusal
-from .night_charge import NightChargingRefusal
+from .night_charge import NIGHT_STANDBY_PARK_REASON, NightChargingRefusal
 from .parking import (
     MIN_LEASE_S,
     PARK_NOT_COMMISSIONED,
@@ -1591,9 +1591,7 @@ class EnergyServiceFacade:
                 FORECAST_PROVIDERS_NOT_COMMISSIONED,
                 "the forecast providers are not composed on this site",
             )
-        return await self._forecast.outlook_payload(
-            now_utc=self._clock.wall_now().astimezone(UTC)
-        )
+        return await self._forecast.outlook_payload(now_utc=self._clock.wall_now().astimezone(UTC))
 
     async def get_observed_objectives(
         self, *, principal: Principal, last: str = "24h"
@@ -2442,6 +2440,123 @@ class EnergyServiceFacade:
         )
         return dict(outcome)
 
+    async def submit_night_disarm(
+        self, *, unit_ids: Any, principal: Principal, request_id: Any = None
+    ) -> dict[str, Any]:
+        """The night standby's internal disarm twin (DESIGN_POD_PARKING
+        amendment §3, operator directive 2026-08-26).
+
+        The health watch's disarm twin (§7.2 step 2) cloned under the composed
+        ``energypod:night-adviser`` principal for the ONE sanctioned exception:
+        the ``park_standby`` engage's stop-direction act — the pod is disarmed
+        BEFORE the Standby write so park's conflict guard sees no live intent,
+        and PARK'S CONFLICT GUARD NEVER NEEDS WEAKENING.  Composition-only
+        wiring: never routed on REST or MCP, and only the night principal the
+        composer granted the arm scope ever reaches it.
+        """
+        self._admit(principal, "arm")
+        units = _validated_units(unit_ids)
+        request = self._night_key("disarm") if request_id is None else request_id
+        request = _correlation_key(request, "request_id")
+        outcomes: list[dict[str, str]] = []
+        degraded: list[str] = []
+        for unit_id in units:
+            outcome = await self._disarm_one(unit_id)
+            outcomes.append(outcome)
+            try:
+                night_payload = {
+                    **dict(outcome),
+                    "reason": "night standby engage disarm",
+                }
+                await self._append_audit(
+                    # _mutation_audit folds ``payload`` into the request
+                    # fingerprint's facts but never onto the event row itself;
+                    # this twin's evidence contract (DESIGN_POD_PARKING §3)
+                    # reads the act from the ROW, so the payload is stamped on
+                    # verbatim.
+                    self._mutation_audit(
+                        event_type="unit_disarmed",
+                        subject=principal.subject,
+                        result=outcome["status"],
+                        request_id=request,
+                        reason_codes=(
+                            NIGHT_STANDBY_PARK_REASON,
+                            outcome["reason"],
+                        ),
+                        unit_id=unit_id,
+                        lifecycle=self._handle_lifecycle(unit_id),
+                        payload=night_payload,
+                    ).model_copy(update={"payload": dict(night_payload)})
+                )
+            except Exception:
+                # The safety-positive family: the disarm stands whatever the
+                # record does, named per unit.
+                degraded.append(f"audit_unavailable:{unit_id}")
+        degraded.extend(
+            await self._publish_degraded(
+                "unit.disarmed", {"principal": principal.subject, "units": outcomes}
+            )
+        )
+        return {"units": outcomes, "degraded": degraded}
+
+    async def submit_night_rearm(
+        self, *, unit_id: Any, principal: Principal, request_id: Any = None
+    ) -> dict[str, Any]:
+        """The night standby's ONE bounded re-arm twin (the health §7.4 clone).
+
+        The release choreography's single bounded verification re-arm: exactly
+        one unit, never the takeover acknowledgement — a foreign objective seen
+        during our park makes the next arm the OPERATOR's, forever, and the
+        refusal lands upstream as the loud ``night_standby_rearm_failed`` rung
+        with the unit left DISARMED (= cannot discharge = safe).  Composition-
+        only wiring; this and the disarm twin above are the only arm paths the
+        night adviser will ever gain.
+        """
+        self._admit(principal, "arm")
+        units = _validated_units([unit_id])
+        if len(units) != 1:
+            raise ValueError("the bounded verification re-arm names exactly one unit")
+        request = self._night_key("rearm") if request_id is None else request_id
+        request = _correlation_key(request, "request_id")
+        target = units[0]
+        outcome = await self._arm_one(target, takeover_acknowledged=False)
+        try:
+            night_payload = {
+                **dict(outcome),
+                "reason": "night standby verification re-arm",
+                "bounded": True,
+                "takeover_acknowledged": False,
+            }
+            await self._append_audit(
+                # The same row-level payload stamp as the disarm twin: the
+                # release evidence reads ``bounded``/``takeover_acknowledged``
+                # from the audit ROW (never takeover), so the twin's payload
+                # is stamped onto the event verbatim.
+                self._mutation_audit(
+                    event_type="unit_armed",
+                    subject=principal.subject,
+                    result=outcome["status"],
+                    request_id=request,
+                    reason_codes=(
+                        "night_standby_verification_rearm",
+                        outcome["reason"],
+                    ),
+                    unit_id=target,
+                    lifecycle=self._handle_lifecycle(target),
+                    payload=night_payload,
+                ).model_copy(update={"payload": dict(night_payload)})
+            )
+        except Exception:
+            # An unaudited arm cannot stand: disarm compensates (Impl-10),
+            # and the caller reads the refusal as the loud rung.
+            with contextlib.suppress(Exception):
+                await self._disarm_one(target)
+            raise
+        await self._publish(
+            "unit.armed", {"principal": principal.subject, "units": [dict(outcome)]}
+        )
+        return dict(outcome)
+
     async def get_health_watch_status(self, *, principal: Principal) -> dict[str, Any]:
         """The watch's program projection (block-presence refusal otherwise).
 
@@ -2598,14 +2713,10 @@ class EnergyServiceFacade:
         duration_s = _positive_duration(ttl_s)
         _reason_text(reason, required=False)
         resolved_idempotency = (
-            self._calibration_key("idempotency")
-            if idempotency_key is None
-            else idempotency_key
+            self._calibration_key("idempotency") if idempotency_key is None else idempotency_key
         )
         _correlation_key(resolved_idempotency, "idempotency_key")
-        request_source = (
-            self._calibration_key("request") if request_id is None else request_id
-        )
+        request_source = self._calibration_key("request") if request_id is None else request_id
         request = _correlation_key(request_source, "request_id")
 
         now_mono = float(self._clock.monotonic())

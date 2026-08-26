@@ -16,6 +16,9 @@
  *   measured-demand ACTIVE STAND-DOWN with its truth ("the grid serves the
  *   heavy load and charging resumes below 800 W" — the resume bound computed
  *   from the wire's own threshold − hysteresis figures, never hardcoded);
+ *   a unit parked by the per-phase rule (2026-08-26) renders its own row —
+ *   "standing by (parked) — answers nothing", its cause named beside itself —
+ *   while the window keeps running around it;
  *   holding names the fail-closed guarantee ("batteries
  *   neither drain nor cycle while the grid meets the spike" — the missing-
  *   evidence fallback at `hold_rate_w`, never a response to measured demand);

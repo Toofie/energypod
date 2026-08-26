@@ -34,7 +34,7 @@
  */
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiClientError } from "../../api/client";
 import type { ApiClient } from "../../api/client";
 import {
@@ -391,6 +391,22 @@ describe("History view — the ready window", () => {
 // --- the archaeology strip (the step series' words) --------------------------------------
 
 describe("History view — the archaeology strip", () => {
+  beforeEach(() => {
+    // The listing's regime selector reads the REAL wall clock against the
+    // fixture window (multiDay = now − window.from > 48 h), so the absolute
+    // calendar fixture was a time bomb: the day-inclusive spelling arrived
+    // the moment real time crossed two days past 2026-08-24T00:00Z and
+    // flipped every clause. Pinning DATE ONLY (timers stay real — the
+    // fetch waits and the click never notice) puts the read inside the
+    // fixture era forever: the time-only words, exactly as authored.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.parse("2026-08-24T06:30:00+00:00"));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   /** Land the world, switch to the mid battery, wait for the strip's heading. */
   async function landStrip(windowBody: unknown = fullWindow()): Promise<void> {
     await landReads(snapshotWith(["mid", "rhs", "lhs"]), windowBody);

@@ -270,6 +270,45 @@ describe("nightCharge — the plain-word maps", () => {
     );
   });
 
+  it("words the true standby: the parked row names its own silence and its own cause", () => {
+    const parked = toNightChargeState(
+      nightChargeState({
+        units: [
+          nightUnitState({ unit_id: "mid", soc_pct: 88, phase: "standing_by_parked", target_w: 0, reason: "night_standby_parked" }),
+        ],
+      }),
+    )!;
+    // The zero-watt target is real but unsaid: the phrase names what a park
+    // IS (no submission, no answer), and the row's reason names why (its OWN
+    // circuit, never the fleet reading).
+    expect(nightUnitRowText(parked.units[0]!)).toBe(
+      "mid — 88% charged · mid standing by (parked) — answers nothing (its own circuit ran heavy)",
+    );
+  });
+
+  it("words the six true-standby codes, each naming its consequence (and the operator's part)", () => {
+    const of = (code: string) =>
+      nightReasonText(toNightChargeState(nightChargeState({ phase: "idle", reason_codes: [code] }))!);
+    expect(of("night_standby_parked")).toBe(
+      "A battery whose own circuit ran heavy is parked in standby — it answers neither charge nor discharge until its load falls back.",
+    );
+    expect(of("night_standby_park_refused")).toBe(
+      "The park was refused — the battery keeps charging at the trickle hold instead of standing by; repeated refusals hold it there for the window.",
+    );
+    expect(of("night_standby_release_failed")).toBe(
+      "Releasing a parked battery failed — it stays parked while the controller retries; the grid still serves its load.",
+    );
+    expect(of("night_standby_release_unverified")).toBe(
+      "The release could not be verified on the battery — it stays treated as parked for the rest of the window, and no further writes are attempted.",
+    );
+    expect(of("night_standby_rearm_failed")).toBe(
+      "The battery left standby but could not be re-armed — arm it by hand; while disarmed it can neither charge nor discharge.",
+    );
+    expect(of("night_standby_adopted")).toBe(
+      "The controller found a standby park it placed before the restart and owns it again — the battery stays parked until its load falls back.",
+    );
+  });
+
   it("words completion with the window's own end clock", () => {
     const done = toNightChargeState(
       nightChargeState({
@@ -494,6 +533,48 @@ describe("nightCharge — the plain-word maps", () => {
     expect(nightPhaseAnnouncement("pacing", "pacing")).toBeNull();
   });
 
+  it("announces the true standby's park and release through the unit rows while the fleet phase holds", () => {
+    // A park rides NO fleet phase (the vocabulary is unchanged): with both
+    // projections' rows passed, a same-phase frame whose parked set moved is
+    // the announcement.
+    const pacingRow = {
+      unitId: "mid",
+      socPct: 88,
+      phase: "pacing",
+      targetW: 2500,
+      reason: "on_plan",
+      targetSocPct: null,
+    } as const;
+    const parkedRow = {
+      unitId: "mid",
+      socPct: 88,
+      phase: "standing_by_parked",
+      targetW: 0,
+      reason: "night_standby_parked",
+      targetSocPct: null,
+    } as const;
+    expect(nightPhaseAnnouncement("pacing", "pacing", [pacingRow], [parkedRow])).toBe(
+      "mid is parked in standby — answers neither charge nor discharge until house demand falls.",
+    );
+    // The exit names BOTH halves: the charging resumes AND the battery is
+    // re-armed (a release without the re-arm is not the story's end).
+    expect(nightPhaseAnnouncement("pacing", "pacing", [parkedRow], [pacingRow])).toBe(
+      "mid left standby — charging resumes and the battery re-arms.",
+    );
+    // Two batteries park together: one sentence, plural verbs, named the
+    // operator's way.
+    expect(
+      nightPhaseAnnouncement("holding_on_demand", "holding_on_demand", [], [
+        parkedRow,
+        { ...parkedRow, unitId: "rhs" },
+      ]),
+    ).toBe(
+      "mid and rhs are parked in standby — answer neither charge nor discharge until house demand falls.",
+    );
+    // An unmoved parked set (a heartbeat's sibling) stays silent.
+    expect(nightPhaseAnnouncement("pacing", "pacing", [parkedRow], [parkedRow])).toBeNull();
+  });
+
   it("keeps the phase and unit-phase vocabularies whole (§5's ONE lists)", () => {
     expect(NIGHT_PHASES).toEqual([
       "idle",
@@ -507,13 +588,36 @@ describe("nightCharge — the plain-word maps", () => {
       "pacing",
       "holding_on_demand",
       "standing_by_on_demand",
+      "standing_by_parked",
       "skipped_full",
       "complete",
       "sitting_out",
     ]);
     // The reason vocabulary is the ONE list (§5's eighteen + V2 §7's five
-    // additions); the wire fixtures agree.
-    expect(NIGHT_REASON_CODES).toHaveLength(23);
+    // additions + the true standby's six lifecycle words); the wire fixtures
+    // agree.
+    expect(NIGHT_REASON_CODES).toHaveLength(29);
+    for (const code of [
+      "night_standby_parked",
+      "night_standby_park_refused",
+      "night_standby_release_failed",
+      "night_standby_release_unverified",
+      "night_standby_rearm_failed",
+      "night_standby_adopted",
+    ]) {
+      expect(NIGHT_REASON_CODES).toContain(code);
+    }
+  });
+
+  it("parses the parked row: an unknown-before phase rides the checklist, never narrowed away", () => {
+    const state = toNightChargeState(
+      nightChargeState({
+        units: [
+          nightUnitState({ unit_id: "mid", soc_pct: 88, phase: "standing_by_parked", target_w: 0, reason: "night_standby_parked" }),
+        ],
+      }),
+    )!;
+    expect(state.units[0]!.phase).toBe("standing_by_parked");
   });
 });
 

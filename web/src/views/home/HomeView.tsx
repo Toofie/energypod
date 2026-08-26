@@ -1276,13 +1276,14 @@ export function HomeView({ client }: HomeViewProps) {
         // The night adviser's own frame (feature-detected, the excess tile's
         // pattern): the payload patches the tile's projection — the per-unit
         // targets, SOC figures, and demand reading refresh on EVERY frame,
-        // heartbeats included, with no announcement; only a PHASE change is
-        // worth the operator's ear (pacing → holding → resume → complete is
-        // the supervised-night story the design wants visible). No refetch:
-        // the payload is the projection, and the plane's live cadence
-        // confirms it. The projection is read and kept current through
-        // nightRef: the phase comparison must happen NOW, not when React runs
-        // a deferred updater.
+        // heartbeats included, with no announcement; only a PHASE change or a
+        // moved PARKED set is worth the operator's ear (pacing → holding →
+        // resume → complete is the supervised-night story the design wants
+        // visible, and a true-standby park rides NO fleet phase — its landing
+        // and release are announced through the unit rows). No refetch: the
+        // payload is the projection, and the plane's live cadence confirms
+        // it. The projection is read and kept current through nightRef: the
+        // comparison must happen NOW, not when React runs a deferred updater.
         const payload: unknown = frame.payload;
         const previous = nightRef.current;
         const event = toNightChargeStateChangedEvent(previous, payload);
@@ -1290,8 +1291,13 @@ export function HomeView({ client }: HomeViewProps) {
           const next = event.state;
           nightRef.current = next;
           setSnapshot((prior) => (prior === null ? prior : { ...prior, nightState: next }));
-          if (previous !== null && !event.heartbeat && previous.phase !== next.phase) {
-            const announcement = nightPhaseAnnouncement(previous.phase, next.phase);
+          if (previous !== null && !event.heartbeat) {
+            const announcement = nightPhaseAnnouncement(
+              previous.phase,
+              next.phase,
+              previous.units,
+              next.units,
+            );
             if (announcement !== null) {
               setAnnouncement(announcement);
             }

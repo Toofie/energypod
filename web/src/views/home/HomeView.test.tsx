@@ -2602,6 +2602,56 @@ describe("HomeView — the night-charge tile", () => {
     expect(region).toHaveTextContent(sentence);
   });
 
+  it("announces the true standby's park through the unit rows while the fleet phase holds", async () => {
+    // A park rides NO fleet phase (the vocabulary is unchanged): the frame
+    // that carries it is a same-phase pacing frame whose parked SET moved —
+    // so the wire-up must hand the announcement BOTH projections' unit rows,
+    // not only the phases. The ear hears the landing without any phase word.
+    const world = nightWorld(nightChargeState({ phase: "pacing" }));
+    const channel = liveChannel([snapshotFrame(world)]);
+    installClient({ snapshot: world, openEvents: channel.openEvents });
+    renderHome();
+    await screen.findByRole("region", { name: NIGHT_REGION });
+
+    channel.push(
+      nightChargeStateChanged(43, {
+        phase: "pacing",
+        reason_codes: ["window_open", "demand_above_threshold", "night_standby_parked"],
+        units: [
+          nightUnitState(),
+          nightUnitState({ unit_id: "mid", soc_pct: 88, phase: "standing_by_parked", target_w: 0, reason: "night_standby_parked" }),
+          nightUnitState({ unit_id: "rhs", soc_pct: 98.0, phase: "skipped_full", target_w: 0, reason: "at_ceiling" }),
+        ],
+      }) as unknown as StreamFrame,
+    );
+
+    expect(
+      await screen.findByText(
+        /mid is parked in standby — answers neither charge nor discharge until house demand falls\./,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("renders the true standby's parked row: the silence and its own cause named beside the SOC", async () => {
+    // The per-phase park (2026-08-26) rides NO fleet phase — the window keeps
+    // pacing around a battery that takes no writes; only its row changes.
+    installClient({
+      snapshot: nightWorld(
+        nightChargeState({
+          units: [
+            nightUnitState({ phase: "pacing" }),
+            nightUnitState({ unit_id: "mid", soc_pct: 88, phase: "standing_by_parked", target_w: 0, reason: "night_standby_parked" }),
+          ],
+        }),
+      ),
+    });
+    renderHome();
+    const region = await screen.findByRole("region", { name: NIGHT_REGION });
+    expect(region).toHaveTextContent(
+      /mid — 88% charged · mid standing by \(parked\) — answers nothing \(its own circuit ran heavy\)/,
+    );
+  });
+
   // One plain sentence per reason code in the ONE pinned vocabulary — the
   // parametrization IS the completeness pin: a code added to the wire
   // vocabulary without a row here fails the completeness test below.
@@ -2724,6 +2774,38 @@ describe("HomeView — the night-charge tile", () => {
     {
       code: "window_closed_below_target",
       sentence: /The window closed below target — solar is finishing what it can\./,
+    },
+    // The true standby's lifecycle (2026-08-26): each word names its own
+    // consequence — and, where one exists, the operator's part in it.
+    {
+      code: "night_standby_parked",
+      sentence:
+        /A battery whose own circuit ran heavy is parked in standby — it answers neither charge nor discharge until its load falls back\./,
+    },
+    {
+      code: "night_standby_park_refused",
+      sentence:
+        /The park was refused — the battery keeps charging at the trickle hold instead of standing by; repeated refusals hold it there for the window\./,
+    },
+    {
+      code: "night_standby_release_failed",
+      sentence:
+        /Releasing a parked battery failed — it stays parked while the controller retries; the grid still serves its load\./,
+    },
+    {
+      code: "night_standby_release_unverified",
+      sentence:
+        /The release could not be verified on the battery — it stays treated as parked for the rest of the window, and no further writes are attempted\./,
+    },
+    {
+      code: "night_standby_rearm_failed",
+      sentence:
+        /The battery left standby but could not be re-armed — arm it by hand; while disarmed it can neither charge nor discharge\./,
+    },
+    {
+      code: "night_standby_adopted",
+      sentence:
+        /The controller found a standby park it placed before the restart and owns it again — the battery stays parked until its load falls back\./,
     },
   ];
 

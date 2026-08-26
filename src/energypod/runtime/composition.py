@@ -325,6 +325,14 @@ _EXCESS_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
 # beyond what an ordinary dispatch needs.
 _NIGHT_ADVISER_PRINCIPAL_SUBJECT = "energypod:night-adviser"
 _NIGHT_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch"})
+# The TRUE STANDBY posture's SECOND composer exception (after Stage R §12/A10,
+# operator directive 2026-08-26), fenced exactly the same way: ONLY a site
+# commissioned with ``demand_response: park_standby`` grants the night adviser
+# the arm scope its two internal twins admit on — the engage's stop-direction
+# disarm and the release's ONE bounded verification re-arm.  Composition-only
+# wiring, never REST/MCP; no other adviser, stage, timer, or surface gains
+# anything from this precedent.
+_NIGHT_STANDBY_ADVISER_PRINCIPAL_SCOPES = frozenset({"observe", "dispatch", "arm"})
 
 # DESIGN_SCHEDULES §2: the composed automation principal the schedule runner
 # submits under — the adviser pattern exactly.  Audit attribution separates
@@ -2016,9 +2024,7 @@ class _RegistryMorningCredit:
         self._cache_key: tuple[Any, ...] | None = None
         self._cache_value: Any = None
 
-    async def __call__(
-        self, window_end: Any, midday_local: Any, quantile: float
-    ) -> Any:
+    async def __call__(self, window_end: Any, midday_local: Any, quantile: float) -> Any:
         from energypod.application.night_charge import (
             REASON_FORECAST_MISSING,
             REASON_FORECAST_STALE,
@@ -2064,8 +2070,7 @@ class _RegistryMorningCredit:
         except Exception:
             return _night_no_credit(REASON_FORECAST_NO_LOAD_BASELINE)
         intervals = sorted(
-            (value.interval_start, value.interval_end, value.value)
-            for value in load_series.values
+            (value.interval_start, value.interval_end, value.value) for value in load_series.values
         )
         surplus_wh = 0.0
         deficit_wh = 0.0
@@ -2114,15 +2119,11 @@ def _pv_slots(
     span is not fully covered (a missing slot is no coverage, never a
     zero)."""
     values = [
-        value
-        for value in pv_series.values
-        if value.quantile == quantile or value.quantile is None
+        value for value in pv_series.values if value.quantile == quantile or value.quantile is None
     ]
     if not any(value.quantile == quantile for value in values):
         values = [value for value in values if value.quantile is None]
-    intervals = sorted(
-        (value.interval_start, value.interval_end, value.value) for value in values
-    )
+    intervals = sorted((value.interval_start, value.interval_end, value.value) for value in values)
     covered_from = window_end
     slots: list[tuple[Any, Any, float]] = []
     for start, end, watts in intervals:
@@ -2140,9 +2141,7 @@ def _pv_slots(
     return [] if covered_from < midday else slots
 
 
-def _load_over(
-    intervals: list[tuple[Any, Any, float]], start: Any, end: Any
-) -> float | None:
+def _load_over(intervals: list[tuple[Any, Any, float]], start: Any, end: Any) -> float | None:
     """The baseline's time-weighted mean load over [start, end), or None when
     the baseline does not cover the span fully (A9's single-gap rule)."""
     span_s = (end - start).total_seconds()
@@ -3626,6 +3625,11 @@ def _build_runtime(
     # widened predicate, no new tier).
     night_config = config.night_charging
     night_present = night_config is not None
+    # The standby posture's lease-cap ceiling (parking.max_lease_s): the
+    # engage lease arithmetic's commissioned bound, mirrored into the adviser
+    # settings so it never guesses the composer's cap.  ``None`` (the common
+    # no-parking site) keeps the adviser's own default.
+    night_parking = config.parking
     # DESIGN_ENERGY_SCORECARD sections 5+7 (E4): a PRESENT block composes the
     # accountant, the energy decode, the snapshot key, and the route; an
     # ABSENT block composes nothing at all.  The A-1 boot gate is keyed
@@ -4396,9 +4400,7 @@ def _build_runtime(
         recovery_staged = "recovery" in health_config.stages
 
         async def _health_disarm(*, unit_id: str) -> Mapping[str, Any]:
-            return await facade.submit_health_disarm(
-                unit_ids=[unit_id], principal=health_principal
-            )
+            return await facade.submit_health_disarm(unit_ids=[unit_id], principal=health_principal)
 
         async def _health_rearm(*, unit_id: str) -> Mapping[str, Any]:
             return await facade.submit_health_rearm(unit_id=unit_id, principal=health_principal)
@@ -4488,9 +4490,7 @@ def _build_runtime(
             park_control=park_controller if recovery_staged else None,
             disarm=_health_disarm if recovery_staged else None,
             arm=(
-                _health_rearm
-                if recovery_staged and health_config.recovery.mode == "auto"
-                else None
+                _health_rearm if recovery_staged and health_config.recovery.mode == "auto" else None
             ),
             recovery_receipts_missing=receipts_missing,
             process_instance_id=process_instance_id,
@@ -4603,36 +4603,24 @@ def _build_runtime(
                 trigger=CalibrationTriggerSettings(
                     trigger_floor_pct=float(calibration_config.trigger.trigger_floor_pct),
                     trigger_after_days=int(calibration_config.trigger.trigger_after_days),
-                    eligibility_window_days=int(
-                        calibration_config.trigger.eligibility_window_days
-                    ),
-                    cycles_daily_floor_pct=float(
-                        calibration_config.trigger.cycles_daily_floor_pct
-                    ),
+                    eligibility_window_days=int(calibration_config.trigger.eligibility_window_days),
+                    cycles_daily_floor_pct=float(calibration_config.trigger.cycles_daily_floor_pct),
                     cycles_daily_min_days=int(calibration_config.trigger.cycles_daily_min_days),
                     min_daily_throughput_wh=float(
                         calibration_config.trigger.min_daily_throughput_wh
                     ),
                     throughput_min_days=int(calibration_config.trigger.throughput_min_days),
-                    probe_pass_window_days=int(
-                        calibration_config.trigger.probe_pass_window_days
-                    ),
+                    probe_pass_window_days=int(calibration_config.trigger.probe_pass_window_days),
                 ),
                 traverse=CalibrationTraverseSettings(
                     floor_pct=float(calibration_config.traverse.floor_pct),
                     discharge_w=int(calibration_config.traverse.discharge_w),
                     min_discharge_w=int(calibration_config.traverse.min_discharge_w),
                     intent_ttl_s=float(calibration_config.traverse.intent_ttl_s),
-                    assumed_delivery_frac=float(
-                        calibration_config.traverse.assumed_delivery_frac
-                    ),
-                    integration_max_gap_s=float(
-                        calibration_config.traverse.integration_max_gap_s
-                    ),
+                    assumed_delivery_frac=float(calibration_config.traverse.assumed_delivery_frac),
+                    integration_max_gap_s=float(calibration_config.traverse.integration_max_gap_s),
                     energy_margin_wh=float(calibration_config.traverse.energy_margin_wh),
-                    metering_allowance_wh=float(
-                        calibration_config.traverse.metering_allowance_wh
-                    ),
+                    metering_allowance_wh=float(calibration_config.traverse.metering_allowance_wh),
                     assumed_capacity_wh=dict(calibration_config.traverse.assumed_capacity_wh or {}),
                 ),
                 top_anchor=CalibrationTopAnchorSettings(
@@ -4647,12 +4635,8 @@ def _build_runtime(
                     poor_surplus_kwh=float(calibration_config.top_anchor.poor_surplus_kwh),
                 ),
                 measurement=CalibrationMeasurementSettings(
-                    reanchor_delta_pct=float(
-                        calibration_config.measurement.reanchor_delta_pct
-                    ),
-                    floor_epsilon_pct=float(
-                        calibration_config.measurement.floor_epsilon_pct
-                    ),
+                    reanchor_delta_pct=float(calibration_config.measurement.reanchor_delta_pct),
+                    floor_epsilon_pct=float(calibration_config.measurement.floor_epsilon_pct),
                 ),
                 unit_ids=tuple(unit.unit_id for unit in config.units),
             ),
@@ -4775,9 +4759,7 @@ def _build_runtime(
                 soc_exponent=float(evening_config.soc_exponent),
                 spill_tolerance_w=int(evening_config.spill_tolerance_w),
                 import_tolerance_w=int(evening_config.import_tolerance_w),
-                assumed_discharge_over_frac=float(
-                    evening_config.assumed_discharge_over_frac
-                ),
+                assumed_discharge_over_frac=float(evening_config.assumed_discharge_over_frac),
                 frozen_word_ticks=int(evening_config.frozen_word_ticks),
                 frozen_flow_delta_w=int(evening_config.frozen_flow_delta_w),
                 delivery_move_floor_w=int(evening_config.delivery_move_floor_w),
@@ -4917,12 +4899,47 @@ def _build_runtime(
         # submission (never REST/MCP).  A night charge is an ordinary
         # OPTIMIZER intent: the arbiter, allocator, SafetyKernel, actor, and
         # authority path downstream are exactly the existing ones.
+        #
+        # The SECOND composer exception (after Stage R §12/A10): ONLY a site
+        # commissioned with ``demand_response: park_standby`` grants the arm
+        # scope and wires the standby ports — the ParkController itself, the
+        # stop-direction/re-arm twin pair, and the lease-payload view.  The
+        # default ``hold`` posture composes NONE of them (an isolated v1
+        # composition stays byte-identical), and validation has already
+        # refused a park_standby posture without its parking block.
+        night_standby = night_config.demand_response == "park_standby"
         night_principal = _NightAdviserPrincipal(
             subject=_NIGHT_ADVISER_PRINCIPAL_SUBJECT,
-            scopes=_NIGHT_ADVISER_PRINCIPAL_SCOPES,
+            scopes=(
+                _NIGHT_STANDBY_ADVISER_PRINCIPAL_SCOPES
+                if night_standby
+                else _NIGHT_ADVISER_PRINCIPAL_SCOPES
+            ),
             interactive=False,
             site_id=config.site.site_id,
         )
+
+        async def _night_disarm(*, unit_id: str) -> Mapping[str, Any]:
+            # The twin returns the batch envelope; the lifecycle port's
+            # contract is the ONE per-unit outcome row (the health watch reads
+            # ``status`` straight off it).
+            result = await facade.submit_night_disarm(unit_ids=[unit_id], principal=night_principal)
+            outcomes: list[Mapping[str, Any]] = list(result["units"])
+            return outcomes[0]
+
+        async def _night_rearm(*, unit_id: str) -> Mapping[str, Any]:
+            return await facade.submit_night_rearm(unit_id=unit_id, principal=night_principal)
+
+        def _night_standby_leases() -> dict[str, dict[str, Any]]:
+            # The suppressing lease-view closure (the shape of _parked_units):
+            # {unit: lease payload} from the ParkController's mirror; a
+            # missing controller or a failing read is empty.
+            if park_controller is None:
+                return {}
+            try:
+                return park_controller.parked_lease_views()
+            except Exception:
+                return {}
 
         async def _submit_night_drive(
             *,
@@ -4969,12 +4986,20 @@ def _build_runtime(
             revision_sink=_record_revision,
             retarget_history=_retarget_history,
             morning_archive_sink=_archive_morning,
+            park_control=park_controller if night_standby else None,
+            disarm=_night_disarm if night_standby else None,
+            arm=_night_rearm if night_standby else None,
+            standby_leases=_night_standby_leases if night_standby else None,
             settings=NightChargeSettings(
                 rate_cap_w=int(night_config.rate_cap_w),
                 hold_rate_w=int(night_config.hold_rate_w),
                 demand_threshold_w=int(night_config.demand_threshold_w),
                 demand_exit_hysteresis_w=int(night_config.demand_exit_hysteresis_w),
                 demand_scope=night_config.demand_scope,
+                demand_response=night_config.demand_response,
+                max_lease_s=(
+                    int(night_parking.max_lease_s) if night_parking is not None else 14_400
+                ),
                 pacing=night_config.pacing,
                 assumed_capacity_wh=dict(night_config.assumed_capacity_wh or {}),
                 demand_telemetry_max_age_s=float(night_config.demand_telemetry_max_age_s),

@@ -971,9 +971,12 @@ def _night_operator() -> Any:
     return OPERATOR
 
 
-def _compose_night_fleet(database: Any, clock: Any) -> Any:
+def _compose_night_fleet(database: Any, clock: Any, *, standby_posture: bool = False) -> Any:
     """A three-unit simulate composition with the partition granted and the
-    night block present-but-suspended (the operator enables it at runtime)."""
+    night block present-but-suspended (the operator enables it at runtime).
+    ``standby_posture`` commissions the TRUE STANDBY posture instead —
+    per_phase independence, the park_standby selector, and the parking lease
+    budget sized past the window span +120 s."""
     from tests.unit.test_composition import (
         _authentication_payload,
         _compose_with,
@@ -983,6 +986,10 @@ def _compose_night_fleet(database: Any, clock: Any) -> Any:
         _validate,
     )
 
+    night_block: dict[str, Any] = {"timezone": "Australia/Brisbane"}
+    if standby_posture:
+        night_block["demand_scope"] = "per_phase"
+        night_block["demand_response"] = "park_standby"
     payload = {
         "schema_version": 1,
         "revision": 7,
@@ -1004,8 +1011,10 @@ def _compose_night_fleet(database: Any, clock: Any) -> Any:
         "authentication": _authentication_payload(),
         "storage": {"database_path": str(database), "busy_timeout_ms": 250},
         "schedule": {"allowed_windows_local": [["00:00", "20:00"]]},
-        "night_charging": {"timezone": "Australia/Brisbane"},
+        "night_charging": night_block,
     }
+    if standby_posture:
+        payload["parking"] = {"max_lease_s": 25_200}
     return _compose_with(_validate(payload), simulate=True, clock=clock)
 
 
@@ -1228,6 +1237,119 @@ async def test_the_scripted_night_runs_the_full_strategy(tmp_path: Any) -> None:
         assert ended["phase"] == "idle"
         assert ended["active"] is False
         assert ended["next_window_at"] is not None, "the next night is named"
+    finally:
+        session.send("lifespan.shutdown")
+        await session.pump_until(
+            lambda: session.seen("lifespan.shutdown.complete")
+            or session.seen("lifespan.shutdown.failed"),
+            message="the lifespan never reported shutdown",
+            attempts=20000,
+        )
+
+
+async def test_the_scripted_standby_parks_the_heavy_phase_releases_and_stands_down(
+    tmp_path: Any,
+) -> None:
+    """The TRUE STANDBY directive end to end over the simulated fleet
+    (operator directive 2026-08-26, "Only the heavy one"): ONE battery's own
+    circuit crosses 1,000 W inside the window and THAT battery alone goes
+    into TRUE STANDBY — an ACTIVE PARK under an automation-origin lease, its
+    sibling pacing on untouched; below 800 W it resumes AND re-arms back to
+    the full capped rate; at window close every exit path releases."""
+    from energypod.domain import UnitLifecycle
+    from tests.unit.test_composition import _LifespanSession
+
+    clock = _NightScriptedClock()
+    runtime = _compose_night_fleet(
+        tmp_path / "standby-scenario.sqlite3", clock, standby_posture=True
+    )
+    operator = _night_operator()
+    assert runtime.night_controller is not None
+
+    enabled = await runtime.facade.set_night_charging(
+        action="enable",
+        confirmation="NIGHT",
+        night_posture="PARTITION_ACKNOWLEDGED",
+        principal=operator,
+        idempotency_key="standby-scenario-enable",
+        request_id="standby-scenario-enable-request",
+    )
+    assert enabled["enabled"] is True
+    assert enabled["acknowledged_partition"] is True
+
+    # lhs's OWN circuit carries tonight's heavy load; the others are quiet.
+    _pod_full(runtime.simulators["rhs"])
+    _script_load(runtime, {"mid": 100, "rhs": 100, "lhs": 1_500})
+
+    session = _LifespanSession(runtime.app)
+    session.send("lifespan.startup")
+    try:
+        await session.pump_until(
+            lambda: session.seen("lifespan.startup.complete"),
+            message="the lifespan never reported startup",
+        )
+        await session.pump_until(
+            lambda: all(getattr(actor, "qualified", False) for actor in runtime.actors.values()),
+            message="the simulated fleet never qualified",
+            attempts=12000,
+        )
+        await runtime.facade.arm(
+            unit_ids=["mid", "rhs", "lhs"],
+            principal=operator,
+            idempotency_key="standby-scenario-arm",
+            request_id="standby-scenario-arm-request",
+        )
+
+        # THE DIRECTIVE'S CORE: only the heavy battery parks.
+        await session.pump_until(
+            lambda: any(unit["phase"] == "standing_by_parked" for unit in _state(runtime)["units"]),
+            message="the heavy phase never went to TRUE STANDBY",
+            attempts=12000,
+        )
+        parked = _state(runtime)
+        by_unit = {unit["unit_id"]: unit for unit in parked["units"]}
+        assert by_unit["lhs"]["phase"] == "standing_by_parked"
+        assert by_unit["lhs"]["target_w"] == 0
+        assert by_unit["mid"]["phase"] == "pacing", "the clean phase is untouched"
+        assert _targets(parked) == {"mid": 2_500}, (
+            "only the heavy battery left the submission — never passive exclusion of the rest"
+        )
+
+        # And it REALLY parked: the vendor Standby register under a lease
+        # whose origin reads automation (the adviser's composed principal).
+        states = await runtime.parking.park_states()
+        assert states["lhs"]["parked"] is True
+        assert states["lhs"]["origin"] == "automation"
+        assert states["lhs"]["reason"] == "night_demand_standby"
+
+        # Below 800 W: resumed AND re-armed, back at the full capped rate —
+        # release is a choreography, not an omission.
+        _script_load(runtime, {"lhs": 600})
+        await session.pump_until(
+            lambda: _targets(_state(runtime)) == {"mid": 2_500, "lhs": 2_500},
+            message="the released battery never returned to full rate",
+            attempts=12000,
+        )
+        assert runtime.actors["lhs"].lifecycle is UnitLifecycle.ARMED_IDLE, (
+            "release means RE-ARMED, not merely resumed"
+        )
+        states = await runtime.parking.park_states()
+        assert states.get("lhs", {}).get("parked") is False
+
+        # Window end: EVERY exit path releases — nothing stays parked past
+        # the window on an alarm-only expiry doctrine.
+        clock.elapsed_s += (_NIGHT_WINDOW_UTC_END - _NIGHT_WINDOW_UTC_START).total_seconds() + 60.0
+        await session.pump_until(
+            lambda: _state(runtime)["reason_codes"] == ["outside_window"],
+            message="the window never ended by non-renewal",
+            attempts=12000,
+        )
+        await session.pump_until(
+            lambda: runtime.parking.parked_unit_ids() == frozenset(),
+            message="window end left a pod parked",
+            attempts=12000,
+        )
+        assert runtime.actors["lhs"].lifecycle is UnitLifecycle.ARMED_IDLE
     finally:
         session.send("lifespan.shutdown")
         await session.pump_until(

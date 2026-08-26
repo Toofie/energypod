@@ -376,6 +376,94 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-26 ~12:20 (night TRUE STANDBY — `park_standby` COMMITTED AND LIVE):
+  THE FURTHER OPERATOR DIRECTIVE THE SAME DAY, IMPLEMENTED, COMMISSIONED,
+  AND DEPLOYED BEFORE TONIGHT'S WINDOW. After the verified overnight
+  reconstruction (EV load stepped onto mid's CT at 00:00:17; the then-running
+  pre-stand-down build stood the fleet aside and mid discharged ~4.25 kWh
+  into it for 92 minutes until the operator's manual park stopped it
+  instantly; the 100 W trickle-hold was separately proven non-actuating),
+  the operator directed per-phase TRUE STANDBY ("Only the heavy one"): a
+  unit whose OWN LOAD word exceeds 1000 W in-window is disarmed and PARKED
+  into vendor Standby via the ParkController lease (answers neither charge
+  nor discharge; the grid serves the heavy load), resuming + re-arming when
+  its word is GOOD below 800 W. Mechanism is ACTIVE PARK (the Stage R §12
+  composer pattern), NEVER passive exclusion (tried 2026-08-24, reversed) —
+  fail-closed evidence arm preserved byte-for-byte; bad evidence DURING a
+  standby KEEPS the park. Tick ordering pinned: remove-held → disarm twin →
+  park → submit LAST (every unit always exactly one of held-in-submission/
+  parked); ≤1 engage AND ≤1 release per tick; EVERY exit path releases
+  (window close / participation loss / disable toggle; e-stop deliberately
+  does not); one-shot boot adoption filters authorizer `energypod:night-
+  adviser` + reason `night_demand_standby`. New facade internal twins
+  submit_night_disarm/submit_night_rearm (never routed); night-adviser arm
+  scope granted ONLY under park_standby (DESIGN_POD_PARKING §13's second
+  composer exception). Wire: unit phase `standing_by_parked` + six additive
+  codes (23→29), payload KEY SET unchanged. CONTRACT-FIRST SWEEP landed
+  (DESIGN_NIGHT_CHARGE §1/§2.4/§2.5/§7; API_CONTRACTS off-peak section;
+  PARKING §13 incl. the live max_lease_s raise 14400→25200 rationale);
+  honest replacement of test_the_night_block_has_no_demand_posture_selector.
+  EXECUTION: docs → red tests (39 red across six families, collection clean)
+  → adversarial test review (fixed 3 plumbing defects pre-implementation) →
+  implementation → GATES: backend 3120 passed, ruff clean, mypy --strict src
+  clean (74 files), web vitest 1128 passed + tsc + vite build clean → final
+  whole-diff review APPROVE with three P0-adjacent P1s FOUND AND FIXED at
+  the cause with regression tests (disable-verdict-at-boundary stranded
+  parks; last-participant-through-the-gap empty submission; dead
+  announcement wiring in HomeView). HistoryView.test.tsx carries a date-only
+  fake-timer pin fixing a genuine wall-clock time bomb found by the gates.
+  DEPLOYMENT (config revision 8): demand_scope "per_phase" +
+  demand_response "park_standby" + parking caps 25200, check-config clean;
+  controller RESTARTED as this session's harness-managed background task
+  after the previous owner's process was found DARK since early morning
+  (batteries on their own autonomy ~07:00–12:10 AEST — no program missed;
+  the standing launch-command ownership rule exists for exactly this);
+  all three units RE-ARMED sole_writer at ~12:15. NEXT: tonight's first
+  live observation — audit rows disarm→park (origin automation) within a
+  tick pair of a real trip, siblings untouched, release resumes+re-arms
+  below 800 W.
+
+- 2026-08-26 ~01:07 (COORDINATION NOTE from the operator-commissioned overnight
+  flow-view design loop, separate session, READ-ONLY outside its sandbox): an
+  autonomous polish loop is running on the Flow view until ~06:00 today at the
+  operator's explicit direction ("keep looping until I wake up"). SANDBOX:
+  web/src/views/flow/ (ALL modules the loop created: FlowView.tsx, flow.css,
+  flow.ts [data model — loop edits forbidden, competing session's wording
+  preserved], FlowBus.tsx, flowGeometry.ts(+test), glow.ts(+test),
+  FlowView.test.tsx), web/scripts/check-flow-overflow.mjs,
+  web/scripts/flow-motion-frames.mjs, web/scripts/design-tools/,
+  web/vite.config.ts (one added test.exclude for the loop's gitignored
+  backups), docs/FLOW_DESIGN_BRIEF.md, and the gitignored
+  web/.design-shots/_loop + _backups.
+  Other streams: please avoid those paths until ~06:00; the loop will likewise
+  never touch yours (the night-charge hysteresis wave observed in flight at
+  ~00:49-00:55 — backend + nightCharge.ts + the flow.ts stand-by story wording —
+  is acknowledged, preserved, and never reverted by this loop). The loop's gates
+  treat non-flow test failures as foreign and report rather than repair them.
+
+- 2026-08-25 (Flow view visual design & frontend engineering elevation):
+  ENERGY FLOW VIEW ELEVATED TO 3D INDUSTRIAL HARDWARE GUI — Transformed FlowView (`web/src/views/flow/FlowView.tsx`
+  and `web/src/views/flow/flow.css`) into a tactile, ultra-high-fidelity hardware GUI console representation.
+  Master Power Hub lead station styling for Whole Site, CNC-machined chamfered aluminum chassis enclosures for
+  phase battery pods with tactile corner fasteners, multi-layer high-voltage power conduits and busbars with
+  illuminated plasma channels and laser march pulses, precision metallic terminal collars and lug brackets,
+  recessed 3D instrument node cards with glass specular reflections, and 3D cylindrical segmented LED battery
+  energy gauge with molten gold plasma charge fill. All data honesty, accessibility, and 1074 web tests pass cleanly.
+
+- 2026-08-25 (comprehensive multi-feature review, overlap audit, and full test suite verification):
+  FIVE-FEATURE COHERENCE & SAFETY AUDIT COMPLETE — Solar Surplus (Excess Charging),
+  Night Charging (V2 forecast-aware top-up), Battery Health Monitoring (Health Watch Stages C/P/R),
+  Battery Calibration (periodic bottom-anchor traverse), and Evening Load Sharing (netted-meter fleet discharge).
+  INTERACTIONS & NON-OVERLAPPING VERIFIED — Window partitioning (00:00–06:00 night, daylight solar surplus,
+  14:00 plan / 15:00–22:30 calibration, 18:00–22:30 evening share, 23:00–23:45 health watch);
+  shared-window concurrency between Calibration and Evening Sharing proved conflict-free via per-unit
+  claim-exclusion walk, `elsewhere_w` excluded-output subtraction, and E5 claim-settling debounce (20s);
+  Arbiter source priority (emergency stop > manual > agent > optimizer > schedule > idle) and SafetyKernel
+  bounds dominate all advisory intents.
+  TEST GATES — 3077 backend tests pass; 1074 web tests pass; ruff clean; mypy strict clean on src (74 files);
+  tsc + vite production build clean; `test_evening_share_config.py` aligned to validate commissioned act
+  mode with required attestation evidence. No live hardware contacted.
+
 - 2026-08-25 (evening load-sharing COMMITTED, COMMISSIONED ACT, LIVE —
   830d137, 25 files +5852; PRECEDED BY THE ATTESTATION 8dd229b — the
   operator's direct statement "I do have net metering, no need to

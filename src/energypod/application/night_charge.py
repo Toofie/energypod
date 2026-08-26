@@ -15,10 +15,16 @@ This module holds NO new authority anywhere (the excess-adviser doctrine):
 - it submits ordinary ``OPTIMIZER`` charge intents — a night charge is an
   ordinary intent judged by the arbiter, allocator, SafetyKernel, and actor
   exactly as a manual request is;
-- hand-back at window end is ALWAYS by non-renewal: the adviser never writes
-  a register, never posts a stop triple, and never submits an idle or
-  zero-watt intent.  When it stops renewing, the intent lapses by TTL and the
-  ~3.5-4.0 s firmware watchdog returns the pod to its own autonomy.
+- hand-back at window end is ALWAYS by non-renewal: under the DEFAULT hold
+  posture the adviser never writes a register, never posts a stop triple,
+  and never submits an idle or zero-watt intent.  When it stops renewing,
+  the intent lapses by TTL and the ~3.5-4.0 s firmware watchdog returns the
+  pod to its own autonomy.  The ONE sanctioned exception is the commissioned
+  ``park_standby`` demand response (operator directive 2026-08-26): a heavy
+  phase's OWN load word parks THAT battery via the ParkController lease
+  (vendor Standby 0x8000<-1) through the composer's granted internal twins —
+  every parking guard judges the act exactly as it judges an operator's,
+  and the default ``hold`` posture composes no park port at all.
 
 The demand rule's source of truth is the per-pod LOAD CT words
 (``load_power_w``, 0x1000+20), NEVER the grid words — the design's one
@@ -35,9 +41,10 @@ the commissioned ``hold_rate_w``, its renewed charge objective replacing
 the pod's CT-following autonomy (the beat-autonomy doctrine), so the
 battery discharges nothing and the cheap off-peak grid serves the heavy
 load while the stored solar evening is preserved.  The hold rides the
-ordinary intent path (never park, never 0x8000), is renewed on the tick
-cadence, and lifts below ``threshold - hysteresis`` to the capped pace —
-or releases at window close by non-renewal.  The fail-closed polarity is
+ordinary intent path (never park under the hold posture), is renewed on
+the tick cadence, and lifts below ``threshold - hysteresis`` to the capped
+pace — or releases at window close by non-renewal.  The fail-closed
+polarity is
 the unchanged SAFETY DOCTRINE: missing/bad/stale evidence HOLDS at
 ``hold_rate_w`` too — the evidence-failure fallback rate and never a
 demand behavior — because standby answers measured demand, never missing
@@ -73,6 +80,7 @@ from typing import Any, Final, Literal, Protocol, TypeGuard
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from energypod.application.parking import PARK_READBACK_UNVERIFIED, PARK_WRITE_FAILED
 from energypod.domain import DataQuality, Direction, IntentSource, UnitLifecycle
 from energypod.domain.audit import AuditEvent
 
@@ -111,6 +119,10 @@ Action = Literal["idle", "propose", "renew", "withdraw"]
 # operator's directive 2026-08-26).  ``holding_on_demand`` is the fail-closed
 # evidence hold alone: the same positive ``hold_rate_w`` charge kept while
 # the demand word is missing/bad/stale, never a demand behavior.
+# ``standing_by_parked`` is the TRUE STANDBY posture's UNIT phase only (a
+# parked battery answers neither charge nor discharge): it renders our
+# standby units' rows under ``park_standby`` and NEVER enters the fleet
+# vocabulary — zero new payload keys, transitions ride reason_codes alone.
 NightPhase = Literal[
     "idle", "pacing", "holding_on_demand", "standing_by_on_demand", "complete", "skipped_full"
 ]
@@ -118,6 +130,7 @@ NightUnitPhase = Literal[
     "pacing",
     "holding_on_demand",
     "standing_by_on_demand",
+    "standing_by_parked",
     "skipped_full",
     "complete",
     "sitting_out",
@@ -187,6 +200,48 @@ _FALLBACK_CODES: Final[frozenset[str]] = frozenset(
 
 _NIGHT_PRINCIPAL = "energypod:night-adviser"
 _NIGHT_POLICY_VERSION = "night-1"
+
+# --- the TRUE STANDBY posture (`park_standby`, operator directive 2026-08-26) -------
+#
+# The demand response selector: ``hold`` (the default, exact v1 identity —
+# the measured stand-down INTO THE HOLD is THE demand behavior and nothing
+# is ever parked) or ``park_standby`` (the ONE sanctioned exception: a heavy
+# phase's OWN measured load word parks THAT battery via the ParkController
+# lease, vendor Standby 0x8000<-1, under the composer's granted principal).
+DemandResponse = Literal["hold", "park_standby"]
+
+# The park reason every standby lease carries, and the six additive reason
+# codes (23→29) the projection's vocabulary gains — ZERO new payload keys:
+# transitions publish through reason_codes membership in the semantic tuple.
+NIGHT_STANDBY_PARK_REASON: Final[str] = "night_demand_standby"
+REASON_NIGHT_STANDBY_PARKED: Final[str] = "night_standby_parked"
+REASON_NIGHT_STANDBY_PARK_REFUSED: Final[str] = "night_standby_park_refused"
+REASON_NIGHT_STANDBY_RELEASE_FAILED: Final[str] = "night_standby_release_failed"
+REASON_NIGHT_STANDBY_RELEASE_UNVERIFIED: Final[str] = "night_standby_release_unverified"
+REASON_NIGHT_STANDBY_REARM_FAILED: Final[str] = "night_standby_rearm_failed"
+REASON_NIGHT_STANDBY_ADOPTED: Final[str] = "night_standby_adopted"
+
+# The engage lease arithmetic: the lease spans the OPEN window plus 120 s of
+# margin (cross-midnight aware through ``open_window_end``), floored at a
+# minute and capped by the commissioned ``max_lease_s`` — window-sized leases
+# make the renewal sweep vestigial and expiry stays ALARM-ONLY.
+_STANDBY_LEASE_MARGIN_S: Final[int] = 120
+_STANDBY_MIN_LEASE_S: Final[int] = 60
+_DEFAULT_MAX_LEASE_S: Final[int] = 14_400
+# Renewal zone: an OURS lease expiring inside 600 s gets ONE recomputed park;
+# the attempt is blocked until the view's expiry MOVES (one renewal per zone
+# entry — never churn against a cap the budget already spent).
+_STANDBY_RENEWAL_ZONE_S: Final[float] = 600.0
+# Refusal ladder rungs: >= 3 consecutive conflict-class refusals latch the
+# unit to the trickle-hold FOR THE WINDOW; a write-failure gets exactly ONE
+# scripted re-issue, and its second failure latches too.  A readback-
+# unverified terminal excludes the unit with no further writes at all.
+_STANDBY_CONFLICT_LATCH: Final[int] = 3
+_STANDBY_WRITE_REISSUE_LIMIT: Final[int] = 2
+
+# The request-id correlation every standby act carries: one per unit per
+# window, deterministic from the window's morning date.
+_STANDBY_REQUEST_PREFIX: Final[str] = "night-standby"
 
 
 @dataclass(frozen=True, slots=True)
@@ -516,6 +571,14 @@ class NightChargeSettings:
     retarget_threshold_pct: float = 20.0
     retarget_min_gap_min: int = 60
     stale_after_s: float = 3600.0
+    # --- the TRUE STANDBY posture (operator directive 2026-08-26); both keys
+    # default to the v1-hold identity and are never consulted under ``hold``
+    # -----------------------------------------------------------------------
+    demand_response: DemandResponse = "hold"
+    # The site's commissioned anti-rollover lease cap (parking.max_lease_s):
+    # the ceiling of the engage lease arithmetic, mirrored here so the
+    # adviser never guesses the composer's bound.
+    max_lease_s: int = _DEFAULT_MAX_LEASE_S
 
 
 class _Clock(Protocol):
@@ -558,6 +621,52 @@ class _ParticipationPort(Protocol):
     def __call__(self) -> str | None: ...
 
 
+class _ParkControlPort(Protocol):
+    """The standby composer's ONE mode-write reach: the ParkController itself.
+
+    Cloned from health-watch Stage R verbatim (§12): ``park_standby`` drives
+    the existing ``park``/``resume`` mutations under the night adviser's
+    composed principal, so every parking guard (conflict, vendor word, lease
+    epochs, durable-first rows, the ``{0, 1}`` transport bound) judges a
+    standby act exactly as it judges an operator's.  No other method of the
+    controller is reachable from here, and this module holds no transport of
+    its own.
+    """
+
+    async def park(
+        self,
+        unit_id: str,
+        *,
+        reason: str,
+        principal_subject: str,
+        request_id: str,
+        lease_s: int | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def resume(
+        self, unit_id: str, *, principal_subject: str, request_id: str
+    ) -> dict[str, Any]: ...
+
+
+class _LifecyclePort(Protocol):
+    """One facade internal twin: the standby engage's disarm (stop-direction)
+    or the release's ONE bounded re-arm.  Cloned from health-watch §7.2/§7.4
+    verbatim; composition wires these — they are never routed on REST or MCP.
+    """
+
+    async def __call__(self, *, unit_id: str) -> Mapping[str, Any]: ...
+
+
+class _StandbyLeasesView(Protocol):
+    """The composer's suppressing lease-view closure: ``{unit: lease
+    payload}`` from the ParkController's lease mirror (the shape of
+    ``_parked_units``, one row per parked lease).  Adoption, the never-fight
+    reconciliation, and the renewal sweep all read THIS view and nothing
+    else; a failing view is swallowed upstream and reads as empty."""
+
+    def __call__(self) -> dict[str, dict[str, Any]]: ...
+
+
 class NightChargeAdviser:
     """One short-TTL CHARGE intent per tick, renewed remove-then-submit.
 
@@ -587,6 +696,10 @@ class NightChargeAdviser:
         revision_sink: _RevisionSinkPort | None = None,
         retarget_history: _RetargetHistoryPort | None = None,
         morning_archive_sink: Callable[[Any], None] | None = None,
+        park_control: _ParkControlPort | None = None,
+        disarm: _LifecyclePort | None = None,
+        arm: _LifecyclePort | None = None,
+        standby_leases: _StandbyLeasesView | None = None,
     ) -> None:
         self._settings = settings
         self._policy = policy
@@ -601,6 +714,15 @@ class NightChargeAdviser:
         # standing refusal would violate the never-retry-a-denied-dispatch
         # doctrine.  ``None`` (isolated compositions) excludes nothing.
         self._parked_units = parked_units
+        # --- the TRUE STANDBY posture (operator directive 2026-08-26).  All
+        # four ports are optional and ``None`` under the default ``hold``
+        # posture, so isolated compositions stay byte-identical; the
+        # composer wires them ONLY for ``demand_response == "park_standby"``
+        # (the SECOND composer exception, fenced exactly like Stage R §12).
+        self._park_control = park_control
+        self._disarm_port = disarm
+        self._arm_port = arm
+        self._standby_leases = standby_leases
         # --- V2: the injected forecast port (§2.7), the trust word, and the
         # durable revision rows (A6).  All optional so isolated v1
         # compositions stay byte-identical; a forecast posture without its
@@ -636,6 +758,28 @@ class NightChargeAdviser:
         self._window_final_soc: dict[str, float] = {}
         self._window_morning_date: date | None = None
         self._pending_notice: dict[str, Any] | None = None
+        # --- TRUE STANDBY window-scoped state (§2 of the park_standby
+        # amendment).  The map is unit -> request_id for OUR standby parks
+        # only; the counters implement the refusal ladder's consecutive
+        # rungs; the never-repark set honors operator/foreign acts; the
+        # closing stash carries parks across the window boundary so EVERY
+        # exit path releases (a timer is not a principal — expiry stays
+        # alarm-only, so the release is OURS to perform).
+        self._standby_parked: dict[str, str] = {}
+        self._standby_closing: dict[str, str] = {}
+        self._standby_conflicts: dict[str, int] = {}
+        self._standby_write_fails: dict[str, int] = {}
+        self._standby_unverified: set[str] = set()
+        self._standby_release_terminal: set[str] = set()
+        self._standby_never_repark: set[str] = set()
+        # Renewal bookkeeping: the last expires_at string we attempted (or
+        # failed) a renewal for, per unit — one renewal per zone entry.
+        self._standby_renew_attempted: dict[str, str] = {}
+        # The one-shot boot-adoption flag and the loud-forever latch flags.
+        self._standby_adopt_done = False
+        self._standby_adopted_now = False
+        self._standby_refused_latch_loud = False
+        self._standby_release_unverified_loud = False
 
     @property
     def held_intent_id(self) -> str | None:
@@ -660,23 +804,41 @@ class NightChargeAdviser:
             # Participation is read AT TICK START (the excess P6 shape): a
             # disabled tick withdraws-if-held exactly once by removal and
             # idles carrying the projection's own participation reason code.
-            return await self._standby("idle", window_now, _NO_READING, (verdict,), ())
+            # The disable toggle is an EXIT PATH: every standby park is
+            # released (resume + re-arm) BEFORE the idle frame returns — a
+            # disabled night never leaves pods answering neither charge nor
+            # discharge.  BOTH maps are read: a verdict landing on the very
+            # tick the window closes finds the parks already moved into the
+            # closing stash by the boundary roll, and a stash behind this
+            # early return would strand them there for as long as the night
+            # stays disabled.  Failures stay mapped for the next disabled
+            # tick's idempotent retry; successes drain spend-once.
+            release_codes = await self._standby_release_all(self._standby_parked)
+            close_codes = await self._standby_release_all(self._standby_closing)
+            codes: tuple[str, ...] = (verdict, *release_codes, *close_codes)
+            return await self._standby("idle", window_now, _NO_READING, codes, ())
         if not window_now:
             # Window end is NON-RENEWAL: remove, then the TTL lapse and the
             # ~3.5-4.0 s watchdog return each pod to its own autonomy.  A
             # forecast window that closed below target leaves the §5.4/A5
             # morning notice on this close frame (the projection latches it
-            # until midday_local).
+            # until midday_local).  The close is ALSO the standby exit path:
+            # the boundary roll stashed the park map, and it is released
+            # here BEFORE the frame returns — a timer is not a principal,
+            # expiry stays alarm-only, so the release is ours to perform.
             notice = self._pending_notice
             self._pending_notice = None
-            codes: tuple[str, ...] = ("outside_window",)
+            close_codes = await self._standby_release_all(self._standby_closing)
+            out_codes: tuple[str, ...] = ("outside_window",)
             if notice is not None:
-                codes = ("outside_window", REASON_WINDOW_CLOSED_BELOW_TARGET)
+                out_codes = ("outside_window", REASON_WINDOW_CLOSED_BELOW_TARGET)
+            if close_codes:
+                out_codes = (*out_codes, *close_codes)
             return await self._standby(
                 "idle",
                 False,
                 _NO_READING,
-                codes,
+                out_codes,
                 (),
                 morning_notice=notice,
             )
@@ -709,6 +871,14 @@ class NightChargeAdviser:
             )
         claimed = self._claimed_units(active)
 
+        # --- TRUE STANDBY bookkeeping before the walk (both one-shot per
+        # window): boot-reconstructed OURS leases are adopted (bookkeeping
+        # only — never an act), and mapped units whose lease view no longer
+        # carries our marker (the operator's Resume, a foreign re-park) are
+        # dropped and honored — never fought, never re-parked.
+        self._standby_adopt(wall)
+        self._standby_reconcile()
+
         plans: list[NightUnitPlan] = []
         participating: list[str] = []
         held_units: list[str] = []
@@ -739,16 +909,42 @@ class NightChargeAdviser:
         if not participating:
             # A stand-down unit always participates now (its hold IS the
             # submission), so this is the completion/sit-out close only.
-            reasons = ("window_open", *_no_participant_reasons(tuple(plans)))
+            reasons = (
+                "window_open",
+                *_no_participant_reasons(tuple(plans)),
+                # The standby words ride this close too: a window whose every
+                # unit is parked/adopted still names the truth loudly.
+                *self._standby_frame_codes(),
+            )
             return await self._standby(
                 _completion_phase(tuple(plans)), True, reading, reasons, tuple(plans)
             )
+
+        action: Action = "renew" if self._submitted_this_window else "propose"
+        await self._remove_held()
+        # The TRUE STANDBY engage choreography rides the remove→submit gap
+        # exactly as pinned: old intent OUT, then ≤1 release and ≤1 engage
+        # (disarm twin → park → exclusion), THEN the new submission — which
+        # carries the result.  Submission happens LAST.
+        engaged_from_hold = bool(held_units)
+        standby_excluded, standby_codes = await self._advance_standby(
+            reading, plans, remaining_s, wall
+        )
+        for excluded_unit in standby_excluded:
+            if excluded_unit in participating:
+                participating.remove(excluded_unit)
+            standing_units[:] = [item for item in standing_units if item != excluded_unit]
+            held_units[:] = [item for item in held_units if item != excluded_unit]
+        participating_set = set(participating)
 
         # The demand response's fleet code (either posture): the evidence
         # word's code outranks the plain threshold code (the loud
         # never-silent-hold requirement), and the tick that releases the
         # response says demand_below_exit (the resumed units are pacing by
-        # then — the code names the transition).
+        # then — the code names the transition).  Assembled AFTER the gap so
+        # a standby release performed inside it names the transition too —
+        # and a measured engage names the threshold it answered even though
+        # its unit left the submission into the park.
         if held_units:
             if reading.evidence != "good":
                 hold_code = f"demand_evidence_{reading.evidence}"
@@ -756,7 +952,12 @@ class NightChargeAdviser:
                 hold_code = "demand_above_threshold"
             reason_codes: tuple[str, ...] = ("window_open", hold_code)
         elif self._resumed_this_tick:
+            # A standby release performed inside the gap names its transition.
             reason_codes = ("window_open", "demand_below_exit")
+        elif engaged_from_hold:
+            # The measured engage left the submission INTO the park this very
+            # tick: the frame still names the threshold it answered.
+            reason_codes = ("window_open", "demand_above_threshold")
         elif at_risk:
             reason_codes = ("window_open", "deadline_at_risk")
         else:
@@ -765,14 +966,25 @@ class NightChargeAdviser:
             # §3.3's loud fallback: the ladder's word rides every frame the
             # window publishes after the computation was abandoned.
             reason_codes = (*reason_codes, self._window_abandoned)
+        reason_codes = (*reason_codes, *standby_codes, *self._standby_frame_codes())
+        if not participating:
+            # The gap consumed the WHOLE submission: the tick's one engagement
+            # (or its readback-unverified refusal) was the last participant's,
+            # so there is nothing left to submit — and an empty selection is
+            # a facade refusal, never a tick.  The close frame carries what
+            # the tick did (the threshold code above when it engaged, the
+            # standby words either way); the old intent is already out by the
+            # remove, which for an all-parked fleet is exactly the hand-back.
+            return await self._standby(
+                _completion_phase(tuple(plans)), True, reading, reason_codes, tuple(plans)
+            )
 
-        action: Action = "renew" if self._submitted_this_window else "propose"
         targets_by_unit = {
             plan.unit_id: plan.target_w
             for plan in plans
-            if plan.phase in ("pacing", "holding_on_demand", "standing_by_on_demand")
+            if plan.unit_id in participating_set
+            and plan.phase in ("pacing", "holding_on_demand", "standing_by_on_demand")
         }
-        await self._remove_held()
         result = await self._submit(
             unit_ids=sorted(participating),
             direction=Direction.CHARGE,
@@ -808,9 +1020,17 @@ class NightChargeAdviser:
     # --- internals -------------------------------------------------------
 
     def _roll_window_state(self, window_now: bool) -> None:
-        """Reset the window-scoped latches at every boundary crossing."""
+        """Reset the window-scoped latches at every boundary crossing.
+
+        On the CLOSE crossing the standby park map moves to the closing
+        stash instead of being discarded — the outside frames then release
+        every parked unit (window close is an exit path; expiry alone is
+        alarm-only and would otherwise leave pods parked unowned).
+        """
         if window_now == self._window_open:
             return
+        closing = dict(self._standby_parked) if self._window_open and not window_now else {}
+        self._standby_closing = closing
         if self._window_open and not window_now and self._window_target is not None:
             # §5.4/A5: a forecast window closing below target leaves the
             # honest notice -- lost window time is unrecoverable, the morning
@@ -842,6 +1062,20 @@ class NightChargeAdviser:
         self._completed_targets = {}
         self._window_final_soc = {}
         self._window_morning_date = None
+        # The standby state is window-scoped throughout: a fresh window
+        # opens with an empty map, fresh ladder counters, and a fresh
+        # one-shot adoption flag (the closing stash was captured above).
+        self._standby_parked = {}
+        self._standby_conflicts = {}
+        self._standby_write_fails = {}
+        self._standby_unverified = set()
+        self._standby_release_terminal = set()
+        self._standby_never_repark = set()
+        self._standby_renew_attempted = {}
+        self._standby_adopt_done = False
+        self._standby_adopted_now = False
+        self._standby_refused_latch_loud = False
+        self._standby_release_unverified_loud = False
 
     # --- V2: the forecast evaluation (§2 at open, §5.2 on revision) ------
 
@@ -947,9 +1181,7 @@ class NightChargeAdviser:
                     )
                 )
 
-    async def _maybe_revise(
-        self, credit: MorningCredit, morning: date, now: datetime
-    ) -> None:
+    async def _maybe_revise(self, credit: MorningCredit, morning: date, now: datetime) -> None:
         """§5.2: a materially changed forecast re-targets the still-charging
         units, both directions, under the DURABLE caps (A6)."""
         assert self._window_credit is not None  # guarded by the caller
@@ -965,11 +1197,7 @@ class NightChargeAdviser:
             # seen, the target stands.
             self._window_evaluated_fetch = credit.fetched_at
             return
-        history = (
-            ()
-            if self._retarget_history is None
-            else tuple(self._retarget_history(morning))
-        )
+        history = () if self._retarget_history is None else tuple(self._retarget_history(morning))
         if len(history) >= _RETARGET_MAX_PER_WINDOW:
             return  # the window's durable budget is spent
         if history:
@@ -1066,9 +1294,7 @@ class NightChargeAdviser:
             "source": credit.source,
             "quantile": credit.quantile,
             "issued_at": None if credit.issued_at is None else credit.issued_at.isoformat(),
-            "fetched_at": None
-            if credit.fetched_at is None
-            else credit.fetched_at.isoformat(),
+            "fetched_at": None if credit.fetched_at is None else credit.fetched_at.isoformat(),
             "e_surplus_kwh": credit.e_surplus_kwh,
             "e_deficit_kwh": credit.e_deficit_kwh,
             "e_credit_kwh": self._credit_kwh(credit),
@@ -1085,11 +1311,9 @@ class NightChargeAdviser:
         if credit is None or target is None:
             return None
         first_unit = self._settings.unit_ids[0] if self._settings.unit_ids else "fleet"
-        window_end = open_window_end(
-            self._clock.wall_now(), self._settings.windows, self._zone
-        )
-        end_wall = "--:--" if window_end is None else window_end.astimezone(self._zone).strftime(
-            "%H:%M"
+        window_end = open_window_end(self._clock.wall_now(), self._settings.windows, self._zone)
+        end_wall = (
+            "--:--" if window_end is None else window_end.astimezone(self._zone).strftime("%H:%M")
         )
         source = credit.source or "forecast"
         quantile_word = (
@@ -1172,12 +1396,8 @@ class NightChargeAdviser:
             "forecast": {
                 "source": credit.source,
                 "quantile": credit.quantile,
-                "fetched_at": None
-                if credit.fetched_at is None
-                else credit.fetched_at.isoformat(),
-                "issued_at": None
-                if credit.issued_at is None
-                else credit.issued_at.isoformat(),
+                "fetched_at": None if credit.fetched_at is None else credit.fetched_at.isoformat(),
+                "issued_at": None if credit.issued_at is None else credit.issued_at.isoformat(),
             },
             "slots": [
                 {
@@ -1215,15 +1435,11 @@ class NightChargeAdviser:
             "forecast": {
                 "source": credit.source,
                 "quantile": credit.quantile,
-                "fetched_at": None
-                if credit.fetched_at is None
-                else credit.fetched_at.isoformat(),
+                "fetched_at": None if credit.fetched_at is None else credit.fetched_at.isoformat(),
                 "previous_fetched_at": None
                 if previous_fetched_at is None
                 else previous_fetched_at.isoformat(),
-                "issued_at": None
-                if credit.issued_at is None
-                else credit.issued_at.isoformat(),
+                "issued_at": None if credit.issued_at is None else credit.issued_at.isoformat(),
             },
         }
         await self._append_night_row("night_target_revised", payload, (direction,), "revised")
@@ -1338,9 +1554,37 @@ class NightChargeAdviser:
         # 1. Eligibility, each sit-out honest (never a fabricated target).
         if observation is None:
             return self._sitting_out(unit_id, "no_charge_headroom", None), False, False
+        if unit_id in self._standby_unverified:
+            # Ladder rung PARK_READBACK_UNVERIFIED, terminal for the window:
+            # the pod MAY be parked in an unknown state, so it is excluded
+            # outright — not even the hold-rate cover commands it again.
+            return (
+                self._sitting_out(unit_id, REASON_NIGHT_STANDBY_PARK_REFUSED, observation),
+                False,
+                False,
+            )
+        if unit_id in self._standby_parked:
+            # OUR standby unit renders the truth: TRUE STANDBY answers neither
+            # charge nor discharge (the new UNIT phase only — never the fleet
+            # vocabulary), zero watts, the additive code riding reason alone.
+            soc = getattr(observation, "authoritative_soc_pct", None)
+            return (
+                NightUnitPlan(
+                    unit_id,
+                    soc if _finite_number(soc) else None,
+                    "standing_by_parked",
+                    0,
+                    REASON_NIGHT_STANDBY_PARKED,
+                    self._unit_target_pct(),
+                ),
+                False,
+                False,
+            )
         if unit_id in self._parked_view():
             # DESIGN_POD_PARKING section 3: the parked exclusion outranks
             # units_disarmed for a parked unit -- resume is the next step.
+            # Operator and foreign standby leases land here too (never ours
+            # to touch): sitting out, honored, never fought.
             return self._sitting_out(unit_id, "unit_parked", observation), False, False
         lifecycle = getattr(observation, "lifecycle", None)
         if lifecycle not in _CONTROLLABLE_LIFECYCLES:
@@ -1515,14 +1759,344 @@ class NightChargeAdviser:
             self._holding_fleet = held
 
     def _parked_view(self) -> frozenset[str]:
-        """The parked-unit selection view; a failing view excludes nothing."""
-        if self._parked_units is None:
-            return frozenset()
-        try:
-            units = self._parked_units()
-        except Exception:
-            return frozenset()
+        """The parked-unit selection view; a failing view excludes nothing.
+
+        Under the standby posture the lease-payload view's keys ride the same
+        exclusion: an operator's or a foreign writer's park holds the unit out
+        of the submission exactly as the parked port does (never ours to
+        touch, never fought).
+        """
+        units: set[str] = set()
+        if self._parked_units is not None:
+            with contextlib.suppress(Exception):
+                units.update(self._parked_units())
+        with contextlib.suppress(Exception):
+            units.update(self._standby_lease_view())
         return frozenset(units)
+
+    def _standby_lease_view(self) -> dict[str, dict[str, Any]]:
+        """The suppressing lease-view read: an absent or failing view is
+        empty — the posture then simply has nothing to adopt, reconcile,
+        renew, or honor."""
+        if self._standby_leases is None:
+            return {}
+        try:
+            views = self._standby_leases()
+        except Exception:
+            return {}
+        return views if isinstance(views, dict) else {}
+
+    def _standby_morning(self, wall: datetime) -> date:
+        """The civil morning the open window belongs to (request-id half)."""
+        ends = open_window_end(wall, self._settings.windows, self._zone)
+        if ends is None:  # pragma: no cover - the advance only runs in-window
+            return wall.astimezone(self._zone).date()
+        return ends.astimezone(self._zone).date()
+
+    def _standby_request_id(self, unit_id: str, wall: datetime) -> str:
+        """One deterministic correlation per unit per window."""
+        return f"{_STANDBY_REQUEST_PREFIX}:{unit_id}:{self._standby_morning(wall).isoformat()}"
+
+    def _standby_lease_s(self, remaining_s: float) -> int:
+        """Window-sized engage leases: the open window plus 120 s of margin,
+        floored at a minute and capped by the commissioned ``max_lease_s``."""
+        cap = int(self._settings.max_lease_s)
+        return min(max(_STANDBY_MIN_LEASE_S, int(remaining_s) + _STANDBY_LEASE_MARGIN_S), cap)
+
+    def _standby_row_is_ours(self, row: Any) -> bool:
+        """Whether a lease-view row carries OUR marker (authorizer and reason
+        together — either alone names someone else's park)."""
+        return (
+            isinstance(row, Mapping)
+            and row.get("authorizer") == _NIGHT_PRINCIPAL
+            and row.get("reason") == NIGHT_STANDBY_PARK_REASON
+        )
+
+    def _standby_adopt(self, wall: datetime) -> None:
+        """One-shot per window: boot-reconstructed OURS leases come back into
+        the map.  Bookkeeping ONLY — never an act, never a re-park, never a
+        resume; operator and foreign leases are not ours and are left alone.
+        The adopted-now word rides exactly one frame (the adopting tick)."""
+        self._standby_adopted_now = False
+        if self._standby_adopt_done or self._standby_leases is None:
+            return
+        self._standby_adopt_done = True
+        view = self._standby_lease_view()
+        adopted = False
+        for unit_id in self._settings.unit_ids:
+            if unit_id in self._standby_parked or unit_id in self._standby_never_repark:
+                continue
+            row = view.get(unit_id)
+            if not self._standby_row_is_ours(row):
+                continue
+            self._standby_parked[unit_id] = self._standby_request_id(unit_id, wall)
+            adopted = True
+        self._standby_adopted_now = adopted
+
+    def _standby_reconcile(self) -> None:
+        """Never fight: a mapped unit whose lease view no longer carries our
+        marker was RESUMED by the operator or overtaken by a foreign writer.
+        Dropped and honored for the window (``_standby_never_repark``), its
+        ladder bookkeeping cleared with it."""
+        if self._standby_leases is None:
+            return
+        view = self._standby_lease_view()
+        for unit_id in list(self._standby_parked):
+            if self._standby_row_is_ours(view.get(unit_id)):
+                continue
+            del self._standby_parked[unit_id]
+            self._standby_never_repark.add(unit_id)
+            self._standby_conflicts.pop(unit_id, None)
+            self._standby_write_fails.pop(unit_id, None)
+            self._standby_renew_attempted.pop(unit_id, None)
+            self._standby_release_terminal.discard(unit_id)
+
+    async def _standby_release_one(
+        self, unit_id: str, *, request_id: str
+    ) -> tuple[tuple[str, ...], bool]:
+        """The release choreography for ONE mapped unit: resume lifts the
+        vendor standby, then the ONE bounded re-arm restores the kernel's
+        control.  Returns ``(codes, covered)`` — ``covered`` when the unit may
+        ride this tick's submission again.
+
+        A failed resume KEEPS the unit mapped (idempotent retry next tick,
+        loud each failing tick); an unverified resume goes TERMINAL for the
+        window (unknown standby state — no further writes at all).  A refused
+        re-arm is NOT a release failure: the release stands, the unit sits
+        DISARMED (= cannot discharge, the safe side), the alert code lands
+        once, and the act is the operator's now.
+        """
+        control = self._park_control
+        if control is None:  # pragma: no cover - the advance guards the port
+            return (), False
+        try:
+            await control.resume(unit_id, principal_subject=_NIGHT_PRINCIPAL, request_id=request_id)
+        except Exception as error:
+            if getattr(error, "code", "") == PARK_READBACK_UNVERIFIED:
+                self._standby_release_terminal.add(unit_id)
+                return (REASON_NIGHT_STANDBY_RELEASE_UNVERIFIED,), False
+            return (REASON_NIGHT_STANDBY_RELEASE_FAILED,), False
+        # Released: off every map whatever the re-arm does.
+        self._standby_parked.pop(unit_id, None)
+        self._standby_conflicts.pop(unit_id, None)
+        self._standby_write_fails.pop(unit_id, None)
+        self._standby_renew_attempted.pop(unit_id, None)
+        self._standby_release_terminal.discard(unit_id)
+        arm_port = self._arm_port
+        if arm_port is not None:
+            outcome: Any
+            try:
+                outcome = await arm_port(unit_id=unit_id)
+            except Exception:
+                return (REASON_NIGHT_STANDBY_REARM_FAILED,), False
+            if not isinstance(outcome, Mapping) or outcome.get("status") != "armed":
+                return (REASON_NIGHT_STANDBY_REARM_FAILED,), False
+        self._resumed_this_tick = True
+        return (), True
+
+    async def _standby_release_all(self, mapped: dict[str, str]) -> tuple[str, ...]:
+        """EVERY exit path's release: window close, disable toggle — each
+        still-mapped unit gets the full resume + re-arm choreography BEFORE
+        the frame returns (a timer is not a principal and expiry stays
+        alarm-only, so the release is ours to perform).  Failures stay mapped
+        for the next tick's idempotent retry; successes drain spend-once;
+        terminal-for-window units take no further writes from anyone."""
+        codes: list[str] = []
+        for unit_id in list(mapped):
+            if unit_id in self._standby_release_terminal:
+                continue
+            request_id = mapped.get(unit_id) or ""
+            unit_codes, _covered = await self._standby_release_one(unit_id, request_id=request_id)
+            codes.extend(unit_codes)
+            if not unit_codes:
+                mapped.pop(unit_id, None)
+        return tuple(codes)
+
+    async def _advance_standby(
+        self,
+        reading: DemandReading,
+        plans: list[NightUnitPlan],
+        remaining_s: float,
+        wall: datetime,
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """The remove→submit gap's TRUE STANDBY choreography.
+
+        Ordering pinned by the amendment: ≤1 release first (the exit-bound
+        hysteresis lives here, the same threshold/exit arithmetic as
+        ``_unit_is_held``), then the renewal sweep (one recomputed park per
+        zone entry), then ≤1 engage — largest measured W first, disarm twin →
+        require disarmed → ``park`` under the deterministic request id → map +
+        exclude from THIS tick's submission.  Submission happens LAST, in the
+        caller.  Every refusal rung leaves the unit COVERED at ``hold_rate_w``
+        THIS TICK (the protected fallback) except the readback-unverified
+        terminal, which is excluded outright.
+        """
+        exclusions: list[str] = []
+        codes: list[str] = []
+        if self._settings.demand_response != "park_standby" or self._park_control is None:
+            return tuple(exclusions), tuple(codes)
+
+        # --- ≤1 release: GOOD own word strictly below threshold - hysteresis.
+        exit_bound = self._settings.demand_threshold_w - self._settings.demand_exit_hysteresis_w
+        released = False
+        for unit_id in list(self._standby_parked):
+            if released:
+                break
+            if unit_id in self._standby_release_terminal:
+                continue
+            if self._settings.demand_scope == "per_phase":
+                word = reading.per_unit.get(unit_id, "missing")
+                unit_w = reading.per_unit_w.get(unit_id)
+            else:  # pragma: no cover - validation refuses fleet-scope standby
+                word, unit_w = reading.evidence, reading.demand_w
+            if word != "good" or unit_w is None or unit_w >= exit_bound:
+                continue
+            unit_codes, _covered = await self._standby_release_one(
+                unit_id, request_id=self._standby_parked.get(unit_id, "")
+            )
+            codes.extend(unit_codes)
+            released = True
+
+        # --- the renewal sweep: OURS leases expiring inside the zone get ONE
+        # recomputed park per zone entry (the attempted-expiry record blocks
+        # churn against a budget that cannot move); a refusal stays loud and
+        # inert — never resumed to dodge a cap, never cycled.
+        write_spent = released
+        view = self._standby_lease_view()
+        for unit_id in list(self._standby_parked):
+            if write_spent:
+                break
+            row = view.get(unit_id)
+            if not self._standby_row_is_ours(row) or isinstance(row, bool):
+                continue
+            assert isinstance(row, Mapping)
+            expires_raw = row.get("expires_at")
+            if not isinstance(expires_raw, str):
+                continue
+            try:
+                expires = datetime.fromisoformat(expires_raw)
+            except ValueError:
+                continue
+            if (expires - wall).total_seconds() >= _STANDBY_RENEWAL_ZONE_S:
+                continue
+            if self._standby_renew_attempted.get(unit_id) == expires_raw:
+                continue
+            self._standby_renew_attempted[unit_id] = expires_raw
+            write_spent = True
+            try:
+                await self._park_control.park(
+                    unit_id,
+                    reason=NIGHT_STANDBY_PARK_REASON,
+                    principal_subject=_NIGHT_PRINCIPAL,
+                    request_id=self._standby_request_id(unit_id, wall),
+                    lease_s=self._standby_lease_s(remaining_s),
+                )
+            except Exception:
+                codes.append(REASON_NIGHT_STANDBY_PARK_REFUSED)
+            break
+
+        # --- ≤1 engage: the largest-W measured-hold candidate, through the
+        # pinned disarm→park choreography inside the watchdog window.
+        if not write_spent:
+            candidates = [
+                plan
+                for plan in plans
+                if plan.phase == "standing_by_on_demand"
+                and plan.unit_id not in self._standby_never_repark
+                and plan.unit_id not in self._standby_unverified
+                and self._standby_conflicts.get(plan.unit_id, 0) < _STANDBY_CONFLICT_LATCH
+                and self._standby_write_fails.get(plan.unit_id, 0) < _STANDBY_WRITE_REISSUE_LIMIT
+            ]
+            if candidates:
+
+                def _heaviest_first(plan: NightUnitPlan) -> tuple[int, str]:
+                    # The largest measured OWN load parks first; a missing
+                    # word sorts last (a held candidate never has one).
+                    watts = reading.per_unit_w.get(plan.unit_id)
+                    return (-(watts if watts is not None else -1), plan.unit_id)
+
+                candidates.sort(key=_heaviest_first)
+                unit_id = candidates[0].unit_id
+                request_id = self._standby_request_id(unit_id, wall)
+                disarmed = False
+                if self._disarm_port is not None:
+                    outcome: Any
+                    try:
+                        outcome = await self._disarm_port(unit_id=unit_id)
+                    except Exception:
+                        outcome = None
+                    disarmed = isinstance(outcome, Mapping) and outcome.get("status") == "disarmed"
+                    if not disarmed:
+                        # Ladder rung: a refused stop-direction act is a
+                        # conflict-class refusal — covered at hold_rate_w this
+                        # tick, the consecutive counter advances.
+                        self._standby_conflicts[unit_id] = (
+                            self._standby_conflicts.get(unit_id, 0) + 1
+                        )
+                        codes.append(REASON_NIGHT_STANDBY_PARK_REFUSED)
+                if disarmed or self._disarm_port is None:
+                    try:
+                        await self._park_control.park(
+                            unit_id,
+                            reason=NIGHT_STANDBY_PARK_REASON,
+                            principal_subject=_NIGHT_PRINCIPAL,
+                            request_id=request_id,
+                            lease_s=self._standby_lease_s(remaining_s),
+                        )
+                    except Exception as error:
+                        code = getattr(error, "code", "")
+                        if code == PARK_READBACK_UNVERIFIED:
+                            # Terminal for the window: the pod MAY be parked
+                            # in an unknown state — excluded, loud, and no
+                            # further writes command it again.
+                            self._standby_unverified.add(unit_id)
+                            exclusions.append(unit_id)
+                            codes.append(REASON_NIGHT_STANDBY_PARK_REFUSED)
+                        elif code == PARK_WRITE_FAILED:
+                            # Rung 2: exactly ONE scripted re-issue next tick
+                            # (the limit IS two attempts); the second failure
+                            # latches past it.
+                            self._standby_write_fails[unit_id] = (
+                                self._standby_write_fails.get(unit_id, 0) + 1
+                            )
+                            codes.append(REASON_NIGHT_STANDBY_PARK_REFUSED)
+                        else:
+                            # Conflict-class (the guard saw a live claim, the
+                            # dawn corner, a cap): covered this tick, counter++
+                            # toward the three-conflict latch.
+                            self._standby_conflicts[unit_id] = (
+                                self._standby_conflicts.get(unit_id, 0) + 1
+                            )
+                            codes.append(REASON_NIGHT_STANDBY_PARK_REFUSED)
+                    else:
+                        # Landed: into the map, OUT of this tick's submission,
+                        # and off the hold latch — the band lives in the
+                        # advance now (identical no-flap guarantee).
+                        self._standby_parked[unit_id] = request_id
+                        self._standby_conflicts.pop(unit_id, None)
+                        self._standby_write_fails.pop(unit_id, None)
+                        self._latch_held(unit_id, held=False)
+                        exclusions.append(unit_id)
+        return tuple(exclusions), tuple(codes)
+
+    def _standby_frame_codes(self) -> tuple[str, ...]:
+        """The additive standby words riding every frame they name: the one-
+        shot adoption word, the parked word while any unit sits in TRUE
+        STANDBY (transitions publish through reason_codes membership alone),
+        and the loud-while-latched refusal word."""
+        codes: list[str] = []
+        if self._standby_adopted_now:
+            codes.append(REASON_NIGHT_STANDBY_ADOPTED)
+        if self._standby_parked:
+            codes.append(REASON_NIGHT_STANDBY_PARKED)
+        latched = any(
+            count >= _STANDBY_CONFLICT_LATCH for count in self._standby_conflicts.values()
+        ) or any(
+            count >= _STANDBY_WRITE_REISSUE_LIMIT for count in self._standby_write_fails.values()
+        )
+        if latched:
+            codes.append(REASON_NIGHT_STANDBY_PARK_REFUSED)
+        return tuple(codes)
 
     def _sitting_out(self, unit_id: str, reason: str, observation: Any) -> NightUnitPlan:
         soc = getattr(observation, "authoritative_soc_pct", None)
@@ -1738,6 +2312,11 @@ class NightChargeState:
         payload = self.payload()
         del payload["last_action"], payload["last_tick_at"]
         return payload
+
+    def __getitem__(self, key: str) -> Any:
+        """Mapping-style read over the §5 JSON shape — ``state()["units"]``
+        and ``state.units`` name the same fact."""
+        return self.payload()[key]
 
     def semantic_tuple(self) -> tuple[Any, ...]:
         """The §5 throttle tuple: the semantic state that triggers an event.
@@ -2068,9 +2647,7 @@ class NightChargeController:
         self._last_tick_at = self._clock.wall_now().isoformat()
         # --- V2: the forecast mirror and the once-per-window morning notice
         # latch (§8/A5 -- the projection holds it until midday_local).
-        self._last_forecast = (
-            None if decision.forecast is None else dict(decision.forecast)
-        )
+        self._last_forecast = None if decision.forecast is None else dict(decision.forecast)
         self._last_explanation = decision.explanation
         if decision.morning_notice is not None:
             self._morning_notice = dict(decision.morning_notice)
@@ -2104,9 +2681,16 @@ class NightChargeController:
 
 
 __all__ = [
+    "NIGHT_STANDBY_PARK_REASON",
     "REASON_DISABLED_BY_CONFIG",
     "REASON_DISABLED_BY_RUNTIME",
     "REASON_NIGHT_ACKNOWLEDGEMENT_REQUIRED",
+    "REASON_NIGHT_STANDBY_ADOPTED",
+    "REASON_NIGHT_STANDBY_PARKED",
+    "REASON_NIGHT_STANDBY_PARK_REFUSED",
+    "REASON_NIGHT_STANDBY_REARM_FAILED",
+    "REASON_NIGHT_STANDBY_RELEASE_FAILED",
+    "REASON_NIGHT_STANDBY_RELEASE_UNVERIFIED",
     "STATE_EVENT_HEARTBEAT_S",
     "STATE_EVENT_TYPE",
     "Action",
