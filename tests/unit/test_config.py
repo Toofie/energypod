@@ -1798,6 +1798,11 @@ def test_the_live_write_examples_night_block_validates_as_documented() -> None:
     payload["schedule"] = document["schedule"]
     payload["plant_history"] = document["plant_history"]
     payload["forecast_providers"] = document["forecast_providers"]
+    # The 2026-08-27 deployment couples `demand_response: park_standby` to a
+    # composed parking block (the standby wave's boot gate) — the example
+    # ships both, so the documented-parse fixture carries the pair together.
+    if "parking" in document:
+        payload["parking"] = document["parking"]
     payload["night_charging"] = document["night_charging"]
     parsed = ControllerConfig.model_validate(payload)
     assert parsed.night_charging is not None

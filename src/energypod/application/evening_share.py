@@ -52,6 +52,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Final, Protocol
 from zoneinfo import ZoneInfo
 
+from energypod.application.site_meter import SiteMeterPort
 from energypod.domain.audit import AuditEvent
 from energypod.domain.intents import Direction
 from energypod.domain.observations import UnitLifecycle
@@ -139,6 +140,10 @@ REASON_CLAIM_SETTLING: Final[str] = "claim_settling"
 REASON_NOT_DELIVERING: Final[str] = "not_delivering"
 REASON_SOC_FLOOR: Final[str] = "soc_floor"
 REASON_IMPLAUSIBLE: Final[str] = "grid_evidence_implausible"
+# v1.2/A1/A8: the one additive code — the fresh site-meter basis was LOST
+# (stale/unavailable reading) and the pod-word derived basis took over for
+# this tick.  Latched per loss-episode so it is loud once, not per-tick spam.
+REASON_SITE_METER_DEGRADED: Final[str] = "site_meter_degraded"
 
 
 class EveningShareRefusal(Exception):
@@ -170,6 +175,11 @@ class EveningShareSettings:
     spill_tolerance_w: int = 150
     import_tolerance_w: int = 100
     assumed_discharge_over_frac: float = 1.16
+    # v1.2/A5: the largest allowed move of the FILED total between consecutive
+    # meter-fresh ticks (the anti-duty-cycle bound); v1.2/A8's one setting.
+    slew_cap_w: int = 500
+    # v1.2/A1: how long a site-meter reading may govern after its capture.
+    site_meter_stale_after_s: float = 5.0
     frozen_word_ticks: int = 8
     frozen_flow_delta_w: int = 200
     delivery_move_floor_w: int = 400
@@ -665,6 +675,7 @@ class EveningShareAdviser:
         health_states: Callable[[], Awaitable[Mapping[str, Any]]],
         parked_units: Callable[[], frozenset[str]] | None = None,
         latched_stop_units: Callable[[], frozenset[str]] | None = None,
+        site_meter: SiteMeterPort | None = None,
         tariff: Mapping[str, float] | None = None,
         process_instance_id: str = "",
     ) -> None:
@@ -683,6 +694,13 @@ class EveningShareAdviser:
         self._health_states = health_states
         self._parked_units = parked_units
         self._latched_stop_units = latched_stop_units
+        # v1.2/A1: the optional authoritative basis.  ``None`` (the absent
+        # block) composes byte-identical v1.1 behavior; when composed, a FRESH
+        # reading replaces the pod-word need numbers for the tick and a lost
+        # reading degrades loudly once (A8's single additive code).
+        self._site_meter = site_meter
+        self._site_meter_ok: bool | None = None  # tri-state across ticks
+        self._divergence_ticks = 0
         self._tariff = dict(tariff) if tariff is not None else None
         self._process_instance_id = process_instance_id
         self._zone = ZoneInfo(settings.timezone)
@@ -714,6 +732,8 @@ class EveningShareAdviser:
         # The per-tick frame the projection renders.
         self._last_frame: dict[str, Any] | None = None
         self._alert_since: dict[str, datetime] = {}
+        # v1.2: slew memory for the meter-fresh filing path (A5).
+        self._last_filed_total: int | None = None
 
     # --- the fleet-loop tick --------------------------------------------------
 
@@ -776,7 +796,60 @@ class EveningShareAdviser:
             await self._evidence_alert(wall, worst)
             return
         net_exchange = -sum(grid_by_unit.values())
+
+        # v1.2/A1+A6: the authoritative site-meter consultation.  A FRESH
+        # reading overrides the pod-word basis entirely (served/net replaced),
+        # and its disagreement with the summed pod words is counted — enough
+        # consecutive divergence holds the program silent on the existing
+        # implausibility code rather than discharging into an untrusted tale.
+        # Anything else (absent port, stale, unavailable) keeps the legacy
+        # basis, degrading loudly exactly once per loss episode.
+        meter = None if self._site_meter is None else await self._site_meter.latest()
+        use_site_basis = False
+        site_codes: tuple[str, ...] = ()
+        if self._site_meter is not None:
+            fresh_reading = (
+                meter is not None
+                and meter.quality == "good"
+                and meter.net_exchange_w is not None
+                and meter.load_w is not None
+                and meter.fresh(now_mono, float(self._settings.site_meter_stale_after_s))
+            )
+            if fresh_reading and meter is not None:
+                assert meter.net_exchange_w is not None  # narrowed above
+                meter_net = float(meter.net_exchange_w)
+                # A6 (site-truth form): a standing DISCHARGE while the
+                # authoritative meter reads a meaningful EXPORT is the one
+                # physical impossibility worth halting on — our filed watts
+                # are landing outside the house. Level differences between
+                # pod sums and the site eye are NOT suspicious here (the
+                # household's loads live behind unseen circuits); direction
+                # contradiction is.
+                exporting_against_us = (
+                    meter_net < -float(int(self._settings.spill_tolerance_w))
+                    and bool(self._last_shares)
+                )
+                if exporting_against_us:
+                    await self._withdraw(wall, (REASON_IMPLAUSIBLE,))
+                    await self._frame(
+                        wall, "withdrawn", latest, {}, (REASON_IMPLAUSIBLE,)
+                    )
+                    await self._evidence_alert(wall, "implausible")
+                    return
+                use_site_basis = True
+            else:
+                self._divergence_ticks = 0
+            # The one-shot degrade notice rides whichever codes the tick files.
+            was_ok = self._site_meter_ok
+            if fresh_reading and was_ok is False:
+                pass  # recovered: silence again
+            elif not fresh_reading:
+                site_codes = (REASON_SITE_METER_DEGRADED,)
+            self._site_meter_ok = fresh_reading
         self._exchange_history.append(net_exchange)
+
+        def _with_site(codes: tuple[str, ...]) -> tuple[str, ...]:
+            return (*site_codes, *codes)
         # E3's plausibility guard (fresh-stamped frozen words).
         implausible = plausibility_verdict(
             spans={
@@ -857,17 +930,27 @@ class EveningShareAdviser:
         # Step 8: engagement on WORK, not import (§6.1) — with the §5.3
         # hysteresis on the disengage side.
         desired = provisional.desired_output_w
+        if use_site_basis and meter is not None:
+            # A2's basis swap on TRUTH: the command cancels METERED EXCHANGE
+            # and nothing else — an import stands as need, an export residual
+            # contributes zero (no watt is ever filed to chase an export).
+            # The served-load word is intentionally NOT re-added: the identity
+            # already nets delivery against demand at one instrument.
+            meter_net = float(meter.net_exchange_w or 0.0)
+            desired = max(0.0, meter_net)
+        def _codes(base: tuple[str, ...]) -> tuple[str, ...]:
+            return (*site_codes, *base)
         edge = JOIN_HYSTERESIS_FRACTION * float(self._settings.min_share_w)
         if not self._engaged and desired < float(self._settings.min_share_w):
             await self._idle_frame(
-                wall, latest, skip_reasons | settling, (REASON_BELOW_FLOOR,), grid_by_unit
+                wall, latest, skip_reasons | settling, _codes((REASON_BELOW_FLOOR,)), grid_by_unit
             )
             return
         if self._engaged and desired < edge:
             await self._withdraw(wall, (REASON_BELOW_FLOOR,))
             self._engaged = False
             await self._idle_frame(
-                wall, latest, skip_reasons | settling, (REASON_BELOW_FLOOR,), grid_by_unit
+                wall, latest, skip_reasons | settling, _codes((REASON_BELOW_FLOOR,)), grid_by_unit
             )
             return
         if not candidates:
@@ -896,10 +979,26 @@ class EveningShareAdviser:
             return
         # Step 9: the deadband (§3.4) — inside [-spill, +import] with a
         # standing command, HOLD the total; outside, recompute BOTH ways.
-        band = self._in_band(net_exchange)
+        band = self._in_band(meter_net if use_site_basis else net_exchange)
         if band and self._standing_total_w is not None:
             total = int(self._standing_total_w)
             fleet_clipped = False
+        elif use_site_basis:
+            # v1.2/A2: the need ceiling — a fresh-meter filing is EXACTLY the
+            # rounded need.  No derate division above it, ever: the derate
+            # doctrine assumed delivery undershoots; measured delivery does
+            # not, and the miss landed as exported battery energy.
+            total = round(desired)
+            unbounded = total
+            fleet_clipped = unbounded > int(self._policy.fleet_discharge_limit_w)
+            # A5's slew: consecutive filings move at most slew_cap_w apart,
+            # killing the burst duty-cycling without latching.
+            previous = self._last_filed_total
+            if previous is not None:
+                slew = int(self._settings.slew_cap_w)
+                low, high = previous - slew, previous + slew
+                total = max(low, min(total, high))
+            self._last_filed_total = total
         else:
             unbounded = round(
                 desired / max(float(self._settings.assumed_discharge_over_frac), 1e-6)
@@ -932,7 +1031,7 @@ class EveningShareAdviser:
         frame = provisional
         within_band = self._in_band(frame.net_exchange_w)
         capability_limited = split.capability_limited or fleet_clipped
-        reasons: tuple[str, ...] = (
+        reasons: tuple[str, ...] = _codes(
             (REASON_CAPABILITY,) if capability_limited else (REASON_ON_PLAN,)
         )
         if within_band:
@@ -995,6 +1094,10 @@ class EveningShareAdviser:
         self._window_open_soc = None
         self._open_work_w = None
         self._alert_since = {}
+        # v1.2 state resets ride the window edge with everything else.
+        self._divergence_ticks = 0
+        self._site_meter_ok = None
+        self._last_filed_total = None
 
     async def _handle_outside_window(self, wall: datetime, today: date) -> None:
         """§6.2 step 2: outside the window is NON-RENEWAL; the window's close

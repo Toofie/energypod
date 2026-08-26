@@ -1191,6 +1191,7 @@ class EnergyServiceFacade:
         calibration: CalibrationSurface | None = None,
         evening: EveningShareSurface | None = None,
         pvoutput: PvOutputUploader | None = None,
+        site_meter: Any | None = None,
     ) -> None:
         if not isinstance(site_id, str) or _ID_PATTERN.fullmatch(site_id) is None:
             raise ValueError("site_id must be a canonical identifier")
@@ -1223,6 +1224,9 @@ class EnergyServiceFacade:
         self._calibration = calibration
         self._evening = evening
         self._pvoutput = pvoutput
+        # DESIGN_SITE_METER §5: the feature-detected projection rides beside
+        # its siblings, present only when the block composed.
+        self._site_meter = site_meter
         self._revision = 0
         self._advisory_correlations = itertools.count(1)
         self._schedule_correlations = itertools.count(1)
@@ -1318,6 +1322,8 @@ class EnergyServiceFacade:
             # optional tariff), present whenever the ``energy_scorecard``
             # block is composed, ABSENT when it is not.
             view["energy_today"] = self._energy.today_payload()
+        if self._site_meter is not None:
+            view["site_meter_state"] = self._site_meter.state_payload()
         if self._history is not None:
             # DESIGN_PLANT_HISTORY section 2.5: the feature-detected
             # ``history_state`` projection rides TOP LEVEL beside its

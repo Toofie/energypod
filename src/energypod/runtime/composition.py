@@ -95,6 +95,7 @@ from energypod.adapters.persistence.sqlite import (
     SQLiteScheduleRepository,
     SQLiteTelemetryHistoryRepository,
 )
+from energypod.adapters.providers.fronius import FroniusSiteMeter
 from energypod.adapters.providers.http import HttpxForecastTransport
 from energypod.adapters.providers.load_baseline import HistorianLoadForecast
 from energypod.adapters.providers.open_meteo import OpenMeteoPvForecast, OpenMeteoWeather
@@ -187,6 +188,7 @@ from energypod.application.service import (
     SCHEDULE_NIGHT_ACK_EVENT_ID,
     EnergyServiceFacade,
 )
+from energypod.application.site_meter import SiteMeterControl
 from energypod.domain import (
     ControlPolicy,
     DataQuality,
@@ -4306,6 +4308,20 @@ def _build_runtime(
     # unit is ACTIVE, and unit detail/MCP project the bounded window.
     delivery_bias = DeliveryBiasEstimator(unit_ids=unit_ids)
 
+    # DESIGN_SITE_METER §2: the optional authoritative eye, composed ONLY
+    # when the block is present; the evening adviser degrades gracefully
+    # without it (A1's fallback), and A8's snapshot key rides its control.
+    site_meter_control = None
+    if config.site_meter is not None:
+        site_meter_control = SiteMeterControl(
+            provider=FroniusSiteMeter(
+                host=config.site_meter.host,
+                port=int(config.site_meter.port),
+                request_timeout_s=float(config.site_meter.request_timeout_s),
+            ),
+            stale_after_s=float(config.site_meter.stale_after_s),
+        )
+
     facade = _ComposedFacade(
         site_id=config.site.site_id,
         clock=resolved_clock,
@@ -4327,6 +4343,7 @@ def _build_runtime(
         delivery_bias=delivery_bias,
         forecast=forecast_surface,
         pvoutput=pvoutput_uploader,
+        site_meter=site_meter_control,
         calibration=None,
         evening=None,
     )
@@ -4770,6 +4787,10 @@ def _build_runtime(
                 act_netting_evidence=evening_config.act_netting_evidence,
                 unit_ids=tuple(unit.unit_id for unit in config.units),
                 degraded_note=evening_degraded_note,
+                slew_cap_w=int(getattr(evening_config, "slew_cap_w", 500)),
+                site_meter_stale_after_s=float(
+                    getattr(evening_config, "site_meter_stale_after_s", 5.0)
+                ),
             ),
             policy=policy,
             clock=resolved_clock,
@@ -4782,6 +4803,7 @@ def _build_runtime(
             health_states=_evening_health_states,
             parked_units=_parked_units,
             latched_stop_units=_evening_latched_stop_unit_ids,
+            site_meter=site_meter_control,
             tariff=_evening_tariff(),
             process_instance_id=process_instance_id,
         )

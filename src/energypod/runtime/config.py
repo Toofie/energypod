@@ -1474,6 +1474,10 @@ class EveningLoadSharingConfig(_FrozenModel):
     spill_tolerance_w: PositiveStrictInt = 150
     import_tolerance_w: PositiveStrictInt = 100
     assumed_discharge_over_frac: Annotated[StrictFloat, Field(ge=1.0, le=1.5)] = 1.16
+    # v1.2/A5: the inter-tick filing move bound (meter-fresh path only).
+    slew_cap_w: Annotated[StrictInt, Field(ge=100)] = 500
+    # v1.2/A1: the site-meter freshness bound consulted by the adviser.
+    site_meter_stale_after_s: Annotated[StrictFloat, Field(gt=0.0, le=60.0)] = 5.0
     frozen_word_ticks: Annotated[StrictInt, Field(ge=2)] = 8
     frozen_flow_delta_w: PositiveStrictInt = 200
     delivery_move_floor_w: PositiveStrictInt = 400
@@ -1687,6 +1691,23 @@ class PvOutputConfig(_FrozenModel):
         return cleaned
 
 
+class SiteMeterConfig(_FrozenModel):
+    """DESIGN_SITE_METER.md: the optional authoritative whole-site eye.
+
+    Block-presence doctrine — ABSENT composes nothing byte-identical; PRESENT
+    composes one read-only Fronius Solar API client injected into the
+    evening adviser (A1's fresh-basis precedence).  No credentials exist on
+    this surface; the host is an operator-provided LAN fact.
+    """
+
+    provider: Literal["fronius"] = "fronius"
+    host: NonEmpty
+    port: Annotated[StrictInt, Field(ge=1, le=65535)] = 80
+    request_timeout_s: Annotated[StrictFloat, Field(ge=0.5, le=10.0)] = 2.0
+    # Validated on ControllerConfig against timing.control_period_s.
+    stale_after_s: Annotated[StrictFloat, Field(gt=0.0, le=60.0)] = 5.0
+
+
 class ControllerConfig(_FrozenModel):
     schema_version: Annotated[StrictInt, Field(ge=1)]
     revision: Annotated[StrictInt, Field(ge=1)]
@@ -1760,7 +1781,12 @@ class ControllerConfig(_FrozenModel):
     # derives from, the health-watch and night windows the last intent must
     # die before, and the night capacity map that must stay ONE physical
     # truth with this block's.
+    # v1.2 wave additions, declared after every block their validators read:
+    # the site meter's staleness gate compares against timing directly, and
+    # the evening pair keeps ONE declaration home beside it.
+    site_meter: SiteMeterConfig | None = None
     evening_load_sharing: EveningLoadSharingConfig | None = None
+
 
     @field_validator("timing")
     @classmethod
@@ -1842,6 +1868,25 @@ class ControllerConfig(_FrozenModel):
         ):
             raise ValueError("write-enabled mode requires enabled authentication")
         return authentication
+
+    @field_validator("site_meter")
+    @classmethod
+    def validate_site_meter(
+        cls, site: SiteMeterConfig | None, info: ValidationInfo
+    ) -> SiteMeterConfig | None:
+        """DESIGN_SITE_METER §2: the commissioning gates for a PRESENT
+        site-meter block (an ABSENT block composes nothing anywhere)."""
+        if site is None:
+            return site
+        timing = info.data.get("timing")
+        control_period = float(getattr(timing, "control_period_s", 0.0) or 0.0)
+        if control_period > 0.0 and site.stale_after_s <= control_period:
+            raise ValueError(
+                f"site_meter.stale_after_s must exceed timing.control_period_s "
+                f"({control_period}): a reading older than one control period "
+                "cannot be the authoritative basis (v1.2/A1)"
+            )
+        return site
 
     @field_validator("excess_charging")
     @classmethod

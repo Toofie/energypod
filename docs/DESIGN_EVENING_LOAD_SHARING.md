@@ -10,6 +10,59 @@ units' flow was counted and never subtracted, and the per-unit exclusion
 races at the sibling's renewal seam). All fourteen amendments (E1–E14)
 are folded into the sections where they landed, and the reviewer rulings
 are recorded verbatim in the amendment log (§18).
+
+STATUS UPDATE 2026-08-27 — CONTRACT v1.2 (THE SITE-METER WAVE, operator-
+directed after the first live evening's evidence; supersedes the named
+v1.1 clauses wherever they conflict):
+
+- A1 — AUTHORITATIVE BASIS: when a composed `site_meter` reading is FRESH
+  (younger than `stale_after_s`), IT IS the control basis: `served_w` is the
+  site load and `net_exchange_w` is the negated grid figure (import-
+  positive) from that one instrument, replacing the pod-word aggregation of
+  §3.3 entirely for that tick. The pod-word derived basis survives only as
+  the degraded fallback (word missing/stale/unparseable → one loud cycle on
+  the new `site_meter_degraded` code, then pod-word math as before). Reason:
+  the first live window (2026-08-26 18:00) proved the pod words structurally
+  blind — all three LOAD CTs read ~0 W against a ~2 kW inhabited house, and
+  rhs was commanded 1148 W into an EXPORTING meter.
+- A2 — THE NEED CEILING (kills the overshoot class): `commanded_total_w`
+  may never exceed confirmed need. Where v1.1 divided by
+  `assumed_discharge_over_frac` to FILE MORE than desired (the §1.2/E1
+  safe-edge bet that delivery undershoots), v1.2 retires that division when
+  the basis is a fresh site meter: `commanded_total = round(desired)` bounded
+  by the kernel fleet limit. The 2026-08-26 arithmetic (`round(1332/1.16)`
+  = 1148 filed against 114 W of true headroom) is the regression case.
+- A3 — FLOOR HONESTY: a fresh-meter total below `min_share_w` idles the
+  program honestly (`below_one_pod_floor`); the floor CLAMP-UP of §5.3 step
+  (3) may manufacture watts against a need smaller than itself. On the
+  degraded pod-word path the v1.1 behavior stands unchanged.
+- A4 — CLOSED-LOOP TRIM: each tick re-reads the meter BEFORE renewal; if
+  last tick's delivery moved net_exchange the WRONG way beyond
+  `exchange_move_floor_w`, the new total trims toward zero-need first (the
+  participant set re-splits under the trimmed ceiling). Two consecutive
+  wrong-direction ticks drop the engaged participants to idle.
+- A5 — SLEW: consecutive filed totals differ by at most `slew_cap_w`
+  (default 500 W/tick, config-bounded [100, cap_w]) — kills the six-minute
+  burst duty-cycling observed 20:00–21:30 without latching.
+- A6 — DIRECTION-CONTRADICTION HOLD: a standing discharge while the
+  authoritative meter reads a meaningful export (`net_exchange_w` beyond
+  minus `spill_tolerance_w`) halts the program that very tick — withdraw,
+  `grid_evidence_implausible`, nothing files — because filed watts landing
+  OUTSIDE the house is physical nonsense, not noise. Level differences
+  between summed pod words and the site eye are expected here (the
+  household's loads live behind circuits no pod CT encircles) and are never
+  grounds to hold; direction contradiction is.
+- A7 — PARTICIPATION stays the smallest highest-weight carry-set of §5.3,
+  joined by the deliverability gate: a member whose pack cannot hold its
+  clamped share (dynamic-discharge refusal) leaves before filing.
+- A8 — SURFACES: `evening_load_sharing` gains `slew_cap_w`; composition
+  gains the optional `site_meter` block (its own contract doc); the
+  snapshot gains a feature-detected `site_meter_state` dictionary.
+  Intent shapes and audit shapes are UNCHANGED. The reason vocabulary
+  adds exactly ONE code — `site_meter_degraded` (the fresh-basis lost,
+  pod-word fallback engaged) — replacing what this block earlier draft
+  called a nameless loud cycle; every other degraded path reuses
+  `grid_evidence_implausible`.
 Parents: `docs/CONTINUITY.md` update log 2026-08-25 (the rebalancing
 research round — the HTW Berlin efficiency figures, the meter-netting
 finding, the shelved-transfer ruling, and the operator's stated goal this
