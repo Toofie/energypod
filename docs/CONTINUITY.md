@@ -376,6 +376,32 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-27 ~08:20 (PVOUTPUT POST HOLE — ROOT CAUSE MINE, FIXED AND
+  VERIFIED): the operator noticed battery add-on feeds (their PVOutput view
+  "B1/B2", our unit_slots lhs/rhs/mid → v7..v12) stopped publishing while
+  another surface kept posting. ROOT CAUSE: yesterday-afternoon's DEFERSED
+  detached relaunch (built during the task-killing churn) parsed
+  var/pvoutput.env and var/solcast.env with a regex that does not accept
+  `export KEY=value` lines — both credential references resolved absent,
+  the uploader composed without its wire client, disabled_reason
+  missing_credentials, ZERO posts from ~16:00 Aug 26 until the fix. THE
+  Bash `source` path always handled the syntax; only my PowerShell port
+  regressed. FIX: export-and-quote-aware env parsing, PRESENCE VERIFIED in
+  the launching shell BEFORE Start-Process, detached relaunch, fleet
+  re-armed, pvoutput re-enabled (disable_reason null, persisted:true),
+  excess re-enabled at its trial cap (restoring the operator's own 14:21
+  toggle; the 500→2500 graduation question is STILL OPEN with them), first
+  successful post 08:17:37 AEST for the 08:15 slot. KILL-PATTERN NOTE: the
+  four same-day session-task sweeps killed a non-python bash watchdog too —
+  session-background-task-tree-targeted, NOT python-sweeping — and since
+  the detached launch (~16:00 Aug 26) the controller has run UNINTERRUPTED
+  overnight including the full 00:00–06:00 standby window; culprit remains
+  unidentified pending the operator's answer about task-list actions.
+  LESSON PINNED: every future launch method (bash source, PowerShell, any
+  service wrapper) MUST strip `export` prefixes and surrounding quotes and
+  VERIFY variable presence before composition boots without its wire
+  clients silently.
+
 - 2026-08-26 ~12:20 (night TRUE STANDBY — `park_standby` COMMITTED AND LIVE):
   THE FURTHER OPERATOR DIRECTIVE THE SAME DAY, IMPLEMENTED, COMMISSIONED,
   AND DEPLOYED BEFORE TONIGHT'S WINDOW. After the verified overnight
