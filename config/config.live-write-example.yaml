@@ -60,7 +60,7 @@
 #     `energypod db backup`/`restore` see one durable store, and is distinct
 #     from the observe-only deployment's database.
 schema_version: 1
-revision: 10
+revision: 11
 mode: write_enabled
 
 site:
@@ -1183,52 +1183,3 @@ battery_calibration:
 # calibration traverse's (one physical fact, three keys); and there is
 # deliberately NO `grid_telemetry_max_age_s` (E10) — the rollup reads the
 # kernel's own `policy.max_telemetry_age_s`, one freshness truth.
-evening_load_sharing:
-  timezone: "Australia/Brisbane"   # must equal site.timezone (A9)
-  mode: "act"                      # §12 step 3 — commissioned 2026-08-25 on
-                                   #   the operator's direct attestation ("I
-                                   #   do have net metering, no need to prove
-                                   #   it, it just is"), recorded as
-                                   #   docs/evidence/netting-attestation-2026-08-25.md
-  act_netting_evidence: docs/evidence/netting-attestation-2026-08-25.md
-                                   # `act` REQUIRES act_netting_evidence
-                                   # (E6) — the key stays absent until the
-                                   # operator's bill-data verification lands
-  window_local: "18:00"            # the operator's evening (2026-08-25: the
-                                   #   16:00 default widened down to their
-                                   #   6pm-midnight ask as far as the walls
-                                   #   allow — the 23:00 watch and 00:00
-                                   #   night cap the end at 22:30)
-  window_end_local: "22:30"        # no-new-renewal; + ttl lands before the
-                                   #   health watch (23:00) and night (00:00)
-  min_share_w: 500                 # [200, cap_w]; the partial-load floor
-                                   #   (63-86% collapse below the rated band)
-  cap_w: 2500                      # <= policy.max_unit_discharge_w
-  participation_floor_pct: 20.0    # [policy.minimum_soc_pct, 50]; drop-out +
-                                   #   redistribute (the old stack threshold)
-  soc_exponent: 2.0                # [1.0, 4.0]; 3.0 restores the old
-                                   #   stack's precedent exactly (§15-1)
-  spill_tolerance_w: 150           # > 0; the bounded accepted spill ceiling
-  import_tolerance_w: 100          # > 0; the deadband's import-side edge
-  assumed_discharge_over_frac: 1.16  # [1.0, 1.5]; the command derate at the
-                                   #   filed +15-16% overshoot's SAFE edge
-  frozen_word_ticks: 8             # >= 2; E3 P1 — a word unchanged this many
-                                   #   ticks while its unit's other word moved
-  frozen_flow_delta_w: 200         # > 0; P1's movement floor
-  delivery_move_floor_w: 400       # > 0; E3 P2 — the fleet battery move that
-                                   #   demands an answer
-  exchange_move_floor_w: 150       # > 0, < delivery_move_floor_w; P2's
-                                   #   absence-of-response floor
-  non_delivery_ticks: 3            # >= 1; E4 — consecutive ticks below 0.5 x
-                                   #   share => not_delivering, share
-                                   #   redistributes
-  intent_ttl_s: 10.0               # (0, 300]; > timing.control_period_s; the
-                                   #   E5 debounce is 2 x this (a stated
-                                   #   constant, never a key)
-  assumed_capacity_wh: {lhs: 5000, mid: 5000, rhs: 4200}
-                                   # MUST equal night_charging's map and the
-                                   #   calibration traverse's (one fact)
-  # act_netting_evidence: "docs/evidence/netting-verification-2026-XX.md"
-                                   # E6's gate — REQUIRED for mode: act; leave
-                                   #   documented and ABSENT until the §10
-                                   #   interval-data cross-check is recorded
