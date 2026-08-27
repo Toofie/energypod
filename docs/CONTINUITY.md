@@ -376,6 +376,22 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-27 ~11:15 (SURPLUS CEILING REVIEWED AND DELIBERATELY KEPT AT 2,500 W
+  — operator decision, research recorded): after asking how safe a raise
+  would be, the operator chose the do-nothing baseline over 3,200/4,600 W
+  options ("I would rather be super safe than charge it quickly"). CIRCUIT
+  FACTS NOW ON RECORD for any future revisit: each pod feeds from its own
+  Hager MSN132 **C32** breaker; the three-way garage panel is fed by a
+  Hager MSN363 **C63** three-pole sub-main; the pod phase runs are ~20–30 m
+  of 6 mm² copper (installed instead of the original 10 mm² spec — worth an
+  electrician's eye someday). Research verdict that shaped the choice: raw
+  ampacity would allow more (QLD single-phase routinely supports 32 A
+  dedicated circuits), but 4,600 W means ~0.9C cell aging, tripled cable
+  heat (still tiny absolutely), and a sub-main living near 95% worst-case;
+  2,500 W runs at half-C with drops ≤1.2% and every margin deep. The export
+  this forgoes occurs ONLY when two packs sit full near solar noon.
+  NO CONFIG CHANGE — commissioned caps stand as-is.
+
 - 2026-08-27 ~10:05 (EVENING-SHARE v1.2 + THE SITE-METER WAVE, COMMITTED AND
   DEPLOYED — fdfbeea): ROOT CAUSE OF THE FIRST-EVENING FAILURE PINNED BY CODE
   ARITHMETIC: filed = round((served_podwords + netted)/1.16) = round(1332/1.16)
