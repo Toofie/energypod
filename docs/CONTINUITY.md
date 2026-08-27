@@ -376,6 +376,22 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-27 ~21:45 (EVENING LOAD-SHARING DECOMMISSIONED AT THE OPERATOR'S
+  DIRECTIVE — config revision 11): mid-window removal ("just disable this
+  feature"), after the operator watched the v1.2 metered-truth build run
+  live and judged the whole program unwanted rather than merely mistuned.
+  The `evening_load_sharing:` block is ABSENT from the live config: by the
+  block-presence doctrine NOTHING composes (no adviser tick, no state key
+  in the snapshot, status route absent) — batteries behave as plain
+  CT-following autonomous units every evening until further notice. Code,
+  contract docs, tests, and the site-meter provider REMAIN in-tree
+  unaffected (absence = byte-identical legacy), so a future return is one
+  config-block restore plus restart — historical anchor for the block:
+  commit bfedeef (revision 10). Restart ritual per runbook: env-verified
+  detached relaunch, fleet re-armed sole_writer, pvoutput/excess restored;
+  snapshot verified WITHOUT the evening key at 21:41 with night
+  per-phase/park_standby standing for midnight.
+
 - 2026-08-27 ~11:15 (SURPLUS CEILING REVIEWED AND DELIBERATELY KEPT AT 2,500 W
   — operator decision, research recorded): after asking how safe a raise
   would be, the operator chose the do-nothing baseline over 3,200/4,600 W
