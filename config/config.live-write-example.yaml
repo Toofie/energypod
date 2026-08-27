@@ -60,7 +60,7 @@
 #     `energypod db backup`/`restore` see one durable store, and is distinct
 #     from the observe-only deployment's database.
 schema_version: 1
-revision: 9
+revision: 10
 mode: write_enabled
 
 site:
@@ -939,6 +939,16 @@ forecast_providers:
 # COMMISSIONED 2026-08-25, PRESENT-BUT-DISABLED: the machinery and the
 # console card compose now; the operator's toggle starts the posting when
 # the other container stands down.
+# DESIGN_SITE_METER.md — the authoritative whole-site eye (v1.2 wave,
+# operator-wired 2026-08-27): one read-only Solar API GET per fleet cycle;
+# fresh readings REPLACE the pod-word need numbers for evening load sharing
+# and degrade loudly back when stale. ABSENT block = byte-identical legacy.
+site_meter:
+  provider: fronius
+  host: "192.168.1.198"
+  request_timeout_s: 2.0
+  stale_after_s: 5.0
+
 pvoutput:
   enabled: false
   api_key_env: PVOUTPUT_API_KEY

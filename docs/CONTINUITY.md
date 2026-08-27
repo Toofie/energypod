@@ -376,6 +376,36 @@ direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
 
+- 2026-08-27 ~10:05 (EVENING-SHARE v1.2 + THE SITE-METER WAVE, COMMITTED AND
+  DEPLOYED — fdfbeea): ROOT CAUSE OF THE FIRST-EVENING FAILURE PINNED BY CODE
+  ARITHMETIC: filed = round((served_podwords + netted)/1.16) = round(1332/1.16)
+  = exactly 1148 W against ~114 W of real need — pod LOAD CTs are structurally
+  blind (~2 kW of house circuits read ZERO on all three pods, Fronius-live-
+  verified) and the derate division plus the min_share floor turned blindness
+  into exported battery energy. FIXES SHIPPED: A1 fresh Fronius site-meter
+  reading REPLACES the pod-word need numbers (new optional `site_meter:` block,
+  provider adapters/providers/fronius.py reading Solar API PowerFlow, sign-
+  translated, fail-closed to unavailable-never-zero); stale/absent degrades
+  loudly ONCE (`site_meter_degraded`, the wave's single additive code) to the
+  legacy path; A2 command = EXACTLY rounded confirmed need on the fresh path
+  (derate retired above need); A3 sub-floor needs idle; A4 closed-loop trim
+  rides per-tick re-reads; A5 slew_cap_w=500 bounds consecutive filings;
+  A6 hold = discharge-under-confirming-EXPORT only (level divergence between
+  the two eye-families is expected topology, pinned as such); zero new intent/
+  audit shapes. Docs-first: DESIGN_EVENING_LOAD_SHARING STATUS-UPDATE block +
+  new DESIGN_SITE_METER.md. PIPELINE NOTE: the workflow subagent service was
+  hard-down all morning (6 instant model-routing failures); the primary ran
+  the full contract-first wave SOLO instead — research incl. online+live
+  probes, red tests (9 pins), adversarial self-review catching TWO design
+  errors pre-ship (load double-count into desire; level-divergence hold that
+  would have idled every evening), gates green. GATES: backend 3139 passed,
+  ruff clean, mypy --strict clean (76 files). DEPLOYMENT revision 10
+  (site_meter host 192.168.1.198): detached restart, fleet re-armed sole_writer,
+  pvoutput/excess restored, snapshot carries feature-detected
+  site_meter_state (available, lazily polled — first `fresh: true` at the
+  16:00 window open). NEXT: tonight's 16:00–22:30 window is the live proof;
+  watch commanded_total_w track metered import minus floors.
+
 - 2026-08-27 ~09:05 (EXCESS CHARGING GRADUATED — config revision 9, LIVE):
   THE OPERATOR'S DIRECTIVE ("consume almost as much as possible"): the
   trial cap `max_charge_from_export_w` 500→2500. The bound is

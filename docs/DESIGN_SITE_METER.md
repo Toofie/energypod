@@ -60,11 +60,13 @@ The APPLICATION layer sees a protocol port injected at composition:
     class _SiteMeterPort(Protocol):
         def latest(self) -> SiteMeterReading | None: ...
 
-polled ONCE per fleet cycle inside a bounded suppressed pass (a failed poll
-is one unavailable word and one log line — never a delay to control), the
-latest reading cached for the tick. The evening adviser consults it FIRST
-each tick under the freshness gate; everything else about composition is
-unchanged.
+polled lazily by the CONSUMING tick — today that is the evening adviser,
+inside its own window, so out-of-window hours legitimately show
+"never polled" in the snapshot (`fresh: false`, `last_reading_quality:
+null`) until the window's first tick lands. A failed poll is one
+unavailable word and one log line — never a delay to control. The
+evening adviser consults the reading FIRST each in-window tick under the
+freshness gate; everything else about composition is unchanged.
 
 ## 4. Freshness and precedence
 
