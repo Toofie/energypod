@@ -52,7 +52,7 @@ import sqlite3
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from os import environ
@@ -2295,6 +2295,7 @@ class _Supervision:
         health_watch: HealthWatchController | None = None,
         calibration: CalibrationAdviser | None = None,
         evening_share: EveningShareAdviser | None = None,
+        boot_arm: Callable[[], Awaitable[dict[str, Any]]] | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -2368,6 +2369,12 @@ class _Supervision:
         # own window, its own vocabulary, its own durable rows; the A14
         # sibling line kept structurally beside the calibration twin.
         self._evening_share = evening_share
+        # site.boot_armed: the appliance deployment's boot-time auto-arm —
+        # the facade's arm_boot, wired only when the config key composes it
+        # (None keeps the interactive doctrine: boot never arms).  The task
+        # runs once after startup, paced and fully suppressed (arm_boot
+        # never raises); see _run_boot_arm.
+        self._boot_arm = boot_arm
         self._tasks: list[asyncio.Task[None]] = []
         self._watcher: asyncio.Task[None] | None = None
         self._started = False
@@ -2415,6 +2422,38 @@ class _Supervision:
         self._watcher = asyncio.create_task(
             self._watch_for_failure(), name="energypod-supervision:watcher"
         )
+        if self._boot_arm is not None:
+            self._tasks.append(
+                asyncio.create_task(
+                    self._run_boot_arm(), name="energypod-supervision:boot-arm"
+                )
+            )
+
+    async def _run_boot_arm(self) -> None:
+        """site.boot_armed: re-arm the fleet once, after startup lands.
+
+        The first wait lets the actors' connects and identity verifications
+        complete (the arm reads the served-objective readback and refuses
+        an unqualified unit); units whose connects lag retry with the
+        batch.  arm_boot NEVER raises — the pass suppresses and skips —
+        so this task is pure pacing around it, and the refusals that
+        survive every attempt stay audited per unit (the operator reads
+        them in the trail, not in a crash).
+        """
+        if self._boot_arm is None:
+            return
+        for attempt in range(_BOOT_ARM_ATTEMPTS):
+            await asyncio.sleep(
+                _BOOT_ARM_FIRST_DELAY_S if attempt == 0 else _BOOT_ARM_RETRY_DELAY_S
+            )
+            try:
+                result = await self._boot_arm()
+            except Exception:
+                return
+            if not isinstance(result, dict) or result.get("suppressed"):
+                return
+            if not result.get("refused"):
+                return
 
     async def stop(self) -> None:
         """Normal shutdown: revoke, stop the loops, and shut every actor down.
@@ -3068,6 +3107,14 @@ class _Supervision:
 
 
 _LAST_SUPERVISION: _Supervision | None = None
+
+# site.boot_armed's pacing: the first wait lands past the actors' connects
+# and the first fleet cycle's polls; units whose connects lag retry on the
+# second/third waits.  Module constants so the simulator rigs can shrink
+# them (real sleeps, tiny values) — the semantics never change.
+_BOOT_ARM_FIRST_DELAY_S = 10.0
+_BOOT_ARM_RETRY_DELAY_S = 15.0
+_BOOT_ARM_ATTEMPTS = 3
 
 
 def _attach_lifespan(app: FastAPI, supervision: _Supervision) -> None:
@@ -5127,6 +5174,7 @@ def _build_runtime(
         health_watch=health_watch_controller,
         calibration=calibration_adviser,
         evening_share=evening_share_adviser,
+        boot_arm=(facade.arm_boot if config.site.boot_armed else None),
     )
     global _LAST_SUPERVISION
     _LAST_SUPERVISION = supervision

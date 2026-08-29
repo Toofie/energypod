@@ -2028,3 +2028,129 @@ async def test_uncommanded_out_of_band_power_is_timestamped_evidence(
     finally:
         await _shutdown_actors(runtime)
     _assert_replay_safety(journal)
+
+
+# --- site.boot_armed: the boot-time auto-arm (the appliance deployment) ---------
+
+
+async def test_boot_arm_arms_a_qualified_fleet_and_audits_under_the_boot_principal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """site.boot_armed's facade half: arm_boot arms every qualified unit.
+
+    The pass reports armed units and no refusals, the actor lands
+    ARMED_IDLE, and the audit row names the BOOT principal — the trail
+    must say a boot armed it, never a human.
+    """
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, _banks = _install_replay_transport(monkeypatch, clock)
+    runtime = _build(_validate(_config_payload(mode="write_enabled")), clock)
+
+    try:
+        actor = runtime.actors[_UNIT_ID]
+        await actor.start()
+        await _qualify(runtime, clock)
+
+        result = await runtime.facade.arm_boot()
+        assert result["suppressed"] is None
+        assert result["armed"] == [_UNIT_ID]
+        assert result["refused"] == {}
+        assert actor.lifecycle is UnitLifecycle.ARMED_IDLE
+
+        rows = [
+            event for event in runtime.audit.recent(limit=64) if event.event_type == "unit_armed"
+        ]
+        assert rows, "the boot arm must be audited"
+        assert all(row.principal == "energypod:boot" for row in rows), (
+            "the boot-arm rows must name the boot principal, never an operator"
+        )
+    finally:
+        await _shutdown_actors(runtime)
+    _assert_replay_safety(journal)
+
+
+async def test_boot_arm_before_qualification_refuses_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A unit whose connects/qualification lag the boot is a REFUSAL, not a
+    crash: arm_boot reports it, the unit stays disarmed, and the supervision's
+    retry pacing (composition's boot-arm task) is what brings it in later."""
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, _banks = _install_replay_transport(monkeypatch, clock)
+    runtime = _build(_validate(_config_payload(mode="write_enabled")), clock)
+
+    try:
+        actor = runtime.actors[_UNIT_ID]
+        await actor.start()
+
+        result = await runtime.facade.arm_boot()
+        assert result["suppressed"] is None
+        assert result["armed"] == []
+        assert result["refused"], "the unqualified unit must appear as a refusal"
+        # The refused unit stays exactly where it was: an unqualified boot
+        # sits in OBSERVE_ONLY (qualification carries it to DISARMED), and
+        # the refused arm must not have moved it.
+        assert actor.lifecycle is UnitLifecycle.OBSERVE_ONLY
+    finally:
+        await _shutdown_actors(runtime)
+    _assert_replay_safety(journal)
+
+
+async def test_boot_arm_is_suppressed_by_a_latched_emergency_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E-stop supremacy: no boot arm while a stop latch is held — the pass
+    reports its suppression, touches nothing, and the unit stays disarmed."""
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    journal, _banks = _install_replay_transport(monkeypatch, clock)
+    runtime = _build(_validate(_config_payload(mode="write_enabled")), clock)
+
+    try:
+        actor = runtime.actors[_UNIT_ID]
+        await actor.start()
+        await _qualify(runtime, clock)
+
+        stop = await runtime.facade.emergency_stop(
+            unit_ids=[_UNIT_ID],
+            reason="boot-arm suppression test",
+            principal=OPERATOR,
+        )
+        assert stop["status"] == "latched"
+
+        result = await runtime.facade.arm_boot()
+        assert result["suppressed"] == "latched_emergency_stop"
+        assert result["armed"] == []
+        assert result["refused"] == {}
+        assert actor.lifecycle is not UnitLifecycle.ARMED_IDLE
+    finally:
+        await _shutdown_actors(runtime)
+    _assert_replay_safety(journal)
+
+
+def test_boot_arm_wiring_follows_the_config_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The composition wires the boot-arm pass exactly when the config key
+    composes it: ``site.boot_armed: true`` hands the supervision the facade's
+    pass; the default leaves it None — boot never arms, unchanged.  Each
+    build replaces the module's last-supervision handle, so the two builds
+    are checked in sequence against the same handle."""
+    _forbid_network_connections(monkeypatch)
+    clock = ManualClock()
+    _install_replay_transport(monkeypatch, clock)
+    composition = _composition()
+
+    payload = _config_payload(mode="write_enabled")
+    _build(_validate(payload), clock)
+    assert composition._LAST_SUPERVISION is not None
+    assert composition._LAST_SUPERVISION._boot_arm is None, (
+        "the default must keep the interactive doctrine: boot never arms"
+    )
+
+    payload["site"]["boot_armed"] = True
+    _build(_validate(payload), clock)
+    assert composition._LAST_SUPERVISION is not None
+    assert composition._LAST_SUPERVISION._boot_arm is not None, (
+        "site.boot_armed: true must wire the facade's arm_boot pass"
+    )

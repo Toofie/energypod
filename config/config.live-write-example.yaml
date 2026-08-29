@@ -67,6 +67,13 @@ site:
   site_id: home
   timezone: Australia/Brisbane
   expected_unit_count: 3
+  boot_armed: true   # the appliance deployment (2026-08-29, the Docker
+                     #   move): every boot arms the fleet — the container
+                     #   restarts nightly and no human re-arms it.  A
+                     #   latched emergency stop still suppresses the boot
+                     #   arm; per-unit refusals skip with their reason
+                     #   audited; a parked unit is never arm-resumed.
+                     #   Default false everywhere else.
 
 units:
   - unit_id: mid

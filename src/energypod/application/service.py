@@ -99,6 +99,11 @@ _SCHEDULE_WIRE_DAYS: Final[dict[str, int]] = {
 
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
+# The boot-time auto-arm's audit principal (``site.boot_armed``): the
+# subject every boot-arm audit row carries, distinct from any operator so
+# the trail names WHO armed — never a human, here.
+_BOOT_ARM_SUBJECT = "energypod:boot"
+
 # API_CONTRACTS: a latched stop carries a fixed duration of at least 24 hours
 # and is removed only by acknowledgement, never by TTL expiry.
 _LATCHED_STOP_DURATION_S: Final[float] = 86_400.0
@@ -2964,6 +2969,63 @@ class EnergyServiceFacade:
                 raise
         await self._publish("unit.armed", {"principal": principal.subject, "units": outcomes})
         return {"units": outcomes}
+
+    async def arm_boot(self, *, request_id: str = "boot") -> dict[str, Any]:
+        """The boot-time auto-arm (``site.boot_armed``): arm every
+        commissioned, disarmed unit under the ``energypod:boot`` principal —
+        the appliance deployment's answer to restarts (the nightly container
+        restart re-arms by this, not by a human).
+
+        This deliberately revises the old boot-never-arms posture FOR THE
+        CONFIG KEY ONLY; everything else is inherited unchanged.  The
+        guards, in order:
+
+        - a latched EMERGENCY STOP suppresses the whole pass (e-stop
+          supremacy: no boot arm while any stop latch is held);
+        - per-unit refusals (identity, foreign-writer latch, qualification,
+          park lease, already-armed) skip that unit with the refusal
+          audited — one refused unit never fails the pass;
+        - the pass NEVER RAISES: an audit append that cannot land is
+          best-effort (the arm itself is already the actor's audited act),
+          and an exploded attempt is returned as that unit's refusal.
+
+        The caller (the supervision's boot-arm task) paces the retries for
+        units whose connects lag the boot; a unit that answered
+        ``unit_not_disarmed`` is already armed by an earlier attempt, not a
+        refusal to retry.
+        """
+        if self._latched_stops:
+            return {
+                "suppressed": "latched_emergency_stop",
+                "armed": [],
+                "refused": {},
+            }
+        armed: list[str] = []
+        refused: dict[str, str] = {}
+        for unit_id in sorted(self._actors):
+            try:
+                outcome = await self._arm_one(unit_id, takeover_acknowledged=False)
+            except Exception as exc:  # the pass never raises
+                refused[unit_id] = f"actor_failure: {exc}"
+                continue
+            if outcome["status"] == "armed":
+                armed.append(unit_id)
+            else:
+                refused[unit_id] = outcome["reason"]
+            with contextlib.suppress(Exception):
+                await self._append_audit(
+                    self._mutation_audit(
+                        event_type="unit_armed",
+                        subject=_BOOT_ARM_SUBJECT,
+                        result=outcome["status"],
+                        request_id=request_id,
+                        reason_codes=(outcome["reason"],),
+                        unit_id=unit_id,
+                        lifecycle=self._handle_lifecycle(unit_id),
+                        payload=dict(outcome),
+                    )
+                )
+        return {"suppressed": None, "armed": armed, "refused": refused}
 
     async def disarm(
         self,

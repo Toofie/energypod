@@ -106,6 +106,18 @@ class SiteConfig(_FrozenModel):
     site_id: NonEmpty
     timezone: NonEmpty
     expected_unit_count: PositiveStrictInt
+    # The appliance deployment's boot-time auto-arm (2026-08-29, the Docker
+    # move): when true, every boot arms all commissioned units under the
+    # `energypod:boot` principal once connections verify — the container
+    # restarts nightly and no human re-arms it.  This deliberately revises
+    # the old boot-never-arms posture FOR THIS KEY ONLY.  Guards inherited
+    # and explicit: a latched emergency stop suppresses the whole pass
+    # (e-stop supremacy), per-unit refusals (identity, foreign-writer latch,
+    # park lease, qualification) skip that unit with the refusal audited,
+    # and a parked unit is never arm-resumed.  Default false: the
+    # interactive doctrine — arming is an operator act — stays the default
+    # for every other deployment.
+    boot_armed: bool = False
 
     @field_validator("site_id")
     @classmethod
