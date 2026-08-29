@@ -1,6 +1,11 @@
-# The image build context: source only.  Secrets, data, caches, and the
-# design-shot vault never enter a layer — the runtime mounts arrive via
-# compose.yaml.
+# The image build context: source + the operator's embedded deployment
+# state.  The all-in-one model BAKES var/ (credentials, env files, the
+# database snapshot) and config/ into the image — the operator accepted
+# this for a local-only deployment (the image never leaves their machine;
+# never push it to a registry).
+#
+# Still excluded: caches, the design-shot vault, tests, docs, and anything
+# that is not runtime cargo.
 
 .git
 .venv
@@ -18,12 +23,10 @@ web/dist
 web/coverage
 web/.design-shots
 
-# Secrets and durable state — mounted at RUNTIME, never baked.
-var/
-*.env
-*.sqlite3
-*.sqlite3-wal
-*.sqlite3-shm
+# The sqlite sidecars are rebuildable runtime artifacts; the .sqlite3 main
+# file IS baked (the build-day snapshot).
+var/*.sqlite3-wal
+var/*.sqlite3-shm
 
 # Docs and tests are not runtime cargo.
 tests/

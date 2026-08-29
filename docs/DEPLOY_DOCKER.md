@@ -1,73 +1,65 @@
 # Deploying the controller in Docker — the operator's runbook
 
 The permanent home: the always-on Docker host that ran the old
-battery-manager container.  The controller runs as two containers —
-`energypod` (the controller: Modbus to the three gateways, the sqlite
-store, the guarded API) and `console` (nginx: the console's static files,
-proxying `/api/v1` — WebSocket included — and `/healthz` to the
-controller).  `restart: unless-stopped` is the point: crashes and host
-reboots self-heal, with no Windows session involved.
+battery-manager container.  The deployment is ALL-IN-ONE: one build bakes
+the controller, the console, the commissioned config, the credentials, and
+the database snapshot into two images.  No volumes, no mounts, no separate
+file staging on the host: build where the repo (with `var/` and
+`config/`) lives, then deploy the images.
 
-## 1. Prerequisites (on the Docker host)
+**The image carries secrets** (the operator accepted this for a local-only
+deployment, 2026-08-29): never push it to a registry, and treat the saved
+image archive like a credential file.
 
-- Docker Engine with the compose plugin (`docker compose version`).
-- Network reach from the host to the three gateways:
-  `192.168.1.11`, `192.168.1.12`, `192.168.1.13` — port `4196` each.
-  The old battery-manager container proved this path.
-- Outbound internet for the build (dependency wheels, node packages) —
-  one-time per build.
+## 1. Prerequisites
 
-## 2. Transfer (Windows machine → Docker host)
+- On the BUILD machine (where this repo lives, with `var/` and `config/`):
+  Docker with the compose plugin — OR build on the host (then the whole
+  repo incl. `var/` and `config/` transfers there first).
+- On the HOST: Docker Engine with compose, and network reach to the three
+  gateways `192.168.1.11/12/13` port `4196` (the old battery-manager
+  container proved this path).
 
-From the repo root, transfer these paths, preserving layout:
-
-| Path | What | Destination on host |
-|---|---|---|
-| `Dockerfile`, `compose.yaml`, `.dockerignore`, `docker/`, `scripts/`, `src/`, `web/`, `pyproject.toml`, `README.md` | the build context | the repo root on the host (e.g. `~/energypod/`) |
-| `config/` | the commissioned configuration (revision 11) | `config/` |
-| `var/live-write.sqlite3` | **the durable store** — historian, leases, PVOutput + calibration state | `var/` |
-| `var/live-credentials.json` | the bearer-token store (the console's logins) | `var/` |
-| `var/solcast.env`, `var/pvoutput.env` | the API-key env files (sourced by the entrypoint) | `var/` |
-
-Easiest transfer: copy the whole repo folder, then delete the host copies
-of `.git`, `.venv`, `web/node_modules`, `web/.design-shots` (the
-`.dockerignore` keeps them out of the image regardless).
-
-## 3. One-time host preparation
-
-The container runs as uid 1000 and must own the database:
+## 2. Build (where the repo + var/ + config/ live)
 
 ```sh
-cd ~/energypod
-sudo chown -R 1000:1000 var/
-chmod +x scripts/docker-verify.sh
+docker compose build
 ```
 
-## 4. Cutover sequence (the ordered dance)
+The build bakes: `config/` (revision 11 — the commissioned configuration),
+`var/live-credentials.json` (the console's bearer tokens),
+`var/solcast.env` + `var/pvoutput.env` (the API keys, sourced by the
+entrypoint), and `var/live-write.sqlite3` (**the build-day snapshot of the
+durable store** — historian, leases, PVOutput + calibration state).
 
-1. **Stop the Windows controller first** — a live sqlite file must not be
-   copied mid-write.  Stop the harness task (or close its window).
-2. Copy `var/live-write.sqlite3` (and the rest of §2, if not already done).
-3. Build and start:
-   ```sh
-   docker compose up -d --build
-   ```
-4. Verify (§5).  Do not proceed until it passes.
-5. Retire the Windows instance — do not restart it; its replacement is live.
-   (Keep the Windows copy of the repo for rollback, §7.)
-
-## 5. Verification
+## 3. Deploy
 
 ```sh
-./scripts/docker-verify.sh          # the console port, default 8080
+# If the images were built away from the host:
+docker save energypod-controller energypod-console | gzip > energypod-images.tar.gz
+# ...transfer + load on the host:  docker load < energypod-images.tar.gz
+
+# On the host:
+docker compose up -d
+```
+
+`restart: unless-stopped` is set on both services: crashes and host
+reboots self-heal.  The operator's nightly restart (`docker restart
+energypod-controller`) is also fine — and with `site.boot_armed: true`
+(the embedded config), **the fleet re-arms itself at every boot**: no
+manual re-arm after restarts.
+
+## 4. Verification
+
+```sh
+./scripts/docker-verify.sh          # console port 8080
 docker compose logs --tail=50 energypod
 ```
 
-Expected: `ALL CHECKS PASS`; the controller log shows the schema at the
-current version, the config at revision 11, and no credential notes.
-Then the browser: `http://<host>:8080` — log in as before (the same
-bearer tokens came across in `var/live-credentials.json`), confirm the
-three pods answer and the Home cards render.
+Expected: `ALL CHECKS PASS`; the controller log shows the current schema
+version, config revision 11, no credential notes, and the boot-arm audit
+rows.  Then the browser: `http://<host>:8080` — same bearer tokens (baked),
+same screens, the three pods answering.
 
 Optional deeper check with the operator token:
 
@@ -75,43 +67,67 @@ Optional deeper check with the operator token:
 ENERGYPOD_TOKEN=<token> ./scripts/docker-verify.sh
 ```
 
-## 6. Day-to-day
+## 5. Cutover from the Windows deployment (the ordered dance)
+
+1. Build (§2) — note the DB snapshot is taken from `var/` **at build
+   time**, so do this AFTER the Windows controller has been stopped (a
+   live sqlite file must not be snapshotted mid-write), or stop → build.
+2. Deploy on the host (§3) and verify (§4).
+3. Retire the Windows instance — do not restart it.  (Keep the Windows
+   copy of the repo for rollback, §7.)
+
+**Never run both controllers against the pods at once** — two Modbus
+writers interleave.
+
+## 6. Day-to-day — and the one trade-off
 
 | Task | Command |
 |---|---|
 | Logs | `docker compose logs -f energypod` |
-| Restart | `docker compose restart energypod` |
-| Upgrade (new code) | `git pull && docker compose up -d --build` — the database persists in `var/` |
-| Stop everything | `docker compose down` (data is untouched — it lives in `var/`) |
+| Nightly restart | `docker restart energypod-controller` — data persists; the fleet re-arms itself |
+| **Upgrade / rebuild** | `docker compose build && docker compose up -d` |
 
-**The arm caveat, prominently:** a controller restart starts the fleet
-**DISARMED** (boot never arms — the doctrine that makes restarts safe).
-Armed state does not survive ANY restart, on any host.  After an upgrade
-or a crash-restart, arm the fleet from the console before any program that
-dispatches (night charge, the health-watch probe, the calibration
-traverse).  Parked units and the PVOutput toggle DO survive restarts
-(durable store) — only the armed/disarmed switch does not.
+**The rebuild trade-off, stated plainly:** the database inside the
+container persists across RESTARTS (the container's writable layer), but a
+REBUILD re-bakes `var/live-write.sqlite3` as it stood at build time — so a
+rebuild resets history to the build-day snapshot.  If the historian data
+matters at upgrade time, copy the current database out of the container
+first and back in after:
+
+```sh
+docker cp energypod-controller:/app/var/live-write.sqlite3 ./live-write.sqlite3
+# ...rebuild...
+docker cp ./live-write.sqlite3 energypod-controller:/app/var/live-write.sqlite3
+docker compose restart energypod
+```
+
+**Arming:** the embedded config sets `site.boot_armed: true` — every boot
+arms all commissioned units automatically (audited under the boot
+principal; a latched emergency stop still suppresses it, and a unit that
+fails identity or is parked stays out).  Manual disarm from the console
+still works and lasts until the next restart, which re-arms per the
+config.  Boot-arming deliberately revises the old "boot never arms"
+posture for this deployment — the operator accepted it for unattended
+appliance operation.
 
 ## 7. Rollback
 
 ```sh
 docker compose down          # on the host
 ```
-…then restart the Windows instance (the harness task).  The database is
-the single durable fact: whichever controller starts with the newest
-`var/live-write.sqlite3` continues the history.  Do not run BOTH
-controllers against the pods at once — two Modbus writers interleave.
+…then restart the Windows instance (its `var/live-write.sqlite3` continues
+the history as of the build-day snapshot — anything the container wrote
+since the build lives only in the container layer; copy it out per §6
+first if it matters).
 
 ## 8. Notes
 
 - **Timezone**: both containers set `TZ=Australia/Brisbane`; the
-  civil-time windows also read `site.timezone` from the config — the two
+  civil-time windows read `site.timezone` from the baked config — the two
   agree.
-- **The gateways**: the controller dials OUT to `192.168.1.11/12/13:4196`
-  on the default bridge network — no host networking or extra ports needed.
+- **Gateways**: the controller dials OUT to `192.168.1.11/12/13:4196` on
+  the default bridge network — no host networking needed.
 - **Ports**: the console publishes `8080` (browser habit unchanged); the
-  controller's raw API publishes on `127.0.0.1:8081` — host-local only,
-  for scripts and verification, never the LAN.
-- **Upgrades**: image rebuilds are stateless; everything durable is in the
-  `var/` mount.  Config changes follow the usual config-revision discipline
-  (edit `config/`, restart `energypod`).
+  controller's raw API publishes on `127.0.0.1:8081` — host-local only.
+- **Config changes**: edit `config/`, rebuild, redeploy — the config is
+  baked (config-revision discipline still applies).

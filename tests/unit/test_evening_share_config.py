@@ -277,30 +277,22 @@ def test_there_is_no_runtime_toggle_for_mode() -> None:
     assert "set_evening" not in service
 
 
-def test_the_live_write_example_validates_cleanly() -> None:
-    """§12/§15-5: the live config block validates in advise or act; in act,
-    the E6 gate requires the recorded evidence row
-    (docs/evidence/netting-attestation-2026-08-25.md);
-    removing the evidence key makes act a validation error."""
+def test_the_live_write_example_carries_no_evening_block() -> None:
+    """The evening-share program is DECOMMISSIONED (revision 11, the
+    operator's 2026-08-27 directive): the live example carries NO
+    `evening_load_sharing:` key at all — absent composes nothing — and the
+    E6 evidence gate still refuses an act block that reappears without its
+    recorded netting evidence."""
     import yaml
 
     payload = yaml.safe_load(
         Path("config/config.live-write-example.yaml").read_text(encoding="utf-8")
     )
-    block = payload["evening_load_sharing"]
-    assert block["mode"] in {"advise", "act"}
-    if block["mode"] == "act":
-        assert (
-            block.get("act_netting_evidence") == "docs/evidence/netting-attestation-2026-08-25.md"
-        )
-        assert Path(block["act_netting_evidence"]).exists()
-    config = _validate(payload)
-    assert config.evening_load_sharing is not None
-    # And act without evidence WOULD be refused on this file, exactly as E6 promises.
+    assert "evening_load_sharing" not in payload, (
+        "the block was decommissioned by operator directive; its return is "
+        "a deliberate config revision, not an oversight"
+    )
     act_no_evidence = dict(payload)
-    act_block = dict(block)
-    act_block["mode"] = "act"
-    act_block.pop("act_netting_evidence", None)
-    act_no_evidence["evening_load_sharing"] = act_block
+    act_no_evidence["evening_load_sharing"] = {"mode": "act"}
     with pytest.raises(ValidationError):
         _validate(act_no_evidence)

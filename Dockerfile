@@ -1,17 +1,25 @@
-# EnergyPod controller + console — the deployment image (three targets).
+# EnergyPod controller + console — the ALL-IN-ONE deployment image.
+#
+# The operator's deployment model (2026-08-29): ONE self-contained image —
+# the controller, the console, the commissioned config, AND the credentials
+# and database baked in at build time.  Local-only deployment: the image
+# carries secrets and must never leave the operator's machine (no registry
+# push).  No volumes, no mounts: `docker compose up -d` is the whole deploy.
+#
+# Trade-off, stated plainly (docs/DEPLOY_DOCKER.md §6): the sqlite database
+# baked at build time is the build-day snapshot.  Nightly restarts preserve
+# everything (the container's writable layer persists across restarts), but
+# a REBUILD resets history to the build-day state — so rebuild only when
+# upgrading, and accept the history reset (or copy var/live-write.sqlite3
+# out first and back in after the build).
 #
 #   console-build — node/pnpm: builds the console (web/) into static files.
 #   runtime       — the controller (default): python + src/energypod/,
-#                   uvicorn on 8080, entrypoint sources the operator's env
-#                   files from the mounted var/.
-#   console-nginx — nginx serving the built console; docker-compose.yml mounts
-#                   docker/nginx.conf, which proxies /api/v1 (WebSocket
-#                   included) and /healthz to the energypod service — the same
-#                   paths web/vite.config.ts proxies in development.
-#
-# NO SECRET IS BAKED INTO ANY TARGET.  Credentials, the API-key env files,
-# and the sqlite database arrive at RUNTIME as mounted volumes (see
-# compose.yaml and docs/DEPLOY_DOCKER.md).
+#                   uvicorn on 8080, entrypoint sources the baked env files.
+#   console-nginx — nginx serving the built console; proxies /api/v1
+#                   (WebSocket included) and /healthz to the energypod
+#                   service — the same paths web/vite.config.ts proxies in
+#                   development.
 
 # --- stage 1: the console build -------------------------------------------------
 
@@ -42,14 +50,20 @@ COPY pyproject.toml README.md ./
 COPY src/ ./src/
 RUN pip install --no-cache-dir .
 
-# Non-root runtime user (uid 1000 — docs/DEPLOY_DOCKER.md chowns the mounted
-# var/ directory to match, because the sqlite database must be writable).
+# Non-root runtime user (uid 1000; the baked /app/var is chowned to match —
+# the sqlite database must be writable).
 RUN useradd --uid 1000 --create-home energypod
+
+# The embedded deployment: the commissioned configuration AND the operator's
+# var/ (credentials, API-key env files, the database snapshot).  The
+# entrypoint sources the env files from here; the controller reads the
+# bearer-token store and the database from here.  Owned by the runtime user.
+COPY config/ ./config/
+COPY var/ ./var/
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chown -R energypod:energypod /app/var
 USER energypod
 
-# The guarded entrypoint: source the operator's credential env files (they
-# carry `export KEY=...` lines) and hand over to the standing launch command.
-COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 
 EXPOSE 8080
@@ -61,8 +75,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
 
 FROM nginx:1.27-alpine AS console-nginx
 COPY --from=console-build /build/dist /usr/share/nginx/html
-# docker/nginx.conf is mounted read-only by compose.yaml (editing the proxy
-# needs no rebuild); this COPY only provides a sane default.
 COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
 ENV TZ=Australia/Brisbane
 EXPOSE 80

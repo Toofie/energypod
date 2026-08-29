@@ -1,25 +1,33 @@
-# EnergyPod — the permanent deployment (docs/DEPLOY_DOCKER.md).
+# EnergyPod — the ALL-IN-ONE deployment (docs/DEPLOY_DOCKER.md).
 #
-# Two services on the operator's always-on Docker host:
-#   energypod — the controller (Modbus to the three gateways, sqlite at
-#               /app/var/live-write.sqlite3, guarded API on 8080 internal).
+# The operator's model: ONE image carrying everything — controller, console,
+# commissioned config, credentials, and the database snapshot.  No volumes,
+# no mounts, no separate file transfers: build once on the operator's
+# machine (where var/ and config/ live), deploy the image to the always-on
+# host, and `docker compose up -d`.
+#
+#   energypod — the controller (Modbus to the three gateways, the embedded
+#               sqlite store, the guarded API on 8080 internal).
 #   console   — nginx serving the built console and proxying /api/v1 (with
 #               the WebSocket) and /healthz to the controller.
 #
 # The operator's browser keeps the familiar port: the console publishes on
-# host port 8080.  The controller's own API is published on 127.0.0.1:8081
+# host port 8080.  The controller's own API publishes on 127.0.0.1:8081
 # (host-local only — scripts and verification, not the LAN).
 #
-# restart: unless-stopped is the point of this deployment: the controller
-# survives crashes and host reboots without this Windows session.
+# restart: unless-stopped + the operator's nightly restart: the fleet
+# re-arms at every boot (site.boot_armed: true in the embedded config), so
+# no nightly re-arm is needed.
 #
-# SECRETS: nothing is baked into either image.  var/ (the env files, the
-# bearer-token store, and the sqlite database) is a bind mount; config/ is
-# mounted read-only.  docs/DEPLOY_DOCKER.md owns the transfer + chown steps.
+# THE IMAGE CARRIES SECRETS (the operator accepted this for a local-only
+# deployment): never push it to a registry.  A REBUILD re-snapshots the
+# database to build day — see docs/DEPLOY_DOCKER.md §6.
 #
-# Usage (from the repo root, on the Docker host):
-#   docker compose up -d --build
-#   docker compose logs -f energypod
+# Usage (from the repo root, on the build machine):
+#   docker compose build            # bakes var/ + config/ at build time
+#   docker save energypod-controller energypod-console | gzip > deploy.tar.gz
+#   # transfer the images (or build on the host with the same repo + var/)
+#   docker compose up -d
 #   ./scripts/docker-verify.sh
 
 services:
@@ -29,15 +37,6 @@ services:
       target: runtime
     container_name: energypod-controller
     restart: unless-stopped
-    volumes:
-      # var/ = the durable store AND the secrets: live-write.sqlite3 (the
-      # historian, leases, pvoutput/calibration state), live-credentials.json
-      # (the bearer-token store), solcast.env + pvoutput.env (sourced by the
-      # entrypoint).  One mount, one chown (see the runbook).
-      - ./var:/app/var
-      # The commissioned configuration, read-only: the deployment's units,
-      # windows, policies, and every program block.
-      - ./config:/app/config:ro
     ports:
       - "127.0.0.1:8081:8080"
     environment:
@@ -51,8 +50,6 @@ services:
     restart: unless-stopped
     depends_on:
       - energypod
-    volumes:
-      - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
       - "8080:80"
     environment:
