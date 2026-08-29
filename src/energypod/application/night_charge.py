@@ -907,8 +907,24 @@ class NightChargeAdviser:
                 self._window_final_soc[plan.unit_id] = float(plan.soc_pct)
 
         if not participating:
-            # A stand-down unit always participates now (its hold IS the
-            # submission), so this is the completion/sit-out close only.
+            # v1.2.1 FIX: with every participant parked (or complete/sat-out),
+            # this early return used to sit ABOVE the standby release check —
+            # a parked unit whose own phase cleared could sit in Standby until
+            # window close because the release pass only ran inside the
+            # submit path nothing reached.  The release runs FIRST here: a
+            # cleared phase resumes and re-arms immediately, checked every
+            # tick, exactly the continuous monitoring the operator specified.
+            release_codes = await self._standby_release_all_eligible(reading)
+            if release_codes:
+                codes = (
+                    "window_open",
+                    *_no_participant_reasons(tuple(plans)),
+                    *release_codes,
+                    *self._standby_frame_codes(),
+                )
+                return await self._standby(
+                    _completion_phase(tuple(plans)), True, reading, codes, tuple(plans)
+                )
             reasons = (
                 "window_open",
                 *_no_participant_reasons(tuple(plans)),
@@ -1893,6 +1909,40 @@ class NightChargeAdviser:
                 return (REASON_NIGHT_STANDBY_REARM_FAILED,), False
         self._resumed_this_tick = True
         return (), True
+
+    async def _standby_release_all_eligible(
+        self, reading: DemandReading
+    ) -> tuple[str, ...]:
+        """v1.2.1: the continuous monitor for the EMPTY-submission path.
+
+        When every participant is parked (or otherwise out of the submission),
+        the tick short-circuits before ``_advance_standby`` — which used to
+        strand a parked unit whose own phase had CLEARED: nothing reached the
+        release pass until window close.  This pass releases EVERY mapped
+        standby whose own word is GOOD and below the exit bound (resume + the
+        ONE bounded re-arm each), regardless of whether anything will submit.
+        A failed release keeps the unit mapped for the idempotent retry next
+        tick — the loop never stops watching, per the operator's directive.
+        """
+        if self._settings.demand_response != "park_standby" or self._park_control is None:
+            return ()
+        exit_bound = self._settings.demand_threshold_w - self._settings.demand_exit_hysteresis_w
+        codes: list[str] = []
+        for unit_id in list(self._standby_parked):
+            if unit_id in self._standby_release_terminal:
+                continue
+            if self._settings.demand_scope == "per_phase":
+                word = reading.per_unit.get(unit_id, "missing")
+                unit_w = reading.per_unit_w.get(unit_id)
+            else:  # pragma: no cover - validation refuses fleet-scope standby
+                word, unit_w = reading.evidence, reading.demand_w
+            if word != "good" or unit_w is None or unit_w >= exit_bound:
+                continue
+            unit_codes, _covered = await self._standby_release_one(
+                unit_id, request_id=self._standby_parked.get(unit_id, "")
+            )
+            codes.extend(unit_codes)
+        return tuple(codes)
 
     async def _standby_release_all(self, mapped: dict[str, str]) -> tuple[str, ...]:
         """EVERY exit path's release: window close, disable toggle — each

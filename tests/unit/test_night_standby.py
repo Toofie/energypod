@@ -968,3 +968,43 @@ async def test_release_unverified_is_terminal_for_the_window(night: Any, api: An
     set_load(rig, "lhs", 500.0)
     await rig.adviser.tick()
     assert len(rig.park.resume_calls) == 1, "terminal: no further release attempts"
+
+
+async def test_a_cleared_phase_resumes_mid_window_even_when_nothing_submits(
+    night: Any, api: Any
+) -> None:
+    """v1.2.1 REGRESSION (live 2026-08-28 night): with EVERY participant
+    parked, the tick took the empty-submission early return ABOVE the release
+    pass — a parked unit whose own phase cleared stayed in Standby until
+    window close.  The continuous monitor must run on the empty path too:
+    both cleared phases resume + re-arm within the same tick, no window close
+    required."""
+    fleet = make_fleet(api, {"lhs": 1_500.0, "mid": 2_000.0, "rhs": 100.0})
+    # rhs sits at the policy ceiling: never a participant.
+    object.__setattr__(fleet["rhs"], "system_soc_pct", 95.0)
+    rig = make_standby_rig(night, api, fleet)
+    await rig.adviser.tick()  # engages the heavier phase (mid)
+    set_load(rig, "lhs", 1_500.0)
+    await rig.adviser.tick()  # engages lhs
+    # Both are now parked: every remaining tick submits NOTHING.
+    submits_after_park = rig.trace.count("submit")
+
+    # Both phases clear below the exit bound.
+    set_load(rig, "lhs", 200.0)
+    set_load(rig, "mid", 300.0)
+    decision = await rig.adviser.tick()
+
+    assert "resume:lhs" in rig.trace, "lhs must resume mid-window"
+    assert "resume:mid" in rig.trace, "mid must resume mid-window"
+    assert rig.trace.index("resume:lhs") < rig.trace.index("rearm:lhs")
+    assert rig.trace.index("resume:mid") < rig.trace.index("rearm:mid")
+    assert sorted(rig.arm.calls) == ["lhs", "mid"]
+    # The release itself files no intent; the plan rows in THIS tick's frame
+    # were built before the release (one tick of display lag is honest — the
+    # physical resume is already done).  The NEXT tick must show both units
+    # back in the fleet and CHARGING again: resume, not stop-until-morning.
+    assert rig.trace.count("submit") == submits_after_park, "release files no intent by itself"
+    decision = await rig.adviser.tick()
+    for unit in ("lhs", "mid"):
+        assert row(decision, unit).phase == "pacing", f"{unit} must be charging again"
+    assert rig.trace.count("submit") == submits_after_park + 1
