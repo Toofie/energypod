@@ -32,6 +32,35 @@ The build bakes: `config/` (revision 11 — the commissioned configuration),
 entrypoint), and `var/live-write.sqlite3` (**the build-day snapshot of the
 durable store** — historian, leases, PVOutput + calibration state).
 
+## 2b. Synology route — build ON the host (recommended)
+
+The image must match the Synology's processor, and this Windows machine
+has no Docker — so the build runs ON the Synology:
+
+1. **Enable SSH** on the Synology: DSM → Control Panel → Terminal & SNMP
+   → Enable SSH service.
+2. **Transfer the COMPLETE repo folder** to a shared folder (File Station
+   handles a zip upload; unzip on the host over SSH).  It must include
+   `var/` (database + credentials) and `config/` — the build bakes them.
+3. **Stop the Windows controller** before the final copy of
+   `var/live-write.sqlite3` (a live database must not be snapshotted
+   mid-write), then SSH in and build:
+
+```sh
+cd /volume1/homes/<you>/energypod        # the transferred repo root
+sh scripts/build-images.sh
+```
+
+The script builds both images and writes `energypod-images.tar.gz` — the
+loadable archive (which is also exactly what was asked for).  Load it via
+Container Manager → Image → Import → Add from file, then create the
+containers from `compose.yaml` (Project → Create), or simply
+`docker compose up -d` in the same SSH session — compose ships with
+DSM 7.2's Container Manager.
+
+The rest of this runbook (verification, day-to-day, trade-offs) applies
+unchanged.
+
 ## 3. Deploy
 
 ```sh
