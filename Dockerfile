@@ -1,76 +1,68 @@
-# EnergyPod controller image (docs/API_CONTRACTS.md "Operations surface").
+# EnergyPod controller + console — the deployment image (three targets).
 #
-# Shape (contract): multi-stage — a Node stage builds the operator console with
-# corepack-pinned pnpm, a Python stage installs the pinned project into its own
-# virtual environment and carries the built console. The runtime user is
-# non-root, no secret is baked in (the .dockerignore keeps credentials and
-# local state out of the build context), the configuration is mounted
-# read-only at /etc/energypod, the SQLite durable store lives on the declared
-# data volume /var/lib/energypod, and HEALTHCHECK probes the one
-# unauthenticated endpoint GET /healthz.
+#   console-build — node/pnpm: builds the console (web/) into static files.
+#   runtime       — the controller (default): python + src/energypod/,
+#                   uvicorn on 8080, entrypoint sources the operator's env
+#                   files from the mounted var/.
+#   console-nginx — nginx serving the built console; docker-compose.yml mounts
+#                   docker/nginx.conf, which proxies /api/v1 (WebSocket
+#                   included) and /healthz to the energypod service — the same
+#                   paths web/vite.config.ts proxies in development.
 #
-# Versions are pinned to the reviewed runtime selection (ADR-0002 and
-# pyproject.toml): Python 3.12 (3.12.10-slim, satisfies requires-python
-# >=3.12,<3.13), Node 24.19.0, pnpm 11.22.0 via corepack.
-#
-# Static validation performed in this repository (Docker is NOT installed in
-# the authoring environment; docs/CONTINUITY.md ledger step 12 defers the real
-# image build to a Docker-capable environment):
-#   1. Every COPY source path was verified to exist in the build context and
-#      to survive the .dockerignore filters.
-#   2. The base-image tags were verified to exist on Docker Hub
-#      (python:3.12.10-slim, node:24.19.0-slim; multi-arch OCI indexes).
-#   3. Version pins were cross-checked against pyproject.toml (requires-python,
-#      console script energypod) and ADR-0002 (pnpm 11.22.0, Node 24.19.0,
-#     React/Vite console built by `corepack pnpm build`).
-#   4. The HEALTHCHECK URL matches the unauthenticated liveness route served
-#      by the controller (GET /healthz on the loopback listener).
-# Run in a Docker-capable environment:
-#   docker build -t energypod-controller:0.1.0 .
+# NO SECRET IS BAKED INTO ANY TARGET.  Credentials, the API-key env files,
+# and the sqlite database arrive at RUNTIME as mounted volumes (see
+# compose.yaml and docs/DEPLOY_DOCKER.md).
 
-# syntax=docker/dockerfile:1
+# --- stage 1: the console build -------------------------------------------------
 
-# --- Stage 1: build the operator console with corepack-pinned pnpm ---------
-FROM node:24.19.0-slim AS web-builder
-ENV PNPM_HOME=/pnpm
-ENV PATH=/pnpm:$PATH
-RUN corepack enable \
-    && corepack prepare pnpm@11.22.0 --activate \
-    && corepack pnpm --version
-WORKDIR /build/web
-# Manifest-only layer first so dependency installs cache independently of src.
-COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
-RUN corepack pnpm install --frozen-lockfile
+FROM node:20-alpine AS console-build
+WORKDIR /build
+COPY web/package.json web/pnpm-lock.yaml ./
+RUN corepack enable && pnpm install --frozen-lockfile
 COPY web/ ./
-RUN corepack pnpm build \
-    && test -f /build/web/dist/index.html
+RUN pnpm build
 
-# --- Stage 2: install the pinned Python project into its own venv ----------
-FROM python:3.12.10-slim AS runtime
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PATH=/opt/energypod-venv/bin:$PATH
-# Dedicated non-root user: fixed uid, no home, no login shell.
-RUN useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin energypod
-RUN python -m venv /opt/energypod-venv
+# --- stage 2: the controller (the default target) -------------------------------
+
+FROM python:3.12-slim AS runtime
+
+# tzdata: the civil-time windows (night charge, health watch, calibration)
+# are computed from the site timezone via zoneinfo — the OS tz database must
+# exist, and TZ keeps logs readable in site time.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+ENV TZ=Australia/Brisbane
+
 WORKDIR /app
-# Install the pinned project (pyproject.toml drives every dependency pin).
+
+# The project itself (energypod-controller).  Copy the packaging metadata
+# first so dependency wheels cache across source-only edits.
 COPY pyproject.toml README.md ./
-COPY src ./src
-RUN /opt/energypod-venv/bin/pip install --no-cache-dir .
-# The built console ships inside the image (ADR-0002); serve it with
-# web/nginx-spa.conf, which proxies /api/v1 and /healthz to this process.
-COPY --from=web-builder /build/web/dist /app/web/dist
-# Read-only configuration mount point; durable SQLite lives on the data volume.
-RUN mkdir -p /etc/energypod /var/lib/energypod \
-    && chown -R energypod:energypod /app /etc/energypod /var/lib/energypod
-VOLUME /var/lib/energypod
+COPY src/ ./src/
+RUN pip install --no-cache-dir .
+
+# Non-root runtime user (uid 1000 — docs/DEPLOY_DOCKER.md chowns the mounted
+# var/ directory to match, because the sqlite database must be writable).
+RUN useradd --uid 1000 --create-home energypod
 USER energypod
+
+# The guarded entrypoint: source the operator's credential env files (they
+# carry `export KEY=...` lines) and hand over to the standing launch command.
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
 EXPOSE 8080
-# Liveness only (API_CONTRACTS): the one unauthenticated endpoint. This is a
-# process-up probe, never readiness and never data.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD ["python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4).status == 200 else 1)"]
-# The controller binds its loopback listener (energypod.main serving default);
-# /healthz above and in-container clients reach it there.
-CMD ["energypod", "run", "/etc/energypod/controller.yaml"]
+# /healthz is the unauthenticated liveness read (rest.py) — no bearer needed.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)" || exit 1
+
+# --- stage 3: the console's nginx (the console-nginx target) --------------------
+
+FROM nginx:1.27-alpine AS console-nginx
+COPY --from=console-build /build/dist /usr/share/nginx/html
+# docker/nginx.conf is mounted read-only by compose.yaml (editing the proxy
+# needs no rebuild); this COPY only provides a sane default.
+COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+ENV TZ=Australia/Brisbane
+EXPOSE 80

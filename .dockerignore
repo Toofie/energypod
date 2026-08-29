@@ -1,55 +1,32 @@
-# EnergyPod controller build context (paired with ./Dockerfile).
-#
-# Keeps the image build hermetic and secret-free (docs/API_CONTRACTS.md
-# "Operations surface": no secrets baked in): local virtualenvs, caches,
-# test state, databases, mutation caches, and environment files never enter
-# a build layer. Everything the Dockerfile COPYs (pyproject.toml, README.md,
-# src/, web/ manifest + sources) stays reachable — verified by the static
-# packaging check described in the Dockerfile header.
+# The image build context: source only.  Secrets, data, caches, and the
+# design-shot vault never enter a layer — the runtime mounts arrive via
+# compose.yaml.
 
-# Version control and CI metadata
 .git
-.gitignore
-.gitattributes
-
-# Local Python state
 .venv
-__pycache__
-*.pyc
+**/__pycache__
+**/*.pyc
+.pytest_cache
 .mypy_cache
 .ruff_cache
-.pytest_cache
-.hypothesis
-.coverage
 htmlcov
-.mutmut-cache
+.coverage
 
-# Local node state (the web stage installs from the lockfile itself)
+# Node
 web/node_modules
 web/dist
-web/tsconfig.tsbuildinfo
+web/coverage
+web/.design-shots
 
-# Local runtime state and durable stores
-data
+# Secrets and durable state — mounted at RUNTIME, never baked.
+var/
+*.env
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
 
-# Secrets and environment files — never part of an image
-.env
-.env.*
-
-# Test and review artifacts
-tests
-.review-findings
-.claude
-claude.txt
-
-# Container artifacts
-Dockerfile
-compose.yaml
-.dockerignore
-
-# OS noise
-Thumbs.db
-.DS_Store
+# Docs and tests are not runtime cargo.
+tests/
+docs/
+*.md
+!README.md

@@ -1,0 +1,6 @@
+# The container scripts must keep LF on every platform: a CRLF shebang line
+# breaks /bin/sh inside the container ("/usr/local/bin/entrypoint.sh: no such
+# file or directory" — the classic Windows checkout failure).
+docker/entrypoint.sh text eol=lf
+scripts/docker-verify.sh text eol=lf
+docker/nginx.conf text eol=lf

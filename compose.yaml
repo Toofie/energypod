@@ -1,79 +1,59 @@
-# EnergyPod controller composition (docs/API_CONTRACTS.md "Operations
-# surface"): one controller service plus a simulator profile for local
-# operation.
+# EnergyPod — the permanent deployment (docs/DEPLOY_DOCKER.md).
 #
-#   docker compose up -d controller                 # observe-only controller
-#   docker compose --profile simulate up -d simulate # local simulator
-#   docker compose logs simulate | grep -i token    # the printed dev token
+# Two services on the operator's always-on Docker host:
+#   energypod — the controller (Modbus to the three gateways, sqlite at
+#               /app/var/live-write.sqlite3, guarded API on 8080 internal).
+#   console   — nginx serving the built console and proxying /api/v1 (with
+#               the WebSocket) and /healthz to the controller.
 #
-# Contract notes:
-#   - Exactly one controller process runs (ADR-0002: uvicorn must run one
-#     worker; never scale this service while control is enabled).
-#   - The container filesystem is read-only; configuration is mounted
-#     read-only at /etc/energypod, and the durable SQLite store lives on the
-#     named data volume /var/lib/energypod (the image declares that VOLUME).
-#   - No secret is provided by this file. `run` mode without a credential
-#     store stays fail-closed (all bearer auth refused).
-#   - HEALTHCHECK is inherited from the image (GET /healthz, liveness only).
+# The operator's browser keeps the familiar port: the console publishes on
+# host port 8080.  The controller's own API is published on 127.0.0.1:8081
+# (host-local only — scripts and verification, not the LAN).
 #
-# Static validation performed here (Docker is NOT installed in the authoring
-# environment; docs/CONTINUITY.md ledger step 12 defers the image build):
-#   1. This file parses as YAML (safe_load) and every services.*.build/
-#     volumes source path was verified to exist in the repository
-#     (./Dockerfile, ./config/controller.yaml, ./config/controller.simulate.yaml).
-#   2. Both mounted configurations were round-tripped through the strict
-#     ControllerConfig model (`energypod check-config` spelling).
-#   3. The simulate service command matches the CLI contract
-#     (`energypod simulate PATH`), and both services' config mount point
-#     matches the image CMD argument /etc/energypod/controller.yaml.
+# restart: unless-stopped is the point of this deployment: the controller
+# survives crashes and host reboots without this Windows session.
 #
-# Known limitation (tracked in docs/DEFERRED_FINDINGS.md #16): until an
-# explicit listener contract exists, `energypod run`/`simulate` bind their
-# loopback interface inside the container. The published port below is
-# therefore reachable only once the serving host is configurable; until then
-# probe the API from inside the container (`docker compose exec controller
-# python -c "..."` against http://127.0.0.1:8080/healthz) or front the
-# controller once the listener contract lands.
-
-name: energypod
+# SECRETS: nothing is baked into either image.  var/ (the env files, the
+# bearer-token store, and the sqlite database) is a bind mount; config/ is
+# mounted read-only.  docs/DEPLOY_DOCKER.md owns the transfer + chown steps.
+#
+# Usage (from the repo root, on the Docker host):
+#   docker compose up -d --build
+#   docker compose logs -f energypod
+#   ./scripts/docker-verify.sh
 
 services:
-  controller:
+  energypod:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: energypod-controller:0.1.0
-    init: true
+      target: runtime
+    container_name: energypod-controller
     restart: unless-stopped
-    # The safety path is one process on one loop; a read-only root keeps the
-    # durable store on its volume and nothing else writable.
-    read_only: true
-    tmpfs:
-      - /tmp
     volumes:
-      - ./config/controller.yaml:/etc/energypod/controller.yaml:ro
-      - energypod-data:/var/lib/energypod
+      # var/ = the durable store AND the secrets: live-write.sqlite3 (the
+      # historian, leases, pvoutput/calibration state), live-credentials.json
+      # (the bearer-token store), solcast.env + pvoutput.env (sourced by the
+      # entrypoint).  One mount, one chown (see the runbook).
+      - ./var:/app/var
+      # The commissioned configuration, read-only: the deployment's units,
+      # windows, policies, and every program block.
+      - ./config:/app/config:ro
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8081:8080"
+    environment:
+      - TZ=Australia/Brisbane
 
-  simulate:
-    profiles: ["simulate"]
+  console:
     build:
       context: .
-      dockerfile: Dockerfile
-    image: energypod-controller:0.1.0
-    init: true
-    read_only: true
-    tmpfs:
-      - /tmp
-    # Simulator deployment: deterministic in-process pods, in-memory
-    # persistence, one development principal whose bearer token is printed
-    # once to stdout at startup (fetch it from `docker compose logs simulate`).
-    command: ["energypod", "simulate", "/etc/energypod/controller.yaml"]
+      target: console-nginx
+    container_name: energypod-console
+    restart: unless-stopped
+    depends_on:
+      - energypod
     volumes:
-      - ./config/controller.simulate.yaml:/etc/energypod/controller.yaml:ro
+      - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
-      - "8081:8080"
-
-volumes:
-  energypod-data:
+      - "8080:80"
+    environment:
+      - TZ=Australia/Brisbane
