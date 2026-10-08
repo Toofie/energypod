@@ -305,6 +305,19 @@ surplus error:
   bounds): ACT demotes itself to full targets, loudly (§3.3), until the
   rolling window re-earns.
 
+**The operator override (added 2026-10-08, operator directive).**
+`trust.mode: "operator_override"` is the operator's durable config act
+that takes the scoreboard OUT of the GOVERNING path: the §3.3 trust rung
+never abandons the window, so the forecast target governs under every
+state word — `provisioning` after a DB reset, even `suspended`.  It
+removes the gate, never the evidence: the ledger keeps scoring and the
+projection keeps displaying the truthful word, the archive rows record
+it, and the missing/stale data rungs still fall back to the v1 ceiling.
+Motivating incident: an image rebuild baked a stale `var/`, resetting a
+legitimately-earned scoreboard; the override re-opens the posture without
+fabricating scored mornings (which would poison the archive).  The
+default `scored` is byte-identical to the gate as shipped.
+
 **Proposed gate: 14 days, 30% mean, +10/−20% bias, 3-and-3 regime mix.**
 Calibration honesty: 14 is a threshold of convenience (two weeks, one
 synoptic cycle, and exactly the historian's full-resolution retention —
@@ -510,6 +523,7 @@ night_charging:
   retarget_min_gap_min: 60       # and the 2-per-window cap (pinned §5.2)
   assumed_capacity_wh: {lhs: 5000, mid: 5000, rhs: 4200}   # ASSUMPTION §2.6
   trust:
+    mode: "scored"               # | operator_override — the operator's gate-removal act (2026-10-08)
     required_days: 14
     tolerance_pct: 30.0          # mean |err| over scored days
     max_overforecast_bias_pct: 10.0   # the DANGEROUS direction, tighter (A4)

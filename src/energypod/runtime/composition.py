@@ -5091,6 +5091,7 @@ def _build_runtime(
                 timezone=night_config.timezone,
                 unit_ids=tuple(unit.unit_id for unit in config.units),
                 target_policy=night_config.target_policy,
+                trust_operator_override=(night_config.trust.mode == "operator_override"),
                 forecast_quantile=float(night_config.forecast_quantile),
                 midday_local=parse_hhmm(night_config.midday_local),
                 floor_pct=float(night_config.floor_pct),

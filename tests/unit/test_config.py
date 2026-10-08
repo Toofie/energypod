@@ -1557,6 +1557,26 @@ def test_the_v2_keys_carry_their_pinned_defaults() -> None:
     assert block.trust.max_overforecast_bias_pct == 10.0
     assert block.trust.max_underforecast_bias_pct == 20.0
     assert block.trust.min_regime_days == 3
+    assert block.trust.mode == "scored", "the absent key is the scored gate"
+
+
+def test_the_trust_mode_key_selects_scored_or_the_operator_override() -> None:
+    """Section 6's override amendment (operator directive 2026-10-08):
+    `mode` selects who governs -- `scored` (the absent-key default) keeps
+    the compound gate exactly as shipped; `operator_override` is the
+    operator's durable act that takes the scoreboard out of the governing
+    path while the ledger keeps scoring.  Anything else is refused by
+    name, night-block-scoped like every other key."""
+    assert _validate(_night_v2_config()).night_charging is not None
+
+    overridden = _validate(_night_v2_config(trust={"mode": "operator_override"}))
+    assert overridden.night_charging is not None
+    assert overridden.night_charging.trust.mode == "operator_override"
+
+    _assert_night_rule(
+        _night_v2_config(trust={"mode": "disabled"}),
+        message_contains="operator_override",
+    )
 
 
 def test_full_posture_is_v1_config_identity_needing_no_forecast_stack() -> None:

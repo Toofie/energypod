@@ -571,6 +571,11 @@ class NightChargeSettings:
     retarget_threshold_pct: float = 20.0
     retarget_min_gap_min: int = 60
     stale_after_s: float = 3600.0
+    # The §6 override (operator directive 2026-10-08): True takes the trust
+    # scoreboard out of the GOVERNING path — the §3.3 trust rung never
+    # abandons the window.  Scoring/display stay truthful and the data rungs
+    # (missing/stale) still fall back; the default is exact gate identity.
+    trust_operator_override: bool = False
     # --- the TRUE STANDBY posture (operator directive 2026-08-26); both keys
     # default to the v1-hold identity and are never consulted under ``hold``
     # -----------------------------------------------------------------------
@@ -1143,10 +1148,15 @@ class NightChargeAdviser:
             return
         # §3.3's last rung, scoped to the governing path (the §3.1 display
         # runs from day one under SUGGEST; an unearned ACT site runs the
-        # fallback per §6 until the scoreboard earns).
+        # fallback per §6 until the scoreboard earns).  The §6 override (the
+        # operator's durable config act, 2026-10-08) takes the scoreboard
+        # out of THIS path: the forecast target then governs under every
+        # state word while the ledger keeps scoring truthfully — the data
+        # rungs above still fall back either way.
         trust = self._trust_state() if self._trust_state is not None else "provisioning"
-        if trust == "suspended" or (
-            self._settings.target_policy == "forecast_act" and trust != "earned"
+        if not self._settings.trust_operator_override and (
+            trust == "suspended"
+            or (self._settings.target_policy == "forecast_act" and trust != "earned")
         ):
             self._abandon(REASON_FORECAST_BELOW_TRUST)
             return

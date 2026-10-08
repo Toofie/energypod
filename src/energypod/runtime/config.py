@@ -655,8 +655,16 @@ class NightTrustBlockConfig(_FrozenModel):
     ASYMMETRIC with over-forecast the dangerous, tighter direction, so the
     over bound must sit strictly below the under bound — a symmetric pair is
     a different gate than the one this contract ships.
+
+    ``mode`` (§6's override amendment, operator directive 2026-10-08):
+    ``scored`` — the absent-key default — governs by the scoreboard exactly
+    as shipped; ``operator_override`` is the operator's durable config act
+    that takes the scoreboard OUT of the governing path (the §3.3 trust
+    rung never abandons).  The ledger keeps scoring and displaying
+    truthfully either way; only the gate is removed, never the evidence.
     """
 
+    mode: Literal["scored", "operator_override"] = "scored"
     required_days: PositiveStrictInt = 14
     tolerance_pct: PositiveFiniteFloat = 30.0
     max_overforecast_bias_pct: PositiveFiniteFloat = 10.0

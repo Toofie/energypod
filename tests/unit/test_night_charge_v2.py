@@ -637,6 +637,66 @@ async def test_below_trust_is_the_act_postures_own_fallback(night: Any, api: Any
     assert suggest_decision.forecast is not None, "the suggest display runs from day one"
 
 
+async def test_the_operator_override_takes_the_scoreboard_out_of_the_governing_path(
+    night: Any, api: Any
+) -> None:
+    """Section 6's override amendment (operator directive 2026-10-08): the
+    operator's durable config act (`trust.mode: operator_override`) takes
+    the scoreboard OUT of the governing path -- the forecast target governs
+    under EVERY trust word, including the fresh-DB reset's `provisioning`
+    and a demoted `suspended`, where the same gate without the override
+    still falls back (the test above).  The override removes the gate,
+    never the evidence: the ledger keeps scoring and the data rungs
+    (missing/stale) still fall back either way."""
+    fleet = make_fleet(api, {"lhs": 60.0, "mid": 60.0, "rhs": 60.0})
+    overridden = make_settings(
+        night, assumed_capacity_wh=dict(CAPACITIES), trust_operator_override=True
+    )
+    for word in ("provisioning", "suspended"):
+        adviser, _, _, _, _ = make_adviser(
+            night,
+            api,
+            dict(fleet),
+            settings=overridden,
+            credit=FakeCreditPort([_credit(night)]),
+            trust=word,
+        )
+        decision = await adviser.tick()
+        assert decision.fallback_reason is None, word
+        assert decision.target_soc_pct == pytest.approx(65.49, abs=0.2), (
+            "the forecast target governs, not the v1 ceiling"
+        )
+        assert all(
+            plan.target_soc_pct == pytest.approx(65.49, abs=0.2)
+            for plan in decision.unit_plans
+        ), word
+
+
+async def test_the_override_never_touches_the_data_rungs(night: Any, api: Any) -> None:
+    """The §6 override removes the trust GATE, not the fail-closed ladder:
+    missing or stale forecast data still abandons to the v1 ceiling under
+    the override (an operator act may not turn absent data into a target)."""
+    fleet = make_fleet(api, {"lhs": 60.0, "mid": 60.0, "rhs": 60.0})
+    overridden = make_settings(
+        night, assumed_capacity_wh=dict(CAPACITIES), trust_operator_override=True
+    )
+    for failure, expected_code in (
+        ("forecast_missing", "REASON_FORECAST_MISSING"),
+        ("forecast_stale", "REASON_FORECAST_STALE"),
+    ):
+        adviser, _, _, _, _ = make_adviser(
+            night,
+            api,
+            dict(fleet),
+            settings=overridden,
+            credit=FakeCreditPort([_credit(night, failure=failure)]),
+            trust="provisioning",
+        )
+        decision = await adviser.tick()
+        assert decision.fallback_reason == getattr(night, expected_code), failure
+        assert decision.target_soc_pct is None, failure
+
+
 async def test_a_fallback_window_archives_nothing_to_score(night: Any, api: Any) -> None:
     """A12: full-posture days and §3.3 fallback nights archive nothing -- the
     trust ledger's exclusion, pinned at the writer."""

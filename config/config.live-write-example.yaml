@@ -656,6 +656,16 @@ night_charging:
   # way), so confirming rhs's true Wh matters most.
   assumed_capacity_wh: {lhs: 5000, mid: 5000, rhs: 4200}
   trust:
+    # The OPERATOR OVERRIDE (directive 2026-10-08): the image rebuild baked a
+    # stale var/ and reset a legitimately-earned scoreboard back to
+    # provisioning.  Rather than wait out a fresh 14-day re-earn — or fake
+    # scored mornings, which would poison the archive — this durable config
+    # act takes the scoreboard OUT of the governing path: the forecast
+    # target governs under every trust word.  The ledger keeps scoring and
+    # the tile keeps showing the truthful word; missing/stale forecast data
+    # still falls back to the v1 ceiling.  Delete this line (or set it back
+    # to "scored") to re-arm the gate at any time.
+    mode: "operator_override"
     required_days: 14       # one synoptic cycle; extend to 28 is documented
     tolerance_pct: 30.0     # mean |err| over the rolling scored window
     max_overforecast_bias_pct: 10.0   # the DANGEROUS direction, tighter (A4)

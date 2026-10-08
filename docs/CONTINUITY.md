@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-09-22 (Australia/Brisbane; both boot-default promotions live in the config — excess participation and the forecast_act night posture — images rebuilt, controller image is the only redeploy)
+Last updated: 2026-10-08 (Australia/Brisbane; trust-gate operator override shipped — `night_charging.trust.mode: operator_override` — the live config already carries it; controller-only change)
 
 ## Purpose
 
@@ -375,6 +375,34 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-10-08 (THE TRUST-GATE OPERATOR OVERRIDE — config revision 13;
+  controller-only change, no image rebuild required for the config key but
+  the running controller must be restarted/redeployed with the new code AND
+  config): the live console showed the trust scoreboard back at
+  `provisioning — 3/14 days · mean err 33.89%` — the 2026-09-22 image rebuild
+  baked the repo's STALE `var/live-write.sqlite3`, resetting the
+  legitimately earned 17-morning ledger (the DEPLOY_DOCKER §6 caveat,
+  realized).  Operator directive: "if it's blocking, remove the block."
+  Implemented as `night_charging.trust.mode: "operator_override"` (default
+  `"scored"` = exact prior identity): the §3.3 trust rung no longer abandons
+  the window — the `forecast_act` target governs under EVERY trust word
+  (`provisioning` after a reset, even `suspended`) — while the ledger keeps
+  scoring and displaying truthfully and the missing/stale DATA rungs still
+  fall back to the v1 ceiling.  Backfilling fake scored mornings was
+  rejected: the override is honest (the scoreboard still says
+  `provisioning`), durable (config survives image rebuilds; the DB does
+  not), and reversible in one key.  Live config set to the override
+  posture; the console tile will keep reading `provisioning — N/14` — that
+  is now informational, not governing.  Changes: config.py (`mode` field on
+  `NightTrustBlockConfig`), night_charge.py (`trust_operator_override` on
+  `NightChargeSettings` + gate rung), composition.py wiring, live-write
+  example, DESIGN §6 amendment, named tests (override governs under
+  provisioning+suspended; data rungs untouched; config default/refusal).
+  Gates: pytest test_config.py + test_night_charge_v2.py + test_night_standby.py
+  green; ruff green; mypy --strict green.  REMINDER: this working tree also
+  still carries the UNCOMMITTED 2026-09-22 revision-12 changes (excess +
+  forecast_act promotion); the operator commits.
 
 - 2026-09-22 ~10:30 (TWO BOOT-DEFAULT PROMOTIONS — config revision 12; both
   images rebuilt; THE CONTROLLER IMAGE ONLY is redeployable): the operator's
