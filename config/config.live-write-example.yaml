@@ -369,7 +369,11 @@ storage:
 # charge intents under the composed automation principal
 # `energypod:excess-adviser` (audit-attributable, never on REST/MCP), the
 # deterministic bound is one additional min() term in the allocator
-# (min(max_charge_from_export_w, max(0, fleet grid export - margin)),
+# (min(max_charge_from_export_w, max(0, fleet grid export + the target's own
+# charging draw - margin)) — the target-draw add-back is the operator-pinned
+# formula (2026-09-04): the measured net already contains the target's draw,
+# and a net-only bound double-counts it, halving the harvest; the credit is
+# fail-closed to nothing on missing/bad/stale telemetry),
 # collapsing to 0 on any missing/bad/stale per-pod grid word at PCS
 # 0x1000+17), and hand-back to each pod's own CT-following autonomy is by
 # non-renewal only — the TTL lapse plus the ~3.5-4.0 s firmware watchdog.
@@ -396,22 +400,35 @@ storage:
 #
 # TRIAL COMMISSIONING (resolved 2026-08-24, present-but-off): the block below
 # is UNCOMMENTED so the machinery composes — the console tile and toggle are
-# visible, the PCS grid block is promoted — while `enabled: false` keeps
-# participation suspended; the trial STARTS at the operator's toggle (which
-# itself requires the one-time NET_BILLED acknowledgement). The trial-cap
+# visible, the PCS grid block is promoted — while `enabled: false` kept
+# participation suspended; the trial STARTED at the operator's toggle (which
+# itself required the one-time NET_BILLED acknowledgement). The trial-cap
 # tension flagged by the implementation is resolved by lowering the autonomy
 # assumption for the trial: assumed_autonomous_charge_w 300 puts the
-# beat-autonomy ENTRY threshold at 400 W, inside the 500 W cap — the
-# simulator-proven combination. Graduation to production restores 2500 W and
-# re-commissions the autonomy key from observed daytime self-charge.
+# beat-autonomy ENTRY threshold at 400 W, inside the 500 W trial cap — the
+# simulator-proven combination.
+#
+# GRADUATION, both halves now resolved: the cap went to 2500 W on the
+# operator's 2026-08-27 directive ("consume almost as much as possible"),
+# and on 2026-09-22 the operator promoted the PARTICIPATION itself to the
+# boot default (`enabled: true`) — the container restarts nightly, and a
+# boot-off posture would silently forfeit every morning's surplus after
+# each restart.
 #
 excess_charging:
-  enabled: false            # suspended at boot; the trial STARTS at the toggle
+  enabled: true             # THE BOOT DEFAULT (operator promotion 2026-09-22): the
+                            #   container restarts nightly and every boot returns
+                            #   participation to this posture, so surplus must be
+                            #   ON in the config itself — the runtime toggle still
+                            #   overrides within a session, and a console disable
+                            #   lasts only until the next restart
   export_headroom_margin_w: 200
   max_charge_from_export_w: 2500  # THE GRADUATION (operator directive 2026-08-27:
                             # "consume almost as much as possible"). The bound is
-                            # min(this cap, export − 200 W margin), so surplus flows
-                            # to the neediest battery up to the headroom itself; the
+                            # min(this cap, export + the target's own charging
+                            # draw − 200 W margin) — the target-draw add-back is
+                            # the operator-pinned formula (2026-09-04) — so surplus
+                            # flows to the neediest battery up to the headroom itself; the
                             # 200 W anti-import margin and hysteresis are unchanged
   export_telemetry_max_age_s: 3.0
   assumed_autonomous_charge_w: 300  # trial value: entry threshold 400 W < 500 W cap
@@ -603,18 +620,24 @@ night_charging:
   demand_telemetry_max_age_s: 3.0
   intent_ttl_s: 10.0
   # --- NIGHT-V2 (DESIGN_NIGHT_CHARGE_V2): the forecast-aware top-up target --
-  # THE SHIPPING POSTURE is forecast_suggest (section 9 step 2, config
-  # revision two): the adviser COMPUTES and DISPLAYS tonight's per-battery
-  # target, its forecast provenance, and the trust scoreboard, but charges
-  # to the v1 ceiling — the submission math is byte-identical to full (a
-  # named test), so this posture runs from day one at zero actuation risk
-  # while the scoreboard accumulates one scored morning per day.
-  # forecast_act is the operator's LATER revision (a human act, exactly like
-  # every other authority grant): it needs the tariff keys with export FIT
-  # strictly below the off-peak import (A3) plus the earned trust line, and
-  # the console can never flip this key — there is deliberately no route.
-  # `full` (the absent-key default) is exact v1 identity.
-  target_policy: "forecast_suggest"
+  # THE COMMISSIONED POSTURE is forecast_act (the operator's promotion
+  # 2026-09-22): the adviser CHARGES to tonight's computed per-battery
+  # forecast target.  The promotion is exactly the LATER revision the
+  # doctrine reserved for a human act: it needs the tariff keys with export
+  # FIT strictly below the off-peak import (A3 — held: 2.0 c < 7.27 c) plus
+  # the earned trust line — held 2026-09-22: 17 scored mornings against
+  # required_days 14, mean |err| 25.52% <= tolerance 30%, bias 11.11%
+  # inside the pinned over/under bounds, regime coverage 6 low + 5 high
+  # mornings against min_regime_days 3.
+  # The FAIL-SAFE is unchanged: on any forecast failure or a lapsed trust
+  # line the adviser falls back LOUDLY to the v1 ceiling (maximum_soc_pct,
+  # 95%) — it can only ever buy MORE off-peak energy than v1, never less.
+  # The console can never flip this key — there is deliberately no route.
+  target_policy: "forecast_act"  # THE PROMOTION (2026-09-22): trust earned
+                            #   (17/14 mornings, |err| 25.52% <= 30, bias
+                            #   11.11% in bounds, 6 low + 5 high regimes) —
+                            #   charge the forecast target; v1 fallback on
+                            #   any failure
   forecast_quantile: 0.1    # the DRIVER slice (p10); p50 explains. The
                             # slot-wise netting compounds to ~95-99% full-by-
                             # midday service, not the nominal 90% (A7)

@@ -52,11 +52,42 @@ sh scripts/build-images.sh
 ```
 
 The script builds both images and writes `energypod-images.tar.gz` — the
-loadable archive (which is also exactly what was asked for).  Load it via
-Container Manager → Image → Import → Add from file, then create the
-containers from `compose.yaml` (Project → Create), or simply
-`docker compose up -d` in the same SSH session — compose ships with
-DSM 7.2's Container Manager.
+loadable archive (which is also exactly what was asked for).
+
+**The host runs DSM 7.1.1 — the old Docker package, NOT Container Manager**
+(confirmed 2026-09-04; Container Manager needs DSM 7.2+, which is why there
+is no Projects tab).  Two ways to run the pair:
+
+**(a) GUI (no SSH)** — the goal is: both containers on ONE user-defined
+bridge network, with the controller NAMED `energypod` (on a user-defined
+network the container name IS the DNS name the console's nginx resolves;
+the default bridge has no DNS — hand-made containers on it crash-loop with
+`host not found in upstream "energypod"`):
+
+1. Image tab: confirm BOTH `energypod-controller` and `energypod-console`
+   are listed (import the archive: Action > Import > Add from file — or
+   `docker load` over SSH).
+2. Network tab: Add → name `energypod-net`; IPv4 "Get network
+   configuration automatically"; leave "Disable IP masquerade" UNCHECKED
+   (the controller dials OUT to the gateways through it) and IPv6 off →
+   OK.  The DSM wizard never asks for a driver — what it creates IS a
+   user-defined bridge (Synology KB: user-defined bridges are what enable
+   container-name DNS).
+3. Delete any hand-made containers from earlier attempts.
+4. Image tab → `energypod-controller` → Launch:
+   container name **`energypod`** (exactly), Advanced → Network =
+   `energypod-net`, NO port mapping needed, enable auto-restart.
+   Wait until it is Running.
+5. Image tab → `energypod-console` → Launch: name `energypod-console`,
+   Network = `energypod-net`, port local **8080** → container **80**,
+   enable auto-restart.
+6. Browser: `http://<nas-ip>:8080`.  After a NAS reboot the console may
+   loop briefly until the controller is up — auto-restart settles it (or
+   restart the console once by hand).
+
+**(b) SSH with compose** — `docker load` the archive, install the compose
+CLI by hand (the 7.1 package does not ship it), then `docker-compose up -d`
+with the repo's compose.yaml.
 
 The rest of this runbook (verification, day-to-day, trade-offs) applies
 unchanged.
@@ -81,9 +112,15 @@ manual re-arm after restarts.
 ## 4. Verification
 
 ```sh
-./scripts/docker-verify.sh          # console port 8080
-docker compose logs --tail=50 energypod
+./scripts/docker-verify.sh          # console port 8080 (default)
+./scripts/docker-verify.sh 8082     # the operator's NAS maps the console to 8082
 ```
+
+**Console login:** the login field takes the credential KEY (the `live-…`
+string naming the entry in `var/live-credentials.json`, not its `subject`).
+The events WebSocket stays in a retry loop until login — by design it buys
+a single-use ticket with the bearer key first, so a fresh browser origin
+errors until the key is entered (observed on the NAS, 2026-09-04).
 
 Expected: `ALL CHECKS PASS`; the controller log shows the current schema
 version, config revision 11, no credential notes, and the boot-arm audit
@@ -95,6 +132,33 @@ Optional deeper check with the operator token:
 ```sh
 ENERGYPOD_TOKEN=<token> ./scripts/docker-verify.sh
 ```
+
+### 4b. If the console crash-loops with `host not found in upstream "energypod"`
+
+The console's nginx resolves the controller by the compose SERVICE name
+(`energypod`) on the project network.  That name only exists when both
+containers are created by the SAME compose project — a console container
+created by hand (`docker run`, or a one-off UI container) lands on the
+default bridge, can't resolve `energypod`, and exits at startup in a
+restart loop.  (The give-away is a container name like
+`energypod-console1`.)
+
+Fix: delete the hand-made containers, and bring the pair up as ONE project —
+`docker compose up -d`, or Container Manager → Project → Create with the
+compose.yaml.  Both images are already loaded; compose uses them and does
+not rebuild.
+
+### 4c. If the event stream shows "connection loss, reconnecting" (REST fine)
+
+The controller rejects a WebSocket whose Origin netloc does not equal the
+Host header it receives (`_validate_websocket_origin`, rest.py).  The
+console's nginx used to forward `Host $host` — port stripped — so a browser
+on any non-standard port (`box:8082`) failed that check with an opaque
+empty 403 while every REST call kept working.  Fixed 2026-09-04 by
+forwarding `Host $http_host` (docker/nginx.conf).  Redeploy just the
+CONSOLE image to pick it up — `docker compose build console` — the
+controller and its data are untouched.  (Proven by handshake probe:
+Origin `box:8082` + Host `box` → 403; Host `box:8082` → 101.)
 
 ## 5. Cutover from the Windows deployment (the ordered dance)
 
@@ -158,5 +222,8 @@ first if it matters).
   the default bridge network — no host networking needed.
 - **Ports**: the console publishes `8080` (browser habit unchanged); the
   controller's raw API publishes on `127.0.0.1:8081` — host-local only.
+- **Serve bind**: the controller defaults to loopback; the entrypoint moves
+  it to `0.0.0.0` (`ENERGYPOD_SERVE_HOST`, main.py) because the console's
+  nginx proxies cross-container.  Nothing else moves the bind.
 - **Config changes**: edit `config/`, rebuild, redeploy — the config is
   baked (config-revision discipline still applies).

@@ -26,11 +26,23 @@ operator authorization.
 - **Deterministic bound (allocator).** For a charge intent with
   `source == OPTIMIZER`:
   `eligible_charge_w = min(max_charge_from_export_w, max(0, floor(Σ_units
-  grid_power_w) - export_headroom_margin_w))`, applied as ONE additional
-  min() term on the allocation demand. It collapses to 0 unless EVERY fleet
-  unit's `grid_power_w` is finite, `GOOD`, and no older than
-  `export_telemetry_max_age_s`. It never applies to any other source or
-  direction, and the un-armed policy triple (the default) also yields 0.
+  grid_power_w + target_charging_w) - export_headroom_margin_w))`, applied as
+  ONE additional min() term on the allocation demand. It collapses to 0 unless
+  EVERY fleet unit's `grid_power_w` is finite, `GOOD`, and no older than
+  `export_telemetry_max_age_s`. `target_charging_w` is the target unit's own
+  measured charging draw (`-battery_watts`, floored at zero — a discharging
+  target credits nothing), credited only when the target's battery telemetry is
+  finite, `GOOD`, and no older than `export_telemetry_max_age_s`; anything less
+  credits NOTHING and the bound stays at the net-only figure. OPERATOR-PINNED
+  2026-09-04: the measured net already contains the target's draw, so a
+  net-only bound counts it twice and the closed loop converges to roughly HALF
+  the harvestable surplus; with the add-back a command at the bound lands the
+  site at exactly the headroom margin. The bound is therefore a per-target
+  figure: the adviser passes its selected target, and the allocator passes the
+  intent's SURVIVING scope when that scope is a single unit — a wider scope
+  credits no single unit's draw and falls back to the conservative net-only
+  figure. It never applies to any other source or direction, and the un-armed
+  policy triple (the default) also yields 0.
 - **Kernel defense in depth.** A non-zero export-bounded charge proposal is
   rejected with `export_evidence_missing` / `export_evidence_bad` /
   `export_evidence_stale` when the fleet grid evidence is unusable; zero-watt

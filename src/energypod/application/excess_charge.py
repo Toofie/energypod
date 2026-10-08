@@ -185,19 +185,32 @@ def _grid_evidence_word(observation: Any, *, max_age_s: float, now_mono: float) 
     return "good"
 
 
-def eligible_export_charge_w(observations: Mapping[str, Any], policy: Any, now_mono: float) -> int:
+def eligible_export_charge_w(
+    observations: Mapping[str, Any], policy: Any, now_mono: float, target_unit_id: str | None = None
+) -> int:
     """The deterministic export bound: one additional min() term, or zero.
 
-    ``min(max_charge_from_export_w, max(0, floor(sum(grid_power_w)) -
-    export_headroom_margin_w))`` over EVERY unit in the policy's per-unit
-    maps (the whole fleet — the arbitrage is net across phases), fail-closed
-    to 0 unless every fleet unit's grid word is finite and its quality GOOD
-    (a quality map that does not carry the key — e.g. a raw fleet
-    projection — is judged on the value alone; the domain Observation always
-    carries the key and an unserved PCS block is independently ``None``) and
-    no older than ``export_telemetry_max_age_s``.  One unreadable phase is
-    NEVER treated as zero export, and an unarmed policy triple (the
-    default) bounds an advisory charge to nothing at all.
+    ``min(max_charge_from_export_w, max(0, floor(sum(grid_power_w) +
+    target_charging_w) - export_headroom_margin_w))`` over EVERY unit in the
+    policy's per-unit maps (the whole fleet — the arbitrage is net across
+    phases), fail-closed to 0 unless every fleet unit's grid word is finite
+    and its quality GOOD (a quality map that does not carry the key — e.g. a
+    raw fleet projection — is judged on the value alone; the domain
+    Observation always carries the key and an unserved PCS block is
+    independently ``None``) and no older than ``export_telemetry_max_age_s``.
+    One unreadable phase is NEVER treated as zero export, and an unarmed
+    policy triple (the default) bounds an advisory charge to nothing at all.
+
+    The target's own charging draw is ADDED BACK before the margin
+    (operator-pinned formula, 2026-09-04).  The measured fleet net already
+    contains the target's draw, so bounding by the raw net would make the
+    closed loop converge to roughly HALF the harvestable surplus (the draw
+    counted twice: once as export reduction, once as the ceiling).  With the
+    add-back, a command at the bound lands the site at exactly the headroom
+    margin — the same grid protection, without the halving.  The credit is
+    fail-closed like every word: missing, flagged, or stale battery telemetry
+    credits nothing, so the bound then stays at the conservative net-only
+    figure (under-harvesting is the safe direction; over-credit could import).
     """
     limit = getattr(policy, "export_charge_limit_w", None)
     margin = getattr(policy, "export_headroom_margin_w", None)
@@ -214,8 +227,39 @@ def eligible_export_charge_w(observations: Mapping[str, Any], policy: Any, now_m
         if _grid_evidence_word(observation, max_age_s=max_age_s, now_mono=now_mono) != "good":
             return 0
         total_w += float(getattr(observation, "grid_power_w", 0.0))
+    if target_unit_id is not None:
+        total_w += _target_charging_add_back_w(
+            observations.get(target_unit_id), max_age_s=max_age_s, now_mono=now_mono
+        )
     eligible = max(0, math.floor(total_w) - int(margin))
     return min(int(limit), eligible)
+
+
+def _target_charging_add_back_w(
+    observation: Any, *, max_age_s: float, now_mono: float
+) -> float:
+    """The target unit's own charging draw, credited only on trustworthy data.
+
+    Charging is negative ``battery_watts`` (the domain's sign: the observed
+    ~-520..-560 W daytime self-charge is charging), so the credit is the
+    negation floored at zero — a discharging target credits nothing.  The
+    same fail-closed classification as the grid word applies: a missing or
+    non-finite value, a quality flag that is not GOOD, or telemetry older
+    than the freshness bound credits nothing at all.
+    """
+    battery_w = getattr(observation, "battery_watts", None)
+    if observation is None or not _finite_number(battery_w):
+        return 0.0
+    quality = getattr(observation, "quality", None)
+    flag = quality.get("battery_watts") if isinstance(quality, Mapping) else None
+    if flag is not None and flag is not DataQuality.GOOD:
+        return 0.0
+    captured_at_mono = getattr(observation, "captured_at_mono", None)
+    if not _finite_number(captured_at_mono):
+        return 0.0
+    if float(now_mono) - captured_at_mono > float(max_age_s):
+        return 0.0
+    return max(0.0, -float(battery_w))
 
 
 def fleet_export_evidence(
@@ -338,7 +382,14 @@ class ExcessChargeAdviser:
         """
         now_mono = float(self._clock.monotonic())
         latest = await self._observations.all_latest()
-        bound_w = eligible_export_charge_w(latest, self._policy, now_mono)
+        # The target is selected BEFORE the bound: the bound now credits the
+        # target's own measured draw back into the net (the operator-pinned
+        # formula, 2026-09-04), so it is a per-target figure.  Selection is
+        # pure over the observations — it only bookkeeps exclusions.
+        target = self._select_target(latest)
+        bound_w = eligible_export_charge_w(
+            latest, self._policy, now_mono, target_unit_id=target
+        )
         evidence, fleet_export_w = fleet_export_evidence(latest, self._policy, now_mono)
         verdict = None if self._participation is None else self._participation()
         if verdict is not None:
@@ -346,7 +397,6 @@ class ExcessChargeAdviser:
                 return await self._withdraw(bound_w, (verdict,), evidence, fleet_export_w)
             return self._idle(bound_w, (verdict,), evidence, fleet_export_w)
         active = await self._intents.active(now_mono)
-        target = self._select_target(latest)
         if self._target_claimed(target, active):
             # Operator precedence, PER UNIT (2026-08-24 concurrent operations):
             # a higher-priority intent claiming the adviser's own target (its

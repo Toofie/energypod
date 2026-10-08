@@ -1775,7 +1775,7 @@ def test_the_live_write_examples_night_block_validates_as_documented() -> None:
     the operator's 2026-08-25 direction (`enabled: true`: night charging
     remains the default across restarts; the runtime toggle still
     overrides within a session), the grant widened beside it, and (since
-    night-V2) the SUGGEST posture with its whole advisory stack — parses
+    night-V2) the ACT posture with its whole advisory stack — parses
     cleanly, so what the operator reads on the example is what the
     controller composes (the projection visible, charging on)."""
     from pathlib import Path
@@ -1787,8 +1787,8 @@ def test_the_live_write_examples_night_block_validates_as_documented() -> None:
     assert isinstance(document, dict), "the example must stay one YAML document"
     assert "night_charging" in document, "the night block is the boot default"
     assert document["night_charging"]["enabled"] is True
-    assert document["night_charging"]["target_policy"] == "forecast_suggest", (
-        "the V2 shipping posture: computed, displayed, and byte-identical v1 charging"
+    assert document["night_charging"]["target_policy"] == "forecast_act", (
+        "the promoted posture (2026-09-22): trust earned, charge the forecast target"
     )
     assert document["schedule"]["allowed_windows_local"] == [["00:00", "20:00"]], (
         "the PARTITION grant ships in the same revision as the night block"

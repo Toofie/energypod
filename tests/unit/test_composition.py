@@ -1718,13 +1718,19 @@ def _export_control_policy(
 
 
 def _export_observation(
-    *, grid_power_w: float | None, captured_at_mono: float = 100.0
+    *,
+    grid_power_w: float | None,
+    captured_at_mono: float = 100.0,
+    battery_watts: float | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         dynamic_charge_limit_w=2_500.0,
         dynamic_discharge_limit_w=2_500.0,
         grid_power_w=grid_power_w,
         captured_at_mono=captured_at_mono,
+        # Absent (the default) is the fixture's idle pod: a non-finite battery
+        # word credits nothing to the bound's target-draw add-back.
+        battery_watts=battery_watts,
     )
 
 
@@ -1792,6 +1798,66 @@ def test_allocator_bounds_optimizer_charge_by_measured_export(
         "the proposal must carry the export-bounded flag so the kernel's evidence "
         "denial can apply to it"
     )
+
+
+_ADD_BACK_GRIDS = {"mid": -1_149.0, "rhs": 2_767.0}  # measured fleet net 1618 W
+
+
+def _charging_fleet() -> dict[str, Any]:
+    """rhs exports 2767 W while mid draws 1149 W of it: the measured net is 1618 W.
+
+    The net ALREADY contains mid's draw — that double-count is exactly what the
+    target-draw add-back removes (OPERATOR-PINNED 2026-09-04).
+    """
+    return {
+        "mid": _export_observation(grid_power_w=-1_149.0, battery_watts=-1_149.0),
+        "rhs": _export_observation(grid_power_w=2_767.0),
+    }
+
+
+def test_allocator_bound_credits_a_single_unit_scopes_own_draw() -> None:
+    """A single-unit OPTIMIZER charge scope credits that unit's own measured
+    draw: min(2500, 1618 + 1149 - 200) = the cap, never the net-only 1418."""
+    policy = _export_control_policy(export_limit_w=2_500, margin_w=200)
+
+    proposals = _allocate_export(_optimizer_charge_intent(watts=3_000), _charging_fleet(), policy)
+
+    assert [proposal.unit_id for proposal in proposals] == ["mid"]
+    assert proposals[0].watts == 2_500
+    assert proposals[0].export_bounded is True
+
+    # The same evidence with no trustworthy battery word: the net-only cap.
+    idle = {
+        "mid": _export_observation(grid_power_w=-1_149.0),
+        "rhs": _export_observation(grid_power_w=2_767.0),
+    }
+    assert _allocate_export(_optimizer_charge_intent(watts=3_000), idle, policy)[0].watts == 1_418
+
+
+def test_allocator_bound_stays_net_only_for_a_multi_unit_scope() -> None:
+    """A wider scope credits no single unit's draw (whose draw would it be?):
+    the cap falls back to the conservative net-only figure, 1618 - 200."""
+    policy = _export_control_policy(export_limit_w=2_500, margin_w=200)
+    intent = _optimizer_charge_intent(watts=3_000, units=frozenset({"mid", "rhs"}))
+
+    proposals = _allocate_export(intent, _charging_fleet(), policy)
+
+    assert sum(proposal.watts for proposal in proposals) == 1_418
+    assert all(proposal.export_bounded for proposal in proposals)
+
+
+def test_allocator_bound_follows_the_surviving_scope_not_the_whole_selection() -> None:
+    """The kernel passes the intent's SURVIVING scope and the bound's target is
+    read from that: a two-unit intent narrowed to one unit by arbitration is a
+    single-unit scope for the credit's purposes."""
+    adapter = _load_class("energypod.runtime.composition", "_FleetAllocatorAdapter")()
+    policy = _export_control_policy(export_limit_w=2_500, margin_w=200)
+    intent = _optimizer_charge_intent(watts=3_000, units=frozenset({"mid", "rhs"}))
+
+    proposals = adapter.allocate(intent, _charging_fleet(), policy, 101.0, frozenset({"mid"}))
+
+    assert [proposal.unit_id for proposal in proposals] == ["mid"]
+    assert proposals[0].watts == 2_500
 
 
 def test_export_bound_is_zero_when_the_policy_triple_is_not_armed() -> None:

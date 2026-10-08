@@ -9,6 +9,12 @@
 # notes when their references don't resolve — never a boot failure).
 set -e
 
+# The controller's serve bind defaults to loopback (main.py — a control plane
+# must not face every interface by accident).  The console's nginx proxies
+# CROSS-CONTAINER (proxy_pass http://energypod:8080), so the embedded
+# deployment moves the bind explicitly, here — never by accident.
+export ENERGYPOD_SERVE_HOST=0.0.0.0
+
 for env_file in /app/var/solcast.env /app/var/pvoutput.env; do
     if [ -f "$env_file" ]; then
         # shellcheck disable=SC1090

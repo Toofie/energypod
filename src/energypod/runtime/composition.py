@@ -1048,6 +1048,10 @@ class _FleetAllocatorAdapter:
         now_mono: float,
         unit_ids: frozenset[str] | None = None,
     ) -> tuple[_FleetProposal, ...]:
+        # Concurrent per-unit arbitration (2026-08-24): the kernel passes the
+        # intent's SURVIVING scope; the domain allocator narrows the selection
+        # and re-sums per-unit targets over it.
+        selected = sorted(intent.selected_unit_ids if unit_ids is None else frozenset(unit_ids))
         export_cap_w: int | None = None
         export_bounded = False
         if (
@@ -1074,12 +1078,20 @@ class _FleetAllocatorAdapter:
             # adviser itself is unchanged: its intents stay export-bounded,
             # and the dawn-corner precedence stays one-sided exactly as
             # pinned (§4.2).
-            export_cap_w = eligible_export_charge_w(observations, policy, now_mono)
+            #
+            # The bound credits the intent's own target draw back into the
+            # net — the same operator-pinned add-back the adviser's bound
+            # carries (2026-09-04): the measured net already contains the
+            # charging this very intent drives, so a net-only cap here would
+            # re-impose the ~halving the adviser's fix removed.  The credit
+            # covers a single-unit scope (the adviser's pinned scope — "its
+            # whole scope is one unit"); a wider scope falls back to the
+            # conservative net-only figure.
+            bound_target = selected[0] if len(selected) == 1 else None
+            export_cap_w = eligible_export_charge_w(
+                observations, policy, now_mono, target_unit_id=bound_target
+            )
             export_bounded = True
-        # Concurrent per-unit arbitration (2026-08-24): the kernel passes the
-        # intent's SURVIVING scope; the domain allocator narrows the selection
-        # and re-sums per-unit targets over it.
-        selected = sorted(intent.selected_unit_ids if unit_ids is None else frozenset(unit_ids))
         headrooms = tuple(
             self._headroom(unit_id, observations.get(unit_id), policy) for unit_id in selected
         )

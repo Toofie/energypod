@@ -818,7 +818,8 @@ observations and policy it already receives — one additional min() term on the
 
 ```text
 eligible_charge_w = min(max_charge_from_export_w,
-                        max(0, floor(Σ_{u ∈ fleet} grid_power_w[u]) - export_headroom_margin_w))
+                        max(0, floor(Σ_{u ∈ fleet} grid_power_w[u] + target_charging_w)
+                            - export_headroom_margin_w))
 ```
 
 - `grid_power_w` is the per-pod CT power at PCS `0x1000+17` (int16, unscaled W; vendor cite
@@ -827,6 +828,14 @@ eligible_charge_w = min(max_charge_from_export_w,
 - The sum is over every unit in the policy's per-unit maps (the whole fleet): the arbitrage is
   net-across-phases. One phase exporting 1500 W while the target's phase idles is exactly the
   scenario the bound serves.
+- `target_charging_w` is the target unit's own measured charging draw (`-battery_watts`,
+  floored at zero — a discharging target credits nothing), credited only on telemetry that is
+  finite, `quality == GOOD`, and no older than `export_telemetry_max_age_s`; anything less
+  credits NOTHING (the bound then stays at the net-only figure — under-harvesting is the safe
+  direction). OPERATOR-PINNED 2026-09-04: the measured net already contains the target's own
+  draw, so a net-only bound double-counts it and the closed loop converges to roughly HALF the
+  harvestable surplus; with the add-back a command at the bound lands the site at exactly the
+  headroom margin — the same grid protection, without the halving.
 - The term can only lower power below today's limits — static per-unit, fleet, BMS dynamic,
   ramp, SOC ceiling/floor, apparent/reactive all still apply unchanged. It can never raise power
   above what today's path would authorize.

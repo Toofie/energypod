@@ -14,3 +14,7 @@ web/dist/
 html/
 var/
 varopenapi.json
+
+# deploy image archives (carry baked credentials + DB)
+*.tar
+*.tar.gz

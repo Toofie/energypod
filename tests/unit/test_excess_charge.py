@@ -17,11 +17,15 @@ Pinned contract (the red phase fails cleanly while the module is absent)::
         exit_hysteresis_w: int,
         intent_ttl_s: float,
     )
-    eligible_export_charge_w(observations, policy, now_mono) -> int
-        # min(max_charge_from_export_w, max(0, floor(sum(grid_power_w)) - margin));
+    eligible_export_charge_w(observations, policy, now_mono, target_unit_id=None) -> int
+        # min(max_charge_from_export_w, max(0, floor(sum(grid_power_w)
+        #    + target_charging_w) - margin));
         # 0 unless EVERY fleet unit's grid evidence is finite, GOOD, and fresh
         # (age <= policy.export_telemetry_max_age_s); 0 when the policy's
-        # export triple is not armed.
+        # export triple is not armed.  target_charging_w is the target unit's
+        # own measured charging draw (-battery_watts, floored at 0), credited
+        # only on finite, GOOD, fresh battery telemetry; target_unit_id=None
+        # (the allocator's own fleet-wide call) stays net-only.
     ExcessChargeDecision(action, target_unit_id, eligible_charge_w,
                          proposed_watts, reason_codes)
     ExcessChargeAdviser(*, settings, policy, clock, observations, intents, submit)
@@ -257,6 +261,20 @@ def make_fleet(
     }
 
 
+def with_battery_word(observation: Any, *, battery_watts: float, quality: Any = None) -> Any:
+    """The same observation carrying an explicit battery word (and flag).
+
+    ``make_observation`` pins a zero battery word -- the fleet fixtures are
+    idle pods -- so the target-draw tests set the draw explicitly.  The quality
+    flag defaults to the observation's own (GOOD); passing a flag overrides
+    just that one key.
+    """
+    updates: dict[str, Any] = {"battery_watts": battery_watts}
+    if quality is not None:
+        updates["quality"] = {**observation.quality, "battery_watts": quality}
+    return observation.model_copy(update=updates)
+
+
 def make_settings(excess: Any, **overrides: Any) -> Any:
     values: dict[str, Any] = {
         "assumed_autonomous_charge_w": 520,
@@ -394,6 +412,134 @@ def test_export_bound_is_deterministic_and_fail_closed(
     }
 
     assert excess.eligible_export_charge_w(observations, policy, NOW) == expected
+
+
+# --- the target's own charging draw is ADDED BACK (operator-pinned 2026-09-04) --
+#
+# The measured fleet net already contains the target's draw, so a net-only
+# bound counts it twice -- once as export reduction, once as the ceiling -- and
+# the closed loop converges to roughly HALF the harvestable surplus.  The bound
+# is therefore a PER-TARGET figure: min(cap, max(0, floor(net +
+# target_charging_w) - margin)), with the credit fail-closed like every word
+# (missing, flagged, or stale battery telemetry credits nothing) and
+# ``target_unit_id=None`` -- the allocator's own fleet-wide call -- staying
+# net-only.  Fixture below: rhs exports 2767 W, mid draws 1149 W of it, so the
+# measured fleet net is 1618 W.
+
+_ADD_BACK_FLEET = {"lhs": 0.0, "mid": -1_149.0, "rhs": 2_767.0}  # net 1618 W
+
+
+def charging_target_fleet(
+    api: Any, *, battery_watts: float = -1_149.0, quality: Any = None
+) -> dict[str, Any]:
+    """The add-back fixture: mid is the neediest unit AND the one drawing."""
+    fleet = make_fleet(api, _ADD_BACK_FLEET)
+    fleet["mid"] = with_battery_word(fleet["mid"], battery_watts=battery_watts, quality=quality)
+    return fleet
+
+
+def test_the_target_charging_draw_is_added_back_before_the_margin(excess: Any, api: Any) -> None:
+    """min(2500, 1618 + 1149 - 200) = the cap.  The net-only figure the same
+    evidence used to produce (1418 W) would have halved the harvest."""
+    policy = make_policy(api, export_charge_limit_w=2_500, export_headroom_margin_w=200)
+
+    assert (
+        excess.eligible_export_charge_w(
+            charging_target_fleet(api), policy, NOW, target_unit_id="mid"
+        )
+        == 2_500
+    )
+    # The same evidence, no target: the old net-only bound, for contrast.
+    assert excess.eligible_export_charge_w(charging_target_fleet(api), policy, NOW) == 1_418
+
+
+async def test_the_tick_proposes_the_add_back_bound(excess: Any, api: Any) -> None:
+    """The tick selects its target BEFORE the bound and passes it in, so the
+    commanded figure is the add-back bound (1618 + 1149 - 100, capped at 2000)
+    and never the net-only 1518 the same evidence used to produce."""
+    adviser, _intents, submit, _clock = make_adviser(excess, api, charging_target_fleet(api))
+
+    decision = await adviser.tick()
+
+    assert decision.action == "propose"
+    assert decision.target_unit_id == "mid"
+    assert decision.eligible_charge_w == 2_000
+    assert decision.proposed_watts == 2_000
+    assert submit.submissions[0]["unit_ids"] == ["mid"]
+    assert submit.submissions[0]["watts"] == 2_000
+
+
+def test_only_the_targets_own_draw_is_credited(excess: Any, api: Any) -> None:
+    """The credit is the TARGET's draw, not any charging unit's: pointing the
+    bound at a unit that is idle leaves the net-only figure standing."""
+    policy = make_policy(api, export_charge_limit_w=2_500, export_headroom_margin_w=200)
+
+    assert (
+        excess.eligible_export_charge_w(
+            charging_target_fleet(api), policy, NOW, target_unit_id="lhs"
+        )
+        == 1_418
+    )
+
+
+def test_a_discharging_target_credits_nothing(excess: Any, api: Any) -> None:
+    """Charging is a NEGATIVE battery word (the domain's sign: the observed
+    ~-520..-560 W daytime self-charge is charging).  A target discharging into
+    the site is already inside the measured net and credits nothing back."""
+    policy = make_policy(api, export_charge_limit_w=2_500, export_headroom_margin_w=200)
+    fleet = make_fleet(api, {"lhs": 0.0, "mid": 400.0, "rhs": 1_218.0})  # net 1618
+    fleet["mid"] = with_battery_word(fleet["mid"], battery_watts=400.0)
+
+    assert excess.eligible_export_charge_w(fleet, policy, NOW, target_unit_id="mid") == 1_418
+
+
+def test_a_flagged_target_battery_word_credits_nothing(excess: Any, api: Any) -> None:
+    """A battery word whose quality flag is not GOOD credits nothing: the bound
+    falls back to the net-only figure rather than trusting a flagged draw."""
+    policy = make_policy(api, export_charge_limit_w=2_500, export_headroom_margin_w=200)
+    fleet = charging_target_fleet(api, quality=api.DataQuality.SUSPECT)
+
+    assert excess.eligible_export_charge_w(fleet, policy, NOW, target_unit_id="mid") == 1_418
+
+
+def test_a_stale_target_read_credits_nothing(excess: Any, api: Any) -> None:
+    """The credit is freshness-gated like every word.  The domain Observation
+    carries ONE capture clock for the grid and the battery words, so a stale
+    target read trips the grid gate first and collapses the whole bound
+    fail-closed -- either way the aged draw credits nothing."""
+    policy = make_policy(api, export_charge_limit_w=2_500, export_headroom_margin_w=200)
+    fleet = charging_target_fleet(api)
+    fleet["mid"] = fleet["mid"].model_copy(update={"captured_at_mono": NOW - 6.0})
+
+    assert excess.eligible_export_charge_w(fleet, policy, NOW, target_unit_id="mid") == 0
+
+    # The credit's OWN freshness gate, isolated from the grid walk (which that
+    # shared clock always decides first on a domain observation): the stale
+    # battery alone drops the credit, the fresh one pays it in full.
+    word = SimpleNamespace(
+        battery_watts=-1_149.0,
+        quality={"battery_watts": api.DataQuality.GOOD},
+        captured_at_mono=NOW,
+    )
+    assert excess._target_charging_add_back_w(word, max_age_s=5.0, now_mono=NOW) == 1_149.0
+    aged = SimpleNamespace(
+        battery_watts=-1_149.0,
+        quality={"battery_watts": api.DataQuality.GOOD},
+        captured_at_mono=NOW - 6.0,
+    )
+    assert excess._target_charging_add_back_w(aged, max_age_s=5.0, now_mono=NOW) == 0.0
+
+
+def test_without_a_target_the_bound_stays_net_only(excess: Any, api: Any) -> None:
+    """``target_unit_id=None`` (explicitly or by omission) behaves exactly as
+    before -- the fleet-wide allocator cap credits no draw, even with a charging
+    target sitting in the map."""
+    policy = make_policy(api)
+
+    fleet = charging_target_fleet(api)
+    assert excess.eligible_export_charge_w(fleet, policy, NOW) == 1_518
+    assert excess.eligible_export_charge_w(fleet, policy, NOW, target_unit_id=None) == 1_518
+    assert excess.eligible_export_charge_w(fleet, policy, NOW, target_unit_id="mid") == 2_000
 
 
 # --- beat-autonomy hysteresis ---------------------------------------------------

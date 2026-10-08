@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import os
 import sys
 from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
@@ -52,6 +53,33 @@ DB_INPUT_OPTION: Final = "--in"
 # configuration is explicitly contracted.
 DEFAULT_SERVE_HOST: Final = "127.0.0.1"
 DEFAULT_SERVE_PORT: Final = 8080
+
+# The one sanctioned way off that default: explicit environment references,
+# read only at serve time.  The embedded container deployment
+# (docker/entrypoint.sh) sets ENERGYPOD_SERVE_HOST=0.0.0.0 because the
+# console's nginx proxies cross-container — but that is a deliberate,
+# deployment-level act, never an accident of composition.  Nothing else in
+# the runtime can move the bind.
+SERVE_HOST_ENV: Final = "ENERGYPOD_SERVE_HOST"
+SERVE_PORT_ENV: Final = "ENERGYPOD_SERVE_PORT"
+
+
+def _resolve_serve_address() -> tuple[str, int]:
+    """The serve bind: the loopback default, moved only by explicit env."""
+    host = os.environ.get(SERVE_HOST_ENV, DEFAULT_SERVE_HOST).strip()
+    raw_port = os.environ.get(SERVE_PORT_ENV, "").strip()
+    try:
+        port = int(raw_port) if raw_port else DEFAULT_SERVE_PORT
+    except ValueError:
+        raise ValueError(
+            f"{SERVE_PORT_ENV} must be an integer port, got {raw_port!r}"
+        ) from None
+    if not host or not 1 <= port <= 65535:
+        raise ValueError(
+            f"{SERVE_HOST_ENV}/{SERVE_PORT_ENV} must name a host and a 1-65535 port, "
+            f"got {host!r}, {port}"
+        )
+    return host, port
 
 _EXIT_OK: Final = 0
 _EXIT_FAILURE: Final = 1
@@ -592,9 +620,10 @@ def _compose_and_hand_off(
     The injected runner owns serving and with it the application lifespan, so
     supervision starts and stops only if the runner drives that lifespan.
     """
+    host, port = _resolve_serve_address()
     runtime = _compose_runtime(config, simulate=simulate)
     try:
-        outcome = runner(runtime.app, host=DEFAULT_SERVE_HOST, port=DEFAULT_SERVE_PORT)
+        outcome = runner(runtime.app, host=host, port=port)
         _settle_runner_outcome(outcome)
         _assert_supervision_healthy(runtime.app)
     except Exception:
@@ -613,9 +642,10 @@ async def _compose_and_serve(
     composition must happen on the very loop that later serves and runs the
     supervision tasks.
     """
+    host, port = _resolve_serve_address()
     runtime = _compose_runtime(config, simulate=simulate)
     try:
-        outcome = runner(runtime.app, host=DEFAULT_SERVE_HOST, port=DEFAULT_SERVE_PORT)
+        outcome = runner(runtime.app, host=host, port=port)
         if inspect.isawaitable(outcome):
             await outcome
         _assert_supervision_healthy(runtime.app)

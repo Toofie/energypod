@@ -1,6 +1,6 @@
 #!/bin/sh
-# The post-deploy verification (docs/DEPLOY_DOCKER.md §5) — run on the Docker
-# host after `docker compose up -d --build`.  Every check prints its own
+# The post-deploy verification (docs/DEPLOY_DOCKER.md §4) — run on the Docker
+# host after `docker compose up -d`.  Every check prints its own
 # pass/fail line; the script exits non-zero if any fail.
 #
 # Usage: ./scripts/docker-verify.sh [console-port]   (default 8080)
@@ -27,9 +27,12 @@ echo "verifying the EnergyPod deployment at ${BASE} ..."
 check "controller health (/healthz)" \
     curl -sf -m 5 "${BASE}/healthz"
 
-# 2. The console is served (the SPA's index).
+# 2. The console is served (the SPA's index).  The pipeline lives INSIDE the
+#    checked command (sh -c, like check 4): a bare `check ... curl | grep`
+#    would pipe check's own pass/fail line into grep — swallowed, and the
+#    check could never pass.
 check "console served (index.html)" \
-    curl -sf -m 5 "${BASE}/" | grep -q "<!doctype html>\|<!DOCTYPE html>"
+    sh -c "curl -sf -m 5 '${BASE}/' | grep -q '<!doctype html>\|<!DOCTYPE html>'"
 
 # 3. The guarded API answers through the proxy — an unauthenticated snapshot
 #    must be REFUSED (401/403), which proves the API and the proxy are up
@@ -43,7 +46,10 @@ else
 fi
 
 # 4. The controller sees the three batteries — needs the operator bearer
-#    token (ENERGYPOD_TOKEN env var, the value from var/live-credentials.json).
+#    token (ENERGYPOD_TOKEN env var).  That token is the credential KEY in
+#    var/live-credentials.json (the `live-…` string naming the entry), not
+#    the entry's `subject` field (verified against the running container,
+#    2026-09-03).
 if [ -n "${ENERGYPOD_TOKEN:-}" ]; then
     check "snapshot carries the fleet" \
         sh -c "curl -sf -m 5 -H 'Authorization: Bearer ${ENERGYPOD_TOKEN}' '${BASE}/api/v1/snapshot' | grep -q '\"units\"'"

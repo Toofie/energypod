@@ -35,6 +35,11 @@ services:
     build:
       context: .
       target: runtime
+    # The explicit image names make save/load honest: `docker compose build`
+    # tags exactly these, `docker save` (docs §3) saves exactly these, and
+    # after `docker load` on the host, `docker compose up -d` uses the loaded
+    # images instead of rebuilding (which would re-snapshot the database).
+    image: energypod-controller:latest
     container_name: energypod-controller
     restart: unless-stopped
     ports:
@@ -46,6 +51,7 @@ services:
     build:
       context: .
       target: console-nginx
+    image: energypod-console:latest
     container_name: energypod-console
     restart: unless-stopped
     depends_on:

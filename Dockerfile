@@ -26,7 +26,11 @@
 FROM node:20-alpine AS console-build
 WORKDIR /build
 COPY web/package.json web/pnpm-lock.yaml ./
-RUN corepack enable && pnpm install --frozen-lockfile
+# pnpm is pinned here, never floated: corepack's unpinned default moved to a
+# pnpm that needs Node >= 22 and the build broke against this Node 20 base
+# (2026-09-03).  Major 10 runs here and reads the lockfileVersion 9.0 file
+# natively.
+RUN npm install -g pnpm@10 && pnpm install --frozen-lockfile
 COPY web/ ./
 RUN pnpm build
 

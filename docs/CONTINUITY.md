@@ -1,6 +1,6 @@
 # EnergyPod continuity and recovery ledger
 
-Last updated: 2026-08-25 (Australia/Brisbane; every commissioned surface live — load-sharing act on the operator's attestation, the fair census tonight, mid's traverse tomorrow, sharing's first window tomorrow 16:00)
+Last updated: 2026-09-22 (Australia/Brisbane; both boot-default promotions live in the config — excess participation and the forecast_act night posture — images rebuilt, controller image is the only redeploy)
 
 ## Purpose
 
@@ -375,6 +375,32 @@ authorized observe-only commissioning validates register topology, scaling,
 direction, freshness, and watchdog timing per physical unit.
 
 ## Update log
+
+- 2026-09-22 ~10:30 (TWO BOOT-DEFAULT PROMOTIONS — config revision 12; both
+  images rebuilt; THE CONTROLLER IMAGE ONLY is redeployable): the operator's
+  premise: the container restarts NIGHTLY, so any runtime-only posture is
+  lost at every boot.  (1) EXCESS SURPLUS → `enabled: true`: the trial's
+  boot suspension was the last runtime-only act — the graduation is now
+  total (cap 2500 W since 2026-08-27; participation since today) and both
+  survive every restart.  (2) NIGHT-V2 `target_policy` forecast_suggest →
+  forecast_act: the promotion the doctrine reserved for a human act, earned
+  on the operator's scoreboard — 17 scored mornings (≥ 14), mean |err|
+  25.52% ≤ 30 tolerance, bias 11.11% inside the over/under bounds, regimes
+  6 low + 5 high (≥ 3 each); tariff A3 long held (FIT 2.0 c < night
+  7.27 c).  The loud v1-ceiling (95%) fallback is unchanged on any forecast
+  failure or lapsed trust.  Gates: 389 + 127 targeted unit tests green —
+  test_the_live_write_examples_night_block_validates_as_documented parses
+  and validates the WHOLE example document, so forecast_act composes
+  against the tariff gates; the example pin test updated to forecast_act.
+  Docker: both images rebuilt 2026-09-22 on the Windows machine (compose).
+  DEPLOY CAVEAT (DEPLOY_DOCKER §6, now acute): the 17 scored mornings live
+  in the RUNNING Synology container's /app/var/live-write.sqlite3 — this
+  repo's copy is stale, and redeploying an image built from it RESETS trust
+  to unearned, silently reverting night charge to the v1 ceiling until 14
+  mornings re-accumulate.  Before redeploy: docker cp the live DB out of
+  the running container, place it in the repo's var/, THEN build; reload
+  energypod-controller ONLY (config bakes solely into the runtime stage;
+  the console image is untouched by this change).
 
 - 2026-08-27 ~21:45 (EVENING LOAD-SHARING DECOMMISSIONED AT THE OPERATOR'S
   DIRECTIVE — config revision 11): mid-window removal ("just disable this
